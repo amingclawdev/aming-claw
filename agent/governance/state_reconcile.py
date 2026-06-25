@@ -815,6 +815,64 @@ def _node_function_signature(node: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(signature, key=lambda item: item["qualified_name"])
 
 
+def _function_signature_delta(
+    *,
+    parsed_signature: list[dict[str, Any]],
+    active_signature: list[dict[str, Any]],
+    identity_reason: str,
+) -> dict[str, Any]:
+    parsed_by_name = {
+        str(item.get("qualified_name") or ""): item
+        for item in parsed_signature
+        if str(item.get("qualified_name") or "")
+    }
+    active_by_name = {
+        str(item.get("qualified_name") or ""): item
+        for item in active_signature
+        if str(item.get("qualified_name") or "")
+    }
+    parsed_names = set(parsed_by_name)
+    active_names = set(active_by_name)
+    added = sorted(parsed_names - active_names)
+    removed = sorted(active_names - parsed_names)
+    if added or removed:
+        return {
+            "stable_identity": False,
+            "reason": identity_reason,
+            "added_functions": added,
+            "removed_functions": removed,
+            "parsed_function_count": len(parsed_names),
+            "active_function_count": len(active_names),
+        }
+
+    line_range_changes: list[dict[str, Any]] = []
+    for qualified_name in sorted(parsed_names):
+        parsed = parsed_by_name[qualified_name]
+        active = active_by_name[qualified_name]
+        parsed_lines = [
+            int(parsed.get("lineno") or 0),
+            int(parsed.get("end_lineno") or parsed.get("lineno") or 0),
+        ]
+        active_lines = [
+            int(active.get("lineno") or 0),
+            int(active.get("end_lineno") or active.get("lineno") or 0),
+        ]
+        if parsed_lines != active_lines:
+            line_range_changes.append({
+                "qualified_name": qualified_name,
+                "active_lines": active_lines,
+                "parsed_lines": parsed_lines,
+            })
+    return {
+        "stable_identity": True,
+        "line_range_changed": bool(line_range_changes),
+        "line_range_change_count": len(line_range_changes),
+        "line_range_changes": line_range_changes[:50],
+        "parsed_function_count": len(parsed_names),
+        "active_function_count": len(active_names),
+    }
+
+
 def _source_path_incremental_eligibility(
     project_root: str | Path,
     active_graph_json: dict[str, Any],
@@ -854,11 +912,18 @@ def _source_path_incremental_eligibility(
         }
     parsed_signature = _module_function_signature(module)
     active_signature = _node_function_signature(node)
-    if parsed_signature != active_signature:
+    signature_delta = _function_signature_delta(
+        parsed_signature=parsed_signature,
+        active_signature=active_signature,
+        identity_reason="source_function_identity_changed",
+    )
+    if not signature_delta.get("stable_identity"):
         return {
             "supported": False,
-            "reason": "source_function_signature_changed",
+            "reason": str(signature_delta.get("reason") or "source_function_identity_changed"),
+            "legacy_reason": "source_function_signature_changed",
             "path": path,
+            "signature_delta": signature_delta,
             "parsed_signature": parsed_signature,
             "active_signature": active_signature,
         }
@@ -886,6 +951,7 @@ def _source_path_incremental_eligibility(
             or any(getattr(func, "decorators", None) for func in getattr(module, "functions", []) or [])
         ),
         "typed_relation_count": len(typed_relations),
+        "signature_delta": signature_delta,
     }
 
 

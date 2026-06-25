@@ -3576,6 +3576,24 @@ def list_reconcile_run_metrics(
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
+_FULL_REBUILD_STRATEGIES = {"full_rebuild_fallback", "legacy_full_like", "full"}
+
+
+def _fallback_next_action(fallback_reason: str) -> str:
+    reason = str(fallback_reason or "").strip()
+    if reason == "source_function_identity_changed":
+        return "run_full_reconcile; function identities changed, so incremental dependency facts may be stale"
+    if reason == "ruleset_change_requires_rule_aware_reconcile":
+        return "run_full_reconcile; graph rule or interpretation inputs changed"
+    if reason == "inventory_status_change_requires_full_rebuild":
+        return "inspect inventory status changes, then run full reconcile if the status change is expected"
+    if reason == "source_typed_relation_asset_unknown":
+        return "file or fix the missing typed-relation asset binding before retrying scope reconcile"
+    if reason:
+        return "review fallback_reason and retry with full reconcile if the changed graph contract is expected"
+    return "review reconcile trace; fallback reason was not recorded"
+
+
 def summarize_reconcile_run_metrics(
     conn: sqlite3.Connection,
     project_id: str,
@@ -3584,6 +3602,8 @@ def summarize_reconcile_run_metrics(
 ) -> dict[str, Any]:
     rows = list_reconcile_run_metrics(conn, project_id, limit=limit)
     buckets: dict[str, dict[str, Any]] = {}
+    fallback_reasons: dict[str, dict[str, Any]] = {}
+    latest_full_rebuild_fallback: dict[str, Any] = {}
     for row in rows:
         strategy = str(row.get("strategy") or "unknown")
         bucket = buckets.setdefault(
@@ -3595,14 +3615,46 @@ def summarize_reconcile_run_metrics(
         bucket["total_elapsed_ms"] += elapsed
         bucket["min_elapsed_ms"] = elapsed if not bucket["min_elapsed_ms"] else min(bucket["min_elapsed_ms"], elapsed)
         bucket["max_elapsed_ms"] = max(bucket["max_elapsed_ms"], elapsed)
+        fallback_reason = str(row.get("fallback_reason") or "")
+        if strategy in _FULL_REBUILD_STRATEGIES and fallback_reason:
+            reason_bucket = fallback_reasons.setdefault(
+                fallback_reason,
+                {
+                    "count": 0,
+                    "total_elapsed_ms": 0,
+                    "latest_created_at": "",
+                    "latest_run_id": "",
+                    "operator_next_action": _fallback_next_action(fallback_reason),
+                },
+            )
+            reason_bucket["count"] += 1
+            reason_bucket["total_elapsed_ms"] += elapsed
+            if not reason_bucket["latest_created_at"]:
+                reason_bucket["latest_created_at"] = str(row.get("created_at") or "")
+                reason_bucket["latest_run_id"] = str(row.get("run_id") or "")
+            if not latest_full_rebuild_fallback:
+                latest_full_rebuild_fallback = {
+                    "run_id": str(row.get("run_id") or ""),
+                    "snapshot_id": str(row.get("snapshot_id") or ""),
+                    "commit_sha": str(row.get("commit_sha") or ""),
+                    "strategy": strategy,
+                    "graph_delta_mode": str(row.get("graph_delta_mode") or ""),
+                    "fallback_reason": fallback_reason,
+                    "elapsed_ms": elapsed,
+                    "created_at": str(row.get("created_at") or ""),
+                    "operator_next_action": _fallback_next_action(fallback_reason),
+                }
     for bucket in buckets.values():
+        count = int(bucket.get("count") or 0)
+        bucket["avg_elapsed_ms"] = round(float(bucket["total_elapsed_ms"]) / count, 2) if count else 0
+    for bucket in fallback_reasons.values():
         count = int(bucket.get("count") or 0)
         bucket["avg_elapsed_ms"] = round(float(bucket["total_elapsed_ms"]) / count, 2) if count else 0
 
     incremental = buckets.get("incremental_graph_delta") or {}
     full_candidates = [
         bucket for name, bucket in buckets.items()
-        if name in {"full_rebuild_fallback", "legacy_full_like", "full"}
+        if name in _FULL_REBUILD_STRATEGIES
     ]
     full_count = sum(int(bucket.get("count") or 0) for bucket in full_candidates)
     full_total = sum(int(bucket.get("total_elapsed_ms") or 0) for bucket in full_candidates)
@@ -3614,6 +3666,8 @@ def summarize_reconcile_run_metrics(
         "project_id": project_id,
         "sample_count": len(rows),
         "by_strategy": buckets,
+        "fallback_reasons": fallback_reasons,
+        "latest_full_rebuild_fallback": latest_full_rebuild_fallback,
         "speedup": {
             "incremental_avg_ms": round(incremental_avg, 2),
             "full_avg_ms": round(full_avg, 2),
