@@ -89,10 +89,79 @@ def validate_contract_write(
                 "write does not match next legal action "
                 f"{expected_stage!r}/{expected_line!r}"
             )
+        _validate_next_action_instance(errors, write, next_action)
     elif require_next_action and next_action is None:
         errors.append("contract execution has no remaining next legal action")
 
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
+
+
+def _validate_next_action_instance(
+    errors: list[str],
+    write: Mapping[str, Any],
+    next_action: Mapping[str, Any],
+) -> None:
+    expected_instance = str(next_action.get("line_instance_id") or "")
+    expected_runtime_context_id = str(next_action.get("runtime_context_id") or "")
+    expected_task_id = str(next_action.get("task_id") or "")
+    expected_lane_id = str(next_action.get("lane_id") or "")
+    if not any(
+        (expected_instance, expected_runtime_context_id, expected_task_id, expected_lane_id)
+    ):
+        return
+
+    actual_runtime_context_id = _write_field(write, "runtime_context_id")
+    if expected_runtime_context_id:
+        if not actual_runtime_context_id:
+            errors.append("missing runtime_context_id for next legal action")
+        elif actual_runtime_context_id != expected_runtime_context_id:
+            errors.append("runtime_context_id does not match next legal action")
+
+    actual_task_id = _write_field(write, "task_id")
+    if expected_task_id and actual_task_id and actual_task_id != expected_task_id:
+        errors.append("task_id does not match next legal action")
+
+    actual_lane_id = _write_field(write, "lane_id", "worker_slot_id", "worker_id")
+    if expected_lane_id and actual_lane_id and actual_lane_id != expected_lane_id:
+        errors.append("lane_id does not match next legal action")
+
+    actual_instance = _write_field(write, "line_instance_id", "instance_id")
+    if not actual_instance:
+        actual_instance = _line_instance_id_from_values(
+            runtime_context_id=actual_runtime_context_id,
+            task_id=actual_task_id,
+            lane_id=actual_lane_id,
+        )
+    if expected_instance and actual_instance and actual_instance != expected_instance:
+        errors.append("line_instance_id does not match next legal action")
+    elif expected_instance and not actual_instance:
+        errors.append("missing line_instance_id for next legal action")
+
+
+def _write_field(write: Mapping[str, Any], *keys: str) -> str:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    for source in (write, payload):
+        for key in keys:
+            value = source.get(key)
+            text = str(value or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _line_instance_id_from_values(
+    *,
+    runtime_context_id: str = "",
+    task_id: str = "",
+    lane_id: str = "",
+) -> str:
+    if runtime_context_id:
+        return f"runtime_context:{runtime_context_id}"
+    if task_id:
+        return f"task:{task_id}"
+    if lane_id:
+        return f"lane:{lane_id}"
+    return ""
 
 
 def _expect_equal(

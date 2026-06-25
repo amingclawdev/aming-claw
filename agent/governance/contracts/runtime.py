@@ -503,6 +503,7 @@ class ContractRuntime:
             effective_write["actor_role"] = effective_actor_role
         if body_actor_role and effective_actor_role and body_actor_role != effective_actor_role:
             effective_write["body_actor_role"] = body_actor_role
+        _enrich_line_instance_fields(effective_write)
         guide = self.current_guide(
             contract_execution_id,
             actor_role=effective_actor_role,
@@ -628,6 +629,14 @@ def _effective_actor_role(write: Mapping[str, Any], *, actor_role: str | None) -
 
 
 _LINE_EVIDENCE_OPTIONAL_FIELDS = (
+    "line_instance_id",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "lane_id",
+    "worker_slot_id",
+    "worker_id",
     "payload",
     "artifact_refs",
     "trace_id",
@@ -660,6 +669,55 @@ def _line_evidence_from_write(
             continue
         evidence[field] = _sanitize_line_evidence_value(write.get(field))
     return evidence
+
+
+def _enrich_line_instance_fields(write: dict[str, Any]) -> None:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    for key in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "lane_id",
+        "worker_slot_id",
+        "worker_id",
+    ):
+        if write.get(key):
+            continue
+        payload_value = payload.get(key)
+        if isinstance(payload_value, (str, int, float, bool)):
+            text = str(payload_value).strip()
+            if text:
+                write[key] = text
+    if write.get("line_instance_id"):
+        return
+    line_instance_id = _line_instance_id_from_write(write)
+    if line_instance_id:
+        write["line_instance_id"] = line_instance_id
+
+
+def _line_instance_id_from_write(write: Mapping[str, Any]) -> str:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    runtime_context_id = str(
+        write.get("runtime_context_id") or payload.get("runtime_context_id") or ""
+    ).strip()
+    task_id = str(write.get("task_id") or payload.get("task_id") or "").strip()
+    lane_id = str(
+        write.get("lane_id")
+        or write.get("worker_slot_id")
+        or write.get("worker_id")
+        or payload.get("lane_id")
+        or payload.get("worker_slot_id")
+        or payload.get("worker_id")
+        or ""
+    ).strip()
+    if runtime_context_id:
+        return f"runtime_context:{runtime_context_id}"
+    if task_id:
+        return f"task:{task_id}"
+    if lane_id:
+        return f"lane:{lane_id}"
+    return ""
 
 
 def _attach_completed_line_evidence(

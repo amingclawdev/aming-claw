@@ -33068,6 +33068,15 @@ def _runtime_next_action_from_guide(
         "meta_contract_gate_decision_source": False,
     }
     for key in (
+        "line_instance_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "lane_id",
+        "worker_slot_id",
+        "worker_id",
+        "worker_index",
         "status",
         "blocked_by_line",
         "blocked_next_action",
@@ -33560,6 +33569,19 @@ def _resolve_contract_runtime_mf_sub_proof(
     if "mf_sub" not in allowed_roles:
         return None
 
+    expected_runtime_context_id = str(next_line.get("runtime_context_id") or "").strip()
+    if expected_runtime_context_id and runtime_context_id != expected_runtime_context_id:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "mf_sub",
+                "proof_error": "runtime_context_next_action_mismatch",
+                "runtime_context_id": runtime_context_id,
+                "expected_runtime_context_id": expected_runtime_context_id,
+            },
+        )
+
     worker_role = _contract_runtime_ref_value(ctx, "worker_role", "role")
     if worker_role and worker_role.strip().lower().replace("-", "_") != "mf_sub":
         raise PermissionDeniedError(
@@ -33693,6 +33715,14 @@ def _contract_runtime_line_write_body(
     for key in (
         "execution_state_revision",
         "runtime_guide_hash",
+        "line_instance_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "lane_id",
+        "worker_slot_id",
+        "worker_id",
         "payload",
         "artifact_refs",
         "trace_id",
