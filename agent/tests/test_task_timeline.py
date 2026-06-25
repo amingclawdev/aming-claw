@@ -13364,6 +13364,72 @@ def test_cross_ref_accepts_registry_child_lineage_with_observer_parent_task_scop
     assert gate["advisory_route_token_child_lineages"] == []
 
 
+def test_cross_ref_prefers_live_server_parent_scope_over_stale_cleanup():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    live_parent = route_context_gate["route_identity"]
+    stale_cleanup_parent = {
+        **live_parent,
+        "route_id": "route-stale-cleanup-parent",
+        "route_context_hash": _fake_sha("stale-cleanup-parent-route"),
+        "prompt_contract_id": "rprompt-stale-cleanup-parent",
+        "prompt_contract_hash": _fake_sha("stale-cleanup-parent-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("stale-cleanup-visible"),
+    }
+    cleanup = copy.deepcopy(cleanup)
+    cleanup["payload"]["route_identity_cleanup"] = {
+        **stale_cleanup_parent,
+        "applied": True,
+    }
+    route_context_gate = copy.deepcopy(route_context_gate)
+    route_context_gate["route_identity_cleanup"] = {
+        "applied": True,
+        "event": {"id": cleanup["id"]},
+        "route_identity": stale_cleanup_parent,
+    }
+    worker_implementation = copy.deepcopy(worker_implementation)
+    child = {
+        field: worker_implementation["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    worker_implementation = _attach_server_action_scope_route_token_lineage(
+        worker_implementation,
+        child,
+        parent_identity=live_parent,
+        route_token_ref=worker_implementation["payload"]["route_token_ref"],
+        acceptance_source="server_backed_route_token_action_scope",
+    )
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is True
+    assert gate["canonical_route_scope"]["route_id"] == live_parent["route_id"]
+    assert gate["canonical_route_scope"]["route_context_hash"] == (
+        live_parent["route_context_hash"]
+    )
+    assert gate["rejected_cross_ref_evidence"] == []
+    accepted = gate["accepted_route_token_child_lineages"][0]
+    assert accepted["canonical_parent_route_scope"]["route_id"] == (
+        live_parent["route_id"]
+    )
+    assert accepted["server_lineage"]["parent_route_identity"]["route_id"] == (
+        live_parent["route_id"]
+    )
+
+
 def test_cross_ref_rejects_observer_parent_task_without_registry_child_lineage():
     from agent.governance import task_timeline
 

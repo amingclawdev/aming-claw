@@ -24366,6 +24366,54 @@ def test_server_route_token_ref_enrichment_covers_live_protected_event_kinds(con
         assert lineage["child_route_identity"]["route_id"] == child_identity["route_id"]
         assert lineage["route_token_ref"] == child_issue["route_token_ref"]
 
+    stale_parent_identity = {
+        **parent_identity,
+        "route_id": "route-stale-cleanup-parent",
+        "route_context_hash": _fake_sha("stale-cleanup-parent-route"),
+        "prompt_contract_id": "rprompt-stale-cleanup-parent",
+        "prompt_contract_hash": _fake_sha("stale-cleanup-parent-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("stale-cleanup-visible"),
+    }
+    cleanup = {
+        "id": 100,
+        "event_type": "route_identity_cleanup",
+        "event_kind": "route_identity_cleanup",
+        "phase": "identity_recovery",
+        "status": "accepted",
+        "backlog_id": backlog_id,
+        "project_id": PID,
+        "payload": {
+            "route_identity_cleanup": {**stale_parent_identity, "applied": True}
+        },
+    }
+    route_context_gate = {
+        "passed": True,
+        "route_identity": parent_identity,
+        "route_identity_cleanup": {
+            "applied": True,
+            "event": {"id": cleanup["id"]},
+            "route_identity": stale_parent_identity,
+        },
+    }
+
+    cross_ref_gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, *enriched],
+        {
+            "backlog_id": backlog_id,
+            "project_id": PID,
+            "route_id": parent_identity["route_id"],
+            "prompt_contract_id": parent_identity["prompt_contract_id"],
+        },
+        route_context_gate=route_context_gate,
+    )
+
+    assert cross_ref_gate["passed"] is True
+    assert cross_ref_gate["canonical_route_scope"]["route_id"] == (
+        parent_identity["route_id"]
+    )
+    assert not cross_ref_gate["rejected_cross_ref_evidence"]
+    assert cross_ref_gate["accepted_route_token_child_lineages"]
+
 
 def test_server_route_token_ref_enrichment_rejects_route_id_mismatch(conn):
     backlog_id = "AC-REF-ONLY-ROUTE-ID-MISMATCH"

@@ -7716,13 +7716,127 @@ def _cross_ref_merge_public_route_scope(
     return merged
 
 
+def _cross_ref_live_parent_route_filters(
+    route_context_gate: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Route-gate parent identities allowed to supersede stale cleanup scope."""
+
+    filters: list[dict[str, str]] = []
+    gate_identity = _cross_ref_public_route_scope(
+        _mapping(route_context_gate).get("route_identity") or {}
+    )
+    if gate_identity:
+        filters.append(gate_identity)
+
+    runtime_filter = _mapping(
+        _mapping(route_context_gate).get("runtime_lineage_identity_filter")
+    )
+    if _truthy(runtime_filter.get("applied")):
+        parent_identity = _cross_ref_public_route_scope(
+            runtime_filter.get("parent_route_identity") or {}
+        )
+        if parent_identity:
+            filters.append(parent_identity)
+
+    unique: list[dict[str, str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for item in filters:
+        key = tuple(
+            str(item.get(field) or "")
+            for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _cross_ref_server_projected_parent_route_scope(
+    rows: list[Any],
+    route_context_gate: Mapping[str, Any],
+    row_anchor: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Return a live parent scope proven by registry-backed child lineage."""
+
+    trusted_parent_filters = _cross_ref_live_parent_route_filters(route_context_gate)
+    if not trusted_parent_filters:
+        return {}
+
+    selected: dict[str, str] = {}
+    for raw in rows:
+        event = _mapping(raw)
+        if not event or not is_protected_close_evidence(event):
+            continue
+        if not _route_event_passed(event):
+            continue
+        if row_anchor and not _cross_ref_same_row_floor(event, row_anchor):
+            continue
+
+        child_scope = _cross_ref_public_route_scope(event)
+        route_token_ref = child_scope.get("route_token_ref", "")
+        if not route_token_ref:
+            continue
+
+        lineage = _first_deep_mapping(event, "route_action_scope_lineage")
+        if not lineage:
+            continue
+        projected_by = _route_marker(lineage.get("projected_by"))
+        if projected_by not in {
+            "handle_task_timeline_append",
+            "server_timeline_precheck_enrichment",
+        }:
+            continue
+
+        parent_identity = _lineage_route_identity(
+            lineage,
+            "parent",
+            (
+                "parent_route_identity",
+                "parent_route_lineage",
+                "parent_identity",
+                "parent",
+            ),
+        )
+        if not parent_identity:
+            continue
+        accepted_lineage = _route_action_scope_server_lineage(
+            event,
+            child_scope,
+            parent_identity,
+            route_token_ref,
+        )
+        if not accepted_lineage:
+            continue
+        parent_scope = _cross_ref_public_route_scope(
+            accepted_lineage.get("parent_route_identity") or parent_identity
+        )
+        if not any(
+            _route_identity_matches_filter(parent_scope, parent_filter)
+            for parent_filter in trusted_parent_filters
+        ):
+            continue
+        selected = parent_scope
+    return selected
+
+
 def _cross_ref_canonical_route_scope(
     rows: list[Any],
     route_context_gate: Mapping[str, Any] | None = None,
+    row_anchor: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
-    """Return the canonical parent route scope, preferring cleanup evidence."""
+    """Return the canonical parent route scope, preferring live server lineage."""
 
     gate = _mapping(route_context_gate)
+    live_scope = _cross_ref_server_projected_parent_route_scope(
+        rows,
+        gate,
+        row_anchor=row_anchor,
+    )
+    if live_scope:
+        gate_identity = _cross_ref_public_route_scope(gate.get("route_identity") or {})
+        return _cross_ref_merge_public_route_scope(live_scope, gate_identity)
+
     cleanup = _mapping(gate.get("route_identity_cleanup"))
     cleanup_scope = _cross_ref_public_route_scope(cleanup.get("route_identity") or {})
     cleanup_event = _mapping(cleanup.get("event"))
@@ -7790,7 +7904,11 @@ def _cross_ref_row_anchor(
     )
     if trusted_task:
         anchor["task_id"] = trusted_task
-    canonical_route_scope = _cross_ref_canonical_route_scope(rows, route_context_gate)
+    canonical_route_scope = _cross_ref_canonical_route_scope(
+        rows,
+        route_context_gate,
+        row_anchor=trusted,
+    )
     for field in MF_CROSS_REF_BRIDGE_ROUTE_FIELDS:
         if canonical_route_scope.get(field):
             anchor[field] = canonical_route_scope[field]
@@ -8011,7 +8129,11 @@ def _cross_ref_route_token_child_diagnostics(
     """Return route-token child diagnostics from canonical route scope evidence."""
 
     gate = _mapping(route_context_gate)
-    canonical_route_scope = _cross_ref_canonical_route_scope(rows, gate)
+    canonical_route_scope = _cross_ref_canonical_route_scope(
+        rows,
+        gate,
+        row_anchor=anchor,
+    )
     if not canonical_route_scope:
         return []
 
@@ -8405,7 +8527,11 @@ def mf_close_cross_ref_gate_verification(
         "status": "passed" if passed else "blocked",
         "row_identity": expected,
         "row_anchor": anchor,
-        "canonical_route_scope": _cross_ref_canonical_route_scope(rows, route_context_gate),
+        "canonical_route_scope": _cross_ref_canonical_route_scope(
+            rows,
+            route_context_gate,
+            row_anchor=anchor,
+        ),
         "bridged_identities": sorted(bridged),
         "bridged_lane_membership": sorted(
             {"|".join(key) for key in lane_membership}
