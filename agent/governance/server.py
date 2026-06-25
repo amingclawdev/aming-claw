@@ -51,6 +51,8 @@ from .contracts.registry import ContractDefinitionRegistry
 from .contracts.runtime import (
     ContractRuntime,
     ContractRuntimeError,
+    LEGACY_CONTRACT_RECOVERY_ACTIONS,
+    is_legacy_primary_contract_route,
     SQLiteContractExecutionStore,
 )
 
@@ -34630,6 +34632,174 @@ def _strip_top_level_timeline_role_fields(payload: Mapping[str, Any]) -> dict[st
     }
 
 
+_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS = (
+    "primary_route_source",
+    "next_move_source",
+    "agent_facing_decision_source",
+    "decision_source",
+    "contract_decision_source",
+)
+
+_LEGACY_PRIMARY_ROUTE_FORBIDDEN_ACTIONS = frozenset(
+    {
+        "close",
+        "close_ready",
+        "contract_add_submit_line",
+        "contract_runtime_submit_line",
+        "implementation",
+        "independent_verification",
+        "next_move_override",
+        "onboard_contract_submit_line",
+        "qa_pass",
+        "qa_verification",
+    }
+)
+
+
+def _legacy_contract_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _legacy_contract_route_candidates(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    candidates: list[Mapping[str, Any]] = [body]
+    payload = body.get("payload")
+    if isinstance(payload, Mapping):
+        candidates.append(payload)
+        payload_metadata = payload.get("metadata")
+        if isinstance(payload_metadata, Mapping):
+            candidates.append(payload_metadata)
+    metadata = body.get("metadata")
+    if isinstance(metadata, Mapping):
+        candidates.append(metadata)
+    return candidates
+
+
+def _legacy_contract_primary_route_claim(body: Mapping[str, Any]) -> dict[str, str]:
+    for candidate in _legacy_contract_route_candidates(body):
+        for key in _LEGACY_PRIMARY_ROUTE_CLAIM_KEYS:
+            value = candidate.get(key)
+            if is_legacy_primary_contract_route(value):
+                return {"field": key, "source": str(value or "")}
+        if _legacy_contract_bool(candidate.get("meta_contract_gate_decision_source")):
+            return {
+                "field": "meta_contract_gate_decision_source",
+                "source": "meta_contract_gate",
+            }
+        contract_id = candidate.get("contract_id")
+        if is_legacy_primary_contract_route(contract_id):
+            return {"field": "contract_id", "source": str(contract_id or "")}
+    return {}
+
+
+def _legacy_contract_recovery_waiver(body: Mapping[str, Any]) -> Mapping[str, Any]:
+    for candidate in _legacy_contract_route_candidates(body):
+        waiver = (
+            candidate.get("legacy_contract_recovery_waiver")
+            or candidate.get("legacy_route_recovery_waiver")
+        )
+        if isinstance(waiver, Mapping):
+            return waiver
+    return {}
+
+
+def _legacy_contract_recovery_gate(
+    body: Mapping[str, Any],
+    *,
+    claim: Mapping[str, str],
+) -> dict[str, Any]:
+    waiver = _legacy_contract_recovery_waiver(body)
+    normalized_event_action = _normalized_contract_runtime_action(
+        str(body.get("event_kind") or body.get("event_type") or "")
+    )
+    if normalized_event_action in _LEGACY_PRIMARY_ROUTE_FORBIDDEN_ACTIONS:
+        return {
+            "accepted": False,
+            "reason": "recovery waiver cannot authorize implementation, QA, close, or next-move override actions",
+            "forbidden_action": normalized_event_action,
+        }
+    if not waiver:
+        return {"accepted": False, "reason": "legacy recovery waiver is required"}
+    accepted = _legacy_contract_bool(waiver.get("accepted")) or str(
+        waiver.get("status") or ""
+    ).strip().lower() in {"accepted", "approved", "allowed"}
+    if not accepted:
+        return {"accepted": False, "reason": "legacy recovery waiver must be accepted"}
+    if str(waiver.get("caller_role") or "").strip() != "observer":
+        return {"accepted": False, "reason": "legacy recovery waiver requires caller_role=observer"}
+    allowed_actions = {
+        _normalized_contract_runtime_action(item)
+        for item in (waiver.get("allowed_actions") or [])
+    }
+    if not allowed_actions:
+        return {"accepted": False, "reason": "legacy recovery waiver requires allowed_actions"}
+    unsupported = allowed_actions - {
+        _normalized_contract_runtime_action(item)
+        for item in LEGACY_CONTRACT_RECOVERY_ACTIONS
+    }
+    if unsupported:
+        return {
+            "accepted": False,
+            "reason": "legacy recovery waiver contains unsupported actions",
+            "unsupported_actions": sorted(unsupported),
+        }
+    reason = str(waiver.get("reason") or "").strip()
+    if len(reason) < 20:
+        return {
+            "accepted": False,
+            "reason": "legacy recovery waiver requires a specific reason",
+        }
+    return {
+        "accepted": True,
+        "reason": reason,
+        "caller_role": "observer",
+        "allowed_actions": sorted(allowed_actions),
+        "claim_field": str(claim.get("field") or ""),
+        "primary_route_source": str(claim.get("source") or ""),
+    }
+
+
+def _legacy_contract_route_gate(body: Mapping[str, Any]) -> dict[str, Any]:
+    claim = _legacy_contract_primary_route_claim(body)
+    if not claim:
+        return {}
+    recovery = _legacy_contract_recovery_gate(body, claim=claim)
+    base = {
+        "schema_version": "legacy_contract_route_block.v1",
+        "required_entry": ONBOARD_CONTRACT_ID,
+        "migration_hint": (
+            "Start with onboard_contract and read ContractRuntime current-state/"
+            "runtime_guide for the next legal action. Legacy timeline/meta "
+            "evidence is audit/recovery only."
+        ),
+        "primary_route_source": str(claim.get("source") or ""),
+        "claim_field": str(claim.get("field") or ""),
+        "allowed_recovery_actions": sorted(
+            _normalized_contract_runtime_action(item)
+            for item in LEGACY_CONTRACT_RECOVERY_ACTIONS
+        ),
+        "forbidden_recovery_actions": sorted(_LEGACY_PRIMARY_ROUTE_FORBIDDEN_ACTIONS),
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+        "next_move_override_allowed": False,
+    }
+    if recovery.get("accepted") is True:
+        return {
+            **base,
+            "blocked": False,
+            "recovery_waiver_accepted": True,
+            "recovery": recovery,
+        }
+    return {
+        **base,
+        "blocked": True,
+        "recovery_waiver_required": True,
+        "recovery": recovery,
+    }
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -34648,6 +34818,14 @@ def handle_task_timeline_append(ctx: RequestContext):
     route_gate = {}
 
     with DBContext(project_id) as conn:
+        legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
+        if legacy_route_gate.get("blocked"):
+            raise GovernanceError(
+                "legacy_contract_route_blocked",
+                "legacy/meta/timeline routes cannot be the primary guided runtime route",
+                422,
+                legacy_route_gate,
+            )
         if task_timeline.is_protected_close_evidence(event):
             route_gate, source_block = _timeline_no_token_source_event_gate_or_block(
                 conn,
@@ -34683,6 +34861,12 @@ def handle_task_timeline_append(ctx: RequestContext):
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
         raw_payload = _strip_caller_route_action_scope_lineage(raw_payload)
+        if legacy_route_gate:
+            raw_payload["legacy_contract_route_gate"] = legacy_route_gate
+            raw_payload["agent_facing_decision_source"] = (
+                "contract_runtime_first_missing_line"
+            )
+            raw_payload["meta_contract_gate_decision_source"] = False
         route_action_scope_lineage = _server_route_action_scope_lineage(
             ctx.body or {},
             event,

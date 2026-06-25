@@ -31,6 +31,55 @@ class ContractRuntimeError(ValueError):
     """Raised when a contract execution cannot be started or advanced."""
 
 
+LEGACY_PRIMARY_CONTRACT_ROUTE_IDS = frozenset(
+    {
+        "legacy_contract",
+        "legacy_contract.v1",
+        "legacy_contract_v1",
+        "meta_contract",
+        "meta_contract.v1",
+        "meta_contract_v1",
+        "meta_contract_gate",
+        "task_timeline",
+        "task_timeline_append",
+        "timeline",
+    }
+)
+
+LEGACY_PRIMARY_CONTRACT_ROUTE_SOURCES = frozenset(
+    {
+        "legacy_contract",
+        "legacy_contract_route",
+        "meta_contract",
+        "meta_contract_gate",
+        "task_timeline",
+        "task_timeline_append",
+        "timeline",
+    }
+)
+
+LEGACY_CONTRACT_RECOVERY_ACTIONS = frozenset(
+    {
+        "audit_recovery",
+        "read_historical_evidence",
+        "record_friction_backlog",
+        "task_timeline_append",
+    }
+)
+
+
+def normalize_contract_route_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def is_legacy_primary_contract_route(value: Any) -> bool:
+    normalized = normalize_contract_route_token(value)
+    return (
+        normalized in LEGACY_PRIMARY_CONTRACT_ROUTE_IDS
+        or normalized in LEGACY_PRIMARY_CONTRACT_ROUTE_SOURCES
+    )
+
+
 class InMemoryContractExecutionStore:
     """Small test/runtime store for contract executions.
 
@@ -287,6 +336,12 @@ class ContractRuntime:
         backlog_lineage: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if is_legacy_primary_contract_route(contract_id):
+            raise ContractRuntimeError(
+                "legacy_contract_route_blocked: legacy/meta/timeline routes "
+                "cannot start primary ContractRuntime executions; start with "
+                "onboard_contract and keep legacy routes audit-only"
+            )
         definition = self.registry.get(
             contract_id,
             version=version,

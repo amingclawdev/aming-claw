@@ -15,6 +15,7 @@ from agent.governance.contracts import (
     ContractDefinitionRegistry,
     ContractRuntime,
 )
+from agent.governance.contracts.runtime import ContractRuntimeError
 
 
 def _definition(**overrides):
@@ -923,6 +924,19 @@ def test_mf_parallel_read_only_adoption_proves_source_hash_and_duplicate_rejecte
     assert len(service.registry.definition_paths()) == before_count
     assert source_path in before_paths
     assert raw_sha256 == "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+
+def test_contract_runtime_blocks_legacy_meta_contract_as_primary_root():
+    runtime = ContractRuntime(ContractCrudService().registry)
+
+    with pytest.raises(ContractRuntimeError, match="legacy_contract_route_blocked"):
+        runtime.start_execution(
+            "meta_contract.v1",
+            project_id="aming-claw",
+            backlog_id="AC-CONTRACT-RUNTIME-LEGACY-ENTRY-BLOCK-20260625",
+            actor_role="observer",
+            contract_execution_id="cex-meta-contract-should-not-start",
+        )
 
 
 def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():

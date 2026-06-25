@@ -22434,6 +22434,87 @@ def test_timeline_append_allows_design_review_contract_event(conn):
     assert task_timeline.is_protected_close_evidence(result) is False
 
 
+def test_timeline_append_blocks_legacy_meta_contract_as_primary_route(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-LEGACY-ENTRY-BLOCK"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "event_type": "observer.blocker",
+                    "event_kind": "record_blocker",
+                    "phase": "route_recovery",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "primary_route_source": "meta_contract",
+                        "reason": "attempted legacy primary route",
+                    },
+                },
+            )
+        )
+
+    assert exc.value.code == "legacy_contract_route_blocked"
+    assert exc.value.details["required_entry"] == "onboard_contract"
+    assert exc.value.details["primary_route_source"] == "meta_contract"
+    assert exc.value.details["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert exc.value.details["next_move_override_allowed"] is False
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
+
+
+def test_timeline_append_accepts_narrow_legacy_recovery_waiver_without_next_move(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-LEGACY-RECOVERY-WAIVER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "event_type": "observer.blocker",
+                "event_kind": "record_blocker",
+                "phase": "route_recovery",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "primary_route_source": "meta_contract",
+                    "reason": "recording legacy route friction only",
+                    "legacy_contract_recovery_waiver": {
+                        "accepted": True,
+                        "caller_role": "observer",
+                        "allowed_actions": ["record_friction_backlog"],
+                        "reason": (
+                            "Audit-only recovery: file friction evidence without "
+                            "changing ContractRuntime next move."
+                        ),
+                    },
+                },
+            },
+        )
+    )
+
+    assert result["event_kind"] == "record_blocker"
+    assert result["meta_contract_gate"]["action"] == "record_blocker"
+    assert "next_legal_action" not in result
+    event = task_timeline.list_events(conn, PID, backlog_id=backlog_id)[0]
+    gate = event["payload"]["legacy_contract_route_gate"]
+    assert gate["blocked"] is False
+    assert gate["recovery_waiver_accepted"] is True
+    assert gate["required_entry"] == "onboard_contract"
+    assert gate["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert gate["next_move_override_allowed"] is False
+    assert event["payload"]["meta_contract_gate_decision_source"] is False
+
+
 def test_backlog_contract_state_projection_legacy_no_contract(conn):
     backlog_id = "AC-CONTRACT-STATE-LEGACY-NO-CONTRACT"
     _insert_simple_mf_close_backlog(conn, backlog_id)
