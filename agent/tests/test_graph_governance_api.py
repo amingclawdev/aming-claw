@@ -22545,6 +22545,130 @@ def test_observer_root_route_context_source_backed_next_action_from_contract_run
     assert row["execution_state_revision"] == 1
 
 
+def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(conn):
+    backlog_id = "AC-ONBOARD-CONTRACT-FACADE"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-root",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    assert started["schema_version"] == "onboard_contract.runtime_facade_response.v1"
+    assert started["contract_id"] == "onboard_contract"
+    assert started["contract_execution_id"] == started["root_contract_execution_id"]
+    assert started["parent_contract_execution_id"] == ""
+    assert started["contract_chain_id"].startswith("cchain-")
+    assert started["next_legal_action"]["id"] == "graph_query_schema_trace"
+    assert started["next_legal_action"]["source"] == "contract_runtime"
+    assert started["runtime_guide_hash"].startswith("sha256:")
+    assert started["execution_state_revision"] == 1
+    assert started["execution_state_hash"].startswith("sha256:")
+    assert started["route_token_ref"] == "rtok-onboard-root"
+    assert started["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    execution_id = started["contract_execution_id"]
+
+    forged = server.handle_project_onboard_contract_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "actor_role": "mf_sub",
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "payload": {"trace_id": "gqt-onboard-facade"},
+            },
+        )
+    )
+
+    assert forged["ok"] is True
+    assert forged["actor_role"] == "observer"
+    assert forged["next_legal_action"]["id"] == "related_backlog_review"
+    assert forged["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+
+    current = server.handle_project_onboard_contract_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    assert current["actor_role"] == "observer"
+    assert current["contract_execution_id"] == execution_id
+    assert current["next_legal_action"]["id"] == "related_backlog_review"
+
+
+def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
+    backlog_id = "AC-ONBOARD-CONTRACT-FACADE-CUSTOM-ID"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    with pytest.raises(
+        ValidationError,
+        match="root execution id is deterministic",
+    ) as exc:
+        server.handle_project_onboard_contract_start(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "contract_execution_id": "cex-custom-onboard-root",
+                },
+            )
+        )
+
+    assert exc.value.details["contract_execution_id"] == "cex-custom-onboard-root"
+    assert exc.value.details["deterministic_contract_execution_id"] == (
+        server._onboard_contract_execution_id(PID, backlog_id)
+    )
+
+
+def test_onboard_contract_facade_rejects_worker_writing_observer_line(conn):
+    backlog_id = "AC-ONBOARD-CONTRACT-FACADE-WORKER-ROLE"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+
+    result = server.handle_project_onboard_contract_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": started["contract_execution_id"]},
+            "mf_sub",
+            method="POST",
+            body={
+                "actor_role": "observer",
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+            },
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["actor_role"] == "mf_sub"
+    assert "cannot write line" in result["decision"]["errors"][0]
+
+
 def test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
     backlog_id = "AC-CONTRACT-ADD-FACADE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -24995,6 +25119,35 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     assert row["contract_chain_id"] == parent_record["contract_chain_id"]
     assert row["execution_state_revision"] == 2
 
+    post_action = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "mutation",
+                "line_id": "hotfix_post_action_summary",
+                "evidence_kind": "hotfix_under_action",
+            },
+        )
+    )
+    assert post_action["ok"] is True
+
+    forged_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+            },
+        )
+    )
+    assert forged_qa["ok"] is False
+    assert "cannot write line" in forged_qa["decision"]["errors"][0]
+
 
 def test_hotfix_enter_source_backed_rejects_body_forged_role(conn):
     backlog_id = "AC-HOTFIX-SOURCE-BACKED-FORGED-ROLE"
@@ -25015,6 +25168,83 @@ def test_hotfix_enter_source_backed_rejects_body_forged_role(conn):
                 },
             )
         )
+
+
+def test_hotfix_enter_source_backed_blocks_until_onboard_runtime_complete(conn):
+    backlog_id = "AC-HOTFIX-SOURCE-BACKED-ONBOARD-INCOMPLETE"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    with pytest.raises(
+        ValidationError,
+        match="source-backed onboard_contract runtime must be started",
+    ):
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Human approved emergency runtime successor repair.",
+                    "backlog_id": backlog_id,
+                    "route_token_ref": "rtok-hotfix-source",
+                },
+            )
+        )
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-source",
+            },
+        )
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="observer onboarding contract must complete before hotfix successor",
+    ):
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Human approved emergency runtime successor repair.",
+                    "backlog_id": backlog_id,
+                    "route_token_ref": "rtok-hotfix-source",
+                },
+            )
+        )
+
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    result = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved emergency runtime successor repair.",
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-source",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["parent_contract_execution_id"] == started["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == (
+        server._onboard_contract_execution_id(PID, backlog_id)
+    )
+    assert result["event"]["payload"]["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
 
 
 def test_hotfix_usage_view_includes_entered_and_under_hotfix_close_action(conn):

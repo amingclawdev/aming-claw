@@ -1022,6 +1022,9 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     tool_by_name = {tool["name"]: tool for tool in governance_mcp_server.TOOLS}
 
     assert {
+        "onboard_contract_start",
+        "onboard_contract_current",
+        "onboard_contract_submit_line",
         "contract_add_start",
         "contract_add_current",
         "contract_add_submit_line",
@@ -1032,6 +1035,13 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     assert "contract_add_create" not in tool_by_name
     assert "contract_definition_create" not in tool_by_name
     assert "contract_definition_update" not in tool_by_name
+    assert "contract_execution_id" not in tool_by_name["onboard_contract_start"][
+        "inputSchema"
+    ]["properties"]
+    assert tool_by_name["onboard_contract_submit_line"]["inputSchema"]["required"] == [
+        "project_id",
+        "contract_execution_id",
+    ]
     assert tool_by_name["contract_add_submit_line"]["inputSchema"]["required"] == [
         "project_id",
         "contract_execution_id",
@@ -1045,12 +1055,14 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     ]["properties"]
 
 
-def test_mcp_contract_add_dispatches_to_guided_http_facade():
+def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
     calls = []
 
     def fake_api(method: str, path: str, data: dict | None = None):
         calls.append((method, path, data))
         return {"ok": True, "path": path}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_api)
 
     dispatcher = ToolDispatcher(
         api_fn=fake_api,
@@ -1059,6 +1071,32 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade():
         workspace=str(ROOT),
     )
 
+    assert governance_mcp_server._dispatch_tool(
+        "onboard_contract_start",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-ONBOARD",
+            "contract_execution_id": "cex-must-not-forward",
+            "route_token_ref": "rtok-onboard",
+        },
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "onboard_contract_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+        },
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "onboard_contract_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+        },
+    )["ok"] is True
     assert dispatcher.dispatch(
         "contract_add_start",
         {
@@ -1111,6 +1149,28 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade():
     )["ok"] is True
 
     assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/onboard-contract/start",
+            {
+                "backlog_id": "AC-ONBOARD",
+                "route_token_ref": "rtok-onboard",
+            },
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/current-state",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/line-writes",
+            {
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+            },
+        ),
         (
             "POST",
             "/api/projects/aming-claw/contract-add/start",
