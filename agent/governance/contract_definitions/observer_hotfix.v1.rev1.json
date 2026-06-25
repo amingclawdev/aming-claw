@@ -94,6 +94,62 @@
   },
   "schema_version": "contract_definition.v1",
   "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "root_start_default": "deny",
+      "requires_parent_execution": true,
+      "denied_reason": "observer_hotfix is a successor under a completed onboarding root"
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "allowed_parent_contracts": [
+        {
+          "contract_id": "onboard_contract",
+          "version": "v1"
+        }
+      ],
+      "allowed_successors": [],
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "requires_contract_chain_id": true,
+      "requires_handoff_evidence": [
+        "observer_work_mode_transition"
+      ]
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state",
+      "mutable_completed_lines_trust_root": false
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "independent_review_required": true,
+      "formatting_only_drift_must_remain_visible": true
+    },
+    "graph_binding_policy": {
+      "source_asset_materialization_required": true,
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true
+    }
+  },
   "successors": [],
   "version": "v1"
 }

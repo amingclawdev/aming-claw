@@ -18,6 +18,18 @@ from agent.governance.contracts import (
 from agent.governance.contracts.runtime import ContractRuntimeError
 
 
+_SYSTEM_LAYER_POLICY_NAMES = [
+    "entrypoint_policy",
+    "successor_policy",
+    "write_authority_policy",
+    "next_action_policy",
+    "projection_policy",
+    "route_policy",
+    "authority_policy",
+    "graph_binding_policy",
+]
+
+
 def _definition(**overrides):
     payload = {
         "schema_version": "contract_definition.v1",
@@ -59,6 +71,25 @@ def _definition(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _assert_explicit_system_layer(definition, *, allow_root_start: bool):
+    read_model = definition["read_model"]
+    assert read_model["system_layer_policy_status"] == {
+        "schema_version": "contract_system_layer_policy_status.v1",
+        "status": "explicit",
+        "explicit": True,
+        "defaulted": False,
+        "deny_by_default": True,
+        "missing_policies": [],
+        "defaulted_policies": [],
+        "explicit_policies": _SYSTEM_LAYER_POLICY_NAMES,
+    }
+    system_layer = read_model["system_layer"]
+    assert system_layer["entrypoint_policy"]["policy_status"] == "explicit"
+    assert system_layer["entrypoint_policy"]["allow_root_start"] is allow_root_start
+    assert system_layer["route_policy"]["route_token_ref_required"] is True
+    assert system_layer["projection_policy"]["mutable_completed_lines_trust_root"] is False
 
 
 def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str):
@@ -403,6 +434,7 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
     assert definition["compat_aliases"] == ["mf_parallel.v1", "parallel_worker.v1"]
 
     read_model = definition["read_model"]
+    _assert_explicit_system_layer(definition, allow_root_start=False)
     assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
     assert [
         (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
@@ -589,6 +621,7 @@ def test_default_registry_exposes_contract_add_definition_and_runtime_path():
     assert definition["compat_aliases"] == ["contract_add.v1", "add_contract.v1"]
 
     read_model = definition["read_model"]
+    _assert_explicit_system_layer(definition, allow_root_start=False)
     assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
     assert [
         (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
@@ -960,6 +993,7 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     onboard_definition = onboarding["data"]["definition"]
     assert onboard_definition["contract_id"] == "onboard_contract"
     assert onboard_definition["contract_type"] == "observer_onboarding"
+    _assert_explicit_system_layer(onboard_definition, allow_root_start=True)
     assert onboard_definition["successors"] == [
         {
             "contract_id": "observer_hotfix",
@@ -1027,6 +1061,7 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     assert hotfix["ok"] is True
     hotfix_definition = hotfix["data"]["definition"]
     assert hotfix_definition["contract_id"] == "observer_hotfix"
+    _assert_explicit_system_layer(hotfix_definition, allow_root_start=False)
     assert [
         (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])
         for line in hotfix_definition["read_model"]["rule_lines"]

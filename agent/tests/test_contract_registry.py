@@ -18,6 +18,18 @@ from agent.governance.contracts.hash import file_sha256
 from agent.governance.contracts.registry import UnknownContractDefinitionError
 
 
+_SYSTEM_LAYER_POLICY_NAMES = [
+    "entrypoint_policy",
+    "successor_policy",
+    "write_authority_policy",
+    "next_action_policy",
+    "projection_policy",
+    "route_policy",
+    "authority_policy",
+    "graph_binding_policy",
+]
+
+
 def _definition(**overrides):
     payload = {
         "schema_version": "contract_definition.v1",
@@ -153,6 +165,47 @@ def test_registry_normalizes_explicit_system_layer_read_model(tmp_path):
     )
     assert "successor_policy" in definition["read_model"]["system_layer_policy_status"][
         "defaulted_policies"
+    ]
+
+
+def test_default_registry_migrated_definitions_expose_explicit_system_layer():
+    registry = ContractDefinitionRegistry()
+
+    expected_root_policy = {
+        "onboard_contract": True,
+        "observer_hotfix": False,
+        "contract_add": False,
+        "mf_parallel": False,
+    }
+    for contract_id, allow_root_start in expected_root_policy.items():
+        definition = registry.get(contract_id)
+        read_model = definition["read_model"]
+
+        assert read_model["system_layer_policy_status"] == {
+            "schema_version": "contract_system_layer_policy_status.v1",
+            "status": "explicit",
+            "explicit": True,
+            "defaulted": False,
+            "deny_by_default": True,
+            "missing_policies": [],
+            "defaulted_policies": [],
+            "explicit_policies": _SYSTEM_LAYER_POLICY_NAMES,
+        }
+        system_layer = read_model["system_layer"]
+        assert system_layer["entrypoint_policy"]["policy_status"] == "explicit"
+        assert system_layer["entrypoint_policy"]["allow_root_start"] is allow_root_start
+        assert (
+            system_layer["write_authority_policy"]["body_supplied_role_claims_trusted"]
+            is False
+        )
+
+    onboard = registry.get("onboard_contract")["read_model"]["system_layer"]
+    assert onboard["successor_policy"]["allowed_successors"] == [
+        {"contract_id": "observer_hotfix", "version": "v1"}
+    ]
+    hotfix = registry.get("observer_hotfix")["read_model"]["system_layer"]
+    assert hotfix["successor_policy"]["allowed_parent_contracts"] == [
+        {"contract_id": "onboard_contract", "version": "v1"}
     ]
 
 

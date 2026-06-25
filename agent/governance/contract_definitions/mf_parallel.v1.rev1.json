@@ -229,6 +229,69 @@
   },
   "schema_version": "contract_definition.v1",
   "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "root_start_default": "deny",
+      "requires_parent_execution": true,
+      "denied_reason": "mf_parallel workers run under an approved parent contract and fenced worktree, not as a root entrypoint"
+    },
+    "successor_policy": {
+      "allow_successor_start": false,
+      "allowed_parent_contracts": [],
+      "allowed_successors": [
+        {
+          "contract_id": "qa_evidence_gate_review.v1",
+          "version": "v1"
+        },
+        {
+          "contract_id": "observer_hotfix",
+          "version": "v1"
+        },
+        {
+          "contract_id": "audit_close_with_qa_acceptance.v1",
+          "version": "v1"
+        }
+      ],
+      "successor_start_default": "deny_until_parent_path_is_source_backed",
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "requires_contract_chain_id": true,
+      "requires_worker_fence": true
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state",
+      "mutable_completed_lines_trust_root": false
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "independent_review_required": true,
+      "formatting_only_drift_must_remain_visible": true
+    },
+    "graph_binding_policy": {
+      "source_asset_materialization_required": true,
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true
+    }
+  },
   "successors": [
     {
       "contract_id": "qa_evidence_gate_review.v1",
