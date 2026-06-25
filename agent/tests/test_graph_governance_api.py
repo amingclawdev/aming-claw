@@ -23247,6 +23247,200 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     )
 
 
+def test_onboard_contract_stale_pinned_execution_returns_recovery_next_action(conn):
+    backlog_id = "AC-ONBOARD-STALE-PINNED-RECOVERY"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-stale",
+            },
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    runtime = server._contract_runtime(conn)
+    stale = runtime.store.get(execution_id)
+    stale["definition_hash"] = "sha256:stale-onboard-definition"
+    runtime.store.update(execution_id, stale)
+    conn.commit()
+
+    current = server.handle_project_onboard_contract_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+
+    assert current["ok"] is False
+    assert current["status"] == "blocked_stale_pinned_execution"
+    assert current["safe_to_continue_existing_execution"] is False
+    assert current["legacy_meta_contract_gate"] == "audit_backstop_only"
+    assert current["next_legal_action"]["id"] == "start_recovery_contract_execution"
+    assert current["next_legal_action"]["endpoint"].endswith(
+        "/onboard-contract/start"
+    )
+
+    recovered = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-recovery",
+                "recovery_policy": "start_new_execution",
+                "stale_contract_execution_id": execution_id,
+            },
+        )
+    )
+
+    assert recovered["ok"] is True
+    assert recovered["contract_execution_id"] == current["recovery"][
+        "recovery_contract_execution_id"
+    ]
+    assert recovered["contract_execution_id"] != execution_id
+    assert recovered["next_legal_action"]["id"] == "graph_query_schema_trace"
+    assert runtime.store.get(execution_id)["definition_hash"] == (
+        "sha256:stale-onboard-definition"
+    )
+
+
+def test_contract_add_stale_pinned_execution_returns_recovery_next_action(conn):
+    backlog_id = "AC-CONTRACT-ADD-STALE-PINNED-RECOVERY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_contract_add_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-add-stale",
+            },
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    runtime = server._contract_runtime(conn)
+    stale = runtime.store.get(execution_id)
+    stale["definition_hash"] = "sha256:stale-contract-add-definition"
+    runtime.store.update(execution_id, stale)
+    conn.commit()
+
+    current = server.handle_project_contract_add_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+
+    assert current["ok"] is False
+    assert current["status"] == "blocked_stale_pinned_execution"
+    assert current["next_legal_action"]["endpoint"].endswith("/contract-add/start")
+
+    recovered = server.handle_project_contract_add_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-add-recovery",
+                "recovery_policy": "start_new_execution",
+                "stale_contract_execution_id": execution_id,
+            },
+        )
+    )
+
+    assert recovered["ok"] is True
+    assert recovered["contract_execution_id"] == current["recovery"][
+        "recovery_contract_execution_id"
+    ]
+    assert recovered["contract_execution_id"] != execution_id
+    assert recovered["next_legal_action"]["id"] == "observer_request_contract_add"
+
+
+def test_mf_parallel_enter_uses_completed_onboard_recovery_parent(conn):
+    backlog_id = "AC-MF-PARALLEL-RECOVERY-PARENT"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-parent",
+            },
+        )
+    )
+    original_execution_id = started["contract_execution_id"]
+    _complete_source_backed_onboarding(conn, original_execution_id)
+    runtime = server._contract_runtime(conn)
+    original = runtime.store.get(original_execution_id)
+    original["definition_hash"] = "sha256:stale-completed-onboard"
+    runtime.store.update(original_execution_id, original)
+    conn.commit()
+
+    blocked = None
+    with pytest.raises(ValidationError) as exc:
+        server.handle_project_mf_parallel_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "reason": "verify stale root recovery guidance",
+                    "route_token_ref": "rtok-mf-parallel-stale",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+            )
+        )
+    blocked = exc.value.details
+    assert blocked["status"] == "blocked_stale_pinned_execution"
+    assert blocked["next_legal_action"]["id"] == "start_recovery_contract_execution"
+
+    recovered = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-parent-recovery",
+                "recovery_policy": "start_new_execution",
+                "stale_contract_execution_id": original_execution_id,
+            },
+        )
+    )
+    recovery_execution_id = recovered["contract_execution_id"]
+    _complete_source_backed_onboarding(conn, recovery_execution_id)
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "reason": "verify recovered onboard parent",
+                "route_token_ref": "rtok-mf-parallel-recovered",
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+
+    assert entered["ok"] is True
+    assert entered["parent_contract_execution_id"] == recovery_execution_id
+    assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+
+
 def test_contract_runtime_generic_facade_preserves_role_and_order_gates(conn):
     backlog_id = "AC-CONTRACT-RUNTIME-GENERIC-GATES"
     _insert_simple_mf_close_backlog(conn, backlog_id)

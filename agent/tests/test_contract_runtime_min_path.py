@@ -10,6 +10,7 @@ from agent.governance.contracts.hash import file_sha256
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     SQLiteContractExecutionStore,
+    StalePinnedContractExecutionError,
 )
 
 
@@ -326,3 +327,25 @@ def test_deprecated_definition_replays_but_cannot_start_new_execution(tmp_path):
 
     replay_guide = runtime.current_guide(record["contract_execution_id"])
     assert replay_guide["contract"]["contract_id"] == "observer_onboard"
+
+
+def test_runtime_raises_structured_stale_pinned_execution_error(tmp_path):
+    _write_minimal_contract(tmp_path)
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path), instruction_root=tmp_path)
+    record = runtime.start_execution(
+        "observer_onboard",
+        project_id="aming-claw",
+        backlog_id="AC-MIN-PATH",
+        actor_role="observer",
+    )
+    record["definition_hash"] = "sha256:stale-pinned-definition"
+    runtime.store.update(record["contract_execution_id"], record)
+
+    with pytest.raises(StalePinnedContractExecutionError) as exc:
+        runtime.current_guide(record["contract_execution_id"], actor_role="observer")
+
+    error = exc.value.to_dict()
+    assert error["field"] == "definition_hash"
+    assert error["contract_execution_id"] == record["contract_execution_id"]
+    assert error["pinned_definition_hash"] == "sha256:stale-pinned-definition"
+    assert error["current_definition_hash"].startswith("sha256:")

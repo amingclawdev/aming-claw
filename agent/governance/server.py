@@ -54,6 +54,7 @@ from .contracts.runtime import (
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     is_legacy_primary_contract_route,
     SQLiteContractExecutionStore,
+    StalePinnedContractExecutionError,
 )
 
 import os
@@ -33073,6 +33074,140 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _contract_runtime_stale_recovery_id(
+    stale: StalePinnedContractExecutionError,
+) -> str:
+    record = stale.record
+    contract_id = str(record.get("contract_id") or "")
+    prefix = {
+        ONBOARD_CONTRACT_ID: "cex-onboard-recovery",
+        CONTRACT_ADD_CONTRACT_ID: "cex-contract-add-recovery",
+        MF_PARALLEL_RECORD_CONTRACT_ID: "cex-mf-parallel-recovery",
+    }.get(contract_id, "cex-contract-recovery")
+    current_definition_hash = (
+        stale.actual
+        if stale.field == "definition_hash"
+        else str(stale.definition.get("definition_hash") or "")
+    )
+    return _contract_runtime_stable_id(
+        prefix,
+        record.get("project_id"),
+        record.get("backlog_id"),
+        record.get("contract_execution_id"),
+        contract_id,
+        record.get("version"),
+        record.get("revision"),
+        current_definition_hash,
+    )
+
+
+def _contract_runtime_recovery_start_endpoint(contract_id: str) -> str:
+    if contract_id == ONBOARD_CONTRACT_ID:
+        return "onboard-contract/start"
+    if contract_id == CONTRACT_ADD_CONTRACT_ID:
+        return "contract-add/start"
+    return "contract-runtime/recover"
+
+
+def _contract_runtime_stale_recovery_projection(
+    stale: StalePinnedContractExecutionError,
+    *,
+    action: str,
+    route_token_ref: str = "",
+    actor_role: str = "",
+) -> dict[str, Any]:
+    record = stale.record
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    contract_id = str(record.get("contract_id") or "")
+    stale_execution_id = str(record.get("contract_execution_id") or "")
+    recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
+    endpoint_suffix = _contract_runtime_recovery_start_endpoint(contract_id)
+    body = {
+        "backlog_id": backlog_id,
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": stale_execution_id,
+    }
+    if route_token_ref:
+        body["route_token_ref"] = route_token_ref
+    next_action = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "start_recovery_contract_execution",
+        "action": "start_recovery_contract_execution",
+        "source": "contract_runtime_stale_pinned_recovery",
+        "precedence": "hash_gate_fail_closed",
+        "contract_execution_id": stale_execution_id,
+        "recovery_contract_execution_id": recovery_execution_id,
+        "stage_id": "recovery",
+        "line_id": "start_recovery_contract_execution",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "contract_runtime_recovery",
+        "required": True,
+        "endpoint": f"/api/projects/{project_id}/{endpoint_suffix}",
+        "body": body,
+        "meta_contract_gate_decision_source": False,
+    }
+    return {
+        "schema_version": "contract_runtime.stale_pinned_execution_recovery.v1",
+        "ok": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": stale_execution_id,
+        "contract_id": contract_id,
+        "status": "blocked_stale_pinned_execution",
+        "error": str(stale),
+        "field": stale.field,
+        "expected_hash": stale.expected,
+        "actual_hash": stale.actual,
+        "actor_role": actor_role,
+        "safe_to_continue_existing_execution": False,
+        "existing_record_preserved": True,
+        "legacy_meta_contract_gate": "audit_backstop_only",
+        "stale_pinned_execution": stale.to_dict(),
+        "recovery": {
+            "schema_version": "contract_runtime_recovery_instruction.v1",
+            "policy": "start_new_execution",
+            "reason": "source_controlled_contract_definition_changed",
+            "stale_contract_execution_id": stale_execution_id,
+            "recovery_contract_execution_id": recovery_execution_id,
+            "record_history_preserved": True,
+            "source_of_authority": "source_controlled_contract_definition",
+        },
+        "next_legal_action": next_action,
+        "agent_facing_decision_source": "contract_runtime_stale_pinned_recovery",
+    }
+
+
+def _contract_runtime_recovery_requested(value: Any) -> bool:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized in {
+        "start_new_execution",
+        "replay_from_current_definition",
+        "definition_hash_mismatch",
+        "stale_pinned_execution",
+    }
+
+
+def _raise_stale_contract_runtime_validation(
+    stale: StalePinnedContractExecutionError,
+    *,
+    action: str,
+    route_token_ref: str = "",
+    actor_role: str = "",
+    message: str = "pinned contract execution is stale",
+) -> None:
+    raise ValidationError(
+        message,
+        _contract_runtime_stale_recovery_projection(
+            stale,
+            action=action,
+            route_token_ref=route_token_ref,
+            actor_role=actor_role,
+        ),
+    )
+
+
 def _observer_onboarding_runtime_projection(
     conn,
     *,
@@ -33120,7 +33255,23 @@ def _observer_onboarding_runtime_projection(
                 "backlog_id": backlog_id,
             },
         )
-    guide = runtime.current_guide(root_execution_id, actor_role=actor_role)
+    try:
+        guide = runtime.current_guide(root_execution_id, actor_role=actor_role)
+    except StalePinnedContractExecutionError as exc:
+        return {
+            "schema_version": "observer_onboarding_runtime_projection.v1",
+            "active": False,
+            "status": "blocked_stale_pinned_execution",
+            "contract_execution_id": root_execution_id,
+            "decision_source": "contract_runtime_stale_pinned_recovery",
+            "legacy_meta_contract_gate": "audit_backstop_only",
+            "recovery": _contract_runtime_stale_recovery_projection(
+                exc,
+                action="observer_onboarding_projection",
+                route_token_ref=route_token_ref,
+                actor_role=actor_role,
+            ),
+        }
     record = store.get(root_execution_id)
     current_state = _runtime_current_state_from_record(record)
     return {
@@ -33481,6 +33632,8 @@ def _onboard_contract_start(
     route_token_ref: str = "",
     contract_execution_id: str = "",
     metadata: Mapping[str, Any] | None = None,
+    recovery_policy: str = "",
+    stale_contract_execution_id: str = "",
 ) -> dict[str, Any]:
     deterministic_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
     if contract_execution_id:
@@ -33505,6 +33658,14 @@ def _onboard_contract_start(
             record["route_token_ref"] = route_token_ref
             runtime.store.update(execution_id, record)
     except ContractRuntimeError:
+        if _contract_runtime_recovery_requested(recovery_policy):
+            raise ValidationError(
+                "onboard_contract recovery requested but no stale deterministic execution exists",
+                {
+                    "contract_execution_id": deterministic_execution_id,
+                    "recovery_policy": recovery_policy,
+                },
+            )
         record = runtime.start_execution(
             ONBOARD_CONTRACT_ID,
             project_id=project_id,
@@ -33528,7 +33689,67 @@ def _onboard_contract_start(
                 **dict(metadata or {}),
             },
         )
-    guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    try:
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    except StalePinnedContractExecutionError as exc:
+        if not _contract_runtime_recovery_requested(recovery_policy):
+            raise
+        if stale_contract_execution_id and stale_contract_execution_id != execution_id:
+            raise ValidationError(
+                "stale_contract_execution_id does not match the deterministic onboard execution",
+                {
+                    "stale_contract_execution_id": stale_contract_execution_id,
+                    "deterministic_contract_execution_id": execution_id,
+                },
+            )
+        recovery_execution_id = _contract_runtime_stale_recovery_id(exc)
+        recovery_chain_id = _contract_runtime_stable_id(
+            "cchain-recovery",
+            project_id,
+            backlog_id,
+            ONBOARD_CONTRACT_ID,
+            recovery_execution_id,
+        )
+        try:
+            record = runtime.store.get(recovery_execution_id)
+            _onboard_contract_require_contract_record(
+                record,
+                contract_execution_id=recovery_execution_id,
+                action="enter/read",
+            )
+            if route_token_ref and not str(record.get("route_token_ref") or ""):
+                record["route_token_ref"] = route_token_ref
+                runtime.store.update(recovery_execution_id, record)
+        except ContractRuntimeError:
+            record = runtime.start_execution(
+                ONBOARD_CONTRACT_ID,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                contract_execution_id=recovery_execution_id,
+                root_contract_execution_id=recovery_execution_id,
+                contract_chain_id=recovery_chain_id,
+                route_token_ref=route_token_ref,
+                role_binding={
+                    "observer": "observer",
+                    "binding_source": "onboard_contract_recovery_facade",
+                },
+                backlog_lineage={
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "stale_contract_execution_id": execution_id,
+                },
+                metadata={
+                    "facade": "onboard_contract",
+                    "generic_crud_exposed": False,
+                    "recovery_policy": "start_new_execution",
+                    "stale_contract_execution_id": execution_id,
+                    "recovery_reason": "stale_pinned_execution",
+                    **dict(metadata or {}),
+                },
+            )
+        execution_id = recovery_execution_id
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
     record = runtime.store.get(execution_id)
     record["runtime_guide"] = guide
     return record
@@ -33551,6 +33772,50 @@ def _onboard_contract_read(
     record = runtime.store.get(contract_execution_id)
     record["runtime_guide"] = guide
     return record
+
+
+def _onboard_contract_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    records = runtime.store.list_by_backlog(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_id=ONBOARD_CONTRACT_ID,
+    )
+    if not records:
+        deterministic = _onboard_contract_execution_id(project_id, backlog_id)
+        raise ContractRuntimeError(f"unknown contract execution: {deterministic}")
+
+    stale: list[StalePinnedContractExecutionError] = []
+    incomplete: list[dict[str, Any]] = []
+    for record in records:
+        execution_id = str(record.get("contract_execution_id") or "")
+        if not execution_id:
+            continue
+        try:
+            refreshed = _onboard_contract_read(
+                conn,
+                contract_execution_id=execution_id,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            stale.append(exc)
+            continue
+        if _runtime_record_is_complete(refreshed):
+            return refreshed
+        incomplete.append(refreshed)
+
+    if incomplete:
+        return incomplete[0]
+    if stale:
+        raise stale[0]
+    deterministic = _onboard_contract_execution_id(project_id, backlog_id)
+    raise ContractRuntimeError(f"unknown contract execution: {deterministic}")
 
 
 def _onboard_contract_effective_actor_role(
@@ -33628,6 +33893,8 @@ def _contract_add_start(
     route_token_ref: str = "",
     contract_execution_id: str = "",
     metadata: Mapping[str, Any] | None = None,
+    recovery_policy: str = "",
+    stale_contract_execution_id: str = "",
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     execution_id = _contract_add_execution_id(
@@ -33646,6 +33913,14 @@ def _contract_add_start(
             record["route_token_ref"] = route_token_ref
             runtime.store.update(execution_id, record)
     except ContractRuntimeError:
+        if _contract_runtime_recovery_requested(recovery_policy):
+            raise ValidationError(
+                "contract_add recovery requested but no stale execution exists",
+                {
+                    "contract_execution_id": execution_id,
+                    "recovery_policy": recovery_policy,
+                },
+            )
         record = runtime.start_execution(
             CONTRACT_ADD_CONTRACT_ID,
             project_id=project_id,
@@ -33669,7 +33944,60 @@ def _contract_add_start(
                 **dict(metadata or {}),
             },
         )
-    guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    try:
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
+    except StalePinnedContractExecutionError as exc:
+        if not _contract_runtime_recovery_requested(recovery_policy):
+            raise
+        if stale_contract_execution_id and stale_contract_execution_id != execution_id:
+            raise ValidationError(
+                "stale_contract_execution_id does not match the contract_add execution",
+                {
+                    "stale_contract_execution_id": stale_contract_execution_id,
+                    "contract_execution_id": execution_id,
+                },
+            )
+        recovery_execution_id = _contract_runtime_stale_recovery_id(exc)
+        try:
+            record = runtime.store.get(recovery_execution_id)
+            _contract_add_require_contract_record(
+                record,
+                contract_execution_id=recovery_execution_id,
+                action="enter/read",
+            )
+            if route_token_ref and not str(record.get("route_token_ref") or ""):
+                record["route_token_ref"] = route_token_ref
+                runtime.store.update(recovery_execution_id, record)
+        except ContractRuntimeError:
+            record = runtime.start_execution(
+                CONTRACT_ADD_CONTRACT_ID,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                contract_execution_id=recovery_execution_id,
+                route_token_ref=route_token_ref,
+                role_binding={
+                    "observer": "observer",
+                    "mf_sub": "mf_sub",
+                    "qa": "qa",
+                    "binding_source": "contract_add_recovery_facade",
+                },
+                backlog_lineage={
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "stale_contract_execution_id": execution_id,
+                },
+                metadata={
+                    "facade": "contract_add",
+                    "generic_crud_exposed": False,
+                    "recovery_policy": "start_new_execution",
+                    "stale_contract_execution_id": execution_id,
+                    "recovery_reason": "stale_pinned_execution",
+                    **dict(metadata or {}),
+                },
+            )
+        execution_id = recovery_execution_id
+        guide = runtime.current_guide(execution_id, actor_role=actor_role)
     record = runtime.store.get(execution_id)
     record["runtime_guide"] = guide
     return record
@@ -41488,10 +41816,22 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                     },
                 )
             try:
-                parent_record = _onboard_contract_read(
+                parent_record = _onboard_contract_parent_for_successor(
                     conn,
-                    contract_execution_id=root_execution_id,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
                     actor_role=derived_actor_role,
+                )
+            except StalePinnedContractExecutionError as exc:
+                _raise_stale_contract_runtime_validation(
+                    exc,
+                    action="hotfix_enter",
+                    route_token_ref=route_token_ref,
+                    actor_role=derived_actor_role,
+                    message=(
+                        "observer onboarding contract is stale; start recovery "
+                        "before hotfix successor"
+                    ),
                 )
             except ContractRuntimeError as exc:
                 raise ValidationError(
@@ -41695,10 +42035,22 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             )
         root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
         try:
-            parent_record = _onboard_contract_read(
+            parent_record = _onboard_contract_parent_for_successor(
                 conn,
-                contract_execution_id=root_execution_id,
+                project_id=project_id,
+                backlog_id=backlog_id,
                 actor_role=derived_actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            _raise_stale_contract_runtime_validation(
+                exc,
+                action="mf_parallel_enter",
+                route_token_ref=route_token_ref,
+                actor_role=derived_actor_role,
+                message=(
+                    "observer onboarding contract is stale; start recovery "
+                    "before mf_parallel successor"
+                ),
             )
         except ContractRuntimeError as exc:
             raise ValidationError(
@@ -41840,6 +42192,10 @@ def handle_project_onboard_contract_start(ctx: RequestContext):
     )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    recovery_policy = str(body.get("recovery_policy") or "").strip()
+    stale_contract_execution_id = str(
+        body.get("stale_contract_execution_id") or ""
+    ).strip()
     with DBContext(project_id) as conn:
         effective_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
         actor_role = _onboard_contract_effective_actor_role(
@@ -41855,15 +42211,25 @@ def handle_project_onboard_contract_start(ctx: RequestContext):
                 "onboard_contract_start",
                 {"required_role": "observer"},
             )
-        record = _onboard_contract_start(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            actor_role=actor_role,
-            route_token_ref=route_token_ref,
-            contract_execution_id=contract_execution_id,
-            metadata=metadata,
-        )
+        try:
+            record = _onboard_contract_start(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                route_token_ref=route_token_ref,
+                contract_execution_id=contract_execution_id,
+                metadata=metadata,
+                recovery_policy=recovery_policy,
+                stale_contract_execution_id=stale_contract_execution_id,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="onboard_contract_start",
+                route_token_ref=route_token_ref,
+                actor_role=actor_role,
+            )
         conn.commit()
     return _onboard_contract_response(record)
 
@@ -41885,11 +42251,21 @@ def handle_project_onboard_contract_current_state(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        record = _onboard_contract_read(
-            conn,
-            contract_execution_id=contract_execution_id,
-            actor_role=actor_role,
-        )
+        try:
+            record = _onboard_contract_read(
+                conn,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="onboard_contract_current",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
         conn.commit()
     response = _onboard_contract_response(record)
     response["actor_role"] = actor_role
@@ -41919,18 +42295,33 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        record = runtime.store.get(contract_execution_id)
-        write = _contract_runtime_line_write_body(
-            record,
-            actor_role=actor_role,
-            body=body,
-        )
-        result = runtime.submit_line_write(
-            contract_execution_id,
-            write,
-            actor_role=actor_role,
-        )
+        try:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
+            record = runtime.store.get(contract_execution_id)
+            write = _contract_runtime_line_write_body(
+                record,
+                actor_role=actor_role,
+                body=body,
+            )
+            result = runtime.submit_line_write(
+                contract_execution_id,
+                write,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            response = _contract_runtime_stale_recovery_projection(
+                exc,
+                action="onboard_contract_submit_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+            response["decision"] = {
+                "ok": False,
+                "errors": [str(exc)],
+            }
+            return response
         conn.commit()
     response = {
         "schema_version": "onboard_contract.line_write_response.v1",
@@ -41963,6 +42354,10 @@ def handle_project_contract_add_start(ctx: RequestContext):
     )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    recovery_policy = str(body.get("recovery_policy") or "").strip()
+    stale_contract_execution_id = str(
+        body.get("stale_contract_execution_id") or ""
+    ).strip()
     with DBContext(project_id) as conn:
         effective_execution_id = _contract_add_execution_id(
             project_id,
@@ -41982,15 +42377,25 @@ def handle_project_contract_add_start(ctx: RequestContext):
                 "contract_add_start",
                 {"required_role": "observer"},
             )
-        record = _contract_add_start(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            actor_role=actor_role,
-            route_token_ref=route_token_ref,
-            contract_execution_id=contract_execution_id,
-            metadata=metadata,
-        )
+        try:
+            record = _contract_add_start(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                route_token_ref=route_token_ref,
+                contract_execution_id=contract_execution_id,
+                metadata=metadata,
+                recovery_policy=recovery_policy,
+                stale_contract_execution_id=stale_contract_execution_id,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_add_start",
+                route_token_ref=route_token_ref,
+                actor_role=actor_role,
+            )
         conn.commit()
     return _contract_add_response(record)
 
@@ -42012,11 +42417,21 @@ def handle_project_contract_add_current_state(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        record = _contract_add_read(
-            conn,
-            contract_execution_id=contract_execution_id,
-            actor_role=actor_role,
-        )
+        try:
+            record = _contract_add_read(
+                conn,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_add_current",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
         conn.commit()
     response = _contract_add_response(record)
     response["actor_role"] = actor_role
@@ -42046,18 +42461,33 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        record = runtime.store.get(contract_execution_id)
-        write = _contract_runtime_line_write_body(
-            record,
-            actor_role=actor_role,
-            body=body,
-        )
-        result = runtime.submit_line_write(
-            contract_execution_id,
-            write,
-            actor_role=actor_role,
-        )
+        try:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
+            record = runtime.store.get(contract_execution_id)
+            write = _contract_runtime_line_write_body(
+                record,
+                actor_role=actor_role,
+                body=body,
+            )
+            result = runtime.submit_line_write(
+                contract_execution_id,
+                write,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            response = _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_add_submit_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+            response["decision"] = {
+                "ok": False,
+                "errors": [str(exc)],
+            }
+            return response
         conn.commit()
     response = {
         "schema_version": "contract_add.line_write_response.v1",
@@ -42093,11 +42523,21 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        record = _contract_runtime_read(
-            conn,
-            contract_execution_id=contract_execution_id,
-            actor_role=actor_role,
-        )
+        try:
+            record = _contract_runtime_read(
+                conn,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_runtime_current",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
         conn.commit()
     response = _contract_runtime_response(record)
     response["actor_role"] = actor_role
@@ -42122,18 +42562,33 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
         )
-        runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        record = runtime.store.get(contract_execution_id)
-        write = _contract_runtime_line_write_body(
-            record,
-            actor_role=actor_role,
-            body=body,
-        )
-        result = runtime.submit_line_write(
-            contract_execution_id,
-            write,
-            actor_role=actor_role,
-        )
+        try:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
+            record = runtime.store.get(contract_execution_id)
+            write = _contract_runtime_line_write_body(
+                record,
+                actor_role=actor_role,
+                body=body,
+            )
+            result = runtime.submit_line_write(
+                contract_execution_id,
+                write,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            response = _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_runtime_submit_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+            response["decision"] = {
+                "ok": False,
+                "errors": [str(exc)],
+            }
+            return response
         conn.commit()
     response = {
         "schema_version": "contract_runtime.line_write_response.v1",

@@ -31,6 +31,44 @@ class ContractRuntimeError(ValueError):
     """Raised when a contract execution cannot be started or advanced."""
 
 
+class StalePinnedContractExecutionError(ContractRuntimeError):
+    """Raised when a persisted execution pins a stale source definition."""
+
+    def __init__(
+        self,
+        field: str,
+        expected: Any,
+        actual: Any,
+        *,
+        record: Mapping[str, Any],
+        definition: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.field = str(field or "")
+        self.expected = str(expected or "")
+        self.actual = str(actual or "")
+        self.record = deepcopy(dict(record))
+        self.definition = deepcopy(dict(definition or {}))
+        super().__init__(f"{self.field} mismatch for pinned contract execution")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "stale_pinned_contract_execution_error.v1",
+            "field": self.field,
+            "expected": self.expected,
+            "actual": self.actual,
+            "contract_execution_id": str(
+                self.record.get("contract_execution_id") or ""
+            ),
+            "contract_id": str(self.record.get("contract_id") or ""),
+            "version": str(self.record.get("version") or ""),
+            "revision": str(self.record.get("revision") or ""),
+            "pinned_definition_hash": str(self.record.get("definition_hash") or ""),
+            "current_definition_hash": str(
+                self.definition.get("definition_hash") or ""
+            ),
+        }
+
+
 LEGACY_PRIMARY_CONTRACT_ROUTE_IDS = frozenset(
     {
         "legacy_contract",
@@ -417,6 +455,8 @@ class ContractRuntime:
             "instruction_bundle_hash",
             record.get("instruction_bundle_hash"),
             instruction_bundle.get("instruction_bundle_hash"),
+            record=record,
+            definition=definition,
         )
         state = build_execution_state(
             definition,
@@ -514,12 +554,33 @@ class ContractRuntime:
             revision=str(record.get("revision") or ""),
             include_deprecated=True,
         )
-        _assert_hash("definition_hash", record.get("definition_hash"), definition.get("definition_hash"))
+        _assert_hash(
+            "definition_hash",
+            record.get("definition_hash"),
+            definition.get("definition_hash"),
+            record=record,
+            definition=definition,
+        )
         return definition
 
 
-def _assert_hash(field: str, expected: Any, actual: Any) -> None:
+def _assert_hash(
+    field: str,
+    expected: Any,
+    actual: Any,
+    *,
+    record: Mapping[str, Any] | None = None,
+    definition: Mapping[str, Any] | None = None,
+) -> None:
     if expected != actual:
+        if record is not None:
+            raise StalePinnedContractExecutionError(
+                field,
+                expected,
+                actual,
+                record=record,
+                definition=definition,
+            )
         raise ContractDefinitionError(f"{field} mismatch for pinned contract execution")
 
 
