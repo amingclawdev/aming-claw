@@ -6691,6 +6691,18 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         or ctx.body.get("graph_project_id")
         or project_id
     )
+    request_owned_files = _runtime_context_service_query_values(
+        ctx.body or {},
+        "owned_files",
+    )
+    request_target_files = _runtime_context_service_query_values(
+        ctx.body or {},
+        "target_files",
+    )
+    if not request_owned_files:
+        request_owned_files = list(request_target_files)
+    if not request_target_files:
+        request_target_files = list(request_owned_files)
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
     context = plan_branch_runtime_context(
         project_id=project_id,
@@ -6698,6 +6710,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         workspace_root=workspace_root,
         batch_id=str(ctx.body.get("batch_id") or ""),
         backlog_id=str(ctx.body.get("backlog_id") or ""),
+        parent_task_id=str(ctx.body.get("parent_task_id") or ""),
         chain_id=str(ctx.body.get("chain_id") or ""),
         root_task_id=str(ctx.body.get("root_task_id") or ctx.body.get("parent_task_id") or ""),
         stage_task_id=str(ctx.body.get("stage_task_id") or task_id),
@@ -6713,6 +6726,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             or ctx.body.get("target_graph_root")
             or ""
         ),
+        target_files=request_target_files,
+        owned_files=request_owned_files,
         attempt=_query_int(ctx.body, "attempt", 1),
         branch_prefix=str(ctx.body.get("branch_prefix") or "codex"),
         worktree_root=worktree_root,
@@ -10107,7 +10122,8 @@ def _runtime_context_worker_guide_response(
 
 def _runtime_context_mf_sub_parent_task_id(context) -> str:
     return str(
-        getattr(context, "root_task_id", "")
+        getattr(context, "parent_task_id", "")
+        or getattr(context, "root_task_id", "")
         or getattr(context, "chain_id", "")
         or getattr(context, "stage_task_id", "")
         or getattr(context, "backlog_id", "")
@@ -34675,6 +34691,7 @@ def _observer_hotfix_successor_runtime_enter(
     handoff_event_id = _contract_runtime_stable_id(
         "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
     )
+    successor_existed = False
     try:
         successor = store.get(successor_execution_id)
     except ContractRuntimeError:
@@ -34704,6 +34721,7 @@ def _observer_hotfix_successor_runtime_enter(
             },
         )
     else:
+        successor_existed = True
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
@@ -34729,6 +34747,24 @@ def _observer_hotfix_successor_runtime_enter(
     }
     runtime.current_guide(successor_execution_id, actor_role=actor_role)
     successor = store.get(successor_execution_id)
+    if successor_existed and _runtime_record_is_complete(successor):
+        raise ValidationError(
+            "observer_hotfix successor runtime is already complete",
+            {
+                "blocker_id": "observer_hotfix_successor_already_complete",
+                "recoverable": True,
+                "next_legal_action": "start_attempt_scoped_observer_hotfix_successor",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "successor_contract_execution_id": successor_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "root_contract_execution_id": root_execution_id,
+                "contract_chain_id": chain_id,
+                "route_token_ref": route_token_ref,
+                "raw_route_token_required": False,
+            },
+        )
     next_line = (
         successor.get("runtime_guide", {}).get("next_legal_action")
         if isinstance(successor.get("runtime_guide"), Mapping)

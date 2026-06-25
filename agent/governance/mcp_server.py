@@ -519,6 +519,14 @@ TOOLS: list[dict] = [
                     "description": "Accepted for audit only; HTTP facade derives the effective role from the session/token.",
                 },
                 "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
             },
             "required": ["project_id", "reason"],
             "anyOf": [

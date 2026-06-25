@@ -100,9 +100,13 @@ def test_observer_hotfix_enter_schemas_require_backlog_scope():
         )
         schema = hotfix_enter["inputSchema"]
         assert {"project_id", "reason"}.issubset(schema["required"])
-        assert {"backlog_id", "bug_id", "actor_role"}.issubset(
-            schema["properties"]
-        )
+        assert {
+            "backlog_id",
+            "bug_id",
+            "actor_role",
+            "observer_session_id",
+            "observer_route_token_ref",
+        }.issubset(schema["properties"])
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
 
@@ -227,6 +231,8 @@ def test_governance_mcp_hotfix_enter_dispatches_to_runtime_facade(monkeypatch):
             "reason": "Human approved runtime repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-hotfix",
+            "observer_session_id": "obs-session-hotfix",
+            "observer_route_token_ref": "rtok-observer-hotfix",
         },
     )
 
@@ -241,6 +247,8 @@ def test_governance_mcp_hotfix_enter_dispatches_to_runtime_facade(monkeypatch):
                 "reason": "Human approved runtime repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-hotfix",
+                "observer_session_id": "obs-session-hotfix",
+                "observer_route_token_ref": "rtok-observer-hotfix",
             },
         )
     ]
@@ -342,6 +350,8 @@ def test_tool_dispatcher_hotfix_enter_posts_runtime_facade():
             "reason": "Human approved runtime repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-hotfix",
+            "observer_session_id": "obs-session-hotfix",
+            "observer_route_token_ref": "rtok-observer-hotfix",
         },
     )
 
@@ -356,6 +366,8 @@ def test_tool_dispatcher_hotfix_enter_posts_runtime_facade():
                 "reason": "Human approved runtime repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-hotfix",
+                "observer_session_id": "obs-session-hotfix",
+                "observer_route_token_ref": "rtok-observer-hotfix",
             },
         )
     ]

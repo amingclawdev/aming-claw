@@ -565,6 +565,50 @@ def test_runtime_text_builder_accepts_hotfix_handoff_parent_without_laundering_r
     assert result["branch_runtime_evidence"]["parent_task_id"] == "cex-hotfix-successor"
 
 
+def test_runtime_text_builder_preserves_absolute_assigned_worktree_root(tmp_path):
+    task_id = "mfsub-route-runtime-parity-hotfix-20260625-a"
+    assigned_worktree = tmp_path / "workers" / ".worktrees" / task_id
+    assigned_worktree.mkdir(parents=True)
+    owned_files = ("agent/observer_runtime.py",)
+    evidence = _branch_runtime_evidence(
+        tmp_path,
+        task_id=task_id,
+        parent_task_id="cex-hotfix-successor",
+        worktree_path=str(assigned_worktree),
+        target_project_root=str(assigned_worktree),
+        target_files=list(owned_files),
+        owned_files=list(owned_files),
+    )
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            task_id=task_id,
+            worker_id=task_id,
+            parent_task_id="cex-hotfix-successor",
+            worktree_root=str(assigned_worktree),
+            target_project_root=str(assigned_worktree),
+            owned_files=owned_files,
+            branch_runtime_evidence=evidence,
+            branch_runtime_registration_ref=(
+                "/api/graph-governance/aming-claw/parallel-branches/allocate"
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["runtime_context"]["worktree_path"] == str(assigned_worktree)
+    assert result["runtime_context"]["target_project_root"] == str(assigned_worktree)
+    startup_intent = result["startup_intent_event"]["payload"][
+        "mf_subagent_startup_intent"
+    ]
+    assert startup_intent["assigned_worktree"] == str(assigned_worktree)
+    assert result["executable_worker_launch"]["startup_recording"]["actual_cwd"] == str(
+        assigned_worktree
+    )
+    assert f"{task_id}/{task_id}" not in result["runtime_context"]["worktree_path"]
+
+
 def test_runtime_text_builder_ignores_top_level_worktree_object_for_path(tmp_path):
     evidence = _branch_runtime_evidence(tmp_path)
     evidence["worktree"] = {

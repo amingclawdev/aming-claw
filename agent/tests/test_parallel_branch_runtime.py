@@ -6124,6 +6124,161 @@ def test_mf_branch_allocation_evidence_hydrates_contract_single_source_fields() 
     assert "raw_private_context" not in evidence["route_identity"]
 
 
+def test_mf_branch_allocation_projection_preserves_explicit_parent_and_file_scope() -> None:
+    conn = _runtime_conn()
+    owned_files = (
+        "agent/governance/parallel_branch_runtime.py",
+        "agent/observer_runtime.py",
+    )
+    context = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id="MF Hotfix Parity",
+        batch_id="PB-HOTFIX",
+        backlog_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        parent_task_id="cex-hotfix-successor",
+        chain_id="cex-onboard-root",
+        root_task_id="cex-onboard-root",
+        stage_task_id="MF Hotfix Parity",
+        agent_id="observer",
+        worker_id="worker-hotfix",
+        workspace_root="/repo",
+        target_project_root="/repo/.worktrees/mf-hotfix-parity",
+        target_files=owned_files,
+        owned_files=owned_files,
+        base_commit="base-hotfix",
+        target_head_commit="target-hotfix",
+        merge_queue_id="mq-hotfix",
+        fence_token="fence-hotfix",
+    )
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+    reloaded = get_branch_context(conn, PROJECT_ID, "MF Hotfix Parity")
+
+    assert reloaded is not None
+    assert saved.parent_task_id == "cex-hotfix-successor"
+    assert reloaded.parent_task_id == "cex-hotfix-successor"
+    assert reloaded.root_task_id == "cex-onboard-root"
+    assert reloaded.chain_id == "cex-onboard-root"
+    assert reloaded.owned_files == owned_files
+    assert reloaded.target_files == owned_files
+
+    payload = branch_context_to_dict(reloaded)
+    assert payload["parent_task_id"] == "cex-hotfix-successor"
+    assert payload["owned_files"] == list(owned_files)
+    assert payload["target_files"] == list(owned_files)
+
+    revision = append_branch_contract_revision(
+        conn,
+        reloaded,
+        payload={
+            "observer_command_id": "cmd-hotfix",
+            "owned_files": list(owned_files),
+            "target_files": list(owned_files),
+        },
+        now_iso=NOW,
+    )
+    projection = build_runtime_context_projection(
+        reloaded,
+        contract_revision=revision,
+        generated_at=NOW,
+    ).to_dict()
+    current = projection["views"]["current"]
+    worker = projection["views"]["worker_view"]
+
+    assert current["identity"]["parent_task_id"] == "cex-hotfix-successor"
+    assert current["graph_query_identity"]["parent_task_id"] == "cex-hotfix-successor"
+    assert current["work"]["owned_files"] == list(owned_files)
+    assert current["work"]["target_files"] == list(owned_files)
+    assert worker["task"]["parent_task_id"] == "cex-hotfix-successor"
+    assert worker["owned_files"] == list(owned_files)
+    assert worker["target_files"] == list(owned_files)
+
+
+def test_parallel_branch_allocate_handler_persists_requested_file_scope(monkeypatch) -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    owned_files = [
+        "agent/governance/server.py",
+        "agent/governance/parallel_branch_runtime.py",
+    ]
+    target_files = [
+        "agent/governance/server.py",
+        "agent/governance/parallel_branch_runtime.py",
+        "agent/observer_runtime.py",
+    ]
+
+    class NoCloseConnection:
+        def __init__(self, wrapped: sqlite3.Connection):
+            self._wrapped = wrapped
+
+        def close(self) -> None:
+            pass
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+    monkeypatch.setattr(
+        server_module,
+        "get_connection",
+        lambda project_id: NoCloseConnection(conn),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_require_graph_governance_operator",
+        lambda ctx, conn, action: None,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_record_bounded_worker_dispatch_event",
+        lambda *args, **kwargs: {"ok": True, "event_id": "evt-dispatch"},
+    )
+
+    ctx = server_module.RequestContext(
+        handler=None,
+        method="POST",
+        path_params={"project_id": PROJECT_ID},
+        query={},
+        body={
+            "task_id": "mf-handler-scope",
+            "workspace_root": "/repo",
+            "backlog_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+            "parent_task_id": "cex-hotfix-successor",
+            "root_task_id": "cex-onboard-root",
+            "stage_task_id": "mf-handler-scope",
+            "worker_id": "worker-handler-scope",
+            "agent_id": "observer",
+            "owned_files": owned_files,
+            "target_files": target_files,
+            "base_commit": "base-handler",
+            "target_head_commit": "target-handler",
+            "merge_queue_id": "mq-handler",
+            "fence_token": "fence-handler",
+            "create_worktree": False,
+            "issue_same_owner_session_token": False,
+            "now_iso": NOW,
+        },
+        request_id="req-handler-scope",
+        token="",
+        idem_key="",
+    )
+
+    status, response = server_module.handle_graph_governance_parallel_branch_allocate(ctx)
+
+    assert status == 201
+    assert response["context"]["parent_task_id"] == "cex-hotfix-successor"
+    assert response["context"]["owned_files"] == owned_files
+    assert response["context"]["target_files"] == target_files
+    assert response["branch_runtime_evidence"]["owned_files"] == owned_files
+    assert response["branch_runtime_evidence"]["target_files"] == target_files
+
+    persisted = get_branch_context(conn, PROJECT_ID, "mf-handler-scope")
+    assert persisted is not None
+    assert persisted.parent_task_id == "cex-hotfix-successor"
+    assert persisted.owned_files == tuple(owned_files)
+    assert persisted.target_files == tuple(target_files)
+
+
 def test_mf_branch_worktree_materialization_uses_planned_identity(tmp_path) -> None:
     fixture = create_parallel_fixture_project(tmp_path)
     repo = fixture.root
@@ -6403,7 +6558,7 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     # column defs in this DDL.
     import re as _re
     _col_def_pattern = _re.compile(
-        r"^\s+(merge_queue_id|merge_preview_id)\s+TEXT NOT NULL DEFAULT ''"
+        r"^\s+(parent_task_id|merge_queue_id|merge_preview_id)\s+TEXT NOT NULL DEFAULT ''"
     )
     from agent.governance.parallel_branch_runtime import PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL
     old_schema_sql = "\n".join(
@@ -6448,12 +6603,18 @@ def test_allocate_persists_merge_queue_id_for_finish_gate(tmp_path) -> None:
     assert "merge_preview_id" in post_cols, (
         "ensure_branch_runtime_schema did not add merge_preview_id column to old table"
     )
+    assert "parent_task_id" in post_cols, (
+        "ensure_branch_runtime_schema did not add parent_task_id column to old table"
+    )
 
     # Existing row must be readable with merge_queue_id defaulting to empty string
     old_ctx = get_branch_context(conn_old, "proj-old", "task-old")
     assert old_ctx is not None
     assert old_ctx.merge_queue_id == "", (
         f"old row merge_queue_id should default to empty, got {old_ctx.merge_queue_id!r}"
+    )
+    assert old_ctx.parent_task_id == "", (
+        f"old row parent_task_id should default to empty, got {old_ctx.parent_task_id!r}"
     )
 
     # After upsert with a merge_queue_id, the value must persist

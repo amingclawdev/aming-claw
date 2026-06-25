@@ -151,6 +151,17 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
     }.issubset(names)
 
 
+def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
+    hotfix = next(tool for tool in TOOLS if tool.get("name") == "observer_hotfix_enter")
+    props = hotfix["inputSchema"]["properties"]
+
+    assert props["observer_session_id"]["type"] == "string"
+    assert props["observer_route_token_ref"]["type"] == "string"
+    assert "raw route tokens are not accepted" in props["observer_route_token_ref"][
+        "description"
+    ]
+
+
 def test_active_runtime_context_tools_are_read_only_and_route_to_current_service():
     tools = {str(tool["name"]): tool for tool in TOOLS}
     current_schema = tools["runtime_context_current"]["inputSchema"]

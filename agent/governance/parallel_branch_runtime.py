@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     runtime_context_id TEXT NOT NULL DEFAULT '',
     batch_id          TEXT NOT NULL DEFAULT '',
     backlog_id        TEXT NOT NULL DEFAULT '',
+    parent_task_id    TEXT NOT NULL DEFAULT '',
     chain_id          TEXT NOT NULL DEFAULT '',
     root_task_id      TEXT NOT NULL DEFAULT '',
     stage_task_id     TEXT NOT NULL DEFAULT '',
@@ -692,6 +693,7 @@ class BranchTaskRuntimeContext:
     runtime_context_id: str = ""
     batch_id: str = ""
     backlog_id: str = ""
+    parent_task_id: str = ""
     chain_id: str = ""
     root_task_id: str = ""
     stage_task_id: str = ""
@@ -1133,6 +1135,7 @@ def preserve_materialized_context_for_allocation(
         runtime_context_id=existing.runtime_context_id or planned.runtime_context_id,
         batch_id=planned.batch_id or existing.batch_id,
         backlog_id=planned.backlog_id or existing.backlog_id,
+        parent_task_id=planned.parent_task_id or existing.parent_task_id,
         chain_id=planned.chain_id or existing.chain_id,
         root_task_id=planned.root_task_id or existing.root_task_id,
         stage_task_id=planned.stage_task_id or existing.stage_task_id,
@@ -1150,6 +1153,8 @@ def preserve_materialized_context_for_allocation(
         or planned.governance_project_id,
         target_project_id=existing.target_project_id or planned.target_project_id,
         target_project_root=existing.target_project_root or planned.target_project_root,
+        target_files=planned.target_files or existing.target_files,
+        owned_files=planned.owned_files or existing.owned_files,
         attempt=existing.attempt or planned.attempt,
         lease_id=existing.lease_id or planned.lease_id,
         lease_expires_at=existing.lease_expires_at or planned.lease_expires_at,
@@ -1189,6 +1194,7 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
         )
         columns.add("retry_round")
     for column in (
+        "parent_task_id",
         "allocation_owner",
         "worker_slot_id",
         "actual_host_worker_id",
@@ -1905,6 +1911,10 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         or branch_runtime_context_id(row["project_id"], row["task_id"], int(row["attempt"] or 1)),
         batch_id=row["batch_id"] or "",
         backlog_id=row["backlog_id"] or "",
+        parent_task_id=(
+            row["parent_task_id"] if "parent_task_id" in row_keys else ""
+        )
+        or "",
         chain_id=row["chain_id"] or "",
         root_task_id=row["root_task_id"] or "",
         stage_task_id=row["stage_task_id"] or "",
@@ -1991,6 +2001,7 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     owned_files = list(context.owned_files)
     target_files = list(context.target_files) or list(owned_files)
     payload["runtime_context_id"] = runtime_context_id_for_branch_context(context)
+    payload["parent_task_id"] = _runtime_context_parent_task_id(context)
     payload["depends_on"] = list(context.depends_on)
     payload["allocation_owner"] = context.allocation_owner or context.agent_id
     payload["observer_allocation_owner"] = payload["allocation_owner"]
@@ -2618,6 +2629,9 @@ def _runtime_context_revision_payload(
 
 
 def _runtime_context_parent_task_id(context: BranchTaskRuntimeContext) -> str:
+    parent_task_id = _runtime_context_text(getattr(context, "parent_task_id", ""))
+    if parent_task_id:
+        return parent_task_id
     root_task_id = _runtime_context_text(context.root_task_id)
     chain_id = _runtime_context_text(context.chain_id)
     task_id = _runtime_context_text(context.task_id)
@@ -7504,7 +7518,7 @@ def upsert_branch_context(
     conn.execute(
         """
         INSERT INTO parallel_branch_runtime_contexts (
-            project_id, task_id, runtime_context_id, batch_id, backlog_id, chain_id, root_task_id,
+            project_id, task_id, runtime_context_id, batch_id, backlog_id, parent_task_id, chain_id, root_task_id,
             stage_task_id, stage_type, retry_round, agent_id, worker_id,
             allocation_owner, worker_slot_id, actual_host_worker_id,
             host_startup_id, host_session_id, governance_project_id,
@@ -7519,12 +7533,16 @@ def upsert_branch_context(
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             runtime_context_id = excluded.runtime_context_id,
             batch_id = excluded.batch_id,
             backlog_id = excluded.backlog_id,
+            parent_task_id = CASE
+                WHEN excluded.parent_task_id != '' THEN excluded.parent_task_id
+                ELSE parallel_branch_runtime_contexts.parent_task_id
+            END,
             chain_id = excluded.chain_id,
             root_task_id = excluded.root_task_id,
             stage_task_id = excluded.stage_task_id,
@@ -7576,6 +7594,7 @@ def upsert_branch_context(
             runtime_context_id,
             context.batch_id,
             context.backlog_id,
+            _runtime_context_text(context.parent_task_id),
             context.chain_id,
             context.root_task_id,
             context.stage_task_id,
@@ -7716,6 +7735,7 @@ def reissue_mf_subagent_runtime_session_token(
         allowed_parent_ids = {
             value
             for value in (
+                context.parent_task_id,
                 context.root_task_id,
                 context.chain_id,
                 context.stage_task_id,
@@ -11588,6 +11608,7 @@ def plan_branch_runtime_context(
     workspace_root: str = "",
     batch_id: str = "",
     backlog_id: str = "",
+    parent_task_id: str = "",
     chain_id: str = "",
     root_task_id: str = "",
     stage_task_id: str = "",
@@ -11626,13 +11647,33 @@ def plan_branch_runtime_context(
     suffix = _attempt_suffix(attempt)
     branch_ref = f"refs/heads/{prefix}/{task_slug}{suffix}"
     worktree_id = f"wt-{task_slug}{suffix}"
-    worktree_parts = [part for part in (worktree_root, worker_slug, f"{task_slug}{suffix}") if part]
-    worktree_path = str(Path(workspace_root, *worktree_parts)) if workspace_root else str(Path(*worktree_parts))
+    worktree_name = f"{task_slug}{suffix}"
+    worktree_root_path = Path(str(worktree_root or ""))
+    if worktree_root_path.is_absolute():
+        root_leaf_slug = _safe_slug(worktree_root_path.name, "")
+        if root_leaf_slug == worktree_name:
+            worktree_path = str(worktree_root_path)
+        else:
+            worktree_parts = [str(worktree_root_path)]
+            if worker_slug and _safe_slug(worktree_root_path.name, "") != worker_slug:
+                worktree_parts.append(worker_slug)
+            worktree_parts.append(worktree_name)
+            worktree_path = str(Path(*worktree_parts))
+    else:
+        worktree_parts = [
+            part for part in (worktree_root, worker_slug, worktree_name) if part
+        ]
+        worktree_path = (
+            str(Path(workspace_root, *worktree_parts))
+            if workspace_root
+            else str(Path(*worktree_parts))
+        )
     return BranchTaskRuntimeContext(
         project_id=project_id,
         task_id=task_id,
         batch_id=batch_id,
         backlog_id=backlog_id,
+        parent_task_id=parent_task_id,
         chain_id=chain_id,
         root_task_id=root_task_id,
         stage_task_id=stage_task_id or task_id,
@@ -11855,6 +11896,7 @@ def branch_context_from_chain_stage(
     task_id: str = "",
     batch_id: str = "",
     backlog_id: str = "",
+    parent_task_id: str = "",
     agent_id: str = "",
     worker_id: str = "",
     allocation_owner: str = "",
@@ -11896,6 +11938,7 @@ def branch_context_from_chain_stage(
         task_id=task_id or stage_task,
         batch_id=batch_id,
         backlog_id=backlog_id,
+        parent_task_id=parent_task_id,
         chain_id=chain_id or root_task_id,
         root_task_id=root_task_id or chain_id,
         stage_task_id=stage_task,

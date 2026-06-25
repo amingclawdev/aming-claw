@@ -351,6 +351,83 @@ def test_runtime_contract_view_preserves_handoff_parent_separately_from_root() -
     assert view["agent_task_contract"]["parent_task_id"] == "cex-hotfix-successor"
 
 
+def test_observer_hotfix_enter_refuses_completed_successor_reuse(monkeypatch) -> None:
+    from agent.governance import server as server_module
+
+    parent_record = {
+        "contract_execution_id": "cex-onboard-parent",
+        "root_contract_execution_id": "cex-onboard-root",
+        "contract_chain_id": "chain-onboard-root",
+    }
+    successor_id = server_module._observer_hotfix_successor_execution_id(
+        "aming-claw",
+        "AC-HOTFIX",
+        parent_record["contract_execution_id"],
+    )
+    completed_record = {
+        "contract_execution_id": successor_id,
+        "parent_contract_execution_id": parent_record["contract_execution_id"],
+        "root_contract_execution_id": parent_record["root_contract_execution_id"],
+        "contract_chain_id": parent_record["contract_chain_id"],
+        "runtime_guide": {"next_legal_action": None},
+        "route_token_ref": "",
+    }
+
+    class FakeStore:
+        def __init__(self, record):
+            self.record = dict(record)
+            self.updated = False
+
+        def get(self, contract_execution_id):
+            assert contract_execution_id == successor_id
+            return dict(self.record)
+
+        def update(self, contract_execution_id, record):
+            assert contract_execution_id == successor_id
+            self.updated = True
+            self.record = dict(record)
+
+    class FakeRuntime:
+        def __init__(self, record):
+            self.store = FakeStore(record)
+            self.started = False
+
+        def start_execution(self, *args, **kwargs):
+            self.started = True
+            raise AssertionError("completed deterministic successor must not be reused")
+
+        def current_guide(self, contract_execution_id, *, actor_role):
+            assert contract_execution_id == successor_id
+            assert actor_role == "observer"
+            return {"next_legal_action": None}
+
+    runtime = FakeRuntime(completed_record)
+    monkeypatch.setattr(server_module, "_contract_runtime", lambda conn: runtime)
+
+    with pytest.raises(server_module.ValidationError) as exc_info:
+        server_module._observer_hotfix_successor_runtime_enter(
+            object(),
+            project_id="aming-claw",
+            backlog_id="AC-HOTFIX",
+            task_id="hotfix-task",
+            parent_record=parent_record,
+            actor_role="observer",
+            route_token_ref="rtok-hotfix-ref",
+            reason="human approved hotfix",
+        )
+
+    assert runtime.started is False
+    details = exc_info.value.details
+    assert details["blocker_id"] == "observer_hotfix_successor_already_complete"
+    assert details["next_legal_action"] == "start_attempt_scoped_observer_hotfix_successor"
+    assert details["successor_contract_execution_id"] == successor_id
+    assert details["parent_contract_execution_id"] == "cex-onboard-parent"
+    assert details["root_contract_execution_id"] == "cex-onboard-root"
+    assert details["contract_chain_id"] == "chain-onboard-root"
+    assert details["route_token_ref"] == "rtok-hotfix-ref"
+    assert details["raw_route_token_required"] is False
+
+
 def test_runtime_contract_view_reports_revision_polling_state() -> None:
     context = BranchTaskRuntimeContext(
         project_id="aming-claw",
