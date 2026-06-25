@@ -232,6 +232,38 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     return properties
 
 
+def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "project_id": {"type": "string"},
+        "contract_execution_id": {"type": "string"},
+        "execution_state_revision": {"type": "integer"},
+        "runtime_guide_hash": {"type": "string"},
+        "stage_id": {"type": "string"},
+        "line_id": {"type": "string"},
+        "evidence_kind": {"type": "string"},
+        "payload": {"type": "object"},
+        "artifact_refs": {"type": "object"},
+        "trace_id": {"type": "string"},
+        "commit_sha": {"type": "string"},
+        "observer_route_token_ref": {
+            "type": "string",
+            "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+        },
+        "route_token_ref": {"type": "string"},
+        "observer_session_id": {
+            "type": "string",
+            "description": "Opaque active observer session id used with observer_route_token_ref.",
+        },
+        "worker_role": {
+            "type": "string",
+            "description": "Use mf_sub for fenced worker-authored lines.",
+        },
+    }
+    for key, value in _runtime_context_write_schema_properties().items():
+        properties.setdefault(key, value)
+    return properties
+
+
 def _runtime_context_write_body(args: dict) -> dict:
     return {
         key: value
@@ -847,28 +879,7 @@ TOOLS: list[dict] = [
         "description": "Submit one role-bound generic ContractRuntime evidence line via ContractRuntime.submit_line_write.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "project_id": {"type": "string"},
-                "contract_execution_id": {"type": "string"},
-                "execution_state_revision": {"type": "integer"},
-                "runtime_guide_hash": {"type": "string"},
-                "stage_id": {"type": "string"},
-                "line_id": {"type": "string"},
-                "evidence_kind": {"type": "string"},
-                "payload": {"type": "object"},
-                "artifact_refs": {"type": "object"},
-                "trace_id": {"type": "string"},
-                "commit_sha": {"type": "string"},
-                "observer_route_token_ref": {
-                    "type": "string",
-                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
-                },
-                "route_token_ref": {"type": "string"},
-                "observer_session_id": {
-                    "type": "string",
-                    "description": "Opaque active observer session id used with observer_route_token_ref.",
-                },
-            },
+            "properties": _contract_runtime_submit_line_schema_properties(),
             "required": ["project_id", "contract_execution_id"],
         },
     },

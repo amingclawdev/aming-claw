@@ -26509,6 +26509,57 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert forged_worker_read["ok"] is False
     assert "cannot write line" in forged_worker_read["decision"]["errors"][0]
 
+    runtime_context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="parallel-source-backed-worker",
+            parent_task_id=result["contract_execution_id"],
+            root_task_id=result["contract_execution_id"],
+            backlog_id=backlog_id,
+            worker_id="worker-parallel-source-backed",
+            worker_slot_id="worker-parallel-source-backed",
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root="/tmp/parallel-source-backed-worker",
+            branch_ref="refs/heads/codex/parallel-source-backed-worker",
+            worktree_path="/tmp/parallel-source-backed-worker",
+            fence_token="fence-parallel-source-backed",
+            session_token_hash=mf_subagent_session_token_hash(
+                "parallel-source-backed-worker-token"
+            ),
+            status="worktree_ready",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-25T12:00:00Z",
+    )
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": result["contract_execution_id"],
+                "worker_role": "mf_sub",
+                "fence_token": "fence-parallel-source-backed",
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": "/tmp/parallel-source-backed-worker",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                },
+            },
+        )
+    )
+    assert worker_read["ok"] is True
+    assert worker_read["actor_role"] == "mf_sub"
+    assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+
 
 def test_mf_parallel_enter_accepts_verified_observer_route_ref(conn):
     backlog_id = "AC-MF-PARALLEL-OBSERVER-REF"
