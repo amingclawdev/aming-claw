@@ -43721,6 +43721,80 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
     return response
 
 
+@route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-writes/precheck")
+def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
+    """Precheck one role-bound ContractRuntime line write without appending evidence."""
+    project_id = ctx.get_project_id()
+    contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    body = dict(ctx.body or {})
+    with DBContext(project_id) as conn:
+        runtime = _contract_runtime(conn)
+        record = runtime.store.get(contract_execution_id)
+        actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_submit_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=contract_execution_id,
+            record=record,
+        )
+        try:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
+            record = runtime.store.get(contract_execution_id)
+            write = _contract_runtime_line_write_body(
+                record,
+                actor_role=actor_role,
+                body=body,
+            )
+            result = runtime.precheck_line_write(
+                contract_execution_id,
+                write,
+                actor_role=actor_role,
+            )
+        except StalePinnedContractExecutionError as exc:
+            response = _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_runtime_submit_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+            response["decision"] = {
+                "ok": False,
+                "errors": [str(exc)],
+            }
+            return response
+        conn.commit()
+    response = {
+        "schema_version": "contract_runtime.line_write_precheck_response.v1",
+        "ok": bool(result.get("ok")),
+        "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
+        "actor_role": actor_role,
+        "decision": result.get("decision") or {},
+        "would_mutate_completed_lines": False,
+        "completed_lines_count": result.get("completed_lines_count"),
+        "execution_state_revision": result.get("execution_state_revision"),
+        "runtime_guide_hash": result.get("runtime_guide_hash"),
+        "agent_facing_decision_source": "contract_runtime_line_write_precheck",
+    }
+    if isinstance(result.get("record"), Mapping):
+        response.update(_contract_runtime_response(result["record"]))
+        response["schema_version"] = "contract_runtime.line_write_precheck_response.v1"
+        response["ok"] = bool(result.get("ok"))
+        response["decision"] = result.get("decision") or {}
+        response["actor_role"] = actor_role
+        response["would_mutate_completed_lines"] = False
+        response["completed_lines_count"] = result.get("completed_lines_count")
+        response["execution_state_revision"] = result.get("execution_state_revision")
+        response["runtime_guide_hash"] = result.get("runtime_guide_hash")
+        response["agent_facing_decision_source"] = "contract_runtime_line_write_precheck"
+    return response
+
+
 @route("GET", "/api/projects/{project_id}/hotfix/usage")
 def handle_project_hotfix_usage(ctx: RequestContext):
     """Return audit-only HOTFIX entry and under_hotfix timeline usage."""

@@ -24041,6 +24041,63 @@ def test_contract_runtime_generic_facade_preserves_role_and_order_gates(conn):
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
 
 
+def test_contract_runtime_line_write_precheck_route_does_not_append(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-LINE-WRITE-DRY-RUN-PRECHECK"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-hotfix-line-write-precheck-route",
+    )
+    conn.commit()
+
+    precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "pre_mutation",
+                "line_id": "hotfix_pre_reason",
+                "evidence_kind": "hotfix_entered",
+                "payload": {"status": "diagnostic_probe_no_mutation_expected"},
+            },
+        )
+    )
+
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    assert precheck["completed_lines_count"] == 0
+    record = runtime.store.get(hotfix["contract_execution_id"])
+    assert record["completed_lines"] == []
+    assert record["execution_state_revision"] == 1
+
+    rejected = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "pre_mutation",
+                "line_id": "hotfix_pre_reason",
+                "evidence_kind": "hotfix_entered",
+                "payload": {"status": "diagnostic_probe_no_mutation_expected"},
+            },
+        )
+    )
+
+    assert rejected["ok"] is False
+    assert rejected["decision"]["errors"] == [
+        "line_write_declares_no_mutation_expected"
+    ]
+    record = runtime.store.get(hotfix["contract_execution_id"])
+    assert record["completed_lines"] == []
+    assert record["execution_state_revision"] == 1
+
+
 def test_observer_root_route_context_contract_first_for_no_contract_row(conn):
     backlog_id = "AC-ROOT-ROUTE-CONTEXT-CONTRACT-FIRST"
     _insert_simple_mf_close_backlog(conn, backlog_id)

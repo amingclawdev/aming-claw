@@ -884,6 +884,15 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_runtime_precheck_line",
+        "description": "Precheck one role-bound generic ContractRuntime evidence line without appending completed evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _contract_runtime_submit_line_schema_properties(),
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
         "name": "runtime_context_current",
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
@@ -1432,6 +1441,20 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http(
             "POST",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
+            body,
+        )
+
+    if name == "contract_runtime_precheck_line":
+        pid = args["project_id"]
+        execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        body = {
+            key: value
+            for key, value in args.items()
+            if key not in {"project_id", "contract_execution_id"} and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
             body,
         )
 

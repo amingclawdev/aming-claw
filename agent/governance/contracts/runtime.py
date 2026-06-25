@@ -19,12 +19,13 @@ from typing import Any
 from uuid import uuid4
 
 from .execution_state import build_execution_state
+from .gate_kernel import ContractGateKernel
 from .guide_compiler import compile_runtime_guide
 from .hash import stable_sha256
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
 from .schema import ContractDefinitionError, is_new_execution_allowed
-from .write_gate import WriteGateDecision, validate_contract_write
+from .write_gate import WriteGateDecision
 
 
 class ContractRuntimeError(ValueError):
@@ -361,6 +362,7 @@ class ContractRuntime:
         self.registry = registry
         self.instruction_root = Path(instruction_root) if instruction_root is not None else registry.root
         self.store = store or InMemoryContractExecutionStore()
+        self.gate_kernel = ContractGateKernel(registry)
 
     def start_execution(
         self,
@@ -397,6 +399,24 @@ class ContractRuntime:
                 f"contract {definition['contract_id']}@{definition['version']}#{definition['revision']} "
                 f"is {definition['status']} and cannot start new executions"
             )
+        parent_contract = self._parent_contract_identity(parent_contract_execution_id)
+        start_precheck = self.gate_kernel.precheck(
+            definition,
+            action="start_execution",
+            actor_role=actor_role,
+            subject={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id or "",
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "root_contract_execution_id": root_contract_execution_id,
+                "contract_chain_id": contract_chain_id,
+                "route_token_ref": route_token_ref,
+                "parent_contract": parent_contract,
+            },
+        )
+        if start_precheck.decision == "block" and _enforce_start_precheck(definition):
+            raise ContractRuntimeError("; ".join(start_precheck.errors))
         instruction_bundle = resolve_instruction_bundle(
             definition,
             root=self.instruction_root,
@@ -420,6 +440,7 @@ class ContractRuntime:
             instruction_bundle=instruction_bundle,
         )
         _attach_completed_line_evidence(guide, [])
+        _attach_precheck_decision(guide, start_precheck.to_dict())
         record = {
             "schema_version": "contract_runtime_execution_record.v1",
             "project_id": project_id,
@@ -439,11 +460,28 @@ class ContractRuntime:
             "execution_state_revision": state["execution_state_revision"],
             "execution_state": state,
             "runtime_guide": guide,
+            "precheck_decision": start_precheck.to_dict(),
             "role_binding": dict(role_binding or {}),
             "backlog_lineage": dict(backlog_lineage or {}),
             "metadata": dict(metadata or {}),
         }
         return self.store.create(record)
+
+    def _parent_contract_identity(
+        self,
+        parent_contract_execution_id: str,
+    ) -> dict[str, Any]:
+        if not parent_contract_execution_id:
+            return {}
+        parent = self.store.get(parent_contract_execution_id)
+        return {
+            "contract_execution_id": str(parent.get("contract_execution_id") or ""),
+            "contract_id": str(parent.get("contract_id") or ""),
+            "version": str(parent.get("version") or ""),
+            "revision": str(parent.get("revision") or ""),
+            "root_contract_execution_id": str(parent.get("root_contract_execution_id") or ""),
+            "contract_chain_id": str(parent.get("contract_chain_id") or ""),
+        }
 
     def current_guide(
         self,
@@ -482,8 +520,26 @@ class ContractRuntime:
             instruction_bundle=instruction_bundle,
         )
         _attach_completed_line_evidence(guide, record.get("completed_lines") or [])
+        current_precheck = self.gate_kernel.precheck(
+            definition,
+            action="current_state",
+            actor_role=actor_role or str(record["execution_state"].get("actor_role") or ""),
+            execution_state=state,
+            runtime_guide=guide,
+            subject={
+                "project_id": record.get("project_id"),
+                "backlog_id": record.get("backlog_id"),
+                "contract_execution_id": contract_execution_id,
+                "parent_contract_execution_id": record.get("parent_contract_execution_id"),
+                "root_contract_execution_id": record.get("root_contract_execution_id"),
+                "contract_chain_id": record.get("contract_chain_id"),
+                "route_token_ref": record.get("route_token_ref"),
+            },
+        )
+        _attach_precheck_decision(guide, current_precheck.to_dict())
         record["execution_state"] = state
         record["runtime_guide"] = guide
+        record["precheck_decision"] = current_precheck.to_dict()
         self.store.update(contract_execution_id, record)
         return guide
 
@@ -509,17 +565,30 @@ class ContractRuntime:
             actor_role=effective_actor_role,
         )
         refreshed = self.store.get(contract_execution_id)
-        decision = validate_contract_write(
+        gate_decision = self.gate_kernel.precheck(
             definition,
-            refreshed["execution_state"],
-            effective_write,
+            action="submit_line",
+            actor_role=effective_actor_role,
+            execution_state=refreshed["execution_state"],
             runtime_guide=guide,
+            write=effective_write,
         )
-        if not decision.ok:
+        if _line_write_declares_no_mutation_expected(effective_write):
             return {
                 "schema_version": "contract_runtime_write_result.v1",
                 "ok": False,
-                "decision": decision.to_dict(),
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=("line_write_declares_no_mutation_expected",),
+                ).to_dict(),
+                "precheck_decision": gate_decision.to_dict(),
+                "record": refreshed,
+            }
+        if not gate_decision.ok:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": gate_decision.to_dict(),
                 "record": refreshed,
             }
 
@@ -551,8 +620,54 @@ class ContractRuntime:
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,
-            "decision": WriteGateDecision(ok=True).to_dict(),
+            "decision": gate_decision.to_dict(),
             "record": self.store.get(contract_execution_id),
+        }
+
+    def precheck_line_write(
+        self,
+        contract_execution_id: str,
+        write: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate a proposed line write without appending completed evidence."""
+
+        record = self.store.get(contract_execution_id)
+        definition = self._load_pinned_definition(record)
+        effective_write = dict(write)
+        body_actor_role = str(effective_write.get("actor_role") or "")
+        effective_actor_role = _effective_actor_role(effective_write, actor_role=actor_role)
+        if effective_actor_role:
+            effective_write["actor_role"] = effective_actor_role
+        if body_actor_role and effective_actor_role and body_actor_role != effective_actor_role:
+            effective_write["body_actor_role"] = body_actor_role
+        _enrich_line_instance_fields(effective_write)
+        guide = self.current_guide(
+            contract_execution_id,
+            actor_role=effective_actor_role,
+        )
+        refreshed = self.store.get(contract_execution_id)
+        gate_decision = self.gate_kernel.precheck(
+            definition,
+            action="submit_line",
+            actor_role=effective_actor_role,
+            execution_state=refreshed["execution_state"],
+            runtime_guide=guide,
+            write=effective_write,
+        )
+        return {
+            "schema_version": "contract_runtime_line_write_precheck_result.v1",
+            "ok": gate_decision.ok,
+            "decision": gate_decision.to_dict(),
+            "record": refreshed,
+            "write": effective_write,
+            "would_mutate_completed_lines": False,
+            "completed_lines_count": len(refreshed.get("completed_lines") or []),
+            "execution_state_revision": int(
+                refreshed.get("execution_state_revision") or 0
+            ),
+            "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
         }
 
     def _load_pinned_definition(self, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -570,7 +685,10 @@ class ContractRuntime:
             definition=definition,
         )
         pinned_source_sha256 = str(record.get("definition_source_sha256") or "")
-        if pinned_source_sha256:
+        if pinned_source_sha256 and not _is_lifecycle_only_source_mismatch(
+            record,
+            definition,
+        ):
             _assert_hash(
                 "definition_source_sha256",
                 pinned_source_sha256,
@@ -579,6 +697,76 @@ class ContractRuntime:
                 definition=definition,
             )
         return definition
+
+
+def _is_lifecycle_only_source_mismatch(
+    record: Mapping[str, Any],
+    definition: Mapping[str, Any],
+) -> bool:
+    if str(definition.get("status") or "") != "deprecated":
+        return False
+    return str(record.get("definition_hash") or "") == str(
+        definition.get("definition_hash") or ""
+    )
+
+
+def _enforce_start_precheck(definition: Mapping[str, Any]) -> bool:
+    """Hard-block the first migrated source-backed root policy.
+
+    The broader Gate Kernel rollout runs in shadow mode for existing facades so
+    contract_add/update/hotfix can be migrated without breaking legacy tests in
+    one step. Parallel worker orchestration is already designed as a successor,
+    and dogfood exposed it as the unsafe root path, so enforce that one now.
+    """
+
+    contract_id = str(definition.get("contract_id") or "")
+    aliases = {str(item) for item in definition.get("compat_aliases") or []}
+    return contract_id == "mf_parallel" or "mf_parallel.v1" in aliases
+
+
+def _attach_precheck_decision(
+    guide: dict[str, Any],
+    decision: Mapping[str, Any],
+) -> None:
+    guide["precheck_decision"] = dict(decision)
+
+
+def _line_write_declares_no_mutation_expected(write: Mapping[str, Any]) -> bool:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    candidates = (write, payload)
+    for candidate in candidates:
+        for key in (
+            "dry_run",
+            "precheck_only",
+            "no_mutation",
+            "no_mutation_expected",
+            "diagnostic_only",
+        ):
+            if _truthy_contract_flag(candidate.get(key)):
+                return True
+        status = str(candidate.get("status") or "").strip().lower()
+        if status in {
+            "dry_run",
+            "dry-run",
+            "precheck",
+            "precheck_only",
+            "diagnostic",
+            "diagnostic_probe",
+            "diagnostic_probe_no_mutation_expected",
+            "no_mutation_expected",
+        }:
+            return True
+        if "no_mutation_expected" in status:
+            return True
+    return False
+
+
+def _truthy_contract_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _assert_hash(

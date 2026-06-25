@@ -1263,6 +1263,15 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_runtime_precheck_line",
+        "description": "Precheck one role-bound generic ContractRuntime evidence line without appending completed evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _contract_runtime_submit_line_schema_properties(),
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
         "name": "observer_repair_run_plan",
         "description": "Build a read-only replayable observer repair-run plan for cross-system recovery. Does not authorize protected writes.",
         "inputSchema": {
@@ -2715,6 +2724,20 @@ class ToolDispatcher:
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
+                body,
+            )
+
+        if name == "contract_runtime_precheck_line":
+            pid = args["project_id"]
+            execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            body = {
+                key: value
+                for key, value in args.items()
+                if key not in {"project_id", "contract_execution_id"} and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
                 body,
             )
 

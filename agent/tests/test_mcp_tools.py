@@ -1041,6 +1041,7 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     assert {
         "contract_runtime_current",
         "contract_runtime_guide",
+        "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
     }.issubset(names)
     submit_properties = _tool_properties("contract_runtime_submit_line")
@@ -1055,6 +1056,7 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
         "fence_token",
         "target_project_root",
     }
+    assert _tool_properties("contract_runtime_precheck_line") == submit_properties
 
     recorder = _Recorder()
     dispatcher = ToolDispatcher(
@@ -1071,6 +1073,24 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     dispatcher.dispatch(
         "contract_runtime_guide",
         {"project_id": "aming-claw", "contract_execution_id": "cex-onboard"},
+    )
+    dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "execution_state_revision": 1,
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+            "runtime_context_id": "rctx-worker",
+            "task_id": "worker-task",
+            "parent_task_id": "observer-task",
+            "worker_role": "mf_sub",
+            "session_token_ref": "sref-worker",
+            "fence_token": "fence-worker",
+            "target_project_root": "/tmp/worker",
+        },
     )
     dispatcher.dispatch(
         "contract_runtime_submit_line",
@@ -1101,6 +1121,23 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
             "GET",
             "/api/projects/aming-claw/contract-runtime/cex-onboard/guide",
             None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/line-writes/precheck",
+            {
+                "execution_state_revision": 1,
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "runtime_context_id": "rctx-worker",
+                "task_id": "worker-task",
+                "parent_task_id": "observer-task",
+                "worker_role": "mf_sub",
+                "session_token_ref": "sref-worker",
+                "fence_token": "fence-worker",
+                "target_project_root": "/tmp/worker",
+            },
         ),
         (
             "POST",
@@ -1137,6 +1174,7 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "contract_update_submit_line",
         "contract_runtime_current",
         "contract_runtime_guide",
+        "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
     }.issubset(names)
     assert "contract_execution_id" not in _tool_properties("onboard_contract_start")
@@ -1155,6 +1193,9 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "fence_token",
         "target_project_root",
     }
+    assert _tool_properties("contract_runtime_precheck_line") == _tool_properties(
+        "contract_runtime_submit_line"
+    )
 
 
 def test_active_mcp_onboard_contract_tools_route_to_source_backed_facade():

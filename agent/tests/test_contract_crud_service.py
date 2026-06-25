@@ -15,6 +15,7 @@ from agent.governance.contracts import (
     ContractCrudService,
     ContractDefinitionRegistry,
     ContractRuntime,
+    run_contract_runtime_precheck,
 )
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
@@ -113,6 +114,38 @@ def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str)
         "actor_role": actor_role,
         "evidence_kind": next_action.get("evidence_kind") or "",
     }
+
+
+def _start_mf_parallel_successor(
+    runtime: ContractRuntime,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict:
+    parent_execution_id = f"cex-onboard-parent-for-{contract_execution_id}"
+    chain_id = f"cchain-for-{contract_execution_id}"
+    runtime.start_execution(
+        "onboard_contract",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=parent_execution_id,
+        actor_role="observer",
+        route_token_ref=route_token_ref,
+        contract_chain_id=chain_id,
+    )
+    return runtime.start_execution(
+        "mf_parallel.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+        parent_contract_execution_id=parent_execution_id,
+        root_contract_execution_id=parent_execution_id,
+        contract_chain_id=chain_id,
+        route_token_ref=route_token_ref,
+    )
 
 
 def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
@@ -639,13 +672,26 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
     ]
 
     runtime = ContractRuntime(service.registry)
-    record = runtime.start_execution(
-        "mf_parallel.v1",
+    with pytest.raises(ContractRuntimeError, match="contract_root_start_denied"):
+        runtime.start_execution(
+            "mf_parallel.v1",
+            project_id="aming-claw",
+            backlog_id="AC-CLAUDE-PARALLEL-CLOSE-RECONCILE-GUIDE-GAP-20260623",
+            contract_execution_id="cex-mf-parallel-root-start-blocked-test",
+            actor_role="observer",
+            route_token_ref="rtok-test",
+        )
+    record = _start_mf_parallel_successor(
+        runtime,
         project_id="aming-claw",
         backlog_id="AC-CLAUDE-PARALLEL-CLOSE-RECONCILE-GUIDE-GAP-20260623",
         contract_execution_id="cex-mf-parallel-runtime-path-test",
-        actor_role="observer",
         route_token_ref="rtok-test",
+    )
+    assert record["precheck_decision"]["schema_version"] == "contract_gate_decision.v1"
+    assert record["precheck_decision"]["decision"] == "allow"
+    assert record["parent_contract_execution_id"] == (
+        "cex-onboard-parent-for-cex-mf-parallel-runtime-path-test"
     )
     assert record["runtime_guide"]["next_legal_action"] == {
         "stage_id": "orchestration",
@@ -794,15 +840,69 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
     assert record["runtime_guide"]["next_legal_action"] is None
 
 
+def test_mf_parallel_gate_precheck_requires_onboard_parent():
+    service = ContractCrudService()
+    definition = service.read("mf_parallel.v1")["data"]["definition"]
+
+    root_decision = run_contract_runtime_precheck(
+        registry=service.registry,
+        definition=definition,
+        action="start_execution",
+        actor_role="observer",
+        subject={
+            "project_id": "aming-claw",
+            "backlog_id": "AC-MF-PARALLEL-GATE-PRECHECK",
+        },
+    )
+    assert root_decision["schema_version"] == "contract_gate_decision.v1"
+    assert root_decision["decision"] == "block"
+    assert "contract_root_start_denied" in root_decision["errors"]
+    assert root_decision["next_move"]["contract_id"] == "onboard_contract"
+
+    runtime = ContractRuntime(service.registry)
+    onboard = runtime.start_execution(
+        "onboard_contract",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-GATE-PRECHECK",
+        contract_execution_id="cex-mf-parallel-gate-onboard-parent",
+        actor_role="observer",
+        route_token_ref="rtok-mf-parallel-gate",
+        contract_chain_id="cchain-mf-parallel-gate",
+    )
+    hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-GATE-PRECHECK",
+        contract_execution_id="cex-mf-parallel-gate-hotfix-parent",
+        actor_role="observer",
+        parent_contract_execution_id=onboard["contract_execution_id"],
+        root_contract_execution_id=onboard["contract_execution_id"],
+        contract_chain_id=onboard["contract_chain_id"],
+        route_token_ref="rtok-mf-parallel-gate",
+    )
+
+    with pytest.raises(ContractRuntimeError, match="parent_contract_not_allowed"):
+        runtime.start_execution(
+            "mf_parallel.v1",
+            project_id="aming-claw",
+            backlog_id="AC-MF-PARALLEL-GATE-PRECHECK",
+            contract_execution_id="cex-mf-parallel-gate-wrong-parent",
+            actor_role="observer",
+            parent_contract_execution_id=hotfix["contract_execution_id"],
+            root_contract_execution_id=onboard["contract_execution_id"],
+            contract_chain_id=onboard["contract_chain_id"],
+            route_token_ref="rtok-mf-parallel-gate",
+        )
+
+
 def test_mf_parallel_runtime_binds_worker_lines_to_runtime_context_instances():
     service = ContractCrudService()
     runtime = ContractRuntime(service.registry)
-    record = runtime.start_execution(
-        "mf_parallel.v1",
+    record = _start_mf_parallel_successor(
+        runtime,
         project_id="aming-claw",
         backlog_id="AC-MF-PARALLEL-LANE-BOUND-LINES-BLOCK-20260625",
         contract_execution_id="cex-mf-parallel-lane-bound-test",
-        actor_role="observer",
         route_token_ref="rtok-lane-bound-test",
     )
     record = runtime.submit_line_write(
@@ -1461,6 +1561,79 @@ def test_contract_runtime_line_write_sanitizes_raw_token_evidence():
     assert "token" not in line["payload"]
     assert "tokens" not in line["payload"]
     assert "governance_token" not in line["payload"]["nested"]
+
+
+def test_contract_runtime_line_write_precheck_does_not_append_evidence():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-LINE-WRITE-DRY-RUN-PRECHECK-20260625",
+        contract_execution_id="cex-hotfix-line-write-precheck-test",
+        actor_role="observer",
+        route_token_ref="rtok-hotfix-line-write-precheck-test",
+    )
+    pre_reason = _runtime_write_from(
+        record,
+        actor_role="observer",
+        stage_id="pre_mutation",
+        line_id="hotfix_pre_reason",
+    )
+
+    precheck = runtime.precheck_line_write(
+        "cex-hotfix-line-write-precheck-test",
+        pre_reason,
+    )
+
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    assert precheck["completed_lines_count"] == 0
+    assert precheck["record"]["completed_lines"] == []
+    assert runtime.store.get("cex-hotfix-line-write-precheck-test")[
+        "completed_lines"
+    ] == []
+
+    result = runtime.submit_line_write(
+        "cex-hotfix-line-write-precheck-test",
+        pre_reason,
+    )
+    assert result["ok"] is True
+    assert len(result["record"]["completed_lines"]) == 1
+
+
+def test_contract_runtime_submit_line_rejects_no_mutation_expected_payload():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-LINE-WRITE-DRY-RUN-PRECHECK-20260625",
+        contract_execution_id="cex-hotfix-no-mutation-submit-test",
+        actor_role="observer",
+        route_token_ref="rtok-hotfix-no-mutation-submit-test",
+    )
+    write = _runtime_write_from(
+        record,
+        actor_role="observer",
+        stage_id="pre_mutation",
+        line_id="hotfix_pre_reason",
+    )
+    write["payload"] = {"status": "diagnostic_probe_no_mutation_expected"}
+
+    result = runtime.submit_line_write(
+        "cex-hotfix-no-mutation-submit-test",
+        write,
+    )
+
+    assert result["ok"] is False
+    assert result["decision"]["errors"] == [
+        "line_write_declares_no_mutation_expected"
+    ]
+    assert result["record"]["completed_lines"] == []
+    assert runtime.store.get("cex-hotfix-no-mutation-submit-test")[
+        "completed_lines"
+    ] == []
 
 
 def test_mf_parallel_read_only_adoption_proves_source_hash_and_duplicate_rejected():

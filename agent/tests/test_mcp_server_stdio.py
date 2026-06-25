@@ -1153,6 +1153,7 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_update_submit_line",
         "contract_runtime_current",
         "contract_runtime_guide",
+        "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
     }.issubset(tool_by_name)
     assert "contract_add_create" not in tool_by_name
@@ -1178,6 +1179,10 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "project_id",
         "contract_execution_id",
     ]
+    assert tool_by_name["contract_runtime_precheck_line"]["inputSchema"]["required"] == [
+        "project_id",
+        "contract_execution_id",
+    ]
     assert "execution_state_revision" in tool_by_name["contract_runtime_submit_line"][
         "inputSchema"
     ]["properties"]
@@ -1190,6 +1195,10 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "fence_token",
         "target_project_root",
     }
+    assert (
+        tool_by_name["contract_runtime_precheck_line"]["inputSchema"]["properties"]
+        == tool_by_name["contract_runtime_submit_line"]["inputSchema"]["properties"]
+    )
     for tool_name in (
         "onboard_contract_start",
         "onboard_contract_current",
@@ -1202,6 +1211,7 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "contract_update_submit_line",
         "contract_runtime_current",
         "contract_runtime_guide",
+        "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
     ):
         properties = tool_by_name[tool_name]["inputSchema"]["properties"]
@@ -1335,6 +1345,26 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         },
     )["ok"] is True
     assert dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "execution_state_revision": 1,
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
+            "runtime_context_id": "rctx-worker",
+            "task_id": "worker-task",
+            "parent_task_id": "observer-task",
+            "worker_role": "mf_sub",
+            "session_token_ref": "sref-worker",
+            "fence_token": "fence-worker",
+            "target_project_root": "/tmp/worker",
+        },
+    )["ok"] is True
+    assert dispatcher.dispatch(
         "contract_runtime_submit_line",
         {
             "project_id": "aming-claw",
@@ -1440,6 +1470,25 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "GET",
             "/api/projects/aming-claw/contract-runtime/cex-onboard/guide?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/line-writes/precheck",
+            {
+                "execution_state_revision": 1,
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
+                "runtime_context_id": "rctx-worker",
+                "task_id": "worker-task",
+                "parent_task_id": "observer-task",
+                "worker_role": "mf_sub",
+                "session_token_ref": "sref-worker",
+                "fence_token": "fence-worker",
+                "target_project_root": "/tmp/worker",
+            },
         ),
         (
             "POST",
