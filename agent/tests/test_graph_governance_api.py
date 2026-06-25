@@ -22884,9 +22884,46 @@ def test_contract_add_facade_starts_guided_runtime_and_rejects_forged_roles(conn
     )
 
 
+def test_contract_update_facade_requires_completed_onboard_successor(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-ROOT-DENIED"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(ValidationError) as exc:
+        server.handle_project_contract_update_start(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "route_token_ref": "rtok-contract-update-root-denied",
+                },
+            )
+        )
+
+    assert "onboard_contract runtime must be started" in str(exc.value)
+    assert exc.value.details["contract_id"] == "onboard_contract"
+    assert exc.value.details["successor_contract_id"] == "contract_update"
+
+
 def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
     backlog_id = "AC-CONTRACT-UPDATE-FACADE"
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update-onboard",
+            },
+        )
+    )
+    parent = _complete_source_backed_onboarding(
+        conn,
+        onboard["contract_execution_id"],
+    )
 
     started = server.handle_project_contract_update_start(
         _ctx_with_role(
@@ -22902,9 +22939,17 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
 
     assert started["ok"] is True
     assert started["contract_id"] == "contract_update"
+    assert started["parent_contract_execution_id"] == parent["contract_execution_id"]
+    assert started["root_contract_execution_id"] == parent["root_contract_execution_id"]
+    assert started["contract_chain_id"] == parent["contract_chain_id"]
     assert started["next_legal_action"]["id"] == "observer_request_contract_update"
     assert started["next_legal_action"]["source"] == "contract_runtime"
     execution_id = started["contract_execution_id"]
+    assert execution_id == server._contract_update_execution_id(
+        PID,
+        backlog_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
+    )
     record = server._contract_runtime(conn).store.get(execution_id)
     assert record["definition_source_sha256"].startswith("sha256:")
 
@@ -25916,6 +25961,67 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     )
     assert forged_qa["ok"] is False
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
+
+
+def test_hotfix_enter_accepts_verified_observer_route_ref(conn):
+    backlog_id = "AC-HOTFIX-OBSERVER-REF"
+    task_id = "hotfix-observer-ref-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-ref-root",
+            },
+        )
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-hotfix-ref",
+    )
+    route_token_ref = "rtok-hotfix-observer-ref"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["hotfix_enter"],
+    )
+
+    result = server.handle_project_hotfix_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "actor_role": "mf_sub",
+                "reason": "Human approved hotfix successor entry with observer ref.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["schema_version"] == "hotfix_enter.runtime_contract_response.v1"
+    assert result["successor_contract_execution_id"]
+    assert result["successor_contract_execution_id"] == result["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert result["runtime_guide"]["contract"]["contract_id"] == "observer_hotfix"
+    assert result["contract_runtime_current_state"]["contract_id"] == "observer_hotfix"
+    assert result["route_token_ref"] == route_token_ref
+    assert result["event"]["payload"]["derived_actor_role"] == "observer"
+    assert result["event"]["payload"]["body_role_claim_ignored"] == "mf_sub"
+    assert result["next_legal_action"]["id"] == "hotfix_post_action_summary"
 
 
 def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):

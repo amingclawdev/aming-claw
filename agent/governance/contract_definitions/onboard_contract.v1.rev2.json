@@ -160,6 +160,10 @@
         {
           "contract_id": "mf_parallel",
           "version": "v1"
+        },
+        {
+          "contract_id": "contract_update",
+          "version": "v1"
         }
       ],
       "requires_contract_chain_id": true,
@@ -208,6 +212,11 @@
     {
       "contract_id": "mf_parallel",
       "reason": "Observer-owned parallel worker orchestration successor after observer onboarding is complete.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "contract_update",
+      "reason": "Source-backed contract revision successor after observer onboarding is complete.",
       "version": "v1"
     }
   ],

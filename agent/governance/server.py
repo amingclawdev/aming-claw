@@ -34049,8 +34049,18 @@ def _contract_update_execution_id(
     project_id: str,
     backlog_id: str,
     *,
+    parent_contract_execution_id: str = "",
     contract_execution_id: str = "",
 ) -> str:
+    if parent_contract_execution_id and not contract_execution_id:
+        return _contract_runtime_stable_id(
+            "cex-contract-update",
+            project_id,
+            backlog_id,
+            parent_contract_execution_id,
+            CONTRACT_UPDATE_CONTRACT_ID,
+            "rev1",
+        )
     return contract_execution_id or _contract_runtime_stable_id(
         "cex-contract-update",
         project_id,
@@ -34069,6 +34079,11 @@ def _contract_update_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "project_id": str(record.get("project_id") or ""),
         "backlog_id": str(record.get("backlog_id") or ""),
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(record.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
         "contract_id": str(record.get("contract_id") or ""),
         "contract_runtime_current_state": current_state,
         "runtime_guide": guide,
@@ -34095,12 +34110,119 @@ def _contract_update_require_contract_record(
     )
 
 
+def _contract_definition_allows_successor(
+    definition: Mapping[str, Any],
+    successor_contract_id: str,
+) -> bool:
+    def _matches(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return text == successor_contract_id or text == f"{successor_contract_id}.v1"
+
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    successor_policy = (
+        system_layer.get("successor_policy")
+        if isinstance(system_layer.get("successor_policy"), Mapping)
+        else {}
+    )
+    for sources in (
+        successor_policy.get("allowed_successors") or [],
+        definition.get("successors") or [],
+    ):
+        for source in sources:
+            if isinstance(source, Mapping) and _matches(source.get("contract_id")):
+                return True
+    return False
+
+
+def _contract_update_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    parent_record = _onboard_contract_parent_for_successor(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        actor_role=actor_role,
+    )
+    if not _runtime_record_is_complete(parent_record):
+        return parent_record
+    runtime = _contract_runtime(conn)
+    parent_definition = runtime.registry.get(
+        str(parent_record.get("contract_id") or ""),
+        version=str(parent_record.get("version") or ""),
+        revision=str(parent_record.get("revision") or ""),
+        include_deprecated=True,
+    )
+    if not _contract_definition_allows_successor(
+        parent_definition,
+        CONTRACT_UPDATE_CONTRACT_ID,
+    ):
+        raise ValidationError(
+            "onboard_contract does not allow contract_update successor",
+            {
+                "parent_contract_execution_id": str(
+                    parent_record.get("contract_execution_id") or ""
+                ),
+                "parent_contract_id": str(parent_record.get("contract_id") or ""),
+                "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+                "next_operator_action": (
+                    "update onboard_contract successor graph before entering "
+                    "contract_update"
+                ),
+            },
+        )
+    return parent_record
+
+
+def _contract_update_require_successor_lineage(
+    record: Mapping[str, Any],
+    *,
+    parent_record: Mapping[str, Any],
+) -> None:
+    parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+    root_execution_id = str(
+        parent_record.get("root_contract_execution_id") or parent_execution_id
+    )
+    chain_id = str(parent_record.get("contract_chain_id") or "")
+    mismatches = {
+        field: {
+            "record": str(record.get(field) or ""),
+            "expected": expected,
+        }
+        for field, expected in (
+            ("parent_contract_execution_id", parent_execution_id),
+            ("root_contract_execution_id", root_execution_id),
+            ("contract_chain_id", chain_id),
+        )
+        if str(record.get(field) or "") != expected
+    }
+    if mismatches:
+        raise ValidationError(
+            "contract_update execution lineage does not match completed onboard parent",
+            {
+                "contract_execution_id": str(record.get("contract_execution_id") or ""),
+                "contract_id": str(record.get("contract_id") or ""),
+                "mismatches": mismatches,
+            },
+        )
+
+
 def _contract_update_start(
     conn,
     *,
     project_id: str,
     backlog_id: str,
     actor_role: str,
+    parent_record: Mapping[str, Any],
     route_token_ref: str = "",
     contract_execution_id: str = "",
     metadata: Mapping[str, Any] | None = None,
@@ -34108,9 +34230,15 @@ def _contract_update_start(
     stale_contract_execution_id: str = "",
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
+    parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+    root_execution_id = str(
+        parent_record.get("root_contract_execution_id") or parent_execution_id
+    )
+    chain_id = str(parent_record.get("contract_chain_id") or "")
     execution_id = _contract_update_execution_id(
         project_id,
         backlog_id,
+        parent_contract_execution_id=parent_execution_id,
         contract_execution_id=contract_execution_id,
     )
     try:
@@ -34119,6 +34247,10 @@ def _contract_update_start(
             record,
             contract_execution_id=execution_id,
             action="enter/read",
+        )
+        _contract_update_require_successor_lineage(
+            record,
+            parent_record=parent_record,
         )
         if route_token_ref and not str(record.get("route_token_ref") or ""):
             record["route_token_ref"] = route_token_ref
@@ -34138,6 +34270,9 @@ def _contract_update_start(
             backlog_id=backlog_id,
             actor_role=actor_role,
             contract_execution_id=execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=root_execution_id,
+            contract_chain_id=chain_id,
             route_token_ref=route_token_ref,
             role_binding={
                 "observer": "observer",
@@ -34148,10 +34283,13 @@ def _contract_update_start(
             backlog_lineage={
                 "project_id": project_id,
                 "backlog_id": backlog_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "root_contract_execution_id": root_execution_id,
             },
             metadata={
                 "facade": "contract_update",
                 "generic_crud_exposed": False,
+                "entrypoint": "onboard_successor",
                 **dict(metadata or {}),
             },
         )
@@ -34186,6 +34324,9 @@ def _contract_update_start(
                 backlog_id=backlog_id,
                 actor_role=actor_role,
                 contract_execution_id=recovery_execution_id,
+                parent_contract_execution_id=parent_execution_id,
+                root_contract_execution_id=root_execution_id,
+                contract_chain_id=chain_id,
                 route_token_ref=route_token_ref,
                 role_binding={
                     "observer": "observer",
@@ -34197,10 +34338,13 @@ def _contract_update_start(
                     "project_id": project_id,
                     "backlog_id": backlog_id,
                     "stale_contract_execution_id": execution_id,
+                    "parent_contract_execution_id": parent_execution_id,
+                    "root_contract_execution_id": root_execution_id,
                 },
                 metadata={
                     "facade": "contract_update",
                     "generic_crud_exposed": False,
+                    "entrypoint": "onboard_successor",
                     "recovery_policy": "start_new_execution",
                     "stale_contract_execution_id": execution_id,
                     "recovery_reason": "stale_pinned_execution",
@@ -41988,7 +42132,9 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     task_id = str(body.get("task_id") or "").strip()
     actor = str(body.get("actor") or "api").strip()
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
-    route_token_ref = str(body.get("route_token_ref") or "").strip()
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
     successor_runtime: dict[str, Any] = {}
     source_backed = False
     derived_actor_role = ""
@@ -42015,15 +42161,19 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             or deterministic_onboard_root_exists
         )
         if source_backed:
-            session = ctx.require_auth(conn)
-            derived_actor_role = str(session.get("role") or "").strip()
+            derived_actor_role = _contract_runtime_effective_actor_role(
+                ctx,
+                conn,
+                action="hotfix_enter",
+                backlog_id=backlog_id,
+            )
             if derived_actor_role != "observer":
                 raise PermissionDeniedError(
                     derived_actor_role,
                     "hotfix_enter",
                     {
                         "body_role_claim": body_role_claim,
-                        "role_source": "request_session",
+                        "role_source": "contract_runtime_effective_actor_role",
                     },
                 )
             try:
@@ -42740,17 +42890,12 @@ def handle_project_contract_update_start(ctx: RequestContext):
         body.get("stale_contract_execution_id") or ""
     ).strip()
     with DBContext(project_id) as conn:
-        effective_execution_id = _contract_update_execution_id(
-            project_id,
-            backlog_id,
-            contract_execution_id=contract_execution_id,
-        )
         actor_role = _contract_update_effective_actor_role(
             ctx,
             conn,
             action="contract_update_start",
             backlog_id=backlog_id,
-            contract_execution_id=effective_execution_id,
+            contract_execution_id="",
         )
         if actor_role != "observer":
             raise PermissionDeniedError(
@@ -42759,11 +42904,30 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 {"required_role": "observer"},
             )
         try:
+            parent_record = _contract_update_parent_for_successor(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+            )
+            if not _runtime_record_is_complete(parent_record):
+                current_state = _runtime_current_state_from_record(parent_record)
+                raise ValidationError(
+                    "observer onboarding contract must complete before contract_update successor",
+                    {
+                        "contract_execution_id": parent_record.get(
+                            "contract_execution_id"
+                        ),
+                        "next_legal_action": current_state.get("next_legal_action")
+                        or {},
+                    },
+                )
             record = _contract_update_start(
                 conn,
                 project_id=project_id,
                 backlog_id=backlog_id,
                 actor_role=actor_role,
+                parent_record=parent_record,
                 route_token_ref=route_token_ref,
                 contract_execution_id=contract_execution_id,
                 metadata=metadata,
@@ -42777,6 +42941,22 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 route_token_ref=route_token_ref,
                 actor_role=actor_role,
             )
+        except ContractRuntimeError as exc:
+            deterministic_onboard_id = _onboard_contract_execution_id(
+                project_id,
+                backlog_id,
+            )
+            raise ValidationError(
+                "source-backed onboard_contract runtime must be started before contract_update successor",
+                {
+                    "contract_execution_id": deterministic_onboard_id,
+                    "contract_id": ONBOARD_CONTRACT_ID,
+                    "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                },
+            ) from exc
         conn.commit()
     return _contract_update_response(record)
 

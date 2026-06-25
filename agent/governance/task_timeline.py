@@ -7819,6 +7819,13 @@ MF_CROSS_REF_BRIDGE_COMMAND_FIELDS = {
     "command_id",
     "originating_command_id",
 }
+MF_CROSS_REF_BEFORE_HANDOFF_DISPOSITIONS = {
+    "abandoned_before_handoff",
+    "cancelled_before_handoff",
+    "discarded_before_handoff",
+    "superseded_before_handoff",
+    "timed_out_before_handoff",
+}
 
 
 def _cross_ref_lane_identity(value: Any) -> dict[str, str]:
@@ -8447,6 +8454,91 @@ def _cross_ref_bridge_scope_membership(
     return membership
 
 
+def _cross_ref_disposed_before_handoff_lanes(
+    rows: list[Any],
+    anchor: dict[str, str],
+) -> tuple[set[tuple[str, ...]], list[dict[str, Any]]]:
+    """Return sibling lanes explicitly removed before handoff.
+
+    This is deliberately narrower than a bridge. It never admits evidence into
+    the row's close-satisfying lane set; it only prevents a non-handoff sibling
+    attempt from blocking close after the observer records an in-scope
+    supersede/abandon disposition.
+    """
+
+    membership: set[tuple[str, ...]] = set()
+    records: list[dict[str, Any]] = []
+    row_backlog = str(anchor.get("backlog_id") or "").strip()
+    row_project = str(anchor.get("project_id") or "").strip()
+    row_route = _cross_ref_bridge_route_scope(anchor)
+    row_command = str(anchor.get("command") or "").strip()
+
+    for raw in rows:
+        event = _mapping(raw)
+        if not event or not _event_passed(event):
+            continue
+        marker = _route_marker(
+            event.get("event_kind") or event.get("event_type") or event.get("phase")
+        )
+        if marker not in {
+            "record_blocker",
+            "contract_state_changed",
+            "contract_binding",
+        }:
+            continue
+        disposition = (
+            _first_deep_mapping(event, "sibling_lane_disposition")
+            or _first_deep_mapping(event, "lane_disposition")
+            or _first_deep_mapping(event, "worker_lane_disposition")
+        )
+        if not disposition:
+            continue
+        disposition_kind = _route_marker(
+            disposition.get("disposition")
+            or disposition.get("state")
+            or disposition.get("status")
+            or disposition.get("reason")
+        )
+        before_handoff = (
+            disposition_kind in MF_CROSS_REF_BEFORE_HANDOFF_DISPOSITIONS
+            or _truthy(disposition.get("before_handoff"))
+        )
+        if not before_handoff or _truthy(disposition.get("handoff_reached")):
+            continue
+        task_id = (
+            str(
+                disposition.get("task_id")
+                or disposition.get("worker_task_id")
+                or disposition.get("child_task_id")
+                or ""
+            ).strip()
+        )
+        if not task_id:
+            continue
+
+        event_route = _cross_ref_bridge_route_scope(event)
+        route_ok = all(
+            (not want) or (not got) or want == got
+            for want, got in zip(row_route, event_route)
+        )
+        if not route_ok:
+            continue
+        event_command = _cross_ref_bridge_command(event)
+        if row_command and event_command and event_command != row_command:
+            continue
+
+        key = (row_backlog, row_project, task_id)
+        membership.add(key)
+        records.append({
+            "event_id": event.get("id") or event.get("event_id"),
+            "task_id": task_id,
+            "disposition": disposition_kind or "before_handoff",
+            "reason": "sibling_lane_disposed_before_handoff",
+            "close_satisfying_by_itself": False,
+        })
+    return membership, records
+
+
 def mf_close_cross_ref_gate_verification(
     events: list[dict[str, Any]] | None,
     row_identity: dict[str, Any] | None = None,
@@ -8564,16 +8656,27 @@ def mf_close_cross_ref_gate_verification(
         route_context_gate=route_context_gate,
     )
     lane_membership = _cross_ref_bridge_scope_membership(rows, anchor)
+    disposed_lane_membership, disposed_lane_records = (
+        _cross_ref_disposed_before_handoff_lanes(rows, anchor)
+    )
     route_token_child_lineages = _cross_ref_route_token_child_diagnostics(
         rows,
         anchor,
         route_context_gate,
     )
     accepted_route_token_child_lineages = [
-        item for item in route_token_child_lineages if item.get("accepted")
+        item
+        for item in route_token_child_lineages
+        if item.get("accepted")
+        and _cross_ref_lane_key(_mapping(item.get("lane_identity")))
+        not in disposed_lane_membership
     ]
     advisory_route_token_child_lineages = [
-        item for item in route_token_child_lineages if not item.get("accepted")
+        item
+        for item in route_token_child_lineages
+        if not item.get("accepted")
+        and _cross_ref_lane_key(_mapping(item.get("lane_identity")))
+        not in disposed_lane_membership
     ]
     row_backlog = str(anchor.get("backlog_id") or "").strip()
     row_project = str(anchor.get("project_id") or "").strip()
@@ -8617,6 +8720,8 @@ def mf_close_cross_ref_gate_verification(
         # the row's equivalence class and is not a cross-ref mismatch.
         lane = _cross_ref_lane_identity(event)
         lane_key = _cross_ref_lane_key(lane)
+        if lane_key in disposed_lane_membership:
+            continue
         if lane_key in lane_membership:
             continue
         aggregate_key = (lane_key[0], lane_key[1], "")
@@ -8696,6 +8801,10 @@ def mf_close_cross_ref_gate_verification(
         "accepted_route_token_child_lineages": accepted_route_token_child_lineages,
         "advisory_route_token_child_lineages": advisory_route_token_child_lineages,
         "ignored_route_token_child_lineages": advisory_route_token_child_lineages,
+        "disposed_before_handoff_lane_membership": sorted(
+            {"|".join(key) for key in disposed_lane_membership}
+        ),
+        "ignored_disposed_before_handoff_lanes": disposed_lane_records,
         "rejected_cross_ref_evidence": rejected,
     }
 

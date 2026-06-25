@@ -201,7 +201,9 @@ def test_default_registry_migrated_definitions_expose_explicit_system_layer():
 
     onboard = registry.get("onboard_contract")["read_model"]["system_layer"]
     assert onboard["successor_policy"]["allowed_successors"] == [
-        {"contract_id": "observer_hotfix", "version": "v1"}
+        {"contract_id": "observer_hotfix", "version": "v1"},
+        {"contract_id": "mf_parallel", "version": "v1"},
+        {"contract_id": "contract_update", "version": "v1"},
     ]
     hotfix = registry.get("observer_hotfix")["read_model"]["system_layer"]
     assert hotfix["successor_policy"]["allowed_parent_contracts"] == [

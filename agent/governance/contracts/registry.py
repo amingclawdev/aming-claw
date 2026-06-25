@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
 
 from .hash import canonical_json, file_sha256, stable_sha256
@@ -268,6 +270,7 @@ def _without_private_fields(definition: Mapping[str, Any]) -> dict[str, Any]:
             "definition_hash",
             "definition_load_record",
             "read_model",
+            "source_control_integrity",
             "source_sha256",
         }
     }
@@ -294,6 +297,10 @@ def _attach_source_load_record(
 ) -> None:
     source_sha256 = file_sha256(path)
     source_path = str(path)
+    source_control_integrity = _source_control_integrity(
+        path,
+        source_sha256=source_sha256,
+    )
     load_record_identity = {
         "schema_version": "contract_definition_load_record_identity.v1",
         "source_path": source_path,
@@ -317,15 +324,121 @@ def _attach_source_load_record(
         "definition_hash": definition.get("definition_hash", ""),
         "loaded_at": loaded_at,
         "runtime_version": CONTRACT_REGISTRY_RUNTIME_VERSION,
-        "drift_status": "current",
-        "next_operator_action": "none",
+        "drift_status": source_control_integrity["drift_status"],
+        "source_control_integrity": dict(source_control_integrity),
+        "next_operator_action": source_control_integrity["next_operator_action"],
     }
     definition["source_sha256"] = source_sha256
+    definition["source_control_integrity"] = dict(source_control_integrity)
     definition["definition_load_record"] = load_record
     read_model = definition.get("read_model")
     if isinstance(read_model, dict):
         read_model["source_sha256"] = source_sha256
+        read_model["source_control_integrity"] = dict(source_control_integrity)
         read_model["definition_load_record"] = dict(load_record)
+
+
+def _source_control_integrity(path: Path, *, source_sha256: str) -> dict[str, Any]:
+    integrity: dict[str, Any] = {
+        "schema_version": "contract_source_control_integrity.v1",
+        "source_path": str(path),
+        "source_sha256": source_sha256,
+        "baseline_source": "git_head",
+        "status": "current",
+        "drift_status": "current",
+        "severity": "none",
+        "changed_since_head": False,
+        "requires_contract_update": False,
+        "legal_status": "legal",
+        "gate_enforcement": "warn_only_until_contract_update_runtime_exists",
+        "blocks_runtime": False,
+        "next_operator_action": "none",
+    }
+    git_root = _git_root_for(path)
+    if git_root is None:
+        integrity.update(
+            {
+                "baseline_source": "unavailable",
+                "status": "source_control_unavailable",
+            }
+        )
+        return integrity
+
+    try:
+        relative_path = path.resolve().relative_to(git_root).as_posix()
+    except ValueError:
+        integrity.update(
+            {
+                "baseline_source": "unavailable",
+                "status": "outside_git_worktree",
+            }
+        )
+        return integrity
+
+    integrity["git_root"] = str(git_root)
+    integrity["git_relative_path"] = relative_path
+    head_blob = _git_head_blob(git_root, relative_path)
+    if head_blob is None:
+        integrity.update(_warning_integrity_fields("missing_from_head"))
+        return integrity
+
+    head_sha256 = "sha256:" + hashlib.sha256(head_blob).hexdigest()
+    integrity["git_head_source_sha256"] = head_sha256
+    if head_sha256 != source_sha256:
+        integrity.update(_warning_integrity_fields("changed_since_head"))
+    return integrity
+
+
+def _warning_integrity_fields(status: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "drift_status": "source_control_drift",
+        "severity": "warning",
+        "changed_since_head": True,
+        "requires_contract_update": True,
+        "legal_status": "illegal_without_contract_update",
+        "blocks_runtime": False,
+        "next_operator_action": "run_contract_update_or_revert_direct_source_edit",
+        "warning": (
+            "source-controlled contract definition differs from its git HEAD "
+            "baseline; this is warning-only until contract_update can author "
+            "the update path"
+        ),
+    }
+
+
+def _git_root_for(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return Path(root).resolve() if root else None
+
+
+def _git_head_blob(git_root: Path, relative_path: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(git_root), "show", f"HEAD:{relative_path}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return bytes(result.stdout)
 
 
 def _utc_now() -> str:

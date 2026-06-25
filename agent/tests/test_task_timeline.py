@@ -13257,6 +13257,94 @@ def test_cross_ref_keeps_unproven_route_token_child_lineage_advisory():
     assert lineage["close_satisfying_by_itself"] is False
 
 
+def test_cross_ref_ignores_explicitly_disposed_sibling_before_handoff():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    canonical = route_context_gate["route_identity"]
+    disposition = {
+        "id": 23,
+        "event_type": "mf.record_blocker",
+        "event_kind": "record_blocker",
+        "phase": "qa_handoff",
+        "actor": "observer",
+        "status": "accepted",
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "task_id": "root-task",
+        "payload": {
+            **canonical,
+            "observer_command_id": "cmd-root-route",
+            "sibling_lane_disposition": {
+                "task_id": "worker-a-task",
+                "runtime_context_id": "mfrctx-worker-a",
+                "worker_slot_id": "worker-a",
+                "disposition": "superseded_before_handoff",
+                "handoff_reached": False,
+                "reason": "worker lane was replaced before qa_handoff",
+            },
+        },
+    }
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation, disposition],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is True
+    assert gate["rejected_cross_ref_evidence"] == []
+    assert gate["accepted_route_token_child_lineages"] == []
+    assert gate["advisory_route_token_child_lineages"] == []
+    assert gate["disposed_before_handoff_lane_membership"] == [
+        "AC-ROUTE-TOKEN-CHILD|aming-claw|worker-a-task"
+    ]
+    ignored = gate["ignored_disposed_before_handoff_lanes"]
+    assert ignored[0]["event_id"] == 23
+    assert ignored[0]["close_satisfying_by_itself"] is False
+
+
+def test_cross_ref_rejects_disposition_after_handoff_claim():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, cleanup, root_close, worker_implementation = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    canonical = route_context_gate["route_identity"]
+    disposition = {
+        "id": 23,
+        "event_type": "mf.record_blocker",
+        "event_kind": "record_blocker",
+        "phase": "qa_handoff",
+        "actor": "observer",
+        "status": "accepted",
+        "backlog_id": row_identity["backlog_id"],
+        "project_id": row_identity["project_id"],
+        "task_id": "root-task",
+        "payload": {
+            **canonical,
+            "observer_command_id": "cmd-root-route",
+            "sibling_lane_disposition": {
+                "task_id": "worker-a-task",
+                "disposition": "superseded_before_handoff",
+                "handoff_reached": True,
+            },
+        },
+    }
+
+    gate = task_timeline.mf_close_cross_ref_gate_verification(
+        [cleanup, root_close, worker_implementation, disposition],
+        row_identity,
+        route_context_gate=route_context_gate,
+    )
+
+    assert gate["passed"] is False
+    assert gate["ignored_disposed_before_handoff_lanes"] == []
+    assert [item["id"] for item in gate["rejected_cross_ref_evidence"]] == [22]
+
+
 def test_cross_ref_accepts_registry_backed_route_token_child_lineage_without_bridge():
     from agent.governance import task_timeline
 

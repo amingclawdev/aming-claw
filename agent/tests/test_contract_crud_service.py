@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -342,6 +343,81 @@ def test_registry_resolves_latest_active_revision_and_runtime_pins_source_hash(
     assert exc.value.field == "definition_source_sha256"
 
 
+def test_direct_source_edit_warns_without_blocking_runtime_until_contract_update(
+    tmp_path: Path,
+):
+    try:
+        subprocess.run(
+            ["git", "--version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git binary is required for source-control integrity warning")
+
+    service = ContractCrudService(tmp_path)
+    created = service.create(_definition())
+    source_path = Path(created["data"]["path"])
+
+    for args in (
+        ["git", "init"],
+        ["git", "config", "user.email", "contracts@example.test"],
+        ["git", "config", "user.name", "Contract Tests"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "baseline contract source"],
+    ):
+        subprocess.run(
+            args,
+            cwd=tmp_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    payload["instruction_layer"]["inline"].append(
+        "Direct source edit without contract_update."
+    )
+    source_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    read = service.read("observer_hotfix")
+    assert read["ok"] is True
+    definition = read["data"]["definition"]
+    integrity = definition["source_control_integrity"]
+    assert integrity["drift_status"] == "source_control_drift"
+    assert integrity["status"] == "changed_since_head"
+    assert integrity["severity"] == "warning"
+    assert integrity["requires_contract_update"] is True
+    assert integrity["legal_status"] == "illegal_without_contract_update"
+    assert integrity["gate_enforcement"] == (
+        "warn_only_until_contract_update_runtime_exists"
+    )
+    assert integrity["blocks_runtime"] is False
+    assert integrity["git_head_source_sha256"].startswith("sha256:")
+    assert integrity["git_head_source_sha256"] != definition["source_sha256"]
+
+    load_record = definition["definition_load_record"]
+    assert load_record["drift_status"] == "source_control_drift"
+    assert load_record["next_operator_action"] == (
+        "run_contract_update_or_revert_direct_source_edit"
+    )
+    assert load_record["source_control_integrity"]["blocks_runtime"] is False
+    assert definition["read_model"]["source_control_integrity"] == integrity
+
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-SOURCE-DRIFT-WARN-ONLY",
+        contract_execution_id="cex-source-drift-warn-only",
+        actor_role="observer",
+        route_token_ref="rtok-source-drift-warning",
+    )
+    assert record["contract_execution_id"] == "cex-source-drift-warn-only"
+    assert record["definition_source_sha256"] == definition["source_sha256"]
+
+
 def test_crud_service_returns_structured_failure_results(tmp_path: Path):
     service = ContractCrudService(tmp_path)
 
@@ -550,6 +626,7 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
             "mf_sub",
             "mf_subagent_finish_gate",
         ),
+        ("qa_handoff", "worker_review_ready_handoff", "mf_sub", "review_ready"),
         (
             "qa",
             "qa_independent_verification",
@@ -635,6 +712,37 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
         )
         assert accepted["ok"] is True
         record = accepted["record"]
+
+    runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="qa")
+    record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+    rejected_qa_before_handoff = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="qa",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert rejected_qa_before_handoff["ok"] is False
+    assert any(
+        "write does not match next legal action" in error
+        for error in rejected_qa_before_handoff["decision"]["errors"]
+    )
+
+    runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="mf_sub")
+    record = runtime.store.get("cex-mf-parallel-runtime-path-test")
+    accepted_handoff = runtime.submit_line_write(
+        "cex-mf-parallel-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="mf_sub",
+            stage_id="qa_handoff",
+            line_id="worker_review_ready_handoff",
+        ),
+    )
+    assert accepted_handoff["ok"] is True
+    record = accepted_handoff["record"]
 
     runtime.current_guide("cex-mf-parallel-runtime-path-test", actor_role="observer")
     record = runtime.store.get("cex-mf-parallel-runtime-path-test")
@@ -1265,6 +1373,14 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
             "reason": (
                 "Observer-owned parallel worker orchestration successor after "
                 "observer onboarding is complete."
+            ),
+            "version": "v1",
+        },
+        {
+            "contract_id": "contract_update",
+            "reason": (
+                "Source-backed contract revision successor after observer "
+                "onboarding is complete."
             ),
             "version": "v1",
         }
