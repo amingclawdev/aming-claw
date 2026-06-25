@@ -915,6 +915,56 @@ def test_root_terminal_contract_with_close_ready_prompts_backlog_close_route_tok
     assert hint["issue_route_token_request"]["parent_route_token_ref"] == "rtok-parent"
 
 
+def test_reference_only_contract_execution_id_does_not_trigger_terminal_close():
+    route_identity = {
+        "route_id": "route-root",
+        "route_context_hash": "sha256:ctx-root",
+        "prompt_contract_id": "rprompt-root",
+        "prompt_contract_hash": "sha256:prompt-root",
+        "visible_injection_manifest_hash": "sha256:visible-root",
+        "route_token_ref": "rtok-parent",
+    }
+    contract = {
+        "contract": {
+            "contract_id": "onboard_contract.v1",
+            "contract_template_id": "onboard_contract.v1",
+            "contract_chain_id": "cchain-root-terminal",
+            "contract_execution_id": "cex-root-terminal",
+            "contract_revision_id": "rev-root-terminal",
+            "state": "selected",
+            "route_identity": route_identity,
+            "required_evidence": ["route_context"],
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [
+            _event(21, "route_context", payload={"route_context": route_identity}),
+            _event(
+                22,
+                "close_ready",
+                status="accepted",
+                verification={
+                    "contract_execution_id": "cex-root-terminal",
+                    "scope": "reference_only",
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-CONTRACT-RUNTIME",
+            "task_id": "task-root-terminal",
+            "target_files": json.dumps(["agent/governance/contract_state_runtime.py"]),
+        },
+    )
+
+    action = projection["next_legal_action"]
+    assert action["id"] == "close_ready"
+    assert action["action"] == "record_close_ready"
+    assert action["contract_execution_id"] == "cex-root-terminal"
+
+
 def test_projection_exposes_active_contract_execution_handle():
     contract = {
         "contract": {
@@ -1656,6 +1706,18 @@ def test_requirement_evidence_is_scoped_by_contract_execution_id():
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
+    reference_only = build_contract_state_projection(
+        [
+            _event(
+                82,
+                "review_lane",
+                payload={"requirement_id": "review_done"},
+                verification={"contract_execution_id": "cex-review-expected"},
+            )
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
     right = build_contract_state_projection(
         [
             _event(
@@ -1670,6 +1732,8 @@ def test_requirement_evidence_is_scoped_by_contract_execution_id():
 
     assert wrong["completed_evidence"] == []
     assert wrong["missing_evidence"] == ["review_done"]
+    assert reference_only["completed_evidence"] == []
+    assert reference_only["missing_evidence"] == ["review_done"]
     assert [item["id"] for item in right["completed_evidence"]] == ["review_done"]
     assert right["missing_evidence"] == []
 

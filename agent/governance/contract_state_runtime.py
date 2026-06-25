@@ -620,6 +620,27 @@ _SUCCESSOR_BINDING_MARKER_FIELD_NAMES = {
     "successor_contract_template_id",
 }
 
+_CONTRACT_EXECUTION_IDENTITY_FIELD_NAMES = (
+    "active_contract_execution_id",
+    "contract_execution_id",
+    "parent_contract_execution_id",
+    "reviewed_contract_execution_id",
+    "successor_contract_execution_id",
+)
+
+_CONTRACT_EXECUTION_IDENTITY_CONTAINER_KEYS = (
+    "active_contract",
+    "active_contract_execution",
+    "contract",
+    "contract_binding",
+    "contract_execution",
+    "contract_identity",
+    "contract_instance",
+    "selected_successor_contract",
+    "successor_contract",
+    "successor_contract_binding",
+)
+
 _TEST_ROUTE_FIELD_NAMES = (
     "test_route",
     "verification_route",
@@ -1422,30 +1443,54 @@ def _completed_requirement_event_ref(
     }
 
 
-def _event_contract_execution_ids(event: Mapping[str, Any]) -> set[str]:
-    execution_ids = {
-        str(event.get(field) or "").strip()
-        for field in (
-            "active_contract_execution_id",
-            "contract_execution_id",
-            "parent_contract_execution_id",
-            "reviewed_contract_execution_id",
-            "successor_contract_execution_id",
-        )
-        if str(event.get(field) or "").strip()
+def _contract_execution_ids_from_direct_fields(value: Mapping[str, Any]) -> set[str]:
+    return {
+        str(value.get(field) or "").strip()
+        for field in _CONTRACT_EXECUTION_IDENTITY_FIELD_NAMES
+        if str(value.get(field) or "").strip()
     }
-    for payload in _event_payloads(event):
-        for field in (
-            "active_contract_execution_id",
-            "contract_execution_id",
-            "parent_contract_execution_id",
-            "reviewed_contract_execution_id",
-            "successor_contract_execution_id",
-        ):
-            execution_id = _payload_field_value(payload, {field})
-            if execution_id:
-                execution_ids.add(execution_id)
+
+
+def _collect_contract_execution_field_values(value: Any, *, depth: int = 0) -> set[str]:
+    if depth > 6:
+        return set()
+    values: set[str] = set()
+    if isinstance(value, Mapping):
+        for field in _CONTRACT_EXECUTION_IDENTITY_FIELD_NAMES:
+            token = str(value.get(field) or "").strip()
+            if token:
+                values.add(token)
+        for child in value.values():
+            values.update(
+                _collect_contract_execution_field_values(child, depth=depth + 1)
+            )
+    elif isinstance(value, list | tuple | set):
+        for child in value:
+            values.update(
+                _collect_contract_execution_field_values(child, depth=depth + 1)
+            )
+    return values
+
+
+def _event_contract_execution_ids(event: Mapping[str, Any]) -> set[str]:
+    execution_ids = _contract_execution_ids_from_direct_fields(event)
+    payload = _mapping(event.get("payload"))
+    if payload:
+        execution_ids.update(_contract_execution_ids_from_direct_fields(payload))
+        for key in _CONTRACT_EXECUTION_IDENTITY_CONTAINER_KEYS:
+            container = payload.get(key)
+            if isinstance(container, Mapping):
+                execution_ids.update(
+                    _contract_execution_ids_from_direct_fields(container)
+                )
     return execution_ids
+
+
+def _event_reference_only_contract_execution_ids(event: Mapping[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for key in ("payload", "verification", "artifact_refs"):
+        refs.update(_collect_contract_execution_field_values(event.get(key)))
+    return refs - _event_contract_execution_ids(event)
 
 
 def _close_ready_evidence_refs(
@@ -1472,6 +1517,12 @@ def _close_ready_evidence_refs(
             expected_execution_id
             and execution_ids
             and expected_execution_id not in execution_ids
+        ):
+            continue
+        if (
+            expected_execution_id
+            and not execution_ids
+            and _event_reference_only_contract_execution_ids(event)
         ):
             continue
         event_id = _event_ref_id(event)
@@ -2631,28 +2682,7 @@ def _event_satisfies_requirement(
     if required_execution_id:
         event_id = _event_ref_id(event)
         accepted_event_ids = set(_string_list(requirement.get("accepted_event_ids")))
-        execution_ids = {
-            str(event.get(field) or "").strip()
-            for field in (
-                "active_contract_execution_id",
-                "contract_execution_id",
-                "parent_contract_execution_id",
-                "reviewed_contract_execution_id",
-                "successor_contract_execution_id",
-            )
-            if str(event.get(field) or "").strip()
-        }
-        for payload in _event_payloads(event):
-            for field in (
-                "active_contract_execution_id",
-                "contract_execution_id",
-                "parent_contract_execution_id",
-                "reviewed_contract_execution_id",
-                "successor_contract_execution_id",
-            ):
-                execution_id = _payload_field_value(payload, {field})
-                if execution_id:
-                    execution_ids.add(execution_id)
+        execution_ids = _event_contract_execution_ids(event)
         if (
             required_execution_id not in execution_ids
             and event_id not in accepted_event_ids
@@ -2955,26 +2985,7 @@ def _event_mentions_contract_execution(
     execution_id = str(contract_execution_id or "").strip()
     if not execution_id:
         return True
-    for field in (
-        "active_contract_execution_id",
-        "contract_execution_id",
-        "parent_contract_execution_id",
-        "reviewed_contract_execution_id",
-        "successor_contract_execution_id",
-    ):
-        if str(event.get(field) or "").strip() == execution_id:
-            return True
-    for payload in _event_payloads(event):
-        for field in (
-            "active_contract_execution_id",
-            "contract_execution_id",
-            "parent_contract_execution_id",
-            "reviewed_contract_execution_id",
-            "successor_contract_execution_id",
-        ):
-            if _payload_field_value(payload, {field}) == execution_id:
-                return True
-    return False
+    return execution_id in _event_contract_execution_ids(event)
 
 
 def _contract_execution_scoped_events(
