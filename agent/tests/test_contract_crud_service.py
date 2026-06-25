@@ -728,6 +728,180 @@ def test_default_registry_exposes_contract_add_definition_and_runtime_path():
     assert record["runtime_guide"]["next_legal_action"] is None
 
 
+def test_contract_add_worker_asset_binding_payload_is_visible_to_qa():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "contract_add",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-LINE-WRITE-EVIDENCE-PERSISTENCE-20260625",
+        contract_execution_id="cex-contract-add-evidence-payload-test",
+        actor_role="observer",
+        route_token_ref="rtok-contract-add-evidence-test",
+    )
+
+    record = runtime.submit_line_write(
+        "cex-contract-add-evidence-payload-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="observer_request",
+            line_id="observer_request_contract_add",
+        ),
+    )["record"]
+
+    for stage_id, line_id in [
+        ("worker_precheck", "worker_draft_precheck"),
+        ("worker_source", "worker_source_or_adoption_proof"),
+        ("worker_runtime_visibility", "worker_runtime_visibility_proof"),
+    ]:
+        runtime.current_guide("cex-contract-add-evidence-payload-test", actor_role="mf_sub")
+        record = runtime.store.get("cex-contract-add-evidence-payload-test")
+        record = runtime.submit_line_write(
+            "cex-contract-add-evidence-payload-test",
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )["record"]
+
+    runtime.current_guide("cex-contract-add-evidence-payload-test", actor_role="mf_sub")
+    record = runtime.store.get("cex-contract-add-evidence-payload-test")
+    asset_binding_write = _runtime_write_from(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_asset_binding",
+        line_id="worker_asset_binding_proposal_or_waiver",
+    )
+    asset_binding_write.update(
+        {
+            "payload": {
+                "binding_status": "waived",
+                "proposed_bindings": [],
+                "waiver": {"direct_trusted_graph_db_write": False},
+                "route_token_ref": "rtok-copy-safe-ref",
+            },
+            "artifact_refs": [],
+            "trace_id": "gqt-20260625-contract-add-evidence",
+            "commit_sha": "dd6a55b55e88338fd0586d3e75ed66c5100cf1e1",
+        }
+    )
+    accepted = runtime.submit_line_write(
+        "cex-contract-add-evidence-payload-test",
+        asset_binding_write,
+    )
+
+    assert accepted["ok"] is True
+    record = accepted["record"]
+    asset_line = next(
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] == "worker_asset_binding_proposal_or_waiver"
+    )
+    assert asset_line["payload"] == {
+        "binding_status": "waived",
+        "proposed_bindings": [],
+        "waiver": {"direct_trusted_graph_db_write": False},
+        "route_token_ref": "rtok-copy-safe-ref",
+    }
+    assert asset_line["artifact_refs"] == []
+    assert asset_line["trace_id"] == "gqt-20260625-contract-add-evidence"
+    assert asset_line["commit_sha"] == "dd6a55b55e88338fd0586d3e75ed66c5100cf1e1"
+
+    qa_guide = runtime.current_guide(
+        "cex-contract-add-evidence-payload-test",
+        actor_role="qa",
+    )
+    qa_asset_line = next(
+        line
+        for line in qa_guide["completed_lines"]
+        if line["line_id"] == "worker_asset_binding_proposal_or_waiver"
+    )
+    assert qa_asset_line["payload"] == asset_line["payload"]
+    assert qa_asset_line["artifact_refs"] == asset_line["artifact_refs"]
+    assert qa_asset_line["payload"]["proposed_bindings"] == []
+    assert qa_asset_line["payload"]["waiver"] == {
+        "direct_trusted_graph_db_write": False
+    }
+    assert qa_guide["next_legal_action"]["line_id"] == "qa_independent_verification"
+
+
+def test_contract_runtime_line_write_sanitizes_raw_token_evidence():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "contract_add",
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-LINE-WRITE-EVIDENCE-PERSISTENCE-20260625",
+        contract_execution_id="cex-contract-add-token-sanitization-test",
+        actor_role="observer",
+        route_token_ref="rtok-contract-add-sanitization-test",
+    )
+    write = _runtime_write_from(
+        record,
+        actor_role="observer",
+        stage_id="observer_request",
+        line_id="observer_request_contract_add",
+    )
+    write.update(
+        {
+            "payload": {
+                "request": "add contract_add fixture",
+                "route_token_ref": "rtok-safe-ref",
+                "token_ref": "role-assignment-token-ref",
+                "route_token": {"raw": "raw-route-token-secret"},
+                "session_token": "raw-session-token-secret",
+                "token": "raw-generic-token-secret",
+                "tokens": ["raw-generic-token-list-secret"],
+                "nested": {
+                    "governance_token": "raw-governance-token-secret",
+                    "keep": "visible",
+                },
+            },
+            "artifact_refs": [
+                {
+                    "path": "agent/governance/contracts/contract_add.v1.rev1.json",
+                    "session_token": "artifact-session-token-secret",
+                }
+            ],
+            "trace_id": "gqt-20260625-token-sanitization",
+            "commit_sha": "dd6a55b55e88338fd0586d3e75ed66c5100cf1e1",
+            "session_token": "top-level-session-token-secret",
+            "route_token": {"raw": "top-level-route-token-secret"},
+        }
+    )
+
+    result = runtime.submit_line_write(
+        "cex-contract-add-token-sanitization-test",
+        write,
+    )
+
+    assert result["ok"] is True
+    line = result["record"]["completed_lines"][0]
+    assert line["payload"]["route_token_ref"] == "rtok-safe-ref"
+    assert line["payload"]["token_ref"] == "role-assignment-token-ref"
+    assert line["payload"]["nested"] == {"keep": "visible"}
+    assert line["artifact_refs"] == [
+        {"path": "agent/governance/contracts/contract_add.v1.rev1.json"}
+    ]
+    serialized_line = json.dumps(line, sort_keys=True)
+    assert "raw-route-token-secret" not in serialized_line
+    assert "raw-session-token-secret" not in serialized_line
+    assert "raw-governance-token-secret" not in serialized_line
+    assert "raw-generic-token-secret" not in serialized_line
+    assert "raw-generic-token-list-secret" not in serialized_line
+    assert "artifact-session-token-secret" not in serialized_line
+    assert "top-level-session-token-secret" not in serialized_line
+    assert "top-level-route-token-secret" not in serialized_line
+    assert "route_token" not in line["payload"]
+    assert "session_token" not in line["payload"]
+    assert "token" not in line["payload"]
+    assert "tokens" not in line["payload"]
+    assert "governance_token" not in line["payload"]["nested"]
+
+
 def test_mf_parallel_read_only_adoption_proves_source_hash_and_duplicate_rejected():
     service = ContractCrudService()
     before_paths = service.registry.definition_paths()

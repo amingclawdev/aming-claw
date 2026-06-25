@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from .execution_state import build_execution_state
 from .guide_compiler import compile_runtime_guide
+from .hash import stable_sha256
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
 from .schema import ContractDefinitionError, is_new_execution_allowed
@@ -319,6 +320,7 @@ class ContractRuntime:
             state,
             instruction_bundle=instruction_bundle,
         )
+        _attach_completed_line_evidence(guide, [])
         record = {
             "schema_version": "contract_runtime_execution_record.v1",
             "project_id": project_id,
@@ -377,6 +379,7 @@ class ContractRuntime:
             state,
             instruction_bundle=instruction_bundle,
         )
+        _attach_completed_line_evidence(guide, record.get("completed_lines") or [])
         record["execution_state"] = state
         record["runtime_guide"] = guide
         self.store.update(contract_execution_id, record)
@@ -418,14 +421,7 @@ class ContractRuntime:
             }
 
         completed_lines = list(refreshed.get("completed_lines") or [])
-        completed_lines.append(
-            {
-                "stage_id": str(effective_write.get("stage_id") or ""),
-                "line_id": str(effective_write.get("line_id") or ""),
-                "actor_role": effective_actor_role,
-                "evidence_kind": str(effective_write.get("evidence_kind") or ""),
-            }
-        )
+        completed_lines.append(_line_evidence_from_write(effective_write, effective_actor_role))
         expected_revision = int(refreshed.get("execution_state_revision") or 1)
         refreshed["completed_lines"] = completed_lines
         refreshed["execution_state_revision"] = expected_revision + 1
@@ -497,6 +493,99 @@ def _effective_actor_role(write: Mapping[str, Any], *, actor_role: str | None) -
         if token:
             return token
     return ""
+
+
+_LINE_EVIDENCE_OPTIONAL_FIELDS = (
+    "payload",
+    "artifact_refs",
+    "trace_id",
+    "commit_sha",
+)
+_RAW_TOKEN_FIELD_NAMES = {
+    "governance_token",
+    "governance_tokens",
+    "route_token",
+    "route_tokens",
+    "session_token",
+    "session_tokens",
+    "token",
+    "tokens",
+}
+
+
+def _line_evidence_from_write(
+    write: Mapping[str, Any],
+    effective_actor_role: str,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "stage_id": str(write.get("stage_id") or ""),
+        "line_id": str(write.get("line_id") or ""),
+        "actor_role": effective_actor_role,
+        "evidence_kind": str(write.get("evidence_kind") or ""),
+    }
+    for field in _LINE_EVIDENCE_OPTIONAL_FIELDS:
+        if field not in write:
+            continue
+        evidence[field] = _sanitize_line_evidence_value(write.get(field))
+    return evidence
+
+
+def _attach_completed_line_evidence(
+    guide: dict[str, Any],
+    completed_lines: Any,
+) -> None:
+    lines = []
+    if isinstance(completed_lines, list):
+        for item in completed_lines:
+            if isinstance(item, Mapping):
+                lines.append(_sanitize_completed_line(item))
+    guide["completed_lines"] = lines
+    guide["runtime_guide_hash"] = stable_sha256(
+        {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
+    )
+
+
+def _sanitize_completed_line(line: Mapping[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for field in (
+        "stage_id",
+        "line_id",
+        "actor_role",
+        "evidence_kind",
+        *_LINE_EVIDENCE_OPTIONAL_FIELDS,
+    ):
+        if field not in line:
+            continue
+        sanitized[field] = _sanitize_line_evidence_value(line.get(field))
+    return sanitized
+
+
+def _sanitize_line_evidence_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key)
+            if _is_raw_token_field(key_text):
+                continue
+            result[key_text] = _sanitize_line_evidence_value(child)
+        return result
+    if isinstance(value, list):
+        result_list = []
+        for item in value:
+            result_list.append(_sanitize_line_evidence_value(item))
+        return result_list
+    if isinstance(value, tuple):
+        return _sanitize_line_evidence_value(list(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _is_raw_token_field(key: str) -> bool:
+    normalized = key.strip().lower()
+    if normalized in _RAW_TOKEN_FIELD_NAMES:
+        return True
+    return normalized.endswith("_token") and not normalized.endswith("_token_ref")
 
 
 def _utc_now() -> str:
