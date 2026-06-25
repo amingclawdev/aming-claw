@@ -28,6 +28,7 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
+from agent.governance.contracts.runtime import ContractRuntimeError
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
@@ -25037,6 +25038,41 @@ def test_hotfix_enter_records_timeline_event(conn):
     assert result["event"]["payload"]["meta_contract_gate"]["allowed"] is True
 
 
+def test_hotfix_enter_preserves_legacy_shape_without_onboard_root_or_flag(conn):
+    backlog_id = "AC-HOTFIX-LEGACY-NO-ONBOARD-ROOT-OR-FLAG"
+    task_id = "hotfix-legacy-no-onboard-root-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    deterministic_root_id = server._onboard_contract_execution_id(PID, backlog_id)
+
+    with pytest.raises(ContractRuntimeError):
+        server._contract_runtime_store(conn).get(deterministic_root_id)
+
+    result = server.handle_project_hotfix_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved ordinary emergency repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["profile"] == "HOTFIX"
+    assert result["hotfix_ref"].startswith("timeline:")
+    assert result.get("schema_version") != "hotfix_enter.runtime_contract_response.v1"
+    assert "successor_contract_execution_id" not in result
+    assert "parent_contract_execution_id" not in result
+    assert "contract_chain_id" not in result
+    assert result["event"]["artifact_refs"]["successor_contract_execution_id"] == ""
+    assert result["event"]["payload"].get("runtime_cutover") is None
+    with pytest.raises(ContractRuntimeError):
+        server._contract_runtime_store(conn).get(deterministic_root_id)
+
+
 def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     backlog_id = "AC-HOTFIX-SOURCE-BACKED-SUCCESSOR"
     task_id = "hotfix-source-backed-task"
@@ -25147,6 +25183,104 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     )
     assert forged_qa["ok"] is False
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
+
+
+def test_hotfix_enter_adopts_completed_onboard_root_without_legacy_flag(conn):
+    backlog_id = "AC-HOTFIX-ADOPT-COMPLETED-ONBOARD-ROOT"
+    task_id = "hotfix-adopt-completed-root-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-adopt-root",
+            },
+        )
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+
+    result = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "actor_role": "qa",
+                "reason": "Human approved emergency runtime successor repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-hotfix-adopt-root",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["schema_version"] == "hotfix_enter.runtime_contract_response.v1"
+    assert result["successor_contract_execution_id"] == result["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == (
+        server._onboard_contract_execution_id(PID, backlog_id)
+    )
+    assert result["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert result["runtime_guide"]["contract"]["contract_id"] == "observer_hotfix"
+    assert result["contract_runtime_current_state"]["contract_id"] == "observer_hotfix"
+    assert result["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert result["event"]["payload"]["runtime_cutover"] is True
+    assert result["event"]["payload"]["successor_contract"][
+        "successor_contract_execution_id"
+    ] == result["successor_contract_execution_id"]
+    assert result["event"]["payload"]["agent_facing_decision_source"] == (
+        "contract_runtime_first_missing_line"
+    )
+
+
+def test_hotfix_enter_blocks_incomplete_onboard_root_without_legacy_flag(conn):
+    backlog_id = "AC-HOTFIX-BLOCK-INCOMPLETE-ONBOARD-ROOT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-incomplete-root",
+            },
+        )
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="observer onboarding contract must complete before hotfix successor",
+    ):
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Human approved emergency runtime successor repair.",
+                    "backlog_id": backlog_id,
+                    "route_token_ref": "rtok-hotfix-incomplete-root",
+                },
+            )
+        )
+
+    assert started["contract_execution_id"] == (
+        server._onboard_contract_execution_id(PID, backlog_id)
+    )
 
 
 def test_hotfix_enter_source_backed_rejects_body_forged_role(conn):

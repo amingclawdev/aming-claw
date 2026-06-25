@@ -40495,7 +40495,19 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             contract = backlog_runtime.parse_json_object(
                 _row_get(row, "chain_trigger_json", "{}")
             )
-        source_backed = _source_backed_onboarding_enabled(contract)
+        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        deterministic_onboard_root_exists = False
+        try:
+            root_record = _contract_runtime_store(conn).get(root_execution_id)
+            deterministic_onboard_root_exists = (
+                str(root_record.get("contract_id") or "") == ONBOARD_CONTRACT_ID
+            )
+        except ContractRuntimeError:
+            deterministic_onboard_root_exists = False
+        source_backed = (
+            _source_backed_onboarding_enabled(contract)
+            or deterministic_onboard_root_exists
+        )
         if source_backed:
             session = ctx.require_auth(conn)
             derived_actor_role = str(session.get("role") or "").strip()
@@ -40508,7 +40520,6 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "role_source": "request_session",
                     },
                 )
-            root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
             try:
                 parent_record = _onboard_contract_read(
                     conn,
@@ -40653,6 +40664,9 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                     "qa_independent_verification"
                 )
                 or {},
+                "agent_facing_decision_source": (
+                    "contract_runtime_first_missing_line"
+                ),
             }
         )
     return response
