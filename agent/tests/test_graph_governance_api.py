@@ -25645,6 +25645,170 @@ def test_hotfix_enter_source_backed_returns_successor_runtime_shape(conn):
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
 
 
+def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
+    backlog_id = "AC-MF-PARALLEL-SOURCE-BACKED-SUCCESSOR"
+    task_id = "parallel-source-backed-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-root",
+            },
+        )
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "actor_role": "qa",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-mf-parallel-root",
+                "worker_fence": {
+                    "fence_token": "fence-parallel-source-backed",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["schema_version"] == "mf_parallel_enter.runtime_contract_response.v1"
+    assert result["successor_contract_execution_id"] == result["contract_execution_id"]
+    assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert result["root_contract_execution_id"] == parent_record["root_contract_execution_id"]
+    assert result["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert result["runtime_guide"]["contract"]["contract_id"] == "mf_parallel"
+    assert result["contract_runtime_current_state"]["contract_id"] == "mf_parallel"
+    assert result["execution_state_revision"] == 1
+    assert result["route_token_ref"] == "rtok-mf-parallel-root"
+    assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+    assert result["next_legal_action"]["source"] == "contract_runtime"
+    assert result["next_legal_action"]["evidence_kind"] == "contract_binding"
+    assert result["qa_independent_verification"] == {
+        "required": True,
+        "actor_role": "qa",
+        "observer_must_not_author": True,
+    }
+    assert result["event"]["payload"]["successor_contract"][
+        "successor_contract_execution_id"
+    ] == result["successor_contract_execution_id"]
+    assert result["event"]["payload"]["body_role_claim_ignored"] == "qa"
+    assert result["event"]["payload"]["meta_contract_gate_decision_source"] is False
+
+    row = conn.execute(
+        "SELECT parent_contract_execution_id, contract_chain_id, execution_state_revision "
+        "FROM contract_runtime_executions WHERE contract_execution_id = ?",
+        (result["successor_contract_execution_id"],),
+    ).fetchone()
+    assert row["parent_contract_execution_id"] == parent_record["contract_execution_id"]
+    assert row["contract_chain_id"] == parent_record["contract_chain_id"]
+    assert row["execution_state_revision"] == 1
+
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+                "payload": {
+                    "worker_fence": {
+                        "fence_token": "fence-parallel-source-backed",
+                        "owned_files": ["agent/governance/server.py"],
+                    }
+                },
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    assert prefill["next_legal_action"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    assert dispatch["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+
+    forged_worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+            },
+        )
+    )
+    assert forged_worker_read["ok"] is False
+    assert "cannot write line" in forged_worker_read["decision"]["errors"][0]
+
+
+def test_mf_parallel_enter_blocks_incomplete_onboard_root(conn):
+    backlog_id = "AC-MF-PARALLEL-BLOCK-INCOMPLETE-ROOT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-incomplete-root",
+            },
+        )
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="observer onboarding contract must complete before mf_parallel successor",
+    ):
+        server.handle_project_mf_parallel_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Human approved parallel worker repair.",
+                    "backlog_id": backlog_id,
+                    "task_id": "parallel-incomplete-root-task",
+                    "route_token_ref": "rtok-mf-parallel-incomplete-root",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+            )
+        )
+
+
 def _start_source_backed_hotfix_successor(
     conn,
     *,

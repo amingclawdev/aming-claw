@@ -435,6 +435,14 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
 
     read_model = definition["read_model"]
     _assert_explicit_system_layer(definition, allow_root_start=False)
+    successor_policy = definition["system_layer"]["successor_policy"]
+    assert successor_policy["allow_successor_start"] is True
+    assert successor_policy["allowed_parent_contracts"] == [
+        {"contract_id": "onboard_contract", "version": "v1"}
+    ]
+    assert "observer_work_mode_transition" in successor_policy[
+        "requires_handoff_evidence"
+    ]
     assert read_model["allowed_writer_roles"] == ["observer", "mf_sub", "qa"]
     assert [
         (line["stage_id"], line["line_id"], line["owner_role"], line["evidence_kind"])

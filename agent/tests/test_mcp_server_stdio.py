@@ -85,6 +85,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {
         "observer_hotfix_enter",
+        "mf_parallel_enter",
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -102,6 +103,26 @@ def test_observer_hotfix_enter_schemas_require_backlog_scope():
         assert {"backlog_id", "bug_id", "actor_role"}.issubset(
             schema["properties"]
         )
+        assert {"required": ["backlog_id"]} in schema["anyOf"]
+        assert {"required": ["bug_id"]} in schema["anyOf"]
+
+
+def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        mf_parallel_enter = next(
+            tool for tool in tools if tool["name"] == "mf_parallel_enter"
+        )
+        schema = mf_parallel_enter["inputSchema"]
+        assert {"project_id", "reason"}.issubset(schema["required"])
+        assert {
+            "backlog_id",
+            "bug_id",
+            "actor_role",
+            "worker_fence",
+            "owned_files",
+            "target_files",
+            "contract_execution_id",
+        }.issubset(schema["properties"])
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
 
@@ -225,6 +246,47 @@ def test_governance_mcp_hotfix_enter_dispatches_to_runtime_facade(monkeypatch):
     ]
 
 
+def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "successor_contract_execution_id": "cex-mf-parallel"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "mf_parallel_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-PARALLEL",
+            "task_id": "parallel-task",
+            "reason": "Human approved parallel repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-parallel",
+            "worker_fence": {"fence_token": "fence-parallel"},
+            "owned_files": ["agent/governance/server.py"],
+        },
+    )
+
+    assert result["successor_contract_execution_id"] == "cex-mf-parallel"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-parallel/enter",
+            {
+                "backlog_id": "AC-PARALLEL",
+                "task_id": "parallel-task",
+                "reason": "Human approved parallel repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-parallel",
+                "worker_fence": {"fence_token": "fence-parallel"},
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    ]
+
+
 def test_governance_mcp_mf_timeline_precheck_forwards_close_commit(monkeypatch):
     calls = []
 
@@ -294,6 +356,52 @@ def test_tool_dispatcher_hotfix_enter_posts_runtime_facade():
                 "reason": "Human approved runtime repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-hotfix",
+            },
+        )
+    ]
+
+
+def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "successor_contract_execution_id": "cex-mf-parallel"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "mf_parallel_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-PARALLEL",
+            "task_id": "parallel-task",
+            "reason": "Human approved parallel repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-parallel",
+            "worker_fence": {"fence_token": "fence-parallel"},
+            "owned_files": ["agent/governance/server.py"],
+        },
+    )
+
+    assert result["successor_contract_execution_id"] == "cex-mf-parallel"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-parallel/enter",
+            {
+                "backlog_id": "AC-PARALLEL",
+                "task_id": "parallel-task",
+                "reason": "Human approved parallel repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-parallel",
+                "worker_fence": {"fence_token": "fence-parallel"},
+                "owned_files": ["agent/governance/server.py"],
             },
         )
     ]

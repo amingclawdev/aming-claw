@@ -907,6 +907,51 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "mf_parallel_enter",
+        "description": "Enter source-backed mf_parallel successor runtime under a completed onboard_contract root.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "actor": {"type": "string"},
+                "actor_role": {
+                    "type": "string",
+                    "description": "Audit-only claim; HTTP facade derives effective role from token/session.",
+                },
+                "contract_execution_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "worker_fence": {"type": "object"},
+                "owned_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "metadata": {"type": "object"},
+            },
+            "required": ["project_id", "reason"],
+            "anyOf": [
+                {"required": ["backlog_id"]},
+                {"required": ["bug_id"]},
+            ],
+        },
+    },
+    {
         "name": "contract_add_start",
         "description": "Start or enter the thin source-backed contract_add guided runtime facade.",
         "inputSchema": {
@@ -2349,6 +2394,15 @@ class ToolDispatcher:
                 if key != "project_id" and value is not None
             }
             return self._api("POST", f"/api/projects/{pid}/hotfix/enter", body)
+
+        if name == "mf_parallel_enter":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api("POST", f"/api/projects/{pid}/mf-parallel/enter", body)
 
         if name == "contract_add_start":
             pid = args["project_id"]

@@ -237,8 +237,13 @@
       "denied_reason": "mf_parallel workers run under an approved parent contract and fenced worktree, not as a root entrypoint"
     },
     "successor_policy": {
-      "allow_successor_start": false,
-      "allowed_parent_contracts": [],
+      "allow_successor_start": true,
+      "allowed_parent_contracts": [
+        {
+          "contract_id": "onboard_contract",
+          "version": "v1"
+        }
+      ],
       "allowed_successors": [
         {
           "contract_id": "qa_evidence_gate_review.v1",
@@ -257,6 +262,9 @@
       "requires_parent_execution_id": true,
       "requires_root_execution_id": true,
       "requires_contract_chain_id": true,
+      "requires_handoff_evidence": [
+        "observer_work_mode_transition"
+      ],
       "requires_worker_fence": true
     },
     "write_authority_policy": {

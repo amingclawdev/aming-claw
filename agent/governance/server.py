@@ -33849,6 +33849,155 @@ def _observer_hotfix_successor_runtime_enter(
     }
 
 
+MF_PARALLEL_CONTRACT_ID = "mf_parallel.v1"
+MF_PARALLEL_RECORD_CONTRACT_ID = "mf_parallel"
+
+
+def _mf_parallel_execution_id(
+    project_id: str,
+    backlog_id: str,
+    parent_execution_id: str,
+    task_id: str,
+    *,
+    contract_execution_id: str = "",
+) -> str:
+    return contract_execution_id or _contract_runtime_stable_id(
+        "cex-mf-parallel",
+        project_id,
+        backlog_id,
+        parent_execution_id,
+        task_id or "default",
+        MF_PARALLEL_RECORD_CONTRACT_ID,
+    )
+
+
+def _mf_parallel_successor_runtime_enter(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    parent_record: Mapping[str, Any],
+    actor_role: str,
+    route_token_ref: str,
+    reason: str,
+    contract_execution_id: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    store = runtime.store
+    parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+    root_execution_id = str(
+        parent_record.get("root_contract_execution_id") or parent_execution_id
+    )
+    chain_id = str(parent_record.get("contract_chain_id") or "")
+    successor_execution_id = _mf_parallel_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+        task_id,
+        contract_execution_id=contract_execution_id,
+    )
+    handoff_event_id = _contract_runtime_stable_id(
+        "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
+    )
+    try:
+        successor = store.get(successor_execution_id)
+    except ContractRuntimeError:
+        successor = runtime.start_execution(
+            MF_PARALLEL_CONTRACT_ID,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=actor_role,
+            contract_execution_id=successor_execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=root_execution_id,
+            contract_chain_id=chain_id,
+            route_token_ref=route_token_ref,
+            role_binding={
+                "observer": actor_role,
+                "mf_sub": "mf_sub",
+                "qa": "qa",
+                "binding_source": "mf_parallel_successor_facade",
+            },
+            backlog_lineage={
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            metadata={
+                "facade": "mf_parallel",
+                "generic_crud_exposed": False,
+                "handoff_reason": reason,
+                "handoff_event_id": handoff_event_id,
+                **dict(metadata or {}),
+            },
+        )
+    else:
+        if str(successor.get("contract_id") or "") != MF_PARALLEL_RECORD_CONTRACT_ID:
+            raise ValidationError(
+                "mf_parallel facade can only enter mf_parallel executions",
+                {
+                    "contract_execution_id": successor_execution_id,
+                    "contract_id": str(successor.get("contract_id") or ""),
+                },
+            )
+        if route_token_ref and not str(successor.get("route_token_ref") or ""):
+            successor["route_token_ref"] = route_token_ref
+            store.update(successor_execution_id, successor)
+    successor_contract = {
+        "schema_version": "contract_successor_handoff.v1",
+        "contract_chain_id": chain_id,
+        "parent_contract_execution_id": parent_execution_id,
+        "successor_contract_execution_id": successor_execution_id,
+        "handoff_event_id": handoff_event_id,
+        "handoff_reason": reason,
+        "successor_contract_id": MF_PARALLEL_RECORD_CONTRACT_ID,
+        "root_contract_execution_id": root_execution_id,
+        "role_binding": {
+            "observer": actor_role,
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "mf_parallel_successor_facade",
+        },
+        "backlog_lineage": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+    }
+    runtime.current_guide(successor_execution_id, actor_role=actor_role)
+    successor = store.get(successor_execution_id)
+    current_state = _runtime_current_state_from_record(successor)
+    runtime_guide = successor.get("runtime_guide") or {}
+    return {
+        "schema_version": "mf_parallel_successor_runtime_enter.v1",
+        "successor_contract": successor_contract,
+        "contract_execution_id": successor_execution_id,
+        "successor_contract_execution_id": successor_execution_id,
+        "parent_contract_execution_id": parent_execution_id,
+        "root_contract_execution_id": root_execution_id,
+        "contract_chain_id": chain_id,
+        "runtime_guide": runtime_guide,
+        "current_state": current_state,
+        "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
+        "execution_state_revision": current_state["execution_state_revision"],
+        "execution_state_hash": current_state["execution_state_hash"],
+        "route_token_ref": str(successor.get("route_token_ref") or ""),
+        "route_token_ref_guidance": {
+            "route_token_ref": str(successor.get("route_token_ref") or ""),
+            "raw_route_token_required": False,
+            "pass_ref_to_next_runtime_write": True,
+        },
+        "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
+        "qa_independent_verification": {
+            "required": True,
+            "actor_role": "qa",
+            "observer_must_not_author": True,
+        },
+    }
+
+
 def _observer_root_route_context_state(
     conn,
     project_id: str,
@@ -41488,6 +41637,193 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             }
         )
     return response
+
+
+@route("POST", "/api/projects/{project_id}/mf-parallel/enter")
+@route("POST", "/api/projects/{project_id}/mf-parallel/start")
+def handle_project_mf_parallel_enter(ctx: RequestContext):
+    """Enter mf_parallel as a source-backed successor under completed onboarding."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("mf_parallel entry requires backlog_id or bug_id")
+    reason = str(body.get("reason") or body.get("human_reason") or "").strip()
+    if not reason:
+        raise ValidationError("mf_parallel entry requires a human reason")
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    if not route_token_ref:
+        raise ValidationError("mf_parallel entry requires route_token_ref")
+    task_id = str(body.get("task_id") or "").strip()
+    actor = str(body.get("actor") or "api").strip()
+    body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
+    contract_execution_id = str(body.get("contract_execution_id") or "").strip()
+    owned_files = body.get("owned_files") if isinstance(body.get("owned_files"), list) else []
+    target_files = body.get("target_files") if isinstance(body.get("target_files"), list) else []
+    worker_fence = (
+        body.get("worker_fence") if isinstance(body.get("worker_fence"), Mapping) else {}
+    )
+    if not worker_fence and not owned_files and not target_files:
+        raise ValidationError(
+            "mf_parallel entry requires worker_fence, owned_files, or target_files"
+        )
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    metadata = {
+        **dict(metadata),
+        "owned_files": list(owned_files),
+        "target_files": list(target_files),
+        "worker_fence": dict(worker_fence),
+    }
+
+    from . import task_timeline
+    from .mf_subagent_contract import validate_meta_contract_timeline_event
+
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        derived_actor_role = str(session.get("role") or "").strip()
+        if derived_actor_role != "observer":
+            raise PermissionDeniedError(
+                derived_actor_role,
+                "mf_parallel_enter",
+                {
+                    "required_role": "observer",
+                    "body_role_claim": body_role_claim,
+                    "role_source": "request_session",
+                },
+            )
+        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        try:
+            parent_record = _onboard_contract_read(
+                conn,
+                contract_execution_id=root_execution_id,
+                actor_role=derived_actor_role,
+            )
+        except ContractRuntimeError as exc:
+            raise ValidationError(
+                "source-backed onboard_contract runtime must be started before mf_parallel successor",
+                {
+                    "contract_execution_id": root_execution_id,
+                    "contract_id": ONBOARD_CONTRACT_ID,
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                },
+            ) from exc
+        if not _runtime_record_is_complete(parent_record):
+            current_state = _runtime_current_state_from_record(parent_record)
+            raise ValidationError(
+                "observer onboarding contract must complete before mf_parallel successor",
+                {
+                    "contract_execution_id": parent_record.get(
+                        "contract_execution_id"
+                    ),
+                    "next_legal_action": current_state.get("next_legal_action") or {},
+                },
+            )
+        successor_runtime = _mf_parallel_successor_runtime_enter(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_record=parent_record,
+            actor_role=derived_actor_role,
+            route_token_ref=route_token_ref,
+            reason=reason,
+            contract_execution_id=contract_execution_id,
+            metadata=metadata,
+        )
+        payload = {
+            "schema_version": "mf_parallel_entered.v1",
+            "reason": reason,
+            "actor": derived_actor_role,
+            "requested_actor": actor,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "runtime_cutover": True,
+            "derived_actor_role": derived_actor_role,
+            "body_role_claim_ignored": body_role_claim,
+            "successor_contract": successor_runtime.get("successor_contract") or {},
+            "worker_fence": dict(worker_fence),
+            "owned_files": list(owned_files),
+            "target_files": list(target_files),
+            "agent_facing_decision_source": (
+                "contract_runtime_first_missing_line"
+            ),
+            "meta_contract_gate_decision_source": False,
+        }
+        payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
+            {
+                "event_type": "mf_parallel.entered",
+                "event_kind": "contract_binding",
+                "phase": "orchestration",
+                "actor": derived_actor_role,
+                "status": "accepted",
+                "payload": payload,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            }
+        )
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type="mf_parallel.entered",
+            phase="orchestration",
+            event_kind="contract_binding",
+            actor=derived_actor_role,
+            status="accepted",
+            payload=payload,
+            artifact_refs={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "successor_contract_execution_id": successor_runtime.get(
+                    "successor_contract_execution_id", ""
+                ),
+                "parent_contract_execution_id": successor_runtime.get(
+                    "parent_contract_execution_id", ""
+                ),
+                "root_contract_execution_id": successor_runtime.get(
+                    "root_contract_execution_id", ""
+                ),
+            },
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "schema_version": "mf_parallel_enter.runtime_contract_response.v1",
+        "project_id": project_id,
+        "event": event,
+        "contract_execution_id": successor_runtime.get("contract_execution_id", ""),
+        "successor_contract_execution_id": successor_runtime.get(
+            "successor_contract_execution_id", ""
+        ),
+        "parent_contract_execution_id": successor_runtime.get(
+            "parent_contract_execution_id", ""
+        ),
+        "root_contract_execution_id": successor_runtime.get(
+            "root_contract_execution_id", ""
+        ),
+        "contract_chain_id": successor_runtime.get("contract_chain_id", ""),
+        "runtime_guide": successor_runtime.get("runtime_guide") or {},
+        "contract_runtime_current_state": successor_runtime.get("current_state") or {},
+        "next_legal_action": successor_runtime.get("next_legal_action") or {},
+        "execution_state_revision": successor_runtime.get(
+            "execution_state_revision", 0
+        ),
+        "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
+        "route_token_ref": successor_runtime.get("route_token_ref", ""),
+        "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
+        or {},
+        "worker_fence": successor_runtime.get("worker_fence") or {},
+        "qa_independent_verification": successor_runtime.get(
+            "qa_independent_verification"
+        )
+        or {},
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+    }
 
 
 @route("POST", "/api/projects/{project_id}/onboard-contract/start")
