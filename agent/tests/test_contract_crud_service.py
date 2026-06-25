@@ -1325,7 +1325,7 @@ def test_mf_parallel_read_only_adoption_proves_source_hash_and_duplicate_rejecte
     source_path = Path(adopted["_source_path"])
     raw_sha256 = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
 
-    assert source_path.name == "mf_parallel.v1.rev1.json"
+    assert source_path.name == "mf_parallel.v1.rev2.json"
     assert adopted["compat_aliases"] == ["mf_parallel.v1", "parallel_worker.v1"]
     assert adopted["definition_hash"].startswith("sha256:")
 
@@ -1359,7 +1359,7 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     assert onboarding["ok"] is True
     onboard_definition = onboarding["data"]["definition"]
     assert onboard_definition["contract_id"] == "onboard_contract"
-    assert onboard_definition["revision"] == "rev2"
+    assert onboard_definition["revision"] == "rev3"
     assert onboard_definition["contract_type"] == "observer_onboarding"
     _assert_explicit_system_layer(onboard_definition, allow_root_start=True)
     assert onboard_definition["successors"] == [
@@ -1449,7 +1449,7 @@ def test_default_registry_exposes_onboarding_and_hotfix_successor_contracts():
     assert onboard_record["runtime_guide"]["next_legal_action"]["line_id"] == (
         "graph_query_schema_trace"
     )
-    assert onboard_record["revision"] == "rev2"
+    assert onboard_record["revision"] == "rev3"
     assert onboard_record["definition_source_sha256"].startswith("sha256:")
 
     hotfix = service.read("observer_hotfix_direct_mutation.v1")

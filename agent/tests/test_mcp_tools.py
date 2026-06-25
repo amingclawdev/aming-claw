@@ -145,6 +145,9 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "observer_command_complete",
         "observer_command_fail",
         "observer_runtime_text_prepare",
+        "onboard_contract_start",
+        "onboard_contract_current",
+        "onboard_contract_submit_line",
     }.issubset(names)
 
 
@@ -1080,6 +1083,102 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
                 "stage_id": "graph_context",
                 "line_id": "graph_query_schema_trace",
                 "evidence_kind": "graph_query_schema_trace",
+            },
+        ),
+    ]
+
+
+def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
+    names = _tool_names()
+
+    assert {
+        "onboard_contract_start",
+        "onboard_contract_current",
+        "onboard_contract_submit_line",
+        "contract_add_start",
+        "contract_add_current",
+        "contract_add_submit_line",
+        "contract_update_start",
+        "contract_update_current",
+        "contract_update_submit_line",
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
+    }.issubset(names)
+    assert "contract_execution_id" not in _tool_properties("onboard_contract_start")
+    assert _tool_properties("onboard_contract_submit_line").keys() >= {
+        "execution_state_revision",
+        "runtime_guide_hash",
+        "observer_session_id",
+        "observer_route_token_ref",
+    }
+
+
+def test_active_mcp_onboard_contract_tools_route_to_source_backed_facade():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "onboard_contract_start",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-ONBOARD",
+            "contract_execution_id": "cex-must-not-forward",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
+        },
+    )
+    dispatcher.dispatch(
+        "onboard_contract_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
+        },
+    )
+    dispatcher.dispatch(
+        "onboard_contract_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "stage_id": "graph_context",
+            "line_id": "graph_query_schema_trace",
+            "evidence_kind": "graph_query_schema_trace",
+            "execution_state_revision": 1,
+            "runtime_guide_hash": "sha256:guide",
+            "observer_session_id": "obs-onboard",
+            "observer_route_token_ref": "rtok-onboard",
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/onboard-contract/start",
+            {
+                "backlog_id": "AC-ONBOARD",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
+            },
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/current-state"
+            "?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
+            None,
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/line-writes",
+            {
+                "stage_id": "graph_context",
+                "line_id": "graph_query_schema_trace",
+                "evidence_kind": "graph_query_schema_trace",
+                "execution_state_revision": 1,
+                "runtime_guide_hash": "sha256:guide",
+                "observer_session_id": "obs-onboard",
+                "observer_route_token_ref": "rtok-onboard",
             },
         ),
     ]

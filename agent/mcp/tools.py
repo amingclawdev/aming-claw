@@ -952,6 +952,80 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "onboard_contract_start",
+        "description": "Start or enter the thin source-backed onboard_contract root runtime facade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "metadata": {"type": "object"},
+            },
+            "required": ["project_id", "backlog_id"],
+        },
+    },
+    {
+        "name": "onboard_contract_current",
+        "description": "Read onboard_contract root runtime guide/current-state without exposing generic CRUD.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
+        "name": "onboard_contract_submit_line",
+        "description": "Submit one role-bound onboard_contract evidence line via ContractRuntime.submit_line_write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "execution_state_revision": {"type": "integer"},
+                "runtime_guide_hash": {"type": "string"},
+                "stage_id": {"type": "string"},
+                "line_id": {"type": "string"},
+                "evidence_kind": {"type": "string"},
+                "payload": {"type": "object"},
+                "artifact_refs": {"type": "object"},
+                "trace_id": {"type": "string"},
+                "commit_sha": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+            },
+            "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
         "name": "contract_add_start",
         "description": "Start or enter the thin source-backed contract_add guided runtime facade.",
         "inputSchema": {
@@ -2476,6 +2550,45 @@ class ToolDispatcher:
                 if key != "project_id" and value is not None
             }
             return self._api("POST", f"/api/projects/{pid}/mf-parallel/enter", body)
+
+        if name == "onboard_contract_start":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key not in {"project_id", "contract_execution_id"} and value is not None
+            }
+            return self._api("POST", f"/api/projects/{pid}/onboard-contract/start", body)
+
+        if name == "onboard_contract_current":
+            pid = args["project_id"]
+            execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            query = {
+                key: value
+                for key, value in args.items()
+                if key
+                in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
+                and value is not None
+            }
+            qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            return self._api(
+                "GET",
+                f"/api/projects/{pid}/onboard-contract/{execution_id}/current-state{qs}",
+            )
+
+        if name == "onboard_contract_submit_line":
+            pid = args["project_id"]
+            execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            body = {
+                key: value
+                for key, value in args.items()
+                if key not in {"project_id", "contract_execution_id"} and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
+                body,
+            )
 
         if name == "contract_add_start":
             pid = args["project_id"]
