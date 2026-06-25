@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
 
-from .hash import canonical_json
+from .hash import canonical_json, file_sha256, stable_sha256
 from .schema import (
     CONTRACT_DEFINITION_SCHEMA_VERSION,
     ContractDefinitionError,
@@ -18,6 +19,7 @@ from .schema import (
 
 
 DEFAULT_DEFINITION_DIR = Path(__file__).resolve().parent.parent / "contract_definitions"
+CONTRACT_REGISTRY_RUNTIME_VERSION = "contract_registry.v1"
 
 
 class UnknownContractDefinitionError(ContractDefinitionError):
@@ -27,8 +29,14 @@ class UnknownContractDefinitionError(ContractDefinitionError):
 class ContractDefinitionRegistry:
     """Registry for source-controlled contract definition config files."""
 
-    def __init__(self, root: str | Path = DEFAULT_DEFINITION_DIR):
+    def __init__(
+        self,
+        root: str | Path = DEFAULT_DEFINITION_DIR,
+        *,
+        loaded_at: str | None = None,
+    ):
         self.root = Path(root)
+        self.loaded_at = loaded_at or _utc_now()
 
     def definition_paths(self) -> list[Path]:
         if not self.root.exists():
@@ -47,6 +55,7 @@ class ContractDefinitionRegistry:
             if not is_contract_definition_payload(payload):
                 continue
             definition = normalize_definition(payload, source_path=str(path))
+            _attach_source_load_record(definition, path, loaded_at=self.loaded_at)
             if not include_deprecated and definition["status"] == "deprecated":
                 continue
             key = _definition_key(definition)
@@ -230,7 +239,12 @@ def _without_private_fields(definition: Mapping[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in definition.items()
         if not str(key).startswith("_")
-        and key not in {"definition_hash", "read_model"}
+        and key not in {
+            "definition_hash",
+            "definition_load_record",
+            "read_model",
+            "source_sha256",
+        }
     }
 
 
@@ -245,3 +259,49 @@ def _file_name(definition: Mapping[str, Any]) -> str:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value)
+
+
+def _attach_source_load_record(
+    definition: dict[str, Any],
+    path: Path,
+    *,
+    loaded_at: str,
+) -> None:
+    source_sha256 = file_sha256(path)
+    source_path = str(path)
+    load_record_identity = {
+        "schema_version": "contract_definition_load_record_identity.v1",
+        "source_path": source_path,
+        "contract_id": definition.get("contract_id", ""),
+        "version": definition.get("version", ""),
+        "revision": definition.get("revision", ""),
+        "source_sha256": source_sha256,
+        "definition_hash": definition.get("definition_hash", ""),
+    }
+    load_record_id = "cdlr-" + stable_sha256(load_record_identity).split(":", 1)[1][:24]
+    load_record = {
+        "schema_version": "contract_definition_load_record.v1",
+        "load_record_id": load_record_id,
+        "source_path": source_path,
+        "contract_id": definition.get("contract_id", ""),
+        "version": definition.get("version", ""),
+        "revision": definition.get("revision", ""),
+        "status": "loaded",
+        "contract_status": definition.get("status", ""),
+        "source_sha256": source_sha256,
+        "definition_hash": definition.get("definition_hash", ""),
+        "loaded_at": loaded_at,
+        "runtime_version": CONTRACT_REGISTRY_RUNTIME_VERSION,
+        "drift_status": "current",
+        "next_operator_action": "none",
+    }
+    definition["source_sha256"] = source_sha256
+    definition["definition_load_record"] = load_record
+    read_model = definition.get("read_model")
+    if isinstance(read_model, dict):
+        read_model["source_sha256"] = source_sha256
+        read_model["definition_load_record"] = dict(load_record)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

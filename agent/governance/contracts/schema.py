@@ -13,6 +13,17 @@ from .hash import definition_hash
 CONTRACT_DEFINITION_SCHEMA_VERSION = "contract_definition.v1"
 VALID_CONTRACT_STATUSES = frozenset({"draft", "active", "deprecated"})
 VALID_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SYSTEM_LAYER_SCHEMA_VERSION = "contract_system_layer.v1"
+SYSTEM_LAYER_POLICY_NAMES = (
+    "entrypoint_policy",
+    "successor_policy",
+    "write_authority_policy",
+    "next_action_policy",
+    "projection_policy",
+    "route_policy",
+    "authority_policy",
+    "graph_binding_policy",
+)
 
 
 class ContractDefinitionError(ValueError):
@@ -49,6 +60,7 @@ def normalize_definition(
         "status": _status(payload),
         "compat_aliases": _string_list(payload.get("compat_aliases"), "compat_aliases"),
         "successors": _successor_list(payload.get("successors")),
+        "system_layer": _normalize_system_layer(payload.get("system_layer")),
         "rule_layer": _normalize_rule_layer(payload.get("rule_layer")),
         "instruction_layer": _normalize_instruction_layer(payload.get("instruction_layer")),
     }
@@ -146,6 +158,122 @@ def _successor_list(value: Any) -> list[dict[str, Any]]:
             raise ContractDefinitionError(f"successors[{index}] missing contract_id")
         successors.append(dict(item))
     return successors
+
+
+def _normalize_system_layer(value: Any) -> dict[str, Any]:
+    embedded_status: Mapping[str, Any] | None = None
+    if value is None:
+        source: Mapping[str, Any] = {}
+        layer_status = "legacy_default_deny"
+        layer_defaulted = True
+        explicit = False
+    elif not isinstance(value, Mapping):
+        raise ContractDefinitionError("system_layer must be an object")
+    else:
+        source = value
+        embedded_status = _embedded_system_layer_policy_status(source)
+        if embedded_status is not None:
+            explicit = bool(embedded_status.get("explicit"))
+            layer_defaulted = bool(embedded_status.get("defaulted"))
+            layer_status = str(embedded_status.get("status") or "partial_default_deny")
+        else:
+            explicit = True
+            missing = [name for name in SYSTEM_LAYER_POLICY_NAMES if name not in source]
+            layer_defaulted = bool(missing)
+            layer_status = "explicit" if not missing else "partial_default_deny"
+
+    normalized: dict[str, Any] = {
+        "schema_version": SYSTEM_LAYER_SCHEMA_VERSION,
+    }
+    if embedded_status is not None:
+        missing_policies = _string_list(
+            embedded_status.get("missing_policies"),
+            "system_layer.policy_status.missing_policies",
+        )
+        defaulted_policies = _string_list(
+            embedded_status.get("defaulted_policies"),
+            "system_layer.policy_status.defaulted_policies",
+        )
+        explicit_policies = _string_list(
+            embedded_status.get("explicit_policies"),
+            "system_layer.policy_status.explicit_policies",
+        )
+    else:
+        missing_policies: list[str] = []
+        defaulted_policies: list[str] = []
+        explicit_policies: list[str] = []
+    for policy_name in SYSTEM_LAYER_POLICY_NAMES:
+        if policy_name in source:
+            normalized[policy_name] = _normalize_system_policy(
+                source[policy_name],
+                policy_name=policy_name,
+                defaulted=False,
+            )
+            if embedded_status is None:
+                explicit_policies.append(policy_name)
+        else:
+            normalized[policy_name] = _normalize_system_policy(
+                None,
+                policy_name=policy_name,
+                defaulted=True,
+            )
+            if embedded_status is None:
+                missing_policies.append(policy_name)
+                defaulted_policies.append(policy_name)
+
+    for key, child in source.items():
+        key_text = str(key)
+        if key_text in SYSTEM_LAYER_POLICY_NAMES or key_text == "schema_version":
+            continue
+        normalized[key_text] = child
+
+    normalized["policy_status"] = {
+        "schema_version": "contract_system_layer_policy_status.v1",
+        "status": layer_status,
+        "explicit": explicit,
+        "defaulted": layer_defaulted,
+        "deny_by_default": True,
+        "missing_policies": missing_policies,
+        "defaulted_policies": defaulted_policies,
+        "explicit_policies": explicit_policies,
+    }
+    return normalized
+
+
+def _embedded_system_layer_policy_status(source: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    status = source.get("policy_status")
+    if not isinstance(status, Mapping):
+        return None
+    status_token = str(status.get("status") or "")
+    if status_token not in {"legacy_default_deny", "partial_default_deny"}:
+        return None
+    return status
+
+
+def _normalize_system_policy(
+    value: Any,
+    *,
+    policy_name: str,
+    defaulted: bool,
+) -> dict[str, Any]:
+    if value is None:
+        return {
+            "schema_version": "contract_system_policy.v1",
+            "policy_name": policy_name,
+            "policy_status": "legacy_default_deny",
+            "defaulted": True,
+            "deny_by_default": True,
+            "allowed": False,
+        }
+    if not isinstance(value, Mapping):
+        raise ContractDefinitionError(f"system_layer.{policy_name} must be an object")
+    normalized = dict(value)
+    normalized.setdefault("schema_version", "contract_system_policy.v1")
+    normalized.setdefault("policy_name", policy_name)
+    normalized.setdefault("policy_status", "explicit")
+    normalized.setdefault("defaulted", defaulted)
+    normalized.setdefault("deny_by_default", True)
+    return normalized
 
 
 def _normalize_rule_layer(value: Any) -> dict[str, Any]:
@@ -300,6 +428,10 @@ def _build_read_model(definition: Mapping[str, Any]) -> dict[str, Any]:
         "contract_type": definition.get("contract_type", ""),
         "status": definition.get("status", ""),
         "definition_hash": definition.get("definition_hash", ""),
+        "system_layer": dict(definition.get("system_layer") or {}),
+        "system_layer_policy_status": dict(
+            (definition.get("system_layer") or {}).get("policy_status") or {}
+        ),
         "compat_aliases": list(definition.get("compat_aliases") or []),
         "successors": [dict(item) for item in definition.get("successors") or []],
         "instruction_layer": {

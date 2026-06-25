@@ -95,6 +95,8 @@ def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     read_model = definition["read_model"]
     assert read_model["role"] == "observer"
     assert read_model["contract_type"] == "implementation"
+    assert read_model["system_layer_policy_status"]["status"] == "legacy_default_deny"
+    assert read_model["system_layer"]["entrypoint_policy"]["allowed"] is False
     assert read_model["compat_aliases"] == ["observer_hotfix_direct_mutation.v1"]
     assert read_model["successors"] == [{"contract_id": "qa_onboard", "version": "v1"}]
     assert read_model["allowed_writer_roles"] == ["observer", "qa"]
@@ -147,6 +149,11 @@ def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     listed = service.list()
     assert listed["data"]["count"] == 1
     assert listed["data"]["definitions"][0]["contract_id"] == "observer_hotfix"
+    assert listed["data"]["definitions"][0]["source_sha256"].startswith("sha256:")
+    load_record = listed["data"]["definitions"][0]["definition_load_record"]
+    assert load_record["source_sha256"] == listed["data"]["definitions"][0]["source_sha256"]
+    assert load_record["definition_hash"] == listed["data"]["definitions"][0]["definition_hash"]
+    assert load_record["drift_status"] == "current"
 
     by_alias = service.read("observer_hotfix_direct_mutation.v1")
     assert by_alias["ok"] is True
@@ -295,6 +302,12 @@ def test_default_crud_service_uses_source_definition_root_without_legacy_cutover
     ]
     read_model = dogfood["read_model"]
     assert read_model["definition_hash"] == dogfood["definition_hash"]
+    assert dogfood["source_sha256"].startswith("sha256:")
+    assert dogfood["definition_load_record"]["definition_hash"] == dogfood["definition_hash"]
+    assert read_model["definition_load_record"]["load_record_id"] == dogfood[
+        "definition_load_record"
+    ]["load_record_id"]
+    assert read_model["system_layer_policy_status"]["deny_by_default"] is True
     assert read_model["successors"] == [
         {
             "contract_id": "contract_runtime_route_context_integration",

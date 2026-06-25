@@ -85,6 +85,110 @@ def test_registry_loads_definition_with_hash_and_alias(tmp_path):
     assert is_new_execution_allowed(by_alias) is True
 
 
+def test_registry_exposes_system_layer_legacy_default_read_model(tmp_path):
+    _write_definition(tmp_path, _definition())
+
+    definition = ContractDefinitionRegistry(tmp_path).get("observer_hotfix")
+    read_model = definition["read_model"]
+
+    assert read_model["system_layer_policy_status"] == {
+        "schema_version": "contract_system_layer_policy_status.v1",
+        "status": "legacy_default_deny",
+        "explicit": False,
+        "defaulted": True,
+        "deny_by_default": True,
+        "missing_policies": [
+            "entrypoint_policy",
+            "successor_policy",
+            "write_authority_policy",
+            "next_action_policy",
+            "projection_policy",
+            "route_policy",
+            "authority_policy",
+            "graph_binding_policy",
+        ],
+        "defaulted_policies": [
+            "entrypoint_policy",
+            "successor_policy",
+            "write_authority_policy",
+            "next_action_policy",
+            "projection_policy",
+            "route_policy",
+            "authority_policy",
+            "graph_binding_policy",
+        ],
+        "explicit_policies": [],
+    }
+    assert read_model["system_layer"]["entrypoint_policy"] == {
+        "schema_version": "contract_system_policy.v1",
+        "policy_name": "entrypoint_policy",
+        "policy_status": "legacy_default_deny",
+        "defaulted": True,
+        "deny_by_default": True,
+        "allowed": False,
+    }
+
+
+def test_registry_normalizes_explicit_system_layer_read_model(tmp_path):
+    payload = _definition(
+        system_layer={
+            "entrypoint_policy": {
+                "allow_root_start": True,
+                "allowed_entrypoints": ["observer_hotfix"],
+            },
+            "route_policy": {
+                "route_token_ref_required": True,
+            },
+        }
+    )
+
+    definition = ContractDefinitionRegistry(tmp_path).validate_payload(payload)
+    system_layer = definition["read_model"]["system_layer"]
+
+    assert system_layer["entrypoint_policy"]["policy_status"] == "explicit"
+    assert system_layer["entrypoint_policy"]["allow_root_start"] is True
+    assert system_layer["route_policy"]["route_token_ref_required"] is True
+    assert definition["read_model"]["system_layer_policy_status"]["status"] == (
+        "partial_default_deny"
+    )
+    assert "successor_policy" in definition["read_model"]["system_layer_policy_status"][
+        "defaulted_policies"
+    ]
+
+
+def test_registry_rejects_non_object_system_layer(tmp_path):
+    with pytest.raises(ContractDefinitionError, match="system_layer must be an object"):
+        ContractDefinitionRegistry(tmp_path).validate_payload(
+            _definition(system_layer=["not-an-object"])
+        )
+
+
+def test_registry_exposes_source_sha_and_load_record(tmp_path):
+    path = _write_definition(tmp_path, _definition())
+
+    registry = ContractDefinitionRegistry(tmp_path, loaded_at="2026-06-25T07:12:00Z")
+    definition = registry.get("observer_hotfix")
+    load_record = definition["definition_load_record"]
+
+    assert definition["source_sha256"] == file_sha256(path)
+    assert load_record["load_record_id"].startswith("cdlr-")
+    assert load_record["source_path"] == str(path)
+    assert load_record["contract_id"] == "observer_hotfix"
+    assert load_record["version"] == "v1"
+    assert load_record["revision"] == "rev1"
+    assert load_record["status"] == "loaded"
+    assert load_record["source_sha256"] == definition["source_sha256"]
+    assert load_record["definition_hash"] == definition["definition_hash"]
+    assert load_record["loaded_at"] == "2026-06-25T07:12:00Z"
+    assert load_record["runtime_version"] == "contract_registry.v1"
+    assert load_record["drift_status"] == "current"
+    assert definition["read_model"]["source_sha256"] == definition["source_sha256"]
+    assert definition["read_model"]["definition_load_record"] == load_record
+    listed_load_record = registry.list_definitions()[0]["definition_load_record"]
+    assert listed_load_record["load_record_id"] == load_record["load_record_id"]
+    assert listed_load_record["loaded_at"] == load_record["loaded_at"]
+
+
 def test_registry_rejects_unsafe_instruction_ref_path(tmp_path):
     payload = _definition(
         instruction_layer={
