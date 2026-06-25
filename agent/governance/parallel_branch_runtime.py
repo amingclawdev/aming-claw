@@ -1987,6 +1987,9 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
 
 def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     payload = asdict(context)
+    target_project_root = runtime_context_effective_target_project_root(context)
+    owned_files = list(context.owned_files)
+    target_files = list(context.target_files) or list(owned_files)
     payload["runtime_context_id"] = runtime_context_id_for_branch_context(context)
     payload["depends_on"] = list(context.depends_on)
     payload["allocation_owner"] = context.allocation_owner or context.agent_id
@@ -1994,8 +1997,11 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     payload["worker_slot_id"] = context.worker_slot_id or context.worker_id
     payload["governance_project_id"] = context.governance_project_id or context.project_id
     payload["target_project_id"] = context.target_project_id or context.project_id
-    payload["target_files"] = list(context.target_files)
-    payload["owned_files"] = list(context.owned_files)
+    payload["target_project_root"] = target_project_root
+    payload["project_root"] = target_project_root
+    payload["repo_root"] = target_project_root
+    payload["target_files"] = target_files
+    payload["owned_files"] = owned_files or list(target_files)
     return payload
 
 
@@ -2004,9 +2010,12 @@ def branch_runtime_allocation_evidence(
     *,
     source_ref: str,
     registration_source: str = "parallel_branch_allocate",
+    route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return machine-consumable branch runtime allocation evidence."""
     runtime_context_id = runtime_context_id_for_branch_context(context)
+    context_payload = branch_context_to_dict(context)
+    route = public_contract_revision_route_identity(route_identity=route_identity)
     return {
         "schema_version": "mf_subagent_branch_runtime.v1",
         "status": context.status or STATE_ALLOCATED,
@@ -2019,7 +2028,22 @@ def branch_runtime_allocation_evidence(
         "allocation_source_ref": source_ref,
         "registration_source": registration_source,
         "runtime_context_id": runtime_context_id,
-        "context": branch_context_to_dict(context),
+        "target_project_root": context_payload.get("target_project_root", ""),
+        "project_root": context_payload.get("project_root", ""),
+        "repo_root": context_payload.get("repo_root", ""),
+        "target_files": list(context_payload.get("target_files") or []),
+        "owned_files": list(context_payload.get("owned_files") or []),
+        "route_identity": route,
+        "route_id": route.get("route_id", ""),
+        "route_context_hash": route.get("route_context_hash", ""),
+        "prompt_contract_id": route.get("prompt_contract_id", ""),
+        "prompt_contract_hash": route.get("prompt_contract_hash", ""),
+        "route_token_ref": route.get("route_token_ref", ""),
+        "visible_injection_manifest_hash": route.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "context": context_payload,
     }
 
 
@@ -2594,12 +2618,16 @@ def _runtime_context_revision_payload(
 
 
 def _runtime_context_parent_task_id(context: BranchTaskRuntimeContext) -> str:
-    return (
-        context.root_task_id
-        or context.chain_id
-        or context.stage_task_id
-        or context.task_id
-    )
+    root_task_id = _runtime_context_text(context.root_task_id)
+    chain_id = _runtime_context_text(context.chain_id)
+    task_id = _runtime_context_text(context.task_id)
+    if (
+        chain_id
+        and chain_id not in {root_task_id, task_id}
+        and not chain_id.startswith(("chain-", "cchain-"))
+    ):
+        return chain_id
+    return root_task_id or chain_id or context.stage_task_id or context.task_id
 
 
 def _runtime_context_route_identity(
@@ -7468,6 +7496,11 @@ def upsert_branch_context(
     ensure_branch_runtime_schema(conn)
     now = now_iso or utc_now()
     runtime_context_id = runtime_context_id_for_branch_context(context)
+    target_project_root = _runtime_context_text(
+        context.target_project_root or context.worktree_path
+    )
+    owned_files = _runtime_context_string_list(context.owned_files)
+    target_files = _runtime_context_string_list(context.target_files) or list(owned_files)
     conn.execute(
         """
         INSERT INTO parallel_branch_runtime_contexts (
@@ -7557,9 +7590,9 @@ def upsert_branch_context(
             context.host_session_id,
             context.governance_project_id or context.project_id,
             context.target_project_id or context.project_id,
-            context.target_project_root,
-            _json_array(context.target_files),
-            _json_array(context.owned_files),
+            target_project_root,
+            _json_array(target_files),
+            _json_array(owned_files),
             context.attempt,
             context.lease_id,
             context.lease_expires_at,
@@ -8005,12 +8038,7 @@ def _contract_revision_from_row(row: sqlite3.Row) -> BranchRuntimeContractRevisi
 
 
 def _parent_task_id_for_context(context: BranchTaskRuntimeContext) -> str:
-    return (
-        context.root_task_id
-        or context.chain_id
-        or context.stage_task_id
-        or context.task_id
-    )
+    return _runtime_context_parent_task_id(context)
 
 
 def append_branch_contract_revision(

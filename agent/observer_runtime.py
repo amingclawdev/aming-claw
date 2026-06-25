@@ -2756,6 +2756,13 @@ def _runtime_text_branch_runtime_evidence(
                     return value
         return ""
 
+    def _evidence_parent_task_id() -> str:
+        for source in _nested_mappings(supplied):
+            value = _runtime_text_context_parent(source)
+            if value:
+                return value
+        return ""
+
     supplied_runtime_context_id = str(
         runtime_context_id
         or (branch_runtime_registration_ref if branch_runtime_registration_ref.startswith("mfrctx-") else "")
@@ -2842,7 +2849,7 @@ def _runtime_text_branch_runtime_evidence(
         ),
         "worker_slot_id": _evidence_field("worker_slot_id", "worker_id"),
         "task_id": _evidence_field("task_id"),
-        "parent_task_id": _evidence_field("parent_task_id", "root_task_id", "chain_id"),
+        "parent_task_id": _evidence_parent_task_id(),
         "fence_token": _evidence_field("fence_token"),
         "worktree_path": _evidence_field("worktree_path", "worktree"),
         "base_commit": _evidence_field("base_commit"),
@@ -2908,6 +2915,17 @@ def _runtime_text_branch_runtime_evidence(
         ),
         "allocation_required": False,
         "registered": True,
+        "task_id": observed_context["task_id"],
+        "parent_task_id": observed_context["parent_task_id"],
+        "fence_token": observed_context["fence_token"],
+        "worktree_path": observed_context["worktree_path"],
+        "target_project_root": (
+            observed_context["target_project_root"]
+            or planned_context["target_project_root"]
+        ),
+        "base_commit": observed_context["base_commit"],
+        "target_head_commit": observed_context["target_head_commit"],
+        "merge_queue_id": observed_context["merge_queue_id"],
         "context": {
             "runtime_context_id": observed_context["runtime_context_id"],
             "governance_project_id": observed_context["governance_project_id"]
@@ -3186,13 +3204,33 @@ def _runtime_text_get_persisted_branch_context(
         conn.close()
 
 
+def _runtime_text_parent_candidates_from_branch_context(context: Any) -> list[str]:
+    values = [
+        str(getattr(context, "parent_task_id", "") or "").strip(),
+        str(getattr(context, "chain_id", "") or "").strip(),
+        str(getattr(context, "root_task_id", "") or "").strip(),
+        str(getattr(context, "stage_task_id", "") or "").strip(),
+        str(getattr(context, "backlog_id", "") or "").strip(),
+    ]
+    out: list[str] = []
+    for value in values:
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
 def _runtime_text_parent_from_branch_context(context: Any) -> str:
-    return str(
-        getattr(context, "root_task_id", "")
-        or getattr(context, "chain_id", "")
-        or getattr(context, "backlog_id", "")
-        or ""
-    )
+    candidates = _runtime_text_parent_candidates_from_branch_context(context)
+    root_task_id = str(getattr(context, "root_task_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    for candidate in candidates:
+        if (
+            candidate
+            and candidate not in {root_task_id, task_id}
+            and not candidate.startswith(("chain-", "cchain-"))
+        ):
+            return candidate
+    return candidates[0] if candidates else ""
 
 
 def _runtime_text_expected_field_mismatches(
@@ -3201,6 +3239,7 @@ def _runtime_text_expected_field_mismatches(
     expected_fields: Mapping[str, str] | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     expected_fields = dict(expected_fields or {})
+    parent_candidates = _runtime_text_parent_candidates_from_branch_context(context)
     actual = {
         "task_id": str(getattr(context, "task_id", "") or ""),
         "parent_task_id": _runtime_text_parent_from_branch_context(context),
@@ -3210,18 +3249,30 @@ def _runtime_text_expected_field_mismatches(
         "target_head_commit": str(getattr(context, "target_head_commit", "") or ""),
         "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
     }
-    missing = [
-        field
-        for field, expected in expected_fields.items()
-        if str(expected or "").strip() and not actual.get(field)
-    ]
-    mismatches = [
-        {"field": field, "expected": str(expected), "actual": actual[field]}
-        for field, expected in expected_fields.items()
-        if str(expected or "").strip()
-        and actual.get(field)
-        and actual[field] != str(expected)
-    ]
+    missing: list[str] = []
+    mismatches: list[dict[str, str]] = []
+    for field, expected in expected_fields.items():
+        expected_text = str(expected or "").strip()
+        if not expected_text:
+            continue
+        if field == "parent_task_id":
+            if not parent_candidates:
+                missing.append(field)
+            elif expected_text not in parent_candidates:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": expected_text,
+                        "actual": actual[field],
+                    }
+                )
+            continue
+        if not actual.get(field):
+            missing.append(field)
+        elif actual[field] != expected_text:
+            mismatches.append(
+                {"field": field, "expected": expected_text, "actual": actual[field]}
+            )
     return missing, mismatches
 
 
@@ -3357,13 +3408,26 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
 
 
 def _runtime_text_context_parent(context: Mapping[str, Any]) -> str:
-    return str(
-        context.get("parent_task_id")
-        or context.get("root_task_id")
-        or context.get("chain_id")
-        or context.get("backlog_id")
-        or ""
-    )
+    root_task_id = str(context.get("root_task_id") or "").strip()
+    task_id = str(context.get("task_id") or "").strip()
+    candidates = [
+        str(context.get("parent_task_id") or "").strip(),
+        str(context.get("chain_id") or "").strip(),
+        root_task_id,
+        str(context.get("stage_task_id") or "").strip(),
+        str(context.get("backlog_id") or "").strip(),
+    ]
+    for candidate in candidates:
+        if (
+            candidate
+            and candidate not in {root_task_id, task_id}
+            and not candidate.startswith(("chain-", "cchain-"))
+        ):
+            return candidate
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return ""
 
 
 def _runtime_text_apply_branch_runtime_context(
@@ -3426,6 +3490,12 @@ def _runtime_text_apply_branch_runtime_context(
     replacements: dict[str, Any] = {}
     for field_name in (
         "runtime_context_id",
+        "batch_id",
+        "backlog_id",
+        "chain_id",
+        "root_task_id",
+        "stage_task_id",
+        "stage_type",
         "branch_ref",
         "ref_name",
         "worktree_id",
@@ -3444,12 +3514,19 @@ def _runtime_text_apply_branch_runtime_context(
         "governance_project_id",
         "target_project_id",
         "target_project_root",
+        "target_files",
+        "owned_files",
         "status",
     ):
         if field_name == "runtime_context_id":
             value = packet.get("runtime_context_id") or supplied_context.get("runtime_context_id")
         else:
             value = supplied_context.get(field_name)
+        if field_name in {"target_files", "owned_files"}:
+            values = _runtime_text_items(value)
+            if values:
+                replacements[field_name] = tuple(values)
+            continue
         if value not in (None, ""):
             replacements[field_name] = value
     return replace(context, **replacements) if replacements else context
@@ -6231,6 +6308,18 @@ def build_observer_runtime_text_context(
         branch_runtime_evidence=hydrated_branch_runtime_evidence,
         supplied_projection=supplied_projection,
     )
+    target_files = _runtime_text_items(context.target_files) or list(owned_files)
+    owned_files = (
+        _runtime_text_items(context.owned_files)
+        or list(owned_files)
+        or list(target_files)
+    )
+    if target_files or owned_files:
+        context = replace(
+            context,
+            target_files=tuple(target_files),
+            owned_files=tuple(owned_files),
+        )
     graph_trace_ids = _runtime_text_items(request.graph_trace_ids)
     runtime_context_id = (
         context.runtime_context_id
@@ -6420,6 +6509,10 @@ def build_observer_runtime_text_context(
     )
     finish_gate_contract = _runtime_text_finish_gate_contract(context)
     first_progress_contract = _runtime_text_first_progress_contract(context)
+    runtime_context_payload = asdict(context)
+    runtime_context_payload["parent_task_id"] = parent_task_id
+    runtime_context_payload["target_files"] = list(context.target_files)
+    runtime_context_payload["owned_files"] = list(context.owned_files)
     launch_payload = {
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
@@ -6427,7 +6520,7 @@ def build_observer_runtime_text_context(
         "observer_command_requirement": observer_command_requirement,
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
-        "runtime_context": asdict(context),
+        "runtime_context": runtime_context_payload,
         "branch_identity": {
             "runtime_context_id": runtime_context_id,
             "observer_command_id": observer_command_id,
@@ -6855,7 +6948,7 @@ def build_observer_runtime_text_context(
             read_receipt_identity.get("read_receipt_event_id") or ""
         ),
         "close_ready": False,
-        "runtime_context": asdict(context),
+        "runtime_context": runtime_context_payload,
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "worker_launch_pack": worker_launch_pack,

@@ -319,6 +319,38 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
     assert view["worker_runtime_query"]["fence_token_required"] is True
 
 
+def test_runtime_contract_view_preserves_handoff_parent_separately_from_root() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-hotfix-worker",
+        root_task_id="cex-onboard-root",
+        chain_id="cex-hotfix-successor",
+        stage_task_id="task-hotfix-worker",
+        backlog_id="AC-RUNTIME-CONTRACT",
+        worker_id="worker-1",
+        branch_ref="refs/heads/codex/task-hotfix-worker",
+        worktree_path="/repo/.worktrees/task-hotfix-worker",
+        base_commit="base123",
+        target_head_commit="target123",
+        merge_queue_id="mq-hotfix",
+        fence_token="fence-runtime",
+        status="running",
+    )
+
+    view = build_mf_subagent_runtime_contract_view(
+        context,
+        role=MF_SUB_ROLE,
+        contract_version="mf_parallel.v1",
+        contract_revision_id="crev-hotfix",
+    )
+
+    assert view["runtime_context"]["parent_task_id"] == "cex-hotfix-successor"
+    assert view["runtime_context"]["task_id"] == "task-hotfix-worker"
+    assert context.root_task_id == "cex-onboard-root"
+    assert context.chain_id == "cex-hotfix-successor"
+    assert view["agent_task_contract"]["parent_task_id"] == "cex-hotfix-successor"
+
+
 def test_runtime_contract_view_reports_revision_polling_state() -> None:
     context = BranchTaskRuntimeContext(
         project_id="aming-claw",

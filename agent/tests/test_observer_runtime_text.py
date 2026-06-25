@@ -513,6 +513,58 @@ def test_runtime_text_prepare_is_stable_across_repeated_host_adapter_registratio
     )
 
 
+def test_runtime_text_builder_accepts_hotfix_handoff_parent_without_laundering_root(
+    tmp_path,
+):
+    worktree_path = (
+        tmp_path
+        / "workers"
+        / ".worktrees"
+        / "worker-1"
+        / "ac-runtime-text-impl-1"
+    )
+    owned_files = (
+        "agent/observer_runtime.py",
+        "agent/governance/parallel_branch_runtime.py",
+    )
+    evidence = _branch_runtime_evidence(
+        tmp_path,
+        parent_task_id="",
+        root_task_id="cex-onboard-root",
+        chain_id="cex-hotfix-successor",
+        target_project_root=str(worktree_path),
+        target_files=list(owned_files),
+        owned_files=list(owned_files),
+    )
+
+    result = build_observer_runtime_text_context(
+        _runtime_text_request(
+            tmp_path,
+            parent_task_id="cex-hotfix-successor",
+            owned_files=owned_files,
+            target_project_root=str(worktree_path),
+            branch_runtime_evidence=evidence,
+            branch_runtime_registration_ref=(
+                "/api/graph-governance/aming-claw/parallel-branches/allocate"
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "prepared"
+    assert result["runtime_context_id"] == "mfrctx-runtime-text"
+    assert result["persistent_evidence"]["dispatch_ready"] is True
+    assert result["persistent_evidence"]["allocation_required"] is False
+    assert result["runtime_context"]["parent_task_id"] == "cex-hotfix-successor"
+    assert result["runtime_context"]["root_task_id"] == "cex-onboard-root"
+    assert result["runtime_context"]["chain_id"] == "cex-hotfix-successor"
+    assert result["runtime_context"]["target_project_root"] == str(worktree_path)
+    assert result["runtime_context"]["owned_files"] == list(owned_files)
+    assert result["runtime_context"]["target_files"] == list(owned_files)
+    assert result["branch_runtime_evidence"]["allocation_required"] is False
+    assert result["branch_runtime_evidence"]["parent_task_id"] == "cex-hotfix-successor"
+
+
 def test_runtime_text_builder_ignores_top_level_worktree_object_for_path(tmp_path):
     evidence = _branch_runtime_evidence(tmp_path)
     evidence["worktree"] = {

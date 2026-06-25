@@ -988,12 +988,16 @@ def build_observer_owned_agent_task_contract(
 
 
 def _parent_task_id_for_contract_view(context: BranchTaskRuntimeContext) -> str:
-    return (
-        context.root_task_id
-        or context.chain_id
-        or context.stage_task_id
-        or context.task_id
-    )
+    root_task_id = _string(context.root_task_id)
+    chain_id = _string(context.chain_id)
+    task_id = _string(context.task_id)
+    if (
+        chain_id
+        and chain_id not in {root_task_id, task_id}
+        and not chain_id.startswith(("chain-", "cchain-"))
+    ):
+        return chain_id
+    return root_task_id or chain_id or context.stage_task_id or context.task_id
 
 
 def mf_subagent_runtime_context_id(context: BranchTaskRuntimeContext) -> str:
@@ -1017,12 +1021,7 @@ def build_mf_subagent_runtime_contract_view(
 
     normalized_role = _string(role).lower().replace("-", "_") or MF_SUB_ROLE
     is_worker = normalized_role == MF_SUB_ROLE
-    parent_task_id = (
-        context.root_task_id
-        or context.chain_id
-        or context.stage_task_id
-        or context.task_id
-    )
+    parent_task_id = _parent_task_id_for_contract_view(context)
     runtime_context_id = mf_subagent_runtime_context_id(context)
     latest_revision_text = _string(latest_revision_id or contract_revision_id)
     known_revision_text = _string(known_revision_id)

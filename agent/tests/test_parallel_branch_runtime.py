@@ -60,6 +60,8 @@ from agent.governance.parallel_branch_runtime import (
     MergeQueueItem,
     append_branch_contract_revision,
     branch_context_from_chain_stage,
+    branch_context_to_dict,
+    branch_runtime_allocation_evidence,
     branch_runtime_context_id,
     build_runtime_context_current_view,
     build_runtime_context_gate_inputs_view,
@@ -6047,6 +6049,79 @@ def test_mf_branch_allocation_planner_sanitizes_worker_attempt_and_persists() ->
     assert reloaded is not None
     assert reloaded.worker_id == "worker 0/../../x"
     assert reloaded.merge_queue_id == "mergeq-PB009"
+
+
+def test_mf_branch_allocation_evidence_hydrates_contract_single_source_fields() -> None:
+    conn = _runtime_conn()
+    owned_files = (
+        "agent/governance/parallel_branch_runtime.py",
+        "agent/observer_runtime.py",
+    )
+    context = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id="MF Contract Hydration",
+        batch_id="PB-CONTRACT",
+        backlog_id="AC-RUNTIME-CONTRACT",
+        chain_id="cex-hotfix-successor",
+        root_task_id="cex-onboard-root",
+        stage_task_id="MF Contract Hydration",
+        agent_id="observer",
+        worker_id="worker one",
+        workspace_root="/repo",
+        target_project_root="",
+        target_files=(),
+        owned_files=owned_files,
+        base_commit="base123",
+        target_head_commit="target123",
+        merge_queue_id="mq-contract",
+        fence_token="fence-contract",
+    )
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+    reloaded = get_branch_context(conn, PROJECT_ID, "MF Contract Hydration")
+
+    assert reloaded is not None
+    expected_root = "/repo/.worktrees/worker-one/mf-contract-hydration"
+    assert saved.target_project_root == expected_root
+    assert saved.target_files == owned_files
+    assert saved.owned_files == owned_files
+    assert reloaded.target_project_root == expected_root
+    assert reloaded.target_files == owned_files
+    assert reloaded.owned_files == owned_files
+
+    context_payload = branch_context_to_dict(reloaded)
+    assert context_payload["target_project_root"] == expected_root
+    assert context_payload["project_root"] == expected_root
+    assert context_payload["repo_root"] == expected_root
+    assert context_payload["target_files"] == list(owned_files)
+    assert context_payload["owned_files"] == list(owned_files)
+
+    evidence = branch_runtime_allocation_evidence(
+        reloaded,
+        source_ref="/api/graph-governance/aming-claw/parallel-branches/allocate",
+        route_identity={
+            "route_id": "route-contract",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-contract",
+            "prompt_contract_hash": "sha256:prompt",
+            "route_token_ref": "rtok-contract",
+            "visible_injection_manifest_hash": "sha256:visible",
+            "raw_private_context": "do not expose",
+        },
+    )
+
+    assert evidence["target_project_root"] == expected_root
+    assert evidence["target_files"] == list(owned_files)
+    assert evidence["owned_files"] == list(owned_files)
+    assert evidence["context"]["target_project_root"] == expected_root
+    assert evidence["context"]["target_files"] == list(owned_files)
+    assert evidence["route_id"] == "route-contract"
+    assert evidence["route_context_hash"] == "sha256:route"
+    assert evidence["prompt_contract_id"] == "rprompt-contract"
+    assert evidence["prompt_contract_hash"] == "sha256:prompt"
+    assert evidence["route_token_ref"] == "rtok-contract"
+    assert evidence["visible_injection_manifest_hash"] == "sha256:visible"
+    assert "raw_private_context" not in evidence["route_identity"]
 
 
 def test_mf_branch_worktree_materialization_uses_planned_identity(tmp_path) -> None:
