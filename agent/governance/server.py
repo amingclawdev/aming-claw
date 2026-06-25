@@ -2899,17 +2899,27 @@ _OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS = {
     "runtime_context_implementation_evidence",
 }
 
+_OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES = {
+    "observer_hotfix_enter": ("hotfix_enter",),
+}
+
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     if not isinstance(allowed_actions, list):
         return allowed_actions
+    expanded = list(allowed_actions)
     normalized = {str(item or "").strip() for item in allowed_actions}
+    for action in list(normalized):
+        for alias in _OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES.get(action, ()):
+            if alias not in normalized:
+                expanded.append(alias)
+                normalized.add(alias)
     if (
         normalized.intersection(_OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS)
         and "task_timeline_append" not in normalized
     ):
-        return [*allowed_actions, "task_timeline_append"]
-    return allowed_actions
+        expanded.append("task_timeline_append")
+    return expanded
 
 
 @route("POST", "/api/projects/{project_id}/observer/route-context/issue")

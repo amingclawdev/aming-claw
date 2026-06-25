@@ -1181,6 +1181,15 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     assert "execution_state_revision" in tool_by_name["contract_runtime_submit_line"][
         "inputSchema"
     ]["properties"]
+    assert set(tool_by_name["contract_runtime_submit_line"]["inputSchema"]["properties"]) >= {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "session_token_ref",
+        "fence_token",
+        "target_project_root",
+    }
     for tool_name in (
         "onboard_contract_start",
         "onboard_contract_current",
@@ -1336,6 +1345,13 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
             "evidence_kind": "graph_query_schema_trace",
             "observer_session_id": "obs-onboard",
             "observer_route_token_ref": "rtok-onboard",
+            "runtime_context_id": "rctx-worker",
+            "task_id": "worker-task",
+            "parent_task_id": "observer-task",
+            "worker_role": "mf_sub",
+            "session_token_ref": "sref-worker",
+            "fence_token": "fence-worker",
+            "target_project_root": "/tmp/worker",
         },
     )["ok"] is True
 
@@ -1435,6 +1451,13 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
                 "evidence_kind": "graph_query_schema_trace",
                 "observer_session_id": "obs-onboard",
                 "observer_route_token_ref": "rtok-onboard",
+                "runtime_context_id": "rctx-worker",
+                "task_id": "worker-task",
+                "parent_task_id": "observer-task",
+                "worker_role": "mf_sub",
+                "session_token_ref": "sref-worker",
+                "fence_token": "fence-worker",
+                "target_project_root": "/tmp/worker",
             },
         ),
     ]

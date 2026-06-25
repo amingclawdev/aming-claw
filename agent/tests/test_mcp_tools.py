@@ -1046,6 +1046,15 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     submit_properties = _tool_properties("contract_runtime_submit_line")
     assert "execution_state_revision" in submit_properties
     assert "runtime_guide_hash" in submit_properties
+    assert submit_properties.keys() >= {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "session_token_ref",
+        "fence_token",
+        "target_project_root",
+    }
 
     recorder = _Recorder()
     dispatcher = ToolDispatcher(
@@ -1072,6 +1081,13 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
             "stage_id": "graph_context",
             "line_id": "graph_query_schema_trace",
             "evidence_kind": "graph_query_schema_trace",
+            "runtime_context_id": "rctx-worker",
+            "task_id": "worker-task",
+            "parent_task_id": "observer-task",
+            "worker_role": "mf_sub",
+            "session_token_ref": "sref-worker",
+            "fence_token": "fence-worker",
+            "target_project_root": "/tmp/worker",
         },
     )
 
@@ -1094,6 +1110,13 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
                 "stage_id": "graph_context",
                 "line_id": "graph_query_schema_trace",
                 "evidence_kind": "graph_query_schema_trace",
+                "runtime_context_id": "rctx-worker",
+                "task_id": "worker-task",
+                "parent_task_id": "observer-task",
+                "worker_role": "mf_sub",
+                "session_token_ref": "sref-worker",
+                "fence_token": "fence-worker",
+                "target_project_root": "/tmp/worker",
             },
         ),
     ]
@@ -1122,6 +1145,15 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "runtime_guide_hash",
         "observer_session_id",
         "observer_route_token_ref",
+    }
+    assert _tool_properties("contract_runtime_submit_line").keys() >= {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "session_token_ref",
+        "fence_token",
+        "target_project_root",
     }
 
 

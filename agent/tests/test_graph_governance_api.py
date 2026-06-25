@@ -26382,6 +26382,14 @@ def test_hotfix_enter_accepts_verified_observer_route_ref(conn):
     assert result["next_legal_action"]["id"] == "hotfix_post_action_summary"
 
 
+def test_observer_route_context_issue_allowed_actions_expands_hotfix_facade_alias():
+    allowed = server._observer_route_context_issue_allowed_actions(
+        ["observer_hotfix_enter"]
+    )
+
+    assert allowed == ["observer_hotfix_enter", "hotfix_enter"]
+
+
 def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     backlog_id = "AC-MF-PARALLEL-SOURCE-BACKED-SUCCESSOR"
     task_id = "parallel-source-backed-task"
