@@ -166,10 +166,16 @@ def _collect_observability_signals(
             key = str(raw_key or "")
             item = raw_item
             key_l = key.lower()
-            if key_l == "fallback_reason" and str(item or "").strip():
-                fallback_reasons.add(str(item).strip())
-            elif "fallback" in key_l and str(item or "").strip() and not isinstance(item, (list, Mapping)):
-                fallback_reasons.add(str(item).strip())
+            if key_l in {"fallback_reason", "fallback_reasons"}:
+                if isinstance(item, (list, tuple, set)):
+                    for reason in item:
+                        reason_text = str(reason or "").strip()
+                        if reason_text:
+                            fallback_reasons.add(reason_text)
+                elif not isinstance(item, Mapping):
+                    reason_text = str(item or "").strip()
+                    if reason_text:
+                        fallback_reasons.add(reason_text)
             elif key_l in {"strategy", "scope_reconcile_strategy", "scope_graph_delta_mode", "mode"} and str(item or "").strip():
                 strategies.add(str(item).strip())
             elif ("candidate" in key_l or key_l in {"feature_cluster_count", "node_count", "edge_count"}) and (
