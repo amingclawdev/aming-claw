@@ -7843,6 +7843,7 @@ def rejoin_mf_subagent_runtime_session_token(
         allowed_parent_ids = {
             value
             for value in (
+                context.parent_task_id,
                 context.root_task_id,
                 context.chain_id,
                 context.stage_task_id,
@@ -7961,6 +7962,7 @@ def initial_join_mf_subagent_runtime_session_token(
         allowed_parent_ids = {
             value
             for value in (
+                context.parent_task_id,
                 context.root_task_id,
                 context.chain_id,
                 context.stage_task_id,
@@ -8932,6 +8934,7 @@ def validate_mf_subagent_graph_query_identity(
         allowed_parent_ids = {
             value
             for value in (
+                context.parent_task_id,
                 context.root_task_id,
                 context.chain_id,
                 context.stage_task_id,
@@ -10891,6 +10894,7 @@ def record_mf_subagent_startup(
     allowed_parent_ids = {
         value
         for value in (
+            context.parent_task_id,
             context.root_task_id,
             context.chain_id,
             context.stage_task_id,
@@ -11425,6 +11429,7 @@ def validate_mf_subagent_runtime_context_lookup(
         allowed_parent_ids = {
             value
             for value in (
+                context.parent_task_id,
                 context.root_task_id,
                 context.chain_id,
                 context.stage_task_id,

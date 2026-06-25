@@ -36726,7 +36726,8 @@ def _runtime_text_prepare_runtime_context_id(body: Mapping[str, Any]) -> str:
 
 def _runtime_text_prepare_parent_task_id(context: Any) -> str:
     return str(
-        getattr(context, "root_task_id", "")
+        getattr(context, "parent_task_id", "")
+        or getattr(context, "root_task_id", "")
         or getattr(context, "chain_id", "")
         or getattr(context, "backlog_id", "")
         or getattr(context, "task_id", "")
@@ -36866,10 +36867,9 @@ def _observer_runtime_text_prepare_worker_route_identity(
 
     effective_body = dict(body)
     supplied_identity = _route_identity_from(body)
+    explicit_parent_route_identity = isinstance(body.get("parent_route_identity"), Mapping)
     parent_route_identity = (
-        dict(body.get("parent_route_identity"))
-        if isinstance(body.get("parent_route_identity"), Mapping)
-        else {}
+        dict(body.get("parent_route_identity")) if explicit_parent_route_identity else {}
     )
     if not parent_route_identity:
         parent_route_identity = {
@@ -36939,11 +36939,50 @@ def _observer_runtime_text_prepare_worker_route_identity(
         for action in ((resolved or {}).get("allowed_actions") or [])
     }
     if resolved and "task_timeline_append" in normalized_actions:
+        registered_parent_lineage = (
+            resolved.get("parent_route_lineage")
+            if isinstance(resolved.get("parent_route_lineage"), Mapping)
+            else {}
+        )
+        registered_child_lineage = (
+            resolved.get("child_route_lineage")
+            if isinstance(resolved.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        if not explicit_parent_route_identity and registered_parent_lineage:
+            registered_parent_identity = {
+                field: _first_text(registered_parent_lineage.get(field))
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            }
+            if any(registered_parent_identity.values()):
+                parent_route_identity = {
+                    field: value
+                    for field, value in registered_parent_identity.items()
+                    if value
+                }
+        child_identity = {
+            field: _first_text(
+                registered_child_lineage.get(field),
+                supplied_identity.get(field),
+                resolved.get(field),
+                parent_route_identity.get(field),
+            )
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        for field, value in child_identity.items():
+            if value:
+                effective_body[field] = value
+                parent_route_identity.setdefault(field, value)
+        if parent_route_identity:
+            effective_body["parent_route_identity"] = parent_route_identity
         proof.update(
             {
                 "status": "resolved_append_scoped_ref",
                 "append_scoped": True,
                 "route_token_ref": route_token_ref,
+                "child_route_identity": {
+                    field: value for field, value in child_identity.items() if value
+                },
             }
         )
         return effective_body, proof
@@ -38031,6 +38070,14 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         if isinstance(branch_runtime_evidence.get("context"), Mapping)
         else {}
     )
+    body = dict(body)
+    resolved_runtime_context_id = str(
+        resolved_context.get("runtime_context_id")
+        or branch_runtime_evidence.get("runtime_context_id")
+        or ""
+    ).strip()
+    if resolved_runtime_context_id and not str(body.get("runtime_context_id") or "").strip():
+        body["runtime_context_id"] = resolved_runtime_context_id
     owned_files = _runtime_context_service_query_values(
         body,
         "owned_files",

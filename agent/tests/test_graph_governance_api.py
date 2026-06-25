@@ -2220,6 +2220,146 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     ]["scope"]["owned_files"] == ["agent/governance/server.py"]
 
 
+def test_observer_runtime_text_prepare_projects_route_identity_to_allocated_context(
+    conn,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    worktree = repo / ".worktrees" / "prepare-worker"
+    task_id = "prepare-route-worker-task"
+    backlog_id = "AC-PREPARE-ROUTE"
+    parent_task_id = "repair-parent-task"
+    root_task_id = "onboard-root-contract"
+    route_identity = {
+        "route_id": "route-prepare-worker",
+        "route_context_hash": "sha256:route-prepare-worker",
+        "prompt_contract_id": "rprompt-prepare-worker",
+        "prompt_contract_hash": "sha256:prompt-prepare-worker",
+        "visible_injection_manifest_hash": "sha256:visible-prepare-worker",
+        "route_token_ref": "rtok-prepare-worker",
+    }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_id=route_identity["route_id"],
+        route_context_hash=route_identity["route_context_hash"],
+        prompt_contract_id=route_identity["prompt_contract_id"],
+        prompt_contract_hash=route_identity["prompt_contract_hash"],
+        visible_injection_manifest_hash=route_identity[
+            "visible_injection_manifest_hash"
+        ],
+        route_token_ref=route_identity["route_token_ref"],
+    )
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "root_task_id": root_task_id,
+                "backlog_id": backlog_id,
+                "observer_command_id": "cmd-prepare-worker",
+                "workspace_root": str(repo),
+                "worktree_path": str(worktree),
+                "worker_id": "prepare-worker",
+                "fence_token": "fence-prepare-worker",
+                "base_commit": "base-prepare-worker",
+                "target_head_commit": "target-prepare-worker",
+                "merge_queue_id": "mq-prepare-worker",
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    context = created["context"]
+    runtime_context_id = context["runtime_context_id"]
+    assert created["dispatch_timeline_event"]["status"] == "skipped"
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "observer_command_id": "cmd-prepare-worker",
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "branch_runtime_registration_ref": runtime_context_id,
+                "fence_token": "fence-prepare-worker",
+                "worktree_path": str(worktree),
+                "base_commit": "base-prepare-worker",
+                "target_head_commit": "target-prepare-worker",
+                "merge_queue_id": "mq-prepare-worker",
+                "main_worktree": str(repo),
+                "workspace_root": str(repo),
+                "owned_files": ["agent/governance/server.py"],
+                **route_identity,
+            },
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["runtime_context_id"] == runtime_context_id
+    assert not prepared["runtime_context_id"].startswith("orctx-")
+    assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["branch_runtime_evidence"]["context"]["parent_task_id"] == (
+        parent_task_id
+    )
+    worker_identity_evidence = prepared["persistent_evidence"][
+        "worker_route_identity"
+    ]
+    assert worker_identity_evidence["status"] == "resolved_append_scoped_ref"
+    assert worker_identity_evidence["child_route_identity"]["route_token_ref"] == (
+        route_identity["route_token_ref"]
+    )
+    revision = prepared["runtime_contract_revision"]
+    assert revision["runtime_context_id"] == runtime_context_id
+    assert revision["payload"]["runtime_context_id"] == runtime_context_id
+    assert revision["payload"]["owned_files"] == ["agent/governance/server.py"]
+    assert revision["route_identity"]["route_token_ref"] == (
+        route_identity["route_token_ref"]
+    )
+    assert prepared["dispatch_timeline_event"]["status"] == "recorded"
+    assert prepared["dispatch_timeline_event"]["runtime_context_id"] == (
+        runtime_context_id
+    )
+
+    latest = get_latest_branch_contract_revision(conn, PID, runtime_context_id)
+    assert latest is not None
+    assert latest.route_identity["route_token_ref"] == route_identity["route_token_ref"]
+    assert latest.route_identity["route_context_hash"] == (
+        route_identity["route_context_hash"]
+    )
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": parent_task_id,
+                "fence_token": "fence-prepare-worker",
+                "target_project_root": str(worktree),
+            },
+        )
+    )
+    worker_view = current_state["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["route_identity"]["route_token_ref"] == (
+        route_identity["route_token_ref"]
+    )
+    assert worker_view["route_identity"]["route_context_hash"] == (
+        route_identity["route_context_hash"]
+    )
+    assert worker_view["next_legal_action"] == "submit_mf_subagent_read_receipt"
+
+
 def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     conn,
     tmp_path,
