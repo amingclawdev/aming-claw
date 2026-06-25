@@ -23008,6 +23008,224 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     )
 
 
+def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-BLOCKED-PRECHECK"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update-block-onboard",
+            },
+        )
+    )
+    parent = _complete_source_backed_onboarding(
+        conn,
+        onboard["contract_execution_id"],
+    )
+    started = server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update-block",
+            },
+        )
+    )
+    execution_id = started["contract_execution_id"]
+
+    observer_request = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_update",
+                "evidence_kind": "contract_update_request",
+            },
+        )
+    )
+    assert observer_request["ok"] is True
+    previous_source = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "stage_id": "worker_previous_source",
+                "line_id": "worker_previous_source_proof",
+                "evidence_kind": "contract_previous_source_proof",
+            },
+        )
+    )
+    assert previous_source["ok"] is True
+    blocked_precheck = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "stage_id": "worker_precheck",
+                "line_id": "worker_revision_precheck",
+                "evidence_kind": "contract_revision_precheck",
+                "payload": {
+                    "status": "blocked",
+                    "recommended_next_action": "observer_hotfix_successor",
+                    "block_reason": "same-revision mutation requires hotfix",
+                },
+            },
+        )
+    )
+    assert blocked_precheck["ok"] is True
+
+    current = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    assert current["next_legal_action"]["id"] == "observer_hotfix_successor"
+    assert current["next_legal_action"]["status"] == "blocked"
+    assert current["next_legal_action"]["action"] == "enter_observer_hotfix_successor"
+    assert current["next_legal_action"]["blocked_next_action"]["line_id"] == (
+        "worker_revision_source_proof"
+    )
+
+    rejected_source_write = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "stage_id": "worker_source",
+                "line_id": "worker_revision_source_proof",
+                "evidence_kind": "contract_revision_source_proof",
+            },
+        )
+    )
+    assert rejected_source_write["ok"] is False
+    assert "observer_hotfix successor" in rejected_source_write["decision"]["errors"][0]
+
+    entered = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Hotfix blocked contract_update precheck before source write.",
+                "backlog_id": backlog_id,
+                "task_id": "blocked-contract-update-hotfix",
+                "parent_contract_execution_id": execution_id,
+                "route_token_ref": "rtok-contract-update-block",
+            },
+        )
+    )
+    hotfix_execution_id = entered["contract_execution_id"]
+    assert entered["parent_contract_execution_id"] == execution_id
+    assert entered["root_contract_execution_id"] == parent["root_contract_execution_id"]
+    assert entered["contract_chain_id"] == parent["contract_chain_id"]
+
+    current_while_hotfix_open = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    assert current_while_hotfix_open["next_legal_action"]["id"] == (
+        "observer_hotfix_successor"
+    )
+
+    runtime = server._contract_runtime(conn)
+    for actor_role, stage_id, line_id, evidence_kind in [
+        ("observer", "mutation", "hotfix_post_action_summary", "hotfix_under_action"),
+        ("qa", "qa", "qa_independent_verification", "independent_verification"),
+        ("observer", "observer_close", "observer_close_ready", "close_ready"),
+    ]:
+        runtime.current_guide(hotfix_execution_id, actor_role=actor_role)
+        hotfix_record = runtime.store.get(hotfix_execution_id)
+        result = runtime.submit_line_write(
+            hotfix_execution_id,
+            server._contract_runtime_write_from_record(
+                hotfix_record,
+                actor_role=actor_role,
+                stage_id=stage_id,
+                line_id=line_id,
+                evidence_kind=evidence_kind,
+            ),
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+
+    resumed = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    assert resumed["next_legal_action"]["id"] == "worker_revision_source_proof"
+    assert resumed["next_legal_action"].get("status") != "blocked"
+
+
+def test_hotfix_enter_rejects_explicit_parent_without_allowed_successor(conn):
+    backlog_id = "AC-HOTFIX-BLOCK-PARENT-NOT-ALLOWING-SUCCESSOR"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-hotfix-parent-denied",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, onboard["contract_execution_id"])
+    first_hotfix = server.handle_project_hotfix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Enter first hotfix.",
+                "backlog_id": backlog_id,
+                "task_id": "first-hotfix",
+                "route_token_ref": "rtok-hotfix-parent-denied",
+            },
+        )
+    )
+
+    with pytest.raises(ValidationError, match="does not allow requested successor"):
+        server.handle_project_hotfix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Nested hotfix should be rejected.",
+                    "backlog_id": backlog_id,
+                    "task_id": "nested-hotfix-denied",
+                    "parent_contract_execution_id": first_hotfix[
+                        "contract_execution_id"
+                    ],
+                    "route_token_ref": "rtok-hotfix-parent-denied",
+                },
+            )
+        )
+
+
 def test_contract_add_facade_denies_coordinator_without_observer_proof(conn):
     backlog_id = "AC-CONTRACT-ADD-COORDINATOR-DENIED"
     _insert_simple_mf_close_backlog(conn, backlog_id)

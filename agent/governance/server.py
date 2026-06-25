@@ -56,6 +56,7 @@ from .contracts.runtime import (
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
 )
+from .contracts.hash import stable_sha256
 
 import os
 import shutil
@@ -33026,8 +33027,10 @@ def _runtime_next_action_from_guide(
     execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
     evidence_kind = str(next_line.get("evidence_kind") or "")
     line_id = str(next_line.get("line_id") or "")
-    action = f"record_{evidence_kind}" if evidence_kind else "record_contract_line"
-    return {
+    action = str(next_line.get("action") or "").strip()
+    if not action:
+        action = f"record_{evidence_kind}" if evidence_kind else "record_contract_line"
+    result = {
         "schema_version": "contract_runtime_next_legal_action.v1",
         "id": line_id,
         "action": action,
@@ -33048,6 +33051,18 @@ def _runtime_next_action_from_guide(
         "required": bool(next_line.get("required", True)),
         "meta_contract_gate_decision_source": False,
     }
+    for key in (
+        "status",
+        "blocked_by_line",
+        "blocked_next_action",
+        "recommended_successor_contract_id",
+        "successor_contract_execution_id",
+        "next_operator_action",
+        "block_reason",
+    ):
+        if key in next_line:
+            result[key] = next_line[key]
+    return result
 
 
 def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -34140,6 +34155,236 @@ def _contract_definition_allows_successor(
     return False
 
 
+def _observer_hotfix_successor_execution_id(
+    project_id: str,
+    backlog_id: str,
+    parent_execution_id: str,
+) -> str:
+    return _contract_runtime_stable_id(
+        "cex-hotfix", project_id, backlog_id, parent_execution_id, "observer_hotfix"
+    )
+
+
+def _contract_runtime_last_blocked_line(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list) or not completed_lines:
+        return {}
+    line = completed_lines[-1]
+    if not isinstance(line, Mapping):
+        return {}
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    status = str(payload.get("status") or line.get("status") or "").strip().lower()
+    if status not in {"blocked", "blocker", "failed_blocked"}:
+        return {}
+    return dict(line)
+
+
+def _contract_runtime_block_successor_id(blocked_line: Mapping[str, Any]) -> str:
+    payload = blocked_line.get("payload") if isinstance(blocked_line.get("payload"), Mapping) else {}
+    refs = (
+        blocked_line.get("artifact_refs")
+        if isinstance(blocked_line.get("artifact_refs"), Mapping)
+        else {}
+    )
+    candidates = [
+        payload.get("recommended_successor_contract_id"),
+        payload.get("successor_contract_id"),
+        refs.get("recommended_successor"),
+        payload.get("recommended_next_action"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if text in {"observer_hotfix", "observer_hotfix.v1"}:
+            return "observer_hotfix"
+        if text in {"observer_hotfix_successor", "enter_observer_hotfix_successor"}:
+            return "observer_hotfix"
+    return ""
+
+
+def _contract_runtime_successor_complete(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    successor_contract_id: str,
+    actor_role: str,
+) -> bool:
+    if successor_contract_id != "observer_hotfix":
+        return False
+    parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+    successor_execution_id = _observer_hotfix_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+    )
+    runtime = _contract_runtime(conn)
+    try:
+        successor = runtime.store.get(successor_execution_id)
+    except ContractRuntimeError:
+        return False
+    if str(successor.get("contract_id") or "") != "observer_hotfix":
+        return False
+    try:
+        runtime.current_guide(successor_execution_id, actor_role=actor_role or "observer")
+    except StalePinnedContractExecutionError:
+        return False
+    successor = runtime.store.get(successor_execution_id)
+    return _runtime_record_is_complete(successor)
+
+
+def _contract_runtime_blocked_successor_next_action(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    actor_role: str,
+) -> dict[str, Any]:
+    blocked_line = _contract_runtime_last_blocked_line(record)
+    if not blocked_line:
+        return {}
+    successor_contract_id = _contract_runtime_block_successor_id(blocked_line)
+    if successor_contract_id != "observer_hotfix":
+        return {}
+    if _contract_runtime_successor_complete(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_record=record,
+        successor_contract_id=successor_contract_id,
+        actor_role=actor_role,
+    ):
+        return {}
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    return {
+        "stage_id": "blocked",
+        "line_id": "observer_hotfix_successor",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "blocked_contract_runtime_line",
+        "required": True,
+        "status": "blocked",
+        "action": "enter_observer_hotfix_successor",
+        "recommended_successor_contract_id": successor_contract_id,
+        "successor_contract_execution_id": _observer_hotfix_successor_execution_id(
+            project_id,
+            backlog_id,
+            parent_execution_id,
+        ),
+        "blocked_by_line": {
+            "stage_id": str(blocked_line.get("stage_id") or ""),
+            "line_id": str(blocked_line.get("line_id") or ""),
+            "actor_role": str(blocked_line.get("actor_role") or ""),
+            "evidence_kind": str(blocked_line.get("evidence_kind") or ""),
+        },
+        "next_operator_action": "enter_observer_hotfix_successor",
+        "block_reason": (
+            "latest completed contract line reported status=blocked and "
+            "requested observer_hotfix successor before continuing"
+        ),
+    }
+
+
+def _contract_runtime_apply_blocked_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    actor_role: str,
+) -> dict[str, Any]:
+    result = dict(record)
+    next_action = _contract_runtime_blocked_successor_next_action(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        record=result,
+        actor_role=actor_role,
+    )
+    if not next_action:
+        return result
+    guide = dict(result.get("runtime_guide") or {})
+    blocked_next_action = guide.get("next_legal_action")
+    projected = dict(next_action)
+    if isinstance(blocked_next_action, Mapping):
+        projected["blocked_next_action"] = dict(blocked_next_action)
+    guide["next_legal_action"] = projected
+    guide["blocked_contract_runtime"] = {
+        "schema_version": "contract_runtime_blocked_projection.v1",
+        "status": "blocked",
+        "source": "completed_line_payload",
+        "successor_contract_id": projected["recommended_successor_contract_id"],
+    }
+    guide["runtime_guide_hash"] = stable_sha256(
+        {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
+    )
+    result["runtime_guide"] = guide
+    return result
+
+
+def _contract_runtime_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    successor_contract_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    try:
+        parent_record = runtime.store.get(parent_contract_execution_id)
+    except ContractRuntimeError as exc:
+        raise ValidationError(
+            "parent_contract_execution_id does not identify a ContractRuntime execution",
+            {"parent_contract_execution_id": parent_contract_execution_id},
+        ) from exc
+    if str(parent_record.get("project_id") or "") != project_id:
+        raise ValidationError("parent contract project mismatch")
+    if str(parent_record.get("backlog_id") or "") != backlog_id:
+        raise ValidationError("parent contract backlog mismatch")
+    try:
+        runtime.current_guide(parent_contract_execution_id, actor_role=actor_role)
+    except StalePinnedContractExecutionError:
+        raise
+    parent_record = runtime.store.get(parent_contract_execution_id)
+    parent_definition = runtime.registry.get(
+        str(parent_record.get("contract_id") or ""),
+        version=str(parent_record.get("version") or ""),
+        revision=str(parent_record.get("revision") or ""),
+        include_deprecated=True,
+    )
+    if not _contract_definition_allows_successor(parent_definition, successor_contract_id):
+        raise ValidationError(
+            "parent contract does not allow requested successor",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "parent_contract_id": str(parent_record.get("contract_id") or ""),
+                "successor_contract_id": successor_contract_id,
+            },
+        )
+    if _runtime_record_is_complete(parent_record):
+        return parent_record
+    blocked_line = _contract_runtime_last_blocked_line(parent_record)
+    if _contract_runtime_block_successor_id(blocked_line) == successor_contract_id:
+        return parent_record
+    current_state = _runtime_current_state_from_record(parent_record)
+    raise ValidationError(
+        "parent contract must complete or expose a blocked successor handoff before hotfix successor",
+        {
+            "parent_contract_execution_id": parent_contract_execution_id,
+            "parent_contract_id": str(parent_record.get("contract_id") or ""),
+            "successor_contract_id": successor_contract_id,
+            "next_legal_action": current_state.get("next_legal_action") or {},
+        },
+    )
+
+
 def _contract_update_parent_for_successor(
     conn,
     *,
@@ -34374,6 +34619,13 @@ def _contract_update_read(
     guide = runtime.current_guide(contract_execution_id, actor_role=actor_role)
     record = runtime.store.get(contract_execution_id)
     record["runtime_guide"] = guide
+    record = _contract_runtime_apply_blocked_projection(
+        conn,
+        project_id=str(record.get("project_id") or ""),
+        backlog_id=str(record.get("backlog_id") or ""),
+        record=record,
+        actor_role=actor_role,
+    )
     return record
 
 
@@ -34417,8 +34669,8 @@ def _observer_hotfix_successor_runtime_enter(
         parent_record.get("root_contract_execution_id") or parent_execution_id
     )
     chain_id = str(parent_record.get("contract_chain_id") or "")
-    successor_execution_id = _contract_runtime_stable_id(
-        "cex-hotfix", project_id, backlog_id, parent_execution_id, "observer_hotfix"
+    successor_execution_id = _observer_hotfix_successor_execution_id(
+        project_id, backlog_id, parent_execution_id
     )
     handoff_event_id = _contract_runtime_stable_id(
         "handoff", project_id, backlog_id, parent_execution_id, successor_execution_id
@@ -42132,6 +42384,9 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     task_id = str(body.get("task_id") or "").strip()
     actor = str(body.get("actor") or "api").strip()
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
+    explicit_parent_execution_id = str(
+        body.get("parent_contract_execution_id") or ""
+    ).strip()
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
@@ -42156,7 +42411,7 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             )
         except ContractRuntimeError:
             deterministic_onboard_root_exists = False
-        source_backed = (
+        source_backed = bool(explicit_parent_execution_id) or (
             _source_backed_onboarding_enabled(contract)
             or deterministic_onboard_root_exists
         )
@@ -42176,47 +42431,69 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "role_source": "contract_runtime_effective_actor_role",
                     },
                 )
-            try:
-                parent_record = _onboard_contract_parent_for_successor(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    actor_role=derived_actor_role,
-                )
-            except StalePinnedContractExecutionError as exc:
-                _raise_stale_contract_runtime_validation(
-                    exc,
-                    action="hotfix_enter",
-                    route_token_ref=route_token_ref,
-                    actor_role=derived_actor_role,
-                    message=(
-                        "observer onboarding contract is stale; start recovery "
-                        "before hotfix successor"
-                    ),
-                )
-            except ContractRuntimeError as exc:
-                raise ValidationError(
-                    "source-backed onboard_contract runtime must be started before hotfix successor",
-                    {
-                        "contract_execution_id": root_execution_id,
-                        "contract_id": ONBOARD_CONTRACT_ID,
-                        "agent_facing_decision_source": (
-                            "contract_runtime_first_missing_line"
+            if explicit_parent_execution_id:
+                try:
+                    parent_record = _contract_runtime_parent_for_successor(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        parent_contract_execution_id=explicit_parent_execution_id,
+                        successor_contract_id="observer_hotfix",
+                        actor_role=derived_actor_role,
+                    )
+                except StalePinnedContractExecutionError as exc:
+                    _raise_stale_contract_runtime_validation(
+                        exc,
+                        action="hotfix_enter",
+                        route_token_ref=route_token_ref,
+                        actor_role=derived_actor_role,
+                        message=(
+                            "parent contract execution is stale; recover it "
+                            "before hotfix successor"
                         ),
-                    },
-                ) from exc
-            if not _runtime_record_is_complete(parent_record):
-                current_state = _runtime_current_state_from_record(parent_record)
-                raise ValidationError(
-                    "observer onboarding contract must complete before hotfix successor",
-                    {
-                        "contract_execution_id": parent_record.get(
-                            "contract_execution_id"
+                    )
+            else:
+                try:
+                    parent_record = _onboard_contract_parent_for_successor(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        actor_role=derived_actor_role,
+                    )
+                except StalePinnedContractExecutionError as exc:
+                    _raise_stale_contract_runtime_validation(
+                        exc,
+                        action="hotfix_enter",
+                        route_token_ref=route_token_ref,
+                        actor_role=derived_actor_role,
+                        message=(
+                            "observer onboarding contract is stale; start recovery "
+                            "before hotfix successor"
                         ),
-                        "next_legal_action": current_state.get("next_legal_action")
-                        or {},
-                    },
-                )
+                    )
+                except ContractRuntimeError as exc:
+                    raise ValidationError(
+                        "source-backed onboard_contract runtime must be started before hotfix successor",
+                        {
+                            "contract_execution_id": root_execution_id,
+                            "contract_id": ONBOARD_CONTRACT_ID,
+                            "agent_facing_decision_source": (
+                                "contract_runtime_first_missing_line"
+                            ),
+                        },
+                    ) from exc
+                if not _runtime_record_is_complete(parent_record):
+                    current_state = _runtime_current_state_from_record(parent_record)
+                    raise ValidationError(
+                        "observer onboarding contract must complete before hotfix successor",
+                        {
+                            "contract_execution_id": parent_record.get(
+                                "contract_execution_id"
+                            ),
+                            "next_legal_action": current_state.get("next_legal_action")
+                            or {},
+                        },
+                    )
             successor_runtime = _observer_hotfix_successor_runtime_enter(
                 conn,
                 project_id=project_id,
@@ -43025,6 +43302,49 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
         try:
             runtime.current_guide(contract_execution_id, actor_role=actor_role)
             record = runtime.store.get(contract_execution_id)
+            blocked_record = _contract_runtime_apply_blocked_projection(
+                conn,
+                project_id=str(record.get("project_id") or ""),
+                backlog_id=str(record.get("backlog_id") or ""),
+                record=record,
+                actor_role=actor_role,
+            )
+            blocked_next = (
+                blocked_record.get("runtime_guide", {}).get("next_legal_action")
+                if isinstance(blocked_record.get("runtime_guide"), Mapping)
+                else {}
+            )
+            if (
+                isinstance(blocked_next, Mapping)
+                and str(blocked_next.get("status") or "") == "blocked"
+            ):
+                response = {
+                    "schema_version": "contract_update.line_write_response.v1",
+                    "ok": False,
+                    "project_id": project_id,
+                    "contract_execution_id": contract_execution_id,
+                    "actor_role": actor_role,
+                    "decision": {
+                        "schema_version": "contract_write_gate_decision.v1",
+                        "ok": False,
+                        "errors": [
+                            "contract execution is blocked; enter observer_hotfix successor before continuing"
+                        ],
+                    },
+                    "agent_facing_decision_source": "contract_runtime_blocked_line",
+                }
+                response.update(_contract_update_response(blocked_record))
+                response["ok"] = False
+                response["decision"] = {
+                    "schema_version": "contract_write_gate_decision.v1",
+                    "ok": False,
+                    "errors": [
+                        "contract execution is blocked; enter observer_hotfix successor before continuing"
+                    ],
+                }
+                response["actor_role"] = actor_role
+                response["agent_facing_decision_source"] = "contract_runtime_blocked_line"
+                return response
             write = _contract_runtime_line_write_body(
                 record,
                 actor_role=actor_role,
