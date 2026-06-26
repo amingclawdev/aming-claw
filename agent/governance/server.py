@@ -6274,6 +6274,20 @@ def _parallel_branch_allocate_requested_worktree_path(
     return "", ""
 
 
+def _parallel_branch_allocate_slug(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    out: list[str] = []
+    last_dash = False
+    for char in text:
+        if char.isascii() and char.isalnum():
+            out.append(char)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    return "".join(out).strip("-")
+
+
 def _parallel_branch_allocate_normalize_worktree_path(
     context: Any,
     body: Mapping[str, Any],
@@ -6304,6 +6318,17 @@ def _parallel_branch_allocate_normalize_worktree_path(
             except ValueError:
                 appended_parts = ()
             if appended_parts:
+                worker_slug = _parallel_branch_allocate_slug(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                )
+                root_leaf_slug = _parallel_branch_allocate_slug(root_path.name)
+                if worker_slug and root_leaf_slug == worker_slug:
+                    raise ValidationError(
+                        "worktree_root appears to include the worker slot but not "
+                        "the final task path; pass the base worktree directory or "
+                        "use worktree_path for the final absolute worker worktree."
+                    )
                 root_parts = root_path.parts
                 if (
                     len(root_parts) >= len(appended_parts)
