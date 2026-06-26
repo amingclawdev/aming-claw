@@ -36505,6 +36505,49 @@ def _contract_runtime_completed_line_projection_gate(
     }
 
 
+def _contract_runtime_completed_line_projection_preflight_gate(
+    conn,
+    *,
+    body: Mapping[str, Any],
+    event_kind: str,
+    trusted_actor_role: str = "",
+) -> dict[str, Any]:
+    contract_execution_id = _contract_runtime_close_execution_id(body)
+    if (
+        not contract_execution_id
+        or not _contract_runtime_close_event_kind_supported(event_kind)
+    ):
+        return {}
+    actor_role = _contract_runtime_close_actor_role(
+        body,
+        trusted_actor_role=trusted_actor_role,
+    )
+    if not actor_role:
+        return {}
+    runtime = _contract_runtime(conn)
+    try:
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+    except ContractRuntimeError:
+        return {}
+    if _runtime_current_state_from_record(record).get("next_legal_action"):
+        return {}
+    line = _contract_runtime_close_line_for_event(
+        record,
+        event_kind=event_kind,
+        body=body,
+    )
+    if not line:
+        return {}
+    return _contract_runtime_completed_line_projection_gate(
+        record,
+        body=body,
+        event_kind=event_kind,
+        actor_role=actor_role,
+        line=line,
+    )
+
+
 def _contract_runtime_close_gate(
     conn,
     *,
@@ -36630,6 +36673,24 @@ def _contract_runtime_close_gate(
     }
 
 
+def _trusted_contract_runtime_actor_role_from_context(
+    ctx: RequestContext,
+    conn,
+) -> str:
+    try:
+        session = ctx.require_auth(conn)
+    except Exception:
+        return ""
+    session_role = (
+        str(session.get("role") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(".", "_")
+    )
+    return session_role if session_role in {"observer", "qa", "mf_sub"} else ""
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -36656,37 +36717,51 @@ def handle_task_timeline_append(ctx: RequestContext):
                 422,
                 legacy_route_gate,
             )
+        trusted_contract_runtime_actor_role = ""
+        contract_runtime_completed_projection_gate = {}
         if task_timeline.is_protected_close_evidence(event):
-            route_gate, source_block = _timeline_no_token_source_event_gate_or_block(
-                conn,
-                project_id,
-                ctx.body or {},
-                event,
+            trusted_contract_runtime_actor_role = (
+                _trusted_contract_runtime_actor_role_from_context(ctx, conn)
             )
-            if source_block:
-                raise GovernanceError(
-                    "route_token_required",
-                    str(source_block.get("reason") or "route_token required"),
-                    422,
-                    source_block,
+            contract_runtime_completed_projection_gate = (
+                _contract_runtime_completed_line_projection_preflight_gate(
+                    conn,
+                    body=ctx.body or {},
+                    event_kind=str(event.get("event_kind") or ""),
+                    trusted_actor_role=trusted_contract_runtime_actor_role,
                 )
-            if not route_gate:
-                waiver_block = _timeline_route_waiver_block_for_high_risk(
-                    conn, project_id, ctx.body or {}, event
+            )
+            if not contract_runtime_completed_projection_gate:
+                route_gate, source_block = _timeline_no_token_source_event_gate_or_block(
+                    conn,
+                    project_id,
+                    ctx.body or {},
+                    event,
                 )
-                if waiver_block:
+                if source_block:
                     raise GovernanceError(
                         "route_token_required",
-                        str(waiver_block.get("reason") or "route_token required"),
+                        str(source_block.get("reason") or "route_token required"),
                         422,
-                        waiver_block,
+                        source_block,
                     )
-                route_gate = _require_route_token_mutation_gate(
-                    ctx,
-                    action="task_timeline_append",
-                    backlog_id=ctx.body.get("backlog_id", ""),
-                    task_id="",
-                )
+                if not route_gate:
+                    waiver_block = _timeline_route_waiver_block_for_high_risk(
+                        conn, project_id, ctx.body or {}, event
+                    )
+                    if waiver_block:
+                        raise GovernanceError(
+                            "route_token_required",
+                            str(waiver_block.get("reason") or "route_token required"),
+                            422,
+                            waiver_block,
+                        )
+                    route_gate = _require_route_token_mutation_gate(
+                        ctx,
+                        action="task_timeline_append",
+                        backlog_id=ctx.body.get("backlog_id", ""),
+                        task_id="",
+                    )
         raw_event_kind = ctx.body.get("event_kind", "")
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
@@ -36776,28 +36851,23 @@ def handle_task_timeline_append(ctx: RequestContext):
             )
         contract_runtime_close_evidence_gate = {}
         if contract_runtime_close_evidence_requested:
-            trusted_contract_runtime_actor_role = ""
-            try:
-                session = ctx.require_auth(conn)
-                session_role = (
-                    str(session.get("role") or "")
-                    .strip()
-                    .lower()
-                    .replace("-", "_")
-                    .replace(".", "_")
+            if contract_runtime_completed_projection_gate:
+                contract_runtime_close_evidence_gate = (
+                    contract_runtime_completed_projection_gate
                 )
-                if session_role in {"observer", "qa", "mf_sub"}:
-                    trusted_contract_runtime_actor_role = session_role
-            except Exception:
-                trusted_contract_runtime_actor_role = ""
-            contract_runtime_close_evidence_gate = _contract_runtime_close_gate(
-                conn,
-                project_id=project_id,
-                body=ctx.body or {},
-                event_kind=norm_event_kind,
-                norm_payload=validation_payload,
-                trusted_actor_role=trusted_contract_runtime_actor_role,
-            )
+            else:
+                if not trusted_contract_runtime_actor_role:
+                    trusted_contract_runtime_actor_role = (
+                        _trusted_contract_runtime_actor_role_from_context(ctx, conn)
+                    )
+                contract_runtime_close_evidence_gate = _contract_runtime_close_gate(
+                    conn,
+                    project_id=project_id,
+                    body=ctx.body or {},
+                    event_kind=norm_event_kind,
+                    norm_payload=validation_payload,
+                    trusted_actor_role=trusted_contract_runtime_actor_role,
+                )
             if meta_contract_error_message:
                 meta_contract_gate = {
                     **meta_contract_gate,

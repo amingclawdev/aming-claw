@@ -27000,6 +27000,137 @@ def test_timeline_append_contract_runtime_projects_completed_hotfix_lines(conn):
     assert projected_gate["projection_source"] == "completed_contract_runtime_line"
 
 
+def test_timeline_append_completed_runtime_projection_precedes_legacy_route_gate(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-PROJECTION-LEGACY-GATE"
+    task_id = "hotfix-runtime-projection-legacy-gate-task"
+    route_token_ref = "rtok-hotfix-timeline-projection-legacy-gate"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+    )
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        successor["contract_execution_id"],
+        close_commit_sha="abc123legacyprojection",
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "template_id": "mf_parallel.v1",
+                    "contract_instance_id": backlog_id,
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "hotfix.under_action",
+                "event_kind": "hotfix_under_action",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "route_token_ref": route_token_ref,
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                    "verification_evidence_refs": ["pytest:focused"],
+                },
+            },
+        )
+    )
+
+    assert "route_token_gate" not in result
+    runtime_gate = result["contract_runtime_close_evidence_gate"]
+    assert runtime_gate["accepted"] is True
+    assert runtime_gate["projection_only"] is True
+    assert runtime_gate["primary_decision_source"] is True
+    assert runtime_gate["line_id"] == "hotfix_post_action_summary"
+    assert runtime_gate["execution_state_revision"] == completed[
+        "execution_state_revision"
+    ]
+    assert result["meta_contract_gate"]["authority_decision_source"] == (
+        "contract_runtime"
+    )
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="hotfix_under_action",
+    )[0]
+    assert event["payload"]["contract_runtime_close_evidence_gate"][
+        "projection_only"
+    ] is True
+
+
+def test_timeline_append_incomplete_runtime_line_still_requires_legacy_route_gate(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-INCOMPLETE-LEGACY-GATE"
+    task_id = "hotfix-runtime-incomplete-legacy-gate-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-incomplete-legacy-gate",
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "template_id": "mf_parallel.v1",
+                    "contract_instance_id": backlog_id,
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "contract_execution_id": successor["contract_execution_id"],
+                        "changed_files": ["agent/governance/server.py"],
+                    },
+                },
+            )
+        )
+
+    assert exc.value.code == "route_token_required"
+    record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "hotfix_post_action_summary"
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="implementation",
+    ) == []
+
+
 def test_timeline_append_contract_runtime_projection_rejects_wrong_role(conn):
     backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-PROJECTION-WRONG-ROLE"
     task_id = "hotfix-runtime-projection-wrong-role-task"
