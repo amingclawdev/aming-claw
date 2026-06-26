@@ -34364,6 +34364,17 @@ def _contract_runtime_line_write_body(
 
 ONBOARD_CONTRACT_ID = "onboard_contract"
 
+_ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "onboard_contract_start",
+    "onboard_contract_current",
+    "onboard_contract_submit_line",
+    "observer_hotfix_enter",
+    "contract_runtime_current",
+    "contract_runtime_submit_line",
+    "task_timeline_append",
+)
+_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
+
 
 def _onboard_contract_execution_id(
     project_id: str,
@@ -34382,9 +34393,217 @@ def _onboard_contract_chain_id(project_id: str, backlog_id: str) -> str:
     )
 
 
+def _onboard_contract_route_issue_target_files_from_record(
+    record: Mapping[str, Any],
+) -> list[str]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    backlog_lineage = (
+        record.get("backlog_lineage")
+        if isinstance(record.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    candidates: list[str] = []
+    for source in (metadata, backlog_lineage, record):
+        for key in (
+            "route_token_issue_target_files",
+            "target_files",
+            "owned_files",
+        ):
+            candidates.extend(_string_list_field(source.get(key)))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        text = str(path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _onboard_contract_route_issue_target_files(
+    conn,
+    *,
+    backlog_id: str,
+    body: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    candidates: list[str] = []
+    for source in (body, metadata):
+        for key in ("route_token_issue_target_files", "target_files", "owned_files"):
+            candidates.extend(_string_list_field(source.get(key)))
+    if not candidates and backlog_id:
+        try:
+            row = conn.execute(
+                "SELECT target_files FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is not None:
+            candidates.extend(_string_list_field(_row_get(row, "target_files", "")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        text = str(path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _onboard_contract_agent_guidance(
+    record: Mapping[str, Any],
+    *,
+    next_legal_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    contract_execution_id = str(record.get("contract_execution_id") or "")
+    route_token_ref = str(record.get("route_token_ref") or "")
+    allowed_actions = _observer_route_context_issue_allowed_actions(
+        list(_ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS)
+    )
+    issue_payload = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": contract_execution_id,
+        "target_files": _onboard_contract_route_issue_target_files_from_record(record),
+        "allowed_actions": allowed_actions,
+        "evidence_refs": [
+            ref
+            for ref in (
+                f"contract_runtime:{contract_execution_id}"
+                if contract_execution_id
+                else "",
+                f"backlog:{backlog_id}" if backlog_id else "",
+            )
+            if ref
+        ],
+    }
+    scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": contract_execution_id,
+    }
+    return {
+        "schema_version": "onboard_contract.agent_onboard_guidance.v1",
+        "role": "observer",
+        "actor_role": "observer",
+        "required_identity": {
+            "schema_version": "onboard_contract.required_identity.v1",
+            "required_fields": [
+                "observer_session_id",
+                "observer_route_token_ref",
+            ],
+            "observer_session_id": {
+                "required": True,
+                "source": "active observer session",
+            },
+            "observer_route_token_ref": {
+                "required": True,
+                "alias": "route_token_ref",
+                "source": "observer_route_context_issue.route_token_ref",
+            },
+            "route_token_ref": {
+                "required": True,
+                "alias": "observer_route_token_ref",
+            },
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "route_token_ref_guidance": {
+            "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+            "current_route_token_ref": route_token_ref,
+            "current_ref_present": bool(route_token_ref),
+            "pass_to_next_runtime_writes_as": [
+                "observer_route_token_ref",
+                "route_token_ref",
+            ],
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "route_token_issue": {
+            "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+            "status": "current_ref_present" if route_token_ref else "issue_required",
+            "mcp_entrypoint": {
+                "tool": "observer_route_context_issue",
+            },
+            "http_entrypoint": {
+                "method": "POST",
+                "path": "/api/projects/{project_id}/observer/route-context/issue",
+                "path_params": {"project_id": project_id},
+            },
+            "observer_route_context_issue_payload": issue_payload,
+            "scope": scope,
+            "allowed_actions": allowed_actions,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "next_legal_action": dict(next_legal_action),
+        "contract_chain": {
+            "schema_version": "onboard_contract.contract_chain_guidance.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_id": str(record.get("contract_id") or ""),
+            "contract_execution_id": contract_execution_id,
+            "root_contract_execution_id": str(
+                record.get("root_contract_execution_id") or ""
+            ),
+            "parent_contract_execution_id": str(
+                record.get("parent_contract_execution_id") or ""
+            ),
+            "contract_chain_id": str(record.get("contract_chain_id") or ""),
+        },
+        "entrypoints": {
+            "onboard_start": {
+                "method": "POST",
+                "path": "/api/projects/{project_id}/onboard-contract/start",
+            },
+            "onboard_current": {
+                "method": "GET",
+                "path": (
+                    "/api/projects/{project_id}/onboard-contract/"
+                    "{contract_execution_id}/current-state"
+                ),
+            },
+            "onboard_submit_line": {
+                "method": "POST",
+                "path": (
+                    "/api/projects/{project_id}/onboard-contract/"
+                    "{contract_execution_id}/line-writes"
+                ),
+            },
+            "successor_current": {
+                "method": "GET",
+                "path": (
+                    "/api/projects/{project_id}/contract-runtime/"
+                    "{contract_execution_id}/current-state"
+                ),
+            },
+            "successor_submit_line": {
+                "method": "POST",
+                "path": (
+                    "/api/projects/{project_id}/contract-runtime/"
+                    "{contract_execution_id}/line-writes"
+                ),
+            },
+            "timeline_append": {
+                "method": "POST",
+                "path": "/api/task/{project_id}/timeline",
+            },
+        },
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _onboard_contract_response(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     current_state = _runtime_current_state_from_record(record)
+    next_legal_action = _runtime_next_action_from_guide(guide)
     return {
         "schema_version": "onboard_contract.runtime_facade_response.v1",
         "ok": True,
@@ -34400,10 +34619,14 @@ def _onboard_contract_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "contract_runtime_current_state": current_state,
         "runtime_guide": guide,
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
-        "next_legal_action": _runtime_next_action_from_guide(guide),
+        "next_legal_action": next_legal_action,
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
         "route_token_ref": str(record.get("route_token_ref") or ""),
+        "agent_onboard_guidance": _onboard_contract_agent_guidance(
+            record,
+            next_legal_action=next_legal_action,
+        ),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
 
@@ -44030,13 +44253,26 @@ def handle_project_onboard_contract_start(ctx: RequestContext):
         ctx, "route_token_ref", "observer_route_token_ref"
     )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    metadata = (
+        dict(body.get("metadata"))
+        if isinstance(body.get("metadata"), Mapping)
+        else {}
+    )
     recovery_policy = str(body.get("recovery_policy") or "").strip()
     stale_contract_execution_id = str(
         body.get("stale_contract_execution_id") or ""
     ).strip()
     with DBContext(project_id) as conn:
         effective_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        metadata.setdefault(
+            "route_token_issue_target_files",
+            _onboard_contract_route_issue_target_files(
+                conn,
+                backlog_id=backlog_id,
+                body=body,
+                metadata=metadata,
+            ),
+        )
         actor_role = _onboard_contract_effective_actor_role(
             ctx,
             conn,

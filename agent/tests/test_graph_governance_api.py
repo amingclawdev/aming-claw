@@ -23062,6 +23062,8 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert started["ok"] is True
     assert started["schema_version"] == "onboard_contract.runtime_facade_response.v1"
     assert started["contract_id"] == "onboard_contract"
+    expected_execution_id = server._onboard_contract_execution_id(PID, backlog_id)
+    assert started["contract_execution_id"] == expected_execution_id
     assert started["contract_execution_id"] == started["root_contract_execution_id"]
     assert started["parent_contract_execution_id"] == ""
     assert started["contract_chain_id"].startswith("cchain-")
@@ -23074,6 +23076,57 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert started["agent_facing_decision_source"] == (
         "contract_runtime_first_missing_line"
     )
+    guidance = started["agent_onboard_guidance"]
+    assert guidance["schema_version"] == "onboard_contract.agent_onboard_guidance.v1"
+    assert guidance["role"] == "observer"
+    assert guidance["actor_role"] == "observer"
+    assert guidance["required_identity"]["required_fields"] == [
+        "observer_session_id",
+        "observer_route_token_ref",
+    ]
+    assert guidance["required_identity"]["route_token_ref"]["alias"] == (
+        "observer_route_token_ref"
+    )
+    assert guidance["raw_route_token_required"] is False
+    assert guidance["raw_route_token_exposed"] is False
+    assert guidance["route_token_ref_guidance"]["current_route_token_ref"] == (
+        "rtok-onboard-root"
+    )
+    assert guidance["route_token_ref_guidance"]["raw_route_token_required"] is False
+    assert guidance["route_token_ref_guidance"]["raw_route_token_exposed"] is False
+    assert guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
+        "observer_route_context_issue"
+    )
+    assert guidance["route_token_issue"]["http_entrypoint"]["path"] == (
+        "/api/projects/{project_id}/observer/route-context/issue"
+    )
+    issue_payload = guidance["route_token_issue"][
+        "observer_route_context_issue_payload"
+    ]
+    assert issue_payload["project_id"] == PID
+    assert issue_payload["caller_role"] == "observer"
+    assert issue_payload["backlog_id"] == backlog_id
+    assert issue_payload["task_id"] == expected_execution_id
+    assert guidance["route_token_issue"]["scope"]["task_id"] == expected_execution_id
+    assert issue_payload["target_files"] == ["agent/governance/server.py"]
+    assert {
+        "onboard_contract_start",
+        "onboard_contract_current",
+        "onboard_contract_submit_line",
+        "observer_hotfix_enter",
+        "hotfix_enter",
+        "contract_runtime_current",
+        "contract_runtime_submit_line",
+        "task_timeline_append",
+    }.issubset(set(issue_payload["allowed_actions"]))
+    assert guidance["route_token_issue"]["raw_route_token_required"] is False
+    assert guidance["route_token_issue"]["raw_route_token_exposed"] is False
+    assert guidance["next_legal_action"] == started["next_legal_action"]
+    assert guidance["contract_chain"]["root_contract_execution_id"] == (
+        expected_execution_id
+    )
+    assert guidance["contract_chain"]["parent_contract_execution_id"] == ""
+    assert guidance["contract_chain"]["contract_chain_id"] == started["contract_chain_id"]
     execution_id = started["contract_execution_id"]
 
     forged = server.handle_project_onboard_contract_line_write(
@@ -23097,6 +23150,12 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert forged["agent_facing_decision_source"] == (
         "contract_runtime_first_missing_line"
     )
+    assert forged["agent_onboard_guidance"]["next_legal_action"] == (
+        forged["next_legal_action"]
+    )
+    assert forged["agent_onboard_guidance"]["route_token_issue"][
+        "observer_route_context_issue_payload"
+    ]["task_id"] == execution_id
 
     current = server.handle_project_onboard_contract_current_state(
         _ctx_with_role(
@@ -23108,6 +23167,54 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert current["actor_role"] == "observer"
     assert current["contract_execution_id"] == execution_id
     assert current["next_legal_action"]["id"] == "related_backlog_review"
+    assert current["agent_onboard_guidance"]["next_legal_action"] == (
+        current["next_legal_action"]
+    )
+    assert current["agent_onboard_guidance"]["route_token_ref_guidance"][
+        "current_route_token_ref"
+    ] == "rtok-onboard-root"
+
+
+def test_onboard_contract_facade_guidance_requests_route_ref_when_missing(conn):
+    backlog_id = "AC-ONBOARD-CONTRACT-FACADE-GUIDANCE-MISSING-REF"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "target_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+            },
+        )
+    )
+
+    execution_id = server._onboard_contract_execution_id(PID, backlog_id)
+    guidance = started["agent_onboard_guidance"]
+    issue_payload = guidance["route_token_issue"][
+        "observer_route_context_issue_payload"
+    ]
+    assert started["contract_execution_id"] == execution_id
+    assert guidance["route_token_ref_guidance"]["current_ref_present"] is False
+    assert guidance["route_token_ref_guidance"]["current_route_token_ref"] == ""
+    assert guidance["route_token_issue"]["status"] == "issue_required"
+    assert issue_payload["task_id"] == execution_id
+    assert guidance["route_token_issue"]["scope"] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+    }
+    assert issue_payload["target_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    assert guidance["raw_route_token_required"] is False
+    assert guidance["raw_route_token_exposed"] is False
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
