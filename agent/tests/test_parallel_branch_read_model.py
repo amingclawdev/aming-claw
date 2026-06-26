@@ -19,6 +19,7 @@ from agent.governance.parallel_branch_runtime import (
     decide_batch_rollback_replay,
     decide_merge_queue,
     decide_restart_recovery,
+    plan_mf_batch_parallel_preflight,
     recover_expired_branch_contexts,
     runtime_tasks_from_contexts,
     upsert_batch_merge_runtime,
@@ -251,6 +252,132 @@ def _merge_queue_plan():
         ],
         scenario_id="PB-010",
     )
+
+
+def test_mf_batch_parallel_preflight_plans_parallel_groups_and_queue_dependencies():
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH",
+        batch_id="batch-1",
+        merge_queue_id="mq-batch-1",
+        target_head_commit="HEAD1",
+        snapshot_id="scope-HEAD1",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-A",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/a.py"],
+                "test_files": ["tests/test_a.py"],
+            },
+            {
+                "bug_id": "AC-ROW-B",
+                "status": "OPEN",
+                "priority": "P0",
+                "target_files": ["src/b.py"],
+                "test_files": ["tests/test_b.py"],
+            },
+            {
+                "bug_id": "AC-ROW-C",
+                "status": "OPEN",
+                "priority": "P2",
+                "target_files": ["src/a.py"],
+                "test_files": ["tests/test_c.py"],
+            },
+        ],
+    )
+
+    assert plan["status"] == "passed"
+    assert plan["fanout_ready"] is True
+    assert [row["backlog_id"] for row in plan["ordered_rows"]] == [
+        "AC-ROW-B",
+        "AC-ROW-A",
+        "AC-ROW-C",
+    ]
+    assert plan["dispatch_groups"] == [
+        {
+            "group_index": 1,
+            "backlog_ids": ["AC-ROW-B", "AC-ROW-A"],
+            "reason": "no_overlap_with_group",
+        },
+        {
+            "group_index": 2,
+            "backlog_ids": ["AC-ROW-C"],
+            "reason": "no_overlap_with_group",
+        },
+    ]
+    planned = plan["merge_queue_plan"]["planned_items"]
+    by_row = {item["backlog_id"]: item for item in planned}
+    assert by_row["AC-ROW-C"]["serializes_after"] == [by_row["AC-ROW-A"]["task_id"]]
+    assert by_row["AC-ROW-C"]["same_node_or_file_conflicts"] == [
+        by_row["AC-ROW-A"]["task_id"]
+    ]
+    assert plan["merge_queue_plan"]["planner_only"] is True
+    assert plan["merge_queue_plan"]["durable_queue_write"] is False
+
+
+def test_mf_batch_parallel_preflight_strict_mode_serializes_every_row():
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH",
+        batch_id="batch-strict",
+        merge_queue_id="mq-batch-strict",
+        target_head_commit="HEAD1",
+        mode="strict_ordered",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-A",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/a.py"],
+            },
+            {
+                "bug_id": "AC-ROW-B",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/b.py"],
+            },
+        ],
+    )
+
+    planned = plan["merge_queue_plan"]["planned_items"]
+    assert plan["status"] == "passed"
+    assert [group["backlog_ids"] for group in plan["dispatch_groups"]] == [
+        ["AC-ROW-A"],
+        ["AC-ROW-B"],
+    ]
+    assert planned[1]["serializes_after"] == [planned[0]["task_id"]]
+
+
+def test_mf_batch_parallel_preflight_blocks_missing_target_head_and_files():
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH",
+        batch_id="batch-blocked",
+        merge_queue_id="mq-batch-blocked",
+        target_head_commit="",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-A",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": [],
+            },
+            {
+                "bug_id": "AC-ROW-B",
+                "status": "FIXED",
+                "priority": "P1",
+                "target_files": ["src/b.py"],
+            },
+        ],
+    )
+
+    assert plan["fanout_ready"] is False
+    assert {blocker["code"] for blocker in plan["blockers"]} >= {
+        "missing_target_head_commit",
+        "missing_target_files",
+        "child_not_actionable",
+    }
 
 
 def _batch_plan():

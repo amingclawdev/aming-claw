@@ -27935,6 +27935,25 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     child_b = "AC-MF-BATCH-PARALLEL-ROW-B"
     for row_id in (backlog_id, child_a, child_b):
         _insert_simple_mf_close_backlog(conn, row_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            "P1",
+            child_a,
+        ),
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/parallel_branch_runtime.py"]),
+            json.dumps(["agent/tests/test_parallel_branch_read_model.py"]),
+            "P0",
+            child_b,
+        ),
+    )
+    conn.commit()
     observer_session_id = _insert_active_observer_session_ref(
         conn,
         session_id="obs-mf-batch-parallel",
@@ -27960,6 +27979,8 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
                 "observer_session_id": observer_session_id,
                 "observer_route_token_ref": route_token_ref,
                 "onboard_service_waiver": True,
+                "target_head_commit": "target-head-1",
+                "graph_snapshot_id": "scope-target-head-1",
             },
         )
     )
@@ -27969,6 +27990,15 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert result["contract_template_id"] == "mf_batch_parallel.v1"
     assert result["parent_contract_execution_id"] == service_parent
     assert result["root_contract_execution_id"] == service_parent
+    assert result["preflight_gate"]["status"] == "passed"
+    assert result["preflight_gate"]["fanout_ready"] is True
+    assert result["preflight_gate"]["target_head_commit"] == "target-head-1"
+    assert result["merge_queue_plan"]["planner_only"] is True
+    assert result["merge_queue_plan"]["durable_queue_write"] is False
+    assert [item["backlog_id"] for item in result["merge_queue_plan"]["planned_items"]] == [
+        child_b,
+        child_a,
+    ]
     assert [item["backlog_id"] for item in result["per_row_successors"]] == [
         child_a,
         child_b,
@@ -27976,12 +28006,73 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert all(
         item["requires_distinct_route_token_ref"]
         and item["route_token_task_id_policy"] == "mf_parallel_successor_execution_id"
+        and item["merge_queue"]["merge_queue_id"] == result["merge_queue_plan"]["merge_queue_id"]
+        and item["merge_queue"]["queue_item_id"]
         for item in result["per_row_successors"]
     )
     payload = result["event"]["payload"]
     assert payload["legacy_onboard_contract_waived"] is True
+    assert payload["preflight_gate"]["preflight_hash"] == result["preflight_gate"][
+        "preflight_hash"
+    ]
+    assert payload["fanout_policy"]["preflight_gate_required"] is True
+    assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
     assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v1"
+
+
+def test_mf_batch_parallel_enter_blocks_without_preflight_target_head(conn):
+    backlog_id = "AC-MF-BATCH-PARALLEL-BLOCKED-ROUTE"
+    child_a = "AC-MF-BATCH-PARALLEL-BLOCKED-A"
+    child_b = "AC-MF-BATCH-PARALLEL-BLOCKED-B"
+    for row_id in (backlog_id, child_a, child_b):
+        _insert_simple_mf_close_backlog(conn, row_id)
+    for row_id, path in (
+        (child_a, "agent/governance/server.py"),
+        (child_b, "agent/governance/parallel_branch_runtime.py"),
+    ):
+        conn.execute(
+            "UPDATE backlog_bugs SET target_files = ? WHERE bug_id = ?",
+            (json.dumps([path]), row_id),
+        )
+    conn.commit()
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-batch-parallel-blocked",
+    )
+    route_token_ref = "rtok-mf-batch-parallel-blocked"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="mf_batch_parallel preflight gate blocked fanout_ready",
+    ) as exc:
+        server.handle_project_mf_batch_parallel_enter(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "backlog_ids": [child_a, child_b],
+                    "reason": "Human approved multi-row fan-out through onboard service.",
+                    "task_id": "batch-parallel-onboard-service-blocked",
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                    "onboard_service_waiver": True,
+                },
+            )
+        )
+
+    assert exc.value.details["preflight_gate"]["fanout_ready"] is False
+    assert {
+        blocker["code"] for blocker in exc.value.details["preflight_gate"]["blockers"]
+    } == {"missing_target_head_commit"}
 
 
 def test_mf_parallel_enter_blocks_incomplete_onboard_root(conn):

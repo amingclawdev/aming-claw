@@ -38,6 +38,18 @@
     "scope": "single_backlog_row",
     "backlog_id_cardinality": "one",
     "multi_backlog_parent_template": "mf_batch_parallel.v1",
+    "batch_parent_handoff_fields": [
+      "parent_batch_id",
+      "merge_queue_id",
+      "queue_item_id",
+      "queue_index",
+      "depends_on",
+      "hard_depends_on",
+      "serializes_after",
+      "conflicts_with",
+      "same_node_or_file_conflicts",
+      "requires_graph_epoch"
+    ],
     "shared_backlog_close_token_allowed": false,
     "description": "mf_parallel.v1 remains scoped to one backlog row. For multiple backlog rows, create an mf_batch_parallel.v1 parent route that fans out to one mf_parallel successor per row."
   },

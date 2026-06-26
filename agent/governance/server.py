@@ -45118,9 +45118,13 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
         raise ValidationError("mf_batch_parallel entry requires backlog_ids list")
     backlog_ids: list[str] = []
     seen: set[str] = set()
+    duplicate_backlog_ids: list[str] = []
     for item in raw_backlog_ids:
         text = str(item or "").strip()
-        if not text or text in seen:
+        if not text:
+            continue
+        if text in seen:
+            duplicate_backlog_ids.append(text)
             continue
         seen.add(text)
         backlog_ids.append(text)
@@ -45139,8 +45143,19 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+    target_head_commit = str(
+        body.get("target_head_commit")
+        or body.get("target_head")
+        or body.get("head_commit")
+        or ""
+    ).strip()
+    target_ref = str(body.get("target_ref") or "refs/heads/main").strip()
+    preflight_mode = str(
+        body.get("preflight_mode") or body.get("merge_mode") or "parallel"
+    ).strip()
 
     from . import task_timeline
+    from .parallel_branch_runtime import plan_mf_batch_parallel_preflight
 
     with DBContext(project_id) as conn:
         root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
@@ -45206,6 +45221,72 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             backlog_ids,
             task_id,
         )
+        merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+        if not merge_queue_id:
+            merge_queue_id = _contract_runtime_stable_id(
+                "mq",
+                project_id,
+                backlog_id,
+                batch_id,
+                MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+            )
+        rows = conn.execute(
+            f"""
+            SELECT bug_id, status, priority, target_files, test_files
+            FROM backlog_bugs
+            WHERE bug_id IN ({",".join("?" for _ in backlog_ids)})
+            """,
+            tuple(backlog_ids),
+        ).fetchall()
+        rows_by_id = {str(_row_get(row, "bug_id", "")): row for row in rows}
+        preflight_rows: list[dict[str, Any]] = []
+        for row_id in backlog_ids:
+            row = rows_by_id.get(row_id)
+            if row is None:
+                preflight_rows.append(
+                    {
+                        "bug_id": row_id,
+                        "missing": True,
+                        "status": "",
+                        "priority": "",
+                        "target_files": [],
+                        "test_files": [],
+                    }
+                )
+                continue
+            preflight_rows.append(
+                {
+                    "bug_id": row_id,
+                    "status": _row_get(row, "status", ""),
+                    "priority": _row_get(row, "priority", ""),
+                    "target_files": _row_get(row, "target_files", ""),
+                    "test_files": _row_get(row, "test_files", ""),
+                }
+            )
+        preflight_gate = plan_mf_batch_parallel_preflight(
+            project_id=project_id,
+            coordination_backlog_id=backlog_id,
+            backlog_rows=preflight_rows,
+            batch_id=batch_id,
+            merge_queue_id=merge_queue_id,
+            target_head_commit=target_head_commit,
+            snapshot_id=str(
+                body.get("snapshot_id") or body.get("graph_snapshot_id") or ""
+            ),
+            target_ref=target_ref,
+            mode=preflight_mode,
+            duplicate_backlog_ids=duplicate_backlog_ids,
+        )
+        if not preflight_gate.get("fanout_ready"):
+            raise ValidationError(
+                "mf_batch_parallel preflight gate blocked fanout_ready",
+                {"preflight_gate": preflight_gate},
+            )
+        queue_items_by_backlog = {
+            str(item.get("backlog_id") or ""): item
+            for item in preflight_gate.get("merge_queue_plan", {}).get("planned_items", [])
+            if isinstance(item, Mapping)
+        }
         per_row_successors = [
             {
                 "backlog_id": row_id,
@@ -45213,12 +45294,34 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "path": "/api/projects/{project_id}/mf-parallel/enter",
                 "requires_distinct_route_token_ref": True,
                 "route_token_task_id_policy": "mf_parallel_successor_execution_id",
+                "owned_files": list(
+                    queue_items_by_backlog.get(row_id, {}).get("owned_files") or []
+                ),
+                "merge_queue": {
+                    key: queue_items_by_backlog.get(row_id, {}).get(key)
+                    for key in (
+                        "merge_queue_id",
+                        "queue_item_id",
+                        "queue_index",
+                        "depends_on",
+                        "hard_depends_on",
+                        "serializes_after",
+                        "conflicts_with",
+                        "same_node_or_file_conflicts",
+                        "requires_graph_epoch",
+                    )
+                },
                 "body": {
                     "backlog_id": row_id,
-                    "task_id": f"{batch_id}:row:{index + 1}",
+                    "task_id": str(
+                        queue_items_by_backlog.get(row_id, {}).get("task_id")
+                        or f"{batch_id}:row:{index + 1}"
+                    ),
                     "parent_batch_id": batch_id,
                     "onboard_service_waiver": onboard_service_waiver,
                     "reason": f"{reason} (batch row {index + 1}/{len(backlog_ids)})",
+                    "merge_queue_id": merge_queue_id,
+                    "merge_queue_item": queue_items_by_backlog.get(row_id, {}),
                 },
             }
             for index, row_id in enumerate(backlog_ids)
@@ -45241,8 +45344,14 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             "onboard_service": (
                 ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
             ),
+            "preflight_gate": preflight_gate,
+            "merge_queue_plan": preflight_gate.get("merge_queue_plan") or {},
             "fanout_policy": {
                 "schema_version": "mf_batch_parallel.fanout_policy.v1",
+                "preflight_gate_required": True,
+                "preflight_id": preflight_gate.get("preflight_id"),
+                "preflight_hash": preflight_gate.get("preflight_hash"),
+                "fanout_ready": bool(preflight_gate.get("fanout_ready")),
                 "successor_contract_id": MF_PARALLEL_RECORD_CONTRACT_ID,
                 "successor_contract_template_id": MF_PARALLEL_CONTRACT_ID,
                 "row_scoped_successor_tokens": True,
@@ -45284,6 +45393,8 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
         "root_contract_execution_id": root_parent_execution_id,
         "contract_chain_id": contract_chain_id,
         "per_row_successors": per_row_successors,
+        "preflight_gate": preflight_gate,
+        "merge_queue_plan": preflight_gate.get("merge_queue_plan") or {},
         "route_token_ref": route_token_ref,
         "agent_facing_decision_source": "onboard_route_guide_service",
     }

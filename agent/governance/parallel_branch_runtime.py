@@ -919,6 +919,335 @@ class MergeQueueItem:
     failure_reason: str = ""
 
 
+def _stable_plan_id(prefix: str, *parts: object) -> str:
+    payload = json.dumps([str(part or "") for part in parts], sort_keys=True)
+    return f"{prefix}-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _normalise_batch_path(path: object) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _batch_string_list(value: object) -> tuple[str, ...]:
+    raw: object = value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                raw = value
+    if isinstance(raw, (list, tuple, set)):
+        items = raw
+    elif raw:
+        items = [raw]
+    else:
+        items = []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        path = _normalise_batch_path(item)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return tuple(result)
+
+
+def _batch_priority_rank(priority: object) -> float:
+    text = str(priority or "").strip().upper()
+    if not text:
+        return 50.0
+    if text.startswith("P"):
+        text = text[1:]
+    try:
+        return float(text)
+    except ValueError:
+        return 50.0
+
+
+def _batch_status_actionable(status: object) -> bool:
+    text = str(status or "").strip().upper()
+    if not text:
+        return False
+    return text not in {
+        "CANCELLED",
+        "CLOSED",
+        "FIXED",
+        "MERGED",
+        "REJECTED",
+        "SUPERSEDED",
+        "VOID",
+    }
+
+
+def _batch_row_id(row: Mapping[str, Any]) -> str:
+    return str(row.get("backlog_id") or row.get("bug_id") or "").strip()
+
+
+def _batch_overlap(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+    left_files = set(_batch_string_list(left.get("target_files")))
+    right_files = set(_batch_string_list(right.get("target_files")))
+    left_tests = set(_batch_string_list(left.get("test_files")))
+    right_tests = set(_batch_string_list(right.get("test_files")))
+    shared_files = sorted(left_files & right_files)
+    shared_tests = sorted(left_tests & right_tests)
+    categories: list[str] = []
+    if shared_files:
+        categories.append("target_files")
+    if shared_tests:
+        categories.append("test_files")
+    return {
+        "left": _batch_row_id(left),
+        "right": _batch_row_id(right),
+        "categories": categories,
+        "shared_files": shared_files,
+        "shared_tests": shared_tests,
+        "overlaps": bool(categories),
+    }
+
+
+def plan_mf_batch_parallel_preflight(
+    *,
+    project_id: str,
+    coordination_backlog_id: str,
+    backlog_rows: Sequence[Mapping[str, Any]],
+    batch_id: str,
+    merge_queue_id: str,
+    target_head_commit: str,
+    snapshot_id: str = "",
+    target_ref: str = "refs/heads/main",
+    mode: str = "parallel",
+    duplicate_backlog_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Plan a multi-backlog fanout gate without persisting merge queue rows."""
+    coordination_id = str(coordination_backlog_id or "").strip()
+    normalized_mode = str(mode or "parallel").strip() or "parallel"
+    blockers: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    operator_index: dict[str, int] = {}
+    for index, row in enumerate(backlog_rows):
+        row_id = _batch_row_id(row)
+        if row_id and row_id not in operator_index:
+            operator_index[row_id] = index
+        if not row_id:
+            blockers.append({"code": "missing_backlog_id", "severity": "block"})
+            continue
+        if row_id in seen:
+            blockers.append(
+                {
+                    "code": "duplicate_child_backlog",
+                    "backlog_id": row_id,
+                    "severity": "block",
+                }
+            )
+            continue
+        seen.add(row_id)
+        target_files = _batch_string_list(row.get("target_files"))
+        test_files = _batch_string_list(row.get("test_files"))
+        status = str(row.get("status") or "").strip()
+        if bool(row.get("missing")):
+            blockers.append(
+                {"code": "missing_child_row", "backlog_id": row_id, "severity": "block"}
+            )
+        if row_id == coordination_id:
+            blockers.append(
+                {
+                    "code": "child_matches_coordination_row",
+                    "backlog_id": row_id,
+                    "severity": "block",
+                }
+            )
+        if not _batch_status_actionable(status):
+            blockers.append(
+                {
+                    "code": "child_not_actionable",
+                    "backlog_id": row_id,
+                    "status": status,
+                    "severity": "block",
+                }
+            )
+        if not target_files:
+            blockers.append(
+                {"code": "missing_target_files", "backlog_id": row_id, "severity": "block"}
+            )
+        rows.append(
+            {
+                "backlog_id": row_id,
+                "status": status,
+                "priority": str(row.get("priority") or ""),
+                "priority_rank": _batch_priority_rank(row.get("priority")),
+                "operator_index": operator_index[row_id],
+                "target_files": list(target_files),
+                "test_files": list(test_files),
+            }
+        )
+    for row_id in duplicate_backlog_ids:
+        if row_id:
+            blockers.append(
+                {
+                    "code": "duplicate_child_backlog",
+                    "backlog_id": str(row_id),
+                    "severity": "block",
+                }
+            )
+    if not str(target_head_commit or "").strip():
+        blockers.append(
+            {
+                "code": "missing_target_head_commit",
+                "severity": "block",
+                "message": "target_head_commit is required before fanout_ready",
+            }
+        )
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: (
+            float(row["priority_rank"]),
+            int(row["operator_index"]),
+            row["backlog_id"],
+        ),
+    )
+    overlap_groups: list[dict[str, Any]] = []
+    overlap_by_row: dict[str, set[str]] = {row["backlog_id"]: set() for row in ordered_rows}
+    for left_index, left in enumerate(ordered_rows):
+        for right in ordered_rows[left_index + 1 :]:
+            overlap = _batch_overlap(left, right)
+            if overlap["overlaps"]:
+                overlap_groups.append(overlap)
+                overlap_by_row[left["backlog_id"]].add(right["backlog_id"])
+                overlap_by_row[right["backlog_id"]].add(left["backlog_id"])
+
+    dispatch_groups: list[dict[str, Any]] = []
+    if normalized_mode == "strict_ordered":
+        for index, row in enumerate(ordered_rows):
+            dispatch_groups.append(
+                {
+                    "group_index": index + 1,
+                    "backlog_ids": [row["backlog_id"]],
+                    "reason": "strict_ordered",
+                }
+            )
+    else:
+        for row in ordered_rows:
+            placed = False
+            for group in dispatch_groups:
+                group_ids = set(group["backlog_ids"])
+                if not overlap_by_row[row["backlog_id"]] & group_ids:
+                    group["backlog_ids"].append(row["backlog_id"])
+                    placed = True
+                    break
+            if not placed:
+                dispatch_groups.append(
+                    {
+                        "group_index": len(dispatch_groups) + 1,
+                        "backlog_ids": [row["backlog_id"]],
+                        "reason": "no_overlap_with_group",
+                    }
+                )
+
+    planned_items: list[dict[str, Any]] = []
+    previous_task_id = ""
+    task_id_by_row: dict[str, str] = {}
+    for index, row in enumerate(ordered_rows):
+        task_id = f"{batch_id}:row:{index + 1}"
+        task_id_by_row[row["backlog_id"]] = task_id
+    for index, row in enumerate(ordered_rows):
+        row_id = row["backlog_id"]
+        task_id = task_id_by_row[row_id]
+        overlap_predecessors = [
+            task_id_by_row[other["backlog_id"]]
+            for other in ordered_rows[:index]
+            if other["backlog_id"] in overlap_by_row[row_id]
+        ]
+        strict_predecessors = (
+            [previous_task_id]
+            if normalized_mode == "strict_ordered" and previous_task_id
+            else []
+        )
+        dependencies = tuple(
+            dict.fromkeys([*strict_predecessors, *overlap_predecessors])
+        )
+        queue_item_id = _stable_plan_id("mqitem", project_id, merge_queue_id, task_id, row_id)
+        planned_items.append(
+            {
+                "schema_version": "mf_batch_parallel.planned_merge_queue_item.v1",
+                "project_id": project_id,
+                "merge_queue_id": merge_queue_id,
+                "queue_item_id": queue_item_id,
+                "queue_index": index + 1,
+                "backlog_id": row_id,
+                "task_id": task_id,
+                "owned_files": list(row["target_files"]),
+                "target_ref": target_ref,
+                "status": "planned",
+                "durable_status_after_worker_finish": STATE_QUEUED_FOR_MERGE,
+                "depends_on": list(dependencies),
+                "hard_depends_on": list(dependencies),
+                "serializes_after": list(dependencies),
+                "conflicts_with": list(overlap_predecessors),
+                "same_node_or_file_conflicts": list(overlap_predecessors),
+                "requires_graph_epoch": list(dependencies),
+                "target_head_commit": str(target_head_commit or "").strip(),
+                "snapshot_id": snapshot_id,
+            }
+        )
+        previous_task_id = task_id
+
+    plan_body = {
+        "schema_version": "mf_batch_parallel.preflight_gate.v1",
+        "status": "blocked" if blockers else "passed",
+        "fanout_ready": not blockers,
+        "mode": normalized_mode,
+        "project_id": project_id,
+        "coordination_backlog_id": coordination_id,
+        "batch_id": batch_id,
+        "merge_queue_id": merge_queue_id,
+        "target_ref": target_ref,
+        "target_head_commit": str(target_head_commit or "").strip(),
+        "snapshot_id": snapshot_id,
+        "blockers": blockers,
+        "ordered_rows": [
+            {
+                "backlog_id": row["backlog_id"],
+                "priority": row["priority"],
+                "priority_rank": row["priority_rank"],
+                "operator_index": row["operator_index"],
+                "target_files": row["target_files"],
+                "test_files": row["test_files"],
+            }
+            for row in ordered_rows
+        ],
+        "overlap_groups": overlap_groups,
+        "dispatch_groups": dispatch_groups,
+        "merge_queue_plan": {
+            "schema_version": "mf_batch_parallel.merge_queue_plan.v1",
+            "planner_only": True,
+            "durable_queue_write": False,
+            "source_of_authority": "parallel_branch_runtime.plan_mf_batch_parallel_preflight",
+            "merge_queue_id": merge_queue_id,
+            "planned_items": planned_items,
+        },
+    }
+    plan_body["preflight_id"] = _stable_plan_id(
+        "mfbatch-preflight",
+        project_id,
+        coordination_id,
+        batch_id,
+        merge_queue_id,
+        plan_body["ordered_rows"],
+        plan_body["overlap_groups"],
+        plan_body["blockers"],
+    )
+    plan_body["preflight_hash"] = "sha256:" + hashlib.sha256(
+        json.dumps(plan_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return plan_body
+
+
 @dataclass(frozen=True)
 class MergeQueueDecision:
     queue_item_id: str

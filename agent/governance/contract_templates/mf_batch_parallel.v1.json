@@ -20,6 +20,9 @@
     "batch_id",
     "backlog_ids",
     "coordination_backlog_id",
+    "preflight_id",
+    "preflight_hash",
+    "merge_queue_plan",
     "row_contracts",
     "conflict_policy",
     "evidence_requirements"
@@ -39,10 +42,37 @@
     "multi_backlog_parent": true,
     "coordination_backlog_id_required": true,
     "minimum_backlog_ids": 2,
+    "preflight_gate_required_before_fanout_ready": true,
+    "preflight_planner_only": true,
+    "durable_merge_queue_write_during_preflight": false,
     "single_row_successor_contract": "mf_parallel.v1",
     "row_scoped_successor_tokens": true,
     "shared_backlog_close_token_allowed": false,
     "description": "The batch parent never shares one backlog token across rows. It creates a per-row successor plan; each row remains responsible for its own worker, QA, merge, reconcile, and close evidence."
+  },
+  "preflight_gate": {
+    "schema_version": "mf_batch_parallel.preflight_gate_contract.v1",
+    "interface": "mf_batch_parallel_enter",
+    "planner_source": "parallel_branch_runtime.plan_mf_batch_parallel_preflight",
+    "required_before_state": "fanout_ready",
+    "side_effect_free_preview": true,
+    "durable_queue_write": false,
+    "required_outputs": [
+      "preflight_id",
+      "preflight_hash",
+      "ordered_rows",
+      "overlap_groups",
+      "dispatch_groups",
+      "merge_queue_plan",
+      "blockers"
+    ],
+    "blocker_policy": {
+      "missing_child_rows": "block",
+      "closed_or_superseded_child_rows": "block",
+      "duplicate_child_rows": "block",
+      "missing_target_files": "block",
+      "missing_target_head_commit": "block"
+    }
   },
   "row_fanout_contract": {
     "schema_version": "mf_batch_parallel.row_fanout_contract.v1",
@@ -54,7 +84,11 @@
       "route_token_ref",
       "owned_files",
       "worker_fence",
-      "qa_handoff"
+      "qa_handoff",
+      "merge_queue_id",
+      "queue_item_id",
+      "queue_index",
+      "dependency_fields"
     ],
     "token_policy": {
       "route_token_task_id": "mf_parallel_successor_execution_id",
@@ -95,6 +129,9 @@
     "independent_verification_required": true
   },
   "evidence_requirements": [
+    "preflight_id",
+    "preflight_hash",
+    "merge_queue_plan",
     "batch_backlog_ids",
     "row_successor_plan",
     "per_row_route_token_refs",
