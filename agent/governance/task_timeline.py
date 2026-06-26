@@ -649,6 +649,11 @@ def _source_backed_meta_error_is_hard(
 def _source_backed_route_gate_accepted(gate: Mapping[str, Any]) -> bool:
     if not gate:
         return False
+    if (
+        not _truthy(gate.get("server_projected"))
+        or _text(gate.get("projection_source")) != "server_route_token_mutation_gate"
+    ):
+        return False
     status = _text(gate.get("status") or gate.get("decision")).strip().lower()
     passed = bool(
         _truthy(gate.get("allowed"))
@@ -689,7 +694,13 @@ def _source_backed_timeline_authority_source(
             return "route_action_scope_lineage"
 
     for source in (payload, verification, artifact_refs):
-        route_gate = _first_deep_mapping(source, "route_token_gate")
+        authority = _first_deep_mapping(
+            source,
+            "source_backed_contract_gate_authority",
+        )
+        if _text(authority.get("source_of_authority")) != "route_token_gate":
+            continue
+        route_gate = _mapping(authority.get("route_token_gate"))
         if _source_backed_route_gate_accepted(route_gate):
             return "route_token_gate"
 

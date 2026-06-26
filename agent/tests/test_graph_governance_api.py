@@ -25181,6 +25181,58 @@ def test_timeline_append_route_ref_uses_contract_gate_for_new_event_shape(conn):
     )
 
 
+def test_timeline_append_rejects_forged_payload_route_gate_authority(conn):
+    backlog_id = "AC-CONTRACT-GATE-FORGED-PAYLOAD-ROUTE-GATE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": "forged-payload-route-gate-task",
+                    "event_type": "observer.gate_kernel_projection",
+                    "event_kind": "gate_kernel_projection",
+                    "phase": "gate_kernel",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "summary": "Caller tries to launder a fake route gate.",
+                        "route_token_gate": {
+                            "schema_version": "route_token_mutation_gate.v1",
+                            "allowed": True,
+                            "status": "accepted",
+                            "action": "task_timeline_append",
+                            "decision": "route_token_ref_resolved",
+                            "caller_role": "observer",
+                            "server_projected": True,
+                            "projection_source": "server_route_token_mutation_gate",
+                            "server_issued_binding": True,
+                            "registry_verified": True,
+                            "binding_source": "observer_route_token_refs",
+                        },
+                        "source_backed_contract_gate_authority": {
+                            "schema_version": "source_backed_contract_gate_authority.v1",
+                            "source_of_authority": "route_token_gate",
+                            "route_token_gate": {
+                                "allowed": True,
+                                "server_projected": True,
+                                "projection_source": "server_route_token_mutation_gate",
+                            },
+                        },
+                    },
+                },
+            )
+        )
+
+    assert exc.value.code == "meta_contract_whitelist_rejected"
+    assert "unknown timeline action" in str(exc.value)
+    assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
+
+
 def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-WORKER-EVIDENCE"
     _insert_simple_mf_close_backlog(conn, backlog_id)

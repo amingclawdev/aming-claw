@@ -29015,6 +29015,8 @@ def _route_gate_public_summary(gate: Mapping[str, Any] | None) -> dict[str, Any]
     route_identity = gate.get("route_identity")
     if isinstance(route_identity, Mapping):
         summary["route_identity"] = _route_identity_public_summary(route_identity)
+    summary["server_projected"] = True
+    summary["projection_source"] = "server_route_token_mutation_gate"
     return summary
 
 
@@ -29065,6 +29067,8 @@ def _timeline_payload_with_route_gate(
 ) -> dict:
     payload_value = body.get("payload") if isinstance(body, dict) else {}
     payload = dict(payload_value) if isinstance(payload_value, dict) else {}
+    payload.pop("source_backed_contract_gate_authority", None)
+    payload.pop("contract_gate_decision", None)
     event_type = str(body.get("event_type", "") if isinstance(body, dict) else "")
     if event_type.startswith("service.route.") or payload.get("service_router_suppress") is True:
         return payload
@@ -29079,7 +29083,14 @@ def _timeline_payload_with_route_gate(
         if not payload.get(key) and body.get(key):
             payload[key] = body.get(key)
     if route_gate:
-        payload["route_token_gate"] = _route_gate_public_summary(route_gate)
+        route_gate_summary = _route_gate_public_summary(route_gate)
+        payload["route_token_gate"] = route_gate_summary
+        payload["source_backed_contract_gate_authority"] = {
+            "schema_version": "source_backed_contract_gate_authority.v1",
+            "source": "server_route_token_gate",
+            "source_of_authority": "route_token_gate",
+            "route_token_gate": route_gate_summary,
+        }
     return payload
 
 
