@@ -26801,6 +26801,41 @@ def _start_source_backed_hotfix_successor(
     )
 
 
+def _complete_source_backed_hotfix_successor(
+    conn,
+    contract_execution_id: str,
+    *,
+    close_commit_sha: str = "",
+) -> dict:
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    for actor_role, stage_id, line_id, evidence_kind in [
+        ("observer", "mutation", "hotfix_post_action_summary", "hotfix_under_action"),
+        ("qa", "qa", "qa_independent_verification", "independent_verification"),
+        ("observer", "observer_close", "observer_close_ready", "close_ready"),
+    ]:
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if evidence_kind == "close_ready" and close_commit_sha:
+            write["commit_sha"] = close_commit_sha
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+        record = result["record"]
+    assert record["runtime_guide"]["next_legal_action"] is None
+    return record
+
+
 def test_timeline_append_contract_runtime_primary_gate_accepts_hotfix_implementation(conn):
     backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-IMPLEMENTATION"
     task_id = "hotfix-runtime-implementation-task"
@@ -26864,6 +26899,155 @@ def test_timeline_append_contract_runtime_primary_gate_accepts_hotfix_implementa
     )[0]
     assert event["payload"]["contract_runtime_close_evidence_gate"]["accepted"] is True
     assert event["payload"]["meta_contract_gate"]["compatibility_only"] is True
+
+
+def test_timeline_append_contract_runtime_projects_completed_hotfix_lines(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-PROJECTION"
+    task_id = "hotfix-runtime-projection-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-projection",
+    )
+    completed = _complete_source_backed_hotfix_successor(
+        conn,
+        successor["contract_execution_id"],
+        close_commit_sha="abc123projection",
+    )
+    completed_revision = completed["execution_state_revision"]
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "hotfix.under_action",
+                "event_kind": "hotfix_under_action",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                    "verification_evidence_refs": ["pytest:focused"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    runtime_gate = result["contract_runtime_close_evidence_gate"]
+    assert runtime_gate["accepted"] is True
+    assert runtime_gate["projection_only"] is True
+    assert runtime_gate["source_completed_line"] is True
+    assert runtime_gate["line_id"] == "hotfix_post_action_summary"
+    assert runtime_gate["evidence_kind"] == "hotfix_under_action"
+    assert runtime_gate["execution_state_revision"] == completed_revision
+    record_after_projection = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert record_after_projection["execution_state_revision"] == completed_revision
+
+    close_projection = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "close_ready",
+                "event_kind": "close_ready",
+                "phase": "close_ready",
+                "actor": "observer",
+                "status": "passed",
+                "commit_sha": "abc123projection",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "close_evidence": {"commit_sha": "abc123projection"},
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+    close_gate = close_projection["contract_runtime_close_evidence_gate"]
+    assert close_gate["projection_only"] is True
+    assert close_gate["line_id"] == "observer_close_ready"
+    assert close_gate["completed_line_ref"]["commit_sha"] == "abc123projection"
+    record_after_close_projection = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert record_after_close_projection["execution_state_revision"] == completed_revision
+
+    projected_event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="hotfix_under_action",
+    )[0]
+    projected_gate = projected_event["payload"]["contract_runtime_close_evidence_gate"]
+    assert projected_gate["projection_only"] is True
+    assert projected_gate["projection_source"] == "completed_contract_runtime_line"
+
+
+def test_timeline_append_contract_runtime_projection_rejects_wrong_role(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-PROJECTION-WRONG-ROLE"
+    task_id = "hotfix-runtime-projection-wrong-role-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-projection-wrong-role",
+    )
+    _complete_source_backed_hotfix_successor(
+        conn,
+        successor["contract_execution_id"],
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "qa.independent_verification",
+                    "event_kind": "independent_verification",
+                    "phase": "qa",
+                    "actor": "observer",
+                    "status": "passed",
+                    "payload": {
+                        "contract_execution_id": successor["contract_execution_id"],
+                        "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+                    },
+                    "route_waiver": _route_waiver(
+                        "task_timeline_append",
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "contract_runtime_close_evidence_rejected"
+    assert exc.value.details["error"] == "completed_line_actor_role_mismatch"
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    ) == []
 
 
 def test_timeline_append_contract_runtime_primary_gate_rejects_observer_qa(conn):
@@ -26934,6 +27118,143 @@ def test_timeline_append_contract_runtime_primary_gate_rejects_observer_qa(conn)
         backlog_id=backlog_id,
         event_kind="independent_verification",
     ) == []
+
+
+def test_timeline_append_contract_runtime_primary_gate_rejects_untrusted_qa_actor_claims(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-UNTRUSTED-QA"
+    task_id = "hotfix-runtime-untrusted-qa-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-untrusted-qa",
+    )
+    server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    for actor in ("qa", "qa:fake"):
+        with pytest.raises(GovernanceError) as exc:
+            server.handle_task_timeline_append(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body={
+                        "backlog_id": backlog_id,
+                        "task_id": task_id,
+                        "event_type": "qa.independent_verification",
+                        "event_kind": "independent_verification",
+                        "phase": "qa",
+                        "actor": actor,
+                        "status": "passed",
+                        "payload": {
+                            "contract_execution_id": successor["contract_execution_id"],
+                            "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+                        },
+                        "route_waiver": _route_waiver(
+                            "task_timeline_append",
+                            backlog_id=backlog_id,
+                            task_id=task_id,
+                        ),
+                    },
+                )
+            )
+
+        assert exc.value.code == "contract_runtime_close_evidence_rejected"
+        assert exc.value.details["error"] == "actor_role_unresolved"
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    ) == []
+
+
+def test_timeline_append_contract_runtime_primary_gate_accepts_trusted_qa_session(conn):
+    backlog_id = "AC-HOTFIX-TIMELINE-RUNTIME-TRUSTED-QA"
+    task_id = "hotfix-runtime-trusted-qa-task"
+    successor = _start_source_backed_hotfix_successor(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref="rtok-hotfix-timeline-trusted-qa",
+    )
+    server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "changed_files": ["agent/governance/server.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    result = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "qa",
+                "actor": "qa:cicero",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+            },
+        )
+    )
+
+    runtime_gate = result["contract_runtime_close_evidence_gate"]
+    assert runtime_gate["accepted"] is True
+    assert runtime_gate["actor_role"] == "qa"
+    assert runtime_gate["line_id"] == "qa_independent_verification"
 
 
 def test_timeline_append_contract_runtime_primary_gate_still_blocks_self_attesting(conn):

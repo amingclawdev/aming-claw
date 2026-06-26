@@ -36153,13 +36153,20 @@ def _contract_runtime_close_event_kind_supported(event_kind: str) -> bool:
     )
 
 
-def _contract_runtime_close_actor_role(body: Mapping[str, Any]) -> str:
+def _contract_runtime_close_actor_role(
+    body: Mapping[str, Any],
+    *,
+    trusted_actor_role: str = "",
+) -> str:
+    trusted_role = (
+        str(trusted_actor_role or "").strip().lower().replace("-", "_").replace(".", "_")
+    )
+    if trusted_role in {"observer", "qa", "mf_sub"}:
+        return trusted_role
     actor = str(body.get("actor") or "").strip().lower()
     actor_token = actor.replace("-", "_").replace(".", "_")
     if actor == "observer" or actor.startswith(("observer:", "observer.", "observer-")):
         return "observer"
-    if actor == "qa" or actor.startswith(("qa:", "qa.", "qa-", "qa_")):
-        return "qa"
     if actor_token.startswith(("mf_sub", "mfsub", "worker")):
         return "mf_sub"
 
@@ -36169,9 +36176,7 @@ def _contract_runtime_close_actor_role(body: Mapping[str, Any]) -> str:
             role = str(container.get(key) or "").strip().lower()
             if role in {"mf_sub", "mfsub", "worker"}:
                 return "mf_sub"
-            if role in {"qa", "independent_qa", "qa_verifier"}:
-                return "qa"
-    return actor_token if actor_token in {"observer", "qa", "mf_sub"} else ""
+    return actor_token if actor_token in {"observer", "mf_sub"} else ""
 
 
 def _contract_runtime_close_explicit_line(
@@ -36346,6 +36351,160 @@ def _contract_runtime_close_audit_meta_gate(
     }
 
 
+def _contract_runtime_completed_line_projection_gate(
+    record: Mapping[str, Any],
+    *,
+    body: Mapping[str, Any],
+    event_kind: str,
+    actor_role: str,
+    line: Mapping[str, Any],
+) -> dict[str, Any]:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    current_state = _runtime_current_state_from_record(record)
+    if current_state.get("next_legal_action"):
+        return {}
+    requested = {
+        "stage_id": str(line.get("stage_id") or "").strip(),
+        "line_id": str(line.get("line_id") or "").strip(),
+        "evidence_kind": str(line.get("evidence_kind") or "").strip(),
+    }
+    if not all(requested.values()):
+        return {}
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    matched_line: Mapping[str, Any] | None = None
+    if isinstance(completed_lines, list):
+        for item in completed_lines:
+            if not isinstance(item, Mapping):
+                continue
+            if (
+                str(item.get("stage_id") or "").strip() == requested["stage_id"]
+                and str(item.get("line_id") or "").strip() == requested["line_id"]
+                and str(item.get("evidence_kind") or "").strip()
+                == requested["evidence_kind"]
+            ):
+                matched_line = item
+                break
+    if matched_line is None:
+        return {}
+
+    completed_actor_role = str(matched_line.get("actor_role") or "").strip()
+    if completed_actor_role != actor_role:
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            "ContractRuntime completed line projection actor role mismatch",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "projection_only": True,
+                "contract_execution_id": str(record.get("contract_execution_id") or ""),
+                "actor_role": actor_role,
+                "completed_actor_role": completed_actor_role,
+                "requested_event_kind": event_kind,
+                "stage_id": requested["stage_id"],
+                "line_id": requested["line_id"],
+                "evidence_kind": requested["evidence_kind"],
+                "error": "completed_line_actor_role_mismatch",
+            },
+        )
+
+    request_route_token_ref = _route_request_identity_value(body, "route_token_ref")
+    record_route_token_ref = str(record.get("route_token_ref") or "").strip()
+    completed_route_token_ref = str(matched_line.get("route_token_ref") or "").strip()
+    source_route_token_ref = completed_route_token_ref or record_route_token_ref
+    if (
+        request_route_token_ref
+        and source_route_token_ref
+        and request_route_token_ref != source_route_token_ref
+    ):
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            "ContractRuntime completed line projection route token mismatch",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "projection_only": True,
+                "contract_execution_id": str(record.get("contract_execution_id") or ""),
+                "actor_role": actor_role,
+                "requested_event_kind": event_kind,
+                "stage_id": requested["stage_id"],
+                "line_id": requested["line_id"],
+                "evidence_kind": requested["evidence_kind"],
+                "error": "completed_line_route_token_ref_mismatch",
+                "request_route_token_ref": request_route_token_ref,
+                "source_route_token_ref": source_route_token_ref,
+            },
+        )
+
+    request_commit_sha = (
+        str(body.get("commit_sha") or "").strip()
+        or _route_request_identity_value(body, "commit_sha")
+    )
+    completed_commit_sha = str(matched_line.get("commit_sha") or "").strip()
+    if (
+        request_commit_sha
+        and completed_commit_sha
+        and request_commit_sha != completed_commit_sha
+    ):
+        raise GovernanceError(
+            "contract_runtime_close_evidence_rejected",
+            "ContractRuntime completed line projection commit mismatch",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+                "accepted": False,
+                "projection_only": True,
+                "contract_execution_id": str(record.get("contract_execution_id") or ""),
+                "actor_role": actor_role,
+                "requested_event_kind": event_kind,
+                "stage_id": requested["stage_id"],
+                "line_id": requested["line_id"],
+                "evidence_kind": requested["evidence_kind"],
+                "error": "completed_line_commit_sha_mismatch",
+                "request_commit_sha": request_commit_sha,
+                "completed_commit_sha": completed_commit_sha,
+            },
+        )
+
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "passed",
+        "projection_only": True,
+        "projection_source": "completed_contract_runtime_line",
+        "source_completed_line": True,
+        "primary_decision_source": True,
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "contract_id": str(record.get("contract_id") or ""),
+        "actor_role": actor_role,
+        "requested_event_kind": event_kind,
+        "stage_id": requested["stage_id"],
+        "line_id": requested["line_id"],
+        "evidence_kind": requested["evidence_kind"],
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "execution_state_revision": current_state.get("execution_state_revision", 0),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "completed_line_ref": {
+            "stage_id": str(matched_line.get("stage_id") or "").strip(),
+            "line_id": str(matched_line.get("line_id") or "").strip(),
+            "evidence_kind": str(matched_line.get("evidence_kind") or "").strip(),
+            "actor_role": completed_actor_role,
+            "line_instance_id": str(matched_line.get("line_instance_id") or "").strip(),
+            "commit_sha": completed_commit_sha,
+        },
+    }
+
+
 def _contract_runtime_close_gate(
     conn,
     *,
@@ -36353,11 +36512,15 @@ def _contract_runtime_close_gate(
     body: Mapping[str, Any],
     event_kind: str,
     norm_payload: Mapping[str, Any],
+    trusted_actor_role: str = "",
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body)
     if not contract_execution_id:
         return {}
-    actor_role = _contract_runtime_close_actor_role(body)
+    actor_role = _contract_runtime_close_actor_role(
+        body,
+        trusted_actor_role=trusted_actor_role,
+    )
     if not actor_role:
         raise GovernanceError(
             "contract_runtime_close_evidence_rejected",
@@ -36394,6 +36557,17 @@ def _contract_runtime_close_gate(
     )
     if not line:
         line = {"stage_id": "", "line_id": "", "evidence_kind": ""}
+    current_state = _runtime_current_state_from_record(record)
+    if not current_state.get("next_legal_action"):
+        projection_gate = _contract_runtime_completed_line_projection_gate(
+            record,
+            body=body,
+            event_kind=event_kind,
+            actor_role=actor_role,
+            line=line,
+        )
+        if projection_gate:
+            return projection_gate
     write = _contract_runtime_write_from_record(
         record,
         actor_role=actor_role,
@@ -36602,12 +36776,27 @@ def handle_task_timeline_append(ctx: RequestContext):
             )
         contract_runtime_close_evidence_gate = {}
         if contract_runtime_close_evidence_requested:
+            trusted_contract_runtime_actor_role = ""
+            try:
+                session = ctx.require_auth(conn)
+                session_role = (
+                    str(session.get("role") or "")
+                    .strip()
+                    .lower()
+                    .replace("-", "_")
+                    .replace(".", "_")
+                )
+                if session_role in {"observer", "qa", "mf_sub"}:
+                    trusted_contract_runtime_actor_role = session_role
+            except Exception:
+                trusted_contract_runtime_actor_role = ""
             contract_runtime_close_evidence_gate = _contract_runtime_close_gate(
                 conn,
                 project_id=project_id,
                 body=ctx.body or {},
                 event_kind=norm_event_kind,
                 norm_payload=validation_payload,
+                trusted_actor_role=trusted_contract_runtime_actor_role,
             )
             if meta_contract_error_message:
                 meta_contract_gate = {
