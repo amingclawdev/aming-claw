@@ -132,6 +132,9 @@ MF_STALE_ROUTE_EVIDENCE_GATE_SCHEMA_VERSION = "mf_stale_route_evidence_gate.v1"
 MF_APPROVAL_SCOPE_GATE_SCHEMA_VERSION = "mf_close_approval_scope_gate.v1"
 MF_COMMAND_DISPOSITION_GATE_SCHEMA_VERSION = "mf_close_command_disposition_gate.v1"
 MF_CLOSE_COMMIT_EVIDENCE_GATE_SCHEMA_VERSION = "mf_close_commit_evidence_gate.v1"
+MF_OBSERVER_DIRECT_CLOSE_EXCEPTION_GATE_SCHEMA_VERSION = (
+    "mf_observer_direct_close_exception_gate.v1"
+)
 MF_FIXED_CLOSE_WAIVER_ALERT_SCHEMA_VERSION = "mf_fixed_close_waiver_alert.v1"
 MF_TIMELINE_REPAIR_SUMMARY_SCHEMA_VERSION = "mf_close_timeline_repair_summary.v1"
 
@@ -7719,6 +7722,282 @@ def _observer_direct_exception_contract_evidence(
     return set(), {}
 
 
+def _close_event_key(event: dict[str, Any]) -> str:
+    kind = str(event.get("event_kind") or "").strip()
+    phase = str(event.get("phase") or "").strip()
+    if kind in MF_CLOSE_REQUIRED_EVENT_KINDS:
+        return kind
+    if phase in MF_CLOSE_REQUIRED_EVENT_KINDS:
+        return phase
+    if (
+        phase == "verification"
+        and kind in {"qa_verification", "independent_verification"}
+    ):
+        return "verification"
+    return ""
+
+
+def _close_event_summary(event: dict[str, Any], evidence_kind: str) -> dict[str, Any]:
+    return {
+        "id": event.get("id") or event.get("event_id"),
+        "event_kind": event.get("event_kind"),
+        "phase": event.get("phase"),
+        "status": event.get("status") or event.get("decision"),
+        "actor": event.get("actor"),
+        "commit_sha": event.get("commit_sha"),
+        "evidence_kind": evidence_kind,
+    }
+
+
+def _latest_passing_close_event(
+    rows: list[dict[str, Any]],
+    key: str,
+    *,
+    after_event_id: int = 0,
+) -> dict[str, Any]:
+    selected: dict[str, Any] = {}
+    selected_order = -1
+    for index, raw in enumerate(rows):
+        event = _mapping(raw)
+        if not event or _close_event_key(event) != key or not _event_passed(event):
+            continue
+        event_id = _event_numeric_id(event)
+        if after_event_id and event_id and event_id <= after_event_id:
+            continue
+        order = event_id or index + 1
+        if order >= selected_order:
+            selected = event
+            selected_order = order
+    return selected
+
+
+def _event_has_evidence(event: dict[str, Any], keys: set[str]) -> bool:
+    return bool(_event_deep_string_list(event, keys)) or _event_deep_truthy(event, keys)
+
+
+def _observer_direct_close_exception_gate(
+    rows: list[dict[str, Any]],
+    contract: dict[str, Any] | None,
+    close_commit_evidence_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Allow a narrow operator-supervised observer direct lane to replace worker gates."""
+
+    route_identity = _contract_route_identity(contract)
+    accepted_exception: dict[str, Any] = {}
+    accepted_exception_event: dict[str, Any] = {}
+    rejected_exceptions: list[dict[str, Any]] = []
+    for raw in rows:
+        event = _mapping(raw)
+        if not event:
+            continue
+        exception = _observer_direct_exception_event(event, route_identity)
+        if exception.get("accepted"):
+            accepted_exception = exception
+            accepted_exception_event = event
+        elif exception.get("missing_fields") != ["observer_direct_exception_event"]:
+            rejected_exceptions.append(exception)
+
+    attempted = bool(accepted_exception or rejected_exceptions)
+    if not attempted:
+        return {
+            "schema_version": MF_OBSERVER_DIRECT_CLOSE_EXCEPTION_GATE_SCHEMA_VERSION,
+            "required": False,
+            "passed": False,
+            "status": "not_applicable",
+            "missing_requirement_ids": [],
+            "accepted_exception": {},
+            "rejected_exceptions": [],
+            "replaced_gate_ids": [],
+        }
+
+    missing: list[str] = []
+    if not accepted_exception:
+        missing.append("accepted_observer_direct_implementation_exception")
+
+    exception_event_id = _event_numeric_id(accepted_exception_event)
+    implementation = _latest_passing_close_event(
+        rows,
+        "implementation",
+        after_event_id=exception_event_id,
+    )
+    implementation_event_id = _event_numeric_id(implementation)
+    verification = _latest_passing_close_event(
+        rows,
+        "verification",
+        after_event_id=implementation_event_id,
+    )
+    close_ready = _latest_passing_close_event(
+        rows,
+        "close_ready",
+        after_event_id=implementation_event_id,
+    )
+
+    if not implementation:
+        missing.append("implementation_after_observer_direct_exception")
+    if not _event_deep_string_list(
+        implementation,
+        {"changed_files", "worker_changed_files", "owned_changed_files"},
+    ):
+        missing.append("changed_files")
+    if not verification:
+        missing.append("verification_after_implementation")
+    if not _event_has_evidence(
+        verification,
+        {
+            "tests",
+            "tests_run",
+            "test_results",
+            "test_commands",
+            "focused_tests",
+            "pytest",
+        },
+    ):
+        missing.append("tests_or_test_results")
+    if not (
+        _event_has_evidence(
+            implementation,
+            {"dirty_scope", "dirty_scope_check", "scope_check", "diff_check"},
+        )
+        or _event_has_evidence(
+            verification,
+            {"dirty_scope", "dirty_scope_check", "scope_check", "diff_check"},
+        )
+    ):
+        missing.append("dirty_scope_or_diff_check")
+    if not close_ready:
+        missing.append("close_ready_after_implementation")
+    if not _event_has_evidence(
+        close_ready,
+        {
+            "governance_redeploy",
+            "redeploy",
+            "redeployed",
+            "runtime_sync",
+            "runtime_version_sync",
+            "version_sync",
+            "runtime_match",
+        },
+    ):
+        missing.append("redeploy_runtime_sync")
+    if not (
+        _event_has_evidence(
+            verification,
+            {"live_regression", "live_regression_evidence", "regression", "smoke_test"},
+        )
+        or _event_has_evidence(
+            close_ready,
+            {"live_regression", "live_regression_evidence", "regression", "smoke_test"},
+        )
+    ):
+        missing.append("live_regression_evidence")
+    if not (
+        _event_has_evidence(close_ready, {"graph_reconciled", "scope_reconciled"})
+        and _event_has_evidence(close_ready, {"preflight_ok", "preflight_passed"})
+    ):
+        missing.append("graph_reconcile_and_preflight")
+    if (
+        not close_commit_evidence_gate.get("passed")
+        or str(close_commit_evidence_gate.get("status") or "") == "not_applicable"
+    ):
+        missing.append("matching_close_commit_timeline_evidence")
+
+    passed = bool(accepted_exception) and not missing
+    return {
+        "schema_version": MF_OBSERVER_DIRECT_CLOSE_EXCEPTION_GATE_SCHEMA_VERSION,
+        "required": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "missing_requirement_ids": missing,
+        "accepted_exception": accepted_exception,
+        "rejected_exceptions": rejected_exceptions,
+        "implementation_event": _close_event_summary(implementation, "implementation")
+        if implementation
+        else {},
+        "verification_event": _close_event_summary(verification, "verification")
+        if verification
+        else {},
+        "close_ready_event": _close_event_summary(close_ready, "close_ready")
+        if close_ready
+        else {},
+        "close_commit_evidence_gate": {
+            "status": close_commit_evidence_gate.get("status"),
+            "close_commit": close_commit_evidence_gate.get("close_commit", ""),
+            "matching_evidence_commit": close_commit_evidence_gate.get(
+                "matching_evidence_commit",
+                "",
+            ),
+        },
+        "replaced_gate_ids": (
+            [
+                "route_context_gate",
+                "finish_gate_projection",
+                "worker_graph_trace_gate",
+                "independent_qa_gate",
+                "contract_projection_gate",
+                "close_timeline_startup_gate",
+            ]
+            if passed
+            else []
+        ),
+        "next_action": (
+            "retry_close_with_observer_direct_exception_evidence"
+            if passed
+            else "record complete operator-supervised observer direct close evidence"
+        ),
+    }
+
+
+def _gate_replaced_by_observer_direct_exception(
+    gate: Mapping[str, Any] | None,
+    gate_id: str,
+    observer_direct_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    replaced = dict(gate or {})
+    original = {
+        key: replaced.get(key)
+        for key in (
+            "passed",
+            "status",
+            "required",
+            "missing_requirement_ids",
+            "missing_event_kinds",
+            "missing_fields",
+            "missing_actions",
+            "reason",
+        )
+        if key in replaced
+    }
+    replaced["passed"] = True
+    replaced["status"] = "replaced_by_observer_direct_close_exception"
+    if "required" in replaced:
+        replaced["required"] = False
+    for key in (
+        "missing_requirement_ids",
+        "missing_event_kinds",
+        "missing_fields",
+        "missing_actions",
+    ):
+        if key in replaced:
+            replaced[key] = []
+    if isinstance(replaced.get("follow_up"), dict):
+        follow_up = dict(replaced["follow_up"])
+        follow_up["required"] = False
+        follow_up["actions"] = []
+        replaced["follow_up"] = follow_up
+    replaced["observer_direct_close_exception_replacement"] = {
+        "schema_version": "observer_direct_close_exception_gate_replacement.v1",
+        "gate_id": gate_id,
+        "source_gate": MF_OBSERVER_DIRECT_CLOSE_EXCEPTION_GATE_SCHEMA_VERSION,
+        "status": "replaced",
+        "original": original,
+        "exception_event": _mapping(observer_direct_gate.get("accepted_exception")).get(
+            "event",
+            {},
+        ),
+    }
+    return replaced
+
+
 def mf_lane_ownership_gate_verification(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
@@ -9665,6 +9944,43 @@ def mf_close_gate_verification(
         rows,
         contract,
     )
+    observer_direct_close_exception_gate = _observer_direct_close_exception_gate(
+        rows,
+        contract,
+        close_commit_evidence_gate,
+    )
+    if observer_direct_close_exception_gate.get("passed"):
+        route_context_gate = _gate_replaced_by_observer_direct_exception(
+            route_context_gate,
+            "route_context_gate",
+            observer_direct_close_exception_gate,
+        )
+        finish_gate_projection = _gate_replaced_by_observer_direct_exception(
+            finish_gate_projection,
+            "finish_gate_projection",
+            observer_direct_close_exception_gate,
+        )
+        worker_graph_trace_gate = _gate_replaced_by_observer_direct_exception(
+            worker_graph_trace_gate,
+            "worker_graph_trace_gate",
+            observer_direct_close_exception_gate,
+        )
+        independent_qa_gate = _gate_replaced_by_observer_direct_exception(
+            independent_qa_gate,
+            "independent_qa_gate",
+            observer_direct_close_exception_gate,
+        )
+        contract_projection_gate = _gate_replaced_by_observer_direct_exception(
+            contract_projection_gate,
+            "contract_projection_gate",
+            observer_direct_close_exception_gate,
+        )
+        if close_timeline_startup_gate:
+            close_timeline_startup_gate = _gate_replaced_by_observer_direct_exception(
+                close_timeline_startup_gate,
+                "close_timeline_startup_gate",
+                observer_direct_close_exception_gate,
+            )
     missing_evidence_groups = mf_close_missing_evidence_groups(
         missing,
         route_context_gate,
@@ -9767,6 +10083,20 @@ def mf_close_gate_verification(
                 "record accepted close evidence for the actual close commit",
             ),
         }
+    if observer_direct_close_exception_gate.get("required"):
+        groups["observer_direct_close_exception"] = {
+            "label": "operator-supervised observer direct close exception",
+            "passed": bool(observer_direct_close_exception_gate.get("passed")),
+            "missing": observer_direct_close_exception_gate.get(
+                "missing_requirement_ids",
+                [],
+            ),
+            "replaced_gate_ids": observer_direct_close_exception_gate.get(
+                "replaced_gate_ids",
+                [],
+            ),
+            "next_action": observer_direct_close_exception_gate.get("next_action", ""),
+        }
     missing_evidence_groups["groups"] = groups
     route_context_reminder = mf_route_context_reminder(
         route_context_gate,
@@ -9826,6 +10156,7 @@ def mf_close_gate_verification(
         "command_disposition_gate": command_disposition_gate,
         "close_commit_evidence_gate": close_commit_evidence_gate,
         "close_timeline_startup_gate": close_timeline_startup_gate,
+        "observer_direct_close_exception_gate": observer_direct_close_exception_gate,
         "missing_evidence_groups": missing_evidence_groups,
         "route_context_reminder": route_context_reminder,
         "checks": {
@@ -9858,6 +10189,9 @@ def mf_close_gate_verification(
             ),
             "close_commit_has_timeline_evidence": bool(
                 close_commit_evidence_gate.get("passed")
+            ),
+            "has_observer_direct_close_exception": bool(
+                observer_direct_close_exception_gate.get("passed")
             ),
             "mf_subagent_startup_close_satisfying": (
                 True

@@ -8466,6 +8466,116 @@ class TestTaskTimeline(unittest.TestCase):
             ]
         )
 
+    def test_observer_direct_exception_can_replace_worker_and_qa_close_gates(self):
+        from agent.governance import task_timeline
+
+        close_commit = "abc1234"
+        contract = {
+            "governance_policy": STRICT_GOVERNANCE_POLICY,
+            "close_context": {"close_commit": close_commit},
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        events = [
+            {
+                "id": 7101,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "reason": "operator-supervised direct repair of a close gate",
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    },
+                    "dirty_scope_check": {"dirty_files": []},
+                },
+            },
+            {
+                "id": 7102,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "dirty_scope_check": {
+                        "changed_files": ["agent/governance/task_timeline.py"],
+                        "unexpected_files": [],
+                    },
+                },
+            },
+            {
+                "id": 7103,
+                "event_kind": "verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "tests_run": ["pytest -q agent/tests/test_task_timeline.py"],
+                    "diff_check": {"unexpected_files": []},
+                    "live_regression": {"status": "passed"},
+                },
+            },
+            {
+                "id": 7104,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "governance_redeploy": {"status": "passed"},
+                    "runtime_version_sync": True,
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                    "live_regression": {"status": "passed"},
+                },
+            },
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertTrue(ready["observer_direct_close_exception_gate"]["passed"])
+        self.assertEqual(
+            ready["route_context_gate"]["status"],
+            "replaced_by_observer_direct_close_exception",
+        )
+        self.assertEqual(
+            ready["independent_qa_gate"]["status"],
+            "replaced_by_observer_direct_close_exception",
+        )
+        self.assertEqual(
+            ready["worker_graph_trace_gate"]["status"],
+            "replaced_by_observer_direct_close_exception",
+        )
+        self.assertEqual(
+            ready["close_timeline_startup_gate"]["status"],
+            "replaced_by_observer_direct_close_exception",
+        )
+        self.assertTrue(ready["checks"]["has_observer_direct_close_exception"])
+        direct_group = ready["missing_evidence_groups"]["groups"][
+            "observer_direct_close_exception"
+        ]
+        self.assertTrue(direct_group["passed"])
+        self.assertIn("independent_qa_gate", direct_group["replaced_gate_ids"])
+
     def test_observer_hotfix_contract_policy_requires_qa_without_parallel_topology(self):
         from agent.governance import task_timeline
 

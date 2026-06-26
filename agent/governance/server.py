@@ -34070,31 +34070,47 @@ def _contract_runtime_record_references_runtime_context(
     if not isinstance(completed_lines, list):
         return False
 
+    def _mapping_candidates(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
+        if depth > 6:
+            return []
+        if isinstance(value, Mapping):
+            candidates: list[Mapping[str, Any]] = [value]
+            for child in value.values():
+                candidates.extend(_mapping_candidates(child, depth=depth + 1))
+            return candidates
+        if isinstance(value, list):
+            candidates = []
+            for child in value:
+                candidates.extend(_mapping_candidates(child, depth=depth + 1))
+            return candidates
+        return []
+
     def _line_value(line: Mapping[str, Any], *keys: str) -> str:
-        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
-        for source in (line, payload):
-            for key in keys:
-                text = str(source.get(key) or "").strip()
-                if text:
-                    return text
+        for key in keys:
+            text = str(line.get(key) or "").strip()
+            if text:
+                return text
         return ""
 
     contract_id = str((record or {}).get("contract_id") or "").strip()
 
-    def _matches_context(payload: Mapping[str, Any]) -> bool:
-        if _line_value(payload, "runtime_context_id") != runtime_context_id:
-            return False
-        if _line_value(payload, "task_id") != task_id:
-            return False
-        if _line_value(payload, "parent_task_id") != parent_task_id:
-            return False
-        return (
-            _line_value(payload, "worker_role", "role")
-            .strip()
-            .lower()
-            .replace("-", "_")
-            == "mf_sub"
-        )
+    def _matches_context(value: Mapping[str, Any]) -> bool:
+        for payload in _mapping_candidates(value):
+            if _line_value(payload, "runtime_context_id") != runtime_context_id:
+                continue
+            if _line_value(payload, "task_id") != task_id:
+                continue
+            if _line_value(payload, "parent_task_id") != parent_task_id:
+                continue
+            if (
+                _line_value(payload, "worker_role", "role")
+                .strip()
+                .lower()
+                .replace("-", "_")
+                == "mf_sub"
+            ):
+                return True
+        return False
 
     for line in completed_lines:
         if not isinstance(line, Mapping):

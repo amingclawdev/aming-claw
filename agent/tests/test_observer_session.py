@@ -31,6 +31,7 @@ def test_register_returns_token_once_and_stores_only_hash():
     token = result["session_token"]
     assert session_id
     assert token
+    assert result["heartbeat_interval_sec"] == 300
     assert result["heartbeat_interval_sec"] == observer_session.HEARTBEAT_INTERVAL_SEC
 
     stored = conn.execute(
@@ -81,19 +82,19 @@ def test_stale_status_is_computed_from_last_seen():
         conn,
         project_id="demo",
         session_id=result["session_id"],
-        now="2026-05-28T00:00:30Z",
+        now="2026-05-28T00:05:00Z",
     )
     idle = observer_session.get_session(
         conn,
         project_id="demo",
         session_id=result["session_id"],
-        now="2026-05-28T00:01:30Z",
+        now="2026-05-28T00:10:00Z",
     )
     stale = observer_session.get_session(
         conn,
         project_id="demo",
         session_id=result["session_id"],
-        now="2026-05-28T00:03:00Z",
+        now="2026-05-28T00:20:00Z",
     )
 
     assert current["computed_status"] == "active"
@@ -168,7 +169,7 @@ def test_stale_session_rejects_privileged_command_claim():
             project_id="demo",
             session_id=result["session_id"],
             session_token=result["session_token"],
-            now="2026-05-28T00:03:00Z",
+            now="2026-05-28T00:20:00Z",
         )
 
 
