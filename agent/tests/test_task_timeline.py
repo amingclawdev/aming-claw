@@ -4048,6 +4048,64 @@ class TestTaskTimeline(unittest.TestCase):
             issued["route_token_ref"],
         )
 
+    def test_timeline_append_route_token_ref_makes_legacy_meta_audit_only(self):
+        from agent.governance import server, task_timeline
+
+        bug_id = "BUG-TL-REF-OBSERVER-REVIEW-AUDIT-META"
+        task_id = "task-observer-review-audit-meta"
+        issued = self._issue_route_token(bug_id, task_id=task_id)
+
+        result = server.handle_task_timeline_append(
+            _ctx(
+                body={
+                    "backlog_id": bug_id,
+                    "task_id": task_id,
+                    "event_type": "observer.hotfix_candidate_review",
+                    "event_kind": "verification",
+                    "phase": "observer_review",
+                    "actor": "observer",
+                    "status": "accepted",
+                    "route_token_ref": issued["route_token_ref"],
+                    "payload": {
+                        "worker_role": "mf_sub",
+                        "worker_timeline_events": {
+                            "implementation": "timeline:7278",
+                            "finish_time_attestation": "timeline:7279",
+                        },
+                        "review_decision": "candidate_ready_for_qa",
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        payload = result["payload"]
+        self.assertNotIn("meta_contract_gate", payload)
+        decision = payload["contract_gate_decision"]
+        self.assertEqual(decision["source_of_authority"], "route_token_gate")
+        self.assertEqual(decision["legacy_meta_contract_gate"], "imported_audit_only")
+        self.assertEqual(decision["decision"], "warn")
+        self.assertIn(
+            "legacy_meta_contract_compatibility_rejected",
+            decision["warnings"],
+        )
+        legacy_gate = decision["meta_contract_gate"]
+        self.assertTrue(legacy_gate["legacy_audit_only"])
+        self.assertEqual(legacy_gate["code"], "meta_contract_whitelist_rejected")
+        self.assertEqual(result["route_token_gate"]["decision"], "route_token_ref_resolved")
+
+        source = task_timeline.list_events(
+            self.conn,
+            "proj",
+            task_id=task_id,
+            backlog_id=bug_id,
+            event_kind="verification",
+        )[0]
+        self.assertEqual(
+            source["payload"]["contract_gate_decision"]["source_of_authority"],
+            "route_token_gate",
+        )
+
     def test_timeline_append_accepts_route_context_waiver(self):
         from agent.governance import server
 

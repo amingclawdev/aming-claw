@@ -635,7 +635,7 @@ def _source_backed_meta_error_is_hard(
     ):
         return True
     if "author_worker_evidence" in message and "requires on_behalf_of" in message:
-        return True
+        return False
     hard_markers = (
         "bypass_timeline_gate",
         "surrogate_startup",

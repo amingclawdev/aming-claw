@@ -37412,6 +37412,13 @@ def handle_task_timeline_append(ctx: RequestContext):
                 ctx.body.get("artifact_refs") or {},
             )
         )
+        if (
+            not source_authority_before_runtime
+            and task_timeline._source_backed_route_gate_accepted(
+                _route_gate_public_summary(route_gate)
+            )
+        ):
+            source_authority_before_runtime = "route_token_gate"
         meta_contract_error_message = ""
         try:
             meta_contract_gate = validate_meta_contract_timeline_event(
