@@ -941,6 +941,12 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     assert "agent/service.py" in delta["impacted_files"]
     assert result["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
     assert result["scope_graph_delta"]["mode"] == "source_dependency_delta"
+    source_update = result["incremental_eligibility"]["source_dependency_update"]
+    assert source_update["source_paths"] == ["agent/service.py"]
+    assert source_update["execution"]["label"] == "source_dependency_delta"
+    assert source_update["execution"]["strategy"] == "serial"
+    assert source_update["execution"]["fallback_reason"] == "single_task"
+    assert source_update["execution"]["deterministic_order"] == "input_order"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/service.py"]

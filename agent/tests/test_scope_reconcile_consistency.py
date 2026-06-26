@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import graph_snapshot_store as store
+from agent.governance import state_reconcile as state_reconcile_module
 from agent.governance.db import _ensure_schema
 from agent.governance.state_reconcile import (
     _read_snapshot_graph,
@@ -469,6 +470,13 @@ def test_scope_reconcile_source_dependency_delta_matches_full_rebuild(conn, tmp_
     assert scope["scope_graph_delta"]["removed_nodes"] == []
     assert scope["scope_graph_delta"]["added_edges"]
     assert scope["scope_graph_delta"]["removed_edges"]
+    source_update = scope["incremental_eligibility"]["source_dependency_update"]
+    impact = source_update["dependency_impact_closure"]
+    assert impact["available"] is True
+    assert impact["schema_version"] == "dependency_impact_closure.v1"
+    assert impact["fan_in"]["direction"] == "fan_in"
+    assert impact["fan_out"]["direction"] == "fan_out"
+    assert impact["has_cycle"] is False
 
     full = run_state_only_full_reconcile(
         conn,
@@ -491,6 +499,152 @@ def test_scope_reconcile_source_dependency_delta_matches_full_rebuild(conn, tmp_
     assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]
     assert scope_node_ids["agent/helper_a.py"] == base_node_ids["agent/helper_a.py"]
     assert scope_node_ids["agent/helper_b.py"] == base_node_ids["agent/helper_b.py"]
+
+
+def test_scope_reconcile_multi_source_dependency_delta_uses_executor_observability(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    _write_dependency_project(project, helper_module="helper_a")
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-multi-source-dep-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-multi-source-dep-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "service.py",
+        "from agent.helper_b import run_helper\n\n"
+        "def service_entry():\n"
+        "    return run_helper()\n",
+    )
+    _write(
+        project / "agent" / "helper_a.py",
+        "def run_helper():\n"
+        "    return 'a2'\n",
+    )
+    _git(project, "add", "agent/service.py", "agent/helper_a.py")
+    _git(project, "commit", "-m", "retarget service and update helper")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    observed: dict[str, int] = {}
+
+    def fake_parallel_executor(tasks, worker, *, label, **_kwargs):
+        task_list = list(tasks)
+        observed["task_count"] = len(task_list)
+        return {
+            "results": [worker(task) for task in task_list],
+            "observability": {
+                "schema_version": "reconcile_parallel_executor.v1",
+                "label": label,
+                "strategy": "parallel_process_pool",
+                "fallback_reason": "",
+                "deterministic_order": "input_order",
+                "task_count": len(task_list),
+                "worker_count": 2,
+            },
+        }
+
+    monkeypatch.setattr(
+        state_reconcile_module,
+        "_run_reconcile_parallel_tasks",
+        fake_parallel_executor,
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-multi-source-dep-head-consistency",
+        snapshot_id="scope-multi-source-dep-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+
+    assert scope["ok"] is True
+    source_update = scope["incremental_eligibility"]["source_dependency_update"]
+    assert observed["task_count"] == 2
+    assert source_update["source_paths"] == ["agent/helper_a.py", "agent/service.py"]
+    assert source_update["execution"]["strategy"] == "parallel_process_pool"
+    assert source_update["execution"]["task_count"] == 2
+    assert source_update["execution"]["deterministic_order"] == "input_order"
+
+
+def test_scope_reconcile_source_signature_change_uses_full_rebuild_fallback(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_dependency_project(project, helper_module="helper_a")
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-source-signature-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-source-signature-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "service.py",
+        "from agent.helper_a import run_helper\n\n"
+        "def service_entry(prefix: str = ''):\n"
+        "    return prefix + run_helper()\n",
+    )
+    _git(project, "add", "agent/service.py")
+    _git(project, "commit", "-m", "change service signature")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-source-signature-head-consistency",
+        snapshot_id="scope-source-signature-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "full_rebuild_fallback"
+    assert scope["scope_file_delta"]["fallback_reason"] == "source_function_signature_changed"
+    assert scope["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
 
 
 def test_scope_reconcile_test_fanin_incremental_matches_full_rebuild(conn, tmp_path):

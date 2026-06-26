@@ -92,6 +92,36 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     _test_fanin_entry_is_strong,
 )
 
+try:
+    from agent.governance.reconcile_dependency_closure import (
+        dependency_impact_closure as _dependency_impact_closure,
+    )
+except Exception as exc:  # pragma: no cover - defensive for partial parallel-worker checkouts
+    _dependency_impact_closure = None
+    _RECONCILE_DFS_CLOSURE_IMPORT_ERROR = exc
+else:
+    _RECONCILE_DFS_CLOSURE_IMPORT_ERROR = None
+
+try:
+    from agent.governance.reconcile_ast_delta import (
+        source_file_function_delta as _source_file_function_delta,
+    )
+except Exception as exc:  # pragma: no cover - defensive for partial parallel-worker checkouts
+    _source_file_function_delta = None
+    _RECONCILE_AST_DELTA_IMPORT_ERROR = exc
+else:
+    _RECONCILE_AST_DELTA_IMPORT_ERROR = None
+
+try:
+    from agent.governance.reconcile_parallel_executor import (
+        run_reconcile_tasks as _run_reconcile_parallel_tasks,
+    )
+except Exception as exc:  # pragma: no cover - defensive for partial parallel-worker checkouts
+    _run_reconcile_parallel_tasks = None
+    _RECONCILE_PARALLEL_IMPORT_ERROR = exc
+else:
+    _RECONCILE_PARALLEL_IMPORT_ERROR = None
+
 
 def _git_commit(project_root: str | Path, ref: str = "HEAD") -> str:
     root = Path(project_root).resolve()
@@ -150,6 +180,25 @@ def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str)
         for path in line.split("\t")[1:]
         if path.strip()
     })
+
+
+def _git_show_file(project_root: str | Path, ref: str, path: str) -> tuple[bool, str, str]:
+    commit = str(ref or "").strip()
+    repo_path = str(path or "").replace("\\", "/").strip("/")
+    if not commit or not repo_path:
+        return False, "", "git_show_file_identity_missing"
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{repo_path}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return False, "", "git_show_file_failed"
+    return True, result.stdout or "", ""
 
 
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -873,10 +922,281 @@ def _function_signature_delta(
     }
 
 
+def _source_path_ast_signature_delta(
+    project_root: str | Path,
+    *,
+    active_commit: str,
+    target_commit: str,
+    path: str,
+    module_name: str,
+) -> dict[str, Any]:
+    repo_path = _norm_repo_path(path)
+    if not repo_path.endswith(".py"):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "source_ast_delta_not_applicable",
+            "path": repo_path,
+        }
+    if _source_file_function_delta is None:
+        return {
+            "ok": False,
+            "reason": "source_ast_delta_unavailable",
+            "path": repo_path,
+            "error_type": type(_RECONCILE_AST_DELTA_IMPORT_ERROR).__name__
+            if _RECONCILE_AST_DELTA_IMPORT_ERROR
+            else "",
+            "error": str(_RECONCILE_AST_DELTA_IMPORT_ERROR or ""),
+        }
+    before_ok, before_source, before_reason = _git_show_file(project_root, active_commit, repo_path)
+    if not before_ok:
+        return {
+            "ok": False,
+            "reason": before_reason or "source_ast_delta_before_source_missing",
+            "path": repo_path,
+            "commit": active_commit,
+        }
+    after_ok, after_source, after_reason = _git_show_file(project_root, target_commit, repo_path)
+    if not after_ok:
+        return {
+            "ok": False,
+            "reason": after_reason or "source_ast_delta_after_source_missing",
+            "path": repo_path,
+            "commit": target_commit,
+        }
+    delta = _source_file_function_delta(
+        before_source=before_source,
+        after_source=after_source,
+        module_name=module_name,
+        path=repo_path,
+    )
+    if not delta.get("ok"):
+        return {
+            "ok": False,
+            "reason": str(delta.get("reason") or "source_ast_delta_parse_failed"),
+            "path": repo_path,
+            "delta": delta,
+        }
+    return {
+        "ok": True,
+        "reason": str(delta.get("reason") or ""),
+        "path": repo_path,
+        "delta": delta.get("delta") or {},
+    }
+
+
+def _function_meta_payload(func: Any) -> dict[str, Any]:
+    return {
+        "module": str(getattr(func, "module", "") or ""),
+        "name": str(getattr(func, "name", "") or ""),
+        "qualified_name": str(getattr(func, "qualified_name", "") or ""),
+        "lineno": int(getattr(func, "lineno", 0) or 0),
+        "end_lineno": int(getattr(func, "end_lineno", 0) or 0),
+        "decorators": list(getattr(func, "decorators", []) or []),
+        "calls": list(getattr(func, "calls", []) or []),
+        "call_contexts": list(getattr(func, "call_contexts", []) or []),
+        "is_entry": bool(getattr(func, "is_entry", False)),
+    }
+
+
+def _module_info_payload(module: ModuleInfo) -> dict[str, Any]:
+    return _json_clone({
+        "path": str(getattr(module, "path", "") or ""),
+        "module_name": str(getattr(module, "module_name", "") or ""),
+        "import_map": dict(getattr(module, "import_map", {}) or {}),
+        "functions": [
+            _function_meta_payload(func)
+            for func in getattr(module, "functions", []) or []
+        ],
+        "source": str(getattr(module, "source", "") or ""),
+        "language": str(getattr(module, "language", "") or ""),
+        "source_kind": str(getattr(module, "source_kind", "") or ""),
+        "adapter_symbols": list(getattr(module, "adapter_symbols", []) or []),
+        "adapter_imports": list(getattr(module, "adapter_imports", []) or []),
+        "adapter_relations": list(getattr(module, "adapter_relations", []) or []),
+    })
+
+
+def _module_info_from_payload(payload: Mapping[str, Any]) -> ModuleInfo:
+    functions = [
+        FunctionMeta(
+            module=str(item.get("module") or ""),
+            name=str(item.get("name") or ""),
+            qualified_name=str(item.get("qualified_name") or ""),
+            lineno=int(item.get("lineno") or 0),
+            end_lineno=int(item.get("end_lineno") or 0),
+            decorators=list(item.get("decorators") or []),
+            calls=list(item.get("calls") or []),
+            call_contexts=list(item.get("call_contexts") or []),
+            is_entry=bool(item.get("is_entry")),
+        )
+        for item in payload.get("functions", []) or []
+        if isinstance(item, dict)
+    ]
+    return ModuleInfo(
+        path=str(payload.get("path") or ""),
+        module_name=str(payload.get("module_name") or ""),
+        import_map=dict(payload.get("import_map") or {}),
+        functions=functions,
+        source=str(payload.get("source") or ""),
+        language=str(payload.get("language") or ""),
+        source_kind=str(payload.get("source_kind") or "symbol_ast"),
+        adapter_symbols=list(payload.get("adapter_symbols") or []),
+        adapter_imports=list(payload.get("adapter_imports") or []),
+        adapter_relations=list(payload.get("adapter_relations") or []),
+    )
+
+
+def _parse_source_dependency_worker(task: Mapping[str, Any]) -> dict[str, Any]:
+    project_root = str(task.get("project_root") or "")
+    path = _norm_repo_path(task.get("path"))
+    expected_module = str(task.get("expected_module") or "")
+    if not path:
+        return {"ok": False, "reason": "source_path_missing", "path": path}
+    module = parse_production_module_file(str(Path(project_root).resolve()), path)
+    if module is None:
+        return {"ok": False, "reason": "source_adapter_parse_failed", "path": path}
+    module_name = str(getattr(module, "module_name", "") or "")
+    if expected_module and module_name != expected_module:
+        return {
+            "ok": False,
+            "reason": "source_module_identity_changed",
+            "path": path,
+            "expected_module": expected_module,
+            "parsed_module": module_name,
+        }
+    if getattr(module, "source_kind", "") == "filetree_fallback":
+        return {
+            "ok": False,
+            "reason": "source_filetree_fallback_requires_full_rebuild",
+            "path": path,
+        }
+    try:
+        project_root_resolved = str(Path(project_root).resolve())
+        typed_relations = extract_typed_relations(
+            project_root_resolved,
+            {module_name: module},
+            graph_enrich_config_rules=_load_graph_enrich_config_rules(project_root_resolved),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "source_typed_relation_scan_failed",
+            "path": path,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    try:
+        module_payload = _module_info_payload(module)
+        typed_relation_payload = _json_clone(typed_relations)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "source_dependency_payload_not_json_serializable",
+            "path": path,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "path": path,
+        "module": module_name,
+        "module_payload": module_payload,
+        "typed_relations": typed_relation_payload,
+        "typed_relation_count": len(typed_relation_payload),
+    }
+
+
+def _serial_source_dependency_parse_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    fallback_reason: str,
+    error: Exception | None = None,
+) -> dict[str, Any]:
+    observability: dict[str, Any] = {
+        "schema_version": "reconcile_parallel_executor.v1",
+        "label": "source_dependency_delta",
+        "strategy": "serial",
+        "fallback_reason": fallback_reason,
+        "fallback_error_type": type(error).__name__ if error else "",
+        "fallback_error": str(error) if error else "",
+        "deterministic_order": "input_order",
+        "task_count": len(tasks),
+        "worker_count": 1,
+    }
+    return {
+        "results": [_parse_source_dependency_worker(task) for task in tasks],
+        "observability": observability,
+    }
+
+
+def _run_source_dependency_parse_tasks(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    if not tasks:
+        return _serial_source_dependency_parse_tasks(tasks, fallback_reason="no_tasks")
+    if _run_reconcile_parallel_tasks is None:
+        return _serial_source_dependency_parse_tasks(
+            tasks,
+            fallback_reason="parallel_executor_unavailable",
+            error=_RECONCILE_PARALLEL_IMPORT_ERROR,
+        )
+    try:
+        return _run_reconcile_parallel_tasks(
+            tasks,
+            _parse_source_dependency_worker,
+            label="source_dependency_delta",
+        )
+    except Exception as exc:
+        return _serial_source_dependency_parse_tasks(
+            tasks,
+            fallback_reason="parallel_executor_unhandled_error",
+            error=exc,
+        )
+
+
+def _source_dependency_impact_closure_payload(
+    changed_node_ids: set[str],
+    deps_graph: Mapping[str, Any],
+) -> dict[str, Any]:
+    roots = sorted(str(node_id or "") for node_id in changed_node_ids if str(node_id or ""))
+    if not roots:
+        return {
+            "available": False,
+            "reason": "source_dependency_impact_roots_missing",
+            "roots": [],
+        }
+    if _dependency_impact_closure is None:
+        return {
+            "available": False,
+            "reason": "dependency_impact_closure_unavailable",
+            "roots": roots,
+            "error_type": type(_RECONCILE_DFS_CLOSURE_IMPORT_ERROR).__name__
+            if _RECONCILE_DFS_CLOSURE_IMPORT_ERROR
+            else "",
+            "error": str(_RECONCILE_DFS_CLOSURE_IMPORT_ERROR or ""),
+        }
+    try:
+        payload = _dependency_impact_closure(roots, deps_graph.get("links", []) or [])
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "dependency_impact_closure_failed",
+            "roots": roots,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    return {
+        **_json_clone(payload),
+        "available": True,
+    }
+
+
 def _source_path_incremental_eligibility(
     project_root: str | Path,
     active_graph_json: dict[str, Any],
     path: str,
+    *,
+    active_commit: str = "",
+    target_commit: str = "",
 ) -> dict[str, Any]:
     node = _node_for_primary_path(active_graph_json, path)
     if not node:
@@ -909,6 +1229,34 @@ def _source_path_incremental_eligibility(
             "supported": False,
             "reason": "source_filetree_fallback_requires_full_rebuild",
             "path": path,
+        }
+    ast_signature_delta = _source_path_ast_signature_delta(
+        project_root,
+        active_commit=active_commit,
+        target_commit=target_commit,
+        path=path,
+        module_name=parsed_module,
+    ) if active_commit and target_commit else {
+        "ok": True,
+        "skipped": True,
+        "reason": "source_ast_delta_commit_context_missing",
+        "path": path,
+    }
+    if not ast_signature_delta.get("ok"):
+        return {
+            "supported": False,
+            "reason": str(ast_signature_delta.get("reason") or "source_ast_delta_failed"),
+            "path": path,
+            "ast_signature_delta": ast_signature_delta,
+        }
+    ast_delta = ast_signature_delta.get("delta") if isinstance(ast_signature_delta.get("delta"), dict) else {}
+    if ast_delta.get("requires_full_rebuild"):
+        return {
+            "supported": False,
+            "reason": str(ast_delta.get("reason") or "source_function_signature_changed"),
+            "legacy_reason": "source_function_signature_changed",
+            "path": path,
+            "ast_signature_delta": ast_signature_delta,
         }
     parsed_signature = _module_function_signature(module)
     active_signature = _node_function_signature(node)
@@ -951,6 +1299,7 @@ def _source_path_incremental_eligibility(
             or any(getattr(func, "decorators", None) for func in getattr(module, "functions", []) or [])
         ),
         "typed_relation_count": len(typed_relations),
+        "ast_signature_delta": ast_signature_delta,
         "signature_delta": signature_delta,
     }
 
@@ -1003,6 +1352,8 @@ def _incremental_metadata_scope_eligibility(
     active_graph_json: dict[str, Any],
     old_rows: list[dict[str, Any]],
     new_rows: list[dict[str, Any]],
+    active_commit: str = "",
+    target_commit: str = "",
 ) -> dict[str, Any]:
     if scope_file_delta.get("status_changed_files"):
         return {"supported": False, "reason": "inventory_status_change_requires_full_rebuild"}
@@ -1099,7 +1450,13 @@ def _incremental_metadata_scope_eligibility(
             metadata_paths.append(path)
             continue
         if kind == "source" and role == "primary":
-            check = _source_path_incremental_eligibility(project_root, active_graph_json, path)
+            check = _source_path_incremental_eligibility(
+                project_root,
+                active_graph_json,
+                path,
+                active_commit=active_commit,
+                target_commit=target_commit,
+            )
             source_checks.append(check)
             if not check.get("supported"):
                 unsupported.append({
@@ -1740,13 +2097,66 @@ def _apply_incremental_source_dependency_delta(
     updated_node_ids: set[str] = set()
     parsed_modules: dict[str, ModuleInfo] = {}
     typed_relations: list[dict[str, Any]] = []
+    parse_tasks: list[dict[str, Any]] = []
+    project_root_resolved = str(Path(project_root).resolve())
     for path in sorted(source_set):
         node = _node_for_primary_path(candidate_graph, path)
         if not node:
             return {"ok": False, "reason": "source_primary_node_not_unique", "path": path}
-        module = parse_production_module_file(str(Path(project_root).resolve()), path)
-        if module is None:
-            return {"ok": False, "reason": "source_adapter_parse_failed", "path": path}
+        metadata = _node_metadata(node)
+        module_name = str(metadata.get("module") or "")
+        if not module_name:
+            return {"ok": False, "reason": "source_module_identity_changed", "path": path, "expected_module": ""}
+        node_id = _node_id(node)
+        if not node_id:
+            return {"ok": False, "reason": "source_node_id_missing", "path": path}
+        changed_modules.add(module_name)
+        updated_node_ids.add(node_id)
+        parse_tasks.append({
+            "project_root": project_root_resolved,
+            "path": path,
+            "expected_module": module_name,
+        })
+
+    parse_execution = _run_source_dependency_parse_tasks(parse_tasks)
+    source_dependency_execution = dict(parse_execution.get("observability") or {})
+    parse_results = [
+        item for item in parse_execution.get("results", []) or []
+        if isinstance(item, dict)
+    ]
+    if len(parse_results) != len(parse_tasks):
+        return {
+            "ok": False,
+            "reason": "source_dependency_parallel_result_mismatch",
+            "expected_result_count": len(parse_tasks),
+            "actual_result_count": len(parse_results),
+            "execution": source_dependency_execution,
+        }
+    for result in parse_results:
+        if not result.get("ok"):
+            return {
+                **result,
+                "ok": False,
+                "execution": source_dependency_execution,
+            }
+        path = _norm_repo_path(result.get("path"))
+        node = _node_for_primary_path(candidate_graph, path)
+        if not node:
+            return {
+                "ok": False,
+                "reason": "source_primary_node_not_unique",
+                "path": path,
+                "execution": source_dependency_execution,
+            }
+        module_payload = result.get("module_payload")
+        if not isinstance(module_payload, dict):
+            return {
+                "ok": False,
+                "reason": "source_dependency_module_payload_missing",
+                "path": path,
+                "execution": source_dependency_execution,
+            }
+        module = _module_info_from_payload(module_payload)
         metadata = _node_metadata(node)
         module_name = str(metadata.get("module") or "")
         if not module_name or module.module_name != module_name:
@@ -1756,12 +2166,8 @@ def _apply_incremental_source_dependency_delta(
                 "path": path,
                 "expected_module": module_name,
                 "parsed_module": module.module_name,
+                "execution": source_dependency_execution,
             }
-        node_id = _node_id(node)
-        if not node_id:
-            return {"ok": False, "reason": "source_node_id_missing", "path": path}
-        changed_modules.add(module_name)
-        updated_node_ids.add(node_id)
         parsed_modules[module_name] = module
         modules[module_name] = module
         metadata["function_count"] = len(module.functions)
@@ -1773,12 +2179,10 @@ def _apply_incremental_source_dependency_delta(
         }
         metadata["function_hashes"] = function_source_hashes(module)
         temp_node = {"module": module_name}
-        project_root_resolved = str(Path(project_root).resolve())
-        module_relations = extract_typed_relations(
-            project_root_resolved,
-            {module_name: module},
-            graph_enrich_config_rules=_load_graph_enrich_config_rules(project_root_resolved),
-        )
+        module_relations = [
+            dict(rel) for rel in result.get("typed_relations", []) or []
+            if isinstance(rel, dict)
+        ]
         enrich_nodes_with_architecture_signals([temp_node], module_relations)
         metadata["typed_relations"] = temp_node.get("typed_relations") or []
         metadata["architecture_signals"] = temp_node.get("architecture_signals") or {}
@@ -1915,6 +2319,10 @@ def _apply_incremental_source_dependency_delta(
     _refresh_relationship_metrics_in_place(candidate_graph)
     if _graph_links_have_cycle(deps_graph.get("links", []) or []):
         return {"ok": False, "reason": "source_dependency_delta_cycle_risk"}
+    dependency_impact_closure = _source_dependency_impact_closure_payload(
+        changed_node_ids,
+        deps_graph,
+    )
     return {
         "ok": True,
         "source_paths": sorted(source_set),
@@ -1922,6 +2330,8 @@ def _apply_incremental_source_dependency_delta(
         "changed_modules": sorted(changed_modules),
         "module_dependency_edge_count": len(module_edges),
         "typed_relation_count": len(typed_relations),
+        "dependency_impact_closure": dependency_impact_closure,
+        "execution": source_dependency_execution,
     }
 
 
@@ -3196,6 +3606,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         active_graph_json=active_graph_json,
         old_rows=active_inventory,
         new_rows=file_inventory,
+        active_commit=active_commit,
+        target_commit=target,
     )
     if not eligibility.get("supported"):
         return {
@@ -3260,6 +3672,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             active_graph_json=active_graph_json,
             old_rows=active_inventory,
             new_rows=file_inventory,
+            active_commit=active_commit,
+            target_commit=target,
         )
         if not final_eligibility.get("supported"):
             return {
@@ -3319,6 +3733,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             active_graph_json=active_graph_json,
             old_rows=active_inventory,
             new_rows=file_inventory,
+            active_commit=active_commit,
+            target_commit=target,
         )
         if not final_eligibility.get("supported"):
             return {
