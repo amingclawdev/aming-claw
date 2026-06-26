@@ -7296,8 +7296,15 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert stored_implementation_payload["route_token_gate"]["caller_role"] == (
         "observer"
     )
-    assert stored_implementation_payload["meta_contract_gate"]["role"] == "mf_sub"
-    assert stored_implementation_payload["meta_contract_gate"]["action"] == (
+    stored_implementation_gate = stored_implementation_payload[
+        "contract_gate_decision"
+    ]
+    assert stored_implementation_gate["source_of_authority"] == (
+        "route_action_scope_lineage"
+    )
+    stored_implementation_meta_gate = stored_implementation_gate["meta_contract_gate"]
+    assert stored_implementation_meta_gate["role"] == "mf_sub"
+    assert stored_implementation_meta_gate["action"] == (
         "implementation"
     )
     stored_implementation_json = json.dumps(
@@ -7668,7 +7675,12 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
     assert payload["route_lineage"]["parent_route_lineage"]["route_id"] == (
         parent_route_identity["route_id"]
     )
-    assert payload["meta_contract_gate"]["action"] == "implementation"
+    assert payload["contract_gate_decision"]["source_of_authority"] == (
+        "route_action_scope_lineage"
+    )
+    assert payload["contract_gate_decision"]["meta_contract_gate"]["action"] == (
+        "implementation"
+    )
 
     ref_only_response = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -25106,6 +25118,69 @@ def test_timeline_append_rejects_forged_meta_contract_gate(conn):
     assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
+def test_timeline_append_route_ref_uses_contract_gate_for_new_event_shape(conn):
+    from agent.governance import observer_route_context
+
+    backlog_id = "AC-CONTRACT-GATE-ROUTE-REF-NEW-EVENT"
+    task_id = "contract-gate-new-event-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:test-contract-gate-new-event"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issue["route_token_ref"],
+        token=issue["route_token"],
+    )
+
+    result = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "observer.gate_kernel_projection",
+                "event_kind": "gate_kernel_projection",
+                "phase": "gate_kernel",
+                "actor": "observer",
+                "status": "passed",
+                "route_token_ref": issue["route_token_ref"],
+                "payload": {"summary": "New source-backed gate event shape."},
+            },
+        )
+    )
+
+    assert "meta_contract_gate" not in result
+    gate = result["contract_gate_decision"]
+    assert gate["schema_version"] == "contract_gate_decision.v1"
+    assert gate["source_of_authority"] == "route_token_gate"
+    assert gate["decision"] == "warn"
+    legacy_meta = gate["meta_contract_gate"]
+    assert legacy_meta["status"] == "compatibility_rejected"
+    assert legacy_meta["code"] == "meta_contract_whitelist_rejected"
+    assert legacy_meta["legacy_audit_only"] is True
+    assert legacy_meta["primary_decision_source"] is False
+
+    event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="gate_kernel_projection",
+    )[0]
+    assert "meta_contract_gate" not in event["payload"]
+    assert event["payload"]["contract_gate_decision"]["source_of_authority"] == (
+        "route_token_gate"
+    )
+
+
 def test_timeline_append_meta_contract_rejects_observer_authoring_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-WORKER-EVIDENCE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -25539,11 +25614,19 @@ def test_timeline_append_ref_only_independent_verification_projects_server_linea
     )
 
     assert result["route_token_gate"]["decision"] == "route_token_ref_resolved"
-    result_gate = result["meta_contract_gate"]
-    assert result_gate["legacy_audit_only"] is True
-    assert result_gate["primary_decision_source"] is False
-    assert result_gate["authority_decision_source"] == "route_action_scope_lineage"
+    assert "meta_contract_gate" not in result
+    result_gate = result["contract_gate_decision"]
+    assert result_gate["schema_version"] == "contract_gate_decision.v1"
     assert result_gate["source_of_authority"] == "route_action_scope_lineage"
+    legacy_meta_gate = result_gate["meta_contract_gate"]
+    assert legacy_meta_gate["legacy_audit_only"] is True
+    assert legacy_meta_gate["primary_decision_source"] is False
+    assert legacy_meta_gate["authority_decision_source"] == "route_action_scope_lineage"
+    assert legacy_meta_gate["source_of_authority"] == "route_action_scope_lineage"
+    legacy_check = result_gate["imported_legacy_checks"][0]
+    assert legacy_check["adapter_id"] == "legacy_meta_contract_timeline_event_gate.v1"
+    assert legacy_check["legacy_authoritative"] is False
+    assert result_gate["primary_decision_source"] is True
     listed = task_timeline.list_events(
         conn,
         PID,
@@ -25552,11 +25635,19 @@ def test_timeline_append_ref_only_independent_verification_projects_server_linea
     )
     assert len(listed) == 1
     payload = listed[0]["payload"]
-    payload_gate = payload["meta_contract_gate"]
-    assert payload_gate["legacy_audit_only"] is True
-    assert payload_gate["primary_decision_source"] is False
-    assert payload_gate["authority_decision_source"] == "route_action_scope_lineage"
+    assert "meta_contract_gate" not in payload
+    payload_gate = payload["contract_gate_decision"]
+    assert payload_gate["schema_version"] == "contract_gate_decision.v1"
     assert payload_gate["source_of_authority"] == "route_action_scope_lineage"
+    payload_legacy_meta_gate = payload_gate["meta_contract_gate"]
+    assert payload_legacy_meta_gate["legacy_audit_only"] is True
+    assert payload_legacy_meta_gate["primary_decision_source"] is False
+    assert payload_legacy_meta_gate["authority_decision_source"] == (
+        "route_action_scope_lineage"
+    )
+    assert payload_legacy_meta_gate["source_of_authority"] == (
+        "route_action_scope_lineage"
+    )
     lineage = payload["route_action_scope_lineage"]
     assert lineage["source"] == "server_route_token_action_scope"
     assert lineage["route_token_ref"] == child_issue["route_token_ref"]
@@ -25682,11 +25773,15 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
         )
     )
 
-    result_gate = result["meta_contract_gate"]
-    assert result_gate["legacy_audit_only"] is True
-    assert result_gate["primary_decision_source"] is False
-    assert result_gate["authority_decision_source"] == "route_token_gate"
+    assert "meta_contract_gate" not in result
+    result_gate = result["contract_gate_decision"]
+    assert result_gate["schema_version"] == "contract_gate_decision.v1"
     assert result_gate["source_of_authority"] == "route_token_gate"
+    result_legacy_meta_gate = result_gate["meta_contract_gate"]
+    assert result_legacy_meta_gate["legacy_audit_only"] is True
+    assert result_legacy_meta_gate["primary_decision_source"] is False
+    assert result_legacy_meta_gate["authority_decision_source"] == "route_token_gate"
+    assert result_legacy_meta_gate["source_of_authority"] == "route_token_gate"
     listed = task_timeline.list_events(
         conn,
         PID,
@@ -25697,11 +25792,14 @@ def test_timeline_append_ref_only_without_parent_lineage_has_no_action_scope_pro
     payload = listed[0]["payload"]
     assert "route_action_scope_lineage" not in payload
     assert payload["route_token_gate"]["decision"] == "route_token_ref_resolved"
-    payload_gate = payload["meta_contract_gate"]
-    assert payload_gate["legacy_audit_only"] is True
-    assert payload_gate["primary_decision_source"] is False
-    assert payload_gate["authority_decision_source"] == "route_token_gate"
+    assert "meta_contract_gate" not in payload
+    payload_gate = payload["contract_gate_decision"]
     assert payload_gate["source_of_authority"] == "route_token_gate"
+    payload_legacy_meta_gate = payload_gate["meta_contract_gate"]
+    assert payload_legacy_meta_gate["legacy_audit_only"] is True
+    assert payload_legacy_meta_gate["primary_decision_source"] is False
+    assert payload_legacy_meta_gate["authority_decision_source"] == "route_token_gate"
+    assert payload_legacy_meta_gate["source_of_authority"] == "route_token_gate"
     serialized_payload = json.dumps(payload, sort_keys=True)
     assert "caller_forged_server_lineage" not in serialized_payload
     assert "caller_nested_action_scope" not in serialized_payload
@@ -27313,9 +27411,17 @@ def test_timeline_append_contract_runtime_primary_gate_accepts_hotfix_implementa
     assert runtime_gate["next_legal_action"]["evidence_kind"] == (
         "independent_verification"
     )
-    assert result["meta_contract_gate"]["compatibility_only"] is True
-    assert result["meta_contract_gate"]["primary_decision_source"] is False
-    assert result["meta_contract_gate"]["status"] == "compatibility_rejected"
+    assert "meta_contract_gate" not in result
+    contract_gate = result["contract_gate_decision"]
+    assert contract_gate["schema_version"] == "contract_gate_decision.v1"
+    assert contract_gate["source_of_authority"] == "contract_runtime"
+    assert contract_gate["primary_decision_source"] is True
+    assert contract_gate["decision"] == "warn"
+    legacy_meta_gate = contract_gate["meta_contract_gate"]
+    assert legacy_meta_gate["compatibility_only"] is True
+    assert legacy_meta_gate["primary_decision_source"] is False
+    assert legacy_meta_gate["status"] == "compatibility_rejected"
+    assert legacy_meta_gate["source_of_authority"] == "contract_runtime"
     assert result["meta_contract_gate_decision_source"] is False
 
     record = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
@@ -27329,7 +27435,10 @@ def test_timeline_append_contract_runtime_primary_gate_accepts_hotfix_implementa
         event_kind="implementation",
     )[0]
     assert event["payload"]["contract_runtime_close_evidence_gate"]["accepted"] is True
-    assert event["payload"]["meta_contract_gate"]["compatibility_only"] is True
+    assert "meta_contract_gate" not in event["payload"]
+    payload_gate = event["payload"]["contract_gate_decision"]
+    assert payload_gate["source_of_authority"] == "contract_runtime"
+    assert payload_gate["meta_contract_gate"]["compatibility_only"] is True
 
 
 def test_timeline_append_contract_runtime_projects_completed_hotfix_lines(conn):
@@ -27491,7 +27600,10 @@ def test_timeline_append_completed_runtime_projection_precedes_legacy_route_gate
     assert runtime_gate["execution_state_revision"] == completed[
         "execution_state_revision"
     ]
-    assert result["meta_contract_gate"]["authority_decision_source"] == (
+    assert "meta_contract_gate" not in result
+    assert result["contract_gate_decision"]["meta_contract_gate"][
+        "authority_decision_source"
+    ] == (
         "contract_runtime"
     )
     event = task_timeline.list_events(

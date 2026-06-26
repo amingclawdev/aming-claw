@@ -36867,13 +36867,19 @@ def _contract_runtime_close_meta_compat_gate(
     error_message: str,
     event_kind: str,
     actor: str,
+    authority_source: str = "contract_runtime",
 ) -> dict[str, Any]:
+    authority = str(authority_source or "").strip() or "contract_runtime"
     return {
         "schema_version": "meta_contract_timeline_gate.v1",
         "allowed": False,
         "status": "compatibility_rejected",
         "compatibility_only": True,
+        "legacy_audit_only": True,
         "primary_decision_source": False,
+        "decision_source": "legacy_meta_contract_audit_only",
+        "authority_decision_source": authority,
+        "source_of_authority": authority,
         "contract_runtime_primary_decision_source": True,
         "meta_contract_gate_decision_source": False,
         "error": error_message,
@@ -37313,6 +37319,15 @@ def handle_task_timeline_append(ctx: RequestContext):
                         backlog_id=ctx.body.get("backlog_id", ""),
                         task_id="",
                     )
+        if not route_gate and not contract_runtime_completed_projection_gate and (
+            ctx.body.get("route_token_ref") or ctx.body.get("route_token")
+        ):
+            route_gate = _require_route_token_mutation_gate(
+                ctx,
+                action="task_timeline_append",
+                backlog_id=ctx.body.get("backlog_id", ""),
+                task_id=ctx.body.get("task_id", ""),
+            )
         raw_event_kind = ctx.body.get("event_kind", "")
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
@@ -37350,9 +37365,17 @@ def handle_task_timeline_append(ctx: RequestContext):
         norm_payload = _strip_top_level_timeline_role_fields(norm_payload)
         validation_payload = dict(norm_payload)
         validation_payload.pop("meta_contract_gate", None)
+        validation_payload.pop("contract_gate_decision", None)
         contract_runtime_close_evidence_requested = bool(
             _contract_runtime_close_execution_id(ctx.body or {})
             and _contract_runtime_close_event_kind_supported(norm_event_kind)
+        )
+        source_authority_before_runtime = (
+            task_timeline._source_backed_timeline_authority_source(
+                validation_payload,
+                ctx.body.get("verification") or {},
+                ctx.body.get("artifact_refs") or {},
+            )
         )
         meta_contract_error_message = ""
         try:
@@ -37373,6 +37396,23 @@ def handle_task_timeline_append(ctx: RequestContext):
         except MfSubagentContractError as exc:
             meta_contract_error_message = str(exc)
             if (
+                source_authority_before_runtime
+                and not task_timeline._source_backed_meta_error_is_hard(
+                    meta_contract_error_message,
+                    {
+                        "payload": validation_payload,
+                        "verification": ctx.body.get("verification") or {},
+                        "artifact_refs": ctx.body.get("artifact_refs") or {},
+                    },
+                )
+            ):
+                meta_contract_gate = _contract_runtime_close_meta_compat_gate(
+                    error_message=meta_contract_error_message,
+                    event_kind=norm_event_kind,
+                    actor=str(ctx.body.get("actor") or ""),
+                    authority_source=source_authority_before_runtime,
+                )
+            elif (
                 not contract_runtime_close_evidence_requested
                 or _contract_runtime_close_meta_error_is_hard(
                     meta_contract_error_message,
@@ -37399,6 +37439,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                 error_message=meta_contract_error_message,
                 event_kind=norm_event_kind,
                 actor=str(ctx.body.get("actor") or ""),
+                authority_source="contract_runtime",
             )
         contract_runtime_close_evidence_gate = {}
         if contract_runtime_close_evidence_requested:
@@ -37438,10 +37479,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                 meta_contract_gate,
                 authority_source="route_token_gate",
             )
-        norm_payload = {
-            **(norm_payload if isinstance(norm_payload, dict) else {}),
-            "meta_contract_gate": meta_contract_gate,
-        }
+        norm_payload = dict(norm_payload) if isinstance(norm_payload, dict) else {}
         if contract_runtime_close_evidence_gate:
             norm_payload["contract_runtime_close_evidence_gate"] = (
                 contract_runtime_close_evidence_gate
@@ -37450,6 +37488,36 @@ def handle_task_timeline_append(ctx: RequestContext):
                 "contract_runtime_first_missing_line"
             )
             norm_payload["meta_contract_gate_decision_source"] = False
+        source_authority = task_timeline._source_backed_timeline_authority_source(
+            norm_payload,
+            ctx.body.get("verification") or {},
+            ctx.body.get("artifact_refs") or {},
+        )
+        if source_authority:
+            norm_payload.pop("meta_contract_gate", None)
+            norm_payload["contract_gate_decision"] = (
+                task_timeline._timeline_contract_gate_decision(
+                    event={
+                        "event_type": ctx.body.get("event_type", ""),
+                        "phase": ctx.body.get("phase", ""),
+                        "event_kind": norm_event_kind,
+                        "actor": ctx.body.get("actor", ""),
+                        "status": norm_status,
+                        "decision": ctx.body.get("decision", ""),
+                        "backlog_id": ctx.body.get("backlog_id", ""),
+                        "task_id": ctx.body.get("task_id", ""),
+                    },
+                    payload=norm_payload,
+                    verification=ctx.body.get("verification") or {},
+                    artifact_refs=ctx.body.get("artifact_refs") or {},
+                    meta_contract_gate=meta_contract_gate,
+                    authority_source=source_authority,
+                )
+            )
+            norm_payload["agent_facing_decision_source"] = "contract_gate_kernel"
+            norm_payload["meta_contract_gate_decision_source"] = False
+        else:
+            norm_payload["meta_contract_gate"] = meta_contract_gate
         if route_gate:
             _record_route_token_gate_event(
                 conn,
@@ -37497,14 +37565,24 @@ def handle_task_timeline_append(ctx: RequestContext):
         )
         if route_gate:
             result["route_token_gate"] = route_gate
-        result["meta_contract_gate"] = meta_contract_gate
+        if source_authority:
+            result["contract_gate_decision"] = (
+                result.get("payload", {}).get("contract_gate_decision")
+                if isinstance(result.get("payload"), Mapping)
+                else norm_payload.get("contract_gate_decision")
+            )
+            result["agent_facing_decision_source"] = "contract_gate_kernel"
+            result["meta_contract_gate_decision_source"] = False
+        else:
+            result["meta_contract_gate"] = meta_contract_gate
         if contract_runtime_close_evidence_gate:
             result["contract_runtime_close_evidence_gate"] = (
                 contract_runtime_close_evidence_gate
             )
-            result["agent_facing_decision_source"] = (
-                "contract_runtime_first_missing_line"
-            )
+            if not source_authority:
+                result["agent_facing_decision_source"] = (
+                    "contract_runtime_first_missing_line"
+                )
             result["meta_contract_gate_decision_source"] = False
         return result
 

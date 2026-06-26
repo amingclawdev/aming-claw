@@ -601,13 +601,19 @@ def _contract_runtime_compat_rejected_meta_gate(
     *,
     error_message: str,
     event: Mapping[str, Any],
+    authority_source: str = "contract_runtime",
 ) -> dict[str, Any]:
+    authority = _text(authority_source) or "contract_runtime"
     return {
         "schema_version": "meta_contract_timeline_gate.v1",
         "allowed": False,
         "status": "compatibility_rejected",
         "compatibility_only": True,
+        "legacy_audit_only": True,
         "primary_decision_source": False,
+        "decision_source": "legacy_meta_contract_audit_only",
+        "authority_decision_source": authority,
+        "source_of_authority": authority,
         "contract_runtime_primary_decision_source": True,
         "meta_contract_gate_decision_source": False,
         "contract_runtime_close_evidence_gate_status": "accepted",
@@ -616,6 +622,161 @@ def _contract_runtime_compat_rejected_meta_gate(
         "event_kind": _text(event.get("event_kind")),
         "actor": _text(event.get("actor")),
     }
+
+
+def _source_backed_meta_error_is_hard(
+    error_message: str,
+    event: Mapping[str, Any],
+) -> bool:
+    message = error_message.lower()
+    if _contract_runtime_meta_contains_truthy_key(
+        event,
+        {"self_attesting", "worker_self_attesting"},
+    ):
+        return True
+    if "author_worker_evidence" in message and "requires on_behalf_of" in message:
+        return True
+    hard_markers = (
+        "bypass_timeline_gate",
+        "surrogate_startup",
+        "forbidden_always rejected flag",
+        "forbidden_always rejected action",
+        "observer_work_mode_transition missing",
+    )
+    return any(marker in message for marker in hard_markers)
+
+
+def _source_backed_route_gate_accepted(gate: Mapping[str, Any]) -> bool:
+    if not gate:
+        return False
+    status = _text(gate.get("status") or gate.get("decision")).strip().lower()
+    passed = bool(
+        _truthy(gate.get("allowed"))
+        or _truthy(gate.get("accepted"))
+        or status in {"accepted", "ok", "passed", "succeeded", "success", "allowed"}
+    )
+    if not passed:
+        return False
+    return bool(
+        gate.get("resolved_from_ref")
+        or gate.get("server_issued_binding")
+        or gate.get("registry_verified")
+        or _text(gate.get("binding_source")) == "observer_route_token_refs"
+    )
+
+
+def _source_backed_timeline_authority_source(
+    payload: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    artifact_refs: Mapping[str, Any],
+) -> str:
+    for source in (payload, verification, artifact_refs):
+        runtime_gate = _first_deep_mapping(
+            source,
+            "contract_runtime_close_evidence_gate",
+        )
+        if (
+            runtime_gate.get("schema_version")
+            == "contract_runtime_close_evidence_gate.v1"
+            and _truthy(runtime_gate.get("accepted") or runtime_gate.get("allowed"))
+            and _truthy(runtime_gate.get("primary_decision_source"))
+        ):
+            return "contract_runtime"
+
+    for source in (payload, verification, artifact_refs):
+        route_lineage = _first_deep_mapping(source, "route_action_scope_lineage")
+        if _truthy(route_lineage.get("accepted") or route_lineage.get("allowed")):
+            return "route_action_scope_lineage"
+
+    for source in (payload, verification, artifact_refs):
+        route_gate = _first_deep_mapping(source, "route_token_gate")
+        if _source_backed_route_gate_accepted(route_gate):
+            return "route_token_gate"
+
+    return ""
+
+
+def _timeline_contract_gate_imported_meta_check(
+    meta_contract_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    status = _text(
+        meta_contract_gate.get("status") or meta_contract_gate.get("decision")
+    ).strip()
+    allowed = _truthy(meta_contract_gate.get("allowed"))
+    warnings: list[str] = []
+    if not allowed or status == "compatibility_rejected":
+        warnings.append("legacy_meta_contract_compatibility_rejected")
+    return {
+        "schema_version": "contract_gate_legacy_adapter_result.v1",
+        "adapter_id": "legacy_meta_contract_timeline_event_gate.v1",
+        "decision": "allow" if not warnings else "warn",
+        "ok": True,
+        "errors": [],
+        "warnings": warnings,
+        "legacy_authoritative": False,
+        "evidence": {"meta_contract_gate": dict(meta_contract_gate)},
+    }
+
+
+def _timeline_contract_gate_decision(
+    *,
+    event: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    artifact_refs: Mapping[str, Any],
+    meta_contract_gate: Mapping[str, Any],
+    authority_source: str,
+) -> dict[str, Any]:
+    legacy_check = _timeline_contract_gate_imported_meta_check(meta_contract_gate)
+    runtime_gate = _first_deep_mapping(
+        payload,
+        "contract_runtime_close_evidence_gate",
+    )
+    warnings = list(legacy_check.get("warnings") or [])
+    decision = "warn" if warnings else "allow"
+    next_move = runtime_gate.get("next_legal_action")
+    envelope: dict[str, Any] = {
+        "schema_version": "contract_gate_decision.v1",
+        "ok": True,
+        "decision": decision,
+        "action": "task_timeline_append",
+        "gate_id": f"task_timeline_append:{authority_source}",
+        "gate_type": "timeline_projection",
+        "stage_id": _text(runtime_gate.get("stage_id")),
+        "line_id": _text(runtime_gate.get("line_id")),
+        "required_role": _text(meta_contract_gate.get("role")),
+        "actor_role": _text(meta_contract_gate.get("role") or event.get("actor")),
+        "errors": [],
+        "warnings": warnings,
+        "missing_lines": [],
+        "missing_proof_fields": [],
+        "hash_status": {},
+        "graph_status": {},
+        "dirty_scope_status": {},
+        "imported_legacy_checks": [legacy_check],
+        "projection_actions": [
+            {
+                "schema_version": "contract_gate_projection_action.v1",
+                "action": "record_timeline_event",
+                "source_of_authority": authority_source,
+                "legacy_meta_contract_gate": "imported_audit_only",
+            }
+        ],
+        "policy_hash": "",
+        "contract_definition_hash": _text(runtime_gate.get("contract_definition_hash")),
+        "execution_state_revision": int(runtime_gate.get("execution_state_revision") or 0),
+        "runtime_guide_hash": _text(runtime_gate.get("runtime_guide_hash")),
+        "next_move": dict(next_move) if isinstance(next_move, Mapping) else {},
+        "source_of_authority": authority_source,
+        "primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+        "legacy_meta_contract_gate": "imported_audit_only",
+        "meta_contract_gate": dict(meta_contract_gate),
+    }
+    envelope["decision_hash"] = _canonical_contract_hash(
+        {key: value for key, value in envelope.items() if key != "decision_hash"}
+    )
+    return envelope
 
 
 def _legacy_meta_audit_authority_source(
@@ -672,6 +833,12 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
     artifact_refs = dict(artifact_refs) if isinstance(artifact_refs, Mapping) else {}
     validation_payload = dict(payload)
     validation_payload.pop("meta_contract_gate", None)
+    validation_payload.pop("contract_gate_decision", None)
+    authority_source = _source_backed_timeline_authority_source(
+        payload,
+        verification,
+        artifact_refs,
+    )
     _ensure_cross_ref_bridge_meta_contract_aliases()
     from .mf_subagent_contract import (
         MfSubagentContractError,
@@ -695,31 +862,51 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
         meta_contract_gate = validate_meta_contract_timeline_event(meta_event)
     except MfSubagentContractError as exc:
         if (
-            _contract_runtime_primary_close_gate_accepted(payload)
+            authority_source == "contract_runtime"
             and _contract_runtime_meta_error_can_be_audit_only(str(exc), meta_event)
+        ) or (
+            authority_source
+            and not _source_backed_meta_error_is_hard(str(exc), meta_event)
         ):
             meta_contract_gate = _contract_runtime_compat_rejected_meta_gate(
                 error_message=str(exc),
                 event=meta_event,
+                authority_source=authority_source,
             )
         else:
             raise
     else:
-        authority_source = (
-            "contract_runtime"
-            if _contract_runtime_primary_close_gate_accepted(payload)
-            else _legacy_meta_audit_authority_source(
-                payload,
-                verification,
-                artifact_refs,
+        audit_authority_source = (
+            authority_source
+            or (
+                "contract_runtime"
+                if _contract_runtime_primary_close_gate_accepted(payload)
+                else _legacy_meta_audit_authority_source(
+                    payload,
+                    verification,
+                    artifact_refs,
+                )
             )
         )
-        if authority_source:
+        if audit_authority_source:
             meta_contract_gate = _contract_runtime_audit_only_meta_gate(
                 meta_contract_gate,
-                authority_source=authority_source,
+                authority_source=audit_authority_source,
             )
-    payload["meta_contract_gate"] = meta_contract_gate
+    if authority_source:
+        payload.pop("meta_contract_gate", None)
+        payload["contract_gate_decision"] = _timeline_contract_gate_decision(
+            event=meta_event,
+            payload=payload,
+            verification=verification,
+            artifact_refs=artifact_refs,
+            meta_contract_gate=meta_contract_gate,
+            authority_source=authority_source,
+        )
+        payload["meta_contract_gate_decision_source"] = False
+        payload["agent_facing_decision_source"] = "contract_gate_kernel"
+    else:
+        payload["meta_contract_gate"] = meta_contract_gate
     with sqlite_write_lock():
         cur = conn.execute(
             """INSERT INTO task_timeline_events
