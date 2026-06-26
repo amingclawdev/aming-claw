@@ -7,6 +7,7 @@ results are returned in the same order as the task payloads.
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Iterable, Mapping
 
@@ -79,6 +80,14 @@ def _serial_map(worker: Callable[[Any], Any], tasks: list[Any]) -> list[Any]:
     return [worker(task) for task in tasks]
 
 
+def _process_pool_unavailable_reason() -> str:
+    main_module = sys.modules.get("__main__")
+    main_file = str(getattr(main_module, "__file__", "") or "")
+    if not main_file or main_file.startswith("<"):
+        return "stdin_or_interactive_main"
+    return ""
+
+
 def run_reconcile_tasks(
     tasks: Iterable[Any],
     worker: Callable[[Any], Any],
@@ -120,6 +129,13 @@ def run_reconcile_tasks(
     if worker_count <= 1:
         if not observability.get("fallback_reason"):
             observability["fallback_reason"] = observability.get("configuration_reason") or "worker_count_one"
+        return {"results": _serial_map(worker, task_list), "observability": observability}
+
+    unavailable_reason = "" if process_pool_factory is not None else _process_pool_unavailable_reason()
+    if unavailable_reason:
+        observability["strategy"] = "serial_fallback"
+        observability["fallback_reason"] = "process_pool_unavailable"
+        observability["fallback_error_type"] = unavailable_reason
         return {"results": _serial_map(worker, task_list), "observability": observability}
 
     pool_factory = process_pool_factory or ProcessPoolExecutor

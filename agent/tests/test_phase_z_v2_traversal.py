@@ -11,6 +11,9 @@ import pytest
 
 # Load phase_z_v2 directly to bypass __init__.py import chain (Python 3.9 compat)
 _here = os.path.dirname(os.path.abspath(__file__))
+_agent_dir = os.path.abspath(os.path.join(_here, ".."))
+_governance_dir = os.path.join(_agent_dir, "governance")
+_phase_dir = os.path.join(_governance_dir, "reconcile_phases")
 _pz_path = os.path.join(_here, "..", "governance", "reconcile_phases", "phase_z_v2.py")
 _spec = importlib.util.spec_from_file_location(
     "agent.governance.reconcile_phases.phase_z_v2", _pz_path,
@@ -19,12 +22,14 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 
 # Ensure parent packages exist in sys.modules
-for _name in [
-    "agent", "agent.governance", "agent.governance.reconcile_phases"
+for _name, _path in [
+    ("agent", _agent_dir),
+    ("agent.governance", _governance_dir),
+    ("agent.governance.reconcile_phases", _phase_dir),
 ]:
     if _name not in sys.modules:
         _pkg = types.ModuleType(_name)
-        _pkg.__path__ = []
+        _pkg.__path__ = [_path]
         _pkg.__package__ = _name
         sys.modules[_name] = _pkg
 
@@ -32,9 +37,24 @@ sys.modules["agent.governance.reconcile_phases.phase_z_v2"] = _mod
 _spec.loader.exec_module(_mod)
 
 dfs_color_from_entries = _mod.dfs_color_from_entries
+dfs_color_from_entries_parallel = _mod.dfs_color_from_entries_parallel
 identify_entries = _mod.identify_entries
 FunctionMeta = _mod.FunctionMeta
 ModuleInfo = _mod.ModuleInfo
+
+
+class _FakePool:
+    def __init__(self, max_workers: int):
+        self.max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def map(self, worker, tasks):
+        return [worker(task) for task in tasks]
 
 
 class TestDfsColorFromEntries:
@@ -102,6 +122,31 @@ class TestDfsColorFromEntries:
         cs, ccm = dfs_color_from_entries({"a": ["b"]}, [])
         assert cs == {}
         assert ccm == {}
+
+    def test_parallel_helper_matches_serial_and_reports_workers(self):
+        """Full rebuild can color independent entries through the process pool."""
+        edges = {
+            "e1": ["a", "shared"],
+            "e2": ["b", "shared"],
+            "a": ["leaf"],
+            "b": ["leaf"],
+            "shared": ["leaf"],
+        }
+        entries = ["e1", "e2"]
+
+        serial_sets, serial_counts = dfs_color_from_entries(edges, entries)
+        parallel_sets, parallel_counts, observability = dfs_color_from_entries_parallel(
+            edges,
+            entries,
+            cpu_count=8,
+            process_pool_factory=_FakePool,
+        )
+
+        assert parallel_sets == serial_sets
+        assert parallel_counts == serial_counts
+        assert observability["strategy"] == "parallel_process_pool"
+        assert observability["worker_count"] == 2
+        assert observability["parallelized"] is True
 
 
 class TestIdentifyEntries:

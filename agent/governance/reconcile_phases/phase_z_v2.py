@@ -33,6 +33,7 @@ from agent.governance.asset_binding_proposals import (
     weak_test_binding_candidates,
 )
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
+from agent.governance.reconcile_parallel_executor import run_reconcile_tasks
 
 # ---------------------------------------------------------------------------
 # R6: Directories to exclude from production module scanning
@@ -4924,21 +4925,87 @@ def dfs_color_from_entries(
     color_count_map: Dict[str, int] = {}
 
     for entry in entries:
-        visited: Set[str] = set()
-        stack = [entry]
-        while stack:
-            node = stack.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            for target in edges.get(node, []):
-                if target not in visited:
-                    stack.append(target)
+        visited = _dfs_visit_entry(edges, entry)
         color_sets[entry] = visited
         for fn in visited:
             color_count_map[fn] = color_count_map.get(fn, 0) + 1
 
     return color_sets, color_count_map
+
+
+def _dfs_visit_entry(edges: Mapping[str, List[str]], entry: str) -> Set[str]:
+    visited: Set[str] = set()
+    stack = [entry]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        for target in edges.get(node, []):
+            if target not in visited:
+                stack.append(target)
+    return visited
+
+
+def _dfs_color_entry_worker(task: Mapping[str, Any]) -> Dict[str, Any]:
+    entry = str(task.get("entry") or "")
+    edges = task.get("edges") or {}
+    if not isinstance(edges, Mapping):
+        edges = {}
+    visited = sorted(_dfs_visit_entry(edges, entry))
+    return {
+        "entry": entry,
+        "visited": visited,
+        "visited_count": len(visited),
+    }
+
+
+def dfs_color_from_entries_parallel(
+    edges: Dict[str, List[str]],
+    entries: List[str],
+    track_distance: bool = False,
+    *,
+    max_workers: int | None = None,
+    cpu_count: int | None = None,
+    process_pool_factory: Callable[..., Any] | None = None,
+) -> Tuple[Dict[str, Set[str]], Dict[str, int], Dict[str, Any]]:
+    """Parallel DFS coloring helper for full rebuild pure-compute work."""
+
+    tasks = [
+        {
+            "entry": entry,
+            "edges": edges,
+            "track_distance": bool(track_distance),
+        }
+        for entry in entries
+    ]
+    run = run_reconcile_tasks(
+        tasks,
+        _dfs_color_entry_worker,
+        label="phase_z_v2_dfs_coloring",
+        max_workers=max_workers,
+        cpu_count=cpu_count,
+        process_pool_factory=process_pool_factory,
+    )
+    color_sets: Dict[str, Set[str]] = {}
+    color_count_map: Dict[str, int] = {}
+    for item in run["results"]:
+        if not isinstance(item, Mapping):
+            continue
+        entry = str(item.get("entry") or "")
+        if not entry:
+            continue
+        visited = {str(fn) for fn in item.get("visited") or [] if str(fn)}
+        color_sets[entry] = visited
+        for fn in visited:
+            color_count_map[fn] = color_count_map.get(fn, 0) + 1
+
+    observability = dict(run.get("observability") or {})
+    observability["parallelized"] = (
+        observability.get("strategy") == "parallel_process_pool"
+        and int(observability.get("worker_count") or 0) > 1
+    )
+    return color_sets, color_count_map, observability
 
 
 # ---------------------------------------------------------------------------
@@ -5042,7 +5109,7 @@ def build_graph_v2_from_symbols(
     # Step 2a: DFS coloring from entries
     started = time.perf_counter()
     entry_qnames = identify_entries(modules)
-    _color_sets, color_count_map = dfs_color_from_entries(
+    _color_sets, color_count_map, dfs_parallel_observability = dfs_color_from_entries_parallel(
         call_graph.edges, entry_qnames
     )
     max_color_count = max(color_count_map.values()) if color_count_map else 0
@@ -5071,6 +5138,10 @@ def build_graph_v2_from_symbols(
             "max_color_count": max_color_count,
             "layer_score_count": len(layer_scores),
             "node_count": len(nodes),
+            "parallelized": bool(dfs_parallel_observability.get("parallelized")),
+            "parallel_evidence": dfs_parallel_observability.get("strategy", "serial"),
+            "worker_count": int(dfs_parallel_observability.get("worker_count") or 0),
+            "parallel_executor": dfs_parallel_observability,
         },
     )
 

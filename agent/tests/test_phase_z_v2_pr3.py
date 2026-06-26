@@ -103,6 +103,50 @@ class TestBuildGraphV2FromSymbols:
         assert trace_steps["production_module_parsing"]["metrics"]["module_count"] >= 1
         assert "file_inventory_count" in trace_steps["inventory_index_work"]["metrics"]
 
+    def test_full_rebuild_dfs_coloring_uses_parallel_executor(self):
+        """Full rebuild records process-pool evidence for DFS coloring."""
+        project = _make_temp_project({
+            "agent/app.py": (
+                "@cli\n"
+                "def entry_one():\n"
+                "    shared()\n"
+                "\n"
+                "@cli\n"
+                "def entry_two():\n"
+                "    shared()\n"
+                "\n"
+                "def shared():\n"
+                "    return 1\n"
+            ),
+        })
+        calls = []
+
+        def fake_run_reconcile_tasks(tasks, worker, **kwargs):
+            calls.append({"tasks": list(tasks), "kwargs": kwargs})
+            return {
+                "results": [worker(task) for task in calls[-1]["tasks"]],
+                "observability": {
+                    "strategy": "parallel_process_pool",
+                    "worker_count": len(calls[-1]["tasks"]),
+                    "deterministic_order": "input_order",
+                },
+            }
+
+        with patch(
+            "agent.governance.reconcile_phases.phase_z_v2.run_reconcile_tasks",
+            side_effect=fake_run_reconcile_tasks,
+        ):
+            result = build_graph_v2_from_symbols(project, dry_run=True)
+
+        assert calls
+        assert calls[0]["kwargs"]["label"] == "phase_z_v2_dfs_coloring"
+        assert len(calls[0]["tasks"]) == 2
+        trace_steps = {step["name"]: step for step in result["phase_trace"]["steps"]}
+        metrics = trace_steps["dfs_coloring"]["metrics"]
+        assert metrics["parallelized"] is True
+        assert metrics["parallel_evidence"] == "parallel_process_pool"
+        assert metrics["worker_count"] == 2
+
     def test_ac2_dry_run_writes_scratch_artifact(self):
         """AC2: dry_run=True writes docs/dev/scratch/graph-v2-{date}.json."""
         project = _make_temp_project({

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from agent.governance.reconcile_parallel_executor import (
     default_worker_count,
     resolve_worker_count,
@@ -112,3 +114,22 @@ def test_run_reconcile_tasks_falls_back_to_serial_when_process_pool_fails():
     assert observability["fallback_reason"] == "process_pool_failed"
     assert observability["fallback_error_type"] == "RuntimeError"
     assert "pool unavailable" in observability["fallback_error"]
+
+
+def test_run_reconcile_tasks_skips_process_pool_when_main_is_stdin(monkeypatch):
+    class StdinMain:
+        __file__ = "<stdin>"
+
+    monkeypatch.setitem(sys.modules, "__main__", StdinMain())
+
+    result = run_reconcile_tasks(
+        [2, 4],
+        _double,
+        cpu_count=8,
+    )
+
+    assert result["results"] == [4, 8]
+    observability = result["observability"]
+    assert observability["strategy"] == "serial_fallback"
+    assert observability["fallback_reason"] == "process_pool_unavailable"
+    assert observability["fallback_error_type"] == "stdin_or_interactive_main"
