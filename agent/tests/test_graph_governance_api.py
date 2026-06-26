@@ -22822,6 +22822,51 @@ def test_observer_root_route_context_source_backed_next_action_from_contract_run
     assert row["execution_state_revision"] == 1
 
 
+def test_observer_root_route_context_uses_existing_source_backed_onboard_runtime_without_chain_trigger(conn):
+    backlog_id = "AC-ROOT-ROUTE-SOURCE-BACKED-FACADE-ONLY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-onboard-facade-only",
+            },
+        )
+    )
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        route_token_ref="rtok-onboard-facade-only",
+        task_id=started["contract_execution_id"],
+        caller_graph_query_schema_trace_id="gqt-20260624-facadeonly",
+    )
+
+    assert result["contract_state"]["legacy_no_contract"] is True
+    assert result["contract_runtime"]["active"] is True
+    assert result["contract_runtime"]["activation_source"] == (
+        "existing_contract_runtime_execution"
+    )
+    assert result["runtime_guide"]["contract"]["contract_id"] == "onboard_contract"
+    assert result["contract_runtime_current_state"]["contract_execution_id"] == (
+        started["contract_execution_id"]
+    )
+    assert result["next_legal_action"]["id"] == "graph_query_schema_trace"
+    assert result["next_legal_action"]["source"] == "contract_runtime"
+    assert result["next_legal_action"]["precedence"] == (
+        "contract_runtime_first_missing_line"
+    )
+    assert result["next_legal_action"]["route_token_ref"] == (
+        "rtok-onboard-facade-only"
+    )
+
+
 def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(conn):
     backlog_id = "AC-ONBOARD-CONTRACT-FACADE"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)

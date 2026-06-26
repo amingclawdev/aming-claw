@@ -2757,7 +2757,20 @@ def _runtime_text_branch_runtime_evidence(
         return ""
 
     def _evidence_parent_task_id() -> str:
-        for source in _nested_mappings(supplied):
+        nested_sources = _nested_mappings(supplied)
+        for source in nested_sources[1:]:
+            value = str(source.get("parent_task_id") or "").strip()
+            if value:
+                return value
+        for source in nested_sources[1:]:
+            value = _runtime_text_context_parent(source)
+            if value:
+                return value
+        for source in nested_sources[:1]:
+            value = str(source.get("parent_task_id") or "").strip()
+            if value:
+                return value
+        for source in nested_sources[:1]:
             value = _runtime_text_context_parent(source)
             if value:
                 return value
@@ -2850,6 +2863,9 @@ def _runtime_text_branch_runtime_evidence(
         "worker_slot_id": _evidence_field("worker_slot_id", "worker_id"),
         "task_id": _evidence_field("task_id"),
         "parent_task_id": _evidence_parent_task_id(),
+        "branch_ref": _evidence_field("branch_ref", "branch"),
+        "ref_name": _evidence_field("ref_name"),
+        "worktree_id": _evidence_field("worktree_id"),
         "fence_token": _evidence_field("fence_token"),
         "worktree_path": _evidence_field("worktree_path", "worktree"),
         "base_commit": _evidence_field("base_commit"),
@@ -2918,6 +2934,9 @@ def _runtime_text_branch_runtime_evidence(
         "task_id": observed_context["task_id"],
         "parent_task_id": observed_context["parent_task_id"],
         "fence_token": observed_context["fence_token"],
+        "branch_ref": observed_context["branch_ref"],
+        "ref_name": observed_context["ref_name"],
+        "worktree_id": observed_context["worktree_id"],
         "worktree_path": observed_context["worktree_path"],
         "target_project_root": (
             observed_context["target_project_root"]
@@ -2943,6 +2962,9 @@ def _runtime_text_branch_runtime_evidence(
             "task_id": observed_context["task_id"],
             "parent_task_id": observed_context["parent_task_id"],
             "fence_token": observed_context["fence_token"],
+            "branch_ref": observed_context["branch_ref"],
+            "ref_name": observed_context["ref_name"],
+            "worktree_id": observed_context["worktree_id"],
             "worktree_path": observed_context["worktree_path"],
             "base_commit": observed_context["base_commit"],
             "target_head_commit": observed_context["target_head_commit"],
@@ -3410,8 +3432,14 @@ def _runtime_text_hydrate_persisted_branch_runtime_evidence(
 def _runtime_text_context_parent(context: Mapping[str, Any]) -> str:
     root_task_id = str(context.get("root_task_id") or "").strip()
     task_id = str(context.get("task_id") or "").strip()
+    parent_task_id = str(context.get("parent_task_id") or "").strip()
+    if (
+        parent_task_id
+        and parent_task_id != task_id
+        and not parent_task_id.startswith(("chain-", "cchain-"))
+    ):
+        return parent_task_id
     candidates = [
-        str(context.get("parent_task_id") or "").strip(),
         str(context.get("chain_id") or "").strip(),
         root_task_id,
         str(context.get("stage_task_id") or "").strip(),

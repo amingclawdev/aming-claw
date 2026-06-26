@@ -33270,12 +33270,6 @@ def _observer_onboarding_runtime_projection(
     actor_role: str,
     route_token_ref: str = "",
 ) -> dict[str, Any]:
-    if not _source_backed_onboarding_enabled(contract):
-        return {
-            "schema_version": "observer_onboarding_runtime_projection.v1",
-            "active": False,
-            "reason": "source_backed_onboarding_not_bound",
-        }
     runtime = _contract_runtime(conn)
     store = runtime.store
     root_execution_id = _contract_runtime_stable_id(
@@ -33284,12 +33278,30 @@ def _observer_onboarding_runtime_projection(
     chain_id = _contract_runtime_stable_id(
         "cchain", project_id, backlog_id, "onboard_contract"
     )
+    source_backed_bound = _source_backed_onboarding_enabled(contract)
+    activation_source = "chain_trigger_json"
     try:
         record = store.get(root_execution_id)
+        if str(record.get("contract_id") or "") != "onboard_contract":
+            return {
+                "schema_version": "observer_onboarding_runtime_projection.v1",
+                "active": False,
+                "reason": "deterministic_execution_id_bound_to_different_contract",
+                "contract_execution_id": root_execution_id,
+                "contract_id": str(record.get("contract_id") or ""),
+            }
+        if not source_backed_bound:
+            activation_source = "existing_contract_runtime_execution"
         if route_token_ref and not str(record.get("route_token_ref") or ""):
             record["route_token_ref"] = route_token_ref
             runtime.store.update(root_execution_id, record)
     except ContractRuntimeError:
+        if not source_backed_bound:
+            return {
+                "schema_version": "observer_onboarding_runtime_projection.v1",
+                "active": False,
+                "reason": "source_backed_onboarding_not_bound",
+            }
         record = runtime.start_execution(
             "onboard_contract",
             project_id=project_id,
@@ -33344,6 +33356,7 @@ def _observer_onboarding_runtime_projection(
         "execution_state_hash": current_state["execution_state_hash"],
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "decision_source": "contract_runtime_first_missing_line",
+        "activation_source": activation_source,
         "legacy_meta_contract_gate": "audit_backstop_only",
     }
 

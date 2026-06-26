@@ -302,7 +302,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "observer_command_id": "cmd-a1",
         "governance_project_id": "aming-claw",
         "target_project_id": "aming-claw",
-        "target_project_root": "",
+        "target_project_root": str(worktree),
         "task_id": "task-a1",
         "parent_task_id": "AC-RUNTIME-TEXT-A1",
         "worker_role": "mf_sub",
@@ -361,6 +361,75 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "audited_graph_query_with_task_and_fence_identity"
         in prepared["first_progress_contract"]["observer_progress_sources"]
     )
+
+
+def test_runtime_text_prepare_prefers_nested_context_parent_over_top_level_backlog(
+    tmp_path,
+):
+    main = tmp_path / "main"
+    main.mkdir()
+    worktree = tmp_path / ".worktrees" / "worker-parent" / "task-parent"
+    allocation_context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        task_id="task-parent",
+        runtime_context_id="mfrctx-runtime-text-parent",
+        backlog_id="AC-RUNTIME-TEXT-PARENT",
+        parent_task_id="mf-parallel-parent-task",
+        root_task_id="mf-parallel-parent-task",
+        stage_task_id="task-parent",
+        stage_type="mf_sub",
+        worker_id="worker-parent",
+        worker_slot_id="worker-parent",
+        fence_token="fence-runtime-text-parent",
+        branch_ref="refs/heads/codex/task-parent",
+        worktree_id="wt-task-parent",
+        worktree_path=str(worktree),
+        base_commit="base-parent",
+        target_head_commit="target-parent",
+        merge_queue_id="mq-runtime-text-parent",
+        status=STATE_WORKTREE_READY,
+    )
+    allocation_evidence = branch_runtime_allocation_evidence(
+        allocation_context,
+        source_ref="/api/graph-governance/aming-claw/parallel-branches/allocate",
+    )
+    allocation_evidence["backlog_id"] = "AC-RUNTIME-TEXT-PARENT"
+
+    prepared = build_observer_runtime_text_context(
+        ObserverRuntimeTextPrepareRequest(
+            project_id="aming-claw",
+            backlog_id="AC-RUNTIME-TEXT-PARENT",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-parent",
+                prompt_contract_id="rprompt-parent",
+                prompt_contract_hash="sha256:prompt-parent",
+                route_token_ref="rtok-runtime-text-parent",
+            ),
+            main_worktree=str(main),
+            owned_files=("agent/observer_runtime.py",),
+            observer_command_id="cmd-parent",
+            task_id="task-parent",
+            parent_task_id="mf-parallel-parent-task",
+            worker_id="worker-parent",
+            fence_token="fence-runtime-text-parent",
+            base_commit="base-parent",
+            target_head_commit="target-parent",
+            merge_queue_id="mq-runtime-text-parent",
+            graph_trace_ids=("gqt-runtime-text-parent",),
+            branch_runtime_evidence=allocation_evidence,
+            route_id="route-parent",
+            visible_injection_manifest_hash="sha256:visible-parent",
+        )
+    )
+
+    assert prepared["ok"] is True
+    assert prepared["status"] == "prepared"
+    assert prepared["branch_runtime_evidence"]["registered"] is True
+    assert prepared["branch_runtime_evidence"]["parent_task_id"] == (
+        "mf-parallel-parent-task"
+    )
+    assert prepared["branch_identity"]["parent_task_id"] == "mf-parallel-parent-task"
+    assert prepared["dispatch_gate"]["branch"] == "refs/heads/codex/task-parent"
 
 
 def test_runtime_text_prepare_hydrates_persisted_allocation_from_runtime_context_id(
