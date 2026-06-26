@@ -8566,6 +8566,10 @@ class TestTaskTimeline(unittest.TestCase):
             "replaced_by_observer_direct_close_exception",
         )
         self.assertEqual(
+            ready["cross_ref_gate"]["status"],
+            "replaced_by_observer_direct_close_exception",
+        )
+        self.assertEqual(
             ready["close_timeline_startup_gate"]["status"],
             "replaced_by_observer_direct_close_exception",
         )
@@ -8575,6 +8579,7 @@ class TestTaskTimeline(unittest.TestCase):
         ]
         self.assertTrue(direct_group["passed"])
         self.assertIn("independent_qa_gate", direct_group["replaced_gate_ids"])
+        self.assertIn("cross_ref_gate", direct_group["replaced_gate_ids"])
 
     def test_observer_hotfix_contract_policy_requires_qa_without_parallel_topology(self):
         from agent.governance import task_timeline

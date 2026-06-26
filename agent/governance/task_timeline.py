@@ -7933,6 +7933,7 @@ def _observer_direct_close_exception_gate(
                 "finish_gate_projection",
                 "worker_graph_trace_gate",
                 "independent_qa_gate",
+                "cross_ref_gate",
                 "contract_projection_gate",
                 "close_timeline_startup_gate",
             ]
@@ -9968,6 +9969,11 @@ def mf_close_gate_verification(
         independent_qa_gate = _gate_replaced_by_observer_direct_exception(
             independent_qa_gate,
             "independent_qa_gate",
+            observer_direct_close_exception_gate,
+        )
+        cross_ref_gate = _gate_replaced_by_observer_direct_exception(
+            cross_ref_gate,
+            "cross_ref_gate",
             observer_direct_close_exception_gate,
         )
         contract_projection_gate = _gate_replaced_by_observer_direct_exception(
