@@ -1,0 +1,112 @@
+{
+  "schema_version": "mf_contract_template.v1",
+  "template_id": "mf_batch_parallel.v1",
+  "version": "v1",
+  "description": "Parent route template for observer-led parallel work across multiple backlog rows. The parent batch owns fan-out planning only; each row enters its own mf_parallel successor with row-scoped route tokens, worker evidence, QA evidence, merge, reconcile, and close gates.",
+  "task_types": [
+    "mf_batch_parallel",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "batch_contract_draft",
+    "batch_scope_review",
+    "row_fanout_planning",
+    "row_successor_dispatch",
+    "row_successor_tracking",
+    "batch_reconcile_summary"
+  ],
+  "required_instance_fields": [
+    "batch_id",
+    "backlog_ids",
+    "coordination_backlog_id",
+    "row_contracts",
+    "conflict_policy",
+    "evidence_requirements"
+  ],
+  "lifecycle_states": [
+    "batch_contract_draft",
+    "fanout_ready",
+    "row_successors_in_progress",
+    "waiting_row_closures",
+    "needs_revision",
+    "batch_summary_ready",
+    "accepted",
+    "rejected"
+  ],
+  "batch_scope_policy": {
+    "schema_version": "mf_batch_parallel.scope_policy.v1",
+    "multi_backlog_parent": true,
+    "coordination_backlog_id_required": true,
+    "minimum_backlog_ids": 2,
+    "single_row_successor_contract": "mf_parallel.v1",
+    "row_scoped_successor_tokens": true,
+    "shared_backlog_close_token_allowed": false,
+    "description": "The batch parent never shares one backlog token across rows. It creates a per-row successor plan; each row remains responsible for its own worker, QA, merge, reconcile, and close evidence."
+  },
+  "row_fanout_contract": {
+    "schema_version": "mf_batch_parallel.row_fanout_contract.v1",
+    "successor_template_id": "mf_parallel.v1",
+    "successor_interface": "mf_parallel_enter",
+    "required_per_row_fields": [
+      "backlog_id",
+      "task_id",
+      "route_token_ref",
+      "owned_files",
+      "worker_fence",
+      "qa_handoff"
+    ],
+    "token_policy": {
+      "route_token_task_id": "mf_parallel_successor_execution_id",
+      "route_token_scope": "single_backlog_row",
+      "raw_route_token_exposed": false
+    },
+    "close_policy": {
+      "per_row_close_required": true,
+      "batch_close_is_summary_only": true,
+      "batch_parent_must_not_close_child_rows": true
+    }
+  },
+  "observer_contract": {
+    "mode": "observer_owned_batch_route",
+    "observer_direct_code": false,
+    "responsibilities": [
+      "confirm_batch_backlog_ids",
+      "detect_conflicts_between_rows",
+      "create_per_row_mf_parallel_successor_plan",
+      "track_row_successor_state",
+      "summarize_batch_completion"
+    ],
+    "default_forbidden_actions": [
+      "shared_row_token",
+      "cross_row_close_without_row_evidence",
+      "merge_child_rows_without_row_qa",
+      "mutate_child_row_contracts_without_successor_route"
+    ]
+  },
+  "worker_contract": {
+    "role": "mf_sub",
+    "scope": "single row successor only",
+    "description": "Workers do not implement directly against the batch parent. They enter the row-scoped mf_parallel successor that owns their file fence and evidence lines."
+  },
+  "qa_contract": {
+    "role": "qa",
+    "scope": "single row successor plus optional batch summary review",
+    "independent_verification_required": true
+  },
+  "evidence_requirements": [
+    "batch_backlog_ids",
+    "row_successor_plan",
+    "per_row_route_token_refs",
+    "per_row_mf_parallel_contract_refs",
+    "conflict_policy",
+    "batch_summary"
+  ],
+  "successors": [
+    {
+      "contract_id": "mf_parallel",
+      "version": "v1",
+      "reason": "Each backlog row in the batch must continue through a row-scoped mf_parallel successor."
+    }
+  ]
+}

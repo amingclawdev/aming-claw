@@ -23152,6 +23152,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "continue_contract_chain",
         "observer_hotfix",
         "operator_supervised_direct_main",
+        "multi_backlog_parallel",
         "parallel_worker",
         "qa_verification",
     }
@@ -23162,11 +23163,18 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert route_guide["backlog_chain_binding"]["continue"][
         "next_legal_action"
     ] == started["next_legal_action"]
-    assert route_guide["role_entries"]["observer"]["next_contracts"] == [
-        {"contract_id": "observer_hotfix", "interface": "hotfix_enter"},
-        {"contract_id": "mf_parallel", "interface": "mf_parallel_enter"},
-        {"contract_id": "qa_session", "interface": "qa_session_register"},
-    ]
+    observer_next = {
+        item["contract_id"]: item
+        for item in route_guide["role_entries"]["observer"]["next_contracts"]
+    }
+    assert observer_next["observer_hotfix"]["interface"] == "hotfix_enter"
+    assert observer_next["mf_parallel"]["interface"] == "mf_parallel_enter"
+    assert observer_next["mf_parallel"]["single_backlog_scoped"] is True
+    assert observer_next["mf_batch_parallel"]["interface"] == "mf_batch_parallel_enter"
+    assert observer_next["mf_batch_parallel"]["multi_backlog_parent"] is True
+    assert observer_next["contract_add"]["interface"] == "contract_add_start"
+    assert observer_next["contract_update"]["interface"] == "contract_update_start"
+    assert observer_next["qa_session"]["interface"] == "qa_session_register"
     direct_main = route_guide["role_entries"]["observer"]["direct_main"]
     assert direct_main["id"] == "operator_supervised_direct_main"
     assert direct_main["entrypoint"] == "observer_direct_mutation_exception"
@@ -23210,6 +23218,15 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     )
     assert route_guide["interface_index"]["mf_parallel_enter"]["path"] == (
         "/api/projects/{project_id}/mf-parallel/enter"
+    )
+    assert route_guide["interface_index"]["mf_batch_parallel_enter"]["path"] == (
+        "/api/projects/{project_id}/mf-batch-parallel/enter"
+    )
+    assert route_guide["interface_index"]["contract_add_start"]["path"] == (
+        "/api/projects/{project_id}/contract-add/start"
+    )
+    assert route_guide["interface_index"]["contract_update_start"]["path"] == (
+        "/api/projects/{project_id}/contract-update/start"
     )
     direct_exception_interface = route_guide["interface_index"][
         "observer_direct_mutation_exception"
@@ -23327,6 +23344,128 @@ def test_onboard_contract_facade_guidance_requests_route_ref_when_missing(conn):
     assert guidance["onboard_route_guide"]["interface_index"]["backlog_get"][
         "mcp_tool"
     ] == "backlog_get"
+
+
+def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_route(conn):
+    backlog_id = "AC-ONBOARD-ROUTE-GUIDE-SERVICE-WAIVER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "route_token_ref": "rtok-onboard-service",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["legacy_onboard_contract_waived"] is True
+    assert result["onboard_contract_required"] is False
+    waiver = result["onboard_service_waiver"]
+    assert waiver["contract_execution_id"] == server._onboard_service_execution_id(
+        PID, backlog_id
+    )
+    guide = result["onboard_route_guide"]
+    assert guide["service"]["source"] == "onboard_route_guide_service"
+    assert guide["legacy_onboard_contract_waived"] is True
+    assert guide["onboard_contract_required"] is False
+    assert "multi_backlog_parallel" in {
+        option["id"] for option in guide["work_type_options"]
+    }
+    assert guide["interface_index"]["mf_batch_parallel_enter"]["path"] == (
+        "/api/projects/{project_id}/mf-batch-parallel/enter"
+    )
+    observer_next = {
+        item["contract_id"]: item
+        for item in guide["role_entries"]["observer"]["next_contracts"]
+    }
+    assert observer_next["mf_batch_parallel"]["multi_backlog_parent"] is True
+    issue_payload = result["agent_onboard_guidance"]["route_token_issue"][
+        "observer_route_context_issue_payload"
+    ]
+    assert {
+        "contract_add_start",
+        "contract_update_start",
+        "mf_batch_parallel_enter",
+    }.issubset(set(issue_payload["allowed_actions"]))
+
+
+def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-ONBOARD-SERVICE-WAIVER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-update-onboard-service",
+    )
+    route_token_ref = "rtok-contract-update-onboard-service"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_update_start"],
+    )
+
+    started = server.handle_project_contract_update_start(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+            },
+        )
+    )
+
+    service_parent = server._onboard_service_execution_id(PID, backlog_id)
+    assert started["ok"] is True
+    assert started["parent_contract_execution_id"] == service_parent
+    assert started["root_contract_execution_id"] == service_parent
+    assert started["contract_chain_id"] == server._onboard_service_chain_id(
+        PID, backlog_id
+    )
+    assert started["next_legal_action"]["id"] == "observer_request_contract_update"
+
+
+def test_multi_backlog_parallel_templates_are_row_scoped():
+    templates_root = Path("agent/governance/contract_templates")
+    batch = json.loads((templates_root / "mf_batch_parallel.v1.json").read_text())
+    row = json.loads((templates_root / "mf_parallel.v1.json").read_text())
+    definition = json.loads(
+        Path("agent/governance/contract_definitions/mf_parallel.v1.rev2.json").read_text()
+    )
+
+    assert batch["template_id"] == "mf_batch_parallel.v1"
+    assert batch["batch_scope_policy"]["multi_backlog_parent"] is True
+    assert batch["batch_scope_policy"]["row_scoped_successor_tokens"] is True
+    assert (
+        batch["row_fanout_contract"]["successor_template_id"]
+        == "mf_parallel.v1"
+    )
+    assert (
+        batch["row_fanout_contract"]["close_policy"][
+            "batch_parent_must_not_close_child_rows"
+        ]
+        is True
+    )
+    assert row["row_scope_policy"]["scope"] == "single_backlog_row"
+    assert row["row_scope_policy"]["multi_backlog_parent_template"] == (
+        "mf_batch_parallel.v1"
+    )
+    parent_contracts = {
+        (item["contract_id"], item["version"])
+        for item in definition["system_layer"]["successor_policy"][
+            "allowed_parent_contracts"
+        ]
+    }
+    assert ("onboard_route_guide", "service") in parent_contracts
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
@@ -27748,6 +27887,101 @@ def test_mf_parallel_enter_accepts_verified_observer_route_ref(conn):
     assert result["event"]["payload"]["derived_actor_role"] == "observer"
     assert result["event"]["payload"]["body_role_claim_ignored"] == "mf_sub"
     assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+
+
+def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
+    backlog_id = "AC-MF-PARALLEL-ONBOARD-SERVICE-WAIVER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-parallel-onboard-service",
+    )
+    route_token_ref = "rtok-mf-parallel-onboard-service"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "reason": "Human approved row-scoped parallel work through onboard service.",
+                "task_id": "parallel-onboard-service-task",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+
+    service_parent = server._onboard_service_execution_id(PID, backlog_id)
+    assert result["ok"] is True
+    assert result["parent_contract_execution_id"] == service_parent
+    assert result["root_contract_execution_id"] == service_parent
+    assert result["event"]["payload"]["legacy_onboard_contract_waived"] is True
+    assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+
+
+def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
+    backlog_id = "AC-MF-BATCH-PARALLEL-ROUTE"
+    child_a = "AC-MF-BATCH-PARALLEL-ROW-A"
+    child_b = "AC-MF-BATCH-PARALLEL-ROW-B"
+    for row_id in (backlog_id, child_a, child_b):
+        _insert_simple_mf_close_backlog(conn, row_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-batch-parallel",
+    )
+    route_token_ref = "rtok-mf-batch-parallel"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+
+    result = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "backlog_ids": [child_a, child_b],
+                "reason": "Human approved multi-row fan-out through onboard service.",
+                "task_id": "batch-parallel-onboard-service",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+            },
+        )
+    )
+
+    service_parent = server._onboard_service_execution_id(PID, backlog_id)
+    assert result["ok"] is True
+    assert result["contract_template_id"] == "mf_batch_parallel.v1"
+    assert result["parent_contract_execution_id"] == service_parent
+    assert result["root_contract_execution_id"] == service_parent
+    assert [item["backlog_id"] for item in result["per_row_successors"]] == [
+        child_a,
+        child_b,
+    ]
+    assert all(
+        item["requires_distinct_route_token_ref"]
+        and item["route_token_task_id_policy"] == "mf_parallel_successor_execution_id"
+        for item in result["per_row_successors"]
+    )
+    payload = result["event"]["payload"]
+    assert payload["legacy_onboard_contract_waived"] is True
+    assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
+    assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v1"
 
 
 def test_mf_parallel_enter_blocks_incomplete_onboard_root(conn):

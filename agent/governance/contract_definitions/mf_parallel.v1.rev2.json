@@ -264,6 +264,10 @@
         {
           "contract_id": "onboard_contract",
           "version": "v1"
+        },
+        {
+          "contract_id": "onboard_route_guide",
+          "version": "service"
         }
       ],
       "allowed_successors": [

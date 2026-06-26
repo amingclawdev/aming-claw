@@ -34379,15 +34379,25 @@ def _contract_runtime_line_write_body(
 
 
 ONBOARD_CONTRACT_ID = "onboard_contract"
+ONBOARD_ROUTE_GUIDE_SERVICE_ID = "onboard_route_guide"
 
 _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "onboard_route_guide",
     "onboard_contract_start",
     "onboard_contract_current",
     "onboard_contract_submit_line",
     "observer_hotfix_enter",
     "observer_direct_mutation_exception",
+    "contract_add_start",
+    "contract_add_current",
+    "contract_add_submit_line",
+    "contract_update_start",
+    "contract_update_current",
+    "contract_update_submit_line",
     "contract_runtime_current",
     "contract_runtime_submit_line",
+    "mf_parallel_enter",
+    "mf_batch_parallel_enter",
     "task_timeline_append",
 )
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
@@ -34408,6 +34418,161 @@ def _onboard_contract_chain_id(project_id: str, backlog_id: str) -> str:
     return _contract_runtime_stable_id(
         "cchain", project_id, backlog_id, ONBOARD_CONTRACT_ID
     )
+
+
+def _onboard_service_execution_id(project_id: str, backlog_id: str) -> str:
+    return _contract_runtime_stable_id(
+        "onboard-service", project_id, backlog_id, ONBOARD_ROUTE_GUIDE_SERVICE_ID
+    )
+
+
+def _onboard_service_chain_id(project_id: str, backlog_id: str) -> str:
+    return _contract_runtime_stable_id(
+        "cchain", project_id, backlog_id, ONBOARD_ROUTE_GUIDE_SERVICE_ID
+    )
+
+
+def _onboard_service_parent_record(
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    chain_id = _onboard_service_chain_id(project_id, backlog_id)
+    return {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        "version": "service",
+        "revision": "v1",
+        "contract_execution_id": execution_id,
+        "root_contract_execution_id": execution_id,
+        "parent_contract_execution_id": "",
+        "contract_chain_id": chain_id,
+        "route_token_ref": route_token_ref,
+        "runtime_guide": {
+            "schema_version": "onboard_route_guide.runtime_parent.v1",
+            "next_legal_action": None,
+        },
+        "metadata": {
+            "facade": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            "service_source": "onboard_route_guide_service",
+            "legacy_onboard_contract_waived": True,
+            "generic_crud_exposed": False,
+        },
+        "backlog_lineage": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "legacy_onboard_contract_waived": True,
+        },
+    }
+
+
+def _onboard_service_materialize_parent_record(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    record = _onboard_service_parent_record(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    execution_id = str(record.get("contract_execution_id") or "")
+    store = _contract_runtime_store(conn)
+    try:
+        existing = store.get(execution_id)
+    except ContractRuntimeError:
+        state = {
+            "schema_version": "contract_execution_state.v1",
+            "contract_execution_id": execution_id,
+            "execution_state_revision": 1,
+            "completed_lines": [
+                {
+                    "stage_id": "onboard_service",
+                    "line_id": "legacy_onboard_contract_waived",
+                    "actor_role": "observer",
+                    "evidence_kind": "onboard_service_waiver",
+                    "payload": {
+                        "legacy_onboard_contract_waived": True,
+                        "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                    },
+                }
+            ],
+        }
+        state["execution_state_hash"] = stable_sha256(state)
+        guide = dict(record["runtime_guide"])
+        guide["execution"] = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "execution_state_revision": 1,
+            "execution_state_hash": state["execution_state_hash"],
+            "route_token_ref": route_token_ref,
+        }
+        guide["completed_lines"] = list(state["completed_lines"])
+        guide["runtime_guide_hash"] = stable_sha256(guide)
+        record.update(
+            {
+                "schema_version": "contract_runtime_execution_record.v1",
+                "definition_hash": stable_sha256(
+                    {
+                        "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                        "version": "service",
+                        "revision": "v1",
+                    }
+                ),
+                "definition_source_sha256": "",
+                "instruction_bundle_hash": stable_sha256(
+                    {
+                        "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                        "instruction": "guide_service",
+                    }
+                ),
+                "completed_lines": list(state["completed_lines"]),
+                "execution_state_revision": 1,
+                "execution_state": state,
+                "runtime_guide": guide,
+                "precheck_decision": {
+                    "schema_version": "contract_gate_decision.v1",
+                    "ok": True,
+                    "decision": "allow",
+                    "action": "onboard_route_guide",
+                    "gate_id": "onboard_route_guide:service_parent",
+                    "source_of_authority": "onboard_route_guide_service",
+                },
+                "role_binding": {
+                    "observer": "observer",
+                    "binding_source": "onboard_route_guide_service",
+                },
+            }
+        )
+        return store.create(record)
+    if route_token_ref and not str(existing.get("route_token_ref") or ""):
+        existing["route_token_ref"] = route_token_ref
+        return store.update(execution_id, existing)
+    return existing
+
+
+def _onboard_service_waiver_requested(
+    body: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    raw = (
+        body.get("onboard_service_waiver")
+        or body.get("legacy_onboard_contract_waived")
+        or body.get("waive_onboard_contract")
+        or metadata.get("onboard_service_waiver")
+        or metadata.get("legacy_onboard_contract_waived")
+        or metadata.get("waive_onboard_contract")
+    )
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "waive"}
 
 
 def _onboard_contract_route_issue_target_files_from_record(
@@ -34479,6 +34644,15 @@ def _onboard_contract_route_guide(
     backlog_id = str(record.get("backlog_id") or "")
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    legacy_onboard_contract_waived = bool(metadata.get("legacy_onboard_contract_waived"))
+    service_source = str(metadata.get("service_source") or "").strip()
+    if not service_source:
+        service_source = (
+            "onboard_route_guide_service"
+            if str(record.get("contract_id") or "") == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+            else "onboard_contract_facade"
+        )
     chain = {
         "project_id": project_id,
         "backlog_id": backlog_id,
@@ -34537,6 +34711,13 @@ def _onboard_contract_route_guide(
             ),
         },
         {
+            "id": "multi_backlog_parallel",
+            "entry": (
+                "agent_onboard_guidance.onboard_route_guide.role_entries."
+                "observer.next_contracts"
+            ),
+        },
+        {
             "id": "parallel_worker",
             "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.worker",
         },
@@ -34550,10 +34731,17 @@ def _onboard_contract_route_guide(
         },
     ]
     interface_index = {
+        "onboard_route_guide": {
+            "kind": "http",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/onboard-route-guide",
+        },
         "onboard_start": {
             "kind": "http",
             "method": "POST",
             "path": "/api/projects/{project_id}/onboard-contract/start",
+            "legacy": True,
+            "waived_by_default_for_service_route": True,
         },
         "onboard_current": {
             "kind": "http",
@@ -34586,6 +34774,23 @@ def _onboard_contract_route_guide(
             "kind": "http",
             "method": "POST",
             "path": "/api/projects/{project_id}/mf-parallel/enter",
+        },
+        "mf_batch_parallel_enter": {
+            "kind": "http",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/mf-batch-parallel/enter",
+        },
+        "contract_add_start": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_add_start",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/contract-add/start",
+        },
+        "contract_update_start": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_update_start",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/contract-update/start",
         },
         "contract_runtime_current": {
             "kind": "mcp_or_http",
@@ -34729,8 +34934,10 @@ def _onboard_contract_route_guide(
         "service": {
             "id": "onboard_route_guide",
             "kind": "guide_service",
-            "source": "onboard_contract_facade",
+            "source": service_source,
         },
+        "onboard_contract_required": not legacy_onboard_contract_waived,
+        "legacy_onboard_contract_waived": legacy_onboard_contract_waived,
         "guide_steps": [
             {
                 "id": "confirm_role",
@@ -34774,6 +34981,27 @@ def _onboard_contract_route_guide(
                     "interface": "mf_parallel_enter",
                     "requires_role": "observer",
                     "requires_route_token_ref": True,
+                    "single_backlog_scoped": True,
+                },
+                "mf_batch_parallel": {
+                    "interface": "mf_batch_parallel_enter",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                    "requires_backlog_ids": True,
+                    "fanout_successor": "mf_parallel",
+                    "row_scoped_successor_tokens": True,
+                },
+                "contract_add": {
+                    "interface": "contract_add_start",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                    "route_token_task_id": "contract_add_execution_id",
+                },
+                "contract_update": {
+                    "interface": "contract_update_start",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                    "onboard_service_waiver_supported": True,
                 },
                 "operator_supervised_direct_main": {
                     "interface": "observer_direct_mutation_exception",
@@ -34807,6 +35035,21 @@ def _onboard_contract_route_guide(
                     {
                         "contract_id": "mf_parallel",
                         "interface": "mf_parallel_enter",
+                        "single_backlog_scoped": True,
+                    },
+                    {
+                        "contract_id": "mf_batch_parallel",
+                        "interface": "mf_batch_parallel_enter",
+                        "multi_backlog_parent": True,
+                    },
+                    {
+                        "contract_id": "contract_add",
+                        "interface": "contract_add_start",
+                    },
+                    {
+                        "contract_id": "contract_update",
+                        "interface": "contract_update_start",
+                        "onboard_service_waiver_supported": True,
                     },
                     {
                         "contract_id": "qa_session",
@@ -34839,12 +35082,16 @@ def _onboard_contract_route_guide(
                 "backlog_get",
                 "backlog_list",
                 "observer_route_context_issue",
+                "contract_add_start",
+                "contract_update_start",
                 "runtime_context_worker_guide",
                 "qa_session_register",
                 "contract_runtime_current",
                 "contract_runtime_submit_line",
                 "task_timeline_append",
                 "observer_direct_mutation_exception",
+                "mf_parallel_enter",
+                "mf_batch_parallel_enter",
             ],
             "index_paths": {
                 "roles": "agent_onboard_guidance.onboard_route_guide.role_entries",
@@ -35018,9 +35265,16 @@ def _onboard_contract_agent_guidance(
             next_legal_action=next_legal_action,
         ),
         "entrypoints": {
+            "onboard_route_guide": {
+                "method": "POST",
+                "path": "/api/projects/{project_id}/onboard-route-guide",
+                "default": True,
+            },
             "onboard_start": {
                 "method": "POST",
                 "path": "/api/projects/{project_id}/onboard-contract/start",
+                "legacy": True,
+                "waived_by_default_for_service_route": True,
             },
             "onboard_current": {
                 "method": "GET",
@@ -35055,6 +35309,93 @@ def _onboard_contract_agent_guidance(
                 "path": "/api/task/{project_id}/timeline",
             },
         },
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _onboard_route_guide_service_next_action(
+    *,
+    role: str = "",
+    work_type: str = "",
+) -> dict[str, Any]:
+    selected_role = str(role or "").strip() or "observer"
+    selected_work_type = str(work_type or "").strip()
+    return {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "confirm_role_and_work_type",
+        "action": "confirm_role_and_work_type",
+        "source": "onboard_route_guide_service",
+        "precedence": "service_route_selection",
+        "role": selected_role,
+        "work_type": selected_work_type,
+        "next_step": (
+            "issue observer_session_id plus route_token_ref, then enter the selected "
+            "successor interface"
+        ),
+        "legacy_onboard_contract_waived": True,
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _onboard_route_guide_service_response(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+    role: str = "",
+    work_type: str = "",
+) -> dict[str, Any]:
+    record = _onboard_service_parent_record(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    target_files = _onboard_contract_route_issue_target_files(
+        conn,
+        backlog_id=backlog_id,
+        body={},
+        metadata={},
+    )
+    record["metadata"] = {
+        **dict(record.get("metadata") or {}),
+        "route_token_issue_target_files": target_files,
+    }
+    next_action = _onboard_route_guide_service_next_action(
+        role=role,
+        work_type=work_type,
+    )
+    guidance = _onboard_contract_agent_guidance(
+        record,
+        next_legal_action=next_action,
+    )
+    return {
+        "schema_version": "onboard_route_guide.service_response.v1",
+        "ok": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "service": {
+            "id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            "kind": "guide_service",
+            "source": "onboard_route_guide_service",
+        },
+        "selected_role": str(role or "").strip(),
+        "selected_work_type": str(work_type or "").strip(),
+        "legacy_onboard_contract_waived": True,
+        "onboard_contract_required": False,
+        "onboard_service_waiver": {
+            "schema_version": "onboard_service_waiver.v1",
+            "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            "legacy_onboard_contract_waived": True,
+            "contract_execution_id": record["contract_execution_id"],
+            "root_contract_execution_id": record["root_contract_execution_id"],
+            "contract_chain_id": record["contract_chain_id"],
+            "route_token_ref": route_token_ref,
+        },
+        "agent_onboard_guidance": guidance,
+        "onboard_route_guide": guidance["onboard_route_guide"],
+        "next_legal_action": next_action,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -35858,7 +36199,16 @@ def _contract_update_parent_for_successor(
     project_id: str,
     backlog_id: str,
     actor_role: str,
+    route_token_ref: str = "",
+    allow_onboard_service_waiver: bool = False,
 ) -> dict[str, Any]:
+    if allow_onboard_service_waiver:
+        return _onboard_service_materialize_parent_record(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
     parent_record = _onboard_contract_parent_for_successor(
         conn,
         project_id=project_id,
@@ -36275,6 +36625,8 @@ def _observer_hotfix_successor_runtime_enter(
 
 MF_PARALLEL_CONTRACT_ID = "mf_parallel.v1"
 MF_PARALLEL_RECORD_CONTRACT_ID = "mf_parallel"
+MF_BATCH_PARALLEL_CONTRACT_ID = "mf_batch_parallel.v1"
+MF_BATCH_PARALLEL_RECORD_CONTRACT_ID = "mf_batch_parallel"
 
 
 def _mf_parallel_execution_id(
@@ -36292,6 +36644,21 @@ def _mf_parallel_execution_id(
         parent_execution_id,
         task_id or "default",
         MF_PARALLEL_RECORD_CONTRACT_ID,
+    )
+
+
+def _mf_batch_parallel_batch_id(
+    project_id: str,
+    backlog_id: str,
+    backlog_ids: Sequence[str],
+    task_id: str,
+) -> str:
+    return _contract_runtime_stable_id(
+        "mf-batch-parallel",
+        project_id,
+        backlog_id,
+        ",".join(backlog_ids),
+        task_id or "default",
     )
 
 
@@ -44270,6 +44637,8 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
     successor_runtime: dict[str, Any] = {}
     source_backed = False
     derived_actor_role = ""
@@ -44291,7 +44660,7 @@ def handle_project_hotfix_enter(ctx: RequestContext):
             )
         except ContractRuntimeError:
             deterministic_onboard_root_exists = False
-        source_backed = bool(explicit_parent_execution_id) or (
+        source_backed = onboard_service_waiver or bool(explicit_parent_execution_id) or (
             _source_backed_onboarding_enabled(contract)
             or deterministic_onboard_root_exists
         )
@@ -44332,6 +44701,13 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                             "before hotfix successor"
                         ),
                     )
+            elif onboard_service_waiver:
+                parent_record = _onboard_service_materialize_parent_record(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    route_token_ref=route_token_ref,
+                )
             else:
                 try:
                     parent_record = _onboard_contract_parent_for_successor(
@@ -44402,6 +44778,10 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                         "successor_contract"
                     )
                     or {},
+                    "legacy_onboard_contract_waived": onboard_service_waiver,
+                    "onboard_service": (
+                        ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
+                    ),
                     "agent_facing_decision_source": (
                         "contract_runtime_first_missing_line"
                     ),
@@ -44534,6 +44914,14 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         "target_files": list(target_files),
         "worker_fence": dict(worker_fence),
     }
+    onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+    if onboard_service_waiver:
+        metadata = {
+            **metadata,
+            "entrypoint": "onboard_service_waiver",
+            "legacy_onboard_contract_waived": True,
+            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        }
 
     from . import task_timeline
     from .mf_subagent_contract import validate_meta_contract_timeline_event
@@ -44556,35 +44944,43 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "role_source": "contract_runtime_effective_actor_role",
                 },
             )
-        try:
-            parent_record = _onboard_contract_parent_for_successor(
+        if onboard_service_waiver:
+            parent_record = _onboard_service_materialize_parent_record(
                 conn,
                 project_id=project_id,
                 backlog_id=backlog_id,
-                actor_role=derived_actor_role,
-            )
-        except StalePinnedContractExecutionError as exc:
-            _raise_stale_contract_runtime_validation(
-                exc,
-                action="mf_parallel_enter",
                 route_token_ref=route_token_ref,
-                actor_role=derived_actor_role,
-                message=(
-                    "observer onboarding contract is stale; start recovery "
-                    "before mf_parallel successor"
-                ),
             )
-        except ContractRuntimeError as exc:
-            raise ValidationError(
-                "source-backed onboard_contract runtime must be started before mf_parallel successor",
-                {
-                    "contract_execution_id": root_execution_id,
-                    "contract_id": ONBOARD_CONTRACT_ID,
-                    "agent_facing_decision_source": (
-                        "contract_runtime_first_missing_line"
+        else:
+            try:
+                parent_record = _onboard_contract_parent_for_successor(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    actor_role=derived_actor_role,
+                )
+            except StalePinnedContractExecutionError as exc:
+                _raise_stale_contract_runtime_validation(
+                    exc,
+                    action="mf_parallel_enter",
+                    route_token_ref=route_token_ref,
+                    actor_role=derived_actor_role,
+                    message=(
+                        "observer onboarding contract is stale; start recovery "
+                        "before mf_parallel successor"
                     ),
-                },
-            ) from exc
+                )
+            except ContractRuntimeError as exc:
+                raise ValidationError(
+                    "source-backed onboard_contract runtime must be started before mf_parallel successor",
+                    {
+                        "contract_execution_id": root_execution_id,
+                        "contract_id": ONBOARD_CONTRACT_ID,
+                        "agent_facing_decision_source": (
+                            "contract_runtime_first_missing_line"
+                        ),
+                    },
+                ) from exc
         if not _runtime_record_is_complete(parent_record):
             current_state = _runtime_current_state_from_record(parent_record)
             raise ValidationError(
@@ -44626,6 +45022,8 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 "contract_runtime_first_missing_line"
             ),
             "meta_contract_gate_decision_source": False,
+            "onboard_service_waiver": onboard_service_waiver,
+            "legacy_onboard_contract_waived": onboard_service_waiver,
         }
         payload["meta_contract_gate"] = validate_meta_contract_timeline_event(
             {
@@ -44661,6 +45059,12 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 ),
                 "root_contract_execution_id": successor_runtime.get(
                     "root_contract_execution_id", ""
+                ),
+                "legacy_onboard_contract": (
+                    "waived" if onboard_service_waiver else "required"
+                ),
+                "onboard_service": (
+                    ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
                 ),
             },
         )
@@ -44698,6 +45102,223 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         or {},
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
+
+
+@route("POST", "/api/projects/{project_id}/mf-batch-parallel/enter")
+@route("POST", "/api/projects/{project_id}/mf-batch-parallel/start")
+def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
+    """Enter a parent route for multi-backlog parallel fan-out."""
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("mf_batch_parallel entry requires coordination backlog_id")
+    raw_backlog_ids = body.get("backlog_ids")
+    if not isinstance(raw_backlog_ids, list):
+        raise ValidationError("mf_batch_parallel entry requires backlog_ids list")
+    backlog_ids: list[str] = []
+    seen: set[str] = set()
+    for item in raw_backlog_ids:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        backlog_ids.append(text)
+    if len(backlog_ids) < 2:
+        raise ValidationError("mf_batch_parallel entry requires at least two backlog_ids")
+    reason = str(body.get("reason") or body.get("human_reason") or "").strip()
+    if not reason:
+        raise ValidationError("mf_batch_parallel entry requires a human reason")
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    if not route_token_ref:
+        raise ValidationError("mf_batch_parallel entry requires route_token_ref")
+    task_id = str(body.get("task_id") or "").strip()
+    actor = str(body.get("actor") or "api").strip()
+    body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+
+    from . import task_timeline
+
+    with DBContext(project_id) as conn:
+        root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
+        derived_actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="mf_batch_parallel_enter",
+            backlog_id=backlog_id,
+        )
+        if derived_actor_role != "observer":
+            raise PermissionDeniedError(
+                derived_actor_role,
+                "mf_batch_parallel_enter",
+                {
+                    "required_role": "observer",
+                    "body_role_claim": body_role_claim,
+                    "role_source": "contract_runtime_effective_actor_role",
+                },
+            )
+        if onboard_service_waiver:
+            parent_record = _onboard_service_materialize_parent_record(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+            )
+        else:
+            try:
+                parent_record = _onboard_contract_parent_for_successor(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    actor_role=derived_actor_role,
+                )
+            except ContractRuntimeError as exc:
+                raise ValidationError(
+                    "source-backed onboard_contract runtime must be started before mf_batch_parallel successor",
+                    {
+                        "contract_execution_id": root_execution_id,
+                        "contract_id": ONBOARD_CONTRACT_ID,
+                        "agent_facing_decision_source": (
+                            "contract_runtime_first_missing_line"
+                        ),
+                    },
+                ) from exc
+        if not _runtime_record_is_complete(parent_record):
+            current_state = _runtime_current_state_from_record(parent_record)
+            raise ValidationError(
+                "observer onboarding contract must complete before mf_batch_parallel successor",
+                {
+                    "contract_execution_id": parent_record.get("contract_execution_id"),
+                    "next_legal_action": current_state.get("next_legal_action") or {},
+                },
+            )
+        parent_execution_id = str(parent_record.get("contract_execution_id") or "")
+        root_parent_execution_id = str(
+            parent_record.get("root_contract_execution_id") or parent_execution_id
+        )
+        contract_chain_id = str(parent_record.get("contract_chain_id") or "")
+        batch_id = _mf_batch_parallel_batch_id(
+            project_id,
+            backlog_id,
+            backlog_ids,
+            task_id,
+        )
+        per_row_successors = [
+            {
+                "backlog_id": row_id,
+                "interface": "mf_parallel_enter",
+                "path": "/api/projects/{project_id}/mf-parallel/enter",
+                "requires_distinct_route_token_ref": True,
+                "route_token_task_id_policy": "mf_parallel_successor_execution_id",
+                "body": {
+                    "backlog_id": row_id,
+                    "task_id": f"{batch_id}:row:{index + 1}",
+                    "parent_batch_id": batch_id,
+                    "onboard_service_waiver": onboard_service_waiver,
+                    "reason": f"{reason} (batch row {index + 1}/{len(backlog_ids)})",
+                },
+            }
+            for index, row_id in enumerate(backlog_ids)
+        ]
+        payload = {
+            "schema_version": "mf_batch_parallel_entered.v1",
+            "contract_id": MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+            "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
+            "batch_id": batch_id,
+            "reason": reason,
+            "actor": derived_actor_role,
+            "requested_actor": actor,
+            "body_role_claim_ignored": body_role_claim,
+            "backlog_id": backlog_id,
+            "backlog_ids": backlog_ids,
+            "parent_contract_execution_id": parent_execution_id,
+            "root_contract_execution_id": root_parent_execution_id,
+            "contract_chain_id": contract_chain_id,
+            "legacy_onboard_contract_waived": onboard_service_waiver,
+            "onboard_service": (
+                ONBOARD_ROUTE_GUIDE_SERVICE_ID if onboard_service_waiver else ""
+            ),
+            "fanout_policy": {
+                "schema_version": "mf_batch_parallel.fanout_policy.v1",
+                "successor_contract_id": MF_PARALLEL_RECORD_CONTRACT_ID,
+                "successor_contract_template_id": MF_PARALLEL_CONTRACT_ID,
+                "row_scoped_successor_tokens": True,
+                "shared_backlog_close_token_allowed": False,
+                "per_row_successors": per_row_successors,
+            },
+            "agent_facing_decision_source": "onboard_route_guide_service",
+            "meta_contract_gate_decision_source": False,
+        }
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id or batch_id,
+            event_type="mf_batch_parallel.entered",
+            phase="orchestration",
+            event_kind="contract_binding",
+            actor=derived_actor_role,
+            status="accepted",
+            payload=payload,
+            artifact_refs={
+                "backlog_id": backlog_id,
+                "batch_id": batch_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
+            },
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "schema_version": "mf_batch_parallel_enter.route_response.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "batch_id": batch_id,
+        "event": event,
+        "contract_id": MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+        "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
+        "parent_contract_execution_id": parent_execution_id,
+        "root_contract_execution_id": root_parent_execution_id,
+        "contract_chain_id": contract_chain_id,
+        "per_row_successors": per_row_successors,
+        "route_token_ref": route_token_ref,
+        "agent_facing_decision_source": "onboard_route_guide_service",
+    }
+
+
+@route("GET", "/api/projects/{project_id}/onboard-route-guide")
+@route("POST", "/api/projects/{project_id}/onboard-route-guide")
+def handle_project_onboard_route_guide(ctx: RequestContext):
+    """Return the role/work-type onboard guide service without starting legacy root contract."""
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    backlog_id = str(
+        body.get("backlog_id")
+        or body.get("bug_id")
+        or _first_query_value(ctx.query, "backlog_id")
+        or _first_query_value(ctx.query, "bug_id")
+        or ""
+    ).strip()
+    if not backlog_id:
+        raise ValidationError("onboard route guide requires backlog_id or bug_id")
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    role = str(body.get("role") or body.get("actor_role") or "").strip()
+    work_type = str(body.get("work_type") or body.get("requested_work_type") or "").strip()
+    with DBContext(project_id) as conn:
+        response = _onboard_route_guide_service_response(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            role=role,
+            work_type=work_type,
+        )
+    return response
 
 
 @route("POST", "/api/projects/{project_id}/onboard-contract/start")
@@ -45055,6 +45676,14 @@ def handle_project_contract_update_start(ctx: RequestContext):
     )
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
+    onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
+    if onboard_service_waiver:
+        metadata = {
+            **dict(metadata),
+            "entrypoint": "onboard_service_waiver",
+            "legacy_onboard_contract_waived": True,
+            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        }
     recovery_policy = str(body.get("recovery_policy") or "").strip()
     stale_contract_execution_id = str(
         body.get("stale_contract_execution_id") or ""
@@ -45079,6 +45708,8 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 project_id=project_id,
                 backlog_id=backlog_id,
                 actor_role=actor_role,
+                route_token_ref=route_token_ref,
+                allow_onboard_service_waiver=onboard_service_waiver,
             )
             if not _runtime_record_is_complete(parent_record):
                 current_state = _runtime_current_state_from_record(parent_record)

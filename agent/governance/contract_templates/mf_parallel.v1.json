@@ -33,6 +33,14 @@
     "merged",
     "rejected"
   ],
+  "row_scope_policy": {
+    "schema_version": "mf_parallel.row_scope_policy.v1",
+    "scope": "single_backlog_row",
+    "backlog_id_cardinality": "one",
+    "multi_backlog_parent_template": "mf_batch_parallel.v1",
+    "shared_backlog_close_token_allowed": false,
+    "description": "mf_parallel.v1 remains scoped to one backlog row. For multiple backlog rows, create an mf_batch_parallel.v1 parent route that fans out to one mf_parallel successor per row."
+  },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",
     "classification_service_id": "route.prompt_alert_bundle",
