@@ -335,6 +335,257 @@ def _insert_startup_graph_trace(
     )
 
 
+def test_runtime_context_graph_trace_refs_expect_successor_parent_not_root() -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-hotfix-lineage",
+        parent_task_id="cex-hotfix-successor",
+        root_task_id="cex-onboard-root",
+        chain_id="cchain-onboard-root",
+        stage_task_id="mf-sub-hotfix-lineage",
+        backlog_id="AC-FINISH-GATE-LINEAGE",
+        worker_id="worker-hotfix-lineage",
+        worker_slot_id="worker-hotfix-lineage",
+        agent_id="agent-hotfix-lineage",
+        branch_ref="refs/heads/codex/mf-sub-hotfix-lineage",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-hotfix-lineage",
+        worktree_path="/tmp/nonexistent-mf-sub-hotfix-lineage",
+        base_commit="base-hotfix-lineage",
+        head_commit="head-hotfix-lineage",
+        target_head_commit="target-hotfix-lineage",
+        merge_queue_id="mq-hotfix-lineage",
+    )
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    _insert_startup_graph_trace(
+        conn,
+        trace_id="gqt-hotfix-lineage",
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        runtime_context_id=runtime_context_id,
+        fence_token=context.fence_token,
+        query_purpose="subagent_context_build",
+    )
+
+    canonical_parent = server_module._runtime_context_mf_sub_parent_task_id(context)
+    refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=canonical_parent,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert canonical_parent == "cex-hotfix-successor"
+    assert context.chain_id == "cchain-onboard-root"
+    assert refs["db_verified"] is True
+    assert refs["parent_task_id"] == "cex-hotfix-successor"
+    assert refs["trace_ids"] == ["gqt-hotfix-lineage"]
+    assert refs["identity_mismatches"] == []
+
+    root_refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.root_task_id,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert root_refs["db_verified"] is False
+    assert any(
+        mismatch["field"] == "parent_task_id"
+        and mismatch["expected"] == "cex-onboard-root"
+        and mismatch["actual"] == "cex-hotfix-successor"
+        for mismatch in root_refs["identity_mismatches"]
+    )
+
+    _status, repair = (
+        server_module._parallel_branch_finish_gate_contract_error_repair_response(
+            project_id=PROJECT_ID,
+            context=context,
+            message="graph trace evidence identity mismatch: parent_task_id",
+        )
+    )
+    assert repair["parent_task_id"] == "cex-hotfix-successor"
+    assert repair["repair"]["expected_context"]["parent_task_id"] == (
+        "cex-hotfix-successor"
+    )
+
+
+def test_runtime_context_graph_trace_refs_use_successor_chain_when_parent_absent() -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-hotfix-legacy-chain-lineage",
+        parent_task_id="",
+        root_task_id="cex-onboard-root",
+        chain_id="cex-hotfix-successor",
+        stage_task_id="mf-sub-hotfix-legacy-chain-lineage",
+        backlog_id="AC-FINISH-GATE-LEGACY-CHAIN-LINEAGE",
+        worker_id="worker-hotfix-legacy-chain-lineage",
+        worker_slot_id="worker-hotfix-legacy-chain-lineage",
+        agent_id="agent-hotfix-legacy-chain-lineage",
+        branch_ref="refs/heads/codex/mf-sub-hotfix-legacy-chain-lineage",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-hotfix-legacy-chain-lineage",
+        worktree_path="/tmp/nonexistent-mf-sub-hotfix-legacy-chain-lineage",
+        base_commit="base-hotfix-legacy-chain-lineage",
+        head_commit="head-hotfix-legacy-chain-lineage",
+        target_head_commit="target-hotfix-legacy-chain-lineage",
+        merge_queue_id="mq-hotfix-legacy-chain-lineage",
+    )
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    _insert_startup_graph_trace(
+        conn,
+        trace_id="gqt-hotfix-legacy-chain-lineage",
+        task_id=context.task_id,
+        parent_task_id=context.chain_id,
+        runtime_context_id=runtime_context_id,
+        fence_token=context.fence_token,
+        query_purpose="subagent_context_build",
+    )
+
+    canonical_parent = server_module._runtime_context_mf_sub_parent_task_id(context)
+    refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=canonical_parent,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-legacy-chain-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert canonical_parent == "cex-hotfix-successor"
+    assert context.root_task_id == "cex-onboard-root"
+    assert refs["db_verified"] is True
+    assert refs["parent_task_id"] == "cex-hotfix-successor"
+    assert refs["trace_ids"] == ["gqt-hotfix-legacy-chain-lineage"]
+    assert refs["identity_mismatches"] == []
+
+    root_refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.root_task_id,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-legacy-chain-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert root_refs["db_verified"] is False
+    assert any(
+        mismatch["field"] == "parent_task_id"
+        and mismatch["expected"] == "cex-onboard-root"
+        and mismatch["actual"] == "cex-hotfix-successor"
+        for mismatch in root_refs["identity_mismatches"]
+    )
+
+    _status, repair = (
+        server_module._parallel_branch_finish_gate_contract_error_repair_response(
+            project_id=PROJECT_ID,
+            context=context,
+            message="graph trace evidence identity mismatch: parent_task_id",
+        )
+    )
+    assert repair["parent_task_id"] == "cex-hotfix-successor"
+    assert repair["repair"]["expected_context"]["parent_task_id"] == (
+        "cex-hotfix-successor"
+    )
+
+
+def test_runtime_context_graph_trace_refs_use_stage_before_legacy_chain_when_root_absent() -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-hotfix-stage-lineage",
+        parent_task_id="",
+        root_task_id="",
+        chain_id="cchain-onboard-root",
+        stage_task_id="cex-hotfix-successor",
+        backlog_id="AC-FINISH-GATE-STAGE-LINEAGE",
+        worker_id="worker-hotfix-stage-lineage",
+        worker_slot_id="worker-hotfix-stage-lineage",
+        agent_id="agent-hotfix-stage-lineage",
+        branch_ref="refs/heads/codex/mf-sub-hotfix-stage-lineage",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-hotfix-stage-lineage",
+        worktree_path="/tmp/nonexistent-mf-sub-hotfix-stage-lineage",
+        base_commit="base-hotfix-stage-lineage",
+        head_commit="head-hotfix-stage-lineage",
+        target_head_commit="target-hotfix-stage-lineage",
+        merge_queue_id="mq-hotfix-stage-lineage",
+    )
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
+    _insert_startup_graph_trace(
+        conn,
+        trace_id="gqt-hotfix-stage-lineage",
+        task_id=context.task_id,
+        parent_task_id=context.stage_task_id,
+        runtime_context_id=runtime_context_id,
+        fence_token=context.fence_token,
+        query_purpose="subagent_context_build",
+    )
+
+    canonical_parent = server_module._runtime_context_mf_sub_parent_task_id(context)
+    refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=canonical_parent,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-stage-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert canonical_parent == "cex-hotfix-successor"
+    assert context.chain_id == "cchain-onboard-root"
+    assert refs["db_verified"] is True
+    assert refs["parent_task_id"] == "cex-hotfix-successor"
+    assert refs["identity_mismatches"] == []
+
+    chain_refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.chain_id,
+        backlog_id=context.backlog_id,
+        fence_token=context.fence_token,
+        explicit_trace_ids=["gqt-hotfix-stage-lineage"],
+        strict_explicit_trace_ids=True,
+    )
+
+    assert chain_refs["db_verified"] is False
+    assert any(
+        mismatch["field"] == "parent_task_id"
+        and mismatch["expected"] == "cchain-onboard-root"
+        and mismatch["actual"] == "cex-hotfix-successor"
+        for mismatch in chain_refs["identity_mismatches"]
+    )
+
+
 def _startup_payload(worktree: str, **overrides: object) -> dict[str, object]:
     base_commit, head_commit = _ensure_startup_git_worktree(Path(worktree))
     worker_session_id = str(overrides.get("worker_session_id") or "codex-session-startup")

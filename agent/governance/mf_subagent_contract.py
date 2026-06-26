@@ -988,6 +988,17 @@ def build_observer_owned_agent_task_contract(
 
 
 def _parent_task_id_for_contract_view(context: BranchTaskRuntimeContext) -> str:
+    return _parent_task_id_for_worker_lineage(context, allow_task_fallback=True)
+
+
+def _parent_task_id_for_worker_lineage(
+    context: BranchTaskRuntimeContext,
+    *,
+    allow_task_fallback: bool,
+) -> str:
+    parent_task_id = _string(getattr(context, "parent_task_id", ""))
+    if parent_task_id:
+        return parent_task_id
     root_task_id = _string(context.root_task_id)
     chain_id = _string(context.chain_id)
     task_id = _string(context.task_id)
@@ -997,7 +1008,10 @@ def _parent_task_id_for_contract_view(context: BranchTaskRuntimeContext) -> str:
         and not chain_id.startswith(("chain-", "cchain-"))
     ):
         return chain_id
-    return root_task_id or chain_id or context.stage_task_id or context.task_id
+    parent = root_task_id or context.stage_task_id or chain_id
+    if parent:
+        return parent
+    return context.task_id if allow_task_fallback else ""
 
 
 def mf_subagent_runtime_context_id(context: BranchTaskRuntimeContext) -> str:
@@ -7008,6 +7022,19 @@ def validate_mf_subagent_finish_gate(
             ("parent", ("task_id",)),
         ),
     )
+    context_parent_task_id = _parent_task_id_for_worker_lineage(
+        context,
+        allow_task_fallback=False,
+    )
+    if (
+        parent_task_id
+        and context_parent_task_id
+        and parent_task_id != context_parent_task_id
+    ):
+        raise MfSubagentContractError(
+            "MF subagent finish gate parent_task_id does not match runtime context"
+        )
+    parent_task_id = context_parent_task_id or parent_task_id
     worker_role = _dispatch_string(
         payload,
         names=("worker_role", "role"),

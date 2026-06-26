@@ -8002,13 +8002,7 @@ def _runtime_context_projection_response(
         project_id=context_project_id,
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
-        parent_task_id=str(
-            getattr(context, "root_task_id", "")
-            or getattr(context, "chain_id", "")
-            or getattr(context, "stage_task_id", "")
-            or getattr(context, "task_id", "")
-            or ""
-        ),
+        parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         backlog_id=str(getattr(context, "backlog_id", "") or ""),
         fence_token=str(getattr(context, "fence_token", "") or ""),
         explicit_trace_ids=explicit_trace_ids,
@@ -10156,15 +10150,27 @@ def _runtime_context_worker_guide_response(
 
 
 def _runtime_context_mf_sub_parent_task_id(context) -> str:
+    parent_task_id = str(getattr(context, "parent_task_id", "") or "").strip()
+    if parent_task_id:
+        return parent_task_id
+    root_task_id = str(getattr(context, "root_task_id", "") or "").strip()
+    chain_id = str(getattr(context, "chain_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    if (
+        chain_id
+        and chain_id not in {root_task_id, task_id}
+        and not chain_id.startswith(("chain-", "cchain-"))
+    ):
+        return chain_id
+    stage_task_id = str(getattr(context, "stage_task_id", "") or "").strip()
     return str(
-        getattr(context, "parent_task_id", "")
-        or getattr(context, "root_task_id", "")
-        or getattr(context, "chain_id", "")
-        or getattr(context, "stage_task_id", "")
+        root_task_id
+        or stage_task_id
+        or chain_id
         or getattr(context, "backlog_id", "")
-        or getattr(context, "task_id", "")
+        or task_id
         or ""
-    )
+    ).strip()
 
 
 def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
@@ -15348,13 +15354,7 @@ def _parallel_branch_finish_gate_contract_error_repair_response(
         or str(getattr(context, "task_id", "") or "").strip()
     )
     task_id = str(getattr(context, "task_id", "") or "")
-    parent_task_id = str(
-        getattr(context, "root_task_id", "")
-        or getattr(context, "chain_id", "")
-        or getattr(context, "stage_task_id", "")
-        or task_id
-        or ""
-    )
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
     missing_fields = list(details["missing_fields"])
     blockers = list(details["blockers"])
     actionable_fields = list(details["actionable_fields"])
@@ -15580,12 +15580,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     project_id=project_id,
                     runtime_context_id=runtime_context_id_for_branch_context(context),
                     task_id=task_id,
-                    parent_task_id=str(
-                        getattr(context, "root_task_id", "")
-                        or getattr(context, "chain_id", "")
-                        or getattr(context, "stage_task_id", "")
-                        or task_id
-                    ),
+                    parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
                     backlog_id=str(getattr(context, "backlog_id", "") or ""),
                     fence_token=str(getattr(context, "fence_token", "") or ""),
                     explicit_trace_ids=_explicit_graph_trace_ids,

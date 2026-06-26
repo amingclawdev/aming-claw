@@ -323,8 +323,9 @@ def test_runtime_contract_view_preserves_handoff_parent_separately_from_root() -
     context = BranchTaskRuntimeContext(
         project_id="aming-claw",
         task_id="task-hotfix-worker",
+        parent_task_id="cex-hotfix-successor",
         root_task_id="cex-onboard-root",
-        chain_id="cex-hotfix-successor",
+        chain_id="cchain-onboard-root",
         stage_task_id="task-hotfix-worker",
         backlog_id="AC-RUNTIME-CONTRACT",
         worker_id="worker-1",
@@ -347,7 +348,7 @@ def test_runtime_contract_view_preserves_handoff_parent_separately_from_root() -
     assert view["runtime_context"]["parent_task_id"] == "cex-hotfix-successor"
     assert view["runtime_context"]["task_id"] == "task-hotfix-worker"
     assert context.root_task_id == "cex-onboard-root"
-    assert context.chain_id == "cex-hotfix-successor"
+    assert context.chain_id == "cchain-onboard-root"
     assert view["agent_task_contract"]["parent_task_id"] == "cex-hotfix-successor"
 
 
@@ -3276,6 +3277,121 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert close_projection["changed_files"] == [
         "agent/governance/mf_subagent_contract.py"
     ]
+
+
+def test_finish_gate_uses_runtime_successor_parent_for_graph_trace_lineage() -> None:
+    context = _context(
+        parent_task_id="cex-hotfix-successor",
+        root_task_id="cex-onboard-root",
+        chain_id="cchain-onboard-root",
+        stage_task_id="task-mf-sub-1",
+    )
+    startup = _finish_startup_evidence(parent_task_id="cex-hotfix-successor")
+    payload = {
+        "project_id": "aming-claw",
+        "task_id": "task-mf-sub-1",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+        "head_commit": "head456",
+        "status": "review_ready",
+        "changed_files": ["agent/governance/mf_subagent_contract.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-hotfix-finish",
+        "fence_token": "fence-2",
+        "summary": "Ready.",
+        "graph_trace_evidence": _graph_trace_evidence(
+            parent_task_id="cex-hotfix-successor",
+            fence_token="fence-2",
+        ),
+        "mf_subagent_startup_gate": startup,
+        "real_startup_events": [_startup_event(startup)],
+        "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
+        "read_receipt_hash": "sha256:read-finish",
+        "read_receipt_event_id": "2873",
+    }
+
+    gate = validate_mf_subagent_finish_gate(payload, context=context)
+
+    assert gate["parent_task_id"] == "cex-hotfix-successor"
+    assert gate["graph_trace_evidence"]["parent_task_id"] == "cex-hotfix-successor"
+    assert gate["startup_lineage"]["parent_task_id"] == "cex-hotfix-successor"
+    assert context.root_task_id == "cex-onboard-root"
+    assert context.chain_id == "cchain-onboard-root"
+
+    root_payload = dict(payload)
+    root_payload["graph_trace_evidence"] = _graph_trace_evidence(
+        parent_task_id="cex-onboard-root",
+        fence_token="fence-2",
+    )
+    with pytest.raises(
+        MfSubagentContractError,
+        match="graph trace evidence identity mismatch: parent_task_id",
+    ):
+        validate_mf_subagent_finish_gate(root_payload, context=context)
+
+    claimed_root_payload = dict(payload)
+    claimed_root_payload["parent_task_id"] = "cex-onboard-root"
+    with pytest.raises(
+        MfSubagentContractError,
+        match="parent_task_id does not match runtime context",
+    ):
+        validate_mf_subagent_finish_gate(claimed_root_payload, context=context)
+
+
+def test_finish_gate_uses_stage_parent_before_legacy_chain_when_root_absent() -> None:
+    context = _context(
+        parent_task_id="",
+        root_task_id="",
+        chain_id="cchain-onboard-root",
+        stage_task_id="cex-hotfix-successor",
+    )
+    startup = _finish_startup_evidence(parent_task_id="cex-hotfix-successor")
+    payload = {
+        "project_id": "aming-claw",
+        "task_id": "task-mf-sub-1",
+        "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+        "branch_ref": "refs/heads/codex/task-mf-sub-1",
+        "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+        "base_commit": "base123",
+        "target_head_commit": "target123",
+        "merge_queue_id": "mq-1",
+        "head_commit": "head456",
+        "status": "review_ready",
+        "changed_files": ["agent/governance/mf_subagent_contract.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-hotfix-finish",
+        "fence_token": "fence-2",
+        "summary": "Ready.",
+        "graph_trace_evidence": _graph_trace_evidence(
+            parent_task_id="cex-hotfix-successor",
+            fence_token="fence-2",
+        ),
+        "mf_subagent_startup_gate": startup,
+        "real_startup_events": [_startup_event(startup)],
+        "finish_time_worker_self_attestation": _finish_time_worker_attestation(),
+        "read_receipt_hash": "sha256:read-finish",
+        "read_receipt_event_id": "2873",
+    }
+
+    gate = validate_mf_subagent_finish_gate(payload, context=context)
+
+    assert gate["parent_task_id"] == "cex-hotfix-successor"
+    assert context.chain_id == "cchain-onboard-root"
+
+    chain_payload = dict(payload)
+    chain_payload["graph_trace_evidence"] = _graph_trace_evidence(
+        parent_task_id="cchain-onboard-root",
+        fence_token="fence-2",
+    )
+    with pytest.raises(
+        MfSubagentContractError,
+        match="graph trace evidence identity mismatch: parent_task_id",
+    ):
+        validate_mf_subagent_finish_gate(chain_payload, context=context)
 
 
 def test_finish_gate_projects_close_fields_from_startup_lineage_for_close_gate() -> None:
