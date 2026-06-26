@@ -23118,6 +23118,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "contract_runtime_current",
         "contract_runtime_submit_line",
         "task_timeline_append",
+        "observer_direct_mutation_exception",
     }.issubset(set(issue_payload["allowed_actions"]))
     assert guidance["route_token_issue"]["raw_route_token_required"] is False
     assert guidance["route_token_issue"]["raw_route_token_exposed"] is False
@@ -23150,6 +23151,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "system_operation",
         "continue_contract_chain",
         "observer_hotfix",
+        "operator_supervised_direct_main",
         "parallel_worker",
         "qa_verification",
     }
@@ -23165,6 +23167,15 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         {"contract_id": "mf_parallel", "interface": "mf_parallel_enter"},
         {"contract_id": "qa_session", "interface": "qa_session_register"},
     ]
+    direct_main = route_guide["role_entries"]["observer"]["direct_main"]
+    assert direct_main["id"] == "operator_supervised_direct_main"
+    assert direct_main["entrypoint"] == "observer_direct_mutation_exception"
+    assert direct_main["default_enabled"] is False
+    assert direct_main["requires_operator_approval"] is True
+    assert "operator_approval_ref" in direct_main["required_identity"]
+    assert "dirty_scope_exact_match" in direct_main["required_evidence"]
+    assert direct_main["raw_operator_token_required"] is False
+    assert direct_main["raw_route_token_exposed"] is False
     assert route_guide["role_entries"]["worker"]["entrypoint"] == (
         "runtime_context_worker_guide"
     )
@@ -23182,6 +23193,9 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert "runtime_context_worker_guide" in route_guide["capability_index"][
         "interfaces"
     ]
+    assert "observer_direct_mutation_exception" in route_guide["capability_index"][
+        "interfaces"
+    ]
     assert route_guide["system_operation_index"]["operations"]["bootstrap_project"][
         "path"
     ] == "/api/project/bootstrap"
@@ -23197,6 +23211,22 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert route_guide["interface_index"]["mf_parallel_enter"]["path"] == (
         "/api/projects/{project_id}/mf-parallel/enter"
     )
+    direct_exception_interface = route_guide["interface_index"][
+        "observer_direct_mutation_exception"
+    ]
+    assert direct_exception_interface["mcp_tool"] == "task_timeline_append"
+    assert direct_exception_interface["event_kind"] == (
+        "observer_direct_implementation_exception"
+    )
+    assert route_guide["backlog_chain_binding"]["create_successor"][
+        "operator_supervised_direct_main"
+    ] == {
+        "interface": "observer_direct_mutation_exception",
+        "requires_role": "observer",
+        "requires_route_token_ref": True,
+        "requires_operator_approval": True,
+        "default_enabled": False,
+    }
     assert route_guide["raw_route_token_required"] is False
     assert route_guide["raw_route_token_exposed"] is False
     execution_id = started["contract_execution_id"]

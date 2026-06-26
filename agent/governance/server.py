@@ -34369,6 +34369,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "onboard_contract_current",
     "onboard_contract_submit_line",
     "observer_hotfix_enter",
+    "observer_direct_mutation_exception",
     "contract_runtime_current",
     "contract_runtime_submit_line",
     "task_timeline_append",
@@ -34513,6 +34514,13 @@ def _onboard_contract_route_guide(
             "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.observer.next_contracts",
         },
         {
+            "id": "operator_supervised_direct_main",
+            "entry": (
+                "agent_onboard_guidance.onboard_route_guide.role_entries."
+                "observer.direct_main"
+            ),
+        },
+        {
             "id": "parallel_worker",
             "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.worker",
         },
@@ -34600,6 +34608,14 @@ def _onboard_contract_route_guide(
             "method": "POST",
             "path": "/api/task/{project_id}/timeline",
         },
+        "observer_direct_mutation_exception": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "task_timeline_append",
+            "method": "POST",
+            "path": "/api/task/{project_id}/timeline",
+            "event_type": "mf.observer_direct_implementation_exception",
+            "event_kind": "observer_direct_implementation_exception",
+        },
         "graph_query": {
             "kind": "mcp_or_http",
             "mcp_tool": "graph_query",
@@ -34656,6 +34672,42 @@ def _onboard_contract_route_guide(
         "raw_qa_session_token_exposed": False,
         "raw_route_token_exposed": False,
     }
+    direct_main_entry = {
+        "schema_version": "onboard_contract.operator_supervised_direct_main.v1",
+        "id": "operator_supervised_direct_main",
+        "role": "observer",
+        "entrypoint": "observer_direct_mutation_exception",
+        "interface": "observer_direct_mutation_exception",
+        "default_enabled": False,
+        "requires_operator_approval": True,
+        "required_identity": [
+            "observer_session_id",
+            "observer_route_token_ref",
+            "backlog_id",
+            "route_identity",
+            "operator_approval_ref",
+        ],
+        "required_evidence": [
+            "observer_direct_mutation=true",
+            "tiny_deterministic_scope",
+            "allowed_files",
+            "dirty_scope_exact_match",
+            "timeline_evidence_recorded_before_mutation",
+            "focused_tests_or_no_test_decision",
+        ],
+        "blocked_without": [
+            "operator_approval_ref",
+            "route_identity",
+            "exact_target_files",
+            "clean_baseline_or_exact_dirty_scope",
+        ],
+        "next_action": (
+            "record observer_direct_mutation_exception before mutation; "
+            "then edit only approved row-scoped files and record tests"
+        ),
+        "raw_operator_token_required": False,
+        "raw_route_token_exposed": False,
+    }
     return {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
@@ -34707,6 +34759,13 @@ def _onboard_contract_route_guide(
                     "requires_role": "observer",
                     "requires_route_token_ref": True,
                 },
+                "operator_supervised_direct_main": {
+                    "interface": "observer_direct_mutation_exception",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                    "requires_operator_approval": True,
+                    "default_enabled": False,
+                },
             },
             "rollback": {
                 "interface": "onboard_start",
@@ -34738,6 +34797,7 @@ def _onboard_contract_route_guide(
                         "interface": "qa_session_register",
                     },
                 ],
+                "direct_main": direct_main_entry,
                 "raw_route_token_required": False,
                 "raw_route_token_exposed": False,
             },
@@ -34768,6 +34828,7 @@ def _onboard_contract_route_guide(
                 "contract_runtime_current",
                 "contract_runtime_submit_line",
                 "task_timeline_append",
+                "observer_direct_mutation_exception",
             ],
             "index_paths": {
                 "roles": "agent_onboard_guidance.onboard_route_guide.role_entries",
