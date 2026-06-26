@@ -553,7 +553,7 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
     }.issubset(properties)
 
 
-def test_mcp_stdio_parallel_branch_allocate_schema_exposes_route_token_ref():
+def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
     ])
@@ -562,12 +562,194 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_route_token_ref():
     assert stderr == ""
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     properties = tools["parallel_branch_allocate"]["inputSchema"]["properties"]
-    assert "route_token_ref" in properties
+    assert {
+        "observer_command_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "owned_files",
+        "target_files",
+        "route_identity",
+        "canonical_route_identity",
+        "parent_route_identity",
+        "route_token_ref",
+    }.issubset(properties)
+    for key in (
+        "observer_command_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert properties[key]["type"] == "string"
+    assert properties["owned_files"]["type"] == "array"
+    assert properties["owned_files"]["items"]["type"] == "string"
+    assert properties["target_files"]["type"] == "array"
+    assert properties["target_files"]["items"]["type"] == "string"
+    assert properties["route_identity"]["type"] == "object"
+    assert properties["canonical_route_identity"]["type"] == "object"
+    assert properties["parent_route_identity"]["type"] == "object"
     assert properties["route_token_ref"]["type"] == "string"
     assert (
         properties["route_token_ref"]["description"]
         == "Opaque server-registered route token reference accepted by protected HTTP facades."
     )
+
+
+def test_mcp_stdio_parallel_branch_allocate_schema_fields_forwarded():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "path": path}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    route_identity = {
+        "route_id": "route-worker",
+        "route_context_hash": "sha256:route-worker",
+        "prompt_contract_id": "rprompt-worker",
+        "prompt_contract_hash": "sha256:prompt-worker",
+        "route_token_ref": "rtok-worker",
+        "visible_injection_manifest_hash": "sha256:visible-worker",
+    }
+    parent_route_identity = {
+        "route_id": "route-parent",
+        "route_context_hash": "sha256:route-parent",
+        "prompt_contract_id": "rprompt-parent",
+        "prompt_contract_hash": "sha256:prompt-parent",
+        "route_token_ref": "rtok-parent",
+        "visible_injection_manifest_hash": "sha256:visible-parent",
+    }
+
+    result = dispatcher.dispatch(
+        "parallel_branch_allocate",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-allocate",
+            "parent_task_id": "AC-ALLOCATE",
+            "backlog_id": "AC-ALLOCATE",
+            "observer_command_id": "cmd-allocate",
+            "route_id": route_identity["route_id"],
+            "route_context_hash": route_identity["route_context_hash"],
+            "prompt_contract_id": route_identity["prompt_contract_id"],
+            "prompt_contract_hash": route_identity["prompt_contract_hash"],
+            "visible_injection_manifest_hash": route_identity[
+                "visible_injection_manifest_hash"
+            ],
+            "route_token_ref": route_identity["route_token_ref"],
+            "route_identity": route_identity,
+            "canonical_route_identity": route_identity,
+            "parent_route_identity": parent_route_identity,
+            "owned_files": ["agent/governance/mcp_server.py"],
+            "target_files": ["agent/tests/test_mcp_server_stdio.py"],
+            "workspace_root": "/repo/.worktrees",
+            "worktree_path": "/repo/.worktrees/mf-sub-allocate",
+            "worker_id": "worker-allocate",
+            "fence_token": "fence-allocate",
+            "base_commit": "base",
+            "target_head_commit": "target",
+            "merge_queue_id": "mq-allocate",
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/allocate",
+            {
+                "task_id": "mf-sub-allocate",
+                "parent_task_id": "AC-ALLOCATE",
+                "backlog_id": "AC-ALLOCATE",
+                "observer_command_id": "cmd-allocate",
+                "route_id": route_identity["route_id"],
+                "route_context_hash": route_identity["route_context_hash"],
+                "prompt_contract_id": route_identity["prompt_contract_id"],
+                "prompt_contract_hash": route_identity["prompt_contract_hash"],
+                "visible_injection_manifest_hash": route_identity[
+                    "visible_injection_manifest_hash"
+                ],
+                "route_token_ref": route_identity["route_token_ref"],
+                "route_identity": route_identity,
+                "canonical_route_identity": route_identity,
+                "parent_route_identity": parent_route_identity,
+                "owned_files": ["agent/governance/mcp_server.py"],
+                "target_files": ["agent/tests/test_mcp_server_stdio.py"],
+                "workspace_root": "/repo/.worktrees",
+                "worktree_path": "/repo/.worktrees/mf-sub-allocate",
+                "worker_id": "worker-allocate",
+                "fence_token": "fence-allocate",
+                "base_commit": "base",
+                "target_head_commit": "target",
+                "merge_queue_id": "mq-allocate",
+            },
+        )
+    ]
+
+
+def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "path": path}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    tool = next(
+        item for item in governance_mcp_server.TOOLS
+        if item["name"] == "parallel_branch_allocate"
+    )
+    properties = tool["inputSchema"]["properties"]
+    assert {
+        "observer_command_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "owned_files",
+        "target_files",
+        "route_identity",
+        "canonical_route_identity",
+        "parent_route_identity",
+    }.issubset(properties)
+
+    result = governance_mcp_server._dispatch_tool(
+        "parallel_branch_allocate",
+        {
+            "project_id": "aming-claw",
+            "task_id": "mf-sub-allocate",
+            "observer_command_id": "cmd-allocate",
+            "route_context_hash": "sha256:route",
+            "prompt_contract_id": "rprompt-allocate",
+            "owned_files": ["agent/governance/mcp_server.py"],
+            "target_files": ["agent/tests/test_mcp_server_stdio.py"],
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/parallel-branches/allocate",
+            {
+                "task_id": "mf-sub-allocate",
+                "observer_command_id": "cmd-allocate",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-allocate",
+                "owned_files": ["agent/governance/mcp_server.py"],
+                "target_files": ["agent/tests/test_mcp_server_stdio.py"],
+            },
+        )
+    ]
 
 
 def test_mcp_stdio_observer_repair_run_plan_schema_is_read_only_entrypoint():

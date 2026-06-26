@@ -247,6 +247,125 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     return properties
 
 
+def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
+    route_identity_properties = {
+        "route_id": {"type": "string"},
+        "route_context_hash": {"type": "string"},
+        "prompt_contract_id": {"type": "string"},
+        "prompt_contract_hash": {"type": "string"},
+        "route_token_ref": {"type": "string"},
+        "visible_injection_manifest_hash": {"type": "string"},
+    }
+    return {
+        "project_id": {"type": "string"},
+        "task_id": {"type": "string"},
+        "workspace_root": {"type": "string"},
+        "repo_root_path": {"type": "string"},
+        "batch_id": {"type": "string"},
+        "backlog_id": {"type": "string"},
+        "chain_id": {"type": "string"},
+        "parent_task_id": {"type": "string"},
+        "root_task_id": {"type": "string"},
+        "stage_task_id": {"type": "string"},
+        "stage_type": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "actor": {"type": "string"},
+        "attempt": {"type": "integer"},
+        "branch_prefix": {"type": "string"},
+        "worktree_root": {"type": "string"},
+        "worktree_path": {
+            "type": "string",
+            "description": (
+                "Final absolute worker worktree path; use when the path "
+                "is already fully allocated."
+            ),
+        },
+        "worker_worktree_path": {
+            "type": "string",
+            "description": "Alias for worktree_path.",
+        },
+        "assigned_worktree": {
+            "type": "string",
+            "description": "Alias for worktree_path.",
+        },
+        "ref_name": {"type": "string"},
+        "target_branch": {"type": "string"},
+        "base_commit": {"type": "string"},
+        "target_head_commit": {"type": "string"},
+        "merge_queue_id": {"type": "string"},
+        "fence_token": {"type": "string"},
+        "observer_command_id": {
+            "type": "string",
+            "description": (
+                "Claimed backlog-specific execute_backlog_row command id "
+                "used for bounded-worker dispatch/startup lineage."
+            ),
+        },
+        "route_id": {"type": "string"},
+        "route_context_hash": {"type": "string"},
+        "prompt_contract_id": {"type": "string"},
+        "prompt_contract_hash": {"type": "string"},
+        "visible_injection_manifest_hash": {"type": "string"},
+        "owned_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Dispatch-visible worker-owned file fence.",
+        },
+        "target_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Alias for dispatch-visible owned_files scope.",
+        },
+        "route_identity": {
+            "type": "object",
+            "description": (
+                "Optional public-safe route identity object; top-level route "
+                "identity fields are also accepted."
+            ),
+            "properties": route_identity_properties,
+        },
+        "canonical_route_identity": {
+            "type": "object",
+            "description": "Alias container for the canonical public route identity.",
+            "properties": route_identity_properties,
+        },
+        "parent_route_identity": {
+            "type": "object",
+            "description": (
+                "Optional public-safe parent route identity used to bind child "
+                "worker route lineage."
+            ),
+            "properties": route_identity_properties,
+        },
+        "issue_same_owner_session_token": {
+            "type": "boolean",
+            "description": (
+                "When agent_id == allocation_owner, issue a scoped worker "
+                "session_token and persist only its hash."
+            ),
+        },
+        "create_worktree": {"type": "boolean"},
+        "now_iso": {"type": "string"},
+        "route_token": {
+            "type": "object",
+            "description": "Route-token evidence required when governance protects this mutation.",
+        },
+        "route_token_ref": {
+            "type": "string",
+            "description": "Opaque server-registered route token reference accepted by protected HTTP facades.",
+        },
+        "route_waiver": {
+            "type": "object",
+            "description": "Explicit waiver for protected route-token gates.",
+        },
+        "route_token_waiver": {
+            "type": "object",
+            "description": "Alias for route_waiver.",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool schema definitions (per MCP spec)
 # ---------------------------------------------------------------------------
@@ -1659,56 +1778,7 @@ TOOLS: list[dict] = [
         "description": "Observer-facing wrapper to allocate/register a parallel branch runtime context before spawning a bounded worker.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "project_id": {"type": "string"},
-                "task_id": {"type": "string"},
-                "workspace_root": {"type": "string"},
-                "repo_root_path": {"type": "string"},
-                "batch_id": {"type": "string"},
-                "backlog_id": {"type": "string"},
-                "chain_id": {"type": "string"},
-                "parent_task_id": {"type": "string"},
-                "root_task_id": {"type": "string"},
-                "stage_task_id": {"type": "string"},
-                "stage_type": {"type": "string"},
-                "agent_id": {"type": "string"},
-                "worker_id": {"type": "string"},
-                "actor": {"type": "string"},
-                "attempt": {"type": "integer"},
-                "branch_prefix": {"type": "string"},
-                "worktree_root": {"type": "string"},
-                "worktree_path": {
-                    "type": "string",
-                    "description": (
-                        "Final absolute worker worktree path; use when the path "
-                        "is already fully allocated."
-                    ),
-                },
-                "worker_worktree_path": {
-                    "type": "string",
-                    "description": "Alias for worktree_path.",
-                },
-                "assigned_worktree": {
-                    "type": "string",
-                    "description": "Alias for worktree_path.",
-                },
-                "ref_name": {"type": "string"},
-                "target_branch": {"type": "string"},
-                "base_commit": {"type": "string"},
-                "target_head_commit": {"type": "string"},
-                "merge_queue_id": {"type": "string"},
-                "fence_token": {"type": "string"},
-                "issue_same_owner_session_token": {
-                    "type": "boolean",
-                    "description": "When agent_id == allocation_owner, issue a scoped worker session_token and persist only its hash.",
-                },
-                "create_worktree": {"type": "boolean"},
-                "now_iso": {"type": "string"},
-                "route_token": {"type": "object", "description": "Route-token evidence required when governance protects this mutation."},
-                "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
-                "route_waiver": {"type": "object", "description": "Explicit waiver for protected route-token gates."},
-                "route_token_waiver": {"type": "object", "description": "Alias for route_waiver."},
-            },
+            "properties": _parallel_branch_allocate_schema_properties(),
             "required": ["project_id", "task_id"],
         },
     },
