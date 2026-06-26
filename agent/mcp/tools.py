@@ -237,6 +237,10 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
             "type": "string",
             "description": "Opaque active observer session id used with observer_route_token_ref.",
         },
+        "qa_session_token": {
+            "type": "string",
+            "description": "Raw QA role token used only as X-Gov-Token; never forwarded as evidence body.",
+        },
         "worker_role": {
             "type": "string",
             "description": "Use mf_sub for fenced worker-authored lines.",
@@ -500,6 +504,42 @@ TOOLS: list[dict] = [
                 "session_token": {"type": "string"},
             },
             "required": ["project_id", "session_id", "session_token"],
+        },
+    },
+    {
+        "name": "qa_session_register",
+        "description": "Register a bounded QA role session for QA-owned ContractRuntime evidence lines.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "principal_id": {
+                    "type": "string",
+                    "description": "QA principal id, for example qa:<subagent-id>.",
+                },
+                "scope": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional bounded QA scope such as backlog or contract execution ids.",
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "qa_session_heartbeat",
+        "description": "Heartbeat a QA role session using its raw role token as X-Gov-Token.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token.",
+                },
+                "status": {"type": "string"},
+            },
+            "required": ["project_id", "qa_session_token"],
         },
     },
     {
@@ -1150,6 +1190,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1179,6 +1223,10 @@ TOOLS: list[dict] = [
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
                 },
             },
             "required": ["project_id", "contract_execution_id"],
@@ -1225,6 +1273,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1252,6 +1304,10 @@ TOOLS: list[dict] = [
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
                 },
             },
             "required": ["project_id", "contract_execution_id"],
@@ -1298,6 +1354,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1326,6 +1386,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1347,6 +1411,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
             },
             "required": ["project_id", "contract_execution_id"],
         },
@@ -1367,6 +1435,10 @@ TOOLS: list[dict] = [
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
                 },
             },
             "required": ["project_id", "contract_execution_id"],
@@ -2375,6 +2447,42 @@ class ToolDispatcher:
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         )
 
+    def _governance_url(self) -> str:
+        bound_owner = getattr(self._api, "__self__", None)
+        url = getattr(bound_owner, "gov_url", None) if bound_owner is not None else None
+        return str(url or os.environ.get("GOVERNANCE_URL", "http://localhost:40000")).rstrip("/")
+
+    def _api_with_role_token(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        role_token: str,
+    ) -> dict:
+        """Call governance with a role token without leaking it into evidence bodies."""
+        token = str(role_token or "").strip()
+        if not token:
+            return self._api(method, path, data)
+        url = f"{self._governance_url()}{path}"
+        headers = {"X-Gov-Token": token}
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        try:
+            req = urllib.request.Request(url, data=body, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode() if exc.fp else ""
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"ok": False, "error": str(exc), "body": raw}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def dispatch(self, name: str, args: dict) -> Any:
         args = dict(args or {})
         # --- Task tools ---
@@ -2449,6 +2557,30 @@ class ToolDispatcher:
                 "POST",
                 f"/api/projects/{pid}/observer-sessions/{sid}/revoke",
                 {"session_token": args["session_token"]},
+            )
+
+        if name == "qa_session_register":
+            pid = args["project_id"]
+            body = {
+                "project_id": pid,
+                "principal_id": args.get("principal_id") or f"qa:{pid}",
+                "role": "qa",
+            }
+            if args.get("scope") is not None:
+                body["scope"] = args["scope"]
+            return self._api("POST", "/api/role/assign", body)
+
+        if name == "qa_session_heartbeat":
+            pid = args["project_id"]
+            body = {
+                "project_id": pid,
+                "status": args.get("status") or "idle",
+            }
+            return self._api_with_role_token(
+                "POST",
+                "/api/role/heartbeat",
+                body,
+                role_token=args.get("qa_session_token") or "",
             )
 
         if name == "observer_route_context_issue":
@@ -2700,6 +2832,7 @@ class ToolDispatcher:
         if name == "contract_add_current":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             query = {
                 key: value
                 for key, value in args.items()
@@ -2708,6 +2841,12 @@ class ToolDispatcher:
                 and value is not None
             }
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "GET",
+                    f"/api/projects/{pid}/contract-add/{execution_id}/current-state{qs}",
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "GET",
                 f"/api/projects/{pid}/contract-add/{execution_id}/current-state{qs}",
@@ -2716,11 +2855,19 @@ class ToolDispatcher:
         if name == "contract_add_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/contract-add/{execution_id}/line-writes",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-add/{execution_id}/line-writes",
@@ -2739,6 +2886,7 @@ class ToolDispatcher:
         if name == "contract_update_current":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             query = {
                 key: value
                 for key, value in args.items()
@@ -2747,6 +2895,12 @@ class ToolDispatcher:
                 and value is not None
             }
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "GET",
+                    f"/api/projects/{pid}/contract-update/{execution_id}/current-state{qs}",
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "GET",
                 f"/api/projects/{pid}/contract-update/{execution_id}/current-state{qs}",
@@ -2755,11 +2909,19 @@ class ToolDispatcher:
         if name == "contract_update_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/contract-update/{execution_id}/line-writes",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-update/{execution_id}/line-writes",
@@ -2770,6 +2932,7 @@ class ToolDispatcher:
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
             suffix = "guide" if name == "contract_runtime_guide" else "current-state"
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             query = {
                 key: value
                 for key, value in args.items()
@@ -2778,6 +2941,12 @@ class ToolDispatcher:
                 and value is not None
             }
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "GET",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}{qs}",
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "GET",
                 f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}{qs}",
@@ -2786,11 +2955,19 @@ class ToolDispatcher:
         if name == "contract_runtime_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
@@ -2800,11 +2977,19 @@ class ToolDispatcher:
         if name == "contract_runtime_precheck_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",

@@ -23330,6 +23330,13 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert forged["ok"] is False
     assert "cannot write line" in forged["decision"]["errors"][0]
 
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-update-worker",
+        fence_token="fence-contract-update-worker",
+        token="contract-update-worker-token",
+    )
     accepted = server.handle_project_contract_update_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
@@ -23346,6 +23353,13 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                         "agent/governance/contract_definitions/"
                         "onboard_contract.v1.rev2.json"
                     ),
+                    "worker_runtime_context": {
+                        "runtime_context_id": runtime_context.runtime_context_id,
+                        "task_id": runtime_context.task_id,
+                        "parent_task_id": backlog_id,
+                        "worker_role": "mf_sub",
+                        "target_project_root": "/tmp/contract-update-worker",
+                    },
                 },
             },
         )
@@ -23357,16 +23371,54 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert accepted["next_legal_action"]["allowed_writer_roles"] == ["mf_sub"]
 
     current = server.handle_project_contract_update_current_state(
-        _ctx_with_role(
+        _ctx(
             {"project_id": PID, "contract_execution_id": execution_id},
-            "mf_sub",
             method="GET",
+            query={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": "fence-contract-update-worker",
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": "/tmp/contract-update-worker",
+            },
         )
     )
     assert current["actor_role"] == "mf_sub"
     assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
         "worker_previous_source_proof"
     )
+
+    previous_source = server.handle_project_contract_update_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": "fence-contract-update-worker",
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": "/tmp/contract-update-worker",
+                "stage_id": "worker_previous_source",
+                "line_id": "worker_previous_source_proof",
+                "evidence_kind": "contract_previous_source_proof",
+                "payload": {
+                    "schema_version": "contract_update.previous_source_proof.v1",
+                    "source_path": (
+                        "agent/governance/contract_definitions/"
+                        "contract_update.v1.rev1.json"
+                    ),
+                    "expected_previous_hash": "sha256:test",
+                },
+            },
+        )
+    )
+    assert previous_source["ok"] is True
+    assert previous_source["actor_role"] == "mf_sub"
+    assert previous_source["next_legal_action"]["id"] == "worker_revision_precheck"
 
 
 def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete(conn):
@@ -24260,6 +24312,27 @@ def test_contract_runtime_generic_facade_preserves_role_and_order_gates(conn):
     )
     assert forged_qa["ok"] is False
     assert "cannot write line" in forged_qa["decision"]["errors"][0]
+
+    accepted_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "payload": {"decision": "pass", "auth_source": "trusted_qa_role"},
+            },
+        )
+    )
+    assert accepted_qa["ok"] is True
+    assert accepted_qa["actor_role"] == "qa"
+    hotfix_record = runtime.store.get(hotfix["contract_execution_id"])
+    assert hotfix_record["completed_lines"][-1]["line_id"] == (
+        "qa_independent_verification"
+    )
+    assert hotfix_record["completed_lines"][-1]["actor_role"] == "qa"
 
 
 def test_contract_runtime_line_write_precheck_route_does_not_append(conn):

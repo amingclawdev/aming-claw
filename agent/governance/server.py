@@ -34079,9 +34079,47 @@ def _contract_runtime_record_references_runtime_context(
                     return text
         return ""
 
+    contract_id = str((record or {}).get("contract_id") or "").strip()
+
+    def _matches_context(payload: Mapping[str, Any]) -> bool:
+        if _line_value(payload, "runtime_context_id") != runtime_context_id:
+            return False
+        if _line_value(payload, "task_id") != task_id:
+            return False
+        if _line_value(payload, "parent_task_id") != parent_task_id:
+            return False
+        return (
+            _line_value(payload, "worker_role", "role")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            == "mf_sub"
+        )
+
     for line in completed_lines:
         if not isinstance(line, Mapping):
             continue
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        if contract_id == CONTRACT_UPDATE_CONTRACT_ID and (
+            str(line.get("stage_id") or "").strip() == "observer_request"
+            and str(line.get("line_id") or "").strip()
+            == "observer_request_contract_update"
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_update_request"
+            and str(line.get("actor_role") or "").strip() == "observer"
+        ):
+            worker_context = (
+                payload.get("worker_runtime_context")
+                if isinstance(payload.get("worker_runtime_context"), Mapping)
+                else {}
+            )
+            worker_dispatch = (
+                payload.get("worker_dispatch")
+                if isinstance(payload.get("worker_dispatch"), Mapping)
+                else {}
+            )
+            if _matches_context(worker_context) or _matches_context(worker_dispatch):
+                return True
         if (
             str(line.get("stage_id") or "").strip() != "dispatch"
             or str(line.get("line_id") or "").strip()
@@ -34091,21 +34129,8 @@ def _contract_runtime_record_references_runtime_context(
             or str(line.get("actor_role") or "").strip() != "observer"
         ):
             continue
-        if _line_value(line, "runtime_context_id") != runtime_context_id:
-            continue
-        if _line_value(line, "task_id") != task_id:
-            continue
-        if _line_value(line, "parent_task_id") != parent_task_id:
-            continue
-        if (
-            _line_value(line, "worker_role", "role")
-            .strip()
-            .lower()
-            .replace("-", "_")
-            != "mf_sub"
-        ):
-            continue
-        return True
+        if _matches_context(line) or _matches_context(payload):
+            return True
     return False
 
 
@@ -35395,6 +35420,7 @@ def _contract_update_effective_actor_role(
     action: str = "contract_update_facade",
     backlog_id: str = "",
     contract_execution_id: str = "",
+    record: Mapping[str, Any] | None = None,
 ) -> str:
     return _contract_runtime_effective_actor_role(
         ctx,
@@ -35402,6 +35428,7 @@ def _contract_update_effective_actor_role(
         action=action,
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
+        record=record,
     )
 
 
@@ -44424,6 +44451,7 @@ def handle_project_contract_update_current_state(ctx: RequestContext):
             action="contract_update_current",
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
+            record=record,
         )
         try:
             record = _contract_update_read(
@@ -44468,6 +44496,7 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
             action="contract_update_submit_line",
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
+            record=record,
         )
         try:
             runtime.current_guide(contract_execution_id, actor_role=actor_role)

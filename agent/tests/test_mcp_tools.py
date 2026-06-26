@@ -29,6 +29,29 @@ class _Recorder:
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _AuthRecorder(_Recorder):
+    def __init__(self):
+        super().__init__()
+        self.auth_calls: list[tuple[str, str, dict | None, str]] = []
+
+    def api_with_role_token(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        role_token: str,
+    ) -> dict:
+        self.auth_calls.append((method, path, data, role_token))
+        return {
+            "ok": True,
+            "method": method,
+            "path": path,
+            "data": data,
+            "role_token": role_token,
+        }
+
+
 class _RuntimeGovRecorder(_Recorder):
     def api(self, method: str, path: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
@@ -1159,6 +1182,128 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     ]
 
 
+def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body():
+    names = _tool_names()
+    assert {"qa_session_register", "qa_session_heartbeat"}.issubset(names)
+    assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
+    for tool_name in (
+        "contract_add_current",
+        "contract_add_submit_line",
+        "contract_update_current",
+        "contract_update_submit_line",
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
+        "contract_runtime_precheck_line",
+    ):
+        assert "qa_session_token" in _tool_properties(tool_name)
+
+    recorder = _AuthRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        manager_api_fn=recorder.api,
+        workspace="/repo",
+    )
+    dispatcher._api_with_role_token = recorder.api_with_role_token
+
+    dispatcher.dispatch(
+        "qa_session_register",
+        {
+            "project_id": "aming-claw",
+            "principal_id": "qa:hooke",
+            "scope": ["backlog:AC-QA"],
+        },
+    )
+    dispatcher.dispatch(
+        "qa_session_heartbeat",
+        {
+            "project_id": "aming-claw",
+            "qa_session_token": "gov-qa-token",
+            "status": "verifying",
+        },
+    )
+    dispatcher.dispatch(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-hotfix",
+            "qa_session_token": "gov-qa-token",
+        },
+    )
+    dispatcher.dispatch(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-hotfix",
+            "qa_session_token": "gov-qa-token",
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "payload": {"decision": "pass"},
+        },
+    )
+    dispatcher.dispatch(
+        "contract_update_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-update",
+            "qa_session_token": "gov-qa-token",
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/role/assign",
+            {
+                "project_id": "aming-claw",
+                "principal_id": "qa:hooke",
+                "role": "qa",
+                "scope": ["backlog:AC-QA"],
+            },
+        )
+    ]
+    assert recorder.auth_calls == [
+        (
+            "POST",
+            "/api/role/heartbeat",
+            {"project_id": "aming-claw", "status": "verifying"},
+            "gov-qa-token",
+        ),
+        (
+            "GET",
+            "/api/projects/aming-claw/contract-runtime/cex-hotfix/current-state",
+            None,
+            "gov-qa-token",
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-hotfix/line-writes",
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "payload": {"decision": "pass"},
+            },
+            "gov-qa-token",
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-update/cex-update/line-writes",
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+            },
+            "gov-qa-token",
+        ),
+    ]
+
+
 def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
     names = _tool_names()
 
@@ -1176,6 +1321,8 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "contract_runtime_guide",
         "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
+        "qa_session_register",
+        "qa_session_heartbeat",
     }.issubset(names)
     assert "contract_execution_id" not in _tool_properties("onboard_contract_start")
     assert _tool_properties("onboard_contract_submit_line").keys() >= {
@@ -1192,6 +1339,7 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "session_token_ref",
         "fence_token",
         "target_project_root",
+        "qa_session_token",
     }
     assert _tool_properties("contract_runtime_precheck_line") == _tool_properties(
         "contract_runtime_submit_line"
