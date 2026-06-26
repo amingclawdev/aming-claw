@@ -17211,7 +17211,10 @@ def _normalize_operation_status(status: str) -> str:
 
 def _operation_unit_progress(status: str) -> dict[str, int]:
     normalized = _normalize_operation_status(status)
-    return {"done": 1 if normalized in {"complete", "cancelled", "failed"} else 0, "total": 1}
+    return {
+        "done": 1 if normalized in {"complete", "cancelled", "failed", "already_current"} else 0,
+        "total": 1,
+    }
 
 
 def _json_loads(raw: Any, default: Any) -> Any:
@@ -17223,6 +17226,254 @@ def _json_loads(raw: Any, default: Any) -> Any:
         except (TypeError, ValueError, json.JSONDecodeError):
             return default
     return default
+
+
+def _first_text_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _first_int_value(*values: Any) -> int:
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            return parsed
+    return 0
+
+
+_SCOPE_RECONCILE_ELAPSED_UNSET = object()
+
+
+def _scope_reconcile_operator_next_action(fallback_reason: str) -> str:
+    fallback_reason = str(fallback_reason or "").strip()
+    if fallback_reason == "source_function_identity_changed":
+        return (
+            "run_full_reconcile; function identities changed, so incremental "
+            "dependency facts may be stale"
+        )
+    if fallback_reason:
+        return (
+            "review fallback_reason and retry with full reconcile if the "
+            "changed graph contract is expected"
+        )
+    return ""
+
+
+def _scope_reconcile_observability(
+    result: Mapping[str, Any] | None,
+    evidence: Mapping[str, Any] | None = None,
+    *,
+    status: str = "",
+    elapsed_ms: Any = _SCOPE_RECONCILE_ELAPSED_UNSET,
+) -> dict[str, Any]:
+    result = result if isinstance(result, Mapping) else {}
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    trace = result.get("trace") if isinstance(result.get("trace"), Mapping) else {}
+    scope_file_delta = (
+        result.get("scope_file_delta")
+        if isinstance(result.get("scope_file_delta"), Mapping)
+        else {}
+    )
+    scope_graph_delta = (
+        result.get("scope_graph_delta")
+        if isinstance(result.get("scope_graph_delta"), Mapping)
+        else {}
+    )
+    incremental_eligibility = (
+        result.get("incremental_eligibility")
+        if isinstance(result.get("incremental_eligibility"), Mapping)
+        else {}
+    )
+    evidence_trace = (
+        evidence.get("operation_trace")
+        if isinstance(evidence.get("operation_trace"), Mapping)
+        else {}
+    )
+    nested_evidence = (
+        evidence.get("reconcile_observability")
+        if isinstance(evidence.get("reconcile_observability"), Mapping)
+        else {}
+    )
+
+    strategy = _first_text_value(
+        result.get("strategy"),
+        result.get("scope_reconcile_strategy"),
+        result.get("reconcile_strategy"),
+        scope_graph_delta.get("strategy"),
+        scope_file_delta.get("strategy"),
+        evidence_trace.get("strategy"),
+        nested_evidence.get("strategy"),
+        evidence.get("strategy"),
+        evidence.get("scope_reconcile_strategy"),
+    )
+    graph_delta_mode = _first_text_value(
+        result.get("graph_delta_mode"),
+        result.get("scope_graph_delta_mode"),
+        scope_graph_delta.get("mode"),
+        scope_graph_delta.get("graph_delta_mode"),
+        scope_file_delta.get("graph_delta_mode"),
+        incremental_eligibility.get("mode"),
+        evidence_trace.get("graph_delta_mode"),
+        nested_evidence.get("graph_delta_mode"),
+        evidence.get("graph_delta_mode"),
+        evidence.get("scope_graph_delta_mode"),
+    )
+    fallback_reason = _first_text_value(
+        result.get("fallback_reason"),
+        scope_graph_delta.get("fallback_reason"),
+        scope_file_delta.get("fallback_reason"),
+        incremental_eligibility.get("fallback_reason"),
+        evidence_trace.get("fallback_reason"),
+        nested_evidence.get("fallback_reason"),
+        evidence.get("fallback_reason"),
+    )
+    status_text = _normalize_operation_status(
+        _first_text_value(
+            status,
+            result.get("status"),
+            result.get("snapshot_status"),
+            evidence_trace.get("status"),
+            evidence.get("status"),
+        )
+    )
+    if not strategy:
+        if status_text == "already_current":
+            strategy = "already_current"
+        elif fallback_reason or graph_delta_mode == "full_rebuild":
+            strategy = "full_rebuild_fallback"
+        elif graph_delta_mode:
+            strategy = "incremental_graph_delta"
+    if not graph_delta_mode:
+        if strategy == "already_current":
+            graph_delta_mode = "none"
+        elif strategy == "full_rebuild_fallback":
+            graph_delta_mode = "full_rebuild"
+    elapsed_candidates: list[Any] = []
+    if elapsed_ms is not _SCOPE_RECONCILE_ELAPSED_UNSET:
+        elapsed_candidates.append(elapsed_ms)
+    elapsed_candidates.extend(
+        [
+            result.get("elapsed_ms"),
+            trace.get("elapsed_ms"),
+            evidence_trace.get("elapsed_ms"),
+            nested_evidence.get("elapsed_ms"),
+            evidence.get("elapsed_ms"),
+        ]
+    )
+    elapsed = _first_int_value(*elapsed_candidates)
+    fallback_required = bool(fallback_reason or strategy == "full_rebuild_fallback")
+    operator_next_action = _first_text_value(
+        result.get("operator_next_action"),
+        evidence_trace.get("operator_next_action"),
+        nested_evidence.get("operator_next_action"),
+        evidence.get("operator_next_action"),
+        _scope_reconcile_operator_next_action(fallback_reason),
+    )
+    return {
+        "elapsed_ms": elapsed,
+        "strategy": strategy,
+        "scope_reconcile_strategy": strategy,
+        "graph_delta_mode": graph_delta_mode,
+        "scope_graph_delta_mode": graph_delta_mode,
+        "fallback_reason": fallback_reason,
+        "fallback_required": fallback_required,
+        "operator_next_action": operator_next_action,
+    }
+
+
+def _scope_reconcile_operation_trace(
+    *,
+    status: str,
+    target_commit_sha: str,
+    parent_commit_sha: str = "",
+    snapshot_id: str = "",
+    run_id: str = "",
+    identity: Mapping[str, Any] | None = None,
+    result: Mapping[str, Any] | None = None,
+    evidence: Mapping[str, Any] | None = None,
+    elapsed_ms: Any = _SCOPE_RECONCILE_ELAPSED_UNSET,
+    started_at: str = "",
+    updated_at: str = "",
+) -> dict[str, Any]:
+    identity = identity if isinstance(identity, Mapping) else {}
+    normalized_status = _normalize_operation_status(status)
+    observability = _scope_reconcile_observability(
+        result,
+        evidence,
+        status=normalized_status,
+        elapsed_ms=elapsed_ms,
+    )
+    trace = {
+        "schema_version": "scope_reconcile_operation_trace.v1",
+        "operation_type": "scope_reconcile",
+        "status": normalized_status,
+        "progress": _operation_unit_progress(normalized_status),
+        "target_commit_sha": str(target_commit_sha or ""),
+        "parent_commit_sha": str(parent_commit_sha or ""),
+        "snapshot_id": str(snapshot_id or ""),
+        "run_id": str(run_id or ""),
+        "ref_name": str(identity.get("ref_name") or ""),
+        "branch_ref": str(identity.get("branch_ref") or ""),
+        "worktree_id": str(identity.get("worktree_id") or ""),
+        "worktree_path": str(identity.get("worktree_path") or ""),
+        **observability,
+    }
+    if started_at:
+        trace["started_at"] = started_at
+    if updated_at:
+        trace["updated_at"] = updated_at
+    return trace
+
+
+def _pending_scope_activation_verification(
+    conn,
+    store: Any,
+    project_id: str,
+    *,
+    root: Path,
+    target_commit_sha: str,
+    activate_requested: bool,
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    status = store.graph_governance_status(conn, project_id)
+    head_commit = _git_head_commit(root)
+    active_graph_commit = str(status.get("graph_snapshot_commit") or "")
+    active_snapshot_id = str(status.get("active_snapshot_id") or "")
+    pending_count = int(status.get("pending_scope_reconcile_count") or 0)
+    matches_target = bool(target_commit_sha and active_graph_commit == target_commit_sha)
+    matches_head = bool(head_commit and active_graph_commit == head_commit)
+    verified = bool(
+        activate_requested
+        and matches_target
+        and (not head_commit or matches_head)
+        and pending_count == 0
+    )
+    return {
+        "schema_version": "scope_reconcile_activation_verification.v1",
+        "source": "graph_status",
+        "requested": bool(activate_requested),
+        "verified": verified,
+        "active_snapshot_id": active_snapshot_id,
+        "active_graph_commit": active_graph_commit,
+        "target_commit_sha": str(target_commit_sha or ""),
+        "head_commit": head_commit,
+        "matches_target_commit": matches_target,
+        "matches_head_commit": matches_head,
+        "pending_scope_reconcile_count": pending_count,
+        "pending_scope_reconcile_zero": pending_count == 0,
+        "ref_name": str(identity.get("ref_name") or ""),
+        "branch_ref": str(identity.get("branch_ref") or ""),
+        "worktree_id": str(identity.get("worktree_id") or ""),
+        "worktree_path": str(identity.get("worktree_path") or ""),
+    }
 
 
 def _git_head_commit(project_root: Path) -> str:
@@ -17892,6 +18143,13 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 target_label = f"{target_label} @ {ref_name}" if target_label else ref_name
             evidence = _json_loads(row.get("evidence_json"), {})
             evidence_summary = evidence if isinstance(evidence, dict) else {}
+            result = _json_loads(row.get("result_json"), {})
+            result_summary = result if isinstance(result, dict) else {}
+            observability = _scope_reconcile_observability(
+                result_summary,
+                evidence_summary,
+                status=op_status,
+            )
             last_error = str(
                 row.get("last_error")
                 or evidence_summary.get("error")
@@ -17899,10 +18157,36 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 or ""
             )
             last_result = str(
-                row.get("result_json")
+                result_summary.get("status")
+                or result_summary.get("snapshot_status")
+                or observability.get("strategy")
                 or evidence_summary.get("recovery_action")
                 or evidence_summary.get("source")
                 or ""
+            )
+            operation_trace = _scope_reconcile_operation_trace(
+                status=op_status,
+                target_commit_sha=commit,
+                parent_commit_sha=str(row.get("parent_commit_sha") or ""),
+                snapshot_id=str(row.get("snapshot_id") or result_summary.get("snapshot_id") or ""),
+                run_id=_first_text_value(
+                    result_summary.get("run_id"),
+                    evidence_summary.get("run_id"),
+                ),
+                identity={
+                    "ref_name": ref_name,
+                    "branch_ref": branch_ref,
+                    "worktree_id": worktree_id,
+                    "worktree_path": worktree_path,
+                },
+                result=result_summary,
+                evidence=evidence_summary,
+                started_at=_first_text_value(
+                    row.get("started_at"),
+                    evidence_summary.get("started_at"),
+                    row.get("queued_at"),
+                ),
+                updated_at=_first_text_value(row.get("updated_at"), row.get("queued_at")),
             )
             supported_actions = ["observer_takeover", "view_trace"]
             if op_status in {"failed", "running", "queued"}:
@@ -17923,6 +18207,16 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "last_error": last_error,
                 "last_result": last_result,
                 "evidence": evidence_summary,
+                "result": result_summary,
+                "elapsed_ms": observability["elapsed_ms"],
+                "strategy": observability["strategy"],
+                "scope_reconcile_strategy": observability["scope_reconcile_strategy"],
+                "graph_delta_mode": observability["graph_delta_mode"],
+                "scope_graph_delta_mode": observability["scope_graph_delta_mode"],
+                "fallback_reason": observability["fallback_reason"],
+                "fallback_required": observability["fallback_required"],
+                "operator_next_action": observability["operator_next_action"],
+                "operation_trace": operation_trace,
                 "ref_name": ref_name,
                 "branch_ref": branch_ref,
                 "worktree_id": worktree_id,
@@ -20932,9 +21226,11 @@ def _record_pending_scope_reconcile_contract_event(
             "target_commit_sha": target_commit_sha,
             "snapshot_id": snapshot_id,
             "reconcile_status": result.get("status") or result.get("snapshot_status") or "",
-            "active": bool(
-                result.get("snapshot_status") == "active" or result.get("active_snapshot_id")
-            ),
+            "active": bool(result.get("activated")),
+            "elapsed_ms": result.get("elapsed_ms") or 0,
+            "strategy": result.get("strategy") or result.get("scope_reconcile_strategy") or "",
+            "graph_delta_mode": result.get("graph_delta_mode") or result.get("scope_graph_delta_mode") or "",
+            "fallback_reason": result.get("fallback_reason") or "",
         },
     )
     return task_timeline.record_event(
@@ -20969,6 +21265,17 @@ def _record_pending_scope_reconcile_contract_event(
                     "target_commit_sha",
                     "target_commit_inferred",
                     "pending_count",
+                    "elapsed_ms",
+                    "strategy",
+                    "scope_reconcile_strategy",
+                    "graph_delta_mode",
+                    "scope_graph_delta_mode",
+                    "fallback_reason",
+                    "fallback_required",
+                    "operator_next_action",
+                    "operation_trace",
+                    "activation_verification",
+                    "activated",
                 }
             },
         },
@@ -21122,6 +21429,8 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     semantic_use_ai = _semantic_use_ai_from_body(body)
     semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
     identity = _pending_scope_identity_from_body(body)
+    request_started_at = _utc_now()
+    request_started_monotonic = time.monotonic()
 
     conn = get_connection(project_id)
     try:
@@ -21136,6 +21445,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
             except Exception:
                 target_commit = ""
         if not target_commit:
+            elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
             return 400, {
                 "ok": False,
                 "project_id": project_id,
@@ -21149,6 +21459,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                     "activate": True,
                     "semantic_use_ai": False,
                 },
+                "elapsed_ms": elapsed_ms,
                 **identity,
             }
         target_pending_for_failure = False
@@ -21179,6 +21490,14 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         body.get("parent_commit_sha") or active.get("commit_sha") or ""
                     )
                     with sqlite_write_lock():
+                        operation_trace = _scope_reconcile_operation_trace(
+                            status=store.PENDING_STATUS_RUNNING,
+                            target_commit_sha=target_commit,
+                            parent_commit_sha=parent_commit,
+                            identity=identity,
+                            evidence={"strategy": "pending", "graph_delta_mode": "pending"},
+                            started_at=request_started_at,
+                        )
                         store.queue_pending_scope_reconcile(
                             conn,
                             project_id,
@@ -21193,6 +21512,13 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                                 "source": "direct_update_graph_force_requeue",
                                 "actor": body.get("actor", "api"),
                                 "parent_commit_sha": parent_commit,
+                                "started_at": request_started_at,
+                                "operation_trace": operation_trace,
+                                "reconcile_observability": {
+                                    "strategy": "pending",
+                                    "graph_delta_mode": "pending",
+                                    "elapsed_ms": 0,
+                                },
                                 **identity,
                             },
                             force_requeue=True,
@@ -21201,6 +21527,26 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
             else:
                 active = store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"]) or {}
                 if str(active.get("commit_sha") or "").strip() == target_commit:
+                    elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
+                    activation_verification = _pending_scope_activation_verification(
+                        conn,
+                        store,
+                        project_id,
+                        root=root,
+                        target_commit_sha=target_commit,
+                        activate_requested=bool(body.get("activate", False)),
+                        identity=identity,
+                    )
+                    operation_trace = _scope_reconcile_operation_trace(
+                        status="already_current",
+                        target_commit_sha=target_commit,
+                        snapshot_id=str(active.get("snapshot_id") or ""),
+                        identity=identity,
+                        result={"status": "already_current"},
+                        elapsed_ms=elapsed_ms,
+                        started_at=request_started_at,
+                        updated_at=_utc_now(),
+                    )
                     return 200, {
                         "ok": True,
                         "project_id": project_id,
@@ -21212,12 +21558,31 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "snapshot_id": active.get("snapshot_id") or "",
                         "active_snapshot_id": active.get("snapshot_id") or "",
                         "pending_count": 0,
+                        "elapsed_ms": elapsed_ms,
+                        "strategy": "already_current",
+                        "scope_reconcile_strategy": "already_current",
+                        "graph_delta_mode": "none",
+                        "scope_graph_delta_mode": "none",
+                        "fallback_reason": "",
+                        "fallback_required": False,
+                        "operator_next_action": "",
+                        "operation_trace": operation_trace,
+                        "activation_verification": activation_verification,
+                        "activated": bool(activation_verification.get("verified")),
                     }
                 parent_active = active or store.get_active_graph_snapshot(conn, project_id) or {}
                 parent_commit = str(
                     body.get("parent_commit_sha") or parent_active.get("commit_sha") or ""
                 )
                 with sqlite_write_lock():
+                    operation_trace = _scope_reconcile_operation_trace(
+                        status=store.PENDING_STATUS_RUNNING,
+                        target_commit_sha=target_commit,
+                        parent_commit_sha=parent_commit,
+                        identity=identity,
+                        evidence={"strategy": "pending", "graph_delta_mode": "pending"},
+                        started_at=request_started_at,
+                    )
                     row = store.queue_pending_scope_reconcile(
                         conn,
                         project_id,
@@ -21232,6 +21597,13 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                             "source": "direct_update_graph",
                             "actor": body.get("actor", "api"),
                             "parent_commit_sha": parent_commit,
+                            "started_at": request_started_at,
+                            "operation_trace": operation_trace,
+                            "reconcile_observability": {
+                                "strategy": "pending",
+                                "graph_delta_mode": "pending",
+                                "elapsed_ms": 0,
+                            },
                             **identity,
                         },
                     )
@@ -21307,6 +21679,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                     }
         except (KeyError, ValueError) as exc:
             if target_pending_for_failure:
+                elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
                 with sqlite_write_lock():
                     store.mark_pending_scope_reconcile_failed(
                         conn,
@@ -21318,12 +21691,27 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         worktree_path=identity["worktree_path"],
                         actor=str(body.get("actor") or "api"),
                         reason=str(exc),
-                        evidence={"source": "direct_update_graph", "error": str(exc), **identity},
+                        evidence={
+                            "source": "direct_update_graph",
+                            "error": str(exc),
+                            "elapsed_ms": elapsed_ms,
+                            "operation_trace": _scope_reconcile_operation_trace(
+                                status=store.PENDING_STATUS_FAILED,
+                                target_commit_sha=target_commit,
+                                identity=identity,
+                                evidence={"elapsed_ms": elapsed_ms},
+                                elapsed_ms=elapsed_ms,
+                                started_at=request_started_at,
+                                updated_at=_utc_now(),
+                            ),
+                            **identity,
+                        },
                     )
                     conn.commit()
             _raise_graph_api_validation(exc)
         except Exception as exc:
             if target_pending_for_failure:
+                elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
                 with sqlite_write_lock():
                     store.mark_pending_scope_reconcile_failed(
                         conn,
@@ -21335,29 +21723,81 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         worktree_path=identity["worktree_path"],
                         actor=str(body.get("actor") or "api"),
                         reason=str(exc),
-                        evidence={"source": "direct_update_graph", "error": str(exc), **identity},
+                        evidence={
+                            "source": "direct_update_graph",
+                            "error": str(exc),
+                            "elapsed_ms": elapsed_ms,
+                            "operation_trace": _scope_reconcile_operation_trace(
+                                status=store.PENDING_STATUS_FAILED,
+                                target_commit_sha=target_commit,
+                                identity=identity,
+                                evidence={"elapsed_ms": elapsed_ms},
+                                elapsed_ms=elapsed_ms,
+                                started_at=request_started_at,
+                                updated_at=_utc_now(),
+                            ),
+                            **identity,
+                        },
                     )
                     conn.commit()
             raise
         if isinstance(result, dict) and result.get("ok", True):
             result = dict(result)
             activate_requested = bool(body.get("activate", False))
+            elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
+            observability = _scope_reconcile_observability(
+                result,
+                elapsed_ms=elapsed_ms,
+                status=str(result.get("status") or result.get("snapshot_status") or "complete"),
+            )
+            result.update(observability)
+            result["elapsed_ms"] = observability["elapsed_ms"] or elapsed_ms
+            result["operation_trace"] = _scope_reconcile_operation_trace(
+                status=str(result.get("status") or result.get("snapshot_status") or "complete"),
+                target_commit_sha=target_commit,
+                parent_commit_sha=str(body.get("parent_commit_sha") or ""),
+                snapshot_id=str(result.get("snapshot_id") or result.get("active_snapshot_id") or ""),
+                run_id=str(result.get("run_id") or body.get("run_id") or ""),
+                identity=identity,
+                result=result,
+                elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+                started_at=request_started_at,
+                updated_at=_utc_now(),
+            )
             if activate_requested:
-                result.setdefault("snapshot_status", "active")
-                result.setdefault("next_action", {
-                    "schema_version": "graph_reconcile_next_action.v1",
-                    "action": "verify_graph_current",
-                    "description": (
-                        "activate=true was requested; verify graph status and "
-                        "operations queue before closing the work."
-                    ),
-                    "endpoint": f"/api/graph-governance/{project_id}/status",
-                    "method": "GET",
-                })
+                activation_verification = _pending_scope_activation_verification(
+                    conn,
+                    store,
+                    project_id,
+                    root=root,
+                    target_commit_sha=target_commit,
+                    activate_requested=True,
+                    identity=identity,
+                )
+                result["activation_verification"] = activation_verification
+                result["activated"] = bool(activation_verification.get("verified"))
+                if activation_verification.get("verified"):
+                    result["snapshot_status"] = "active"
+                    result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
+                    result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
+                else:
+                    result["snapshot_status"] = "activation_unverified"
+                    result["next_action"] = {
+                        "schema_version": "graph_reconcile_next_action.v1",
+                        "action": "verify_graph_current",
+                        "description": (
+                            "activate=true was requested, but active graph status "
+                            "has not confirmed active_graph_commit == HEAD with "
+                            "pending_scope_reconcile_count == 0."
+                        ),
+                        "endpoint": f"/api/graph-governance/{project_id}/status",
+                        "method": "GET",
+                    }
             else:
                 snapshot_id = str(result.get("snapshot_id") or "")
                 result.setdefault("snapshot_status", "candidate")
                 result.setdefault("candidate_only", True)
+                result["activated"] = False
                 if snapshot_id:
                     active = (
                         store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"])
@@ -21375,6 +21815,12 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                             identity=identity,
                         ),
                     )
+            if isinstance(result.get("operation_trace"), dict):
+                result["operation_trace"]["activated"] = bool(result.get("activated"))
+                if isinstance(result.get("activation_verification"), dict):
+                    result["operation_trace"]["activation_verification"] = result[
+                        "activation_verification"
+                    ]
             timeline_event = _record_pending_scope_reconcile_contract_event(
                 conn,
                 project_id=project_id,
