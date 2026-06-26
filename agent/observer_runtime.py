@@ -78,6 +78,9 @@ OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION = "observer_executable_worker_l
 OBSERVER_EXECUTABLE_HANDOFF_PACKET_SCHEMA_VERSION = (
     "observer_runtime_text.executable_handoff_packet.v1"
 )
+OBSERVER_RUNTIME_TEXT_WORKER_ENVELOPE_CLAIM_SCHEMA_VERSION = (
+    "observer_runtime_text.worker_envelope_claim.v1"
+)
 OBSERVER_RUNTIME_TEXT_NEXT_LEGAL_ACTION_SCHEMA_VERSION = (
     "observer_runtime_text.next_legal_action.v1"
 )
@@ -162,6 +165,7 @@ WORKER_LAUNCH_PACK_REQUIRED_FIELDS = (
     "graph_query_schema_trace_id",
     "context_pack_refs",
     "context_pack_status",
+    "runtime_context_worker_envelope_claim",
     "local_runtime_context_bridge",
     "runtime_context_entrypoints",
     "cli_runtime_requirements",
@@ -4918,6 +4922,7 @@ def _runtime_text_worker_launch_pack(
     host_adapter_surrogate_startup: Mapping[str, Any],
     registered_host_adapter_spawn: Mapping[str, Any],
     launch_text_hash: str,
+    runtime_context_worker_envelope_claim: Mapping[str, Any],
 ) -> dict[str, Any]:
     context_pack_refs, context_pack_status, context_pack_resolution = (
         _runtime_text_context_pack_status(request)
@@ -5203,6 +5208,9 @@ def _runtime_text_worker_launch_pack(
         "startup_identity_policy": startup_identity_policy,
         "same_owner_session_token_startup": dict(same_owner_session_token_startup),
         "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
+        "runtime_context_worker_envelope_claim": dict(
+            runtime_context_worker_envelope_claim
+        ),
         "startup_refusal_policy": startup_refusal_policy,
         "test_environment_preflight": test_environment_preflight,
         "tests_to_run": list(normalized_test_commands or request.test_commands),
@@ -5362,6 +5370,9 @@ def _runtime_text_worker_launch_pack(
         "context_pack_refs": context_pack_refs,
         "context_pack_status": context_pack_status,
         "context_pack_resolution": context_pack_resolution,
+        "runtime_context_worker_envelope_claim": dict(
+            runtime_context_worker_envelope_claim
+        ),
         "local_runtime_context_bridge": local_bridge,
         "runtime_context_entrypoints": runtime_context_entrypoints,
         "cli_runtime_requirements": cli_runtime_requirements,
@@ -5564,6 +5575,167 @@ def _runtime_text_missing_launch_fields(payload: Mapping[str, Any]) -> list[str]
     return missing
 
 
+def _runtime_text_worker_envelope_claim(
+    *,
+    request: ObserverRuntimeTextPrepareRequest,
+    context: Any,
+    runtime_context_id: str,
+    observer_command_id: str,
+    parent_task_id: str,
+    route_identity: Mapping[str, Any],
+    target_project_root: str,
+) -> dict[str, Any]:
+    """Return a copy-safe claim bridge for worker-side host envelope recovery."""
+
+    task_id = str(getattr(context, "task_id", "") or request.task_id or "").strip()
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or request.worker_id
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or request.worker_id
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    safe_route_identity = {
+        str(field): str(route_identity.get(field) or "").strip()
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+    }
+    initial_join_path = (
+        f"/api/graph-governance/{request.project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token/initial-join"
+    )
+    rejoin_path = (
+        f"/api/graph-governance/{request.project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token/rejoin"
+    )
+    initial_join_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        **safe_route_identity,
+        "reason": "Codex app worker claims first runtime-context host envelope",
+        "ttl_seconds": 3600,
+    }
+    rejoin_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "reason": "Codex app worker lost raw runtime-context auth after startup",
+        "ttl_seconds": 3600,
+    }
+    required_fields = [
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ]
+    missing_fields = [
+        field
+        for field in required_fields
+        if not str(initial_join_body.get(field) or "").strip()
+    ]
+    return {
+        "schema_version": OBSERVER_RUNTIME_TEXT_WORKER_ENVELOPE_CLAIM_SCHEMA_VERSION,
+        "status": "ready" if not missing_fields else "blocked",
+        "claim_mode": "runtime_context_session_token_initial_join",
+        "backend_mode": BACKEND_CODEX_APP_SUBAGENT,
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "observer_command_id": observer_command_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+        "branch": str(getattr(context, "branch_ref", "") or ""),
+        "route_identity": dict(safe_route_identity),
+        "required_fields": required_fields,
+        "missing_fields": missing_fields,
+        "host_env_injection_required": False,
+        "worker_claims_host_envelope": True,
+        "host_envelope_delivery": "runtime_context_session_token_initial_join",
+        "session_token_ref_alone_authorizes_writes": False,
+        "raw_tokens_in_prompt_allowed": False,
+        "raw_host_envelope_persisted": False,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "initial_join": {
+            "method": "POST",
+            "path": initial_join_path,
+            "tool": "runtime_context_session_token_initial_join",
+            "facade": "runtime_context.session_token_initial_join",
+            "body_source": "copy_safe_body",
+            "body": dict(initial_join_body),
+            "copy_safe_body": dict(initial_join_body),
+            "required_before_worker_evidence": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ],
+        },
+        "rejoin": {
+            "method": "POST",
+            "path": rejoin_path,
+            "tool": "runtime_context_session_token_rejoin",
+            "facade": "runtime_context.session_token_rejoin",
+            "body_source": "copy_safe_body",
+            "body": dict(rejoin_body),
+            "copy_safe_body": dict(rejoin_body),
+            "use_after": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ],
+        },
+        "worker_instructions": [
+            (
+                "Before mf_subagent_read_receipt or mf_subagent_startup, call "
+                "initial_join.copy_safe_body to obtain the live host envelope."
+            ),
+            (
+                "Use the returned host_envelope env values only in the live "
+                "worker session."
+            ),
+            (
+                "Do not paste raw session or fence tokens into timeline, "
+                "implementation evidence, finish evidence, or final messages."
+            ),
+            (
+                "If initial_join says lineage already exists, stop and use "
+                "rejoin.copy_safe_body only after the existing read "
+                "receipt/startup lineage is verified."
+            ),
+        ],
+        "security_boundary": {
+            "copy_safe_claim_body": True,
+            "raw_session_token_persisted_to_timeline": False,
+            "raw_fence_token_persisted_to_timeline": False,
+            "observer_authors_worker_evidence": False,
+            "session_token_ref_alone_authorizes_writes": False,
+        },
+    }
+
+
 def _runtime_text_executable_worker_launch(
     *,
     request: ObserverRuntimeTextPrepareRequest,
@@ -5575,6 +5747,7 @@ def _runtime_text_executable_worker_launch(
     launch_text_hash: str,
     worker_launch_pack: Mapping[str, Any],
     startup_recording: Mapping[str, Any],
+    runtime_context_worker_envelope_claim: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the concrete host command/payload for a real CLI worker launch."""
 
@@ -5668,21 +5841,49 @@ def _runtime_text_executable_worker_launch(
             else {}
         ),
     }
+    worker_envelope_claim = (
+        dict(runtime_context_worker_envelope_claim)
+        if isinstance(runtime_context_worker_envelope_claim, Mapping)
+        else {}
+    )
     missing_fields = _runtime_text_missing_launch_fields(payload)
     if unsupported_backend:
         missing_fields.append("backend_mode.codex_cli")
-    if app_subagent_handoff_required:
-        missing_fields.append("host_adapter.codex_app_subagent_secure_env")
+    if app_subagent_handoff_required and (
+        str(worker_envelope_claim.get("status") or "") != "ready"
+    ):
+        missing_fields.extend(
+            str(item)
+            for item in (worker_envelope_claim.get("missing_fields") or [])
+            if str(item or "").strip()
+        )
+        if "host_adapter.codex_app_subagent_worker_envelope_claim" not in missing_fields:
+            missing_fields.append(
+                "host_adapter.codex_app_subagent_worker_envelope_claim"
+            )
+    codex_app_bridge_ready = bool(
+        app_subagent_handoff_required
+        and not unsupported_backend
+        and not missing_fields
+        and str(worker_envelope_claim.get("status") or "") == "ready"
+    )
+    launch_ready = bool((command or codex_app_bridge_ready) and not missing_fields)
     command_display = ""
     if command:
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}" for key, value in env_template.items()
         )
         command_display = f"{env_prefix} {shlex.join(command)}"
+    elif codex_app_bridge_ready:
+        command_display = (
+            "Host-managed Codex app subagent handoff via runtime-context "
+            "worker envelope claim; no shell command is generated and no raw "
+            "tokens are embedded in the prompt."
+        )
     elif app_subagent_handoff_required:
         command_display = (
             "Host-managed Codex app subagent handoff; no shell command is "
-            "generated until the host can inject the worker envelope."
+            "generated until the runtime-context worker envelope claim is ready."
         )
     public_env_template = {
         key: (
@@ -5852,6 +6053,16 @@ def _runtime_text_executable_worker_launch(
             "fence_token": fence_token_placeholder,
             "fence_token_env": fence_token_env,
         },
+        "auth_alternatives": {
+            "runtime_context_worker_envelope_claim": {
+                "source": (
+                    "response.executable_worker_launch."
+                    "runtime_context_worker_envelope_claim.initial_join"
+                ),
+                "host_env_injection_required": False,
+                "raw_tokens_persisted": False,
+            }
+        },
         "body": read_receipt_body_skeleton,
         "copy_safe_body": dict(read_receipt_body_skeleton),
         "retry_payload": dict(read_receipt_body_skeleton),
@@ -5917,9 +6128,52 @@ def _runtime_text_executable_worker_launch(
             "fence_token": fence_token_placeholder,
             "fence_token_env": fence_token_env,
         },
+        "auth_alternatives": {
+            "runtime_context_worker_envelope_claim": {
+                "source": (
+                    "response.executable_worker_launch."
+                    "runtime_context_worker_envelope_claim.initial_join"
+                ),
+                "host_env_injection_required": False,
+                "raw_tokens_persisted": False,
+            }
+        },
         "body": startup_body_skeleton,
         "payload": startup_persisted_payload_skeleton,
     }
+    operator_must_fill = (
+        [
+            "response.launch_text",
+            "host.actual_host_worker_id",
+            "host.worker_session_id",
+            "host.worker_transcript_ref",
+        ]
+        if codex_app_bridge_ready
+        else [
+            f"env.{session_token_env}",
+            f"env.{fence_token_env}",
+            "response.launch_text",
+        ]
+    )
+    handoff_next_step = (
+        {
+            "action": "spawn_codex_app_subagent_with_runtime_context_bridge",
+            "description": (
+                "Spawn the Codex app subagent in the assigned worktree with "
+                "response.launch_text. The worker must claim the runtime-context "
+                "host envelope before read receipt/startup and must not persist "
+                "raw tokens."
+            ),
+        }
+        if codex_app_bridge_ready
+        else {
+            "action": "launch_worker_now",
+            "description": (
+                "Launch the worker now with this argv/env/stdin packet, then "
+                "submit the read receipt facade payload and the startup facade payload."
+            ),
+        }
+    )
     handoff_packet = {
         "schema_version": OBSERVER_EXECUTABLE_HANDOFF_PACKET_SCHEMA_VERSION,
         "public_safe": True,
@@ -5933,11 +6187,7 @@ def _runtime_text_executable_worker_launch(
         "env_placeholders": dict(public_env_template),
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
-        "operator_must_fill": [
-            f"env.{session_token_env}",
-            f"env.{fence_token_env}",
-            "response.launch_text",
-        ],
+        "operator_must_fill": operator_must_fill,
         "command_skeleton": public_command_skeleton,
         "argv_skeleton": list(command),
         "stdin": {
@@ -5954,22 +6204,22 @@ def _runtime_text_executable_worker_launch(
         "observer_command_id": observer_command_id,
         "worker_guide_ref": worker_guide_ref,
         "worker_guide_url": worker_guide_url,
+        "runtime_context_worker_envelope_claim": dict(worker_envelope_claim),
+        "worker_envelope_claim_source": (
+            "response.executable_worker_launch.runtime_context_worker_envelope_claim"
+        ),
         "read_receipt_facade_payload_skeleton": read_receipt_payload_skeleton,
         "startup_facade_payload_skeleton": startup_payload_skeleton,
-        "next_step": {
-            "action": "launch_worker_now",
-            "description": (
-                "Launch the worker now with this argv/env/stdin packet, then "
-                "submit the read receipt facade payload and the startup facade payload."
-            ),
-        },
+        "next_step": handoff_next_step,
     }
     host_adapter_handoff = {
         "schema_version": "observer_runtime_text.host_adapter_handoff.v1",
         "backend_mode": BACKEND_CODEX_APP_SUBAGENT,
         "requested_backend_mode": requested_backend_mode,
         "status": (
-            "blocked_until_secure_worker_envelope"
+            "ready_for_runtime_context_claim_bridge"
+            if codex_app_bridge_ready
+            else "blocked_until_runtime_context_worker_envelope_claim"
             if app_subagent_handoff_required
             else "not_applicable"
         ),
@@ -5977,29 +6227,52 @@ def _runtime_text_executable_worker_launch(
         "host_tool": "multi_agent_v1.spawn_agent",
         "command_generated": False,
         "reason": (
-            "Codex app subagent launch needs a host-created worker session in "
-            "the assigned worktree plus a secure worker envelope for "
-            "AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN."
+            "Codex app subagent launch uses a worker-claimed runtime-context "
+            "host envelope, so raw session/fence tokens are not embedded in "
+            "the prompt or timeline."
+            if codex_app_bridge_ready
+            else (
+                "Codex app subagent launch needs a copy-safe runtime-context "
+                "worker envelope claim before read receipt/startup."
+            )
         ),
-        "required_host_capabilities": [
-            "spawn_subagent_in_assigned_worktree",
-            "inject_secure_worker_env",
-            "return_host_session_id",
-            "return_worker_transcript_ref",
-        ],
-        "next_legal_action": "provide_codex_app_subagent_host_envelope_or_use_codex_cli",
+        "required_host_capabilities": (
+            [
+                "spawn_subagent_in_assigned_worktree",
+                "pass_copy_safe_runtime_context_claim_to_worker",
+                "return_host_session_id",
+                "return_worker_transcript_ref",
+            ]
+            if codex_app_bridge_ready
+            else [
+                "spawn_subagent_in_assigned_worktree",
+                "provide_runtime_context_worker_envelope_claim",
+                "return_host_session_id",
+                "return_worker_transcript_ref",
+            ]
+        ),
+        "next_legal_action": (
+            "spawn_codex_app_subagent_with_runtime_context_bridge"
+            if codex_app_bridge_ready
+            else "repair_runtime_context_worker_envelope_claim_or_use_codex_cli"
+        ),
         "fallback_backend": BACKEND_CODEX_CLI,
         "worker_next_legal_action": str(
             worker_launch_pack.get("next_legal_action") or ""
         ),
         "handoff_packet_source": "response.executable_worker_launch.handoff_packet",
+        "runtime_context_worker_envelope_claim": dict(worker_envelope_claim),
+        "runtime_context_worker_envelope_claim_source": (
+            "response.executable_worker_launch.runtime_context_worker_envelope_claim"
+        ),
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
     }
     return {
         "schema_version": OBSERVER_EXECUTABLE_WORKER_LAUNCH_SCHEMA_VERSION,
-        "status": "ready" if command and not missing_fields else "blocked",
-        "executable": bool(command and not missing_fields),
+        "status": "ready" if launch_ready else "blocked",
+        "executable": launch_ready,
+        "host_adapter_launchable": codex_app_bridge_ready,
         "backend_mode": backend_mode,
         "requested_backend_mode": requested_backend_mode,
         "command": command,
@@ -6024,11 +6297,7 @@ def _runtime_text_executable_worker_launch(
         "env_additions": dict(env_template),
         "env_policy": env_policy,
         "environment_policy": env_policy,
-        "operator_must_fill": [
-            f"env.{session_token_env}",
-            f"env.{fence_token_env}",
-            "response.launch_text",
-        ],
+        "operator_must_fill": operator_must_fill,
         "payload": payload,
         "required_fields": list(EXECUTABLE_WORKER_LAUNCH_REQUIRED_FIELDS),
         "missing_fields": missing_fields,
@@ -6036,6 +6305,7 @@ def _runtime_text_executable_worker_launch(
         "startup_identity_policy": dict(startup_identity_policy),
         "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "startup_recording": dict(startup_recording),
+        "runtime_context_worker_envelope_claim": dict(worker_envelope_claim),
         "worker_launch_pack_hash": str(
             worker_launch_pack.get("worker_launch_pack_hash") or ""
         ),
@@ -6082,6 +6352,16 @@ def _runtime_text_observer_next_legal_action(
     handoff_packet = (
         executable_worker_launch.get("handoff_packet")
         if isinstance(executable_worker_launch.get("handoff_packet"), Mapping)
+        else {}
+    )
+    worker_envelope_claim = (
+        executable_worker_launch.get("runtime_context_worker_envelope_claim")
+        if isinstance(
+            executable_worker_launch.get("runtime_context_worker_envelope_claim"),
+            Mapping,
+        )
+        else handoff_packet.get("runtime_context_worker_envelope_claim")
+        if isinstance(handoff_packet.get("runtime_context_worker_envelope_claim"), Mapping)
         else {}
     )
     env_policy = (
@@ -6217,6 +6497,39 @@ def _runtime_text_observer_next_legal_action(
     if (
         host_adapter_handoff
         and str(host_adapter_handoff.get("host_adapter") or "") == "codex_app_subagent"
+        and str(executable_worker_launch.get("backend_mode") or "")
+        == BACKEND_CODEX_APP_SUBAGENT
+        and status == "ready"
+    ):
+        next_action.update(
+            {
+                "id": "spawn_codex_app_subagent_with_runtime_context_bridge",
+                "action": str(
+                    host_adapter_handoff.get("next_legal_action")
+                    or "spawn_codex_app_subagent_with_runtime_context_bridge"
+                ),
+                "description": (
+                    "Spawn the Codex app subagent in the assigned worktree. "
+                    "The worker must claim the runtime-context host envelope "
+                    "before read receipt/startup; raw tokens stay out of the "
+                    "prompt and timeline."
+                ),
+                "host_adapter_handoff": dict(host_adapter_handoff),
+                "host_adapter_handoff_source": (
+                    "response.executable_worker_launch.host_adapter_handoff"
+                ),
+                "runtime_context_worker_envelope_claim": dict(worker_envelope_claim),
+                "runtime_context_worker_envelope_claim_source": (
+                    "response.executable_worker_launch."
+                    "runtime_context_worker_envelope_claim"
+                ),
+            }
+        )
+    if (
+        host_adapter_handoff
+        and str(host_adapter_handoff.get("host_adapter") or "") == "codex_app_subagent"
+        and str(executable_worker_launch.get("backend_mode") or "")
+        == BACKEND_CODEX_APP_SUBAGENT
         and status != "ready"
     ):
         next_action.update(
@@ -6224,12 +6537,12 @@ def _runtime_text_observer_next_legal_action(
                 "id": "resolve_host_adapter_handoff",
                 "action": str(
                     host_adapter_handoff.get("next_legal_action")
-                    or "provide_codex_app_subagent_host_envelope_or_use_codex_cli"
+                    or "repair_runtime_context_worker_envelope_claim_or_use_codex_cli"
                 ),
                 "description": (
                     "Resolve the Codex app subagent host-adapter boundary before "
-                    "worker launch; do not record worker read receipt/startup until "
-                    "a real worker session has a secure envelope."
+                    "worker launch; do not record worker read receipt/startup "
+                    "until the runtime-context worker envelope claim is ready."
                 ),
                 "host_adapter_handoff": dict(host_adapter_handoff),
                 "host_adapter_handoff_source": (
@@ -6516,6 +6829,28 @@ def build_observer_runtime_text_context(
         fence_token=context.fence_token,
         runtime_context_id=runtime_context_id,
     )
+    target_project_root = (
+        str(request.target_project_root or "")
+        or str(getattr(context, "target_project_root", "") or "")
+        or str(getattr(context, "worktree_path", "") or "")
+    )
+    route_identity = {
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+    }
+    runtime_context_worker_envelope_claim = _runtime_text_worker_envelope_claim(
+        request=request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        observer_command_id=observer_command_id,
+        parent_task_id=parent_task_id,
+        route_identity=route_identity,
+        target_project_root=target_project_root,
+    )
     runtime_context_projection = (
         supplied_projection
         if supplied_projection
@@ -6568,6 +6903,7 @@ def build_observer_runtime_text_context(
         "mf_subagent_input": mf_subagent_input,
         "prelaunch_graph_context": prelaunch_graph_context,
         "self_contract_lookup": self_contract_lookup,
+        "runtime_context_worker_envelope_claim": runtime_context_worker_envelope_claim,
         "startup_echo_contract": startup_echo_contract,
         "graph_first_obligations": graph_first_obligations,
         "first_progress_contract": first_progress_contract,
@@ -6727,6 +7063,7 @@ def build_observer_runtime_text_context(
         host_adapter_surrogate_startup=host_adapter_surrogate_startup,
         registered_host_adapter_spawn=registered_host_adapter_spawn,
         launch_text_hash=launch_text_hash,
+        runtime_context_worker_envelope_claim=runtime_context_worker_envelope_claim,
     )
     worker_launch_pack_preflight = dict(
         worker_launch_pack.get("startup_preflight") or {}
@@ -6850,6 +7187,7 @@ def build_observer_runtime_text_context(
         launch_text_hash=launch_text_hash,
         worker_launch_pack=worker_launch_pack,
         startup_recording=startup_recording,
+        runtime_context_worker_envelope_claim=runtime_context_worker_envelope_claim,
     )
     executable_launch_ready = bool(
         executable_worker_launch.get("executable")
@@ -6950,6 +7288,9 @@ def build_observer_runtime_text_context(
             "host_adapter_surrogate_startup": dict(host_adapter_surrogate_startup),
             "startup_identity": dict(same_owner_session_token_startup),
             "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
+            "runtime_context_worker_envelope_claim": dict(
+                runtime_context_worker_envelope_claim
+            ),
             "close_ready": False,
             "startup_recording": startup_recording,
             "startup_intent_event": startup_intent_event,
@@ -6969,6 +7310,7 @@ def build_observer_runtime_text_context(
         "host_adapter_surrogate_startup": host_adapter_surrogate_startup,
         "startup_identity": same_owner_session_token_startup,
         "registered_host_adapter_spawn": registered_host_adapter_spawn,
+        "runtime_context_worker_envelope_claim": runtime_context_worker_envelope_claim,
         "executable_worker_launch": executable_worker_launch,
         "executable_handoff_packet": dict(executable_handoff_packet),
         "read_receipt_identity": read_receipt_identity,

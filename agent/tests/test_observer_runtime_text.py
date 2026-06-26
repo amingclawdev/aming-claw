@@ -870,43 +870,72 @@ def test_runtime_text_unsupported_backend_blocks_executable_launch(tmp_path):
     assert validation["next_legal_action"]["status"] == "blocked"
 
 
-def test_runtime_text_codex_app_subagent_reports_host_adapter_handoff(tmp_path):
+def test_runtime_text_codex_app_subagent_uses_runtime_envelope_claim_bridge(tmp_path):
     result = build_observer_runtime_text_context(
         _runtime_text_request(tmp_path, backend_mode="codex_app_subagent")
     )
 
-    assert result["ok"] is False
-    assert result["status"] == "blocked"
+    assert result["ok"] is True
+    assert result["status"] == "prepared"
+    assert "runtime_context_worker_envelope_claim" in result["launch_text"]
     executable = result["executable_worker_launch"]
     assert executable["backend_mode"] == "codex_app_subagent"
     assert executable["requested_backend_mode"] == "codex_app_subagent"
     assert executable["command"] == []
-    assert executable["executable"] is False
+    assert executable["executable"] is True
+    assert executable["status"] == "ready"
+    assert executable["host_adapter_launchable"] is True
+    assert executable["shell_safe"] is False
     assert "backend_mode.codex_cli" not in executable["missing_fields"]
-    assert "host_adapter.codex_app_subagent_secure_env" in executable["missing_fields"]
+    assert executable["missing_fields"] == []
+    assert "env.AMING_WORKER_SESSION_TOKEN" not in executable["operator_must_fill"]
+    assert "host.worker_session_id" in executable["operator_must_fill"]
+
+    claim = executable["runtime_context_worker_envelope_claim"]
+    assert claim["status"] == "ready"
+    assert claim["host_env_injection_required"] is False
+    assert claim["worker_claims_host_envelope"] is True
+    assert claim["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
+    assert claim["initial_join"]["tool"] == "runtime_context_session_token_initial_join"
+    assert claim["initial_join"]["copy_safe_body"]["route_token_ref"] == (
+        "route-token-ref"
+    )
+    assert claim["rejoin"]["tool"] == "runtime_context_session_token_rejoin"
+    assert result["worker_launch_pack"]["runtime_context_worker_envelope_claim"] == claim
+    assert result["runtime_context_worker_envelope_claim"] == claim
 
     handoff = executable["host_adapter_handoff"]
-    assert handoff["status"] == "blocked_until_secure_worker_envelope"
+    assert handoff["status"] == "ready_for_runtime_context_claim_bridge"
     assert handoff["host_adapter"] == "codex_app_subagent"
     assert handoff["host_tool"] == "multi_agent_v1.spawn_agent"
     assert handoff["fallback_backend"] == "codex_cli"
     assert handoff["worker_next_legal_action"] == "submit_mf_subagent_read_receipt"
-    assert "inject_secure_worker_env" in handoff["required_host_capabilities"]
+    assert "inject_secure_worker_env" not in handoff["required_host_capabilities"]
+    assert "pass_copy_safe_runtime_context_claim_to_worker" in handoff[
+        "required_host_capabilities"
+    ]
+    assert handoff["runtime_context_worker_envelope_claim"] == claim
+    handoff_packet = executable["handoff_packet"]
+    assert handoff_packet["runtime_context_worker_envelope_claim"] == claim
+    assert handoff_packet["next_step"]["action"] == (
+        "spawn_codex_app_subagent_with_runtime_context_bridge"
+    )
 
     next_action = result["next_legal_action"]
-    assert next_action["status"] == "blocked"
-    assert next_action["allowed"] is False
-    assert next_action["id"] == "resolve_host_adapter_handoff"
+    assert next_action["status"] == "ready"
+    assert next_action["allowed"] is True
+    assert next_action["id"] == "spawn_codex_app_subagent_with_runtime_context_bridge"
     assert next_action["action"] == (
-        "provide_codex_app_subagent_host_envelope_or_use_codex_cli"
+        "spawn_codex_app_subagent_with_runtime_context_bridge"
     )
     assert next_action["host_adapter_handoff"] == handoff
-    assert "host_adapter.codex_app_subagent_secure_env" in next_action[
-        "missing_fields"
-    ]
+    assert next_action["runtime_context_worker_envelope_claim"] == claim
+    assert next_action["missing_fields"] == []
     validation = result["dispatch_gate_validation"]
-    assert validation["status"] == "executable_worker_launch_blocked"
-    assert validation["next_legal_action"]["id"] == "resolve_host_adapter_handoff"
+    assert validation["allowed"] is True
+    assert validation["next_legal_action"]["id"] == (
+        "spawn_codex_app_subagent_with_runtime_context_bridge"
+    )
 
 
 def test_runtime_text_worker_launch_pack_rejects_observer_only_next_action(tmp_path):
