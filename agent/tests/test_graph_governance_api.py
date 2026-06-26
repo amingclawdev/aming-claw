@@ -23127,6 +23127,78 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     )
     assert guidance["contract_chain"]["parent_contract_execution_id"] == ""
     assert guidance["contract_chain"]["contract_chain_id"] == started["contract_chain_id"]
+    route_guide = guidance["onboard_route_guide"]
+    assert route_guide["schema_version"] == "onboard_contract.route_guide_service.v1"
+    assert route_guide["service"] == {
+        "id": "onboard_route_guide",
+        "kind": "guide_service",
+        "source": "onboard_contract_facade",
+    }
+    assert [step["id"] for step in route_guide["guide_steps"]] == [
+        "confirm_role",
+        "confirm_work_type",
+        "bind_backlog_contract_chain",
+        "return_execution_guidance",
+    ]
+    assert {option["id"] for option in route_guide["role_options"]} == {
+        "observer",
+        "worker",
+        "qa",
+    }
+    assert {option["id"] for option in route_guide["work_type_options"]} >= {
+        "capability_query",
+        "system_operation",
+        "continue_contract_chain",
+        "observer_hotfix",
+        "parallel_worker",
+        "qa_verification",
+    }
+    assert route_guide["backlog_chain_binding"]["backlog_id"] == backlog_id
+    assert route_guide["backlog_chain_binding"]["contract_execution_id"] == (
+        expected_execution_id
+    )
+    assert route_guide["backlog_chain_binding"]["continue"][
+        "next_legal_action"
+    ] == started["next_legal_action"]
+    assert route_guide["role_entries"]["observer"]["next_contracts"] == [
+        {"contract_id": "observer_hotfix", "interface": "hotfix_enter"},
+        {"contract_id": "mf_parallel", "interface": "mf_parallel_enter"},
+        {"contract_id": "qa_session", "interface": "qa_session_register"},
+    ]
+    assert route_guide["role_entries"]["worker"]["entrypoint"] == (
+        "runtime_context_worker_guide"
+    )
+    assert route_guide["role_entries"]["worker"]["required_token_refs"] == [
+        "session_token_ref",
+        "route_token_ref",
+    ]
+    assert route_guide["role_entries"]["worker"]["raw_session_token_exposed"] is False
+    assert route_guide["role_entries"]["sub_worker"]["alias_of"] == "worker"
+    assert route_guide["role_entries"]["qa"]["entrypoint"] == "qa_session_register"
+    assert route_guide["role_entries"]["qa"]["raw_qa_session_token_exposed"] is False
+    assert route_guide["capability_index"]["index_paths"]["interfaces"] == (
+        "agent_onboard_guidance.onboard_route_guide.interface_index"
+    )
+    assert "runtime_context_worker_guide" in route_guide["capability_index"][
+        "interfaces"
+    ]
+    assert route_guide["system_operation_index"]["operations"]["bootstrap_project"][
+        "path"
+    ] == "/api/project/bootstrap"
+    assert route_guide["system_operation_index"]["operations"]["redeploy"][
+        "mcp_tool"
+    ] == "governance_redeploy"
+    assert route_guide["system_operation_index"]["operations"]["reconcile"][
+        "queue_path"
+    ] == "/api/graph-governance/{project_id}/pending-scope"
+    assert route_guide["interface_index"]["hotfix_enter"]["path"] == (
+        "/api/projects/{project_id}/hotfix/enter"
+    )
+    assert route_guide["interface_index"]["mf_parallel_enter"]["path"] == (
+        "/api/projects/{project_id}/mf-parallel/enter"
+    )
+    assert route_guide["raw_route_token_required"] is False
+    assert route_guide["raw_route_token_exposed"] is False
     execution_id = started["contract_execution_id"]
 
     forged = server.handle_project_onboard_contract_line_write(
@@ -23156,6 +23228,9 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert forged["agent_onboard_guidance"]["route_token_issue"][
         "observer_route_context_issue_payload"
     ]["task_id"] == execution_id
+    assert forged["agent_onboard_guidance"]["onboard_route_guide"][
+        "next_legal_action"
+    ] == forged["next_legal_action"]
 
     current = server.handle_project_onboard_contract_current_state(
         _ctx_with_role(
@@ -23173,6 +23248,9 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert current["agent_onboard_guidance"]["route_token_ref_guidance"][
         "current_route_token_ref"
     ] == "rtok-onboard-root"
+    assert current["agent_onboard_guidance"]["onboard_route_guide"][
+        "backlog_chain_binding"
+    ]["continue"]["next_legal_action"] == current["next_legal_action"]
 
 
 def test_onboard_contract_facade_guidance_requests_route_ref_when_missing(conn):
@@ -23215,6 +23293,10 @@ def test_onboard_contract_facade_guidance_requests_route_ref_when_missing(conn):
     ]
     assert guidance["raw_route_token_required"] is False
     assert guidance["raw_route_token_exposed"] is False
+    assert guidance["onboard_route_guide"]["route_token_ref_present"] is False
+    assert guidance["onboard_route_guide"]["interface_index"]["backlog_get"][
+        "mcp_tool"
+    ] == "backlog_get"
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):

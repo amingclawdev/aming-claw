@@ -34453,6 +34453,385 @@ def _onboard_contract_route_issue_target_files(
     return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
 
 
+def _onboard_contract_route_guide(
+    record: Mapping[str, Any],
+    *,
+    next_legal_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    contract_execution_id = str(record.get("contract_execution_id") or "")
+    route_token_ref = str(record.get("route_token_ref") or "")
+    chain = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_id": str(record.get("contract_id") or ""),
+        "contract_execution_id": contract_execution_id,
+        "root_contract_execution_id": str(
+            record.get("root_contract_execution_id") or ""
+        ),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+    }
+    role_options = [
+        {
+            "id": "observer",
+            "role": "observer",
+            "aliases": ["coordinator", "owner"],
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.observer",
+        },
+        {
+            "id": "worker",
+            "role": "worker",
+            "aliases": ["mf_sub", "sub_worker"],
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.worker",
+        },
+        {
+            "id": "qa",
+            "role": "qa",
+            "aliases": ["verifier", "independent_verification"],
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.qa",
+        },
+    ]
+    work_type_options = [
+        {
+            "id": "capability_query",
+            "entry": "agent_onboard_guidance.onboard_route_guide.capability_index",
+        },
+        {
+            "id": "system_operation",
+            "entry": "agent_onboard_guidance.onboard_route_guide.system_operation_index",
+        },
+        {
+            "id": "continue_contract_chain",
+            "entry": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
+        },
+        {
+            "id": "observer_hotfix",
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.observer.next_contracts",
+        },
+        {
+            "id": "parallel_worker",
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.worker",
+        },
+        {
+            "id": "qa_verification",
+            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.qa",
+        },
+        {
+            "id": "rollback_or_recover_contract",
+            "entry": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding.rollback",
+        },
+    ]
+    interface_index = {
+        "onboard_start": {
+            "kind": "http",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/onboard-contract/start",
+        },
+        "onboard_current": {
+            "kind": "http",
+            "method": "GET",
+            "path": (
+                "/api/projects/{project_id}/onboard-contract/"
+                "{contract_execution_id}/current-state"
+            ),
+        },
+        "onboard_submit_line": {
+            "kind": "http",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/onboard-contract/"
+                "{contract_execution_id}/line-writes"
+            ),
+        },
+        "observer_route_context_issue": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "observer_route_context_issue",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+        },
+        "hotfix_enter": {
+            "kind": "http",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/hotfix/enter",
+        },
+        "mf_parallel_enter": {
+            "kind": "http",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/mf-parallel/enter",
+        },
+        "contract_runtime_current": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_runtime_current",
+            "method": "GET",
+            "path": (
+                "/api/projects/{project_id}/contract-runtime/"
+                "{contract_execution_id}/current-state"
+            ),
+        },
+        "contract_runtime_submit_line": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_runtime_submit_line",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/contract-runtime/"
+                "{contract_execution_id}/line-writes"
+            ),
+        },
+        "runtime_context_worker_guide": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "runtime_context_worker_guide",
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/worker-guide"
+            ),
+        },
+        "qa_session_register": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "qa_session_register",
+        },
+        "task_timeline_append": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "task_timeline_append",
+            "method": "POST",
+            "path": "/api/task/{project_id}/timeline",
+        },
+        "graph_query": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "graph_query",
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/query",
+        },
+        "backlog_get": {
+            "kind": "mcp",
+            "mcp_tool": "backlog_get",
+        },
+        "backlog_list": {
+            "kind": "mcp",
+            "mcp_tool": "backlog_list",
+        },
+    }
+    worker_entry = {
+        "role": "worker",
+        "aliases": ["mf_sub", "sub_worker"],
+        "entrypoint": "runtime_context_worker_guide",
+        "required_identity": [
+            "runtime_context_id",
+            "parent_task_id",
+            "task_id",
+            "fence_token",
+            "target_project_root",
+            "session_token_ref",
+        ],
+        "required_token_refs": ["session_token_ref", "route_token_ref"],
+        "next_action": "read runtime_context_worker_guide, then submit the next required worker evidence line",
+        "raw_session_token_required": False,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    qa_entry = {
+        "role": "qa",
+        "aliases": ["verifier", "independent_verification"],
+        "entrypoint": "qa_session_register",
+        "required_identity": [
+            "project_id",
+            "parent_task_id",
+            "task_id or contract_execution_id",
+            "qa_session_token_ref or route_token_ref",
+        ],
+        "required_token_refs": [
+            "qa_session_token_ref",
+            "qa_child_route_token_ref",
+            "route_token_ref",
+        ],
+        "next_action": (
+            "register or rejoin QA, read contract/runtime current state, "
+            "then append independent verification evidence"
+        ),
+        "raw_qa_session_token_required": False,
+        "raw_qa_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        "schema_version": "onboard_contract.route_guide_service.v1",
+        "service": {
+            "id": "onboard_route_guide",
+            "kind": "guide_service",
+            "source": "onboard_contract_facade",
+        },
+        "guide_steps": [
+            {
+                "id": "confirm_role",
+                "order": 1,
+                "options": role_options,
+                "selection_required": True,
+            },
+            {
+                "id": "confirm_work_type",
+                "order": 2,
+                "options": work_type_options,
+                "selection_required": True,
+            },
+            {
+                "id": "bind_backlog_contract_chain",
+                "order": 3,
+                "binding": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
+            },
+            {
+                "id": "return_execution_guidance",
+                "order": 4,
+                "binding": "agent_onboard_guidance.onboard_route_guide.role_entries",
+            },
+        ],
+        "role_options": role_options,
+        "work_type_options": work_type_options,
+        "backlog_chain_binding": {
+            "schema_version": "onboard_contract.backlog_chain_binding.v1",
+            **chain,
+            "continue": {
+                "interface": "onboard_current",
+                "next_legal_action": dict(next_legal_action),
+            },
+            "create_successor": {
+                "observer_hotfix": {
+                    "interface": "hotfix_enter",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                },
+                "mf_parallel": {
+                    "interface": "mf_parallel_enter",
+                    "requires_role": "observer",
+                    "requires_route_token_ref": True,
+                },
+            },
+            "rollback": {
+                "interface": "onboard_start",
+                "body_fields": ["backlog_id", "recovery_policy=start_new_execution"],
+            },
+        },
+        "role_entries": {
+            "observer": {
+                "role": "observer",
+                "entrypoint": "onboard_start or onboard_current",
+                "required_identity": [
+                    "observer_session_id",
+                    "observer_route_token_ref",
+                ],
+                "required_token_refs": ["observer_route_token_ref", "route_token_ref"],
+                "current_route_token_ref_present": bool(route_token_ref),
+                "next_action": "follow next_legal_action or create a successor contract/runtime",
+                "next_contracts": [
+                    {
+                        "contract_id": "observer_hotfix",
+                        "interface": "hotfix_enter",
+                    },
+                    {
+                        "contract_id": "mf_parallel",
+                        "interface": "mf_parallel_enter",
+                    },
+                    {
+                        "contract_id": "qa_session",
+                        "interface": "qa_session_register",
+                    },
+                ],
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "worker": worker_entry,
+            "sub_worker": {
+                **worker_entry,
+                "role": "sub_worker",
+                "alias_of": "worker",
+            },
+            "qa": qa_entry,
+        },
+        "capability_index": {
+            "schema_version": "onboard_contract.capability_index.v1",
+            "query_returns": [
+                "role_options",
+                "work_type_options",
+                "interface_index",
+                "system_operation_index",
+                "backlog_chain_binding",
+            ],
+            "interfaces": [
+                "graph_query",
+                "backlog_get",
+                "backlog_list",
+                "observer_route_context_issue",
+                "runtime_context_worker_guide",
+                "qa_session_register",
+                "contract_runtime_current",
+                "contract_runtime_submit_line",
+                "task_timeline_append",
+            ],
+            "index_paths": {
+                "roles": "agent_onboard_guidance.onboard_route_guide.role_entries",
+                "interfaces": "agent_onboard_guidance.onboard_route_guide.interface_index",
+                "system_operations": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "system_operation_index"
+                ),
+                "chain": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
+            },
+        },
+        "system_operation_index": {
+            "schema_version": "onboard_contract.system_operation_index.v1",
+            "operations": {
+                "install": {
+                    "kind": "operator_cli",
+                    "command": "aming-claw launcher",
+                    "gated": True,
+                },
+                "start_governance": {
+                    "kind": "operator_cli",
+                    "command": "aming-claw start",
+                    "gated": True,
+                },
+                "bootstrap_project": {
+                    "kind": "http",
+                    "method": "POST",
+                    "path": "/api/project/bootstrap",
+                    "gated": True,
+                },
+                "status": {
+                    "kind": "mcp",
+                    "mcp_tools": [
+                        "runtime_status",
+                        "graph_status",
+                        "graph_operations_queue",
+                    ],
+                },
+                "redeploy": {
+                    "kind": "mcp",
+                    "mcp_tool": "governance_redeploy",
+                    "gated": True,
+                },
+                "reconcile": {
+                    "kind": "mcp_or_http",
+                    "mcp_tools": [
+                        "graph_operations_queue",
+                        "graph_pending_scope_queue",
+                    ],
+                    "status_path": "/api/graph-governance/{project_id}/operations/queue",
+                    "queue_path": "/api/graph-governance/{project_id}/pending-scope",
+                    "gated": True,
+                },
+            },
+        },
+        "interface_index": interface_index,
+        "next_legal_action": dict(next_legal_action),
+        "route_token_ref": route_token_ref,
+        "route_token_ref_present": bool(route_token_ref),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _onboard_contract_agent_guidance(
     record: Mapping[str, Any],
     *,
@@ -34557,6 +34936,10 @@ def _onboard_contract_agent_guidance(
             ),
             "contract_chain_id": str(record.get("contract_chain_id") or ""),
         },
+        "onboard_route_guide": _onboard_contract_route_guide(
+            record,
+            next_legal_action=next_legal_action,
+        ),
         "entrypoints": {
             "onboard_start": {
                 "method": "POST",
