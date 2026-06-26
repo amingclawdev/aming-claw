@@ -26492,6 +26492,39 @@ def test_observer_route_context_issue_allowed_actions_expands_hotfix_facade_alia
     assert allowed == ["observer_hotfix_enter", "hotfix_enter"]
 
 
+def _insert_mf_parallel_source_backed_runtime_context(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str = "parallel-source-backed-worker",
+    parent_task_id: str | None = None,
+    fence_token: str = "fence-parallel-source-backed",
+    token: str = "parallel-source-backed-worker-token",
+) -> BranchTaskRuntimeContext:
+    return upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            parent_task_id=parent_task_id or backlog_id,
+            root_task_id=parent_task_id or backlog_id,
+            backlog_id=backlog_id,
+            worker_id=f"worker-{task_id}",
+            worker_slot_id=f"worker-{task_id}",
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=f"/tmp/{task_id}",
+            branch_ref=f"refs/heads/codex/{task_id}",
+            worktree_path=f"/tmp/{task_id}",
+            fence_token=fence_token,
+            session_token_hash=mf_subagent_session_token_hash(token),
+            status="worktree_ready",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+        now_iso="2026-06-25T12:00:00Z",
+    )
+
+
 def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     backlog_id = "AC-MF-PARALLEL-SOURCE-BACKED-SUCCESSOR"
     task_id = "parallel-source-backed-task"
@@ -26589,6 +26622,10 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
         "observer_dispatch_bounded_workers"
     )
 
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+    )
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
@@ -26598,6 +26635,16 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
                 "stage_id": "dispatch",
                 "line_id": "observer_dispatch_bounded_workers",
                 "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                },
             },
         )
     )
@@ -26619,30 +26666,41 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert forged_worker_read["ok"] is False
     assert "cannot write line" in forged_worker_read["decision"]["errors"][0]
 
-    runtime_context = upsert_branch_context(
-        conn,
-        BranchTaskRuntimeContext(
-            project_id=PID,
-            task_id="parallel-source-backed-worker",
-            parent_task_id=result["contract_execution_id"],
-            root_task_id=result["contract_execution_id"],
-            backlog_id=backlog_id,
-            worker_id="worker-parallel-source-backed",
-            worker_slot_id="worker-parallel-source-backed",
-            governance_project_id=PID,
-            target_project_id=PID,
-            target_project_root="/tmp/parallel-source-backed-worker",
-            branch_ref="refs/heads/codex/parallel-source-backed-worker",
-            worktree_path="/tmp/parallel-source-backed-worker",
-            fence_token="fence-parallel-source-backed",
-            session_token_hash=mf_subagent_session_token_hash(
-                "parallel-source-backed-worker-token"
-            ),
-            status="worktree_ready",
-            lease_expires_at="2999-01-01T00:00:00Z",
-        ),
-        now_iso="2026-06-25T12:00:00Z",
+    with pytest.raises(PermissionDeniedError) as wrong_parent_contract:
+        server.handle_project_contract_runtime_line_write(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result["contract_execution_id"],
+                },
+                method="POST",
+                body={
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "parent_contract_execution_id": "cex-wrong-parent",
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-parallel-source-backed",
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                    "target_project_root": "/tmp/parallel-source-backed-worker",
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "evidence_kind": "read_receipt",
+                    "payload": {
+                        "schema_version": "mf_parallel.worker_read_receipt.v1",
+                        "runtime_context_id": runtime_context.runtime_context_id,
+                        "task_id": runtime_context.task_id,
+                    },
+                },
+            )
+        )
+    assert (
+        wrong_parent_contract.value.details["proof_error"]
+        == "parent_contract_execution_mismatch"
     )
+
     worker_read = server.handle_project_contract_runtime_line_write(
         _ctx(
             {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
@@ -26650,7 +26708,7 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
             body={
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
-                "parent_task_id": result["contract_execution_id"],
+                "parent_task_id": backlog_id,
                 "worker_role": "mf_sub",
                 "fence_token": "fence-parallel-source-backed",
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
@@ -26669,6 +26727,215 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert worker_read["ok"] is True
     assert worker_read["actor_role"] == "mf_sub"
     assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+
+
+def test_mf_parallel_worker_read_rejects_runtime_context_only_in_non_dispatch_line(conn):
+    backlog_id = "AC-MF-PARALLEL-RUNTIME-CONTEXT-NON-DISPATCH"
+    task_id = "parallel-non-dispatch-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-non-dispatch-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-mf-parallel-non-dispatch-root",
+                "worker_fence": {
+                    "fence_token": "fence-non-dispatch",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    assert result["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-non-dispatch-worker",
+        fence_token="fence-non-dispatch",
+        token="parallel-non-dispatch-worker-token",
+    )
+
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+                "payload": {
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                },
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {"worker_role": "mf_sub"},
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    with pytest.raises(PermissionDeniedError) as blocked:
+        server.handle_project_contract_runtime_line_write(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result["contract_execution_id"],
+                },
+                method="POST",
+                body={
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-non-dispatch",
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                    "target_project_root": "/tmp/parallel-non-dispatch-worker",
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "evidence_kind": "read_receipt",
+                },
+            )
+        )
+    assert (
+        blocked.value.details["proof_error"]
+        == "runtime_context_not_dispatched_for_contract_execution"
+    )
+
+
+def test_mf_parallel_worker_read_rejects_dispatch_parent_task_mismatch(conn):
+    backlog_id = "AC-MF-PARALLEL-DISPATCH-PARENT-MISMATCH"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-dispatch-parent-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": "parallel-dispatch-parent-task",
+                "route_token_ref": "rtok-mf-parallel-dispatch-parent-root",
+                "worker_fence": {
+                    "fence_token": "fence-dispatch-parent",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    assert result["ok"] is True
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-dispatch-parent-worker",
+        fence_token="fence-dispatch-parent",
+        token="parallel-dispatch-parent-worker-token",
+    )
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": "AC-WRONG-PARENT",
+                "worker_role": "mf_sub",
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    with pytest.raises(PermissionDeniedError) as blocked:
+        server.handle_project_contract_runtime_line_write(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": result["contract_execution_id"],
+                },
+                method="POST",
+                body={
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-dispatch-parent",
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                    "target_project_root": "/tmp/parallel-dispatch-parent-worker",
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "evidence_kind": "read_receipt",
+                },
+            )
+        )
+    assert (
+        blocked.value.details["proof_error"]
+        == "runtime_context_not_dispatched_for_contract_execution"
+    )
 
 
 def test_mf_parallel_enter_accepts_verified_observer_route_ref(conn):

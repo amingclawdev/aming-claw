@@ -33571,6 +33571,68 @@ def _contract_runtime_next_line(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return next_line if isinstance(next_line, Mapping) else {}
 
 
+def _contract_runtime_record_references_runtime_context(
+    record: Mapping[str, Any] | None,
+    context,
+) -> bool:
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
+        record, Mapping
+    ):
+        return False
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return False
+
+    def _line_value(line: Mapping[str, Any], *keys: str) -> str:
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        for source in (line, payload):
+            for key in keys:
+                text = str(source.get(key) or "").strip()
+                if text:
+                    return text
+        return ""
+
+    for line in completed_lines:
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "").strip() != "dispatch"
+            or str(line.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+            or str(line.get("actor_role") or "").strip() != "observer"
+        ):
+            continue
+        if _line_value(line, "runtime_context_id") != runtime_context_id:
+            continue
+        if _line_value(line, "task_id") != task_id:
+            continue
+        if _line_value(line, "parent_task_id") != parent_task_id:
+            continue
+        if (
+            _line_value(line, "worker_role", "role")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            != "mf_sub"
+        ):
+            continue
+        return True
+    return False
+
+
 def _resolve_contract_runtime_mf_sub_proof(
     ctx: RequestContext,
     conn,
@@ -33655,16 +33717,59 @@ def _resolve_contract_runtime_mf_sub_proof(
         )
 
     parent_task_id = _contract_runtime_ref_value(ctx, "parent_task_id")
-    if contract_execution_id and parent_task_id != contract_execution_id:
+    expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if parent_task_id and parent_task_id != expected_parent_task_id:
         raise PermissionDeniedError(
             "coordinator",
             action,
             {
                 "required_role": "mf_sub",
-                "proof_error": "contract_execution_parent_task_mismatch",
+                "proof_error": "runtime_context_parent_task_mismatch",
                 "runtime_context_id": runtime_context_id,
                 "parent_task_id": parent_task_id,
-                "expected_parent_task_id": contract_execution_id,
+                "expected_parent_task_id": expected_parent_task_id,
+            },
+        )
+
+    parent_contract_execution_id = _contract_runtime_ref_value(
+        ctx,
+        "parent_contract_execution_id",
+        "contract_parent_execution_id",
+    )
+    expected_parent_contract_execution_id = str(
+        (record or {}).get("parent_contract_execution_id") or ""
+    )
+    if (
+        parent_contract_execution_id
+        and expected_parent_contract_execution_id
+        and parent_contract_execution_id != expected_parent_contract_execution_id
+    ):
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "mf_sub",
+                "proof_error": "parent_contract_execution_mismatch",
+                "runtime_context_id": runtime_context_id,
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "expected_parent_contract_execution_id": (
+                    expected_parent_contract_execution_id
+                ),
+            },
+        )
+
+    if not _contract_runtime_record_references_runtime_context(
+        record,
+        context,
+    ):
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "mf_sub",
+                "proof_error": "runtime_context_not_dispatched_for_contract_execution",
+                "runtime_context_id": runtime_context_id,
+                "contract_execution_id": contract_execution_id,
             },
         )
 
