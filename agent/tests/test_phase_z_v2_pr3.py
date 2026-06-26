@@ -139,8 +139,8 @@ class TestBuildGraphV2FromSymbols:
             result = build_graph_v2_from_symbols(project, dry_run=True)
 
         assert calls
-        assert calls[0]["kwargs"]["label"] == "phase_z_v2_dfs_coloring"
-        assert len(calls[0]["tasks"]) == 2
+        dfs_call = next(call for call in calls if call["kwargs"]["label"] == "phase_z_v2_dfs_coloring")
+        assert len(dfs_call["tasks"]) == 2
         trace_steps = {step["name"]: step for step in result["phase_trace"]["steps"]}
         metrics = trace_steps["dfs_coloring"]["metrics"]
         assert metrics["parallelized"] is True

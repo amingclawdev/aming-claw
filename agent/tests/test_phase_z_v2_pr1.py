@@ -15,12 +15,14 @@ from typing import Dict, List
 
 import pytest
 
+from agent.governance.reconcile_phases import phase_z_v2 as phase_z_v2_module
 from agent.governance.reconcile_phases.phase_z_v2 import (
     EXCLUDE_DIRS,
     CallGraph,
     FunctionMeta,
     ModuleInfo,
     build_function_call_facts,
+    build_function_call_facts_parallel,
     build_call_graph,
     enrich_nodes_with_function_call_facts,
     handle_cycle,
@@ -83,6 +85,207 @@ def _make_modules(module_specs: Dict[str, Dict]) -> Dict[str, ModuleInfo]:
             language=spec.get("language", ""),
         )
     return modules
+
+
+def test_coverage_scan_cache_matches_direct_lookup(tmp_path):
+    project = _make_project(str(tmp_path), {
+        "agent/__init__.py": "",
+        "agent/service.py": """\
+            def run():
+                return 1
+        """,
+        "tests/test_service.py": """\
+            from agent.service import run
+
+            def test_run():
+                assert run() == 1
+        """,
+        "docs/service.md": "See agent/service.py for details.\n",
+    })
+    primary = os.path.join(project, "agent", "service.py")
+
+    cache = phase_z_v2_module.build_coverage_scan_cache(project)
+
+    assert phase_z_v2_module.find_test_coverage(
+        project,
+        primary,
+        coverage_scan_cache=cache,
+    ) == phase_z_v2_module.find_test_coverage(project, primary)
+    assert phase_z_v2_module.find_doc_coverage(
+        project,
+        primary,
+        coverage_scan_cache=cache,
+    ) == phase_z_v2_module.find_doc_coverage(project, primary)
+
+
+def test_extract_typed_relations_parallel_matches_serial_with_fake_pool(tmp_path):
+    project = _make_project(str(tmp_path), {
+        "agent/__init__.py": "",
+        "agent/service.py": """\
+            CREATE_TABLE_SQL = "CREATE TABLE tasks (id TEXT)"
+            INSERT_SQL = "INSERT INTO tasks VALUES (?)"
+
+            def create_task():
+                return "task.created"
+        """,
+        "agent/api.py": """\
+            def create_task_route():
+                return "/api/task"
+        """,
+    })
+    modules = parse_production_modules(project)
+
+    class FakePool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            task_list = list(tasks)
+            module_names = [task["module"]["module_name"] for task in task_list]
+            assert module_names == sorted(module_names)
+            assert {"agent.api", "agent.service"}.issubset(set(module_names))
+            return [worker(task) for task in task_list]
+
+    serial = phase_z_v2_module.extract_typed_relations(project, modules)
+    parallel, execution = phase_z_v2_module.extract_typed_relations_parallel(
+        project,
+        modules,
+        cpu_count=8,
+        process_pool_factory=FakePool,
+    )
+
+    assert parallel == serial
+    assert execution["strategy"] == "parallel_process_pool"
+    assert execution["parallelized"] is True
+    assert execution["worker_count"] >= 2
+    assert execution["module_count"] >= 2
+
+
+def test_extract_typed_relations_parallel_falls_back_when_pool_fails(tmp_path):
+    project = _make_project(str(tmp_path), {
+        "agent/__init__.py": "",
+        "agent/service.py": """\
+            CREATE_TABLE_SQL = "CREATE TABLE tasks (id TEXT)"
+            INSERT_SQL = "INSERT INTO tasks VALUES (?)"
+        """,
+        "agent/api.py": """\
+            def create_task_route():
+                return "/api/task"
+        """,
+    })
+    modules = parse_production_modules(project)
+
+    class FailingPool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            raise RuntimeError("typed relation pool unavailable")
+
+    serial = phase_z_v2_module.extract_typed_relations(project, modules)
+    fallback, execution = phase_z_v2_module.extract_typed_relations_parallel(
+        project,
+        modules,
+        cpu_count=8,
+        process_pool_factory=FailingPool,
+    )
+
+    assert fallback == serial
+    assert execution["strategy"] == "serial_fallback"
+    assert execution["parallelized"] is False
+    assert execution["fallback_reason"] == "process_pool_failed"
+    assert execution["fallback_error_type"] == "RuntimeError"
+
+
+def test_parse_production_modules_parallel_matches_serial_with_fake_pool(tmp_path):
+    project = _make_project(str(tmp_path), {
+        "agent/__init__.py": "",
+        "agent/service.py": "def run():\n    return 1\n",
+        "agent/worker.py": "def work():\n    return 2\n",
+        "tests/test_service.py": "def test_run():\n    assert True\n",
+    })
+
+    class FakePool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            task_list = list(tasks)
+            rel_paths = [task["rel_path"] for task in task_list]
+            assert rel_paths == sorted(rel_paths)
+            assert "tests/test_service.py" not in rel_paths
+            return [worker(task) for task in task_list]
+
+    serial = parse_production_modules(project)
+    parallel, execution = phase_z_v2_module.parse_production_modules_parallel(
+        project,
+        cpu_count=8,
+        process_pool_factory=FakePool,
+    )
+
+    assert sorted(parallel) == sorted(serial)
+    assert {
+        name: [func.qualified_name for func in module.functions]
+        for name, module in parallel.items()
+    } == {
+        name: [func.qualified_name for func in module.functions]
+        for name, module in serial.items()
+    }
+    assert execution["strategy"] == "parallel_process_pool"
+    assert execution["parallelized"] is True
+    assert execution["source_file_count"] >= 2
+
+
+def test_parse_production_modules_parallel_falls_back_when_pool_fails(tmp_path):
+    project = _make_project(str(tmp_path), {
+        "agent/__init__.py": "",
+        "agent/service.py": "def run():\n    return 1\n",
+        "agent/worker.py": "def work():\n    return 2\n",
+    })
+
+    class FailingPool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            raise RuntimeError("parser pool unavailable")
+
+    serial = parse_production_modules(project)
+    fallback, execution = phase_z_v2_module.parse_production_modules_parallel(
+        project,
+        cpu_count=8,
+        process_pool_factory=FailingPool,
+    )
+
+    assert sorted(fallback) == sorted(serial)
+    assert execution["strategy"] == "serial_fallback"
+    assert execution["parallelized"] is False
+    assert execution["fallback_reason"] == "process_pool_failed"
+    assert execution["fallback_error_type"] == "RuntimeError"
 
 
 # ===========================================================================
@@ -406,6 +609,199 @@ class TestBuildCallGraph:
         assert nodes[1]["function_calls"][0]["callee"] == "mod_a::helper"
         assert nodes[0]["function_called_by"][0]["caller"] == "mod_b::work"
         assert nodes[0]["function_called_by_count"] == 1
+
+    def test_build_function_call_facts_parallel_matches_serial_with_fake_pool(self):
+        """Parallel worker partitioning preserves the serial fact contract."""
+
+        class FakePool:
+            def __init__(self, max_workers: int):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, worker, tasks):
+                task_list = list(tasks)
+                assert [task["module_name"] for task in task_list] == ["mod_b", "mod_c"]
+                return [worker(task) for task in task_list]
+
+        modules = _make_modules({
+            "mod_a": {
+                "functions": [
+                    {"name": "helper", "calls": []},
+                ],
+            },
+            "mod_b": {
+                "import_map": {"helper": "mod_a.helper"},
+                "functions": [
+                    {"name": "work", "calls": ["helper"]},
+                ],
+            },
+            "mod_c": {
+                "import_map": {"helper": "mod_a.helper"},
+                "functions": [
+                    {"name": "run", "calls": ["helper"]},
+                ],
+            },
+        })
+        graph = build_call_graph(modules)
+
+        serial = build_function_call_facts(modules, graph)
+        parallel, observability = build_function_call_facts_parallel(
+            modules,
+            graph,
+            cpu_count=8,
+            process_pool_factory=FakePool,
+        )
+
+        assert parallel == serial
+        assert observability["strategy"] == "parallel_process_pool"
+        assert observability["parallelized"] is True
+        assert observability["worker_count"] == 2
+        assert observability["task_partition"] == "caller_module"
+
+    def test_build_function_call_facts_parallel_falls_back_to_serial_on_pool_failure(self):
+        """Process-pool failure uses shared serial fallback without changing facts."""
+
+        class FailingPool:
+            def __init__(self, max_workers: int):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, worker, tasks):
+                raise RuntimeError("pool unavailable")
+
+        modules = _make_modules({
+            "mod_a": {
+                "functions": [
+                    {"name": "helper", "calls": []},
+                ],
+            },
+            "mod_b": {
+                "import_map": {"helper": "mod_a.helper"},
+                "functions": [
+                    {"name": "work", "calls": ["helper"]},
+                ],
+            },
+            "mod_c": {
+                "import_map": {"helper": "mod_a.helper"},
+                "functions": [
+                    {"name": "run", "calls": ["helper"]},
+                ],
+            },
+        })
+        graph = build_call_graph(modules)
+
+        serial = build_function_call_facts(modules, graph)
+        fallback, observability = build_function_call_facts_parallel(
+            modules,
+            graph,
+            cpu_count=8,
+            process_pool_factory=FailingPool,
+        )
+
+        assert fallback == serial
+        assert observability["strategy"] == "serial_fallback"
+        assert observability["parallelized"] is False
+        assert observability["fallback_reason"] == "process_pool_failed"
+        assert observability["fallback_error_type"] == "RuntimeError"
+
+    def test_build_graph_v2_records_function_call_fact_parallel_observability(self, tmp_path, monkeypatch):
+        """Full graph build exposes function-call fact executor details in phase trace."""
+
+        class FakePool:
+            def __init__(self, max_workers: int):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, worker, tasks):
+                return [worker(task) for task in list(tasks)]
+
+        def fake_dfs_color_from_entries_parallel(edges, entries, track_distance=False, **kwargs):
+            color_sets, color_count_map = phase_z_v2_module.dfs_color_from_entries(
+                edges,
+                entries,
+                track_distance=track_distance,
+            )
+            return color_sets, color_count_map, {
+                "strategy": "serial",
+                "worker_count": 1,
+                "parallelized": False,
+            }
+
+        original_parallel = phase_z_v2_module.build_function_call_facts_parallel
+
+        def fake_build_function_call_facts_parallel(modules, call_graph, **kwargs):
+            return original_parallel(
+                modules,
+                call_graph,
+                graph_enrich_config_rules=kwargs.get("graph_enrich_config_rules"),
+                cpu_count=8,
+                process_pool_factory=FakePool,
+            )
+
+        monkeypatch.setattr(
+            phase_z_v2_module,
+            "dfs_color_from_entries_parallel",
+            fake_dfs_color_from_entries_parallel,
+        )
+        monkeypatch.setattr(
+            phase_z_v2_module,
+            "build_function_call_facts_parallel",
+            fake_build_function_call_facts_parallel,
+        )
+        project = _make_project(str(tmp_path), {
+            "agent/__init__.py": "",
+            "agent/a.py": """\
+                from agent.b import helper
+
+                def work():
+                    helper()
+            """,
+            "agent/c.py": """\
+                from agent.b import helper
+
+                def run():
+                    helper()
+            """,
+            "agent/b.py": """\
+                def helper():
+                    return 1
+            """,
+        })
+
+        result = phase_z_v2_module.build_graph_v2_from_symbols(
+            project,
+            dry_run=True,
+            scratch_dir=str(tmp_path / "scratch"),
+            run_id="test-function-call-facts-parallel",
+        )
+
+        function_step = next(
+            step
+            for step in result["phase_trace"]["steps"]
+            if step["name"] == "function_call_facts"
+        )
+        metrics = function_step["metrics"]
+        assert metrics["strategy"] == "parallel_process_pool"
+        assert metrics["parallelized"] is True
+        assert metrics["worker_count"] == 2
+        assert metrics["fallback_reason"] == ""
+        assert metrics["executor"]["label"] == "phase_z_v2_function_call_facts"
+        assert metrics["executor"]["task_partition"] == "caller_module"
 
 
 # ===========================================================================

@@ -1199,6 +1199,23 @@ def _source_path_incremental_eligibility(
     target_commit: str = "",
 ) -> dict[str, Any]:
     node = _node_for_primary_path(active_graph_json, path)
+    return _source_path_incremental_eligibility_for_node(
+        project_root,
+        node,
+        path,
+        active_commit=active_commit,
+        target_commit=target_commit,
+    )
+
+
+def _source_path_incremental_eligibility_for_node(
+    project_root: str | Path,
+    node: dict[str, Any] | None,
+    path: str,
+    *,
+    active_commit: str = "",
+    target_commit: str = "",
+) -> dict[str, Any]:
     if not node:
         return {"supported": False, "reason": "source_primary_node_not_unique", "path": path}
     module = parse_production_module_file(str(Path(project_root).resolve()), path)
@@ -1304,6 +1321,71 @@ def _source_path_incremental_eligibility(
     }
 
 
+def _source_path_incremental_eligibility_worker(task: Mapping[str, Any]) -> dict[str, Any]:
+    path = _norm_repo_path(task.get("path"))
+    node = task.get("node")
+    return _source_path_incremental_eligibility_for_node(
+        str(task.get("project_root") or ""),
+        node if isinstance(node, dict) else None,
+        path,
+        active_commit=str(task.get("active_commit") or ""),
+        target_commit=str(task.get("target_commit") or ""),
+    )
+
+
+def _serial_source_eligibility_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    fallback_reason: str,
+    error: Exception | None = None,
+) -> dict[str, Any]:
+    observability: dict[str, Any] = {
+        "schema_version": "reconcile_parallel_executor.v1",
+        "label": "source_eligibility",
+        "strategy": "serial",
+        "fallback_reason": fallback_reason,
+        "fallback_error_type": type(error).__name__ if error else "",
+        "fallback_error": str(error) if error else "",
+        "deterministic_order": "input_order",
+        "task_count": len(tasks),
+        "worker_count": 1,
+    }
+    return {
+        "results": [_source_path_incremental_eligibility_worker(task) for task in tasks],
+        "observability": observability,
+    }
+
+
+def _run_source_eligibility_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    max_workers: int | None = None,
+    process_pool_factory: Any | None = None,
+) -> dict[str, Any]:
+    if not tasks:
+        return _serial_source_eligibility_tasks(tasks, fallback_reason="no_tasks")
+    if _run_reconcile_parallel_tasks is None:
+        return _serial_source_eligibility_tasks(
+            tasks,
+            fallback_reason="parallel_executor_unavailable",
+            error=_RECONCILE_PARALLEL_IMPORT_ERROR,
+        )
+    try:
+        return _run_reconcile_parallel_tasks(
+            tasks,
+            _source_path_incremental_eligibility_worker,
+            label="source_eligibility",
+            max_workers=max_workers,
+            process_pool_factory=process_pool_factory,
+        )
+    except Exception as exc:
+        return _serial_source_eligibility_tasks(
+            tasks,
+            fallback_reason="parallel_executor_unhandled_error",
+            error=exc,
+        )
+
+
 def _node_ids_for_paths(graph_json: dict[str, Any], paths: set[str]) -> list[str]:
     if not paths:
         return []
@@ -1354,6 +1436,8 @@ def _incremental_metadata_scope_eligibility(
     new_rows: list[dict[str, Any]],
     active_commit: str = "",
     target_commit: str = "",
+    source_eligibility_max_workers: int | None = None,
+    source_eligibility_process_pool_factory: Any | None = None,
 ) -> dict[str, Any]:
     if scope_file_delta.get("status_changed_files"):
         return {"supported": False, "reason": "inventory_status_change_requires_full_rebuild"}
@@ -1435,6 +1519,8 @@ def _incremental_metadata_scope_eligibility(
     source_paths: list[str] = []
     metadata_paths: list[str] = []
     test_paths: list[str] = []
+    source_tasks: list[dict[str, Any]] = []
+    classified_paths: list[dict[str, str]] = []
     for path in sorted(impacted):
         if path in test_file_set_paths:
             test_paths.append(path)
@@ -1450,13 +1536,67 @@ def _incremental_metadata_scope_eligibility(
             metadata_paths.append(path)
             continue
         if kind == "source" and role == "primary":
-            check = _source_path_incremental_eligibility(
-                project_root,
-                active_graph_json,
-                path,
-                active_commit=active_commit,
-                target_commit=target_commit,
-            )
+            node = _node_for_primary_path(active_graph_json, path)
+            classified_paths.append({
+                "path": path,
+                "file_kind": kind,
+                "attachment_role": role,
+                "classification": "source",
+            })
+            source_tasks.append({
+                "project_root": str(Path(project_root).resolve()),
+                "path": path,
+                "node": _json_clone(node) if node else None,
+                "active_commit": active_commit,
+                "target_commit": target_commit,
+            })
+            continue
+        if kind not in _INCREMENTAL_METADATA_FILE_KINDS or role == "primary":
+            classified_paths.append({
+                "path": path,
+                "file_kind": kind,
+                "attachment_role": role,
+                "classification": "unsupported",
+            })
+
+    source_eligibility_execution: dict[str, Any] = {}
+    source_checks_by_path: dict[str, dict[str, Any]] = {}
+    if source_tasks:
+        source_execution = _run_source_eligibility_tasks(
+            source_tasks,
+            max_workers=source_eligibility_max_workers,
+            process_pool_factory=source_eligibility_process_pool_factory,
+        )
+        source_eligibility_execution = dict(source_execution.get("observability") or {})
+        source_results = [
+            item for item in source_execution.get("results", []) or []
+            if isinstance(item, dict)
+        ]
+        if len(source_results) != len(source_tasks):
+            return {
+                "supported": False,
+                "reason": "source_eligibility_parallel_result_mismatch",
+                "expected_result_count": len(source_tasks),
+                "actual_result_count": len(source_results),
+                "source_checks": source_results,
+                "source_eligibility_execution": source_eligibility_execution,
+            }
+        source_checks_by_path = {
+            _norm_repo_path(result.get("path")): result
+            for result in source_results
+            if _norm_repo_path(result.get("path"))
+        }
+
+    for item in classified_paths:
+        path = item["path"]
+        kind = item["file_kind"]
+        role = item["attachment_role"]
+        if item.get("classification") == "source":
+            check = source_checks_by_path.get(path) or {
+                "supported": False,
+                "reason": "source_eligibility_result_missing",
+                "path": path,
+            }
             source_checks.append(check)
             if not check.get("supported"):
                 unsupported.append({
@@ -1468,8 +1608,7 @@ def _incremental_metadata_scope_eligibility(
             else:
                 source_paths.append(path)
             continue
-        if kind not in _INCREMENTAL_METADATA_FILE_KINDS or role == "primary":
-            unsupported.append({"path": path, "file_kind": kind, "attachment_role": role})
+        unsupported.append({"path": path, "file_kind": kind, "attachment_role": role})
     if unsupported:
         detailed_reasons = sorted({
             str(item.get("reason") or "")
@@ -1481,6 +1620,7 @@ def _incremental_metadata_scope_eligibility(
             "reason": detailed_reasons[0] if len(detailed_reasons) == 1 else "structural_or_unknown_file_requires_full_rebuild",
             "unsupported": unsupported,
             "source_checks": source_checks,
+            **({"source_eligibility_execution": source_eligibility_execution} if source_eligibility_execution else {}),
         }
     if test_paths and (source_paths or metadata_paths):
         return {
@@ -1490,6 +1630,7 @@ def _incremental_metadata_scope_eligibility(
             "source_paths": source_paths,
             "metadata_paths": metadata_paths,
             "source_checks": source_checks,
+            **({"source_eligibility_execution": source_eligibility_execution} if source_eligibility_execution else {}),
         }
     source_dependency_delta = any(
         bool(check.get("requires_dependency_delta"))
@@ -1519,6 +1660,7 @@ def _incremental_metadata_scope_eligibility(
         "added_test_paths": added_test_paths,
         "removed_test_paths": removed_test_paths,
         "source_checks": source_checks,
+        **({"source_eligibility_execution": source_eligibility_execution} if source_eligibility_execution else {}),
     }
 
 

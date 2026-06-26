@@ -221,6 +221,200 @@ def test_scope_file_delta_keeps_changed_file_status_changes_blocking(tmp_path):
     assert delta["impacted_files"] == ["agent/tests/test_service.py"]
 
 
+def _source_eligibility_graph() -> dict:
+    return {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.a",
+                    "primary": ["agent/a.py"],
+                    "metadata": {
+                        "module": "agent.a",
+                        "functions": ["agent.a::run_a"],
+                        "function_lines": {"run_a": [1, 2]},
+                    },
+                },
+                {
+                    "id": "L7.b",
+                    "primary": ["agent/b.py"],
+                    "metadata": {
+                        "module": "agent.b",
+                        "functions": ["agent.b::run_b"],
+                        "function_lines": {"run_b": [1, 2]},
+                    },
+                },
+            ],
+            "links": [],
+        }
+    }
+
+
+def _source_eligibility_rows() -> list[dict]:
+    return [
+        {"path": "agent/a.py", "file_kind": "source", "attachment_role": "primary"},
+        {"path": "agent/b.py", "file_kind": "source", "attachment_role": "primary"},
+    ]
+
+
+def _source_eligibility_scope_delta() -> dict:
+    return {
+        "changed_files": ["agent/a.py", "agent/b.py"],
+        "hash_changed_files": ["agent/a.py", "agent/b.py"],
+        "impacted_files": ["agent/a.py", "agent/b.py"],
+        "added_files": [],
+        "removed_files": [],
+        "status_changed_files": [],
+    }
+
+
+def _install_source_eligibility_parse_fakes(monkeypatch, project: Path) -> None:
+    modules = {
+        "agent/a.py": state_reconcile.ModuleInfo(
+            path=str(project / "agent" / "a.py"),
+            module_name="agent.a",
+            functions=[
+                state_reconcile.FunctionMeta(
+                    module="agent.a",
+                    name="run_a",
+                    qualified_name="agent.a::run_a",
+                    lineno=1,
+                    end_lineno=2,
+                )
+            ],
+        ),
+        "agent/b.py": state_reconcile.ModuleInfo(
+            path=str(project / "agent" / "b.py"),
+            module_name="agent.b",
+            functions=[
+                state_reconcile.FunctionMeta(
+                    module="agent.b",
+                    name="run_b",
+                    qualified_name="agent.b::run_b",
+                    lineno=1,
+                    end_lineno=2,
+                )
+            ],
+        ),
+    }
+    monkeypatch.setattr(
+        state_reconcile,
+        "parse_production_module_file",
+        lambda _root, path: modules[path],
+    )
+    monkeypatch.setattr(state_reconcile, "extract_typed_relations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        state_reconcile,
+        "_source_path_ast_signature_delta",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "skipped": True,
+            "reason": "test_ast_delta_skipped",
+        },
+    )
+
+
+def test_incremental_metadata_source_eligibility_parallel_matches_serial(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    _write(project / "agent" / "a.py", "def run_a():\n    return 1\n")
+    _write(project / "agent" / "b.py", "def run_b():\n    return 2\n")
+    _install_source_eligibility_parse_fakes(monkeypatch, project)
+    seen_task_orders: list[list[str]] = []
+
+    class FakePool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            task_list = list(tasks)
+            seen_task_orders.append([task["path"] for task in task_list])
+            return [worker(task) for task in task_list]
+
+    serial = state_reconcile._incremental_metadata_scope_eligibility(
+        _source_eligibility_scope_delta(),
+        project_root=project,
+        active_graph_json=_source_eligibility_graph(),
+        old_rows=_source_eligibility_rows(),
+        new_rows=_source_eligibility_rows(),
+        active_commit="base",
+        target_commit="head",
+        source_eligibility_max_workers=1,
+    )
+    parallel = state_reconcile._incremental_metadata_scope_eligibility(
+        _source_eligibility_scope_delta(),
+        project_root=project,
+        active_graph_json=_source_eligibility_graph(),
+        old_rows=_source_eligibility_rows(),
+        new_rows=_source_eligibility_rows(),
+        active_commit="base",
+        target_commit="head",
+        source_eligibility_process_pool_factory=FakePool,
+    )
+
+    serial_execution = serial.pop("source_eligibility_execution")
+    parallel_execution = parallel.pop("source_eligibility_execution")
+    assert serial == parallel
+    assert serial["source_paths"] == ["agent/a.py", "agent/b.py"]
+    assert serial_execution["strategy"] == "serial"
+    assert serial_execution["fallback_reason"] == "worker_count_one"
+    assert parallel_execution["strategy"] == "parallel_process_pool"
+    assert parallel_execution["label"] == "source_eligibility"
+    assert parallel_execution["worker_count"] == 2
+    assert parallel_execution["deterministic_order"] == "input_order"
+    assert seen_task_orders == [["agent/a.py", "agent/b.py"]]
+
+
+def test_incremental_metadata_source_eligibility_falls_back_when_pool_fails(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    _write(project / "agent" / "a.py", "def run_a():\n    return 1\n")
+    _write(project / "agent" / "b.py", "def run_b():\n    return 2\n")
+    _install_source_eligibility_parse_fakes(monkeypatch, project)
+
+    class FailingPool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            raise RuntimeError("source eligibility pool unavailable")
+
+    result = state_reconcile._incremental_metadata_scope_eligibility(
+        _source_eligibility_scope_delta(),
+        project_root=project,
+        active_graph_json=_source_eligibility_graph(),
+        old_rows=_source_eligibility_rows(),
+        new_rows=_source_eligibility_rows(),
+        active_commit="base",
+        target_commit="head",
+        source_eligibility_process_pool_factory=FailingPool,
+    )
+
+    assert result["supported"] is True
+    assert result["source_paths"] == ["agent/a.py", "agent/b.py"]
+    assert [check["supported"] for check in result["source_checks"]] == [True, True]
+    execution = result["source_eligibility_execution"]
+    assert execution["strategy"] == "serial_fallback"
+    assert execution["fallback_reason"] == "process_pool_failed"
+    assert execution["fallback_error_type"] == "RuntimeError"
+    assert "source eligibility pool unavailable" in execution["fallback_error"]
+
+
 def _write_project(root: Path) -> list[Path]:
     files = [
         root / "agent" / "service.py",

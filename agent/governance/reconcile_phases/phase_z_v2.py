@@ -739,13 +739,32 @@ def parse_production_modules(
 
     modules: Dict[str, ModuleInfo] = {}
 
+    for rel_file in _production_source_files(project_root, prod_dirs=prod_dirs, profile=profile):
+        parsed = parse_production_module_file(project_root, rel_file, profile=profile)
+        if parsed is not None:
+            modules[parsed.module_name] = parsed
+
+    return modules
+
+
+def _production_source_files(
+    project_root: str,
+    *,
+    prod_dirs: Optional[Tuple[str, ...]] = None,
+    profile: Optional[Any] = None,
+) -> List[str]:
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    if prod_dirs is None:
+        prod_dirs = tuple(getattr(profile, "source_roots", None) or DEFAULT_PROD_DIRS)
+
+    paths: List[str] = []
     for prod_dir in prod_dirs:
         base = project_root if prod_dir in ("", ".") else os.path.join(project_root, prod_dir)
         if not os.path.isdir(base):
             continue
-
         for dirpath, dirnames, filenames in os.walk(base):
-            # Filter excluded dirs IN-PLACE so os.walk skips them
             kept_dirs = []
             for dirname in dirnames:
                 rel_dir = os.path.relpath(os.path.join(dirpath, dirname), project_root)
@@ -761,29 +780,8 @@ def parse_production_modules(
                 rel_file = os.path.relpath(fpath, project_root)
                 if not profile.is_production_source_path(rel_file):
                     continue
-                try:
-                    source = _read_file(fpath)
-                except (UnicodeDecodeError, OSError):
-                    continue
-
-                mod_name = _path_to_module(fpath, project_root)
-                adapter = _adapter_for_source_file(fpath)
-                if isinstance(adapter, PythonAdapter):
-                    parsed = _parse_python_module(fpath, mod_name, source)
-                    if parsed is None:
-                        continue
-                    modules[mod_name] = parsed
-                else:
-                    modules[mod_name] = _parse_filetree_module(
-                        project_root,
-                        fpath,
-                        mod_name,
-                        source,
-                        adapter,
-                        rel_file.replace(os.sep, "/"),
-                    )
-
-    return modules
+                paths.append(rel_file.replace(os.sep, "/"))
+    return sorted(set(paths))
 
 
 def parse_production_module_file(
@@ -801,7 +799,7 @@ def parse_production_module_file(
     if profile is None:
         from agent.governance.project_profile import discover_project_profile
         profile = discover_project_profile(project_root)
-    root = Path(project_root).resolve()
+    root = Path(project_root)
     rel = str(rel_path or "").replace("\\", "/").strip("/")
     if (
         not rel
@@ -831,6 +829,68 @@ def parse_production_module_file(
         adapter,
         rel,
     )
+
+
+def _production_module_parse_worker(task: Mapping[str, Any]) -> Dict[str, Any]:
+    project_root = str(task.get("project_root") or "")
+    rel_path = str(task.get("rel_path") or "")
+    profile = _profile_from_payload(task.get("profile") if isinstance(task.get("profile"), Mapping) else None)
+    module = parse_production_module_file(project_root, rel_path, profile=profile)
+    return {
+        "rel_path": rel_path,
+        "module": module,
+        "module_name": module.module_name if module is not None else "",
+    }
+
+
+def parse_production_modules_parallel(
+    project_root: str,
+    prod_dirs: Optional[Tuple[str, ...]] = None,
+    profile: Optional[Any] = None,
+    *,
+    max_workers: int | None = None,
+    cpu_count: int | None = None,
+    process_pool_factory: Callable[..., Any] | None = None,
+) -> Tuple[Dict[str, ModuleInfo], Dict[str, Any]]:
+    """Parse production modules through ordered per-file worker tasks."""
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    if prod_dirs is None:
+        prod_dirs = tuple(getattr(profile, "source_roots", None) or DEFAULT_PROD_DIRS)
+    rel_paths = _production_source_files(project_root, prod_dirs=prod_dirs, profile=profile)
+    profile_data = _profile_payload(profile)
+    tasks = [
+        {
+            "project_root": str(project_root),
+            "rel_path": rel_path,
+            "profile": profile_data,
+        }
+        for rel_path in rel_paths
+    ]
+    run = run_reconcile_tasks(
+        tasks,
+        _production_module_parse_worker,
+        label="phase_z_v2_production_module_parsing",
+        max_workers=max_workers,
+        cpu_count=cpu_count,
+        process_pool_factory=process_pool_factory,
+    )
+    modules: Dict[str, ModuleInfo] = {}
+    for result in run.get("results") or []:
+        if not isinstance(result, Mapping):
+            continue
+        module = result.get("module")
+        if isinstance(module, ModuleInfo) and module.module_name:
+            modules[module.module_name] = module
+    observability = dict(run.get("observability") or {})
+    observability["parallelized"] = (
+        observability.get("strategy") == "parallel_process_pool"
+        and int(observability.get("worker_count") or 0) > 1
+    )
+    observability["source_file_count"] = len(rel_paths)
+    observability["module_count"] = len(modules)
+    return modules, observability
 
 
 def _read_file(path: str) -> str:
@@ -1383,6 +1443,7 @@ def find_test_coverage(
     project_root: str,
     primary_file: str,
     profile: Optional[Any] = None,
+    coverage_scan_cache: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Find test files and coverage for a given primary source file.
 
@@ -1458,32 +1519,21 @@ def find_test_coverage(
             tokens.append(stem)
         return any(token and token in lowered for token in tokens)
 
-    for dirpath, dirnames, filenames in os.walk(project_root):
-        kept_dirs = []
-        for dirname in dirnames:
-            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
-            if profile.is_excluded_path(rel_dir) or profile.is_doc_path(rel_dir):
+    cached_sources = (
+        list(coverage_scan_cache.get("test_sources") or [])
+        if isinstance(coverage_scan_cache, Mapping)
+        else []
+    )
+    if cached_sources:
+        for item in cached_sources:
+            if not isinstance(item, Mapping):
                 continue
-            kept_dirs.append(dirname)
-        dirnames[:] = kept_dirs
-        for fname in filenames:
-            if not DEFAULT_LANGUAGE_POLICY.is_source_path(fname):
-                continue
-            fpath = os.path.join(dirpath, fname)
-            rel = _repo_relpath(project_root, fpath)
-            if profile.is_excluded_path(rel) or profile.is_doc_path(rel):
-                continue
-            if not _is_test_like(rel, fname):
-                continue
+            fpath = str(item.get("path") or "")
+            rel = str(item.get("rel_path") or _repo_relpath(project_root, fpath))
+            fname = str(item.get("file_name") or os.path.basename(fpath))
             name_match = _matches_primary(fname)
-            content_match = False
-            content = ""
-            test_files.append(fpath)
-            try:
-                content = _read_file(fpath)
-                content_match = _content_matches_primary(content)
-            except OSError:
-                content = ""
+            content = str(item.get("content") or "")
+            content_match = _content_matches_primary(content)
             if (
                 content_match
                 and not name_match
@@ -1491,9 +1541,46 @@ def find_test_coverage(
             ):
                 content_match = False
             if not name_match and not content_match:
-                test_files.pop()
                 continue
-            covered_lines += content.count("\n")
+            test_files.append(fpath)
+            covered_lines += int(item.get("covered_lines") or content.count("\n"))
+    else:
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            kept_dirs = []
+            for dirname in dirnames:
+                rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+                if profile.is_excluded_path(rel_dir) or profile.is_doc_path(rel_dir):
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for fname in filenames:
+                if not DEFAULT_LANGUAGE_POLICY.is_source_path(fname):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                rel = _repo_relpath(project_root, fpath)
+                if profile.is_excluded_path(rel) or profile.is_doc_path(rel):
+                    continue
+                if not _is_test_like(rel, fname):
+                    continue
+                name_match = _matches_primary(fname)
+                content_match = False
+                content = ""
+                test_files.append(fpath)
+                try:
+                    content = _read_file(fpath)
+                    content_match = _content_matches_primary(content)
+                except OSError:
+                    content = ""
+                if (
+                    content_match
+                    and not name_match
+                    and not _test_content_match_language_compatible(primary_file, fpath)
+                ):
+                    content_match = False
+                if not name_match and not content_match:
+                    test_files.pop()
+                    continue
+                covered_lines += content.count("\n")
 
     return {"test_files": test_files, "covered_lines": covered_lines}
 
@@ -1517,6 +1604,7 @@ def find_doc_coverage(
     project_root: str,
     primary_file: str,
     profile: Optional[Any] = None,
+    coverage_scan_cache: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Find doc files referencing a given primary source file.
 
@@ -1538,40 +1626,139 @@ def find_doc_coverage(
         "docs/dev/observer/logs/",
     }
 
-    for dirpath, dirnames, filenames in os.walk(project_root):
-        kept_dirs = []
-        for dirname in dirnames:
-            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
-            if profile.is_excluded_path(rel_dir) or profile.is_test_path(rel_dir):
+    cached_sources = (
+        list(coverage_scan_cache.get("doc_sources") or [])
+        if isinstance(coverage_scan_cache, Mapping)
+        else []
+    )
+    if cached_sources or isinstance(coverage_scan_cache, Mapping):
+        ignored_doc_files.extend(
+            str(path)
+            for path in (coverage_scan_cache or {}).get("ignored_doc_files", [])
+            if str(path)
+        )
+        for item in cached_sources:
+            if not isinstance(item, Mapping):
                 continue
-            kept_dirs.append(dirname)
-        dirnames[:] = kept_dirs
-        for fname in filenames:
-            if not fname.lower().endswith((".md", ".rst", ".txt", ".adoc")):
-                continue
-            fpath = os.path.join(dirpath, fname)
-            doc_rel = _repo_relpath(project_root, fpath)
-            if profile.is_excluded_path(doc_rel) or profile.is_test_path(doc_rel):
-                ignored_doc_files.append(fpath)
-                continue
-            if any(doc_rel.startswith(prefix) for prefix in skip_rel_prefixes):
-                ignored_doc_files.append(fpath)
-                continue
-            if _is_git_ignored_path(project_root, doc_rel):
-                ignored_doc_files.append(fpath)
-                continue
-            try:
-                content = _read_file(fpath)
-                if rel_normalized in content or basename in content or module_token in content:
-                    doc_files.append(fpath)
-                    covered_lines += content.count("\n")
-            except OSError:
-                pass
+            fpath = str(item.get("path") or "")
+            content = str(item.get("content") or "")
+            if rel_normalized in content or basename in content or module_token in content:
+                doc_files.append(fpath)
+                covered_lines += int(item.get("covered_lines") or content.count("\n"))
+    else:
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            kept_dirs = []
+            for dirname in dirnames:
+                rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+                if profile.is_excluded_path(rel_dir) or profile.is_test_path(rel_dir):
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for fname in filenames:
+                if not fname.lower().endswith((".md", ".rst", ".txt", ".adoc")):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                doc_rel = _repo_relpath(project_root, fpath)
+                if profile.is_excluded_path(doc_rel) or profile.is_test_path(doc_rel):
+                    ignored_doc_files.append(fpath)
+                    continue
+                if any(doc_rel.startswith(prefix) for prefix in skip_rel_prefixes):
+                    ignored_doc_files.append(fpath)
+                    continue
+                if _is_git_ignored_path(project_root, doc_rel):
+                    ignored_doc_files.append(fpath)
+                    continue
+                try:
+                    content = _read_file(fpath)
+                    if rel_normalized in content or basename in content or module_token in content:
+                        doc_files.append(fpath)
+                        covered_lines += content.count("\n")
+                except OSError:
+                    pass
 
     return {
         "doc_files": doc_files,
         "covered_lines": covered_lines,
         "ignored_doc_files": ignored_doc_files,
+    }
+
+
+def build_coverage_scan_cache(
+    project_root: str,
+    profile: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Scan test/doc coverage sources once for full-rebuild node matching."""
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    test_sources: List[Dict[str, Any]] = []
+    doc_sources: List[Dict[str, Any]] = []
+    ignored_doc_files: List[str] = []
+    skip_doc_prefixes = {
+        "docs/dev/scratch/",
+        "docs/dev/observer/logs/",
+    }
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        kept_dirs = []
+        for dirname in dirnames:
+            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+            if profile.is_excluded_path(rel_dir):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            rel = _repo_relpath(project_root, fpath)
+            if profile.is_excluded_path(rel):
+                continue
+            lower = fname.lower()
+            if (
+                DEFAULT_LANGUAGE_POLICY.is_source_path(fname)
+                and profile.is_test_path(rel)
+                and not profile.is_doc_path(rel)
+            ):
+                try:
+                    content = _read_file(fpath)
+                except OSError:
+                    continue
+                test_sources.append({
+                    "path": fpath,
+                    "rel_path": rel,
+                    "file_name": fname,
+                    "content": content,
+                    "covered_lines": content.count("\n"),
+                })
+                continue
+            if not lower.endswith((".md", ".rst", ".txt", ".adoc")):
+                continue
+            if profile.is_test_path(rel):
+                ignored_doc_files.append(fpath)
+                continue
+            if any(rel.startswith(prefix) for prefix in skip_doc_prefixes):
+                ignored_doc_files.append(fpath)
+                continue
+            if _is_git_ignored_path(project_root, rel):
+                ignored_doc_files.append(fpath)
+                continue
+            try:
+                content = _read_file(fpath)
+            except OSError:
+                continue
+            doc_sources.append({
+                "path": fpath,
+                "rel_path": rel,
+                "file_name": fname,
+                "content": content,
+                "covered_lines": content.count("\n"),
+            })
+    return {
+        "schema_version": "coverage_scan_cache.v1",
+        "test_sources": test_sources,
+        "doc_sources": doc_sources,
+        "ignored_doc_files": sorted(ignored_doc_files),
+        "test_source_count": len(test_sources),
+        "doc_source_count": len(doc_sources),
+        "ignored_doc_file_count": len(ignored_doc_files),
     }
 
 
@@ -2401,17 +2588,71 @@ def _module_name_tokens(module_name: str) -> Set[str]:
     return {p.lower() for p in parts if p}
 
 
-def extract_typed_relations(
+def _profile_payload(profile: Optional[Any]) -> Dict[str, Any]:
+    if profile is None:
+        return {}
+    return {
+        "project_root": str(getattr(profile, "project_root", "") or ""),
+        "languages": list(getattr(profile, "languages", []) or []),
+        "source_roots": list(getattr(profile, "source_roots", []) or []),
+        "test_roots": list(getattr(profile, "test_roots", []) or []),
+        "doc_roots": list(getattr(profile, "doc_roots", []) or []),
+        "exclude_roots": list(getattr(profile, "exclude_roots", []) or []),
+        "ignore_globs": list(getattr(profile, "ignore_globs", []) or []),
+        "manifest_files": list(getattr(profile, "manifest_files", []) or []),
+    }
+
+
+def _profile_from_payload(payload: Mapping[str, Any] | None) -> Optional[Any]:
+    if not payload:
+        return None
+    try:
+        from agent.governance.project_profile import ProjectProfile
+
+        return ProjectProfile(
+            project_root=str(payload.get("project_root") or ""),
+            languages=list(payload.get("languages") or []),
+            source_roots=list(payload.get("source_roots") or []),
+            test_roots=list(payload.get("test_roots") or []),
+            doc_roots=list(payload.get("doc_roots") or []),
+            exclude_roots=list(payload.get("exclude_roots") or []),
+            ignore_globs=list(payload.get("ignore_globs") or []),
+            manifest_files=list(payload.get("manifest_files") or []),
+        )
+    except Exception:
+        return None
+
+
+def _module_typed_relation_payload(module: ModuleInfo) -> Dict[str, Any]:
+    return {
+        "path": str(module.path or ""),
+        "module_name": str(module.module_name or ""),
+        "source": str(module.source or ""),
+        "language": str(module.language or ""),
+        "source_kind": str(module.source_kind or ""),
+        "adapter_relations": list(module.adapter_relations or []),
+    }
+
+
+def _module_from_typed_relation_payload(payload: Mapping[str, Any]) -> ModuleInfo:
+    return ModuleInfo(
+        path=str(payload.get("path") or ""),
+        module_name=str(payload.get("module_name") or ""),
+        source=str(payload.get("source") or ""),
+        language=str(payload.get("language") or ""),
+        source_kind=str(payload.get("source_kind") or "symbol_ast"),
+        adapter_relations=[
+            dict(item)
+            for item in (payload.get("adapter_relations") or [])
+            if isinstance(item, Mapping)
+        ],
+    )
+
+
+def _typed_relation_context(
     project_root: str,
     modules: Dict[str, ModuleInfo],
-    *,
-    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Extract typed state/workflow/contract/artifact edges from modules.
-
-    This is intentionally deterministic.  AI can later review ambiguous labels,
-    but the scanner first records evidence that a generic PM can audit.
-    """
+) -> Tuple[Dict[str, str], Set[str], Optional[Any]]:
     sql_by_module: Dict[str, str] = {}
     created_tables: Set[str] = set()
     try:
@@ -2424,85 +2665,185 @@ def extract_typed_relations(
         sql_by_module[module.module_name] = blob
         created_tables.update(_SQL_CREATE_RE.findall(blob))
     created_tables.add("sqlite_master")
+    return sql_by_module, created_tables, profile
 
+
+def _typed_relations_for_module(
+    project_root: str,
+    module: ModuleInfo,
+    *,
+    sql_blob: str,
+    created_tables: Set[str],
+    profile: Optional[Any] = None,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+) -> List[TypedRelation]:
     relations: List[TypedRelation] = []
-    for module in modules.values():
-        source = module.source or ""
-        rel_file = _repo_relpath(project_root, module.path)
-        constants = _string_constants(source)
-        sql_blob = sql_by_module.get(module.module_name, "")
-        event_call_relations = _event_bus_call_relations(module, project_root)
-        event_call_targets = {str(rel.target) for rel in event_call_relations}
+    source = module.source or ""
+    rel_file = _repo_relpath(project_root, module.path)
+    constants = _string_constants(source)
+    event_call_relations = _event_bus_call_relations(module, project_root)
+    event_call_targets = {str(rel.target) for rel in event_call_relations}
 
-        for table in sorted(set(_SQL_CREATE_RE.findall(sql_blob))):
-            relations.append(TypedRelation(module.module_name, "owns_state", table, "db_table",
-                                           "CREATE TABLE", rel_file))
-        for table in sorted(set(_SQL_INSERT_RE.findall(sql_blob) + _SQL_UPDATE_RE.findall(sql_blob) + _SQL_DELETE_RE.findall(sql_blob))):
-            if table not in created_tables:
-                continue
-            relations.append(TypedRelation(module.module_name, "writes_state", table, "db_table",
-                                           "SQL write", rel_file))
-        for table in sorted(set(_SQL_READ_RE.findall(sql_blob))):
-            if table not in created_tables:
-                continue
-            relations.append(TypedRelation(module.module_name, "reads_state", table, "db_table",
-                                           "SQL read", rel_file))
+    for table in sorted(set(_SQL_CREATE_RE.findall(sql_blob))):
+        relations.append(TypedRelation(module.module_name, "owns_state", table, "db_table",
+                                       "CREATE TABLE", rel_file))
+    for table in sorted(set(_SQL_INSERT_RE.findall(sql_blob) + _SQL_UPDATE_RE.findall(sql_blob) + _SQL_DELETE_RE.findall(sql_blob))):
+        if table not in created_tables:
+            continue
+        relations.append(TypedRelation(module.module_name, "writes_state", table, "db_table",
+                                       "SQL write", rel_file))
+    for table in sorted(set(_SQL_READ_RE.findall(sql_blob))):
+        if table not in created_tables:
+            continue
+        relations.append(TypedRelation(module.module_name, "reads_state", table, "db_table",
+                                       "SQL read", rel_file))
 
-        for value in sorted(set(constants)):
-            if _looks_like_artifact(value) and _governed_artifact_literal(project_root, value, profile):
-                relations.append(TypedRelation(
-                    module.module_name,
-                    _artifact_relation_type(source),
-                    value.replace("\\", "/"),
-                    "artifact",
-                    "string literal",
-                    rel_file,
-                ))
-                continue
-            if _EVENT_TOKEN_RE.match(value) and not value.startswith(("http.", "https.")):
-                if re.match(r"^L\d+\.\d+$", value):
-                    continue
-                if value in event_call_targets:
-                    continue
-                lower = source.lower()
-                if "chain_events" in lower or "event_type" in lower or "emit" in lower:
-                    rel_type = "emits_event" if ("insert into chain_events" in lower or "persist_event" in lower or "emit" in lower) else "consumes_event"
-                    relation = TypedRelation(module.module_name, rel_type, value, "event",
-                                             "event literal", rel_file)
-                    relation = _apply_graph_enrich_config_rule_to_typed_relation(
-                        relation,
-                        module=module,
-                        rules=graph_enrich_config_rules,
-                    )
-                    if relation is not None:
-                        relations.append(relation)
-
-        relations.extend(event_call_relations)
-        lowered = source.lower()
-        if "/api/task" in lowered or "create_task" in lowered or "task_create" in lowered:
-            relations.append(TypedRelation(module.module_name, "creates_task", "governance_task",
-                                           "task", "task creation", rel_file))
-        if "operation_type" in lowered or "cluster_fingerprint" in lowered:
-            relations.append(TypedRelation(module.module_name, "uses_task_metadata",
-                                           "task_metadata", "task_metadata",
-                                           "metadata contract", rel_file))
-        relations.extend(_route_relations(module, project_root))
-        for adapter_rel in module.adapter_relations or []:
-            relation_type = str(adapter_rel.get("relation_type") or "")
-            target = str(adapter_rel.get("target") or "")
-            target_kind = str(adapter_rel.get("target_kind") or "")
-            if not relation_type or not target or not target_kind:
-                continue
+    for value in sorted(set(constants)):
+        if _looks_like_artifact(value) and _governed_artifact_literal(project_root, value, profile):
             relations.append(TypedRelation(
                 module.module_name,
-                relation_type,
-                target,
-                target_kind,
-                str(adapter_rel.get("evidence") or "adapter relation"),
+                _artifact_relation_type(source),
+                value.replace("\\", "/"),
+                "artifact",
+                "string literal",
                 rel_file,
             ))
+            continue
+        if _EVENT_TOKEN_RE.match(value) and not value.startswith(("http.", "https.")):
+            if re.match(r"^L\d+\.\d+$", value):
+                continue
+            if value in event_call_targets:
+                continue
+            lower = source.lower()
+            if "chain_events" in lower or "event_type" in lower or "emit" in lower:
+                rel_type = "emits_event" if ("insert into chain_events" in lower or "persist_event" in lower or "emit" in lower) else "consumes_event"
+                relation = TypedRelation(module.module_name, rel_type, value, "event",
+                                         "event literal", rel_file)
+                relation = _apply_graph_enrich_config_rule_to_typed_relation(
+                    relation,
+                    module=module,
+                    rules=graph_enrich_config_rules,
+                )
+                if relation is not None:
+                    relations.append(relation)
 
+    relations.extend(event_call_relations)
+    lowered = source.lower()
+    if "/api/task" in lowered or "create_task" in lowered or "task_create" in lowered:
+        relations.append(TypedRelation(module.module_name, "creates_task", "governance_task",
+                                       "task", "task creation", rel_file))
+    if "operation_type" in lowered or "cluster_fingerprint" in lowered:
+        relations.append(TypedRelation(module.module_name, "uses_task_metadata",
+                                       "task_metadata", "task_metadata",
+                                       "metadata contract", rel_file))
+    relations.extend(_route_relations(module, project_root))
+    for adapter_rel in module.adapter_relations or []:
+        relation_type = str(adapter_rel.get("relation_type") or "")
+        target = str(adapter_rel.get("target") or "")
+        target_kind = str(adapter_rel.get("target_kind") or "")
+        if not relation_type or not target or not target_kind:
+            continue
+        relations.append(TypedRelation(
+            module.module_name,
+            relation_type,
+            target,
+            target_kind,
+            str(adapter_rel.get("evidence") or "adapter relation"),
+            rel_file,
+        ))
+    return relations
+
+
+def _typed_relation_worker(task: Mapping[str, Any]) -> Dict[str, Any]:
+    project_root = str(task.get("project_root") or "")
+    module = _module_from_typed_relation_payload(task.get("module") or {})
+    relations = _typed_relations_for_module(
+        project_root,
+        module,
+        sql_blob=str(task.get("sql_blob") or ""),
+        created_tables={str(item) for item in (task.get("created_tables") or [])},
+        profile=_profile_from_payload(task.get("profile") if isinstance(task.get("profile"), Mapping) else None),
+        graph_enrich_config_rules=task.get("graph_enrich_config_rules")
+        if isinstance(task.get("graph_enrich_config_rules"), dict)
+        else None,
+    )
+    return {
+        "module_name": module.module_name,
+        "relations": [relation.__dict__ for relation in relations],
+    }
+
+
+def extract_typed_relations(
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    *,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Extract typed state/workflow/contract/artifact edges from modules.
+
+    This is intentionally deterministic.  AI can later review ambiguous labels,
+    but the scanner first records evidence that a generic PM can audit.
+    """
+    sql_by_module, created_tables, profile = _typed_relation_context(project_root, modules)
+    relations: List[TypedRelation] = []
+    for module in modules.values():
+        relations.extend(_typed_relations_for_module(
+            project_root,
+            module,
+            sql_blob=sql_by_module.get(module.module_name, ""),
+            created_tables=created_tables,
+            profile=profile,
+            graph_enrich_config_rules=graph_enrich_config_rules,
+        ))
     return [r.__dict__ for r in _dedupe_typed_relations(relations)]
+
+
+def extract_typed_relations_parallel(
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    *,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+    max_workers: int | None = None,
+    cpu_count: int | None = None,
+    process_pool_factory: Callable[..., Any] | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Extract typed relations through ordered per-module worker tasks."""
+    sql_by_module, created_tables, profile = _typed_relation_context(project_root, modules)
+    profile_data = _profile_payload(profile)
+    tasks = [
+        {
+            "project_root": str(project_root),
+            "module": _module_typed_relation_payload(modules[module_name]),
+            "sql_blob": sql_by_module.get(module_name, ""),
+            "created_tables": sorted(created_tables),
+            "profile": profile_data,
+            "graph_enrich_config_rules": graph_enrich_config_rules or {},
+        }
+        for module_name in sorted(modules)
+    ]
+    run = run_reconcile_tasks(
+        tasks,
+        _typed_relation_worker,
+        label="phase_z_v2_typed_relations",
+        max_workers=max_workers,
+        cpu_count=cpu_count,
+        process_pool_factory=process_pool_factory,
+    )
+    relations: List[TypedRelation] = []
+    for result in run.get("results") or []:
+        if not isinstance(result, Mapping):
+            continue
+        for rel in result.get("relations") or []:
+            if isinstance(rel, Mapping):
+                relations.append(TypedRelation(**dict(rel)))
+    observability = dict(run.get("observability") or {})
+    observability["parallelized"] = (
+        observability.get("strategy") == "parallel_process_pool"
+        and int(observability.get("worker_count") or 0) > 1
+    )
+    observability["module_count"] = len(modules)
+    observability["relation_count"] = len(relations)
+    return [r.__dict__ for r in _dedupe_typed_relations(relations)], observability
 
 
 def _apply_graph_enrich_config_rule_to_typed_relation(
@@ -2859,6 +3200,291 @@ def build_function_call_facts(
         bucket["called_by"].sort(key=lambda item: (item.get("callee", ""), item.get("caller", "")))
         bucket["weak_calls"].sort(key=lambda item: (item.get("caller", ""), item.get("raw_target", "")))
     return facts
+
+
+def _empty_function_call_facts(module_names: List[str]) -> Dict[str, Dict[str, Any]]:
+    return {
+        module_name: {"calls": [], "called_by": [], "weak_calls": []}
+        for module_name in module_names
+    }
+
+
+def _append_unique_fact(
+    bucket: List[Dict[str, Any]],
+    seen: Set[str],
+    item: Dict[str, Any],
+) -> None:
+    key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+    if key in seen:
+        return
+    seen.add(key)
+    bucket.append(item)
+
+
+def _graph_enrich_config_rule_decision_for_weak_call_payload(
+    weak: Mapping[str, Any],
+    module_context: Mapping[str, Any],
+    *,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not rules:
+        return {"matched": False, "rule_id": "", "action": "", "downgrade_to": "", "errors": []}
+    context = {
+        "edge": "calls",
+        "source_evidence": "weak_call_resolver_ambiguous_short_name",
+        "language": str(module_context.get("language") or ""),
+        "source_path": str(module_context.get("path") or ""),
+        "raw_target": str(weak.get("raw_target") or weak.get("target") or ""),
+    }
+    weak_context = weak.get("context") or {}
+    if isinstance(weak_context, Mapping):
+        for key in ("call_syntax", "receiver_kind"):
+            if weak_context.get(key):
+                context[key] = weak_context[key]
+    try:
+        from agent.governance.graph_enrich_config_ops import evaluate_graph_enrich_config_rules
+
+        return evaluate_graph_enrich_config_rules(rules, context)
+    except Exception:
+        return {"matched": False, "rule_id": "", "action": "", "downgrade_to": "", "errors": ["rule_eval_failed"]}
+
+
+def _function_call_fact_worker(task: Mapping[str, Any]) -> Dict[str, Any]:
+    module_name = str(task.get("module_name") or "")
+    module_context = task.get("module_context") or {}
+    if not isinstance(module_context, Mapping):
+        module_context = {}
+    rules = task.get("graph_enrich_config_rules")
+    if not isinstance(rules, dict):
+        rules = None
+
+    calls: List[Dict[str, Any]] = []
+    called_by: Dict[str, List[Dict[str, Any]]] = {}
+    weak_calls: List[Dict[str, Any]] = []
+    calls_seen: Set[str] = set()
+    weak_seen: Set[str] = set()
+    called_by_seen: Dict[str, Set[str]] = {}
+
+    for edge in task.get("strong_edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        target_module = str(edge.get("callee_module") or "")
+        if not target_module:
+            continue
+        item = {
+            "caller": str(edge.get("caller") or ""),
+            "caller_short": str(edge.get("caller_short") or ""),
+            "caller_module": module_name,
+            "caller_file": str(edge.get("caller_file") or ""),
+            "caller_line": list(edge.get("caller_line") or [0, 0]),
+            "callee": str(edge.get("callee") or ""),
+            "callee_short": str(edge.get("callee_short") or ""),
+            "callee_module": target_module,
+            "callee_file": str(edge.get("callee_file") or ""),
+            "callee_line": list(edge.get("callee_line") or [0, 0]),
+            "confidence": "strong",
+            "resolution": "resolved",
+        }
+        _append_unique_fact(calls, calls_seen, item)
+        bucket = called_by.setdefault(target_module, [])
+        seen = called_by_seen.setdefault(target_module, set())
+        _append_unique_fact(bucket, seen, item)
+
+    for weak in task.get("weak_edges") or []:
+        if not isinstance(weak, Mapping):
+            continue
+        rule_decision = _graph_enrich_config_rule_decision_for_weak_call_payload(
+            weak,
+            module_context,
+            rules=rules,
+        )
+        if _graph_enrich_config_rule_suppresses(rule_decision):
+            continue
+        item = {
+            "caller": str(weak.get("caller") or ""),
+            "caller_short": str(weak.get("caller_short") or ""),
+            "caller_module": module_name,
+            "caller_file": str(weak.get("caller_file") or ""),
+            "caller_line": list(weak.get("caller_line") or [0, 0]),
+            "raw_target": str(weak.get("raw_target") or weak.get("target") or ""),
+            "candidates": list(weak.get("candidates") or []),
+            "confidence": "weak",
+            "resolution": "ambiguous",
+            "reason": str(weak.get("reason") or ""),
+        }
+        weak_context = weak.get("context") or {}
+        if isinstance(weak_context, Mapping):
+            for key in ("call_syntax", "receiver_kind"):
+                if weak_context.get(key):
+                    item[key] = weak_context[key]
+        if rule_decision.get("matched"):
+            item["graph_enrich_config_rule"] = {
+                "rule_id": rule_decision.get("rule_id", ""),
+                "action": rule_decision.get("action", ""),
+                "downgrade_to": rule_decision.get("downgrade_to", ""),
+                "matched_predicates": rule_decision.get("matched_predicates", []),
+            }
+        _append_unique_fact(weak_calls, weak_seen, item)
+
+    calls.sort(key=lambda item: (item.get("caller", ""), item.get("callee", "")))
+    for bucket in called_by.values():
+        bucket.sort(key=lambda item: (item.get("callee", ""), item.get("caller", "")))
+    weak_calls.sort(key=lambda item: (item.get("caller", ""), item.get("raw_target", "")))
+    return {
+        "module_name": module_name,
+        "calls": calls,
+        "called_by": called_by,
+        "weak_calls": weak_calls,
+    }
+
+
+def _build_function_call_fact_tasks(
+    modules: Dict[str, ModuleInfo],
+    call_graph: CallGraph,
+    *,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    module_names = set(modules)
+    module_paths = {module_name: module.path for module_name, module in modules.items()}
+    module_context = {
+        module_name: {
+            "path": str(module.path or ""),
+            "language": str(module.language or ""),
+        }
+        for module_name, module in modules.items()
+    }
+    function_lines = {
+        qname: _function_line_range(func)
+        for qname, func in (call_graph.all_functions or {}).items()
+    }
+    tasks_by_module: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_task(module_name: str) -> Dict[str, Any]:
+        return tasks_by_module.setdefault(module_name, {
+            "module_name": module_name,
+            "module_context": module_context.get(module_name, {}),
+            "graph_enrich_config_rules": graph_enrich_config_rules or {},
+            "strong_edges": [],
+            "weak_edges": [],
+        })
+
+    for caller, targets in sorted((call_graph.edges or {}).items()):
+        caller_module = _module_from_qname(caller)
+        if caller_module not in module_names:
+            continue
+        for target in sorted(set(targets or [])):
+            target_module = _module_from_qname(target)
+            if target_module not in module_names:
+                continue
+            task = ensure_task(caller_module)
+            task["strong_edges"].append({
+                "caller": caller,
+                "caller_short": _function_short_name(caller),
+                "caller_file": module_paths.get(caller_module, ""),
+                "caller_line": function_lines.get(caller, [0, 0]),
+                "callee": target,
+                "callee_short": _function_short_name(target),
+                "callee_module": target_module,
+                "callee_file": module_paths.get(target_module, ""),
+                "callee_line": function_lines.get(target, [0, 0]),
+            })
+
+    for weak in sorted(call_graph.weak_edges or [], key=lambda item: (item.caller, item.target)):
+        caller_module = _module_from_qname(weak.caller)
+        if caller_module not in module_names:
+            continue
+        task = ensure_task(caller_module)
+        weak_context = weak.context if isinstance(weak.context, dict) else {}
+        task["weak_edges"].append({
+            "caller": weak.caller,
+            "caller_short": _function_short_name(weak.caller),
+            "caller_file": module_paths.get(caller_module, ""),
+            "caller_line": function_lines.get(weak.caller, [0, 0]),
+            "target": weak.target,
+            "raw_target": str(weak_context.get("raw_target") or weak.target),
+            "candidates": list(weak.candidates or []),
+            "reason": weak.reason,
+            "context": dict(weak_context),
+        })
+
+    return [tasks_by_module[module_name] for module_name in sorted(tasks_by_module)]
+
+
+def _reduce_function_call_fact_results(
+    module_names: List[str],
+    results: List[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    facts = _empty_function_call_facts(module_names)
+    seen = {
+        module_name: {"calls": set(), "called_by": set(), "weak_calls": set()}
+        for module_name in module_names
+    }
+    for result in results:
+        if not isinstance(result, Mapping):
+            continue
+        module_name = str(result.get("module_name") or "")
+        if module_name in facts:
+            for item in result.get("calls") or []:
+                if isinstance(item, dict):
+                    _append_unique_fact(facts[module_name]["calls"], seen[module_name]["calls"], item)
+            for item in result.get("weak_calls") or []:
+                if isinstance(item, dict):
+                    _append_unique_fact(facts[module_name]["weak_calls"], seen[module_name]["weak_calls"], item)
+        called_by = result.get("called_by") or {}
+        if isinstance(called_by, Mapping):
+            for target_module, items in called_by.items():
+                target_key = str(target_module or "")
+                if target_key not in facts:
+                    continue
+                for item in items or []:
+                    if isinstance(item, dict):
+                        _append_unique_fact(
+                            facts[target_key]["called_by"],
+                            seen[target_key]["called_by"],
+                            item,
+                        )
+
+    for bucket in facts.values():
+        bucket["calls"].sort(key=lambda item: (item.get("caller", ""), item.get("callee", "")))
+        bucket["called_by"].sort(key=lambda item: (item.get("callee", ""), item.get("caller", "")))
+        bucket["weak_calls"].sort(key=lambda item: (item.get("caller", ""), item.get("raw_target", "")))
+    return facts
+
+
+def build_function_call_facts_parallel(
+    modules: Dict[str, ModuleInfo],
+    call_graph: CallGraph,
+    *,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+    max_workers: int | None = None,
+    cpu_count: int | None = None,
+    process_pool_factory: Callable[..., Any] | None = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Build function call facts through ordered pure-compute worker tasks."""
+    module_names = sorted(modules)
+    tasks = _build_function_call_fact_tasks(
+        modules,
+        call_graph,
+        graph_enrich_config_rules=graph_enrich_config_rules,
+    )
+    run = run_reconcile_tasks(
+        tasks,
+        _function_call_fact_worker,
+        label="phase_z_v2_function_call_facts",
+        max_workers=max_workers,
+        cpu_count=cpu_count,
+        process_pool_factory=process_pool_factory,
+    )
+    facts = _reduce_function_call_fact_results(module_names, run["results"])
+    observability = dict(run.get("observability") or {})
+    observability["parallelized"] = (
+        observability.get("strategy") == "parallel_process_pool"
+        and int(observability.get("worker_count") or 0) > 1
+    )
+    observability["task_partition"] = "caller_module"
+    observability["task_count"] = len(tasks)
+    observability["module_count"] = len(module_names)
+    return facts, observability
 
 
 def _load_graph_enrich_config_rules(project_root: str | Path) -> Dict[str, Any]:
@@ -5047,7 +5673,10 @@ def build_graph_v2_from_symbols(
     phase_trace = _new_phase_trace(run_id)
 
     started = time.perf_counter()
-    modules = parse_production_modules(project_root, profile=profile)
+    modules, production_parse_observability = parse_production_modules_parallel(
+        project_root,
+        profile=profile,
+    )
     _record_phase_step(
         phase_trace,
         "production_module_parsing",
@@ -5056,6 +5685,11 @@ def build_graph_v2_from_symbols(
             "module_count": len(modules),
             "function_count": _module_function_count(modules),
             "source_kind_counts": _module_source_kind_counts(modules),
+            "strategy": str(production_parse_observability.get("strategy") or "serial"),
+            "worker_count": int(production_parse_observability.get("worker_count") or 0),
+            "parallelized": bool(production_parse_observability.get("parallelized")),
+            "fallback_reason": str(production_parse_observability.get("fallback_reason") or ""),
+            "parallel_executor": production_parse_observability,
         },
     )
 
@@ -5151,12 +5785,23 @@ def build_graph_v2_from_symbols(
         modules,
         profile=profile,
     )
+    coverage_scan_cache = build_coverage_scan_cache(project_root, profile=profile)
 
     # Step 3: PR3 — coverage lookup
     for node in nodes:
         pf = node.get("primary_file", "")
-        test_cov = find_test_coverage(project_root, pf, profile=profile)
-        doc_cov = find_doc_coverage(project_root, pf, profile=profile)
+        test_cov = find_test_coverage(
+            project_root,
+            pf,
+            profile=profile,
+            coverage_scan_cache=coverage_scan_cache,
+        )
+        doc_cov = find_doc_coverage(
+            project_root,
+            pf,
+            profile=profile,
+            coverage_scan_cache=coverage_scan_cache,
+        )
         node["test_coverage"] = test_cov
         node["doc_coverage"] = doc_cov
     _attach_test_consumer_fanin_to_nodes(
@@ -5189,12 +5834,13 @@ def build_graph_v2_from_symbols(
         feature_clusters.extend(_fallback_feature_clusters(all_fallback_nodes))
         feature_clusters.sort(key=lambda c: c.get("cluster_fingerprint", ""))
 
+    file_inventory_observability: Dict[str, Any] = {}
     try:
         from agent.governance.reconcile_file_inventory import (
-            build_file_inventory,
+            build_file_inventory_with_observability,
             summarize_file_inventory,
         )
-        file_inventory = build_file_inventory(
+        file_inventory, file_inventory_observability = build_file_inventory_with_observability(
             project_root=project_root,
             run_id=run_id,
             nodes=nodes,
@@ -5222,11 +5868,21 @@ def build_graph_v2_from_symbols(
             "filetree_fallback_node_count": len(fallback_nodes),
             "file_inventory_count": len(file_inventory),
             "file_inventory_summary": file_inventory_summary,
+            "coverage_scan_cache": {
+                "test_source_count": int(coverage_scan_cache.get("test_source_count") or 0),
+                "doc_source_count": int(coverage_scan_cache.get("doc_source_count") or 0),
+                "ignored_doc_file_count": int(coverage_scan_cache.get("ignored_doc_file_count") or 0),
+            },
+            "strategy": str(file_inventory_observability.get("strategy") or "serial"),
+            "worker_count": int(file_inventory_observability.get("worker_count") or 0),
+            "parallelized": bool(file_inventory_observability.get("parallelized")),
+            "fallback_reason": str(file_inventory_observability.get("fallback_reason") or ""),
+            "parallel_executor": file_inventory_observability,
         },
     )
 
     started = time.perf_counter()
-    typed_relations = extract_typed_relations(
+    typed_relations, typed_relation_observability = extract_typed_relations_parallel(
         project_root,
         modules,
         graph_enrich_config_rules=graph_enrich_config_rules,
@@ -5250,11 +5906,16 @@ def build_graph_v2_from_symbols(
         started,
         metrics={
             "typed_relation_count": len(typed_relations),
+            "strategy": str(typed_relation_observability.get("strategy") or "serial"),
+            "worker_count": int(typed_relation_observability.get("worker_count") or 0),
+            "parallelized": bool(typed_relation_observability.get("parallelized")),
+            "fallback_reason": str(typed_relation_observability.get("fallback_reason") or ""),
+            "parallel_executor": typed_relation_observability,
         },
     )
 
     started = time.perf_counter()
-    function_call_facts = build_function_call_facts(
+    function_call_facts, function_call_fact_observability = build_function_call_facts_parallel(
         modules,
         call_graph,
         graph_enrich_config_rules=graph_enrich_config_rules,
@@ -5266,6 +5927,12 @@ def build_graph_v2_from_symbols(
         started,
         metrics={
             "function_call_fact_count": len(function_call_facts),
+            "strategy": str(function_call_fact_observability.get("strategy") or "serial"),
+            "worker_count": int(function_call_fact_observability.get("worker_count") or 0),
+            "parallelized": bool(function_call_fact_observability.get("parallelized")),
+            "fallback_reason": str(function_call_fact_observability.get("fallback_reason") or ""),
+            "executor": function_call_fact_observability,
+            "parallel_executor": function_call_fact_observability,
         },
     )
 

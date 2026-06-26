@@ -9,6 +9,7 @@ import subprocess
 from agent.governance.db import _ensure_schema
 from agent.governance.reconcile_file_inventory import (
     build_file_inventory,
+    build_file_inventory_with_observability,
     query_file_inventory,
     summarize_file_inventory,
     upsert_file_inventory,
@@ -23,6 +24,15 @@ def _write(path, content):
 
 def _by_path(rows):
     return {row["path"]: row for row in rows}
+
+
+def _strip_volatile(rows):
+    stripped = []
+    for row in rows:
+        item = dict(row)
+        item.pop("updated_at", None)
+        stripped.append(item)
+    return sorted(stripped, key=lambda row: row["path"])
 
 
 def _git(cwd, *args):
@@ -93,6 +103,81 @@ def test_git_inventory_is_tracked_only_across_worktrees(tmp_path):
     assert "agent/local_only.py" not in paths_main
     assert ".codex/config.toml" not in paths_main
     assert "agent/other_local_only.py" not in paths_linked
+
+
+def test_inventory_file_facts_parallel_matches_serial_with_fake_pool(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "docs" / "README.md"), "# docs\n")
+
+    class FakePool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            task_list = list(tasks)
+            assert [task["path"] for task in task_list] == ["agent/service.py", "docs/README.md"]
+            return [worker(task) for task in task_list]
+
+    serial_rows, serial_execution = build_file_inventory_with_observability(
+        project_root=str(project),
+        run_id="run-parallel",
+        max_workers=1,
+    )
+    parallel_rows, parallel_execution = build_file_inventory_with_observability(
+        project_root=str(project),
+        run_id="run-parallel",
+        cpu_count=8,
+        process_pool_factory=FakePool,
+    )
+
+    assert _strip_volatile(parallel_rows) == _strip_volatile(serial_rows)
+    assert serial_execution["strategy"] == "serial"
+    assert serial_execution["fallback_reason"] == "worker_count_one"
+    assert parallel_execution["strategy"] == "parallel_process_pool"
+    assert parallel_execution["parallelized"] is True
+    assert parallel_execution["worker_count"] == 2
+    assert parallel_execution["file_count"] == 2
+
+
+def test_inventory_file_facts_fall_back_when_pool_fails(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "docs" / "README.md"), "# docs\n")
+
+    class FailingPool:
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, worker, tasks):
+            raise RuntimeError("inventory pool unavailable")
+
+    rows, execution = build_file_inventory_with_observability(
+        project_root=str(project),
+        run_id="run-fallback",
+        cpu_count=8,
+        process_pool_factory=FailingPool,
+    )
+
+    assert {row["path"] for row in rows} == {"agent/service.py", "docs/README.md"}
+    assert all(row["sha256"] for row in rows)
+    assert all(row["file_hash"].startswith("sha256:") for row in rows)
+    assert execution["strategy"] == "serial_fallback"
+    assert execution["fallback_reason"] == "process_pool_failed"
+    assert execution["fallback_error_type"] == "RuntimeError"
+    assert "inventory pool unavailable" in execution["fallback_error"]
 
 
 def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):

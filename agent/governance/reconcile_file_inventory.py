@@ -8,10 +8,11 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Mapping, Optional
 
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 from agent.governance.project_profile import ProjectProfile, discover_project_profile
+from agent.governance.reconcile_parallel_executor import run_reconcile_tasks
 
 
 CONFIG_FILENAMES = set(DEFAULT_LANGUAGE_POLICY.config_filenames)
@@ -111,6 +112,30 @@ def _file_facts(path: Path) -> tuple[str, str, int]:
     except OSError:
         size_bytes = 0
     return digest, _file_hash(digest), size_bytes
+
+
+def _file_fact_worker(task: Mapping[str, Any]) -> dict[str, Any]:
+    project_root = str(task.get("project_root") or "")
+    rel = normalize_relpath(project_root, task.get("path") or "")
+    try:
+        digest, file_hash, size_bytes = _file_facts(Path(project_root) / rel)
+        return {
+            "path": rel,
+            "sha256": digest,
+            "file_hash": file_hash,
+            "size_bytes": size_bytes,
+            "error": "",
+            "error_type": "",
+        }
+    except OSError as exc:
+        return {
+            "path": rel,
+            "sha256": "",
+            "file_hash": "",
+            "size_bytes": 0,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
 
 
 def _gitignored_paths(project_root: str | Path, paths: Iterable[str]) -> set[str]:
@@ -401,7 +426,7 @@ def _attachment_role(kind: str, node_roles: dict[str, list[str]] | None) -> str:
     return ""
 
 
-def build_file_inventory(
+def build_file_inventory_with_observability(
     *,
     project_root: str,
     run_id: str,
@@ -409,8 +434,11 @@ def build_file_inventory(
     feature_clusters: Optional[List[dict[str, Any]]] = None,
     profile: Optional[ProjectProfile] = None,
     last_scanned_commit: str = "",
-) -> List[dict[str, Any]]:
-    """Build an auditable inventory for every non-excluded project file."""
+    max_workers: int | None = None,
+    cpu_count: int | None = None,
+    process_pool_factory: Any | None = None,
+) -> tuple[List[dict[str, Any]], dict[str, Any]]:
+    """Build inventory rows and expose file-fact executor observability."""
     if profile is None:
         profile = discover_project_profile(project_root)
     nodes = nodes or []
@@ -421,7 +449,8 @@ def build_file_inventory(
         feature_clusters,
     )
     now = utc_now()
-    rows: list[FileInventoryRow] = []
+    rows: list[dict[str, Any]] = []
+    fact_tasks: list[dict[str, Any]] = []
 
     for rel in sorted(_walk_project_files(project_root, profile)):
         kind = classify_file_kind(profile, rel)
@@ -514,25 +543,14 @@ def build_file_inventory(
             else "unbound"
         )
 
-        abs_path = Path(project_root) / rel
-        try:
-            digest, file_hash, size_bytes = _file_facts(abs_path)
-        except OSError:
-            digest = ""
-            file_hash = ""
-            size_bytes = 0
-            scan_status = "error"
-            graph_status = "error"
-            reason = "file could not be read"
-
         rows.append(FileInventoryRow(
             run_id=run_id,
             path=rel,
             file_kind=kind,
             language=_language_for(rel, kind),
-            sha256=digest,
-            file_hash=file_hash,
-            size_bytes=size_bytes,
+            sha256="",
+            file_hash="",
+            size_bytes=0,
             last_scanned_commit=last_scanned_commit,
             graph_status=graph_status,
             mapped_node_ids=mapped_node_ids,
@@ -550,9 +568,80 @@ def build_file_inventory(
             reason=reason,
             decision=decision,
             updated_at=now,
-        ))
+        ).to_dict())
+        fact_tasks.append({
+            "project_root": str(Path(project_root).resolve()),
+            "path": rel,
+        })
 
-    return [row.to_dict() for row in rows]
+    fact_run = run_reconcile_tasks(
+        fact_tasks,
+        _file_fact_worker,
+        label="file_inventory_facts",
+        max_workers=max_workers,
+        cpu_count=cpu_count,
+        process_pool_factory=process_pool_factory,
+    )
+    observability = dict(fact_run.get("observability") or {})
+    observability["parallelized"] = (
+        observability.get("strategy") == "parallel_process_pool"
+        and int(observability.get("worker_count") or 0) > 1
+    )
+    observability["file_count"] = len(rows)
+    fact_results = [
+        item for item in (fact_run.get("results") or [])
+        if isinstance(item, dict)
+    ]
+    if len(fact_results) != len(fact_tasks):
+        fact_results = [_file_fact_worker(task) for task in fact_tasks]
+        observability["strategy"] = "serial_fallback"
+        observability["parallelized"] = False
+        observability["fallback_reason"] = "file_fact_result_count_mismatch"
+        observability["expected_result_count"] = len(fact_tasks)
+        observability["actual_result_count"] = len(fact_results)
+
+    facts_by_path = {
+        normalize_relpath(project_root, result.get("path") or ""): result
+        for result in fact_results
+        if normalize_relpath(project_root, result.get("path") or "")
+    }
+    for row in rows:
+        fact = facts_by_path.get(str(row.get("path") or ""))
+        if not fact:
+            row["scan_status"] = "error"
+            row["graph_status"] = "error"
+            row["reason"] = "file facts missing"
+            continue
+        row["sha256"] = str(fact.get("sha256") or "")
+        row["file_hash"] = str(fact.get("file_hash") or "")
+        row["size_bytes"] = int(fact.get("size_bytes") or 0)
+        if fact.get("error"):
+            row["scan_status"] = "error"
+            row["graph_status"] = "error"
+            row["reason"] = "file could not be read"
+
+    return rows, observability
+
+
+def build_file_inventory(
+    *,
+    project_root: str,
+    run_id: str,
+    nodes: Optional[List[dict[str, Any]]] = None,
+    feature_clusters: Optional[List[dict[str, Any]]] = None,
+    profile: Optional[ProjectProfile] = None,
+    last_scanned_commit: str = "",
+) -> List[dict[str, Any]]:
+    """Build an auditable inventory for every non-excluded project file."""
+    rows, _observability = build_file_inventory_with_observability(
+        project_root=project_root,
+        run_id=run_id,
+        nodes=nodes,
+        feature_clusters=feature_clusters,
+        profile=profile,
+        last_scanned_commit=last_scanned_commit,
+    )
+    return rows
 
 
 def summarize_file_inventory(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
