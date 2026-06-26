@@ -2489,6 +2489,93 @@ def _runtime_context_lane_event_clauses(event: Mapping[str, Any]) -> list[str]:
     )
 
 
+def _runtime_context_lane_reviewed_event_refs(event: Mapping[str, Any]) -> list[str]:
+    merged = _runtime_context_lane_event_mapping(event)
+    refs: list[str] = []
+    for source in (
+        merged,
+        _runtime_context_mapping(merged.get("reviewed_events")),
+        _runtime_context_mapping(merged.get("artifact_refs")),
+    ):
+        for key in _RUNTIME_CONTEXT_REVIEWED_EVENT_REF_KEYS:
+            refs.extend(
+                _runtime_context_lane_normalized_ref(item)
+                for item in _runtime_context_string_list(source.get(key))
+            )
+    return _runtime_context_dedupe([ref for ref in refs if ref])
+
+
+def _runtime_context_lane_event_is_worker_revision_implementation(
+    event: Mapping[str, Any],
+) -> bool:
+    if not _runtime_context_is_worker_evidence(event):
+        return False
+    event_kind = _runtime_context_lane_event_kind(event)
+    return event_kind in {
+        "implementation",
+        "implementation_evidence",
+        "runtime_context_implementation_evidence",
+        "worker_implementation",
+        "mf_subagent_implementation",
+    }
+
+
+def _runtime_context_lane_event_is_worker_finish_or_review_ready(
+    event: Mapping[str, Any],
+) -> bool:
+    if not _runtime_context_is_worker_evidence(event):
+        return False
+    event_kind = _runtime_context_lane_event_kind(event)
+    if event_kind in {
+        "finish_gate",
+        "mf_subagent_finish_gate",
+        "review_ready",
+        "worker_review_ready",
+        "close_ready",
+    }:
+        return True
+    if _runtime_context_finish_gate_lane_projection(event):
+        return True
+    merged = _runtime_context_lane_event_mapping(event)
+    if merged.get("review_ready") or merged.get("waiting_merge"):
+        return True
+    return any(
+        _runtime_context_lane_clause_id(merged.get(key))
+        in {"review_ready", "waiting_merge"}
+        for key in ("worker_status", "stop_state", "handoff_status")
+    )
+
+
+def _runtime_context_lane_failed_qa_superseded_by_post_failure_revision(
+    *,
+    blocker_index: int,
+    blocker_raw_event: Mapping[str, Any],
+    fulfilling_records: Sequence[tuple[int, Mapping[str, Any], Mapping[str, Any]]],
+) -> bool:
+    event_kind = _runtime_context_lane_event_kind(blocker_raw_event)
+    status = _runtime_context_lane_event_status(blocker_raw_event)
+    if event_kind not in _RUNTIME_CONTEXT_QA_EVENT_KINDS:
+        return False
+    if status not in _RUNTIME_CONTEXT_BLOCKING_STATUSES:
+        return False
+    reviewed_refs = set(_runtime_context_lane_reviewed_event_refs(blocker_raw_event))
+    saw_revision_implementation = False
+    saw_finish_or_review_ready = False
+    for record_index, event_view, raw_event in fulfilling_records:
+        if record_index <= blocker_index:
+            continue
+        event_ref = _runtime_context_lane_normalized_ref(event_view.get("event_ref"))
+        if not event_ref or event_ref in reviewed_refs:
+            continue
+        if _runtime_context_lane_event_is_worker_revision_implementation(raw_event):
+            saw_revision_implementation = True
+        if _runtime_context_lane_event_is_worker_finish_or_review_ready(raw_event):
+            saw_finish_or_review_ready = True
+        if saw_revision_implementation and saw_finish_or_review_ready:
+            return True
+    return False
+
+
 def build_runtime_context_lane_plan_view(
     events: Sequence[Mapping[str, Any]] | None,
     *,
@@ -2503,16 +2590,21 @@ def build_runtime_context_lane_plan_view(
     clause_by_id = {item["clause"]: dict(item) for item in clause_items}
     fulfilled: dict[str, dict[str, Any]] = {}
     blocking_events: list[dict[str, Any]] = []
+    blocking_records: list[tuple[int, dict[str, Any], Mapping[str, Any]]] = []
+    fulfilling_records: list[tuple[int, dict[str, Any], Mapping[str, Any]]] = []
     resolved_event_refs: set[str] = set()
     last_event: dict[str, Any] = {}
     lane = _runtime_context_text(lane_id)
-    for _, event in sorted(
-        [
+    sorted_events = sorted(
+        (
             (index, event)
             for index, event in enumerate(events or ())
             if isinstance(event, Mapping)
-        ],
+        ),
         key=_runtime_context_lane_event_sort_key,
+    )
+    for ordered_index, (_, event) in enumerate(
+        sorted_events,
     ):
         merged = _runtime_context_lane_event_mapping(event)
         event_lane = _runtime_context_text(
@@ -2542,14 +2634,17 @@ def build_runtime_context_lane_plan_view(
             if clause in clause_by_id
         ]
         if status in _RUNTIME_CONTEXT_BLOCKING_STATUSES:
-            blocking_events.append(
+            blocking_event = (
                 event_view
                 | {"clauses": clauses}
                 | _runtime_context_lane_blocking_event_details(event, merged)
             )
+            blocking_events.append(blocking_event)
+            blocking_records.append((ordered_index, blocking_event, event))
             continue
         if status not in _RUNTIME_CONTEXT_FULFILLING_STATUSES:
             continue
+        fulfilling_records.append((ordered_index, event_view, event))
         resolved_event_refs.update(_runtime_context_lane_resolved_refs(event))
         for clause in clauses:
             if clause in fulfilled:
@@ -2560,11 +2655,33 @@ def build_runtime_context_lane_plan_view(
                 | {"clause": clause, "status": "fulfilled"}
             )
     if resolved_event_refs:
+        blocking_records = [
+            record
+            for record in blocking_records
+            if _runtime_context_lane_normalized_ref(record[1].get("event_ref"))
+            not in resolved_event_refs
+        ]
         blocking_events = [
             event
             for event in blocking_events
             if _runtime_context_lane_normalized_ref(event.get("event_ref"))
             not in resolved_event_refs
+        ]
+    superseded_blocking_refs = {
+        _runtime_context_lane_normalized_ref(blocking_event.get("event_ref"))
+        for blocker_index, blocking_event, raw_event in blocking_records
+        if _runtime_context_lane_failed_qa_superseded_by_post_failure_revision(
+            blocker_index=blocker_index,
+            blocker_raw_event=raw_event,
+            fulfilling_records=fulfilling_records,
+        )
+    }
+    if superseded_blocking_refs:
+        blocking_events = [
+            event
+            for event in blocking_events
+            if _runtime_context_lane_normalized_ref(event.get("event_ref"))
+            not in superseded_blocking_refs
         ]
     fulfilled_items = [fulfilled[clause] for clause in clause_order if clause in fulfilled]
     missing_items = [

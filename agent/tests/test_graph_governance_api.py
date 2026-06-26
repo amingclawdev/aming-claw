@@ -8592,40 +8592,50 @@ def test_runtime_context_current_state_allows_validated_worker_read(conn):
     assert worker_view["raw_session_token_exposed"] is False
 
 
+def _runtime_context_qa_handoff_current_values(
+    label: str,
+    *,
+    implementation_event_ref: str = "timeline:3",
+    finish_gate_ref: str = "timeline:4",
+) -> dict[str, object]:
+    return {
+        "runtime_context_id": f"mfrctx-{label}",
+        "task_id": f"task-{label}",
+        "parent_task_id": f"parent-{label}",
+        "read_receipt_event_ref": "timeline:1",
+        "startup_event_ref": "timeline:2",
+        "startup_runtime_context_id": f"mfrctx-{label}",
+        "startup_fence_token_present": True,
+        "startup_worker_session_id": f"worker-{label}",
+        "startup_worker_transcript_ref": f"multi_agent:worker-{label}",
+        "startup_harness_type": "codex",
+        "startup_route_id": f"route-{label}",
+        "startup_route_context_hash": f"sha256:route-{label}",
+        "startup_prompt_contract_id": f"prompt-{label}",
+        "startup_prompt_contract_hash": f"sha256:prompt-{label}",
+        "startup_route_token_ref": f"rtok-{label}",
+        "startup_read_receipt_hash": f"sha256:read-{label}",
+        "startup_read_receipt_event_id": "1",
+        "route_id": f"route-{label}",
+        "route_context_hash": f"sha256:route-{label}",
+        "prompt_contract_id": f"prompt-{label}",
+        "prompt_contract_hash": f"sha256:prompt-{label}",
+        "route_token_ref": f"rtok-{label}",
+        "visible_injection_manifest_hash": f"sha256:visible-{label}",
+        "graph_trace_ids": [f"gqt-{label}"],
+        "implementation_event_refs": [implementation_event_ref],
+        "worker_self_attesting": True,
+        "finish_gate_ref": finish_gate_ref,
+        "checkpoint_id": f"ckpt-{label}",
+    }
+
+
 def test_runtime_context_action_plan_hands_off_independent_qa_after_finish():
+    current_values = _runtime_context_qa_handoff_current_values("qa-handoff")
     action_plan = build_runtime_context_action_plan_view(
         {
-            "runtime_context_id": "mfrctx-qa-handoff",
-            "current_values": {
-                "runtime_context_id": "mfrctx-qa-handoff",
-                "task_id": "task-qa-handoff",
-                "parent_task_id": "parent-qa-handoff",
-                "read_receipt_event_ref": "timeline:1",
-                "startup_event_ref": "timeline:2",
-                "startup_runtime_context_id": "mfrctx-qa-handoff",
-                "startup_fence_token_present": True,
-                "startup_worker_session_id": "worker-qa-handoff",
-                "startup_worker_transcript_ref": "multi_agent:worker-qa-handoff",
-                "startup_harness_type": "codex",
-                "startup_route_id": "route-qa-handoff",
-                "startup_route_context_hash": "sha256:route-qa-handoff",
-                "startup_prompt_contract_id": "prompt-qa-handoff",
-                "startup_prompt_contract_hash": "sha256:prompt-qa-handoff",
-                "startup_route_token_ref": "rtok-qa-handoff",
-                "startup_read_receipt_hash": "sha256:read-qa-handoff",
-                "startup_read_receipt_event_id": "1",
-                "route_id": "route-qa-handoff",
-                "route_context_hash": "sha256:route-qa-handoff",
-                "prompt_contract_id": "prompt-qa-handoff",
-                "prompt_contract_hash": "sha256:prompt-qa-handoff",
-                "route_token_ref": "rtok-qa-handoff",
-                "visible_injection_manifest_hash": "sha256:visible-qa-handoff",
-                "graph_trace_ids": ["gqt-qa-handoff"],
-                "implementation_event_refs": ["timeline:3"],
-                "worker_self_attesting": True,
-                "finish_gate_ref": "timeline:4",
-                "checkpoint_id": "ckpt-qa-handoff",
-            },
+            "runtime_context_id": current_values["runtime_context_id"],
+            "current_values": current_values,
             "lane_plan": {},
         },
         gate_inputs_view={},
@@ -8641,6 +8651,160 @@ def test_runtime_context_action_plan_hands_off_independent_qa_after_finish():
     )
     assert action_plan["next_required_evidence"][0]["producer"] == "independent_qa"
     assert action_plan["next_required_evidence"][0]["worker_owned"] is False
+
+
+def test_runtime_context_failed_qa_without_revision_keeps_rework_action():
+    current_values = _runtime_context_qa_handoff_current_values("failed-qa-stale")
+    lane_plan = build_runtime_context_lane_plan_view(
+        [
+            {
+                "id": "5",
+                "event_type": "independent_verification.completed",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "actor": "independent-qa",
+                "status": "failed",
+                "task_id": current_values["task_id"],
+                "created_at": "2026-06-26T00:05:00Z",
+                "payload": {
+                    "runtime_context_id": current_values["runtime_context_id"],
+                    "task_id": current_values["task_id"],
+                    "parent_task_id": current_values["parent_task_id"],
+                    "reviewer_role": "independent_qa",
+                    "reviewed_events": {
+                        "implementation_event_refs": ["timeline:3"],
+                        "finish_gate_event_ref": "timeline:4",
+                    },
+                    "findings": [{"title": "rerun still fails"}],
+                },
+                "verification": {
+                    "result": "failed",
+                    "acceptance_failed": ["qa_rerun_contract"],
+                },
+            }
+        ],
+        lane_id=str(current_values["task_id"]),
+        generated_at="2026-06-26T00:06:00Z",
+    )
+    action_plan = build_runtime_context_action_plan_view(
+        {
+            "runtime_context_id": current_values["runtime_context_id"],
+            "current_values": current_values,
+            "lane_plan": lane_plan,
+        },
+        gate_inputs_view={},
+        close_gate_view={
+            "missing": [{"field": "verification_event_refs"}],
+            "ready": False,
+        },
+    )
+
+    assert action_plan["next_legal_action"] == "revise_after_failed_independent_qa"
+    assert action_plan["next_required_evidence"][0]["id"] == "failed_qa_revision"
+    assert action_plan["failed_qa_revision_projection"]["failed_qa_event_ref"] == (
+        "timeline:5"
+    )
+
+
+def test_runtime_context_failed_qa_revision_finish_projects_fresh_qa_rerun():
+    current_values = _runtime_context_qa_handoff_current_values(
+        "failed-qa-revised",
+        implementation_event_ref="timeline:6",
+        finish_gate_ref="timeline:7",
+    )
+    lane_plan = build_runtime_context_lane_plan_view(
+        [
+            {
+                "id": "5",
+                "event_type": "independent_verification.completed",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "actor": "independent-qa",
+                "status": "failed",
+                "task_id": current_values["task_id"],
+                "created_at": "2026-06-26T00:05:00Z",
+                "payload": {
+                    "runtime_context_id": current_values["runtime_context_id"],
+                    "task_id": current_values["task_id"],
+                    "parent_task_id": current_values["parent_task_id"],
+                    "reviewer_role": "independent_qa",
+                    "reviewed_events": {
+                        "implementation_event_refs": ["timeline:3"],
+                        "finish_gate_event_ref": "timeline:4",
+                    },
+                    "findings": [{"title": "first QA pass failed"}],
+                },
+                "verification": {
+                    "result": "failed",
+                    "acceptance_failed": ["qa_rerun_contract"],
+                },
+            },
+            {
+                "id": "6",
+                "event_type": "runtime_context.implementation_evidence",
+                "event_kind": "implementation_evidence",
+                "phase": "implementation",
+                "actor": "worker-failed-qa-revised",
+                "status": "accepted",
+                "task_id": current_values["task_id"],
+                "created_at": "2026-06-26T00:06:00Z",
+                "payload": {
+                    "runtime_context_id": current_values["runtime_context_id"],
+                    "task_id": current_values["task_id"],
+                    "parent_task_id": current_values["parent_task_id"],
+                    "worker_role": "mf_sub",
+                    "query_source": "mf_subagent",
+                    "changed_files": [
+                        "agent/governance/parallel_branch_runtime.py"
+                    ],
+                },
+            },
+            {
+                "id": "7",
+                "event_type": "mf_subagent.finish_gate",
+                "event_kind": "mf_subagent_finish_gate",
+                "phase": "finish_gate",
+                "actor": "worker-failed-qa-revised",
+                "status": "passed",
+                "task_id": current_values["task_id"],
+                "created_at": "2026-06-26T00:07:00Z",
+                "payload": {
+                    "mf_subagent_finish_gate": {
+                        "runtime_context_id": current_values["runtime_context_id"],
+                        "task_id": current_values["task_id"],
+                        "parent_task_id": current_values["parent_task_id"],
+                        "worker_role": "mf_sub",
+                        "lane_ownership_projection": {
+                            "worker_role": "mf_sub",
+                            "review_ready": True,
+                            "worker_status": "review_ready",
+                        },
+                    }
+                },
+            },
+        ],
+        lane_id=str(current_values["task_id"]),
+        generated_at="2026-06-26T00:08:00Z",
+    )
+    action_plan = build_runtime_context_action_plan_view(
+        {
+            "runtime_context_id": current_values["runtime_context_id"],
+            "current_values": current_values,
+            "lane_plan": lane_plan,
+        },
+        gate_inputs_view={},
+        close_gate_view={
+            "missing": [{"field": "verification_event_refs"}],
+            "ready": False,
+        },
+    )
+
+    assert lane_plan["blocking_events"] == []
+    assert action_plan["next_legal_action"] == "handoff_to_independent_qa"
+    assert action_plan["next_required_evidence"][0]["id"] == (
+        "independent_verification"
+    )
+    assert action_plan["failed_qa_revision_projection"]["status"] == "not_required"
 
 
 def test_runtime_context_current_state_route_folds_lane_plan_from_timeline_events(conn):
