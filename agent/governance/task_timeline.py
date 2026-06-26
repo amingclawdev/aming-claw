@@ -670,6 +670,40 @@ def _source_backed_route_gate_accepted(gate: Mapping[str, Any]) -> bool:
     )
 
 
+def source_backed_route_gate_authority(
+    route_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    route_gate_copy = dict(route_gate) if isinstance(route_gate, Mapping) else {}
+    envelope: dict[str, Any] = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_route_token_gate",
+        "source_of_authority": "route_token_gate",
+        "route_token_gate": route_gate_copy,
+    }
+    envelope["authority_hash"] = _canonical_contract_hash(
+        {key: value for key, value in envelope.items() if key != "authority_hash"}
+    )
+    return envelope
+
+
+def _source_backed_route_gate_authority_valid(authority: Mapping[str, Any]) -> bool:
+    if not authority:
+        return False
+    if _text(authority.get("schema_version")) != "source_backed_contract_gate_authority.v1":
+        return False
+    if _text(authority.get("source")) != "server_route_token_gate":
+        return False
+    if _text(authority.get("source_of_authority")) != "route_token_gate":
+        return False
+    authority_hash = _text(authority.get("authority_hash"))
+    if not authority_hash:
+        return False
+    expected_hash = _canonical_contract_hash(
+        {key: value for key, value in dict(authority).items() if key != "authority_hash"}
+    )
+    return authority_hash == expected_hash
+
+
 def _source_backed_timeline_authority_source(
     payload: Mapping[str, Any],
     verification: Mapping[str, Any],
@@ -698,7 +732,7 @@ def _source_backed_timeline_authority_source(
             source,
             "source_backed_contract_gate_authority",
         )
-        if _text(authority.get("source_of_authority")) != "route_token_gate":
+        if not _source_backed_route_gate_authority_valid(authority):
             continue
         route_gate = _mapping(authority.get("route_token_gate"))
         if _source_backed_route_gate_accepted(route_gate):

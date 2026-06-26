@@ -29085,12 +29085,11 @@ def _timeline_payload_with_route_gate(
     if route_gate:
         route_gate_summary = _route_gate_public_summary(route_gate)
         payload["route_token_gate"] = route_gate_summary
-        payload["source_backed_contract_gate_authority"] = {
-            "schema_version": "source_backed_contract_gate_authority.v1",
-            "source": "server_route_token_gate",
-            "source_of_authority": "route_token_gate",
-            "route_token_gate": route_gate_summary,
-        }
+        from . import task_timeline as _task_timeline
+
+        payload["source_backed_contract_gate_authority"] = (
+            _task_timeline.source_backed_route_gate_authority(route_gate_summary)
+        )
     return payload
 
 
