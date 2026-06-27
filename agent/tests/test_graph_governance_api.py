@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27733,6 +27734,42 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn
 
     assert worker_read["ok"] is True
     assert worker_read["actor_role"] == "mf_sub"
+
+
+def test_runtime_context_worker_task_alias_is_dispatch_only():
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-contract-update-alias",
+        task_id="worker-task-alias",
+        parent_task_id="parent-contract-update-task",
+    )
+    record = {
+        "contract_id": server.CONTRACT_UPDATE_CONTRACT_ID,
+        "runtime_guide": {
+            "completed_lines": [
+                {
+                    "stage_id": "observer_request",
+                    "line_id": "observer_request_contract_update",
+                    "evidence_kind": "contract_update_request",
+                    "actor_role": "observer",
+                    "payload": {
+                        "worker_runtime_context": {
+                            "runtime_context_id": (
+                                "mfrctx-contract-update-alias"
+                            ),
+                            "worker_task_id": "worker-task-alias",
+                            "parent_task_id": "parent-contract-update-task",
+                            "worker_role": "mf_sub",
+                        }
+                    },
+                }
+            ]
+        },
+    }
+
+    assert (
+        server._contract_runtime_record_references_runtime_context(record, context)
+        is False
+    )
 
 
 def test_mf_parallel_worker_read_rejects_runtime_context_only_in_non_dispatch_line(conn):

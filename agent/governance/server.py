@@ -34094,11 +34094,15 @@ def _contract_runtime_record_references_runtime_context(
 
     contract_id = str((record or {}).get("contract_id") or "").strip()
 
-    def _matches_context(value: Mapping[str, Any]) -> bool:
+    def _matches_context(
+        value: Mapping[str, Any],
+        *,
+        task_id_keys: tuple[str, ...] = ("task_id",),
+    ) -> bool:
         for payload in _mapping_candidates(value):
             if _line_value(payload, "runtime_context_id") != runtime_context_id:
                 continue
-            if _line_value(payload, "task_id", "worker_task_id") != task_id:
+            if _line_value(payload, *task_id_keys) != task_id:
                 continue
             if _line_value(payload, "parent_task_id") != parent_task_id:
                 continue
@@ -34145,7 +34149,14 @@ def _contract_runtime_record_references_runtime_context(
             or str(line.get("actor_role") or "").strip() != "observer"
         ):
             continue
-        if _matches_context(line) or _matches_context(payload):
+        dispatch_task_id_keys = ("task_id", "worker_task_id")
+        if _matches_context(
+            line,
+            task_id_keys=dispatch_task_id_keys,
+        ) or _matches_context(
+            payload,
+            task_id_keys=dispatch_task_id_keys,
+        ):
             return True
     return False
 
