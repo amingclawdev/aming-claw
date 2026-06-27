@@ -24315,12 +24315,6 @@ def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
 def test_onboard_route_guide_returns_contract_chain_current_projection(conn):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-CURRENT-PROJECTION"
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    parent = server._onboard_service_materialize_parent_record(
-        conn,
-        project_id=PID,
-        backlog_id=backlog_id,
-        route_token_ref="rtok-onboard-current-projection",
-    )
 
     response = server.handle_project_onboard_route_guide(
         _ctx_with_role(
@@ -24336,6 +24330,9 @@ def test_onboard_route_guide_returns_contract_chain_current_projection(conn):
         )
     )
 
+    parent = server._contract_runtime_store(conn).get(
+        server._onboard_service_execution_id(PID, backlog_id)
+    )
     current = response["contract_chain_current"]
     assert current["projection_source"] == "backlog_contract_chain_current"
     assert current["root_contract_execution_id"] == parent["contract_execution_id"]
@@ -24375,6 +24372,36 @@ def test_contract_chain_current_endpoint_returns_onboard_service_projection(conn
     assert current["root_contract_execution_id"] == parent["contract_execution_id"]
     assert current["current_contract_id"] == "onboard_route_guide"
     assert current["contract_chain_id"] == parent["contract_chain_id"]
+
+
+def test_contract_chain_current_rebuild_materializes_onboard_service_projection(conn):
+    backlog_id = "AC-CONTRACT-CHAIN-CURRENT-REBUILD-MATERIALIZES"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    response = server.handle_project_contract_chain_current(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "backlog_id": backlog_id,
+                "rebuild_if_missing": "true",
+                "route_token_ref": "rtok-contract-chain-current-rebuild",
+            },
+        )
+    )
+
+    parent = server._contract_runtime_store(conn).get(
+        server._onboard_service_execution_id(PID, backlog_id)
+    )
+    current = response["contract_chain_current"]
+    assert response["ok"] is True
+    assert response["projection_missing"] is False
+    assert response["rebuild_if_missing"] is True
+    assert current["projection_source"] == "backlog_contract_chain_current"
+    assert current["root_contract_execution_id"] == parent["contract_execution_id"]
+    assert current["current_contract_execution_id"] == parent["contract_execution_id"]
+    assert current["current_contract_id"] == "onboard_route_guide"
+    assert current["contract_chain_id"] == parent["contract_chain_id"]
+    assert parent["route_token_ref"] == "rtok-contract-chain-current-rebuild"
 
 
 def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_path):

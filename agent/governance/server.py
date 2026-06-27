@@ -33770,13 +33770,41 @@ def _contract_chain_current_projection(
     project_id: str,
     backlog_id: str,
     rebuild_if_missing: bool = False,
+    route_token_ref: str = "",
 ) -> dict[str, Any]:
     try:
+        current_projection = read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
+        if current_projection or not rebuild_if_missing:
+            return current_projection
+        try:
+            rebuilt_projection = rebuild_backlog_contract_chain_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        except sqlite3.Error:
+            rebuilt_projection = {}
+        if rebuilt_projection:
+            return rebuilt_projection
+        record = _onboard_service_materialize_parent_record(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
+        projected = record.get("contract_chain_current")
+        if isinstance(projected, Mapping) and projected:
+            return dict(projected)
         return read_backlog_contract_chain_current(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
-            rebuild_if_missing=rebuild_if_missing,
+            rebuild_if_missing=True,
         )
     except sqlite3.Error as exc:
         return {
@@ -33797,12 +33825,14 @@ def _contract_chain_current_response(
     project_id: str,
     backlog_id: str,
     rebuild_if_missing: bool = False,
+    route_token_ref: str = "",
 ) -> dict[str, Any]:
-    current_projection = read_backlog_contract_chain_current(
+    current_projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
         rebuild_if_missing=rebuild_if_missing,
+        route_token_ref=route_token_ref,
     )
     return {
         "ok": True,
@@ -36330,7 +36360,8 @@ def _onboard_route_guide_service_response(
     role: str = "",
     work_type: str = "",
 ) -> dict[str, Any]:
-    record = _onboard_service_parent_record(
+    record = _onboard_service_materialize_parent_record(
+        conn,
         project_id=project_id,
         backlog_id=backlog_id,
         route_token_ref=route_token_ref,
@@ -36346,6 +36377,7 @@ def _onboard_route_guide_service_response(
         project_id=project_id,
         backlog_id=backlog_id,
         rebuild_if_missing=True,
+        route_token_ref=route_token_ref,
     )
     projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
@@ -48017,12 +48049,16 @@ def handle_project_contract_chain_current(ctx: RequestContext):
     if not backlog_id:
         raise ValidationError("contract_chain_current requires backlog_id or bug_id")
     rebuild_if_missing = _query_bool(ctx.query, "rebuild_if_missing", False)
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
     with DBContext(project_id) as conn:
         return _contract_chain_current_response(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
             rebuild_if_missing=rebuild_if_missing,
+            route_token_ref=route_token_ref,
         )
 
 
