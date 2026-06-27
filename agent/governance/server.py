@@ -39586,7 +39586,7 @@ def handle_task_timeline_list(ctx: RequestContext):
     correlation_id = _first_query_value(ctx.query, "correlation_id")
     severity = _first_query_value(ctx.query, "severity")
     decision = _first_query_value(ctx.query, "decision")
-    include_compact_ledger = _truthy_flag(
+    explicit_compact_ledger = _truthy_flag(
         _first_query_value(ctx.query, "include_compact_ledger")
         or _first_query_value(ctx.query, "compact_ledger")
     )
@@ -39598,6 +39598,21 @@ def handle_task_timeline_list(ctx: RequestContext):
         limit = int(_first_query_value(ctx.query, "limit", "200") or "200")
     except (TypeError, ValueError):
         limit = 200
+    filtered_request = any(
+        [
+            task_id,
+            backlog_id,
+            trace_id,
+            phase,
+            event_kind,
+            scenario_id,
+            correlation_id,
+            severity,
+            decision,
+            parent_event_id,
+        ]
+    )
+    include_compact_ledger = explicit_compact_ledger or filtered_request
     from . import task_timeline
 
     with DBContext(project_id) as conn:
@@ -43946,6 +43961,11 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
     pid = ctx.path_params["project_id"]
     bug_id = ctx.path_params["bug_id"]
     include_events = _query_bool(ctx.query, "include_events", False)
+    include_compact_ledger = (
+        include_events
+        or _query_bool(ctx.query, "include_compact_ledger", False)
+        or _query_bool(ctx.query, "compact_ledger", False)
+    )
     limit = max(1, min(_query_int(ctx.query, "limit", 1000), 1000))
     view = str(ctx.query.get("view") or "full").strip().lower()
     conn = get_connection(pid)
@@ -44174,6 +44194,12 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                     break
         if reason_human:
             result["reason_human"] = reason_human
+        if include_compact_ledger:
+            result["compact_ledger"] = task_timeline.build_compact_ledger(
+                conn,
+                pid,
+                events,
+            )
         if include_events:
             result["events"] = events
         return result
