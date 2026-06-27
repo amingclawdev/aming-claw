@@ -9256,6 +9256,42 @@ def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) 
         raise BranchRuntimeFenceError("Fence token mismatch: branch context was reclaimed")
 
 
+_FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES = frozenset(
+    {
+        STATE_VALIDATED,
+        STATE_MERGE_READY,
+        "review_ready",
+        "waiting_merge",
+    }
+)
+
+
+def _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
+    context: BranchTaskRuntimeContext,
+    *,
+    fence_token: str,
+    checkpoint_id: str,
+    require_finish_gate: bool,
+    allow_finish_checkpoint_without_fence: bool,
+) -> bool:
+    if not allow_finish_checkpoint_without_fence:
+        return False
+    if fence_token:
+        return False
+    if not require_finish_gate:
+        return False
+    expected_checkpoint = str(checkpoint_id or "").strip()
+    if not expected_checkpoint:
+        raise ValueError("checkpoint_id is required when require_finish_gate is true")
+    if context.checkpoint_id != expected_checkpoint:
+        raise ValueError("checkpoint_id does not match the validated finish gate")
+    if context.replay_source != "mf_sub_finish_gate":
+        raise ValueError("validated mf_sub finish gate checkpoint is required")
+    if context.status not in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES:
+        raise ValueError("branch context is not merge-ready from a finish gate")
+    return True
+
+
 MF_SUBAGENT_ROUTE_IDENTITY_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -12285,6 +12321,7 @@ def queue_merge_item_for_branch_context(
     merge_preview_id: str = "",
     checkpoint_id: str = "",
     require_finish_gate: bool = False,
+    allow_finish_checkpoint_without_fence: bool = False,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Persist a fenced merge queue request for one branch runtime context."""
@@ -12295,7 +12332,14 @@ def queue_merge_item_for_branch_context(
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
-    if context.fence_token or fence_token:
+    finish_checkpoint_route_gate = _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
+        context,
+        fence_token=fence_token,
+        checkpoint_id=checkpoint_id,
+        require_finish_gate=require_finish_gate,
+        allow_finish_checkpoint_without_fence=allow_finish_checkpoint_without_fence,
+    )
+    if (context.fence_token or fence_token) and not finish_checkpoint_route_gate:
         _require_current_fence(context, fence_token)
     if require_finish_gate:
         expected_checkpoint = str(checkpoint_id or "").strip()

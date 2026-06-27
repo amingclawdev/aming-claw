@@ -11766,6 +11766,100 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub"
 
 
+def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fence(conn):
+    queue_id = "mergeq-api-finish-route-checkpoint"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="mf-sub-route-checkpoint-task",
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/mf-sub-route-checkpoint-task",
+            status="worktree_ready",
+            fence_token="fence-mf-sub-route-checkpoint",
+            worktree_path="/tmp/nonexistent-mf-sub-route-checkpoint-task",
+            base_commit="base",
+            head_commit="head",
+            target_head_commit="target",
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T07:32:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id="mf-sub-route-checkpoint-task",
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-mf-sub-route-checkpoint",
+        worktree_path="/tmp/nonexistent-mf-sub-route-checkpoint-task",
+        branch_ref="refs/heads/codex/mf-sub-route-checkpoint-task",
+        head_commit="head",
+    )
+
+    server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "mf-sub-route-checkpoint-task",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-mf-sub-route-checkpoint",
+                "fence_token": "fence-mf-sub-route-checkpoint",
+                "head_commit": "head",
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-mf-sub-route-checkpoint",
+                    worktree_path="/tmp/nonexistent-mf-sub-route-checkpoint-task",
+                    branch_ref="refs/heads/codex/mf-sub-route-checkpoint-task",
+                    head_commit="head",
+                ),
+            },
+        )
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "mf-sub-route-checkpoint-task",
+                    "merge_queue_id": queue_id,
+                    "worker_role": "mf_sub",
+                    "checkpoint_id": "ckpt-mf-sub-route-checkpoint",
+                    "fence_token": "fence-stale",
+                    "route_waiver": _route_waiver(
+                        "merge_queue",
+                        task_id="mf-sub-route-checkpoint-task",
+                    ),
+                },
+            )
+        )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "mf-sub-route-checkpoint-task",
+                "merge_queue_id": queue_id,
+                "worker_role": "mf_sub",
+                "checkpoint_id": "ckpt-mf-sub-route-checkpoint",
+                "route_waiver": _route_waiver(
+                    "merge_queue",
+                    task_id="mf-sub-route-checkpoint-task",
+                ),
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-route-checkpoint"
+    assert queued["queue_item"]["task_id"] == "mf-sub-route-checkpoint-task"
+    assert queued["route_token_gate"]["action"] == "merge_queue"
+
+
 def test_mf_sub_session_cannot_enqueue_or_execute_merge(conn):
     queue_id = "mergeq-api-mf-sub-denied"
     upsert_branch_context(

@@ -6627,6 +6627,131 @@ def test_merge_queue_enqueue_uses_current_fence_and_updates_context() -> None:
     assert queued["queue_item"]["snapshot_id"] == "scope-merge"
 
 
+def test_merge_queue_accepts_route_gated_finish_checkpoint_without_raw_fence() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-route-checkpoint",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-route-checkpoint",
+            status=STATE_VALIDATED,
+            fence_token="fence-route-checkpoint",
+            base_commit="base-route-checkpoint",
+            head_commit="head-route-checkpoint",
+            target_head_commit="target-route-checkpoint",
+            checkpoint_id="ckpt-route-checkpoint",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso=NOW,
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-route-checkpoint",
+            merge_queue_id="mergeq-route-checkpoint",
+            require_finish_gate=True,
+            checkpoint_id="ckpt-route-checkpoint",
+            now_iso=NOW,
+        )
+
+    with pytest.raises(ValueError, match="checkpoint_id does not match"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-route-checkpoint",
+            merge_queue_id="mergeq-route-checkpoint",
+            require_finish_gate=True,
+            checkpoint_id="ckpt-wrong",
+            allow_finish_checkpoint_without_fence=True,
+            now_iso=NOW,
+        )
+
+    queued = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-route-checkpoint",
+        merge_queue_id="mergeq-route-checkpoint",
+        require_finish_gate=True,
+        checkpoint_id="ckpt-route-checkpoint",
+        allow_finish_checkpoint_without_fence=True,
+        now_iso=NOW,
+    )
+
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["checkpoint_id"] == "ckpt-route-checkpoint"
+    assert queued["queue_item"]["branch_head"] == "head-route-checkpoint"
+
+
+def test_merge_queue_route_gated_finish_checkpoint_rejects_non_finish_source() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-route-non-finish",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-route-non-finish",
+            status=STATE_VALIDATED,
+            fence_token="fence-route-non-finish",
+            base_commit="base-route-non-finish",
+            head_commit="head-route-non-finish",
+            target_head_commit="target-route-non-finish",
+            checkpoint_id="ckpt-route-non-finish",
+            replay_source="manual_checkpoint",
+        ),
+        now_iso=NOW,
+    )
+
+    with pytest.raises(ValueError, match="validated mf_sub finish gate"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-route-non-finish",
+            merge_queue_id="mergeq-route-non-finish",
+            require_finish_gate=True,
+            checkpoint_id="ckpt-route-non-finish",
+            allow_finish_checkpoint_without_fence=True,
+            now_iso=NOW,
+        )
+
+
+def test_merge_queue_route_gated_finish_checkpoint_rejects_non_ready_context() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-route-running",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-route-running",
+            status=STATE_RUNNING,
+            fence_token="fence-route-running",
+            base_commit="base-route-running",
+            head_commit="head-route-running",
+            target_head_commit="target-route-running",
+            checkpoint_id="ckpt-route-running",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso=NOW,
+    )
+
+    with pytest.raises(ValueError, match="not merge-ready"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-route-running",
+            merge_queue_id="mergeq-route-running",
+            require_finish_gate=True,
+            checkpoint_id="ckpt-route-running",
+            allow_finish_checkpoint_without_fence=True,
+            now_iso=NOW,
+        )
+
+
 def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:
     conn = _runtime_conn()
     shared_task_id = "shared-task"

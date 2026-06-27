@@ -16293,6 +16293,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     _query_bool(ctx.body, "require_finish_gate", False)
                     or str(ctx.body.get("worker_role") or "") == "mf_sub"
                 ),
+                allow_finish_checkpoint_without_fence=bool(route_gate),
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(
