@@ -13,6 +13,8 @@ import {
 } from "./taskTimelineSemantics";
 
 export const TASK_PLAYBACK_TRACE_SCHEMA = "task_playback_trace.v1";
+export const TASK_COMPACT_LEDGER_SCHEMA = "task_timeline.compact_multi_backlog_ledger.v1";
+export const TASK_COMPACT_LEDGER_EVENT_TYPE = "task_timeline.compact_ledger";
 
 export type TaskPlaybackSource = "governed" | "governed_partial" | "fallback_sample";
 export type TaskPlaybackFrameStatus = "passed" | "blocked" | "failed" | "running" | "waiting" | "missing" | "recorded" | "unknown";
@@ -169,6 +171,60 @@ export interface TaskPlaybackStatusSummary {
   has_governed_data: boolean;
 }
 
+export interface TaskPlaybackCompactLedgerPayloadRef {
+  event_id: string;
+  payload_sha256: string;
+  payload_bytes: number | null;
+}
+
+export interface TaskPlaybackCompactLedgerNextAction {
+  id: string;
+  action: string;
+  stage_id: string;
+  line_id: string;
+  owner_role: string;
+  description: string;
+}
+
+export interface TaskPlaybackCompactLedgerBlockerSummary {
+  kind: string;
+  count: number | null;
+  keys: string[];
+  summary: string;
+  reason: string;
+}
+
+export interface TaskPlaybackCompactLedgerRow {
+  backlog_id: string;
+  title: string;
+  priority: string;
+  status: string;
+  commit: string;
+  contract_execution_id: string;
+  merge_queue_id: string;
+  merge_queue_index: number | null;
+  merge_queue_item_id: string;
+  merge_queue_task_id: string;
+  merge_queue_status: string;
+  latest_event_id: string;
+  latest_event_kind: string;
+  latest_event_type: string;
+  latest_status: string;
+  latest_payload_ref: TaskPlaybackCompactLedgerPayloadRef;
+  next_legal_action: TaskPlaybackCompactLedgerNextAction;
+  blocker_summary: TaskPlaybackCompactLedgerBlockerSummary;
+  head_commit: string;
+  readiness_state: string;
+}
+
+export interface TaskPlaybackCompactLedger {
+  schema_version: typeof TASK_COMPACT_LEDGER_SCHEMA | string;
+  project_id: string;
+  row_count: number;
+  source_event_count: number;
+  rows: TaskPlaybackCompactLedgerRow[];
+}
+
 export interface TaskPlaybackTrace {
   schema_version: typeof TASK_PLAYBACK_TRACE_SCHEMA;
   project_id: string;
@@ -181,6 +237,7 @@ export interface TaskPlaybackTrace {
   statuses: TaskPlaybackStatusSummary;
   evidence_refs: TaskPlaybackEvidenceRef[];
   artifact_refs: TaskPlaybackArtifactRef[];
+  compact_ledger: TaskPlaybackCompactLedger;
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
   close_gate_matrix: GateMatrixProjection;
@@ -191,6 +248,7 @@ export interface NormalizeTaskPlaybackInput {
   backlog: BacklogBug;
   taskTimeline?: TaskTimelineResponse | null;
   gateResponse?: BacklogTimelineGateResponse | null;
+  compactLedger?: unknown;
   source?: TaskPlaybackSource;
   generatedAt?: string;
 }
@@ -224,12 +282,17 @@ export function sanitizeTaskPlaybackEvidenceText(value: string, path = ""): stri
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
   const timelineEvents = input.taskTimeline?.events ?? [];
   const gateEvents = input.gateResponse?.events ?? [];
-  const events = mergeTimelineEvents(timelineEvents, gateEvents);
+  const compactLedger = normalizeTaskPlaybackCompactLedger(
+    firstCompactLedgerSource(input.compactLedger, input.taskTimeline, input.gateResponse),
+    input.projectId,
+  );
+  const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(compactLedger, input.generatedAt);
+  const events = mergeTimelineEvents([...timelineEvents, ...ledgerEvents], gateEvents);
   const frames = events.map((event, index) => frameFromEvent(event, index));
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
   const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
   const closeGateMatrix = projectGateMatrix(timelineGateWithAuditClose(input.gateResponse), closeGateSummary.applicable);
-  const source = input.source ?? (input.taskTimeline || input.gateResponse ? "governed" : "fallback_sample");
+  const source = input.source ?? (input.taskTimeline || input.gateResponse || compactLedger.rows.length > 0 ? "governed" : "fallback_sample");
   const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
   const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
   const statuses = summarizeFrames(frames, closeGateSummary, source);
@@ -246,6 +309,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     statuses,
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
+    compact_ledger: compactLedger,
     privacy_boundary: {
       raw_prompt_text: "not_displayed",
       host_private_paths: "redacted",
@@ -341,6 +405,265 @@ export function fallbackTaskPlaybackSampleTrace(projectId: string): TaskPlayback
     },
     source: "fallback_sample",
   });
+}
+
+export function emptyCompactLedger(projectId = ""): TaskPlaybackCompactLedger {
+  return {
+    schema_version: TASK_COMPACT_LEDGER_SCHEMA,
+    project_id: projectId,
+    row_count: 0,
+    source_event_count: 0,
+    rows: [],
+  };
+}
+
+export function normalizeTaskPlaybackCompactLedger(source: unknown, fallbackProjectId = ""): TaskPlaybackCompactLedger {
+  const record = asRecord(findCompactLedgerSource(source) ?? source);
+  if (Object.keys(record).length === 0) return emptyCompactLedger(fallbackProjectId);
+  const rawRows = Array.isArray(record.rows) ? record.rows : [];
+  const rows = rawRows.map(normalizeCompactLedgerRow).filter((row) => row.backlog_id || row.contract_execution_id || row.latest_event_id);
+  return {
+    schema_version: firstStringField(record, ["schema_version"]) || TASK_COMPACT_LEDGER_SCHEMA,
+    project_id: firstStringField(record, ["project_id"]) || fallbackProjectId,
+    row_count: numberFrom(record.row_count) ?? rows.length,
+    source_event_count: numberFrom(record.source_event_count) ?? 0,
+    rows,
+  };
+}
+
+export function taskPlaybackLedgerRowsToTimelineEvents(
+  ledger: TaskPlaybackCompactLedger | null | undefined,
+  generatedAt?: string,
+): TaskTimelineEvent[] {
+  if (!ledger?.rows.length) return [];
+  const at = generatedAt ?? new Date().toISOString();
+  return ledger.rows.map((row, index) => compactLedgerEventFromRow(row, ledger, index, at));
+}
+
+export function taskPlaybackLedgerRowRefs(row: TaskPlaybackCompactLedgerRow): TaskPlaybackEvidenceRef[] {
+  const payload = row.latest_payload_ref;
+  const refs: TaskPlaybackEvidenceRef[] = [];
+  if (row.latest_event_id) refs.push({ kind: "source_event", label: "latest event", value: row.latest_event_id });
+  if (row.latest_event_kind) refs.push({ kind: "source_event", label: "latest event kind", value: row.latest_event_kind });
+  if (payload.event_id) refs.push({ kind: "source_event", label: "payload event", value: payload.event_id });
+  if (payload.payload_sha256) refs.push({ kind: "artifact", label: "payload sha", value: payload.payload_sha256 });
+  if (payload.payload_bytes != null) refs.push({ kind: "artifact", label: "payload bytes", value: String(payload.payload_bytes) });
+  if (row.contract_execution_id) refs.push({ kind: "artifact", label: "contract execution", value: row.contract_execution_id });
+  if (row.merge_queue_id) refs.push({ kind: "artifact", label: "merge queue", value: row.merge_queue_id });
+  if (row.merge_queue_item_id) refs.push({ kind: "artifact", label: "merge queue item", value: row.merge_queue_item_id });
+  if (row.merge_queue_task_id) refs.push({ kind: "artifact", label: "merge queue task", value: row.merge_queue_task_id });
+  if (row.head_commit || row.commit) refs.push({ kind: "commit", label: "head commit", value: shortCommit(row.head_commit || row.commit) });
+  return stableEvidence(refs);
+}
+
+export function taskPlaybackCompactLedgerRowForBacklog(
+  ledger: TaskPlaybackCompactLedger | null | undefined,
+  backlogId: string,
+): TaskPlaybackCompactLedgerRow | null {
+  if (!ledger?.rows.length) return null;
+  return ledger.rows.find((row) => row.backlog_id === backlogId) ?? ledger.rows[0] ?? null;
+}
+
+export function taskPlaybackCompactLedgerNextActionLabel(
+  action: TaskPlaybackCompactLedgerNextAction | null | undefined,
+): string {
+  if (!action) return "";
+  const primary = action.action || action.id;
+  const meta = [
+    action.stage_id ? `stage ${action.stage_id}` : "",
+    action.line_id ? `line ${action.line_id}` : "",
+    action.owner_role ? `owner ${action.owner_role}` : "",
+  ].filter(Boolean);
+  const suffix = meta.length > 0 ? ` (${meta.join("; ")})` : "";
+  const detail = action.description ? ` - ${action.description}` : "";
+  return `${primary}${suffix}${detail}`.trim();
+}
+
+export function taskPlaybackCompactLedgerBlockerLabel(
+  blocker: TaskPlaybackCompactLedgerBlockerSummary | null | undefined,
+): string {
+  if (!blocker) return "";
+  const keys = blocker.keys.length > 0 ? formatCompactList(blocker.keys) : "";
+  const count = blocker.count != null ? `${blocker.count} blocker${blocker.count === 1 ? "" : "s"}` : "";
+  return [
+    blocker.kind,
+    count,
+    keys,
+    blocker.summary,
+    blocker.reason,
+  ].filter(Boolean).join(" - ");
+}
+
+function firstCompactLedgerSource(...sources: unknown[]): unknown {
+  for (const source of sources) {
+    const found = findCompactLedgerSource(source);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findCompactLedgerSource(source: unknown): unknown {
+  const record = asRecord(source);
+  if (Object.keys(record).length === 0) return null;
+  if (Array.isArray(record.rows)) return record;
+  for (const key of ["compact_ledger", "compactLedger"]) {
+    const candidate = asRecord(record[key]);
+    if (Array.isArray(candidate.rows)) return candidate;
+  }
+  for (const key of ["timeline_gate", "payload", "verification", "artifact_refs"]) {
+    const nested = findCompactLedgerSource(record[key]);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function normalizeCompactLedgerRow(value: unknown): TaskPlaybackCompactLedgerRow {
+  const record = asRecord(value);
+  const latestPayloadRef = normalizeLedgerPayloadRef(record.latest_payload_ref);
+  return {
+    backlog_id: firstStringField(record, ["backlog_id", "bug_id"]),
+    title: firstStringField(record, ["title"]),
+    priority: firstStringField(record, ["priority"]),
+    status: firstStringField(record, ["status"]),
+    commit: firstStringField(record, ["commit"]),
+    contract_execution_id: firstStringField(record, ["contract_execution_id", "cex_id"]),
+    merge_queue_id: firstStringField(record, ["merge_queue_id"]),
+    merge_queue_index: numberFrom(record.merge_queue_index),
+    merge_queue_item_id: firstStringField(record, ["merge_queue_item_id"]),
+    merge_queue_task_id: firstStringField(record, ["merge_queue_task_id"]),
+    merge_queue_status: firstStringField(record, ["merge_queue_status"]),
+    latest_event_id: firstStringField(record, ["latest_event_id"]),
+    latest_event_kind: firstStringField(record, ["latest_event_kind"]),
+    latest_event_type: firstStringField(record, ["latest_event_type"]),
+    latest_status: firstStringField(record, ["latest_status"]),
+    latest_payload_ref: latestPayloadRef,
+    next_legal_action: normalizeLedgerNextAction(record.next_legal_action),
+    blocker_summary: normalizeLedgerBlockerSummary(record.blocker_summary),
+    head_commit: firstStringField(record, ["head_commit", "head", "commit"]),
+    readiness_state: firstStringField(record, ["readiness_state", "readiness", "close_readiness"]),
+  };
+}
+
+function normalizeLedgerPayloadRef(value: unknown): TaskPlaybackCompactLedgerPayloadRef {
+  const record = asRecord(value);
+  return {
+    event_id: firstStringField(record, ["event_id", "latest_event_id"]),
+    payload_sha256: firstStringField(record, ["payload_sha256", "sha256", "payload_hash"]),
+    payload_bytes: numberFrom(record.payload_bytes),
+  };
+}
+
+function normalizeLedgerNextAction(value: unknown): TaskPlaybackCompactLedgerNextAction {
+  const record = asRecord(value);
+  const textValue = typeof value === "string" ? safeText(value) : "";
+  return {
+    id: firstStringField(record, ["id"]) || textValue,
+    action: firstStringField(record, ["action", "tool", "command"]) || textValue,
+    stage_id: firstStringField(record, ["stage_id", "stage"]),
+    line_id: firstStringField(record, ["line_id"]),
+    owner_role: firstStringField(record, ["owner_role", "role", "worker_role"]),
+    description: firstStringField(record, ["description", "detail", "reason"]),
+  };
+}
+
+function normalizeLedgerBlockerSummary(value: unknown): TaskPlaybackCompactLedgerBlockerSummary {
+  const record = asRecord(value);
+  const keys = stringsFromUnknown(record.keys ?? record.blocker_ids ?? record.blockers)
+    .map(safeText)
+    .filter((item) => item && item !== "[private detail redacted]");
+  return {
+    kind: firstStringField(record, ["kind", "type"]),
+    count: numberFrom(record.count),
+    keys: stable(keys),
+    summary: firstStringField(record, ["summary", "description"]),
+    reason: firstStringField(record, ["reason"]),
+  };
+}
+
+function compactLedgerEventFromRow(
+  row: TaskPlaybackCompactLedgerRow,
+  ledger: TaskPlaybackCompactLedger,
+  index: number,
+  generatedAt: string,
+): TaskTimelineEvent {
+  const refs = taskPlaybackLedgerRowRefs(row);
+  const nextAction = row.next_legal_action;
+  const payload = {
+    schema_version: ledger.schema_version,
+    lane: "gate",
+    backlog_id: row.backlog_id,
+    title: row.title,
+    priority: row.priority,
+    row_status: row.status,
+    contract_execution_id: row.contract_execution_id,
+    merge_queue_id: row.merge_queue_id,
+    merge_queue_index: row.merge_queue_index,
+    merge_queue_item_id: row.merge_queue_item_id,
+    merge_queue_task_id: row.merge_queue_task_id,
+    merge_queue_status: row.merge_queue_status,
+    latest_event_id: row.latest_event_id,
+    latest_event_kind: row.latest_event_kind,
+    latest_event_type: row.latest_event_type,
+    latest_status: row.latest_status,
+    latest_payload_ref: row.latest_payload_ref,
+    next_legal_action: nextAction,
+    blocker_summary: row.blocker_summary,
+    head_commit: row.head_commit,
+    readiness_state: row.readiness_state,
+    ledger_refs: refs.map((ref) => `${ref.label}: ${ref.value}`),
+    source_event_count: ledger.source_event_count,
+    ledger_row_count: ledger.row_count,
+  };
+  return {
+    event_id: `ledger:${row.backlog_id || row.contract_execution_id || index + 1}`,
+    project_id: ledger.project_id,
+    backlog_id: row.backlog_id,
+    task_id: row.merge_queue_task_id || row.contract_execution_id,
+    event_type: TASK_COMPACT_LEDGER_EVENT_TYPE,
+    event_kind: "contract_runtime_compact_ledger",
+    phase: "contract_runtime",
+    actor: "ContractRuntime",
+    status: compactLedgerStatus(row),
+    commit_sha: row.head_commit || row.commit || undefined,
+    payload,
+    verification: {
+      readiness_state: row.readiness_state,
+      close_ready: row.readiness_state === "close_ready",
+      blocked: compactLedgerStatus(row) === "blocked",
+      next_legal_action: nextAction,
+      blocker_summary: row.blocker_summary,
+    },
+    artifact_refs: {
+      compact_ledger_schema: ledger.schema_version,
+      contract_execution_id: row.contract_execution_id,
+      latest_payload_ref: row.latest_payload_ref,
+      merge_queue_id: row.merge_queue_id,
+      merge_queue_index: row.merge_queue_index,
+      merge_queue_item_id: row.merge_queue_item_id,
+      merge_queue_task_id: row.merge_queue_task_id,
+      merge_queue_status: row.merge_queue_status,
+      ledger_refs: refs.map((ref) => `${ref.label}: ${ref.value}`),
+      source_event_id: row.latest_event_id,
+      source_event_refs: refs.filter((ref) => ref.kind === "source_event").map((ref) => ref.value),
+    },
+    created_at: generatedAt,
+  };
+}
+
+function compactLedgerStatus(row: TaskPlaybackCompactLedgerRow): TaskPlaybackFrameStatus {
+  const readiness = row.readiness_state.toLowerCase();
+  const latestStatus = row.latest_status.toLowerCase();
+  const blockerText = [
+    row.blocker_summary.kind,
+    row.blocker_summary.summary,
+    row.blocker_summary.reason,
+    row.blocker_summary.keys.join(" "),
+  ].join(" ").toLowerCase();
+  if (readiness.includes("block") || latestStatus.includes("block") || blockerText.includes("block")) return "blocked";
+  if (readiness.includes("fail") || latestStatus.includes("fail")) return "failed";
+  if (readiness.includes("close_ready") || readiness.includes("verified") || readiness.includes("implemented")) return "passed";
+  if (readiness.includes("planned") || readiness.includes("pending") || latestStatus.includes("pending")) return "waiting";
+  return "recorded";
 }
 
 function mergeTimelineEvents(primary: TaskTimelineEvent[], secondary: TaskTimelineEvent[]): TaskTimelineEvent[] {
@@ -603,6 +926,7 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
     "verification.backlog_id",
     "artifact_refs.backlog_id",
   ]);
+  pushCompactLedgerFacts(facts, event);
   // Route identity must show the CANONICAL route_id (e.g. "route-repair-…"),
   // never the preview/static placeholder ("event.route_prompt_context.preview")
   // that some source/service events carry as their route_id. Prefer the
@@ -882,7 +1206,133 @@ function specificFactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimeline
   if (startupRefs.length > 0) {
     pushFact(facts, "startup_refs", "startup refs", formatCompactList(startupRefs), sourceForPath(startupRefs[0].path));
   }
-  return stableFacts(facts).slice(0, 24);
+  return stableFacts(facts).slice(0, 32);
+}
+
+function pushCompactLedgerFacts(facts: TaskPlaybackStructuredFact[], event: TaskTimelineEvent): void {
+  pushFirstFact(facts, event, "contract_execution_id", "contract execution id", [
+    "payload.contract_execution_id",
+    "verification.contract_execution_id",
+    "artifact_refs.contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "readiness_state", "readiness", [
+    "payload.readiness_state",
+    "verification.readiness_state",
+    "artifact_refs.readiness_state",
+  ]);
+  pushFirstFact(facts, event, "head_commit", "head commit", [
+    "payload.head_commit",
+    "verification.head_commit",
+    "artifact_refs.head_commit",
+  ]);
+  pushFirstFact(facts, event, "latest_event_id", "latest event id", [
+    "payload.latest_event_id",
+    "verification.latest_event_id",
+    "artifact_refs.latest_event_id",
+    "artifact_refs.latest_payload_ref.event_id",
+  ]);
+  pushFirstFact(facts, event, "latest_event_kind", "latest event kind", [
+    "payload.latest_event_kind",
+    "verification.latest_event_kind",
+    "artifact_refs.latest_event_kind",
+  ]);
+  pushFirstFact(facts, event, "latest_event_type", "latest event type", [
+    "payload.latest_event_type",
+    "verification.latest_event_type",
+    "artifact_refs.latest_event_type",
+  ]);
+  pushFirstFact(facts, event, "latest_status", "latest status", [
+    "payload.latest_status",
+    "verification.latest_status",
+    "artifact_refs.latest_status",
+  ]);
+  pushFirstFact(facts, event, "latest_payload_sha", "latest payload sha", [
+    "payload.latest_payload_ref.payload_sha256",
+    "verification.latest_payload_ref.payload_sha256",
+    "artifact_refs.latest_payload_ref.payload_sha256",
+  ]);
+  pushFirstFact(facts, event, "latest_payload_bytes", "latest payload bytes", [
+    "payload.latest_payload_ref.payload_bytes",
+    "verification.latest_payload_ref.payload_bytes",
+    "artifact_refs.latest_payload_ref.payload_bytes",
+  ]);
+  pushFirstFact(facts, event, "merge_queue_id", "merge queue id", [
+    "payload.merge_queue_id",
+    "verification.merge_queue_id",
+    "artifact_refs.merge_queue_id",
+  ]);
+  pushFirstFact(facts, event, "merge_queue_index", "merge queue index", [
+    "payload.merge_queue_index",
+    "verification.merge_queue_index",
+    "artifact_refs.merge_queue_index",
+  ]);
+  pushFirstFact(facts, event, "merge_queue_item_id", "merge queue item id", [
+    "payload.merge_queue_item_id",
+    "verification.merge_queue_item_id",
+    "artifact_refs.merge_queue_item_id",
+  ]);
+  pushFirstFact(facts, event, "merge_queue_task_id", "merge queue task id", [
+    "payload.merge_queue_task_id",
+    "verification.merge_queue_task_id",
+    "artifact_refs.merge_queue_task_id",
+  ]);
+  pushFirstFact(facts, event, "merge_queue_status", "merge queue status", [
+    "payload.merge_queue_status",
+    "verification.merge_queue_status",
+    "artifact_refs.merge_queue_status",
+  ]);
+
+  const nextAction = firstLedgerNextAction(event);
+  if (nextAction) {
+    pushFact(facts, "next_legal_action", "next legal action", nextAction.value, nextAction.source);
+  }
+  const blocker = firstLedgerBlockerSummary(event);
+  if (blocker) {
+    pushFact(facts, "blocker_summary", "blocker summary", blocker.value, blocker.source);
+  }
+  const ledgerRefs = publicValuesAtPaths(event, [
+    "payload.ledger_refs",
+    "artifact_refs.ledger_refs",
+  ]);
+  if (ledgerRefs.length > 0) {
+    pushFact(facts, "ledger_refs", "ledger refs", formatCompactList(ledgerRefs), sourceForPath(ledgerRefs[0].path));
+  }
+}
+
+function firstLedgerNextAction(event: TaskTimelineEvent): PublicFieldValue | null {
+  const paths = [
+    "payload.next_legal_action",
+    "verification.next_legal_action",
+    "artifact_refs.next_legal_action",
+  ];
+  for (const path of paths) {
+    if (isSensitiveEvidencePath(path)) continue;
+    const value = valueAtPath(event as unknown as Record<string, unknown>, path);
+    const record = asRecord(value);
+    const label = Object.keys(record).length > 0
+      ? taskPlaybackCompactLedgerNextActionLabel(normalizeLedgerNextAction(record))
+      : safeText(stringFrom(value));
+    if (label && label !== "[private detail redacted]") return { value: label, path, source: sourceForPath(path) };
+  }
+  return null;
+}
+
+function firstLedgerBlockerSummary(event: TaskTimelineEvent): PublicFieldValue | null {
+  const paths = [
+    "payload.blocker_summary",
+    "verification.blocker_summary",
+    "artifact_refs.blocker_summary",
+  ];
+  for (const path of paths) {
+    if (isSensitiveEvidencePath(path)) continue;
+    const value = valueAtPath(event as unknown as Record<string, unknown>, path);
+    const record = asRecord(value);
+    const label = Object.keys(record).length > 0
+      ? taskPlaybackCompactLedgerBlockerLabel(normalizeLedgerBlockerSummary(record))
+      : safeText(stringFrom(value));
+    if (label && label !== "[private detail redacted]") return { value: label, path, source: sourceForPath(path) };
+  }
+  return null;
 }
 
 // The preview/static placeholder route id (e.g. "event.route_prompt_context.preview")
@@ -1119,10 +1569,17 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   const blockerIds = publicValuesAtPaths(event, [
     "payload.blocker_ids",
     "payload.blockers",
+    "payload.blocker_summary",
+    "payload.blocker_summary.keys",
+    "payload.blocker_summary.kind",
     "payload.failed_request_ids",
     "verification.blocker_ids",
     "verification.blockers",
+    "verification.blocker_summary",
+    "verification.blocker_summary.keys",
+    "verification.blocker_summary.kind",
     "artifact_refs.blocker_ids",
+    "artifact_refs.blocker_summary",
   ]);
   if (blockerIds.length > 0) {
     pushFact(diagnosis, "blocker_ids", "blocker ids", formatCompactList(blockerIds), sourceForPath(blockerIds[0].path));
@@ -1251,6 +1708,7 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
   const nextAction = bridgeAction ? null : firstPublicValueAtPaths(event, [
     "payload.next_legal_action.description",
     "payload.next_legal_action.action",
+    "payload.next_legal_action.id",
     "payload.remaining_scope.next_legal_action.description",
     "payload.remaining_scope.next_legal_action.action",
     "payload.next_legal_action",
@@ -1261,6 +1719,7 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "payload.recovery_options",
     "verification.next_legal_action.description",
     "verification.next_legal_action.action",
+    "verification.next_legal_action.id",
     "verification.remaining_scope.next_legal_action.description",
     "verification.remaining_scope.next_legal_action.action",
     "verification.next_legal_action",
@@ -1269,6 +1728,7 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "verification.legal_next_action",
     "artifact_refs.next_legal_action.description",
     "artifact_refs.next_legal_action.action",
+    "artifact_refs.next_legal_action.id",
     "artifact_refs.remaining_scope.next_legal_action.description",
     "artifact_refs.remaining_scope.next_legal_action.action",
     "artifact_refs.next_legal_action",
@@ -2148,6 +2608,24 @@ function eventSummaryFromEvent(
   const implementedAndMerged = factValue(facts, "implemented_and_merged");
   const remainingAcceptance = factValue(diagnosis, "remaining_acceptance");
   const remainingOpen = factValue(diagnosis, "remaining_open");
+  if (event.event_type === TASK_COMPACT_LEDGER_EVENT_TYPE) {
+    const contractExecutionId = factValue(facts, "contract_execution_id");
+    const readiness = factValue(facts, "readiness_state");
+    const latestEvent = factValue(facts, "latest_event_id");
+    const latestKind = factValue(facts, "latest_event_kind");
+    const latestStatus = factValue(facts, "latest_status");
+    const headCommit = factValue(facts, "head_commit");
+    const nextAction = factValue(facts, "next_legal_action") || factValue(diagnosis, "next_legal_action");
+    const blockerSummary = factValue(facts, "blocker_summary") || factValue(diagnosis, "blocker_ids");
+    const latest = [latestEvent ? `latest event ${latestEvent}` : "", latestKind, latestStatus].filter(Boolean).join(" / ");
+    const identity = [
+      contractExecutionId ? `contract execution ${contractExecutionId}` : "",
+      backlog ? `backlog ${backlog}` : "",
+      readiness ? `readiness ${readiness}` : "",
+      headCommit ? `head ${headCommit}` : "",
+    ].filter(Boolean);
+    return `ContractRuntime compact ledger recorded ${identity.length > 0 ? identity.join(", ") : "runtime ledger state"}${latest ? `; ${latest}` : ""}${blockerSummary ? `; blockers ${blockerSummary}` : ""}${nextAction ? `; next legal action ${nextAction}` : ""}.`;
+  }
   const requiredEvidenceCount = firstCountAtPaths(event, [
     "payload.required_evidence",
     "payload.evidence_required",
@@ -2557,6 +3035,21 @@ function evidenceFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSeman
     label: "graph trace",
     value,
   })));
+  refs.push(...collectPublicStrings(containers, ["contract_execution_id"]).map((value) => ({
+    kind: "artifact" as const,
+    label: "contract execution",
+    value,
+  })));
+  refs.push(...collectPublicStrings(containers, ["latest_payload_ref", "ledger_refs"]).map((value) => ({
+    kind: "artifact" as const,
+    label: "ledger ref",
+    value,
+  })));
+  refs.push(...collectPublicStrings(containers, ["latest_event_id", "source_event_id", "source_event_refs"]).map((value) => ({
+    kind: "source_event" as const,
+    label: "source event",
+    value,
+  })));
   refs.push(...collectPublicStrings(containers, ["node_id", "node_ids", "target_node_id", "inspected_node_ids"]).map((value) => ({
     kind: "node" as const,
     label: "node",
@@ -2581,7 +3074,17 @@ function artifactsFromEvent(event: TaskTimelineEvent, semantic: TaskTimelineSema
   const tests = collectPublicStrings(containers, ["tests_run", "test_commands", "tests_written", "test_files", "commands"]);
   const screenshots = collectPublicStrings(containers, ["screenshot", "screenshots", "browser_screenshot", "browser_screenshots"]);
   const graph = collectPublicStrings(containers, ["graph_trace_ids", "graph_query_trace_ids", "trace_ids"]);
-  const artifactRefs = collectPublicStrings(containers, ["artifact_refs", "artifacts", "content_sys_artifacts"]);
+  const artifactRefs = collectPublicStrings(containers, [
+    "artifact_refs",
+    "artifacts",
+    "content_sys_artifacts",
+    "contract_execution_id",
+    "latest_payload_ref",
+    "ledger_refs",
+    "merge_queue_id",
+    "merge_queue_item_id",
+    "merge_queue_task_id",
+  ]);
   const refs: TaskPlaybackArtifactRef[] = [
     ...files.map((value) => ({ kind: "file" as const, value })),
     ...tests.map((value) => ({ kind: "test" as const, value })),
@@ -2960,6 +3463,15 @@ function stringFrom(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
+}
+
+function numberFrom(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
