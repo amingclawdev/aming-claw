@@ -4,7 +4,7 @@
   "purpose": "Packaged fallback context for fresh plugin sessions before a local graph database is available.",
   "last_curated_commit": "899d676",
   "recommended_first_actions": [
-    "Read aming-claw://skill and aming-claw://current-context.",
+    "Read aming-claw://current-context, then call MCP onboard_route_guide. Use aming-claw://skill only as the active onboard skill resource, not as a second entrypoint.",
     "If the visible dashboard URL has ?project_id=<id>, read aming-claw://project/<id>/context so graph/backlog calls use the user-selected project instead of the default. Legacy ?project=<id> links are accepted as fallback only.",
     "Call graph_query with tool=query_schema before inspecting files; use graph-native discovery before full scans.",
     "Use find_node_by_path, get_node, get_neighbors, degree_summary, high_degree_nodes, function_index, search_structure, and search_semantic before falling back to full repo scans.",
@@ -39,10 +39,11 @@
         ".codex-plugin/plugin.json",
         ".claude-plugin/plugin.json",
         ".claude-plugin/marketplace.json",
-        "skills/aming-claw/SKILL.md",
-        "skills/aming-claw/references/mcp-tools.md"
+        "skills/aming-claw-onboard/SKILL.md",
+        "Archive/skills/index.json",
+        "Archive/skills/aming-claw/references/mcp-tools.md"
       ],
-      "notes": "Stdio MCP bridge exposing tools and resources for Codex/Claude local plugin sessions."
+      "notes": "Stdio MCP bridge exposing onboard_route_guide as the only service entrypoint plus archived reference resources for provenance."
     },
     {
       "name": "packaging",

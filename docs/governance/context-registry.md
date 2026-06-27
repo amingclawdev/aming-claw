@@ -78,7 +78,7 @@ The worker receives the scoped contract, not the private reasoning.
 The default fallback document is:
 
 ```text
-skills/aming-claw/references/observer-context-safe.md
+Archive/skills/aming-claw/references/observer-context-safe.md
 ```
 
 It contains observer-safe expertise routing rules and can be shipped in the

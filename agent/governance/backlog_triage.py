@@ -36,7 +36,7 @@ _COMMON_CONTEXT_FILES = {
     "agent/governance/task_timeline.py",
     "content-system/render-pipeline.md",
     "docs/governance/manual-fix-sop.md",
-    "skills/aming-claw/references/mf-sop.md",
+    "Archive/skills/aming-claw/references/mf-sop.md",
 }
 
 # --- Hub-file downweighting constants ---

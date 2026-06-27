@@ -746,7 +746,10 @@ TOOLS: list[dict] = [
     },
     {
         "name": "mf_parallel_enter",
-        "description": "Enter source-backed mf_parallel successor runtime under a completed onboard_contract root.",
+        "description": (
+            "Enter source-backed mf_parallel successor runtime only after "
+            "onboard_route_guide selects it as the next interface."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -790,8 +793,86 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "mf_batch_parallel_enter",
+        "description": (
+            "Enter source-backed mf_batch_parallel parent runtime only after "
+            "onboard_route_guide selects multi_backlog_parallel."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Coordination backlog row for the batch.",
+                },
+                "bug_id": {
+                    "type": "string",
+                    "description": "Alias for the coordination backlog row.",
+                },
+                "backlog_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Child backlog rows to preflight and fan out.",
+                },
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "human_reason": {"type": "string"},
+                "actor": {"type": "string"},
+                "actor_role": {
+                    "type": "string",
+                    "description": "Accepted for audit only; HTTP facade derives the effective role from the session/token.",
+                },
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "onboard_service_waiver": {
+                    "type": "boolean",
+                    "description": "Use the onboard_route_guide service parent instead of legacy onboard_contract.",
+                },
+                "target_head_commit": {"type": "string"},
+                "target_head": {
+                    "type": "string",
+                    "description": "Alias for target_head_commit.",
+                },
+                "head_commit": {
+                    "type": "string",
+                    "description": "Alias for target_head_commit.",
+                },
+                "target_ref": {"type": "string"},
+                "snapshot_id": {"type": "string"},
+                "graph_snapshot_id": {
+                    "type": "string",
+                    "description": "Alias for snapshot_id.",
+                },
+                "preflight_mode": {"type": "string"},
+                "merge_mode": {
+                    "type": "string",
+                    "description": "Alias for preflight_mode.",
+                },
+                "merge_queue_id": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["project_id", "backlog_ids", "reason"],
+            "anyOf": [
+                {"required": ["backlog_id"]},
+                {"required": ["bug_id"]},
+            ],
+        },
+    },
+    {
         "name": "onboard_contract_start",
-        "description": "Start or enter the thin source-backed onboard_contract root runtime facade.",
+        "description": (
+            "Legacy/internal onboard_contract facade. Do not use as an entrypoint; "
+            "call onboard_route_guide first and use this only when that service "
+            "explicitly returns the waived legacy contract path."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -814,7 +895,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "onboard_contract_current",
-        "description": "Read onboard_contract root runtime guide/current-state without exposing generic CRUD.",
+        "description": (
+            "Legacy/internal onboard_contract current-state reader. Do not use as "
+            "an entrypoint; call onboard_route_guide first and use this only for "
+            "a service-returned contract_execution_id."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -835,7 +920,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "onboard_contract_submit_line",
-        "description": "Submit one role-bound onboard_contract evidence line via ContractRuntime.submit_line_write.",
+        "description": (
+            "Legacy/internal onboard_contract evidence writer. Do not use as an "
+            "entrypoint; call onboard_route_guide first and submit only when the "
+            "service-returned guide requires this waived legacy contract line."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1489,6 +1578,17 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             if key != "project_id" and value is not None
         }
         return _http("POST", f"/api/projects/{pid}/mf-parallel/enter", body)
+
+    if name == "mf_batch_parallel_enter":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http(
+            "POST", f"/api/projects/{pid}/mf-batch-parallel/enter", body
+        )
 
     if name == "onboard_contract_start":
         pid = args["project_id"]

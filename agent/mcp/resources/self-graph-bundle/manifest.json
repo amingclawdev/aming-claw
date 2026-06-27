@@ -22,12 +22,12 @@
   },
   "resources": [
     {
-      "bytes": 2904,
+      "bytes": 3104,
       "mime_type": "application/json",
       "path": "agent/mcp/resources/seed-graph-summary.json",
       "required": true,
       "role": "seed_graph_summary",
-      "sha256": "ca71ee8f7ee8485415ffffab4b9a1ccdadc52d06dbd7ce2903ea8ea80c13e660"
+      "sha256": "c1d30a88cb546f2fcfa743223ccfc09f8d35b8682d5570f942d732566d0d8dbc"
     },
     {
       "bytes": 4683879,

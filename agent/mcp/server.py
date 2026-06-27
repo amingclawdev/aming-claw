@@ -44,30 +44,33 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "aming-claw"
 SERVER_VERSION = "1.1.0"
 
-RESOURCE_FILES: dict[str, tuple[str, str, str]] = {
+ResourcePathSpec = str | tuple[str, ...]
+
+
+RESOURCE_FILES: dict[str, tuple[str, ResourcePathSpec, str]] = {
     "aming-claw://skill": (
-        "Aming Claw Skill",
-        "skills/aming-claw/SKILL.md",
+        "Aming Claw Onboard Skill",
+        "skills/aming-claw-onboard/SKILL.md",
         "text/markdown",
     ),
     "aming-claw://graph-first": (
-        "Graph-first Playbook",
-        "skills/aming-claw/references/graph-first.md",
+        "Archived Graph-first Playbook",
+        "Archive/skills/aming-claw/references/graph-first.md",
         "text/markdown",
     ),
     "aming-claw://mcp-tools": (
-        "MCP Tools Guide",
-        "skills/aming-claw/references/mcp-tools.md",
+        "Archived MCP Tools Guide",
+        "Archive/skills/aming-claw/references/mcp-tools.md",
         "text/markdown",
     ),
     "aming-claw://mf-sop": (
-        "Manual Fix SOP",
-        "skills/aming-claw/references/mf-sop.md",
+        "Archived Manual Fix SOP",
+        "Archive/skills/aming-claw/references/mf-sop.md",
         "text/markdown",
     ),
     "aming-claw://plugin-packaging": (
-        "Plugin Packaging Guide",
-        "skills/aming-claw/references/plugin-packaging.md",
+        "Archived Plugin Packaging Guide",
+        "Archive/skills/aming-claw/references/plugin-packaging.md",
         "text/markdown",
     ),
     "aming-claw://seed-graph-summary": (
@@ -96,6 +99,10 @@ RESOURCE_FILES: dict[str, tuple[str, str, str]] = {
         "application/json",
     ),
 }
+
+
+def _resource_path_candidates(spec: ResourcePathSpec) -> tuple[str, ...]:
+    return (spec,) if isinstance(spec, str) else tuple(spec)
 
 # JSON-RPC error codes
 PARSE_ERROR = -32700
@@ -227,7 +234,8 @@ class AmingClawMCP:
 
     def _resources_list(self) -> dict:
         resources = []
-        for uri, (name, rel_path, mime_type) in RESOURCE_FILES.items():
+        for uri, (name, rel_path_spec, mime_type) in RESOURCE_FILES.items():
+            rel_path = _resource_path_candidates(rel_path_spec)[0]
             resources.append({
                 "uri": uri,
                 "name": name,
@@ -265,20 +273,25 @@ class AmingClawMCP:
         spec = RESOURCE_FILES.get(uri)
         if not spec:
             raise ValueError(f"Unknown resource URI: {uri}")
-        _, rel_path, _ = spec
+        _, rel_path_spec, _ = spec
         candidates = [
             Path(self._workspace).resolve(),
             Path(__file__).resolve().parents[2],
         ]
-        for root in candidates:
-            path = (root / rel_path).resolve()
-            try:
-                path.relative_to(root)
-            except ValueError as exc:
-                raise ValueError(f"Resource escapes workspace: {uri}") from exc
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-        raise FileNotFoundError(f"Resource file not found for {uri}: {rel_path}")
+        missing: list[str] = []
+        for rel_path in _resource_path_candidates(rel_path_spec):
+            for root in candidates:
+                path = (root / rel_path).resolve()
+                try:
+                    path.relative_to(root)
+                except ValueError as exc:
+                    raise ValueError(f"Resource escapes workspace: {uri}") from exc
+                if path.exists():
+                    return path.read_text(encoding="utf-8")
+                missing.append(rel_path)
+        raise FileNotFoundError(
+            f"Resource file not found for {uri}: {', '.join(dict.fromkeys(missing))}"
+        )
 
     def _resource_mime_type(self, uri: str) -> str:
         if uri == "aming-claw://current-context" or (uri.startswith("aming-claw://project/") and uri.endswith("/context")):
@@ -344,7 +357,7 @@ class AmingClawMCP:
             "",
             "## Guardrails",
             "",
-            "- Read `aming-claw://skill` before mutations.",
+            "- Start with MCP `onboard_route_guide`; `aming-claw://skill` is the onboard-skill resource, not a second entrypoint.",
             "- Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
             "- File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
             "- Use browser-use/dashboard as the shared visual control plane when available.",

@@ -86,6 +86,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert {
         "observer_hotfix_enter",
         "mf_parallel_enter",
+        "mf_batch_parallel_enter",
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -126,6 +127,34 @@ def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
             "owned_files",
             "target_files",
             "contract_execution_id",
+        }.issubset(schema["properties"])
+        assert {"required": ["backlog_id"]} in schema["anyOf"]
+        assert {"required": ["bug_id"]} in schema["anyOf"]
+
+
+def test_mf_batch_parallel_enter_schemas_require_batch_scope():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        mf_batch_parallel_enter = next(
+            tool for tool in tools if tool["name"] == "mf_batch_parallel_enter"
+        )
+        schema = mf_batch_parallel_enter["inputSchema"]
+        assert {"project_id", "backlog_ids", "reason"}.issubset(schema["required"])
+        assert {
+            "backlog_id",
+            "bug_id",
+            "backlog_ids",
+            "actor_role",
+            "observer_session_id",
+            "observer_route_token_ref",
+            "onboard_service_waiver",
+            "target_head_commit",
+            "target_ref",
+            "snapshot_id",
+            "graph_snapshot_id",
+            "preflight_mode",
+            "merge_mode",
+            "merge_queue_id",
+            "metadata",
         }.issubset(schema["properties"])
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
@@ -295,6 +324,61 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
     ]
 
 
+def test_governance_mcp_mf_batch_parallel_enter_dispatches_to_runtime_facade(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_http(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": True, "batch_id": "batch-1"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    result = governance_mcp_server._dispatch_tool(
+        "mf_batch_parallel_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-BATCH",
+            "backlog_ids": ["AC-ONE", "AC-TWO"],
+            "task_id": "batch-task",
+            "reason": "Human approved batch repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-batch",
+            "observer_session_id": "obs-batch",
+            "onboard_service_waiver": True,
+            "target_head_commit": "abc123",
+            "target_ref": "refs/heads/main",
+            "preflight_mode": "parallel",
+            "merge_queue_id": "mq-batch",
+            "metadata": {"source": "test"},
+        },
+    )
+
+    assert result["batch_id"] == "batch-1"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-batch-parallel/enter",
+            {
+                "backlog_id": "AC-BATCH",
+                "backlog_ids": ["AC-ONE", "AC-TWO"],
+                "task_id": "batch-task",
+                "reason": "Human approved batch repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-batch",
+                "observer_session_id": "obs-batch",
+                "onboard_service_waiver": True,
+                "target_head_commit": "abc123",
+                "target_ref": "refs/heads/main",
+                "preflight_mode": "parallel",
+                "merge_queue_id": "mq-batch",
+                "metadata": {"source": "test"},
+            },
+        )
+    ]
+
+
 def test_governance_mcp_mf_timeline_precheck_forwards_close_commit(monkeypatch):
     calls = []
 
@@ -414,6 +498,64 @@ def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
                 "route_token_ref": "rtok-parallel",
                 "worker_fence": {"fence_token": "fence-parallel"},
                 "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    ]
+
+
+def test_tool_dispatcher_mf_batch_parallel_enter_posts_runtime_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "batch_id": "batch-1"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "mf_batch_parallel_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-BATCH",
+            "backlog_ids": ["AC-ONE", "AC-TWO"],
+            "task_id": "batch-task",
+            "reason": "Human approved batch repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-batch",
+            "observer_session_id": "obs-batch",
+            "onboard_service_waiver": True,
+            "target_head_commit": "abc123",
+            "target_ref": "refs/heads/main",
+            "preflight_mode": "parallel",
+            "merge_queue_id": "mq-batch",
+            "metadata": {"source": "test"},
+        },
+    )
+
+    assert result["batch_id"] == "batch-1"
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-batch-parallel/enter",
+            {
+                "backlog_id": "AC-BATCH",
+                "backlog_ids": ["AC-ONE", "AC-TWO"],
+                "task_id": "batch-task",
+                "reason": "Human approved batch repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-batch",
+                "observer_session_id": "obs-batch",
+                "onboard_service_waiver": True,
+                "target_head_commit": "abc123",
+                "target_ref": "refs/heads/main",
+                "preflight_mode": "parallel",
+                "merge_queue_id": "mq-batch",
+                "metadata": {"source": "test"},
             },
         )
     ]
@@ -1827,12 +1969,19 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
             "method": "resources/read",
             "params": {"uri": "aming-claw://self-graph-bundle-manifest"},
         },
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "resources/read",
+            "params": {"uri": "aming-claw://graph-first"},
+        },
     ])
 
     assert returncode == 0
     assert stderr == ""
     resources = {r["uri"]: r for r in responses[0]["result"]["resources"]}
     assert "aming-claw://skill" in resources
+    assert resources["aming-claw://skill"]["name"] == "Aming Claw Onboard Skill"
     assert "aming-claw://current-context" in resources
     assert "aming-claw://seed-graph-summary" in resources
     assert "aming-claw://self-graph-bundle-manifest" in resources
@@ -1842,8 +1991,9 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     templates = responses[1]["result"]["resourceTemplates"]
     assert templates[0]["uriTemplate"] == "aming-claw://project/{project_id}/context"
     skill_text = responses[2]["result"]["contents"][0]["text"]
-    assert "## Capabilities" in skill_text
-    assert "graph_query" in skill_text
+    assert "# Aming Claw Onboard" in skill_text
+    assert "only active Aming Claw skill entrypoint" in skill_text
+    assert "onboard_route_guide" in skill_text
     context_text = responses[3]["result"]["contents"][0]["text"]
     assert "project_id: `aming-claw`" in context_text
     assert "dashboard_url:" in context_text
@@ -1855,14 +2005,20 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     assert "Call `graph_query` with `tool=query_schema`" in context_text
     seed = json.loads(responses[4]["result"]["contents"][0]["text"])
     assert seed["project_id"] == "aming-claw"
+    assert "onboard_route_guide" in " ".join(seed["recommended_first_actions"])
     assert "graph-native" in " ".join(seed["recommended_first_actions"]).lower()
     mcp_surface = next(s for s in seed["core_surfaces"] if s["name"] == "mcp-plugin")
     assert ".codex-plugin/plugin.json" in mcp_surface["paths"]
     assert ".claude-plugin/plugin.json" in mcp_surface["paths"]
+    assert "skills/aming-claw-onboard/SKILL.md" in mcp_surface["paths"]
+    assert "skills/aming-claw/SKILL.md" not in mcp_surface["paths"]
     manifest = json.loads(responses[5]["result"]["contents"][0]["text"])
     assert manifest["bundle_major"] == 1
     assert manifest["consumer_contract"]["incompatible_major_action"] == "emit_plugin_update_reminder"
     assert manifest["resource_uris"]["graph_structure"] == "aming-claw://self-graph-bundle/graph-structure"
+    graph_first_text = responses[6]["result"]["contents"][0]["text"]
+    assert "Graph-First Playbook" in graph_first_text
+    assert "graph_query" in graph_first_text
     assert manifest["resource_uris"]["semantic_projection"] == "aming-claw://self-graph-bundle/semantic-projection"
 
 

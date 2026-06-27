@@ -1,15 +1,7 @@
 recursive-include agent/governance/dashboard_dist *
 recursive-include agent/mcp/resources *
-recursive-include skills/aming-claw *
-recursive-include skills/aming-claw-hn-challenge *
-recursive-include skills/aming-claw-hn-demo *
-recursive-include skills/aming-claw-hn-demo-after-work *
-recursive-include skills/aming-claw-hn-demo-before-work *
-recursive-include skills/aming-claw-hn-demo-during-work *
-recursive-include skills/aming-claw-launcher *
-recursive-include skills/aming-claw-vibe-queue-demo *
-recursive-include skills/aming-claw-drift-demo *
-recursive-include skills/aming-claw-backlog-dupe-demo *
+recursive-include skills/aming-claw-onboard *
+recursive-include Archive/skills *
 recursive-include docs/vibe-queue-demo *
 recursive-include docs/drift-demo *
 recursive-include docs/backlog-dupe-demo *

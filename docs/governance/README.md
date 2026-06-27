@@ -49,9 +49,10 @@ audit-grade node coverage.
 | Register a target project | [onboarding.md](../onboarding.md) |
 | Configure project YAML and AI routing | [config/aming-claw-yaml.md](../config/aming-claw-yaml.md) |
 | Adapt graph rules for a language/framework | [semantic enrichment config](../config/semantic-enrichment.md) |
-| Use MCP tools and graph queries | [skills MCP guide](../../skills/aming-claw/references/mcp-tools.md) |
-| Follow Manual Fix in V1 | [skills MF checklist](../../skills/aming-claw/references/mf-sop.md) |
-| Package Codex/Claude plugins | [plugin packaging notes](../../skills/aming-claw/references/plugin-packaging.md) |
+| Select agent role/work type or next contract | MCP `onboard_route_guide` via [onboarding.md](../onboarding.md) |
+| Use MCP tools and graph queries | MCP `onboard_route_guide` index paths; archived provenance: [MCP guide](../../Archive/skills/aming-claw/references/mcp-tools.md) |
+| Follow Manual Fix in V1 | MCP `onboard_route_guide` selected contract path; archived provenance: [MF checklist](../../Archive/skills/aming-claw/references/mf-sop.md) |
+| Package Codex/Claude plugins | MCP `onboard_route_guide` system-operation index; archived provenance: [plugin packaging notes](../../Archive/skills/aming-claw/references/plugin-packaging.md) |
 
 ## Specifications
 

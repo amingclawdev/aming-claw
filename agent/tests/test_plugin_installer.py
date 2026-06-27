@@ -117,16 +117,13 @@ def _write_plugin_fixture(root: Path) -> None:
         path.write_text(json.dumps(text), encoding="utf-8")
 
     for rel in (
-        "skills/aming-claw/SKILL.md",
-        "skills/aming-claw-hn-challenge/SKILL.md",
-        "skills/aming-claw-hn-demo/SKILL.md",
-        "skills/aming-claw-hn-demo-after-work/SKILL.md",
-        "skills/aming-claw-hn-demo-before-work/SKILL.md",
-        "skills/aming-claw-hn-demo-during-work/SKILL.md",
-        "skills/aming-claw-vibe-queue-demo/SKILL.md",
-        "skills/aming-claw-drift-demo/SKILL.md",
-        "skills/aming-claw-backlog-dupe-demo/SKILL.md",
-        "skills/aming-claw-launcher/SKILL.md",
+        "skills/aming-claw-onboard/SKILL.md",
+        "Archive/skills/index.json",
+        "Archive/skills/aming-claw/SKILL.md",
+        "Archive/skills/aming-claw/references/graph-first.md",
+        "Archive/skills/aming-claw/references/mcp-tools.md",
+        "Archive/skills/aming-claw/references/mf-sop.md",
+        "Archive/skills/aming-claw/references/plugin-packaging.md",
         "frontend/dashboard/scripts/e2e-hn-demo.mjs",
         "frontend/dashboard/scripts/e2e-vibe-queue-fixture.mjs",
         "frontend/dashboard/scripts/e2e-vibe-queue-audit.mjs",
@@ -218,7 +215,8 @@ def test_validate_plugin_root_requires_expected_assets(tmp_path):
 
     validated = validate_plugin_root(tmp_path)
     assert ".codex-plugin/plugin.json" in validated
-    assert "skills/aming-claw/SKILL.md" in validated
+    assert "skills/aming-claw-onboard/SKILL.md" in validated
+    assert "Archive/skills/index.json" in validated
 
 
 def test_default_plugin_update_state_path_uses_user_state_home(tmp_path, monkeypatch):
@@ -316,7 +314,7 @@ def test_plugin_update_state_status_blocks_newer_self_bundle_major(tmp_path):
 
 def test_plugin_changed_surface_classification_maps_restart_obligations():
     surfaces = classify_plugin_changed_surfaces([
-        "skills/aming-claw/SKILL.md",
+        "skills/aming-claw-onboard/SKILL.md",
         "agent/governance/server.py",
         "agent/manager_http_server.py",
         "docs/governance/manual-fix-sop.md",
@@ -357,7 +355,7 @@ def test_plugin_update_check_reports_available_and_writes_state(tmp_path):
     remote, source = _make_remote_plugin_repo(tmp_path)
     install_root = tmp_path / "install"
     _clone_plugin_repo(remote, install_root)
-    skill = source / "skills" / "aming-claw" / "SKILL.md"
+    skill = source / "skills" / "aming-claw-onboard" / "SKILL.md"
     skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
     remote_commit = _git_commit_all(source, "update skill")
     _git(["push", "origin", "main"], source)
@@ -374,7 +372,7 @@ def test_plugin_update_check_reports_available_and_writes_state(tmp_path):
     assert result.status == "available"
     assert result.update_available is True
     assert result.remote_commit == remote_commit
-    assert "skills/aming-claw/SKILL.md" in result.changed_files
+    assert "skills/aming-claw-onboard/SKILL.md" in result.changed_files
     assert result.changed_surfaces == ["mcp"]
     state = plugin_update_state_status(state_path=state_path)
     assert state["ok"] is True
@@ -598,14 +596,12 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
 
     assert target == codex_home / "plugins" / "cache" / "aming-claw-local" / "aming-claw" / "0.1.1"
     assert (target / ".codex-plugin" / "plugin.json").is_file()
-    assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-hn-demo" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-hn-demo-after-work" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-vibe-queue-demo" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-drift-demo" / "SKILL.md").is_file()
-    assert (target / "skills" / "aming-claw-backlog-dupe-demo" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-onboard" / "SKILL.md").is_file()
+    assert not (target / "skills" / "aming-claw" / "SKILL.md").exists()
+    assert (target / "Archive" / "skills" / "index.json").is_file()
+    assert (
+        target / "Archive" / "skills" / "aming-claw" / "references" / "mcp-tools.md"
+    ).is_file()
     assert (target / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs").is_file()
     assert (target / "frontend" / "dashboard" / "scripts" / "e2e-vibe-queue-fixture.mjs").is_file()
     assert (target / "frontend" / "dashboard" / "scripts" / "e2e-drift-demo-fixture.mjs").is_file()
@@ -645,7 +641,8 @@ def test_install_codex_plugin_cache_replaces_existing_symlink_payload(tmp_path):
 
     assert refreshed == target
     assert not (target / "skills").is_symlink()
-    assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
+    assert (target / "skills" / "aming-claw-onboard" / "SKILL.md").is_file()
+    assert (target / "Archive" / "skills" / "index.json").is_file()
 
 
 def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
@@ -664,7 +661,8 @@ def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
 
     assert refreshed == marketplace_root
     assert not (plugin_target / "skills").is_symlink()
-    assert (plugin_target / "skills" / "aming-claw" / "SKILL.md").is_file()
+    assert (plugin_target / "skills" / "aming-claw-onboard" / "SKILL.md").is_file()
+    assert (plugin_target / "Archive" / "skills" / "index.json").is_file()
     assert (plugin_target / ".codex" / "config.toml").is_file()
 
 

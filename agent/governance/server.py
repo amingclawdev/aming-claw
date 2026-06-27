@@ -31166,8 +31166,8 @@ def handle_task_create(ctx: RequestContext):
                     "Fix work, do NOT use this entrypoint. Instead: "
                     "1) backlog_upsert with chain_trigger_json.parallel_contract "
                     "using the mf_parallel.v1 template; 2) task_timeline_append "
-                    "events tied to mf_id. See aming-claw://mf-sop and "
-                    "skills/aming-claw/SKILL.md 'Observer Operating Modes'. "
+                    "events tied to mf_id. Start from MCP onboard_route_guide; "
+                    "aming-claw://mf-sop is archived provenance, not an entrypoint. "
                     "If you genuinely need to test chain automation, pass "
                     "metadata.parent_task_id pointing to an existing pm task_id."
                 )
@@ -33780,7 +33780,7 @@ def _contract_runtime_stale_recovery_id(
 
 def _contract_runtime_recovery_start_endpoint(contract_id: str) -> str:
     if contract_id == ONBOARD_CONTRACT_ID:
-        return "onboard-contract/start"
+        return "onboard-route-guide"
     if contract_id == CONTRACT_ADD_CONTRACT_ID:
         return "contract-add/start"
     if contract_id == CONTRACT_UPDATE_CONTRACT_ID:
@@ -33802,11 +33802,18 @@ def _contract_runtime_stale_recovery_projection(
     stale_execution_id = str(record.get("contract_execution_id") or "")
     recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
     endpoint_suffix = _contract_runtime_recovery_start_endpoint(contract_id)
-    body = {
-        "backlog_id": backlog_id,
-        "recovery_policy": "start_new_execution",
-        "stale_contract_execution_id": stale_execution_id,
-    }
+    if contract_id == ONBOARD_CONTRACT_ID:
+        body = {
+            "backlog_id": backlog_id,
+            "work_type": "rollback_or_recover_contract",
+            "legacy_onboard_contract": "waived_until_service_returns_facade",
+        }
+    else:
+        body = {
+            "backlog_id": backlog_id,
+            "recovery_policy": "start_new_execution",
+            "stale_contract_execution_id": stale_execution_id,
+        }
     if route_token_ref:
         body["route_token_ref"] = route_token_ref
     next_action = {
@@ -34990,6 +34997,8 @@ def _onboard_contract_route_guide(
             "method": "POST",
             "path": "/api/projects/{project_id}/onboard-contract/start",
             "legacy": True,
+            "internal_only": True,
+            "entrypoint": "onboard_route_guide",
             "waived_by_default_for_service_route": True,
         },
         "onboard_current": {
@@ -34999,6 +35008,10 @@ def _onboard_contract_route_guide(
                 "/api/projects/{project_id}/onboard-contract/"
                 "{contract_execution_id}/current-state"
             ),
+            "legacy": True,
+            "internal_only": True,
+            "entrypoint": "onboard_route_guide",
+            "use_only_when_returned_by": "onboard_route_guide",
         },
         "onboard_submit_line": {
             "kind": "http",
@@ -35007,6 +35020,10 @@ def _onboard_contract_route_guide(
                 "/api/projects/{project_id}/onboard-contract/"
                 "{contract_execution_id}/line-writes"
             ),
+            "legacy": True,
+            "internal_only": True,
+            "entrypoint": "onboard_route_guide",
+            "use_only_when_returned_by": "onboard_route_guide",
         },
         "observer_route_context_issue": {
             "kind": "mcp_or_http",
@@ -35217,7 +35234,7 @@ def _onboard_contract_route_guide(
             "schema_version": "onboard_contract.backlog_chain_binding.v1",
             **chain,
             "continue": {
-                "interface": "onboard_current",
+                "interface": "onboard_route_guide",
                 "next_legal_action": dict(next_legal_action),
             },
             "create_successor": {
@@ -35261,14 +35278,14 @@ def _onboard_contract_route_guide(
                 },
             },
             "rollback": {
-                "interface": "onboard_start",
-                "body_fields": ["backlog_id", "recovery_policy=start_new_execution"],
+                "interface": "onboard_route_guide",
+                "body_fields": ["backlog_id", "work_type=rollback_or_recover_contract"],
             },
         },
         "role_entries": {
             "observer": {
                 "role": "observer",
-                "entrypoint": "onboard_start or onboard_current",
+                "entrypoint": "onboard_route_guide",
                 "required_identity": [
                     "observer_session_id",
                     "observer_route_token_ref",
@@ -35523,6 +35540,8 @@ def _onboard_contract_agent_guidance(
                 "method": "POST",
                 "path": "/api/projects/{project_id}/onboard-contract/start",
                 "legacy": True,
+                "internal_only": True,
+                "entrypoint": "onboard_route_guide",
                 "waived_by_default_for_service_route": True,
             },
             "onboard_current": {
@@ -35531,6 +35550,10 @@ def _onboard_contract_agent_guidance(
                     "/api/projects/{project_id}/onboard-contract/"
                     "{contract_execution_id}/current-state"
                 ),
+                "legacy": True,
+                "internal_only": True,
+                "entrypoint": "onboard_route_guide",
+                "use_only_when_returned_by": "onboard_route_guide",
             },
             "onboard_submit_line": {
                 "method": "POST",
@@ -35538,6 +35561,10 @@ def _onboard_contract_agent_guidance(
                     "/api/projects/{project_id}/onboard-contract/"
                     "{contract_execution_id}/line-writes"
                 ),
+                "legacy": True,
+                "internal_only": True,
+                "entrypoint": "onboard_route_guide",
+                "use_only_when_returned_by": "onboard_route_guide",
             },
             "successor_current": {
                 "method": "GET",
@@ -37960,9 +37987,9 @@ def _legacy_contract_route_gate(body: Mapping[str, Any]) -> dict[str, Any]:
         "schema_version": "legacy_contract_route_block.v1",
         "required_entry": ONBOARD_CONTRACT_ID,
         "migration_hint": (
-            "Start with onboard_contract and read ContractRuntime current-state/"
-            "runtime_guide for the next legal action. Legacy timeline/meta "
-            "evidence is audit/recovery only."
+            "Start with onboard_route_guide. Use an onboard_service_waiver "
+            "or service-returned legacy facade only when the guide explicitly "
+            "returns that path. Legacy timeline/meta evidence is audit/recovery only."
         ),
         "primary_route_source": str(claim.get("source") or ""),
         "claim_field": str(claim.get("field") or ""),
@@ -45586,7 +45613,7 @@ def handle_project_hotfix_enter(ctx: RequestContext):
                     )
                 except ContractRuntimeError as exc:
                     raise ValidationError(
-                        "source-backed onboard_contract runtime must be started before hotfix successor",
+                        "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before hotfix successor",
                         {
                             "contract_execution_id": root_execution_id,
                             "contract_id": ONBOARD_CONTRACT_ID,
@@ -45829,7 +45856,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 )
             except ContractRuntimeError as exc:
                 raise ValidationError(
-                    "source-backed onboard_contract runtime must be started before mf_parallel successor",
+                    "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before mf_parallel successor",
                     {
                         "contract_execution_id": root_execution_id,
                         "contract_id": ONBOARD_CONTRACT_ID,
@@ -46054,7 +46081,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 )
             except ContractRuntimeError as exc:
                 raise ValidationError(
-                    "source-backed onboard_contract runtime must be started before mf_batch_parallel successor",
+                    "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before mf_batch_parallel successor",
                     {
                         "contract_execution_id": root_execution_id,
                         "contract_id": ONBOARD_CONTRACT_ID,
@@ -46358,7 +46385,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
 @route("POST", "/api/projects/{project_id}/onboard-contract/start")
 @route("POST", "/api/projects/{project_id}/onboard-contract/enter")
 def handle_project_onboard_contract_start(ctx: RequestContext):
-    """Start or enter the thin source-backed onboard_contract root facade."""
+    """Legacy/internal onboard_contract facade; onboard_route_guide is the entrypoint."""
     project_id = ctx.get_project_id()
     body = dict(ctx.body or {})
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
@@ -46427,7 +46454,7 @@ def handle_project_onboard_contract_start(ctx: RequestContext):
 @route("GET", "/api/projects/{project_id}/onboard-contract/{contract_execution_id}/current-state")
 @route("GET", "/api/projects/{project_id}/onboard-contract/{contract_execution_id}/guide")
 def handle_project_onboard_contract_current_state(ctx: RequestContext):
-    """Read onboard_contract root runtime guide/current-state without generic CRUD."""
+    """Legacy/internal onboard_contract current-state reader for service-returned paths."""
     project_id = ctx.get_project_id()
     contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
     if not contract_execution_id:
@@ -46464,7 +46491,7 @@ def handle_project_onboard_contract_current_state(ctx: RequestContext):
 
 @route("POST", "/api/projects/{project_id}/onboard-contract/{contract_execution_id}/line-writes")
 def handle_project_onboard_contract_line_write(ctx: RequestContext):
-    """Submit one role-bound onboard_contract evidence line via ContractRuntime."""
+    """Legacy/internal onboard_contract evidence writer for service-returned paths."""
     project_id = ctx.get_project_id()
     contract_execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
     if not contract_execution_id:
@@ -46782,7 +46809,7 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 backlog_id,
             )
             raise ValidationError(
-                "source-backed onboard_contract runtime must be started before contract_update successor",
+                "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before contract_update successor",
                 {
                     "contract_execution_id": deterministic_onboard_id,
                     "contract_id": ONBOARD_CONTRACT_ID,

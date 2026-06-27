@@ -32,7 +32,7 @@ VALID_VISIBILITIES = {
 
 OBSERVER_ROLES = {"observer"}
 FALLBACK_PACK_ID = "observer_safe_expertise_routing.v1"
-FALLBACK_DOC_REL_PATH = "skills/aming-claw/references/observer-context-safe.md"
+FALLBACK_DOC_REL_PATH = "Archive/skills/aming-claw/references/observer-context-safe.md"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS context_packs (

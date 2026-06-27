@@ -2012,16 +2012,13 @@ def _write_cli_plugin_fixture(root):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(text), encoding="utf-8")
     for rel in (
-        "skills/aming-claw/SKILL.md",
-        "skills/aming-claw-hn-challenge/SKILL.md",
-        "skills/aming-claw-hn-demo/SKILL.md",
-        "skills/aming-claw-hn-demo-after-work/SKILL.md",
-        "skills/aming-claw-hn-demo-before-work/SKILL.md",
-        "skills/aming-claw-hn-demo-during-work/SKILL.md",
-        "skills/aming-claw-vibe-queue-demo/SKILL.md",
-        "skills/aming-claw-drift-demo/SKILL.md",
-        "skills/aming-claw-backlog-dupe-demo/SKILL.md",
-        "skills/aming-claw-launcher/SKILL.md",
+        "skills/aming-claw-onboard/SKILL.md",
+        "Archive/skills/index.json",
+        "Archive/skills/aming-claw/SKILL.md",
+        "Archive/skills/aming-claw/references/graph-first.md",
+        "Archive/skills/aming-claw/references/mcp-tools.md",
+        "Archive/skills/aming-claw/references/mf-sop.md",
+        "Archive/skills/aming-claw/references/plugin-packaging.md",
         "frontend/dashboard/scripts/e2e-hn-demo.mjs",
         "frontend/dashboard/scripts/e2e-vibe-queue-fixture.mjs",
         "frontend/dashboard/scripts/e2e-vibe-queue-audit.mjs",
@@ -2343,7 +2340,7 @@ class TestCliPlugin:
         _git(["clone", str(remote), str(plugin_root)], install_root)
         _git(["checkout", "main"], plugin_root)
 
-        skill = source / "skills" / "aming-claw" / "SKILL.md"
+        skill = source / "skills" / "aming-claw-onboard" / "SKILL.md"
         skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
         remote_commit = _git_commit_all(source, "update skill")
         _git(["push", "origin", "main"], source)
@@ -2412,7 +2409,7 @@ class TestCliPlugin:
         _git(["clone", str(remote), str(plugin_root)], install_root)
         _git(["checkout", "main"], plugin_root)
 
-        skill = source / "skills" / "aming-claw" / "SKILL.md"
+        skill = source / "skills" / "aming-claw-onboard" / "SKILL.md"
         skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
         _git_commit_all(source, "update skill")
         _git(["push", "origin", "main"], source)

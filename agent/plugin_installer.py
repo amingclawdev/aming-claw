@@ -29,16 +29,13 @@ REQUIRED_PLUGIN_FILES = (
     ".agents/plugins/marketplace.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
-    "skills/aming-claw/SKILL.md",
-    "skills/aming-claw-hn-challenge/SKILL.md",
-    "skills/aming-claw-hn-demo/SKILL.md",
-    "skills/aming-claw-hn-demo-after-work/SKILL.md",
-    "skills/aming-claw-hn-demo-before-work/SKILL.md",
-    "skills/aming-claw-hn-demo-during-work/SKILL.md",
-    "skills/aming-claw-vibe-queue-demo/SKILL.md",
-    "skills/aming-claw-drift-demo/SKILL.md",
-    "skills/aming-claw-backlog-dupe-demo/SKILL.md",
-    "skills/aming-claw-launcher/SKILL.md",
+    "skills/aming-claw-onboard/SKILL.md",
+    "Archive/skills/index.json",
+    "Archive/skills/aming-claw/SKILL.md",
+    "Archive/skills/aming-claw/references/graph-first.md",
+    "Archive/skills/aming-claw/references/mcp-tools.md",
+    "Archive/skills/aming-claw/references/mf-sop.md",
+    "Archive/skills/aming-claw/references/plugin-packaging.md",
     "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     "frontend/dashboard/scripts/e2e-vibe-queue-fixture.mjs",
     "frontend/dashboard/scripts/e2e-vibe-queue-audit.mjs",
@@ -63,6 +60,7 @@ REQUIRED_PLUGIN_FILES = (
 CODEX_PLUGIN_PAYLOAD = (
     ".codex-plugin",
     "skills",
+    "Archive/skills",
     "frontend/dashboard/scripts/e2e-hn-demo.mjs",
     "frontend/dashboard/scripts/e2e-vibe-queue-fixture.mjs",
     "frontend/dashboard/scripts/e2e-vibe-queue-audit.mjs",
@@ -1034,6 +1032,7 @@ def classify_plugin_changed_surfaces(changed_files: Sequence[str]) -> list[str]:
             or path.startswith(".claude-plugin/")
             or path.startswith(".agents/plugins/")
             or path.startswith("skills/")
+            or path.startswith("Archive/skills/")
             or path.startswith("agent/mcp/")
             or path in {"agent/plugin_installer.py", "agent/cli.py"}
         ):

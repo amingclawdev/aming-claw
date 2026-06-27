@@ -91,19 +91,14 @@ class TestPackagedDashboardAssets:
 
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
         assert "recursive-include agent/mcp/resources *" in manifest
-        assert "recursive-include skills/aming-claw *" in manifest
-        assert "recursive-include skills/aming-claw-hn-challenge *" in manifest
-        assert "recursive-include skills/aming-claw-hn-demo *" in manifest
-        assert "recursive-include skills/aming-claw-hn-demo-before-work *" in manifest
-        assert "recursive-include skills/aming-claw-hn-demo-during-work *" in manifest
-        assert "recursive-include skills/aming-claw-hn-demo-after-work *" in manifest
-        assert "recursive-include skills/aming-claw-vibe-queue-demo *" in manifest
-        assert "recursive-include skills/aming-claw-drift-demo *" in manifest
-        assert "recursive-include skills/aming-claw-backlog-dupe-demo *" in manifest
+        assert "recursive-include skills/aming-claw-onboard *" in manifest
+        assert "recursive-include Archive/skills *" in manifest
+        assert "recursive-include skills/aming-claw *" not in manifest
+        assert "recursive-include skills/aming-claw-hn-demo *" not in manifest
         assert "recursive-include docs/vibe-queue-demo *" in manifest
         assert "recursive-include docs/drift-demo *" in manifest
         assert "recursive-include docs/backlog-dupe-demo *" in manifest
-        assert "recursive-include skills/aming-claw-launcher *" in manifest
+        assert "recursive-include skills/aming-claw-launcher *" not in manifest
         assert "recursive-include docs/assets *.png" in manifest
         assert "include LICENSE" in manifest
         assert "include frontend/dashboard/scripts/e2e-hn-demo.mjs" in manifest
@@ -255,14 +250,11 @@ class TestLocalPluginPackaging:
         assert DEFAULT_REPO_URL == "https://github.com/amingclawdev/aming-claw"
         assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
         assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-hn-challenge/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-hn-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-hn-demo-before-work/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-hn-demo-during-work/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-hn-demo-after-work/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-vibe-queue-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-drift-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
-        assert "skills/aming-claw-backlog-dupe-demo/SKILL.md" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-onboard/SKILL.md" in REQUIRED_PLUGIN_FILES
+        assert "Archive/skills/index.json" in REQUIRED_PLUGIN_FILES
+        assert "Archive/skills/aming-claw/references/mcp-tools.md" in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw/SKILL.md" not in REQUIRED_PLUGIN_FILES
+        assert "skills/aming-claw-launcher/SKILL.md" not in REQUIRED_PLUGIN_FILES
         assert "frontend/dashboard/scripts/e2e-hn-demo.mjs" in REQUIRED_PLUGIN_FILES
         assert "frontend/dashboard/scripts/e2e-vibe-queue-fixture.mjs" in REQUIRED_PLUGIN_FILES
         assert "frontend/dashboard/scripts/e2e-drift-demo-fixture.mjs" in REQUIRED_PLUGIN_FILES

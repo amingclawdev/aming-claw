@@ -23259,6 +23259,9 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert route_guide["backlog_chain_binding"]["continue"][
         "next_legal_action"
     ] == started["next_legal_action"]
+    assert route_guide["backlog_chain_binding"]["continue"]["interface"] == (
+        "onboard_route_guide"
+    )
     observer_next = {
         item["contract_id"]: item
         for item in route_guide["role_entries"]["observer"]["next_contracts"]
@@ -23470,6 +23473,20 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert guide["service"]["source"] == "onboard_route_guide_service"
     assert guide["legacy_onboard_contract_waived"] is True
     assert guide["onboard_contract_required"] is False
+    assert guide["role_entries"]["observer"]["entrypoint"] == "onboard_route_guide"
+    assert guide["backlog_chain_binding"]["continue"]["interface"] == (
+        "onboard_route_guide"
+    )
+    assert guide["backlog_chain_binding"]["rollback"]["interface"] == (
+        "onboard_route_guide"
+    )
+    assert guide["interface_index"]["onboard_start"]["internal_only"] is True
+    assert guide["interface_index"]["onboard_start"]["entrypoint"] == (
+        "onboard_route_guide"
+    )
+    assert guide["interface_index"]["onboard_current"]["use_only_when_returned_by"] == (
+        "onboard_route_guide"
+    )
     assert "multi_backlog_parallel" in {
         option["id"] for option in guide["work_type_options"]
     }
@@ -23489,6 +23506,12 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "contract_update_start",
         "mf_batch_parallel_enter",
     }.issubset(set(issue_payload["allowed_actions"]))
+    assert result["agent_onboard_guidance"]["entrypoints"]["onboard_start"][
+        "internal_only"
+    ] is True
+    assert result["agent_onboard_guidance"]["entrypoints"]["onboard_start"][
+        "entrypoint"
+    ] == "onboard_route_guide"
 
 
 def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
@@ -24491,8 +24514,13 @@ def test_onboard_contract_stale_pinned_execution_returns_recovery_next_action(co
     assert current["legacy_meta_contract_gate"] == "audit_backstop_only"
     assert current["next_legal_action"]["id"] == "start_recovery_contract_execution"
     assert current["next_legal_action"]["endpoint"].endswith(
-        "/onboard-contract/start"
+        "/onboard-route-guide"
     )
+    assert current["next_legal_action"]["body"] == {
+        "backlog_id": backlog_id,
+        "work_type": "rollback_or_recover_contract",
+        "legacy_onboard_contract": "waived_until_service_returns_facade",
+    }
 
     recovered = server.handle_project_onboard_contract_start(
         _ctx_with_role(
@@ -29508,7 +29536,7 @@ def test_hotfix_enter_source_backed_blocks_until_onboard_runtime_complete(conn):
 
     with pytest.raises(
         ValidationError,
-        match="source-backed onboard_contract runtime must be started",
+        match="onboard_route_guide service waiver or returned legacy onboard_contract facade is required",
     ):
         server.handle_project_hotfix_enter(
             _ctx_with_role(

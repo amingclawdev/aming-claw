@@ -135,6 +135,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "task_timeline_append",
         "task_timeline_list",
         "mf_timeline_precheck",
+        "mf_batch_parallel_enter",
         "observer_repair_run_plan",
         "observer_repair_run_route_evidence",
         "backlog_export",
@@ -1326,6 +1327,26 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "qa_session_heartbeat",
     }.issubset(names)
     assert "contract_execution_id" not in _tool_properties("onboard_contract_start")
+    assert _tool_properties("mf_batch_parallel_enter").keys() >= {
+        "backlog_id",
+        "bug_id",
+        "backlog_ids",
+        "observer_session_id",
+        "observer_route_token_ref",
+        "onboard_service_waiver",
+        "target_head_commit",
+        "target_ref",
+        "snapshot_id",
+        "graph_snapshot_id",
+        "preflight_mode",
+        "merge_mode",
+        "merge_queue_id",
+    }
+    onboard_start = next(
+        tool for tool in TOOLS if tool.get("name") == "onboard_contract_start"
+    )
+    assert "Legacy/internal" in onboard_start["description"]
+    assert "onboard_route_guide" in onboard_start["description"]
     assert _tool_properties("onboard_contract_submit_line").keys() >= {
         "execution_state_revision",
         "runtime_guide_hash",
@@ -1414,6 +1435,54 @@ def test_active_mcp_onboard_contract_tools_route_to_source_backed_facade():
                 "observer_route_token_ref": "rtok-onboard",
             },
         ),
+    ]
+
+
+def test_active_mcp_mf_batch_parallel_enter_routes_to_runtime_facade():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    result = dispatcher.dispatch(
+        "mf_batch_parallel_enter",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-BATCH",
+            "backlog_ids": ["AC-ONE", "AC-TWO"],
+            "task_id": "batch-task",
+            "reason": "Human approved batch repair.",
+            "actor_role": "observer",
+            "route_token_ref": "rtok-batch",
+            "observer_session_id": "obs-batch",
+            "onboard_service_waiver": True,
+            "target_head_commit": "abc123",
+            "target_ref": "refs/heads/main",
+            "preflight_mode": "parallel",
+            "merge_queue_id": "mq-batch",
+            "metadata": {"source": "test"},
+        },
+    )
+
+    assert result["path"] == "/api/projects/aming-claw/mf-batch-parallel/enter"
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/mf-batch-parallel/enter",
+            {
+                "backlog_id": "AC-BATCH",
+                "backlog_ids": ["AC-ONE", "AC-TWO"],
+                "task_id": "batch-task",
+                "reason": "Human approved batch repair.",
+                "actor_role": "observer",
+                "route_token_ref": "rtok-batch",
+                "observer_session_id": "obs-batch",
+                "onboard_service_waiver": True,
+                "target_head_commit": "abc123",
+                "target_ref": "refs/heads/main",
+                "preflight_mode": "parallel",
+                "merge_queue_id": "mq-batch",
+                "metadata": {"source": "test"},
+            },
+        )
     ]
 
 
