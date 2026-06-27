@@ -57,6 +57,7 @@ from agent.governance.parallel_branch_runtime import (
     build_runtime_context_lane_plan_view,
     get_branch_context,
     get_latest_branch_contract_revision,
+    list_merge_queue_items,
     mf_subagent_session_token_hash,
     runtime_context_id_for_branch_context,
     runtime_context_session_token_ref,
@@ -28143,11 +28144,25 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert result["preflight_gate"]["status"] == "passed"
     assert result["preflight_gate"]["fanout_ready"] is True
     assert result["preflight_gate"]["target_head_commit"] == "target-head-1"
-    assert result["merge_queue_plan"]["planner_only"] is True
-    assert result["merge_queue_plan"]["durable_queue_write"] is False
+    assert result["merge_queue_plan"]["planner_only"] is False
+    assert result["merge_queue_plan"]["durable_queue_write"] is True
+    assert result["merge_queue_plan"]["durable_queue_item_count"] == 2
     assert [item["backlog_id"] for item in result["merge_queue_plan"]["planned_items"]] == [
         child_b,
         child_a,
+    ]
+    persisted_items = list_merge_queue_items(
+        conn,
+        PID,
+        result["merge_queue_plan"]["merge_queue_id"],
+    )
+    assert [item.task_id for item in persisted_items] == [
+        result["merge_queue_plan"]["planned_items"][0]["task_id"],
+        result["merge_queue_plan"]["planned_items"][1]["task_id"],
+    ]
+    assert [item.current_target_head for item in persisted_items] == [
+        "target-head-1",
+        "target-head-1",
     ]
     assert [item["backlog_id"] for item in result["per_row_successors"]] == [
         child_a,

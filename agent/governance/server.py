@@ -45749,7 +45749,12 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     ).strip()
 
     from . import task_timeline
-    from .parallel_branch_runtime import plan_mf_batch_parallel_preflight
+    from .parallel_branch_runtime import (
+        MergeQueueItem,
+        merge_queue_item_to_dict,
+        plan_mf_batch_parallel_preflight,
+        upsert_merge_queue_items,
+    )
 
     with DBContext(project_id) as conn:
         root_execution_id = _onboard_contract_execution_id(project_id, backlog_id)
@@ -45876,10 +45881,70 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "mf_batch_parallel preflight gate blocked fanout_ready",
                 {"preflight_gate": preflight_gate},
             )
+        merge_queue_plan = dict(preflight_gate.get("merge_queue_plan") or {})
+        planned_items = [
+            item
+            for item in merge_queue_plan.get("planned_items", [])
+            if isinstance(item, Mapping)
+        ]
+        durable_queue_items = [
+            MergeQueueItem(
+                project_id=project_id,
+                merge_queue_id=str(item.get("merge_queue_id") or merge_queue_id),
+                queue_item_id=str(item.get("queue_item_id") or ""),
+                task_id=str(item.get("task_id") or ""),
+                branch_ref=str(item.get("branch_ref") or ""),
+                queue_index=int(item.get("queue_index") or 0),
+                status=str(item.get("status") or "planned"),
+                depends_on=tuple(str(value) for value in (item.get("depends_on") or [])),
+                hard_depends_on=tuple(
+                    str(value) for value in (item.get("hard_depends_on") or [])
+                ),
+                serializes_after=tuple(
+                    str(value) for value in (item.get("serializes_after") or [])
+                ),
+                conflicts_with=tuple(
+                    str(value) for value in (item.get("conflicts_with") or [])
+                ),
+                same_node_or_file_conflicts=tuple(
+                    str(value)
+                    for value in (item.get("same_node_or_file_conflicts") or [])
+                ),
+                requires_graph_epoch=tuple(
+                    str(value) for value in (item.get("requires_graph_epoch") or [])
+                ),
+                target_ref=str(item.get("target_ref") or target_ref),
+                base_commit=str(item.get("target_head_commit") or target_head_commit),
+                validated_target_head=str(
+                    item.get("target_head_commit") or target_head_commit
+                ),
+                current_target_head=str(
+                    item.get("target_head_commit") or target_head_commit
+                ),
+                snapshot_id=str(item.get("snapshot_id") or ""),
+            )
+            for item in planned_items
+        ]
+        persisted_queue_items = upsert_merge_queue_items(conn, durable_queue_items)
+        persisted_queue_item_payloads = [
+            merge_queue_item_to_dict(item) for item in persisted_queue_items
+        ]
+        merge_queue_plan.update(
+            {
+                "planner_only": False,
+                "durable_queue_write": True,
+                "durable_queue_item_count": len(persisted_queue_items),
+                "durable_queue_items": persisted_queue_item_payloads,
+                "source_of_authority": (
+                    "server.handle_project_mf_batch_parallel_enter"
+                ),
+            }
+        )
+        preflight_gate = dict(preflight_gate)
+        preflight_gate["merge_queue_plan"] = merge_queue_plan
         queue_items_by_backlog = {
             str(item.get("backlog_id") or ""): item
-            for item in preflight_gate.get("merge_queue_plan", {}).get("planned_items", [])
-            if isinstance(item, Mapping)
+            for item in planned_items
         }
         per_row_successors = [
             {
