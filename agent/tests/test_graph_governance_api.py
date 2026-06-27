@@ -23620,6 +23620,50 @@ def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
     assert started["next_legal_action"]["id"] == "observer_request_contract_update"
 
 
+def test_contract_update_start_infers_onboard_service_waiver_from_current_chain(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-ONBOARD-SERVICE-CURRENT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-contract-update-onboard-service-current",
+    )
+    route_token_ref = "rtok-contract-update-onboard-service-current"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_update_start"],
+    )
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+
+    started = server.handle_project_contract_update_start(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    service_parent = server._onboard_service_execution_id(PID, backlog_id)
+    assert started["ok"] is True
+    assert started["parent_contract_execution_id"] == service_parent
+    assert started["root_contract_execution_id"] == service_parent
+    assert started["contract_chain_id"] == server._onboard_service_chain_id(
+        PID, backlog_id
+    )
+    assert started["next_legal_action"]["id"] == "observer_request_contract_update"
+
+
 def test_multi_backlog_parallel_templates_are_row_scoped():
     templates_root = Path("agent/governance/contract_templates")
     batch = json.loads((templates_root / "mf_batch_parallel.v1.json").read_text())

@@ -35251,7 +35251,29 @@ def _onboard_service_waiver_requested(
     )
     if isinstance(raw, bool):
         return raw
+    if isinstance(raw, Mapping):
+        return (
+            bool(raw.get("legacy_onboard_contract_waived"))
+            or bool(raw.get("onboard_contract_waived"))
+            or str(raw.get("service_id") or "").strip()
+            == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+        )
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "waive"}
+
+
+def _onboard_service_parent_materialized(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> bool:
+    try:
+        record = _contract_runtime_store(conn).get(
+            _onboard_service_execution_id(project_id, backlog_id)
+        )
+    except ContractRuntimeError:
+        return False
+    return _onboard_service_record(record)
 
 
 def _onboard_contract_route_issue_target_files_from_record(
@@ -48418,18 +48440,33 @@ def handle_project_contract_update_start(ctx: RequestContext):
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
-    if onboard_service_waiver:
-        metadata = {
-            **dict(metadata),
-            "entrypoint": "onboard_service_waiver",
-            "legacy_onboard_contract_waived": True,
-            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-        }
     recovery_policy = str(body.get("recovery_policy") or "").strip()
     stale_contract_execution_id = str(
         body.get("stale_contract_execution_id") or ""
     ).strip()
     with DBContext(project_id) as conn:
+        inferred_onboard_service_waiver = (
+            not onboard_service_waiver
+            and _onboard_service_parent_materialized(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        if inferred_onboard_service_waiver:
+            onboard_service_waiver = True
+        if onboard_service_waiver:
+            metadata = {
+                **dict(metadata),
+                "entrypoint": "onboard_service_waiver",
+                "legacy_onboard_contract_waived": True,
+                "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                "onboard_service_waiver_source": (
+                    "contract_chain_current_projection"
+                    if inferred_onboard_service_waiver
+                    else "request"
+                ),
+            }
         actor_role = _contract_update_effective_actor_role(
             ctx,
             conn,
