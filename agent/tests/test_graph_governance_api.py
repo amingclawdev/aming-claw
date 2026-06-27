@@ -27624,6 +27624,121 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
     assert worker_read["actor_role"] == "mf_sub"
 
 
+def test_mf_parallel_worker_read_accepts_dispatch_payload_default_worker_role(conn):
+    backlog_id = "AC-MF-PARALLEL-DISPATCH-DEFAULT-WORKER-ROLE"
+    task_id = "parallel-default-worker-role-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-default-worker-role-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-mf-parallel-default-worker-role-root",
+                "worker_fence": {
+                    "fence_token": "fence-default-worker-role",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    assert result["ok"] is True
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-default-worker-role-worker",
+        fence_token="fence-default-worker-role",
+        token="parallel-default-worker-role-token",
+    )
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": {
+                    "bounded_workers": [
+                        {
+                            "runtime_context_id": runtime_context.runtime_context_id,
+                            "task_id": runtime_context.task_id,
+                            "parent_task_id": backlog_id,
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(result["contract_execution_id"])
+    completed_dispatch = record["completed_lines"][-1]
+    assert completed_dispatch["worker_role"] == "mf_sub"
+    assert (
+        completed_dispatch["payload"]["bounded_workers"][0]["worker_role"]
+        == "mf_sub"
+    )
+
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": "fence-default-worker-role",
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": "/tmp/parallel-default-worker-role-worker",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                },
+            },
+        )
+    )
+
+    assert worker_read["ok"] is True
+    assert worker_read["actor_role"] == "mf_sub"
+
+
 def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn):
     backlog_id = "AC-MF-PARALLEL-DISPATCH-WORKER-TASK-ALIAS"
     task_id = "parallel-worker-task-alias"

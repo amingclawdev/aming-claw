@@ -34535,7 +34535,95 @@ def _contract_runtime_line_write_body(
     ):
         if key in body:
             write[key] = body[key]
+    if (
+        write.get("line_id") == "observer_dispatch_bounded_workers"
+        and write.get("evidence_kind") == "dispatch_bounded_worker"
+    ):
+        raw_payload = write.get("payload")
+        payload = raw_payload if isinstance(raw_payload, Mapping) else {}
+        worker_role = (
+            str(write.get("worker_role") or "").strip()
+            or _dispatch_payload_worker_role(payload)
+        )
+        if not worker_role:
+            worker_role = "mf_sub"
+        write["worker_role"] = worker_role
+        if isinstance(payload, Mapping):
+            write["payload"] = _normalize_dispatch_payload_worker_role(
+                payload,
+                worker_role,
+            )
     return write
+
+
+def _dispatch_payload_worker_role(value: Any, *, depth: int = 0) -> str:
+    if depth > 6:
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("worker_role", "role"):
+            role = str(value.get(key) or "").strip()
+            if role:
+                return role
+        for child in value.values():
+            role = _dispatch_payload_worker_role(child, depth=depth + 1)
+            if role:
+                return role
+    if isinstance(value, list):
+        for child in value:
+            role = _dispatch_payload_worker_role(child, depth=depth + 1)
+            if role:
+                return role
+    return ""
+
+
+def _normalize_dispatch_payload_worker_role(
+    value: Any,
+    worker_role: str,
+    *,
+    depth: int = 0,
+) -> Any:
+    if depth > 6:
+        return value
+    if isinstance(value, Mapping):
+        normalized = dict(value)
+        has_worker_context = bool(
+            str(normalized.get("runtime_context_id") or "").strip()
+        )
+        has_worker_task = bool(
+            str(
+                normalized.get("task_id")
+                or normalized.get("worker_task_id")
+                or ""
+            ).strip()
+        )
+        has_parent_task = bool(str(normalized.get("parent_task_id") or "").strip())
+        if (
+            has_worker_context
+            and has_worker_task
+            and has_parent_task
+            and not str(
+                normalized.get("worker_role") or normalized.get("role") or ""
+            ).strip()
+        ):
+            normalized["worker_role"] = worker_role
+        for key, child in list(normalized.items()):
+            if isinstance(child, (Mapping, list)):
+                normalized[key] = _normalize_dispatch_payload_worker_role(
+                    child,
+                    worker_role,
+                    depth=depth + 1,
+                )
+        return normalized
+    if isinstance(value, list):
+        return [
+            _normalize_dispatch_payload_worker_role(
+                child,
+                worker_role,
+                depth=depth + 1,
+            )
+            for child in value
+        ]
+    return value
 
 
 ONBOARD_CONTRACT_ID = "onboard_contract"
