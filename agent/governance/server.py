@@ -34098,7 +34098,7 @@ def _contract_runtime_record_references_runtime_context(
         for payload in _mapping_candidates(value):
             if _line_value(payload, "runtime_context_id") != runtime_context_id:
                 continue
-            if _line_value(payload, "task_id") != task_id:
+            if _line_value(payload, "task_id", "worker_task_id") != task_id:
                 continue
             if _line_value(payload, "parent_task_id") != parent_task_id:
                 continue
