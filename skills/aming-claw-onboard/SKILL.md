@@ -1,29 +1,34 @@
 ---
 name: aming-claw-onboard
-description: Single Aming Claw entrypoint. Use this first for Aming Claw governance, backlog, graph, runtime, worker, QA, dashboard, MCP, install/start/bootstrap, or dogfood work; route through the onboard route guide service before choosing a role or successor contract.
+description: Single Aming Claw skill entrypoint. Use this first for Aming Claw governance, backlog, graph, runtime, worker, QA, dashboard, MCP, install/start/bootstrap, or dogfood work; prefer the MCP onboard_route_guide tool before choosing a role or successor contract.
 ---
 
 # Aming Claw Onboard
 
 This is the only active Aming Claw skill entrypoint.
 
-Start here, then use the live onboard route guide service as the source of
-truth. Archived skills are historical reference only and are not active
+Start here, then use the live MCP `onboard_route_guide` tool as the source of
+truth. The HTTP endpoint is a fallback only when the host does not expose the
+MCP tool. Archived skills are historical reference only and are not active
 instructions.
 
 ## Entry
 
 1. Check the live project state with MCP: `runtime_status`, `graph_status`, and
    `graph_operations_queue`.
-2. Call the onboard route guide service:
-   `POST /api/projects/{project_id}/onboard-route-guide`.
-3. Confirm role: `observer`, `worker`, or `qa`.
-4. Confirm work type, such as `capability_query`, `system_operation`,
+2. Call MCP `onboard_route_guide` with `project_id` and any available
+   `backlog_id` or `bug_id`, role/work-type hints, and route-token refs.
+3. If MCP does not expose `onboard_route_guide`, fall back to
+   `POST /api/projects/{project_id}/onboard-route-guide` with the same fields.
+4. Confirm role: `observer`, `worker`, `mf_sub`, or `qa`.
+5. Confirm work type, such as `capability_query`, `system_operation`,
    `continue_contract_chain`, `observer_hotfix`,
    `operator_supervised_direct_main`, `multi_backlog_parallel`,
    `parallel_worker`, or `qa_verification`.
-5. Follow only the returned `agent_onboard_guidance`,
-   `interface_index`, `backlog_chain_binding`, and `next_legal_action`.
+6. Follow only the returned role/token guidance, `next_legal_action`, and index
+   paths under `agent_onboard_guidance.onboard_route_guide`, including
+   `interface_index`, `capability_index`, `system_operation_index`,
+   `backlog_chain_binding`, and archive/resource paths.
 
 ## Guardrails
 

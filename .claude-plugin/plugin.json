@@ -1,7 +1,7 @@
 {
   "name": "aming-claw",
   "version": "0.1.1",
-  "description": "Graph-first governance workflow guard for Aming Claw. Bundles one onboard-first skill entrypoint and the project MCP server (.mcp.json) so Claude Code sessions start from the onboard route guide service before selecting role, work type, runtime contract, worker, QA, or system operation paths.",
+  "description": "Graph-first governance workflow guard for Aming Claw. Bundles one onboard-first skill entrypoint and the project MCP server (.mcp.json) so Claude Code sessions start from MCP onboard_route_guide, with HTTP fallback only when MCP is unavailable, before selecting role, work type, runtime contract, worker, QA, or system operation paths.",
   "author": {
     "name": "Aming Claw"
   },

@@ -6,6 +6,7 @@
   "plugins": [
     {
       "name": "aming-claw",
+      "description": "One onboard-first skill entrypoint plus MCP onboard_route_guide service.",
       "source": {
         "source": "local",
         "path": "./."
