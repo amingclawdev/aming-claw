@@ -10,7 +10,7 @@
     {
       "name": "aming-claw",
       "source": "./",
-      "description": "Graph-first governance workflow guard with one onboard-first skill entrypoint and the project MCP server.",
+      "description": "Graph-first governance workflow guard with one onboard-first skill entrypoint and MCP onboard_route_guide service.",
       "version": "0.1.1"
     }
   ]

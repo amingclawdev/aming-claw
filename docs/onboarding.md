@@ -6,10 +6,11 @@ register a clean target project, build the graph, then use dashboard/MCP tools
 to inspect, file backlog, and plan PR work.
 
 The single user-invocable skill entry is `/aming-claw:aming-claw-onboard`.
-From that entry, use the live onboard route guide service:
-`POST /api/projects/{project_id}/onboard-route-guide`. The CLI launcher
-remains `aming-claw launcher` for local setup. Archived skills under
-`Archive/skills/` are provenance only, not active instructions.
+From that entry, prefer MCP `onboard_route_guide` as the live onboard route
+guide service. If the host has not exposed that MCP tool, fall back to
+`POST /api/projects/{project_id}/onboard-route-guide` with the same fields.
+The CLI launcher remains `aming-claw launcher` for local setup. Archived skills
+under `Archive/skills/` are provenance only, not active instructions.
 
 The packaged Codex plugin manifest also installs a client-side `PreToolUse`
 hard guard that runs `python agent/hooks/onboarding_guard.py` before protected
@@ -56,9 +57,11 @@ context:
 1. List MCP resources.
 2. Confirm `aming-claw://current-context` is present.
 3. Read `aming-claw://current-context`.
-4. Use `/aming-claw:aming-claw-onboard` or the onboard route guide service.
+4. Use `/aming-claw:aming-claw-onboard`, then call MCP `onboard_route_guide`.
+   Use the HTTP route-guide endpoint only when MCP is unavailable.
 5. Confirm role and work type in the returned onboard guide.
-6. Follow the returned capability, interface, and backlog-chain index paths.
+6. Follow the returned role/token guidance, next legal action, capability,
+   interface, system-operation, archive/resource, and backlog-chain index paths.
 
 Use the current-context project id, governance URL, dashboard URL, graph state,
 and guardrails as the session anchor before observer root-route-context,
@@ -106,8 +109,9 @@ host can install the plugin, load the Aming Claw MCP server, and run the demo
 prompt in a clean container runtime. The loop is contract-first even when the
 container itself is only a fixture:
 
-1. In the host observer session, read `aming-claw://current-context`,
-   `aming-claw://skill`, `aming-claw://graph-first`, and `aming-claw://mf-sop`.
+1. In the host observer session, read `aming-claw://current-context`, then call
+   MCP `onboard_route_guide`. Read graph-first, MCP-tools, MF SOP, or archive
+   resources only through the returned index paths and availability status.
 2. Bind the work to a backlog row and route context before changing docs,
    runner scripts, runtime code, or demo fixtures.
 3. Run a minimal CLI/auth smoke in Docker before a required live prompt when

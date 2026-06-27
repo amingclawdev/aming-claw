@@ -215,6 +215,14 @@ def _runtime_context_write_body(args: dict) -> dict:
     }
 
 
+def _onboard_route_guide_body(args: dict) -> dict:
+    return {
+        key: value
+        for key, value in args.items()
+        if key != "project_id" and value not in (None, "", [], {})
+    }
+
+
 def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     properties: dict[str, Any] = {
         "project_id": {"type": "string"},
@@ -1068,6 +1076,56 @@ TOOLS: list[dict] = [
                 "head_commit": {"type": "string", "description": "Alias for close_commit."},
             },
             "required": ["project_id", "bug_id"],
+        },
+    },
+    {
+        "name": "onboard_route_guide",
+        "description": (
+            "Only onboard service entrypoint for Aming Claw role, work-type, "
+            "capability, system-operation, and backlog-chain guidance. Prefer "
+            "this MCP tool; use the HTTP endpoint only when MCP is unavailable."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier.",
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Optional backlog row to scope the guide.",
+                },
+                "bug_id": {
+                    "type": "string",
+                    "description": "Alias for backlog_id.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Requested actor role, such as observer, mf_sub, worker, or qa.",
+                },
+                "actor_role": {
+                    "type": "string",
+                    "description": "Alias for role when the host names the actor role explicitly.",
+                },
+                "work_type": {
+                    "type": "string",
+                    "description": "Requested work type for onboard routing.",
+                },
+                "requested_work_type": {
+                    "type": "string",
+                    "description": "Alias for work_type.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque route-token ref accepted by protected HTTP facades.",
+                },
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+            },
+            "required": ["project_id"],
         },
     },
     {
@@ -2762,6 +2820,14 @@ class ToolDispatcher:
                     query[key] = value
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
+
+        if name == "onboard_route_guide":
+            pid = args["project_id"]
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/onboard-route-guide",
+                _onboard_route_guide_body(args),
+            )
 
         if name == "observer_hotfix_enter":
             pid = args["project_id"]

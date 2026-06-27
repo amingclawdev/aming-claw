@@ -1,7 +1,7 @@
 {
   "name": "aming-claw",
   "version": "0.1.1",
-  "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and MCP tools.",
+  "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and the onboard_route_guide MCP tool.",
   "license": "FSL-1.1-MIT",
   "keywords": [
     "governance",
@@ -27,7 +27,7 @@
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
-    "longDescription": "Provides Aming Claw governance with a single onboard-first skill entrypoint plus MCP resources and configuration. Agents start from the onboard route guide service, then select role, work type, runtime contract, worker, QA, or system operation paths from live guidance.",
+    "longDescription": "Provides Aming Claw governance with a single onboard-first skill entrypoint plus MCP resources and configuration. Agents start from MCP onboard_route_guide, using the HTTP endpoint only as fallback, then select role, work type, runtime contract, worker, QA, or system operation paths from live guidance.",
     "developerName": "Aming Claw",
     "category": "Productivity",
     "capabilities": [
@@ -36,7 +36,7 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Start from the active aming-claw-onboard skill and the onboard route guide service before changing governed code.",
+      "Start from the active aming-claw-onboard skill and MCP onboard_route_guide tool (the onboard route guide) before changing governed code; use the HTTP endpoint only as fallback.",
       "If governance is offline, ask the user to run aming-claw start; do not use archived skills as active instructions.",
       "Call runtime_status, graph_status, graph_operations_queue, and backlog checks before implementation."
     ],

@@ -5,7 +5,9 @@
     "skill_id": "aming-claw-onboard",
     "path": "skills/aming-claw-onboard/SKILL.md",
     "service": "onboard_route_guide",
+    "mcp_tool": "onboard_route_guide",
     "service_path": "/api/projects/{project_id}/onboard-route-guide",
+    "service_policy": "Prefer MCP onboard_route_guide; use the HTTP endpoint only when MCP is unavailable.",
     "replacement_index_paths": [
       "agent_onboard_guidance.onboard_route_guide.role_entries",
       "agent_onboard_guidance.onboard_route_guide.interface_index",
