@@ -147,8 +147,8 @@ class TestLocalPluginPackaging:
         assert (ROOT / manifest["mcpServers"]).is_file()
         assert "MCP" in manifest["interface"]["capabilities"]
         assert "MCP resources" in manifest["interface"]["longDescription"]
-        assert any("aming-claw://skill" in prompt for prompt in manifest["interface"]["defaultPrompt"])
-        assert any("aming-claw://seed-graph-summary" in prompt for prompt in manifest["interface"]["defaultPrompt"])
+        assert any("aming-claw-onboard" in prompt for prompt in manifest["interface"]["defaultPrompt"])
+        assert any("onboard route guide" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert (ROOT / "CLAUDE.md").is_file()
 
     def test_codex_repo_marketplace_compatibility_metadata_exists(self):
@@ -326,39 +326,32 @@ class TestClaudePluginPackaging:
         assert manifest["repository"] == "https://github.com/amingclawdev/aming-claw"
 
     def test_claude_plugin_auto_discovered_assets_exist(self):
-        # Claude Code auto-discovers skills/ and .mcp.json from the plugin root,
-        # so the manifest itself does not have to point at them. We assert they
-        # exist where the runtime expects them.
-        assert (ROOT / "skills" / "aming-claw" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-hn-challenge" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-hn-demo" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-hn-demo-before-work" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-hn-demo-during-work" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-hn-demo-after-work" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-vibe-queue-demo" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-drift-demo" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-backlog-dupe-demo" / "SKILL.md").is_file()
-        assert (ROOT / "skills" / "aming-claw-launcher" / "SKILL.md").is_file()
+        # Claude Code auto-discovers skills/ and .mcp.json from the plugin root.
+        # Aming Claw intentionally exposes exactly one active skill entrypoint.
+        active_skills = sorted((ROOT / "skills").glob("*/SKILL.md"))
+        assert [path.parent.name for path in active_skills] == ["aming-claw-onboard"]
+        assert (ROOT / "Archive" / "skills" / "index.json").is_file()
         assert (ROOT / ".mcp.json").is_file()
         assert (ROOT / "CLAUDE.md").is_file()
 
-    def test_claude_launcher_skill_documents_cli_surface(self):
-        skill = (ROOT / "skills" / "aming-claw-launcher" / "SKILL.md").read_text(encoding="utf-8")
+    def test_onboard_skill_documents_single_entry_surface(self):
+        skill = (ROOT / "skills" / "aming-claw-onboard" / "SKILL.md").read_text(encoding="utf-8")
 
-        assert skill.startswith("---"), "launcher skill must start with YAML frontmatter"
-        assert "name: aming-claw-launcher" in skill
+        assert skill.startswith("---"), "onboard skill must start with YAML frontmatter"
+        assert "name: aming-claw-onboard" in skill
         assert "description:" in skill
-        # Launcher skill must document the preview/start/open/status surface.
-        for command in (
-            "aming-claw launcher",
-            "aming-claw start",
-            "aming-claw status",
-            "aming-claw open",
-            "aming-claw plugin install",
+        for marker in (
+            "POST /api/projects/{project_id}/onboard-route-guide",
+            "observer",
+            "worker",
+            "qa",
+            "capability_query",
+            "system_operation",
+            "continue_contract_chain",
+            "operator_supervised_direct_main",
         ):
-            assert command in skill, f"launcher skill missing reference to `{command}`"
-        # Launcher skill must hand off to the main governance skill for non-preview work.
-        assert "aming-claw/SKILL.md" in skill
+            assert marker in skill, f"onboard skill missing `{marker}`"
+        assert "Archive/skills/" in skill
 
     def test_claude_plugin_manifest_does_not_leak_user_machine_paths(self):
         manifest_text = (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -368,13 +361,13 @@ class TestClaudePluginPackaging:
         assert "web3ToolBoxDev" not in manifest_text
         assert "aming_claw.git" not in manifest_text
 
-    def test_everyday_demo_skill_frontmatter_is_yaml_parseable(self):
+    def test_archived_skill_frontmatter_is_yaml_parseable(self):
         import yaml
 
         for rel in (
-            "skills/aming-claw-drift-demo/SKILL.md",
-            "skills/aming-claw-backlog-dupe-demo/SKILL.md",
-            "skills/aming-claw-vibe-queue-demo/SKILL.md",
+            "Archive/skills/aming-claw-drift-demo/SKILL.md",
+            "Archive/skills/aming-claw-backlog-dupe-demo/SKILL.md",
+            "Archive/skills/aming-claw-vibe-queue-demo/SKILL.md",
         ):
             text = (ROOT / rel).read_text(encoding="utf-8")
             assert text.startswith("---\n"), rel
@@ -382,6 +375,22 @@ class TestClaudePluginPackaging:
             parsed = yaml.safe_load(frontmatter)
             assert parsed["name"], rel
             assert parsed["description"], rel
+
+    def test_archived_skill_index_maps_legacy_skills_to_onboard(self):
+        index = json.loads((ROOT / "Archive" / "skills" / "index.json").read_text(encoding="utf-8"))
+
+        assert index["active_entrypoint"]["skill_id"] == "aming-claw-onboard"
+        assert index["active_entrypoint"]["path"] == "skills/aming-claw-onboard/SKILL.md"
+        archived = {item["skill_id"]: item for item in index["archived_skills"]}
+        assert len(archived) == 12
+        for skill_id in (
+            "aming-claw",
+            "aming-claw-launcher",
+            "aming-claw-drift-demo",
+            "aming-claw-backlog-dupe-demo",
+            "aming-claw-vibe-queue-demo",
+        ):
+            assert archived[skill_id]["archive_path"].startswith("Archive/skills/")
 
     def test_claude_local_marketplace_points_to_root_plugin(self):
         marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"

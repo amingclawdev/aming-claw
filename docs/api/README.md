@@ -49,7 +49,7 @@ new graph context.
 
 | File | V1 Status | Description |
 | --- | --- | --- |
-| [governance-api.md](governance-api.md) | Legacy/deep reference | Broad governance API guide. V1 users should prefer MCP tools (see [skill MCP guide](../../skills/aming-claw/references/mcp-tools.md)) and the table above; consult this file only when you need an endpoint that isn't surfaced through MCP, and double-check version-gate examples against §7 of [architecture.md](../architecture.md). |
+| [governance-api.md](governance-api.md) | Legacy/deep reference | Broad governance API guide. V1 users should start from the onboard route guide service and prefer MCP tools plus the table above; the archived legacy MCP guide is preserved at [Archive/skills/aming-claw/references/mcp-tools.md](../../Archive/skills/aming-claw/references/mcp-tools.md) for provenance. Consult this file only when you need an endpoint that is not surfaced through MCP, and double-check version-gate examples against §7 of [architecture.md](../architecture.md). |
 | [executor-api.md](executor-api.md) | Experimental in V1 | Executor API guide for task execution and chain automation. Not required for the V1 dashboard/graph path. |
 
 ## Notes

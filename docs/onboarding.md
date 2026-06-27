@@ -5,10 +5,11 @@ project. V1 is local-first: start governance, open the dashboard, explicitly
 register a clean target project, build the graph, then use dashboard/MCP tools
 to inspect, file backlog, and plan PR work.
 
-The single user-invocable onboarding entry is
-`/aming-claw:aming-claw-launcher` in Claude Code or `aming-claw launcher` at
-the CLI. The launcher skill is the compact state machine; this document remains
-the full schema and first-run route-gate source.
+The single user-invocable skill entry is `/aming-claw:aming-claw-onboard`.
+From that entry, use the live onboard route guide service:
+`POST /api/projects/{project_id}/onboard-route-guide`. The CLI launcher
+remains `aming-claw launcher` for local setup. Archived skills under
+`Archive/skills/` are provenance only, not active instructions.
 
 The packaged Codex plugin manifest also installs a client-side `PreToolUse`
 hard guard that runs `python agent/hooks/onboarding_guard.py` before protected
@@ -55,9 +56,9 @@ context:
 1. List MCP resources.
 2. Confirm `aming-claw://current-context` is present.
 3. Read `aming-claw://current-context`.
-4. Read `aming-claw://skill`.
-5. Read `aming-claw://graph-first`.
-6. For Manual Fix or worker-lane work, read `aming-claw://mf-sop`.
+4. Use `/aming-claw:aming-claw-onboard` or the onboard route guide service.
+5. Confirm role and work type in the returned onboard guide.
+6. Follow the returned capability, interface, and backlog-chain index paths.
 
 Use the current-context project id, governance URL, dashboard URL, graph state,
 and guardrails as the session anchor before observer root-route-context,
@@ -255,10 +256,10 @@ After graph build:
    criteria.
 5. For implementation, the V1 implementation default is observer-led Manual
    Fix unless the user explicitly asks to test experimental chain automation.
-   The MF checklist
-   (predeclare backlog → graph-first discovery → focused tests → Chain trailer
-   commit → Update Graph → backlog close) lives in
-   [skills/aming-claw/references/mf-sop.md](../skills/aming-claw/references/mf-sop.md).
+   The live route guide is the entrypoint for the current MF path. The archived
+   historical MF checklist is preserved at
+   [Archive/skills/aming-claw/references/mf-sop.md](../Archive/skills/aming-claw/references/mf-sop.md)
+   for provenance only.
 
 Parallel MF uses observer-only coordination by default. The observer writes the
 backlog row and `mf_parallel.v1` contract, starts bounded local Codex

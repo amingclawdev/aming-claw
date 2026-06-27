@@ -1,0 +1,93 @@
+{
+  "schema_version": "aming_claw_archived_skill_index.v1",
+  "status": "archived",
+  "active_entrypoint": {
+    "skill_id": "aming-claw-onboard",
+    "path": "skills/aming-claw-onboard/SKILL.md",
+    "service": "onboard_route_guide",
+    "service_path": "/api/projects/{project_id}/onboard-route-guide",
+    "replacement_index_paths": [
+      "agent_onboard_guidance.onboard_route_guide.role_entries",
+      "agent_onboard_guidance.onboard_route_guide.interface_index",
+      "agent_onboard_guidance.onboard_route_guide.capability_index",
+      "agent_onboard_guidance.onboard_route_guide.system_operation_index",
+      "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding"
+    ]
+  },
+  "archived_at": "2026-06-27",
+  "reason": "Normalize Aming Claw plugin discovery to one onboard-first skill entrypoint.",
+  "archived_skills": [
+    {
+      "skill_id": "aming-claw",
+      "previous_path": "skills/aming-claw/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw/SKILL.md",
+      "replacement": "skills/aming-claw-onboard/SKILL.md"
+    },
+    {
+      "skill_id": "aming-claw-launcher",
+      "previous_path": "skills/aming-claw-launcher/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-launcher/SKILL.md",
+      "replacement": "skills/aming-claw-onboard/SKILL.md"
+    },
+    {
+      "skill_id": "aming-claw-project-inbox",
+      "previous_path": "skills/aming-claw-project-inbox/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-project-inbox/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.work_type_options"
+    },
+    {
+      "skill_id": "aming-claw-hn-challenge",
+      "previous_path": "skills/aming-claw-hn-challenge/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-hn-challenge/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-hn-demo",
+      "previous_path": "skills/aming-claw-hn-demo/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-hn-demo/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-hn-demo-before-work",
+      "previous_path": "skills/aming-claw-hn-demo-before-work/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-hn-demo-before-work/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-hn-demo-during-work",
+      "previous_path": "skills/aming-claw-hn-demo-during-work/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-hn-demo-during-work/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-hn-demo-after-work",
+      "previous_path": "skills/aming-claw-hn-demo-after-work/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-hn-demo-after-work/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-vibe-queue-demo",
+      "previous_path": "skills/aming-claw-vibe-queue-demo/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-vibe-queue-demo/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-drift-demo",
+      "previous_path": "skills/aming-claw-drift-demo/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-drift-demo/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-backlog-dupe-demo",
+      "previous_path": "skills/aming-claw-backlog-dupe-demo/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-backlog-dupe-demo/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.capability_index"
+    },
+    {
+      "skill_id": "aming-claw-ue-review",
+      "previous_path": "skills/aming-claw-ue-review/SKILL.md",
+      "archive_path": "Archive/skills/aming-claw-ue-review/SKILL.md",
+      "replacement": "agent_onboard_guidance.onboard_route_guide.work_type_options"
+    }
+  ]
+}

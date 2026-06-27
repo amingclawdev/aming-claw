@@ -4,6 +4,11 @@ This index is generated from the latest reconcile doc-index review. It is
 the repo-level entry point for feature nodes, owned code, linked docs,
 linked tests, and remaining doc/test debt.
 
+For agent entrypoint selection, start with `/aming-claw:aming-claw-onboard`
+and the onboard route guide service. Legacy skill documents are archived under
+`Archive/skills/`; `Archive/skills/index.json` maps old skill ids to archive
+paths and replacement onboard index paths.
+
 ## Source
 
 - project_id: `aming-claw`

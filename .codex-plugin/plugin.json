@@ -1,7 +1,7 @@
 {
   "name": "aming-claw",
   "version": "0.1.1",
-  "description": "Codex plugin packaging for Aming Claw governance, launcher, Project Inbox capture, HN challenge/demo skills, everyday AI coding demo skills, and MCP tools.",
+  "description": "Codex plugin packaging for Aming Claw governance with one onboard-first skill entrypoint and MCP tools.",
   "license": "FSL-1.1-MIT",
   "keywords": [
     "governance",
@@ -27,7 +27,7 @@
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
-    "longDescription": "Provides the Aming Claw governance, launcher, Project Inbox capture workflow, HN challenge/demo skills, and everyday AI coding demo skills plus MCP resources and configuration so agents start with graph-first discovery, backlog/MF discipline, core runtime checks, and dashboard governance context.",
+    "longDescription": "Provides Aming Claw governance with a single onboard-first skill entrypoint plus MCP resources and configuration. Agents start from the onboard route guide service, then select role, work type, runtime contract, worker, QA, or system operation paths from live guidance.",
     "developerName": "Aming Claw",
     "category": "Productivity",
     "capabilities": [
@@ -36,9 +36,9 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Read aming-claw://skill before changing governed code; use graph/backlog checks first.",
-      "If governance is offline, read aming-claw://seed-graph-summary, then ask user to run aming-claw start.",
-      "Call graph_query/query_schema, runtime, graph, and backlog checks before implementation."
+      "Start from the active aming-claw-onboard skill and the onboard route guide service before changing governed code.",
+      "If governance is offline, ask the user to run aming-claw start; do not use archived skills as active instructions.",
+      "Call runtime_status, graph_status, graph_operations_queue, and backlog checks before implementation."
     ],
     "brandColor": "#0F766E"
   }
