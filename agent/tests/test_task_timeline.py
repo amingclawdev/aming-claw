@@ -15675,5 +15675,286 @@ def test_parallel_parent_contract_gate_accepts_child_lane_and_merge_events_witho
     }
 
 
+def _contract_runtime_projection_line(
+    stage_id,
+    line_id,
+    actor_role,
+    evidence_kind,
+    *,
+    commit_sha="",
+    payload=None,
+):
+    line = {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": actor_role,
+        "evidence_kind": evidence_kind,
+        "payload": dict(payload or {}),
+    }
+    if commit_sha:
+        line["commit_sha"] = commit_sha
+    return line
+
+
+def _completed_mf_parallel_runtime_record(close_commit, worker_commit):
+    worker_payload = {
+        "runtime_context_id": "mfrctx-unit",
+        "task_id": "unit:impl",
+        "parent_task_id": "unit:parent",
+        "worker_role": "mf_sub",
+        "worker_id": "mfsub-unit",
+        "worker_slot_id": "mfsub-unit",
+        "fence_token_hash": "sha256:" + "1" * 64,
+        "changed_files": ["agent/governance/server.py"],
+        "owned_files": ["agent/governance/server.py"],
+    }
+    startup_payload = {
+        **worker_payload,
+        "actual_cwd": "/tmp/aming-claw-worker",
+        "actual_git_root": "/tmp/aming-claw-worker",
+        "branch": "codex/unit",
+        "head_commit": worker_commit,
+    }
+    finish_gate_payload = {
+        **worker_payload,
+        "mf_subagent_finish_gate": {
+            "status": "passed",
+            "close_ready": True,
+            "head_commit": worker_commit,
+            "changed_files": ["agent/governance/server.py"],
+            "receipt_gate": {
+                "status": "passed",
+                "read_receipt_present": True,
+                "read_receipt_event_id_present": True,
+                "startup_present": True,
+                "observer_command_id_present": True,
+            },
+            "startup_worker_identity_gate": {"passed": True},
+            "worker_self_attestation_gate": {"passed": True},
+            "startup_evidence": startup_payload,
+        },
+    }
+    lines = [
+        _contract_runtime_projection_line(
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "observer",
+            "contract_binding",
+        ),
+        _contract_runtime_projection_line(
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "observer",
+            "dispatch_bounded_worker",
+            payload=worker_payload,
+        ),
+        _contract_runtime_projection_line(
+            "worker_read",
+            "worker_read_runtime_guide",
+            "mf_sub",
+            "read_receipt",
+            payload={**worker_payload, "read_receipt_hash": "sha256:" + "2" * 64},
+        ),
+        _contract_runtime_projection_line(
+            "worker_startup",
+            "worker_startup",
+            "mf_sub",
+            "mf_subagent_startup",
+            payload=startup_payload,
+        ),
+        _contract_runtime_projection_line(
+            "worker_context",
+            "worker_graph_context",
+            "mf_sub",
+            "graph_trace",
+            payload={**worker_payload, "graph_query_trace_ids": ["gqt-unit"]},
+        ),
+        _contract_runtime_projection_line(
+            "worker_implementation",
+            "worker_implementation",
+            "mf_sub",
+            "implementation",
+            commit_sha=worker_commit,
+            payload=worker_payload,
+        ),
+        _contract_runtime_projection_line(
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "mf_sub",
+            "record_finish_time_worker_attestation",
+            commit_sha=worker_commit,
+            payload={**worker_payload, "finish_time_worker_self_attestation": True},
+        ),
+        _contract_runtime_projection_line(
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_sub",
+            "mf_subagent_finish_gate",
+            commit_sha=worker_commit,
+            payload=finish_gate_payload,
+        ),
+        _contract_runtime_projection_line(
+            "qa_handoff",
+            "worker_review_ready_handoff",
+            "mf_sub",
+            "review_ready",
+            commit_sha=worker_commit,
+            payload={**worker_payload, "review_ready": True, "stop_state": "review_ready"},
+        ),
+        _contract_runtime_projection_line(
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+            commit_sha=worker_commit,
+            payload={
+                "principal_id": "qa:unit",
+                "verdict": "passed",
+                "changed_files": ["agent/governance/server.py"],
+            },
+        ),
+        _contract_runtime_projection_line(
+            "observer_integration",
+            "observer_merge",
+            "observer",
+            "merge",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+        _contract_runtime_projection_line(
+            "observer_integration",
+            "observer_reconcile",
+            "observer",
+            "reconcile",
+            commit_sha=close_commit,
+            payload={"graph_reconciled": True, "scope_reconciled": True},
+        ),
+        _contract_runtime_projection_line(
+            "observer_integration",
+            "observer_close_ready",
+            "observer",
+            "close_ready",
+            commit_sha=close_commit,
+            payload={
+                "merge_commit": close_commit,
+                "close_readiness": {
+                    "qa_independent_verification": True,
+                    "governance_redeploy": True,
+                    "graph_reconcile": True,
+                },
+                "validation": {"preflight_ok": True},
+            },
+        ),
+    ]
+    state = {
+        "execution_state_revision": 14,
+        "execution_state_hash": "sha256:" + "3" * 64,
+    }
+    return {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-PROJECTION",
+        "contract_execution_id": "cex-runtime-projection",
+        "contract_id": "mf_parallel",
+        "route_token_ref": "rtok-runtime",
+        "completed_lines": lines,
+        "execution_state_revision": 14,
+        "execution_state": state,
+        "runtime_guide": {
+            "next_legal_action": None,
+            "completed_lines": lines,
+            "runtime_guide_hash": "sha256:" + "4" * 64,
+        },
+    }
+
+
+def test_backlog_close_contract_runtime_completed_lines_project_to_close_gate():
+    from agent.governance import server, task_timeline
+
+    close_commit = "f149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "c05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    record = _completed_mf_parallel_runtime_record(close_commit, worker_commit)
+    identity = {
+        "route_id": "route-unit",
+        "route_context_hash": _fake_sha("route-unit"),
+        "prompt_contract_id": "rprompt-unit",
+        "prompt_contract_hash": _fake_sha("prompt-unit"),
+        "visible_injection_manifest_hash": _fake_sha("visible-unit"),
+    }
+    events = server._contract_runtime_close_authority_seed_events(
+        record=record,
+        identity=identity,
+    )
+    events.extend(
+        server._contract_runtime_close_authority_event(
+            record=record,
+            line=line,
+            event_id=index + 10,
+            identity=identity,
+            close_commit=close_commit,
+        )
+        for index, line in enumerate(record["completed_lines"])
+    )
+
+    gate = task_timeline.mf_close_gate_verification(
+        events,
+        contract={
+            "project_id": "aming-claw",
+            "template_id": "mf_parallel.v1",
+            "close_context": {"close_commit": close_commit},
+            "required_lanes": [
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+            ],
+        },
+    )
+
+    assert gate["passed"] is True, gate
+    assert gate["checks"]["has_verification"] is True
+    assert gate["checks"]["has_independent_qa"] is True
+    assert gate["checks"]["close_commit_has_timeline_evidence"] is True
+
+
+def test_backlog_close_contract_runtime_projection_rejects_cross_backlog_record():
+    from agent.governance import server
+
+    close_commit = "f149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    record = _completed_mf_parallel_runtime_record(
+        close_commit,
+        "c05d49fc962bd91e20b540b8f3ca5f06b27c293e",
+    )
+    record["backlog_id"] = "OTHER-BACKLOG"
+
+    class _Store:
+        def get(self, _execution_id):
+            return record
+
+    class _Runtime:
+        store = _Store()
+
+        def current_guide(self, _execution_id, *, actor_role=None):
+            return record["runtime_guide"]
+
+    with mock.patch.object(server, "_contract_runtime", return_value=_Runtime()):
+        case = unittest.TestCase()
+        with case.assertRaises(server.GovernanceError) as raised:
+            server._contract_runtime_close_authority_projection(
+                None,
+                project_id="aming-claw",
+                bug_id="AC-RUNTIME-PROJECTION",
+                body={
+                    "contract_execution_id": "cex-runtime-projection",
+                    "commit": close_commit,
+                },
+                route_gate={
+                    "route_context_hash": _fake_sha("route-unit"),
+                    "prompt_contract_id": "rprompt-unit",
+                },
+                close_commit=close_commit,
+            )
+
+    assert raised.exception.code == "contract_runtime_close_authority_rejected"
+    assert raised.exception.details["error"] == "contract_execution_scope_mismatch"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38348,6 +38348,457 @@ def _contract_runtime_close_gate(
     }
 
 
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION = (
+    "contract_runtime_close_authority_projection.v1"
+)
+
+
+def _contract_runtime_close_authority_identity(
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    gate = route_gate if isinstance(route_gate, Mapping) else {}
+    identity: dict[str, str] = {}
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        value = (
+            _route_request_identity_value(body, field)
+            or str(gate.get(field) or "").strip()
+        )
+        if value:
+            identity[field] = value
+    return identity
+
+
+def _contract_runtime_close_authority_line_payload(
+    line: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    return dict(payload)
+
+
+def _contract_runtime_close_authority_actor(
+    line: Mapping[str, Any],
+) -> str:
+    actor_role = str(line.get("actor_role") or "").strip()
+    payload = _contract_runtime_close_authority_line_payload(line)
+    if actor_role == "qa":
+        return str(payload.get("principal_id") or "qa:contract-runtime")
+    if actor_role == "mf_sub":
+        return str(
+            line.get("worker_id")
+            or payload.get("worker_id")
+            or payload.get("worker_slot_id")
+            or payload.get("task_id")
+            or "mf_sub:contract-runtime"
+        )
+    if actor_role:
+        return actor_role
+    return "contract-runtime"
+
+
+def _contract_runtime_close_authority_status(
+    line: Mapping[str, Any],
+    default: str = "passed",
+) -> str:
+    payload = _contract_runtime_close_authority_line_payload(line)
+    status = str(
+        line.get("status")
+        or payload.get("status")
+        or payload.get("verdict")
+        or default
+    ).strip().lower()
+    if status in {"fail", "failed", "blocked", "reject", "rejected"}:
+        return "failed"
+    if status in {"accepted", "allow", "allowed", "approved", "ok", "pass", "passed", "succeeded"}:
+        return status
+    return default
+
+
+def _contract_runtime_close_authority_event_kind(
+    line: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    evidence_kind = _contract_runtime_close_normalized(line.get("evidence_kind"))
+    line_id = _contract_runtime_close_normalized(line.get("line_id"))
+    if evidence_kind == "contract_binding":
+        return "route_context", "dispatch", "passed"
+    if evidence_kind == "dispatch_bounded_worker":
+        return "mf_subagent_dispatch", "dispatch", "passed"
+    if evidence_kind == "read_receipt":
+        return "mf_subagent_read_receipt", "worker_read", "passed"
+    if evidence_kind == "mf_subagent_startup":
+        return "mf_subagent_startup", "startup", "passed"
+    if evidence_kind == "graph_trace":
+        return "graph_query_trace", "worker_context", "passed"
+    if evidence_kind == "implementation":
+        return "implementation", "implementation", "accepted"
+    if evidence_kind == "record_finish_time_worker_attestation":
+        return "finish_time_worker_attestation", "worker_attestation", "passed"
+    if evidence_kind == "mf_subagent_finish_gate":
+        return "contract_runtime_finish_gate", "worker_finish", "passed"
+    if evidence_kind == "review_ready":
+        return "review_ready", "qa_handoff", "passed"
+    if evidence_kind == "independent_verification":
+        return "independent_verification", "verification", "passed"
+    if evidence_kind == "merge":
+        return "merge", "merge", "passed"
+    if evidence_kind == "reconcile":
+        return "reconcile", "reconcile", "passed"
+    if evidence_kind == "close_ready" or line_id == "observer_close_ready":
+        return "close_ready", "close", "accepted"
+    return evidence_kind or line_id or "contract_runtime_line", evidence_kind or "contract_runtime", "passed"
+
+
+def _contract_runtime_close_authority_requirement_ids(
+    line: Mapping[str, Any],
+    event_kind: str,
+) -> list[str]:
+    evidence_kind = _contract_runtime_close_normalized(line.get("evidence_kind"))
+    mapping = {
+        "contract_binding": ["route_context", "route_prompt_bundle"],
+        "dispatch_bounded_worker": [
+            "bounded_implementation_worker_dispatch",
+            "bounded_implementation_subagent.dispatch",
+        ],
+        "read_receipt": ["read_receipt", "mf_subagent_read_receipt"],
+        "mf_subagent_startup": ["mf_subagent_startup"],
+        "graph_trace": ["worker_graph_trace", "mf_subagent_graph_trace"],
+        "implementation": ["implementation", "worker_implementation_evidence"],
+        "record_finish_time_worker_attestation": ["finish_time_worker_attestation"],
+        "mf_subagent_finish_gate": ["mf_subagent_finish_gate"],
+        "review_ready": ["review_ready", "bounded_implementation_subagent.review_ready"],
+        "independent_verification": [
+            "verification",
+            "independent_verification",
+            "independent_verification_lane",
+            "independent_qa",
+        ],
+        "merge": ["merge", "live_merge"],
+        "reconcile": ["reconcile"],
+        "close_ready": ["close_ready"],
+    }
+    ids = list(mapping.get(evidence_kind, []))
+    if event_kind == "verification" and "verification" not in ids:
+        ids.append("verification")
+    if event_kind == "close_ready" and "close_ready" not in ids:
+        ids.append("close_ready")
+    return list(dict.fromkeys(item for item in ids if item))
+
+
+def _contract_runtime_close_authority_commit(
+    line: Mapping[str, Any],
+    close_commit: str,
+) -> str:
+    payload = _contract_runtime_close_authority_line_payload(line)
+    for key in ("commit_sha", "commit", "merge_commit", "head_commit", "verified_commit"):
+        value = str(line.get(key) or payload.get(key) or "").strip()
+        if value:
+            return value
+    event_kind, _phase, _status = _contract_runtime_close_authority_event_kind(line)
+    return close_commit if event_kind in {"close_ready", "merge", "reconcile"} else ""
+
+
+def _contract_runtime_close_authority_event(
+    *,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+    event_id: int,
+    identity: Mapping[str, str],
+    close_commit: str,
+) -> dict[str, Any]:
+    event_kind, phase, default_status = _contract_runtime_close_authority_event_kind(line)
+    payload = _contract_runtime_close_authority_line_payload(line)
+    source_task_id = str(payload.pop("task_id", "") or line.get("task_id") or "").strip()
+    source_parent_task_id = str(
+        payload.pop("parent_task_id", "") or line.get("parent_task_id") or ""
+    ).strip()
+    payload.pop("route_token_ref", None)
+    payload.pop("child_route_lineage", None)
+    payload.pop("parent_route_lineage", None)
+    if str(line.get("actor_role") or "").strip() == "mf_sub":
+        payload.setdefault("worker_role", "mf_sub")
+    if _contract_runtime_close_normalized(line.get("evidence_kind")) == "graph_trace":
+        payload.setdefault("query_source", "mf_subagent")
+    if _contract_runtime_close_normalized(line.get("evidence_kind")) == "mf_subagent_finish_gate":
+        payload.pop("mf_subagent_finish_gate", None)
+        payload["runtime_finish_gate_completed"] = True
+    requirement_ids = _contract_runtime_close_authority_requirement_ids(line, event_kind)
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    payload.update({
+        "contract_runtime_projection": True,
+        "contract_execution_id": contract_execution_id,
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "source_line": {
+            "stage_id": str(line.get("stage_id") or "").strip(),
+            "line_id": str(line.get("line_id") or "").strip(),
+            "evidence_kind": str(line.get("evidence_kind") or "").strip(),
+            "actor_role": str(line.get("actor_role") or "").strip(),
+            "line_instance_id": str(line.get("line_instance_id") or "").strip(),
+            "task_id": source_task_id,
+            "parent_task_id": source_parent_task_id,
+        },
+        "requirement_ids": requirement_ids,
+        "contract_evidence": [
+            {"requirement_id": req_id, "status": "passed"}
+            for req_id in requirement_ids
+        ],
+        "scope": f"{project_id}:{backlog_id}:{contract_execution_id}",
+        **dict(identity),
+    })
+    if event_kind == "route_context":
+        payload.setdefault("route_context", {
+            **dict(identity),
+            "caller_role": "observer",
+            "required_lanes": [
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+            ],
+        })
+        if identity.get("visible_injection_manifest_hash"):
+            payload.setdefault(
+                "visible_injection_manifest_hash",
+                identity["visible_injection_manifest_hash"],
+            )
+    commit_sha = _contract_runtime_close_authority_commit(line, close_commit)
+    event = {
+        "id": event_id,
+        "event_id": f"contract-runtime:{contract_execution_id}:{event_id}",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": contract_execution_id,
+        "event_type": f"contract_runtime.{event_kind}",
+        "event_kind": event_kind,
+        "phase": phase,
+        "actor": _contract_runtime_close_authority_actor(line),
+        "status": _contract_runtime_close_authority_status(line, default_status),
+        "commit_sha": commit_sha,
+        "payload": payload,
+        "verification": {
+            **dict(identity),
+            "requirement_ids": requirement_ids,
+            "contract_evidence": [
+                {"requirement_id": req_id, "status": "passed"}
+                for req_id in requirement_ids
+            ],
+        },
+        "artifact_refs": {
+            **(
+                dict(line.get("artifact_refs"))
+                if isinstance(line.get("artifact_refs"), Mapping)
+                else {}
+            ),
+            "contract_execution_id": contract_execution_id,
+        },
+        "scope": f"{project_id}:{backlog_id}:{contract_execution_id}",
+        **dict(identity),
+    }
+    return event
+
+
+def _contract_runtime_close_authority_seed_events(
+    *,
+    record: Mapping[str, Any],
+    identity: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    scope = f"{project_id}:{backlog_id}:{contract_execution_id}"
+    route_payload = {
+        "contract_runtime_projection": True,
+        "contract_execution_id": contract_execution_id,
+        "route_context": {
+            **dict(identity),
+            "caller_role": "observer",
+            "allowed_actions": ["contract_runtime_close_authority"],
+            "required_lanes": [
+                "bounded_implementation_worker",
+                "independent_verification_lane",
+            ],
+        },
+        "visible_injection_manifest_hash": identity.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "requirement_ids": ["route_context", "route_prompt_bundle"],
+        "contract_evidence": [
+            {"requirement_id": "route_context", "status": "passed"},
+            {"requirement_id": "route_prompt_bundle", "status": "passed"},
+        ],
+        "scope": scope,
+        **dict(identity),
+    }
+    action_payload = {
+        "contract_runtime_projection": True,
+        "contract_execution_id": contract_execution_id,
+        "allowed_action": "contract_runtime_close_authority",
+        "requirement_ids": ["route_action_precheck", "route_action_gate"],
+        "contract_evidence": [
+            {"requirement_id": "route_action_precheck", "status": "passed"},
+            {"requirement_id": "route_action_gate", "status": "passed"},
+        ],
+        "scope": scope,
+        **dict(identity),
+    }
+    return [
+        {
+            "id": 1,
+            "event_id": f"contract-runtime:{contract_execution_id}:route-context",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": contract_execution_id,
+            "event_type": "contract_runtime.route_context",
+            "event_kind": "route_context",
+            "phase": "dispatch",
+            "actor": "observer",
+            "status": "passed",
+            "payload": route_payload,
+            "verification": dict(identity),
+            "scope": scope,
+            **dict(identity),
+        },
+        {
+            "id": 2,
+            "event_id": f"contract-runtime:{contract_execution_id}:route-action",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": contract_execution_id,
+            "event_type": "contract_runtime.route_action_precheck",
+            "event_kind": "route_action_precheck",
+            "phase": "pre_mutation",
+            "actor": "observer",
+            "status": "allowed",
+            "payload": action_payload,
+            "verification": dict(identity),
+            "scope": scope,
+            **dict(identity),
+        },
+    ]
+
+
+def _contract_runtime_close_authority_projection(
+    conn,
+    *,
+    project_id: str,
+    bug_id: str,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None,
+    close_commit: str,
+) -> dict[str, Any]:
+    contract_execution_id = _contract_runtime_close_execution_id(body)
+    if not contract_execution_id:
+        return {}
+    runtime = _contract_runtime(conn)
+    try:
+        runtime.current_guide(contract_execution_id, actor_role="observer")
+        record = runtime.store.get(contract_execution_id)
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_close_authority_rejected",
+            str(exc),
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+                "accepted": False,
+                "contract_execution_id": contract_execution_id,
+                "error": str(exc),
+            },
+        ) from exc
+
+    record_project = str(record.get("project_id") or "").strip()
+    record_backlog = str(record.get("backlog_id") or "").strip()
+    if record_project != project_id or record_backlog != bug_id:
+        raise GovernanceError(
+            "contract_runtime_close_authority_rejected",
+            "ContractRuntime close authority must belong to the backlog row being closed",
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+                "accepted": False,
+                "contract_execution_id": contract_execution_id,
+                "project_id": project_id,
+                "backlog_id": bug_id,
+                "record_project_id": record_project,
+                "record_backlog_id": record_backlog,
+                "error": "contract_execution_scope_mismatch",
+            },
+        )
+
+    current_state = _runtime_current_state_from_record(record)
+    if current_state.get("next_legal_action"):
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "incomplete",
+            "contract_execution_id": contract_execution_id,
+            "next_legal_action": current_state.get("next_legal_action") or {},
+            "projected_events": [],
+        }
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list) or not completed_lines:
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "missing_completed_lines",
+            "contract_execution_id": contract_execution_id,
+            "projected_events": [],
+        }
+
+    identity = _contract_runtime_close_authority_identity(body, route_gate)
+    if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "missing_route_identity",
+            "contract_execution_id": contract_execution_id,
+            "projected_events": [],
+        }
+
+    projected_events = _contract_runtime_close_authority_seed_events(
+        record=record,
+        identity=identity,
+    )
+    projected_events.extend(
+        _contract_runtime_close_authority_event(
+            record=record,
+            line=line,
+            event_id=index + 10,
+            identity=identity,
+            close_commit=close_commit,
+        )
+        for index, line in enumerate(completed_lines)
+        if isinstance(line, Mapping)
+    )
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "projected",
+        "contract_execution_id": contract_execution_id,
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "execution_state_revision": current_state.get("execution_state_revision", 0),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "projected_event_count": len(projected_events),
+        "projected_events": projected_events,
+    }
+
+
 def _trusted_contract_runtime_actor_role_from_context(
     ctx: RequestContext,
     conn,
@@ -46692,12 +47143,41 @@ def _verify_mf_close_timeline_gate(
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
     contract = _mf_close_contract_with_route_context(contract, row, body)
-    verification = _mf_close_gate_verification(
-        events,
-        contract=contract,
-        conn=conn,
+    runtime_projection = _contract_runtime_close_authority_projection(
+        conn,
         project_id=project_id,
+        bug_id=bug_id,
+        body=body,
+        route_gate=route_gate,
+        close_commit=_audit_recovery_close_commit(row, body),
     )
+    if runtime_projection.get("accepted"):
+        verification = _mf_close_gate_verification(
+            list(runtime_projection.get("projected_events") or []),
+            contract=contract,
+            conn=conn,
+            project_id=project_id,
+        )
+        verification = dict(verification)
+        verification["contract_runtime_close_authority_projection"] = {
+            key: value
+            for key, value in runtime_projection.items()
+            if key != "projected_events"
+        }
+    else:
+        verification = _mf_close_gate_verification(
+            events,
+            contract=contract,
+            conn=conn,
+            project_id=project_id,
+        )
+        if runtime_projection:
+            verification = dict(verification)
+            verification["contract_runtime_close_authority_projection"] = {
+                key: value
+                for key, value in runtime_projection.items()
+                if key != "projected_events"
+            }
     if not verification.get("passed"):
         missing_event_kinds = verification.get("missing_event_kinds") or []
         contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
