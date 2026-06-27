@@ -7696,6 +7696,39 @@ def _observer_direct_exception_event(
     }
 
 
+def _normalised_file_set(values: list[str]) -> set[str]:
+    return {str(value or "").strip().replace("\\", "/").lstrip("./") for value in values if str(value or "").strip()}
+
+
+def _observer_direct_changed_file_scope(
+    implementation: Mapping[str, Any],
+    contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    changed_files = _event_deep_string_list(
+        _mapping(implementation),
+        {"changed_files", "worker_changed_files", "owned_changed_files"},
+    )
+    close_context = _mapping(_mapping(contract).get("close_context"))
+    allowed_files = _dedupe_nonempty(
+        [
+            *_string_list(close_context.get("target_files")),
+            *_string_list(close_context.get("owned_files")),
+            *_string_list(close_context.get("allowed_files")),
+            *_string_list(close_context.get("allowed_changed_files")),
+        ]
+    )
+    changed_set = _normalised_file_set(changed_files)
+    allowed_set = _normalised_file_set(allowed_files)
+    unexpected = sorted(changed_set - allowed_set) if allowed_set else []
+    return {
+        "changed_files": changed_files,
+        "allowed_files": allowed_files,
+        "unexpected_changed_files": unexpected,
+        "passed": bool(changed_files) and not unexpected,
+        "enforced": bool(allowed_set),
+    }
+
+
 def _observer_direct_exception_contract_evidence(
     events: list[dict[str, Any]],
     contract: dict[str, Any] | None,
@@ -7834,11 +7867,13 @@ def _observer_direct_close_exception_gate(
 
     if not implementation:
         missing.append("implementation_after_observer_direct_exception")
-    if not _event_deep_string_list(
-        implementation,
-        {"changed_files", "worker_changed_files", "owned_changed_files"},
-    ):
+    changed_file_scope = _observer_direct_changed_file_scope(implementation, contract)
+    if not changed_file_scope["changed_files"]:
         missing.append("changed_files")
+    elif not changed_file_scope["allowed_files"]:
+        missing.append("allowed_changed_file_scope")
+    elif changed_file_scope["unexpected_changed_files"]:
+        missing.append("changed_files_within_allowed_scope")
     if not verification:
         missing.append("verification_after_implementation")
     if not _event_has_evidence(
@@ -7927,6 +7962,7 @@ def _observer_direct_close_exception_gate(
                 "",
             ),
         },
+        "changed_file_scope": changed_file_scope,
         "replaced_gate_ids": (
             [
                 "route_context_gate",
@@ -10310,6 +10346,25 @@ def compact_gate_summary(
         "failed_gates": failed_gates,
         "event_count": int(full_result.get("event_count") or 0),
     }
+    observer_direct_gate = _mapping(full_result.get("observer_direct_close_exception_gate"))
+    if observer_direct_gate.get("required") or observer_direct_gate.get("passed"):
+        accepted_exception = _mapping(observer_direct_gate.get("accepted_exception"))
+        accepted_exception_event = _mapping(accepted_exception.get("event"))
+        summary["observer_direct_close_exception_gate"] = {
+            "schema_version": observer_direct_gate.get(
+                "schema_version",
+                MF_OBSERVER_DIRECT_CLOSE_EXCEPTION_GATE_SCHEMA_VERSION,
+            ),
+            "passed": bool(observer_direct_gate.get("passed")),
+            "status": str(observer_direct_gate.get("status") or ""),
+            "missing_requirement_ids": list(
+                observer_direct_gate.get("missing_requirement_ids") or []
+            ),
+            "replaced_gate_ids": list(observer_direct_gate.get("replaced_gate_ids") or []),
+            "accepted_exception_event_id": accepted_exception_event.get("id"),
+            "changed_file_scope": observer_direct_gate.get("changed_file_scope") or {},
+            "next_action": str(observer_direct_gate.get("next_action") or ""),
+        }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
     if parent_successor_gap:

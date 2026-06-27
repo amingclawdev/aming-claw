@@ -416,6 +416,120 @@ def test_mf_close_p1_governance_route_requires_consumed_route_context(
 
 
 @patch("agent.governance.server.subprocess.run")
+def test_mf_close_accepts_operator_approved_observer_direct_exception(
+    _mock_subprocess,
+    _mock_db,
+    _mock_audit,
+):
+    """Operator-approved observer-direct rows can close without worker/QA lanes."""
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "priority": "P0",
+        "target_files": '["agent/governance/server.py"]',
+        "title": "Direct close gate",
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": {
+            "governance_policy": {"requirements": {"independent_qa": True}},
+            "close_context": {"close_commit": "abc1234"},
+            "route_context_hash": _ROUTE_CONTEXT_HASH,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        },
+    }
+    events = [
+        {
+            "id": 7101,
+            "event_type": "mf.observer_direct_implementation_exception",
+            "event_kind": "observer_direct_implementation_exception",
+            "phase": "pre_mutation",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "payload": {
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
+                "prompt_contract_id": "prompt-contract-backlog-close",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
+                "reason": "operator-supervised direct repair of a close gate",
+                "operator_approval": {"approved": True, "approved_by": "operator"},
+                "dirty_scope_check": {"dirty_files": []},
+            },
+        },
+        {
+            "id": 7102,
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "commit_sha": "abc1234",
+            "payload": {
+                "changed_files": ["agent/governance/server.py"],
+                "dirty_scope_check": {
+                    "changed_files": ["agent/governance/server.py"],
+                    "unexpected_files": [],
+                },
+            },
+        },
+        {
+            "id": 7103,
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "codex_observer",
+            "commit_sha": "abc1234",
+            "verification": {
+                "tests_run": ["pytest -q agent/tests/test_backlog_close_commit_verify.py"],
+                "test_results": {"passed": 1},
+                "diff_check": {"unexpected_files": []},
+                "live_regression": {"status": "passed"},
+            },
+        },
+        {
+            "id": 7104,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "commit_sha": "abc1234",
+            "verification": {
+                "governance_redeploy": {"status": "passed"},
+                "runtime_version_sync": True,
+                "graph_reconciled": True,
+                "preflight_ok": True,
+                "live_regression": {"status": "passed"},
+            },
+        },
+    ]
+    ctx = _make_ctx(commit="abc1234")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        result = handle_backlog_close(ctx)
+
+    assert result["ok"] is True
+    assert result["gate_summary"]["ok"] is True
+    assert result["gate_summary"]["can_close"] is True
+    assert result["gate_summary"]["failed_gates"] == []
+    direct_gate = result["gate_summary"]["observer_direct_close_exception_gate"]
+    assert direct_gate["passed"] is True
+    assert direct_gate["accepted_exception_event_id"] == 7101
+    assert "independent_qa_gate" in direct_gate["replaced_gate_ids"]
+    assert direct_gate["changed_file_scope"]["unexpected_changed_files"] == []
+
+
+@patch("agent.governance.server.subprocess.run")
 def test_mf_close_instantiated_contract_missing_e2e_is_blocked(_mock_subprocess, _mock_db, _mock_audit):
     """Instantiated MF contracts can require specific timeline evidence before close."""
     from agent.governance.errors import GovernanceError
