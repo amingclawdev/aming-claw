@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Any, Mapping
 
+from .contracts.runtime import read_backlog_contract_chain_current
+
 log = logging.getLogger(__name__)
 
 
@@ -12930,6 +12932,55 @@ def _compact_ledger_backlog_ids(event: Mapping[str, Any]) -> set[str]:
     return ids
 
 
+def _compact_contract_chain_current_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    backlog_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    projections: dict[str, dict[str, Any]] = {}
+    for backlog_id in sorted(backlog_ids):
+        current = read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
+        if current:
+            projections[backlog_id] = current
+    return projections
+
+
+def _apply_compact_contract_chain_current(
+    row: dict[str, Any],
+    current: Mapping[str, Any],
+) -> None:
+    if not current:
+        return
+    row["contract_chain_id"] = str(current.get("contract_chain_id") or "")
+    row["root_contract_execution_id"] = str(
+        current.get("root_contract_execution_id") or ""
+    )
+    row["current_contract_execution_id"] = str(
+        current.get("current_contract_execution_id") or ""
+    )
+    row["current_contract_id"] = str(current.get("current_contract_id") or "")
+    row["parent_to_resume_contract_execution_id"] = str(
+        current.get("parent_to_resume_contract_execution_id") or ""
+    )
+    row["active_child_contract_execution_id"] = str(
+        current.get("active_child_contract_execution_id") or ""
+    )
+    row["projection_generation"] = int(current.get("generation") or 0)
+    row["projection_watermark"] = int(current.get("projection_watermark") or 0)
+    row["projection_hash"] = str(current.get("projection_hash") or "")
+    row["projection_degraded"] = bool(current.get("degraded"))
+    degraded_flags = current.get("degraded_flags")
+    row["projection_degraded_flags"] = (
+        dict(degraded_flags) if isinstance(degraded_flags, Mapping) else {}
+    )
+    row["contract_chain_current"] = dict(current)
+
+
 def build_compact_ledger(
     conn: sqlite3.Connection,
     project_id: str,
@@ -12972,6 +13023,18 @@ def build_compact_ledger(
                 "blocker_summary": {},
                 "head_commit": "",
                 "readiness_state": "unknown",
+                "contract_chain_id": "",
+                "root_contract_execution_id": "",
+                "current_contract_execution_id": "",
+                "current_contract_id": "",
+                "parent_to_resume_contract_execution_id": "",
+                "active_child_contract_execution_id": "",
+                "projection_generation": 0,
+                "projection_watermark": 0,
+                "projection_hash": "",
+                "projection_degraded": False,
+                "projection_degraded_flags": {},
+                "contract_chain_current": {},
             },
         )
 
@@ -13053,6 +13116,15 @@ def build_compact_ledger(
                 row["readiness_state"] = "implemented"
             elif row["merge_queue_id"]:
                 row["readiness_state"] = "planned"
+
+    current_projections = _compact_contract_chain_current_rows(
+        conn,
+        project_id,
+        backlog_ids,
+    )
+    for backlog_id, current in current_projections.items():
+        if backlog_id in ledger:
+            _apply_compact_contract_chain_current(ledger[backlog_id], current)
 
     rows = sorted(
         ledger.values(),

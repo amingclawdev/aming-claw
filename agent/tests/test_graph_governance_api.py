@@ -24312,6 +24312,71 @@ def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     )
 
 
+def test_onboard_route_guide_returns_contract_chain_current_projection(conn):
+    backlog_id = "AC-ONBOARD-ROUTE-GUIDE-CURRENT-PROJECTION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref="rtok-onboard-current-projection",
+    )
+
+    response = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-onboard-current-projection",
+            },
+        )
+    )
+
+    current = response["contract_chain_current"]
+    assert current["projection_source"] == "backlog_contract_chain_current"
+    assert current["root_contract_execution_id"] == parent["contract_execution_id"]
+    assert current["contract_chain_id"] == parent["contract_chain_id"]
+    assert current["projection_watermark"] >= 1
+    assert current["degraded"] is False
+    assert response["runtime_resume"]["source"] == "backlog_contract_chain_current"
+    assert response["runtime_resume"]["projection_hash"] == current["projection_hash"]
+    assert response["agent_onboard_guidance"]["contract_chain_current"] == current
+    assert response["runtime_resume"].get("source") != "task_timeline_compact_ledger"
+
+
+def test_contract_chain_current_endpoint_returns_onboard_service_projection(conn):
+    backlog_id = "AC-CONTRACT-CHAIN-CURRENT-ENDPOINT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref="rtok-contract-chain-current-endpoint",
+    )
+
+    response = server.handle_project_contract_chain_current(
+        _ctx(
+            {"project_id": PID},
+            query={"backlog_id": backlog_id},
+        )
+    )
+
+    current = response["contract_chain_current"]
+    assert response["ok"] is True
+    assert response["project_id"] == PID
+    assert response["backlog_id"] == backlog_id
+    assert response["projection_missing"] is False
+    assert response["rebuild_if_missing"] is False
+    assert current["projection_source"] == "backlog_contract_chain_current"
+    assert current["root_contract_execution_id"] == parent["contract_execution_id"]
+    assert current["current_contract_id"] == "onboard_route_guide"
+    assert current["contract_chain_id"] == parent["contract_chain_id"]
+
+
 def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_path):
     backlog_id = "AC-DIRECT-FIX-DISPATCH-CONTEXT-BINDING"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -24456,6 +24521,12 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     next_action = repaired["contract_runtime_current_state"]["next_legal_action"]
     assert next_action["line_id"] == "qa_independent_verification"
     assert next_action["owner_role"] == "qa"
+    direct_record = server._contract_runtime_store(conn).get(direct_execution_id)
+    direct_generation = int(direct_record["execution_state_revision"])
+    repair_ref = (
+        f"contract_runtime:{direct_execution_id}:"
+        f"completed_lines:{len(direct_record['completed_lines']) - 1}"
+    )
 
     qa = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -24469,9 +24540,18 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
                 "verification": {
                     "verdict": "PASS",
                     "independent": True,
+                    "direct_fix_contract_execution_id": direct_execution_id,
+                    "projection_generation": direct_generation,
+                    "source_ref": repair_ref,
                 },
                 "payload": {
                     "qa_summary": "dispatch context was required before repair",
+                    "child_contract_execution_id": direct_execution_id,
+                    "projection_generation": direct_generation,
+                    "source_refs": [repair_ref],
+                },
+                "artifact_refs": {
+                    "source_refs": [repair_ref],
                 },
             },
         )
@@ -24536,6 +24616,126 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
         onboard["next_legal_action"]["successor_contract_execution_id"]
         == direct_execution_id
     )
+
+
+def test_direct_fix_generic_qa_cannot_resume_parent_without_projection_binding(conn):
+    backlog_id = "AC-DIRECT-FIX-GENERIC-QA-NO-PARENT-RESUME"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair successor entry gate blocked after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": "direct-fix-generic-qa-no-resume",
+                "parent_contract_execution_id": parent_execution_id,
+                "route_token_ref": "rtok-direct-fix-generic-qa-no-resume",
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    direct_execution_id = entered["contract_execution_id"]
+    runtime = server._contract_runtime(conn)
+
+    def _write_line(
+        *,
+        actor_role: str,
+        stage_id: str,
+        line_id: str,
+        evidence_kind: str,
+        payload: dict | None = None,
+    ) -> dict:
+        runtime.current_guide(direct_execution_id, actor_role=actor_role)
+        record = runtime.store.get(direct_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if payload is not None:
+            write["payload"] = payload
+        result = runtime.submit_line_write(
+            direct_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+        return result
+
+    _write_line(
+        actor_role="observer",
+        stage_id="operator_approval",
+        line_id="direct_fix_operator_approval",
+        evidence_kind="operator_approval",
+    )
+    _write_line(
+        actor_role="observer",
+        stage_id="dispatch_context",
+        line_id="direct_fix_dispatch_context",
+        evidence_kind="dispatch_bounded_worker",
+    )
+    _write_line(
+        actor_role="mf_sub",
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        evidence_kind="direct_fix_repair_evidence",
+    )
+    _write_line(
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+        evidence_kind="independent_verification",
+        payload={
+            "status": "pass",
+            "qa_summary": "generic QA lacks child/generation/source refs",
+        },
+    )
+    _write_line(
+        actor_role="observer",
+        stage_id="return_to_parent",
+        line_id="direct_fix_return_to_parent",
+        evidence_kind="direct_fix_return_to_parent",
+        payload={
+            "parent_contract_execution_id": parent_execution_id,
+            "successor_contract_execution_id": direct_execution_id,
+        },
+    )
+    runtime.current_guide(direct_execution_id, actor_role="observer")
+    direct_record = runtime.store.get(direct_execution_id)
+    assert server._runtime_record_is_complete(direct_record) is True
+
+    current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert current["readiness_state"] == "direct_fix_complete_awaiting_independent_qa"
+    assert current["current_contract_execution_id"] == direct_execution_id
+    assert current["next_legal_action"]["id"] == "qa_independent_verification"
+
+    parent_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    parent_next = parent_current["next_legal_action"]
+    assert parent_next["id"] == "qa_independent_verification"
+    assert parent_next["source"] == "backlog_contract_chain_current"
+    assert parent_next["successor_contract_execution_id"] == direct_execution_id
+    assert parent_current["runtime_guide"].get("successor_return", {}) == {}
 
 
 def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):

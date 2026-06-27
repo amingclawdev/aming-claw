@@ -53,8 +53,12 @@ from .contracts.runtime import (
     ContractRuntimeError,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     is_legacy_primary_contract_route,
+    read_backlog_contract_chain_current,
+    rebuild_backlog_contract_chain_projection,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    upsert_contract_chain_root_current_binding,
+    upsert_contract_chain_successor_binding,
 )
 from .contracts.hash import stable_sha256
 
@@ -33760,6 +33764,100 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _contract_chain_current_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    rebuild_if_missing: bool = False,
+) -> dict[str, Any]:
+    try:
+        return read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=rebuild_if_missing,
+        )
+    except sqlite3.Error as exc:
+        return {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "degraded": True,
+            "degraded_flags": {
+                "projection_read_failed": str(exc),
+            },
+            "projection_source": "backlog_contract_chain_current",
+        }
+
+
+def _contract_chain_current_response(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    rebuild_if_missing: bool = False,
+) -> dict[str, Any]:
+    current_projection = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=rebuild_if_missing,
+    )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_chain_current": current_projection,
+        "projection_missing": not bool(current_projection),
+        "rebuild_if_missing": rebuild_if_missing,
+    }
+
+
+def _onboard_runtime_resume_from_current_projection(
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not current_projection:
+        return {}
+    next_action = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    readiness_state = str(current_projection.get("readiness_state") or "unknown")
+    status = readiness_state
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        status = "returned"
+    return {
+        "schema_version": "onboard_route_guide.runtime_resume.v1",
+        "status": status,
+        "readiness_state": readiness_state,
+        "mode": "contract_chain_current_projection",
+        "source": "backlog_contract_chain_current",
+        "project_id": str(current_projection.get("project_id") or ""),
+        "backlog_id": str(current_projection.get("backlog_id") or ""),
+        "contract_chain_id": str(current_projection.get("contract_chain_id") or ""),
+        "root_contract_execution_id": str(
+            current_projection.get("root_contract_execution_id") or ""
+        ),
+        "current_contract_execution_id": str(
+            current_projection.get("current_contract_execution_id") or ""
+        ),
+        "current_contract_id": str(current_projection.get("current_contract_id") or ""),
+        "parent_to_resume_contract_execution_id": str(
+            current_projection.get("parent_to_resume_contract_execution_id") or ""
+        ),
+        "active_child_contract_execution_id": str(
+            current_projection.get("active_child_contract_execution_id") or ""
+        ),
+        "next_legal_action": dict(next_action),
+        "projection_watermark": int(
+            current_projection.get("projection_watermark") or 0
+        ),
+        "projection_hash": str(current_projection.get("projection_hash") or ""),
+    }
+
+
 def _contract_runtime_stale_recovery_id(
     stale: StalePinnedContractExecutionError,
 ) -> str:
@@ -34094,7 +34192,18 @@ def _contract_runtime_complete_direct_fix_child_for_parent(
             record = runtime.store.get(execution_id)
         except (ContractRuntimeError, StalePinnedContractExecutionError):
             continue
-        if _runtime_record_is_complete(record):
+        projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+            child_contract_execution_id=execution_id,
+        )
+        if (
+            _runtime_record_is_complete(record)
+            and str(projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        ):
             return record
     return {}
 
@@ -35043,6 +35152,8 @@ def _onboard_service_materialize_parent_record(
                 revision=1,
             )
         )
+        current_projection = upsert_contract_chain_root_current_binding(conn, created)
+        created["contract_chain_current"] = current_projection
         if blocked_successor_entry is None:
             return created
         projected = _contract_runtime_apply_blocked_projection(
@@ -35052,7 +35163,12 @@ def _onboard_service_materialize_parent_record(
             record=created,
             actor_role="observer",
         )
-        return store.update(execution_id, projected)
+        updated = store.update(execution_id, projected)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
     if route_token_ref and not str(existing.get("route_token_ref") or ""):
         existing["route_token_ref"] = route_token_ref
     if blocked_successor_entry is not None:
@@ -35070,9 +35186,23 @@ def _onboard_service_materialize_parent_record(
             record=existing,
             actor_role="observer",
         )
-        return store.update(execution_id, existing)
+        updated = store.update(execution_id, existing)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
     if route_token_ref:
-        return store.update(execution_id, existing)
+        updated = store.update(execution_id, existing)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
+    existing["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+        conn,
+        existing,
+    )
     return existing
 
 
@@ -35254,6 +35384,13 @@ def _onboard_contract_route_guide(
             "kind": "http",
             "method": "POST",
             "path": "/api/projects/{project_id}/onboard-route-guide",
+        },
+        "contract_chain_current": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_chain_current",
+            "method": "GET",
+            "path": "/api/projects/{project_id}/contract-chain-current",
+            "query_params": ["backlog_id", "rebuild_if_missing"],
         },
         "onboard_start": {
             "kind": "http",
@@ -35630,6 +35767,7 @@ def _onboard_contract_route_guide(
                 "graph_query",
                 "backlog_get",
                 "backlog_list",
+                "contract_chain_current",
                 "observer_route_context_issue",
                 "contract_add_start",
                 "contract_update_start",
@@ -36203,29 +36341,56 @@ def _onboard_route_guide_service_response(
         body={},
         metadata={},
     )
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+    )
+    projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
     }
-    runtime_resume = _onboard_blocked_contract_resume_projection(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        actor_role=str(role or "").strip() or "observer",
-        route_token_ref=route_token_ref,
-    )
+    runtime_resume = {}
+    if current_projection and not projection_degraded:
+        runtime_resume = _onboard_runtime_resume_from_current_projection(
+            current_projection
+        )
+    else:
+        runtime_resume = _onboard_blocked_contract_resume_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=str(role or "").strip() or "observer",
+            route_token_ref=route_token_ref,
+        )
+        if current_projection:
+            runtime_resume["projection_degraded"] = True
+            runtime_resume["projection_degraded_reason"] = (
+                current_projection.get("degraded_flags") or {}
+            )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
     )
     if runtime_resume:
         resume_next = runtime_resume.get("next_legal_action")
-        if isinstance(resume_next, Mapping):
+        if isinstance(resume_next, Mapping) and resume_next:
             next_action = dict(resume_next)
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
     )
+    if current_projection:
+        guidance["contract_chain_current"] = current_projection
+        guidance["contract_chain"]["current_projection"] = current_projection
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["contract_chain_current"] = current_projection
+            chain_binding = route_guide.get("backlog_chain_binding")
+            if isinstance(chain_binding, dict):
+                chain_binding["current_projection"] = current_projection
     if runtime_resume:
         guidance["runtime_resume"] = runtime_resume
         guidance["contract_chain"]["runtime_resume"] = runtime_resume
@@ -36267,6 +36432,11 @@ def _onboard_route_guide_service_response(
         },
         "agent_onboard_guidance": guidance,
         "onboard_route_guide": guidance["onboard_route_guide"],
+        "contract_chain_current": current_projection,
+        "projection_degraded": projection_degraded,
+        "projection_degraded_reason": (
+            current_projection.get("degraded_flags") if projection_degraded else {}
+        ),
         "runtime_resume": runtime_resume,
         "next_legal_action": next_action,
         "raw_route_token_required": False,
@@ -37023,6 +37193,137 @@ def _contract_runtime_block_successor_id(blocked_line: Mapping[str, Any]) -> str
     return ""
 
 
+def _direct_fix_projection_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    child_contract_execution_id: str,
+) -> dict[str, Any]:
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    if not projection or projection.get("degraded"):
+        return {}
+    readiness_state = str(projection.get("readiness_state") or "").strip()
+    if readiness_state not in {
+        "direct_fix_child_active",
+        "direct_fix_complete_awaiting_independent_qa",
+        "return_to_parent_after_direct_fix_qa",
+        "parent_resume_required_after_direct_fix_qa",
+    }:
+        return {}
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    current_id = str(projection.get("current_contract_execution_id") or "")
+    active_child_id = str(projection.get("active_child_contract_execution_id") or "")
+    parent_to_resume = str(
+        projection.get("parent_to_resume_contract_execution_id") or ""
+    )
+    action_child_id = str(
+        next_action.get("successor_contract_execution_id")
+        or next_action.get("contract_execution_id")
+        or ""
+    )
+    child_matches = child_contract_execution_id in {
+        current_id,
+        active_child_id,
+        action_child_id,
+    }
+    if not child_matches:
+        return {}
+    if parent_to_resume and parent_to_resume != parent_contract_execution_id:
+        return {}
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        parent_matches = (
+            current_id == parent_contract_execution_id
+            or parent_to_resume == parent_contract_execution_id
+        )
+        if not parent_matches:
+            return {}
+    return dict(projection)
+
+
+def _direct_fix_projection_next_action_for_parent(
+    projection: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_contract_execution_id: str,
+    blocked_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    readiness_state = str(projection.get("readiness_state") or "").strip()
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        return {}
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if not next_action:
+        return {}
+    projected = dict(next_action)
+    projected.setdefault("schema_version", "contract_runtime_next_legal_action.v1")
+    projected["source"] = "backlog_contract_chain_current"
+    projected["precedence"] = "direct_fix_projection_current_child"
+    projected["status"] = "blocked"
+    projected["mode"] = "direct_fix_child_resume"
+    projected["readiness_state"] = readiness_state
+    projected["successor_contract_id"] = DIRECT_FIX_CONTRACT_ID
+    projected["successor_contract_template_id"] = DIRECT_FIX_TEMPLATE_ID
+    projected["successor_contract_execution_id"] = child_contract_execution_id
+    projected["recommended_successor_contract_id"] = DIRECT_FIX_CONTRACT_ID
+    projected["recommended_successor_contract_template_id"] = DIRECT_FIX_TEMPLATE_ID
+    projected["requires_route_token_ref"] = True
+    projected["endpoint"] = (
+        f"/api/projects/{project_id}/contract-runtime/"
+        f"{child_contract_execution_id}/line-writes"
+    )
+    projected["body"] = {
+        "backlog_id": backlog_id,
+        "stage_id": str(next_action.get("stage_id") or ""),
+        "line_id": str(next_action.get("line_id") or ""),
+        "evidence_kind": str(next_action.get("evidence_kind") or ""),
+        "contract_execution_id": child_contract_execution_id,
+    }
+    projected["return_to_parent"] = _direct_fix_return_to_parent_projection(
+        parent_record=parent_record,
+        blocked_line=blocked_line,
+    )
+    projected["blocked_by_line"] = {
+        "stage_id": str(blocked_line.get("stage_id") or ""),
+        "line_id": str(blocked_line.get("line_id") or ""),
+        "actor_role": str(blocked_line.get("actor_role") or ""),
+        "evidence_kind": str(blocked_line.get("evidence_kind") or ""),
+    }
+    if readiness_state == "direct_fix_complete_awaiting_independent_qa":
+        projected["next_operator_action"] = "record_direct_fix_independent_qa"
+        projected["block_reason"] = (
+            "direct_fix child repair is complete, but independent QA is not "
+            "projection-bound yet"
+        )
+    elif readiness_state == "return_to_parent_after_direct_fix_qa":
+        projected["next_operator_action"] = "record_direct_fix_return_to_parent"
+        projected["block_reason"] = (
+            "direct_fix independent QA passed; record the child return line "
+            "before resuming the parent"
+        )
+    else:
+        projected["next_operator_action"] = "continue_direct_fix_child"
+        projected["block_reason"] = (
+            "direct_fix child remains the current contract-chain projection"
+        )
+    return projected
+
+
 def _contract_runtime_successor_complete(
     conn,
     *,
@@ -37059,6 +37360,18 @@ def _contract_runtime_successor_complete(
     except StalePinnedContractExecutionError:
         return False
     successor = runtime.store.get(successor_execution_id)
+    if successor_contract_id == DIRECT_FIX_CONTRACT_ID:
+        projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_execution_id,
+            child_contract_execution_id=successor_execution_id,
+        )
+        return (
+            str(projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        )
     return _runtime_record_is_complete(successor)
 
 
@@ -37092,6 +37405,28 @@ def _contract_runtime_blocked_successor_next_action(
             backlog_id,
             parent_execution_id,
         )
+        direct_fix_projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_execution_id,
+            child_contract_execution_id=successor_execution_id,
+        )
+        projected_child_next = _direct_fix_projection_next_action_for_parent(
+            direct_fix_projection,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_record=record,
+            child_contract_execution_id=successor_execution_id,
+            blocked_line=blocked_line,
+        )
+        if projected_child_next:
+            return projected_child_next
+        if (
+            str(direct_fix_projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        ):
+            return {}
         return_to_parent = _direct_fix_return_to_parent_projection(
             parent_record=record,
             blocked_line=blocked_line,
@@ -37945,6 +38280,13 @@ def _direct_fix_successor_runtime_enter(
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
+    current_projection = upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=successor,
+        edge_kind="direct_fix_child",
+        binding_kind="direct_fix_child_current",
+    )
     return {
         "schema_version": "direct_fix_successor_runtime_enter.v1",
         "successor_contract": successor_contract,
@@ -37958,6 +38300,7 @@ def _direct_fix_successor_runtime_enter(
         "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
+        "contract_chain_current": current_projection,
         "route_token_ref": str(successor.get("route_token_ref") or ""),
         "route_token_ref_guidance": {
             "route_token_ref": str(successor.get("route_token_ref") or ""),
@@ -38116,6 +38459,13 @@ def _mf_parallel_successor_runtime_enter(
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
+    current_projection = upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=successor,
+        edge_kind="mf_parallel_child",
+        binding_kind="mf_parallel_child_current",
+    )
     return {
         "schema_version": "mf_parallel_successor_runtime_enter.v1",
         "successor_contract": successor_contract,
@@ -38129,6 +38479,7 @@ def _mf_parallel_successor_runtime_enter(
         "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
+        "contract_chain_current": current_projection,
         "route_token_ref": str(successor.get("route_token_ref") or ""),
         "route_token_ref_guidance": {
             "route_token_ref": str(successor.get("route_token_ref") or ""),
@@ -47017,6 +47368,7 @@ def handle_project_direct_fix_enter(ctx: RequestContext):
         "next_legal_action": successor_runtime.get("next_legal_action") or {},
         "execution_state_revision": successor_runtime.get("execution_state_revision", 0),
         "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
+        "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
         "route_token_ref": successor_runtime.get("route_token_ref", ""),
         "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
         or {},
@@ -47246,6 +47598,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "execution_state_revision", 0
         ),
         "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
+        "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
         "route_token_ref": successor_runtime.get("route_token_ref", ""),
         "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
         or {},
@@ -47652,6 +48005,27 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     return response
 
 
+@route("GET", "/api/projects/{project_id}/contract-chain-current")
+def handle_project_contract_chain_current(ctx: RequestContext):
+    """Read the durable backlog_contract_chain_current projection for a row."""
+    project_id = ctx.get_project_id()
+    backlog_id = str(
+        _first_query_value(ctx.query, "backlog_id")
+        or _first_query_value(ctx.query, "bug_id")
+        or ""
+    ).strip()
+    if not backlog_id:
+        raise ValidationError("contract_chain_current requires backlog_id or bug_id")
+    rebuild_if_missing = _query_bool(ctx.query, "rebuild_if_missing", False)
+    with DBContext(project_id) as conn:
+        return _contract_chain_current_response(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=rebuild_if_missing,
+        )
+
+
 @route("POST", "/api/projects/{project_id}/onboard-contract/start")
 @route("POST", "/api/projects/{project_id}/onboard-contract/enter")
 def handle_project_onboard_contract_start(ctx: RequestContext):
@@ -48042,7 +48416,10 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 route_token_ref=route_token_ref,
                 allow_onboard_service_waiver=onboard_service_waiver,
             )
-            if not _runtime_record_is_complete(parent_record):
+            if (
+                not _runtime_record_is_complete(parent_record)
+                and not _onboard_service_record(parent_record)
+            ):
                 current_state = _runtime_current_state_from_record(parent_record)
                 raise ValidationError(
                     "observer onboarding contract must complete before contract_update successor",
@@ -48078,6 +48455,18 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 project_id,
                 backlog_id,
             )
+            if not onboard_service_waiver:
+                raise ValidationError(
+                    "onboard_contract runtime must be started before contract_update successor",
+                    {
+                        "contract_execution_id": deterministic_onboard_id,
+                        "contract_id": ONBOARD_CONTRACT_ID,
+                        "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+                        "agent_facing_decision_source": (
+                            "contract_runtime_first_missing_line"
+                        ),
+                    },
+                ) from exc
             raise ValidationError(
                 "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before contract_update successor",
                 {

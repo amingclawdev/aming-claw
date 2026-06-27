@@ -710,6 +710,36 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_chain_current",
+        "description": (
+            "Read the durable backlog_contract_chain_current projection for a "
+            "backlog row. This does not timeline-scan as a normal fallback; "
+            "set rebuild_if_missing only for an explicit projection rebuild."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier.",
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Backlog row id to read from the current projection.",
+                },
+                "bug_id": {
+                    "type": "string",
+                    "description": "Alias for backlog_id.",
+                },
+                "rebuild_if_missing": {
+                    "type": "boolean",
+                    "description": "Explicitly rebuild the projection if no current row exists.",
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "observer_hotfix_enter",
         "description": "Enter source-backed observer_hotfix successor runtime after onboarding completion.",
         "inputSchema": {
@@ -1560,6 +1590,19 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             f"/api/projects/{pid}/onboard-route-guide",
             _onboard_route_guide_body(args),
         )
+
+    if name == "contract_chain_current":
+        pid = args["project_id"]
+        backlog_id = str(args.get("backlog_id") or args.get("bug_id") or "").strip()
+        query = {}
+        if backlog_id:
+            query["backlog_id"] = backlog_id
+        if "rebuild_if_missing" in args:
+            query["rebuild_if_missing"] = (
+                "true" if args.get("rebuild_if_missing") else "false"
+            )
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http("GET", f"/api/projects/{pid}/contract-chain-current{qs}")
 
     if name == "observer_hotfix_enter":
         pid = args["project_id"]

@@ -207,6 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
 
     def ensure_schema(self) -> None:
         self.conn.executescript(self.SCHEMA_SQL)
+        ensure_contract_chain_mapping_schema(self.conn)
 
     def create(self, record: Mapping[str, Any]) -> dict[str, Any]:
         contract_execution_id = str(record.get("contract_execution_id") or "")
@@ -253,6 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
             raise ContractRuntimeError(
                 f"contract execution already exists: {contract_execution_id}"
             ) from exc
+        refresh_contract_chain_projection_for_record(self.conn, stored)
         return deepcopy(stored)
 
     def get(self, contract_execution_id: str) -> dict[str, Any]:
@@ -320,6 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
             raise ContractRuntimeError(
                 f"unknown contract execution: {contract_execution_id}"
             )
+        refresh_contract_chain_projection_for_record(self.conn, stored)
         return deepcopy(stored)
 
     def list_by_backlog(
@@ -347,6 +350,1260 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
             raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
             records.append(_decode_record(raw))
         return records
+
+
+CONTRACT_CHAIN_MAPPING_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS backlog_contract_chain_bindings (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key            TEXT NOT NULL UNIQUE,
+    project_id                 TEXT NOT NULL,
+    backlog_id                 TEXT NOT NULL,
+    contract_chain_id          TEXT NOT NULL,
+    root_contract_execution_id TEXT NOT NULL DEFAULT '',
+    contract_execution_id      TEXT NOT NULL,
+    parent_contract_execution_id TEXT NOT NULL DEFAULT '',
+    contract_id                TEXT NOT NULL DEFAULT '',
+    binding_kind               TEXT NOT NULL,
+    generation                 INTEGER NOT NULL DEFAULT 0,
+    execution_state_revision   INTEGER NOT NULL DEFAULT 0,
+    source_ref                 TEXT NOT NULL DEFAULT '',
+    source_hash                TEXT NOT NULL DEFAULT '',
+    degraded_flags_json        TEXT NOT NULL DEFAULT '{}',
+    metadata_json              TEXT NOT NULL DEFAULT '{}',
+    created_at                 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_bindings_backlog
+    ON backlog_contract_chain_bindings(project_id, backlog_id, id);
+CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_bindings_execution
+    ON backlog_contract_chain_bindings(contract_execution_id, id);
+CREATE TABLE IF NOT EXISTS contract_chain_edges (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    edge_key                   TEXT NOT NULL UNIQUE,
+    project_id                 TEXT NOT NULL,
+    backlog_id                 TEXT NOT NULL,
+    contract_chain_id          TEXT NOT NULL,
+    parent_contract_execution_id TEXT NOT NULL,
+    child_contract_execution_id TEXT NOT NULL,
+    root_contract_execution_id TEXT NOT NULL DEFAULT '',
+    edge_kind                  TEXT NOT NULL,
+    generation                 INTEGER NOT NULL DEFAULT 0,
+    source_ref                 TEXT NOT NULL DEFAULT '',
+    source_hash                TEXT NOT NULL DEFAULT '',
+    metadata_json              TEXT NOT NULL DEFAULT '{}',
+    created_at                 TEXT NOT NULL,
+    UNIQUE (
+        project_id,
+        contract_chain_id,
+        parent_contract_execution_id,
+        child_contract_execution_id,
+        edge_kind
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_contract_chain_edges_backlog
+    ON contract_chain_edges(project_id, backlog_id, contract_chain_id, id);
+CREATE TABLE IF NOT EXISTS backlog_contract_chain_current (
+    project_id                 TEXT NOT NULL,
+    backlog_id                 TEXT NOT NULL,
+    contract_chain_id          TEXT NOT NULL DEFAULT '',
+    root_contract_execution_id TEXT NOT NULL DEFAULT '',
+    current_contract_execution_id TEXT NOT NULL DEFAULT '',
+    current_contract_id        TEXT NOT NULL DEFAULT '',
+    parent_to_resume_contract_execution_id TEXT NOT NULL DEFAULT '',
+    active_child_contract_execution_id TEXT NOT NULL DEFAULT '',
+    readiness_state            TEXT NOT NULL DEFAULT '',
+    generation                 INTEGER NOT NULL DEFAULT 0,
+    projection_watermark       INTEGER NOT NULL DEFAULT 0,
+    projection_hash            TEXT NOT NULL DEFAULT '',
+    active_chain_json          TEXT NOT NULL DEFAULT '{}',
+    next_legal_action_json     TEXT NOT NULL DEFAULT '{}',
+    degraded_flags_json        TEXT NOT NULL DEFAULT '{}',
+    source_refs_json           TEXT NOT NULL DEFAULT '[]',
+    updated_at                 TEXT NOT NULL,
+    PRIMARY KEY (project_id, backlog_id)
+);
+CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_current_chain
+    ON backlog_contract_chain_current(project_id, contract_chain_id);
+"""
+
+
+DIRECT_FIX_CONTRACT_IDS = frozenset({"direct_fix", "direct_fix.v1"})
+MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v1"})
+DIRECT_FIX_QA_EVIDENCE_KINDS = frozenset(
+    {"independent_verification", "direct_fix_independent_qa"}
+)
+
+
+def ensure_contract_chain_mapping_schema(conn: sqlite3.Connection) -> None:
+    """Create durable backlog-to-contract-chain mapping tables."""
+
+    conn.executescript(CONTRACT_CHAIN_MAPPING_SCHEMA_SQL)
+
+
+def refresh_contract_chain_projection_for_record(
+    conn: sqlite3.Connection,
+    record: Mapping[str, Any],
+    *,
+    binding_kind: str = "",
+    edge_kind: str = "",
+) -> dict[str, Any]:
+    """Upsert mapping rows for one execution and rebuild its backlog current view."""
+
+    ensure_contract_chain_mapping_schema(conn)
+    _upsert_contract_chain_binding(
+        conn,
+        record,
+        binding_kind=binding_kind or _binding_kind_for_record(record),
+    )
+    if str(record.get("parent_contract_execution_id") or "").strip():
+        _upsert_contract_chain_edge(
+            conn,
+            record,
+            edge_kind=edge_kind or _edge_kind_for_record(record),
+        )
+    return rebuild_backlog_contract_chain_projection(
+        conn,
+        project_id=str(record.get("project_id") or ""),
+        backlog_id=str(record.get("backlog_id") or ""),
+    )
+
+
+def upsert_contract_chain_root_current_binding(
+    conn: sqlite3.Connection,
+    record: Mapping[str, Any],
+    *,
+    binding_kind: str = "root_current",
+) -> dict[str, Any]:
+    """Bind a root/service parent execution and refresh the current projection."""
+
+    return refresh_contract_chain_projection_for_record(
+        conn,
+        record,
+        binding_kind=binding_kind,
+    )
+
+
+def upsert_contract_chain_successor_binding(
+    conn: sqlite3.Connection,
+    *,
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+    edge_kind: str = "",
+    binding_kind: str = "successor_current",
+) -> dict[str, Any]:
+    """Bind a parent/child successor edge and refresh the current projection."""
+
+    _validate_successor_lineage(parent_record, child_record)
+    return refresh_contract_chain_projection_for_record(
+        conn,
+        child_record,
+        binding_kind=binding_kind,
+        edge_kind=edge_kind,
+    )
+
+
+def rebuild_backlog_contract_chain_projection(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Rebuild the current projection from durable ContractRuntime executions."""
+
+    project_id = str(project_id or "").strip()
+    backlog_id = str(backlog_id or "").strip()
+    if not project_id or not backlog_id:
+        return {}
+    ensure_contract_chain_mapping_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT record_json, created_at, updated_at
+        FROM contract_runtime_executions
+        WHERE project_id = ? AND backlog_id = ?
+        ORDER BY created_at ASC, updated_at ASC, contract_execution_id ASC
+        """,
+        (project_id, backlog_id),
+    ).fetchall()
+    records: list[dict[str, Any]] = []
+    row_times: dict[str, str] = {}
+    for row in rows:
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
+        record = _decode_record(raw)
+        execution_id = str(record.get("contract_execution_id") or "")
+        if not execution_id:
+            continue
+        records.append(record)
+        row_times[execution_id] = (
+            str(row["updated_at"] if isinstance(row, sqlite3.Row) else row[2])
+        )
+        _upsert_contract_chain_binding(
+            conn,
+            record,
+            binding_kind=_binding_kind_for_record(record),
+        )
+        if str(record.get("parent_contract_execution_id") or "").strip():
+            _upsert_contract_chain_edge(
+                conn,
+                record,
+                edge_kind=_edge_kind_for_record(record),
+            )
+
+    if not records:
+        conn.execute(
+            """
+            DELETE FROM backlog_contract_chain_current
+            WHERE project_id = ? AND backlog_id = ?
+            """,
+            (project_id, backlog_id),
+        )
+        return {}
+
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        chain_id = str(record.get("contract_chain_id") or "").strip()
+        if not chain_id:
+            chain_id = str(record.get("root_contract_execution_id") or "").strip()
+        if not chain_id:
+            chain_id = str(record.get("contract_execution_id") or "").strip()
+        chains.setdefault(chain_id, []).append(record)
+
+    active_chain_id = _select_active_chain_id(chains, row_times)
+    chain_records = chains.get(active_chain_id, [])
+    degraded_flags: dict[str, Any] = {}
+    if len(chains) > 1:
+        degraded_flags["multi_active_chains"] = sorted(chains)
+    if not active_chain_id:
+        degraded_flags["missing_contract_chain_id"] = True
+
+    root_record = _select_root_record(chain_records)
+    current = _project_current_contract_state(
+        chain_records,
+        root_record=root_record,
+        row_times=row_times,
+    )
+    watermark = _projection_watermark(conn, project_id, backlog_id)
+    active_chain = {
+        "schema_version": "backlog_contract_chain.active_chain.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_chain_id": active_chain_id,
+        "root_contract_execution_id": str(
+            root_record.get("contract_execution_id") if root_record else ""
+        ),
+        "execution_count": len(chain_records),
+        "execution_ids": [
+            str(record.get("contract_execution_id") or "")
+            for record in chain_records
+            if str(record.get("contract_execution_id") or "")
+        ],
+    }
+    source_refs = _projection_source_refs(chain_records)
+    projection_row = {
+        "schema_version": "backlog_contract_chain_current.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_chain_id": active_chain_id,
+        "root_contract_execution_id": active_chain["root_contract_execution_id"],
+        "current_contract_execution_id": current["current_contract_execution_id"],
+        "current_contract_id": current["current_contract_id"],
+        "parent_to_resume_contract_execution_id": current[
+            "parent_to_resume_contract_execution_id"
+        ],
+        "active_child_contract_execution_id": current[
+            "active_child_contract_execution_id"
+        ],
+        "readiness_state": current["readiness_state"],
+        "generation": current["generation"],
+        "projection_watermark": watermark,
+        "active_chain": active_chain,
+        "next_legal_action": current["next_legal_action"],
+        "degraded_flags": degraded_flags,
+        "source_refs": source_refs,
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+    }
+    projection_hash = stable_sha256(_projection_hash_payload(projection_row))
+    projection_row["projection_hash"] = projection_hash
+    conn.execute(
+        """
+        INSERT INTO backlog_contract_chain_current (
+            project_id,
+            backlog_id,
+            contract_chain_id,
+            root_contract_execution_id,
+            current_contract_execution_id,
+            current_contract_id,
+            parent_to_resume_contract_execution_id,
+            active_child_contract_execution_id,
+            readiness_state,
+            generation,
+            projection_watermark,
+            projection_hash,
+            active_chain_json,
+            next_legal_action_json,
+            degraded_flags_json,
+            source_refs_json,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, backlog_id) DO UPDATE SET
+            contract_chain_id = excluded.contract_chain_id,
+            root_contract_execution_id = excluded.root_contract_execution_id,
+            current_contract_execution_id = excluded.current_contract_execution_id,
+            current_contract_id = excluded.current_contract_id,
+            parent_to_resume_contract_execution_id = excluded.parent_to_resume_contract_execution_id,
+            active_child_contract_execution_id = excluded.active_child_contract_execution_id,
+            readiness_state = excluded.readiness_state,
+            generation = excluded.generation,
+            projection_watermark = excluded.projection_watermark,
+            projection_hash = excluded.projection_hash,
+            active_chain_json = excluded.active_chain_json,
+            next_legal_action_json = excluded.next_legal_action_json,
+            degraded_flags_json = excluded.degraded_flags_json,
+            source_refs_json = excluded.source_refs_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            project_id,
+            backlog_id,
+            active_chain_id,
+            projection_row["root_contract_execution_id"],
+            projection_row["current_contract_execution_id"],
+            projection_row["current_contract_id"],
+            projection_row["parent_to_resume_contract_execution_id"],
+            projection_row["active_child_contract_execution_id"],
+            projection_row["readiness_state"],
+            projection_row["generation"],
+            watermark,
+            projection_hash,
+            _record_json(active_chain),
+            _record_json(current["next_legal_action"]),
+            _record_json(degraded_flags),
+            json.dumps(source_refs, sort_keys=True, separators=(",", ":")),
+            _utc_now(),
+        ),
+    )
+    return read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+
+
+def read_backlog_contract_chain_current(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    rebuild_if_missing: bool = False,
+) -> dict[str, Any]:
+    """Read the onboard/runtime current projection for a backlog row."""
+
+    project_id = str(project_id or "").strip()
+    backlog_id = str(backlog_id or "").strip()
+    if not project_id or not backlog_id:
+        return {}
+    ensure_contract_chain_mapping_schema(conn)
+    row = conn.execute(
+        """
+        SELECT *
+        FROM backlog_contract_chain_current
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (project_id, backlog_id),
+    ).fetchone()
+    if row is None and rebuild_if_missing:
+        return rebuild_backlog_contract_chain_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    if row is None:
+        return {}
+    return _current_projection_from_row(row)
+
+
+def _upsert_contract_chain_binding(
+    conn: sqlite3.Connection,
+    record: Mapping[str, Any],
+    *,
+    binding_kind: str,
+) -> None:
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not project_id or not backlog_id or not execution_id:
+        return
+    revision = int(record.get("execution_state_revision") or 0)
+    source_hash = stable_sha256(_binding_hash_payload(record))
+    idempotency_key = stable_sha256(
+        {
+            "kind": binding_kind,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "execution_state_revision": revision,
+            "source_hash": source_hash,
+        }
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO backlog_contract_chain_bindings (
+            idempotency_key,
+            project_id,
+            backlog_id,
+            contract_chain_id,
+            root_contract_execution_id,
+            contract_execution_id,
+            parent_contract_execution_id,
+            contract_id,
+            binding_kind,
+            generation,
+            execution_state_revision,
+            source_ref,
+            source_hash,
+            degraded_flags_json,
+            metadata_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            idempotency_key,
+            project_id,
+            backlog_id,
+            str(record.get("contract_chain_id") or ""),
+            str(record.get("root_contract_execution_id") or ""),
+            execution_id,
+            str(record.get("parent_contract_execution_id") or ""),
+            str(record.get("contract_id") or ""),
+            binding_kind,
+            revision,
+            revision,
+            f"contract_runtime:{execution_id}:revision:{revision}",
+            source_hash,
+            "{}",
+            _record_json(_binding_metadata(record)),
+            _utc_now(),
+        ),
+    )
+
+
+def _upsert_contract_chain_edge(
+    conn: sqlite3.Connection,
+    record: Mapping[str, Any],
+    *,
+    edge_kind: str,
+) -> None:
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    parent_id = str(record.get("parent_contract_execution_id") or "").strip()
+    child_id = str(record.get("contract_execution_id") or "").strip()
+    chain_id = str(record.get("contract_chain_id") or "").strip()
+    if not project_id or not backlog_id or not parent_id or not child_id:
+        return
+    source_hash = stable_sha256(
+        {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_chain_id": chain_id,
+            "parent_contract_execution_id": parent_id,
+            "child_contract_execution_id": child_id,
+            "edge_kind": edge_kind,
+        }
+    )
+    edge_key = stable_sha256(
+        {
+            "project_id": project_id,
+            "contract_chain_id": chain_id,
+            "parent_contract_execution_id": parent_id,
+            "child_contract_execution_id": child_id,
+            "edge_kind": edge_kind,
+        }
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO contract_chain_edges (
+            edge_key,
+            project_id,
+            backlog_id,
+            contract_chain_id,
+            parent_contract_execution_id,
+            child_contract_execution_id,
+            root_contract_execution_id,
+            edge_kind,
+            generation,
+            source_ref,
+            source_hash,
+            metadata_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            edge_key,
+            project_id,
+            backlog_id,
+            chain_id,
+            parent_id,
+            child_id,
+            str(record.get("root_contract_execution_id") or ""),
+            edge_kind,
+            int(record.get("execution_state_revision") or 0),
+            f"contract_runtime:{child_id}",
+            source_hash,
+            _record_json(_binding_metadata(record)),
+            _utc_now(),
+        ),
+    )
+
+
+def _validate_successor_lineage(
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+) -> None:
+    parent_execution_id = str(
+        parent_record.get("contract_execution_id") or ""
+    ).strip()
+    child_execution_id = str(child_record.get("contract_execution_id") or "").strip()
+    if not parent_execution_id or not child_execution_id:
+        raise ContractRuntimeError("successor binding requires parent and child executions")
+    child_parent_id = str(
+        child_record.get("parent_contract_execution_id") or ""
+    ).strip()
+    if child_parent_id != parent_execution_id:
+        raise ContractRuntimeError(
+            "successor child parent_contract_execution_id does not match parent_record"
+        )
+    expected_root_id = str(
+        parent_record.get("root_contract_execution_id") or parent_execution_id
+    ).strip()
+    child_root_id = str(
+        child_record.get("root_contract_execution_id") or ""
+    ).strip()
+    if child_root_id != expected_root_id:
+        raise ContractRuntimeError(
+            "successor child root_contract_execution_id does not match parent lineage"
+        )
+    expected_chain_id = str(parent_record.get("contract_chain_id") or "").strip()
+    child_chain_id = str(child_record.get("contract_chain_id") or "").strip()
+    if expected_chain_id and child_chain_id != expected_chain_id:
+        raise ContractRuntimeError(
+            "successor child contract_chain_id does not match parent lineage"
+        )
+    parent_project_id = str(parent_record.get("project_id") or "").strip()
+    child_project_id = str(child_record.get("project_id") or "").strip()
+    if parent_project_id and child_project_id != parent_project_id:
+        raise ContractRuntimeError(
+            "successor child project_id does not match parent_record"
+        )
+    parent_backlog_id = str(parent_record.get("backlog_id") or "").strip()
+    child_backlog_id = str(child_record.get("backlog_id") or "").strip()
+    if parent_backlog_id and child_backlog_id != parent_backlog_id:
+        raise ContractRuntimeError(
+            "successor child backlog_id does not match parent_record"
+        )
+
+
+def _binding_kind_for_record(record: Mapping[str, Any]) -> str:
+    parent_id = str(record.get("parent_contract_execution_id") or "").strip()
+    contract_id = str(record.get("contract_id") or "").strip()
+    if not parent_id and contract_id == "onboard_route_guide":
+        return "onboard_service_root_current"
+    if not parent_id:
+        return "root_current"
+    if contract_id in DIRECT_FIX_CONTRACT_IDS:
+        return "direct_fix_child_current"
+    if contract_id in MF_PARALLEL_CONTRACT_IDS:
+        return "mf_parallel_child_current"
+    return "successor_current"
+
+
+def _edge_kind_for_record(record: Mapping[str, Any]) -> str:
+    contract_id = str(record.get("contract_id") or "").strip()
+    if contract_id in DIRECT_FIX_CONTRACT_IDS:
+        return "direct_fix_child"
+    if contract_id in MF_PARALLEL_CONTRACT_IDS:
+        return "mf_parallel_child"
+    if contract_id:
+        return f"{contract_id}_child"
+    return "successor_child"
+
+
+def _binding_hash_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "project_id": str(record.get("project_id") or ""),
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "contract_id": str(record.get("contract_id") or ""),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(
+            record.get("root_contract_execution_id") or ""
+        ),
+        "execution_state_revision": int(record.get("execution_state_revision") or 0),
+        "completed_line_count": len(record.get("completed_lines") or []),
+    }
+
+
+def _binding_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "route_token_ref_present": bool(str(record.get("route_token_ref") or "")),
+        "metadata": dict(record.get("metadata") or {})
+        if isinstance(record.get("metadata"), Mapping)
+        else {},
+        "backlog_lineage": dict(record.get("backlog_lineage") or {})
+        if isinstance(record.get("backlog_lineage"), Mapping)
+        else {},
+    }
+
+
+def _projection_watermark(
+    conn: sqlite3.Connection,
+    project_id: str,
+    backlog_id: str,
+) -> int:
+    row = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0)
+        FROM backlog_contract_chain_bindings
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (project_id, backlog_id),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row[0] if not isinstance(row, sqlite3.Row) else row[0] or 0)
+
+
+def _projection_hash_payload(projection_row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in projection_row.items()
+        if str(key) not in {"projection_hash", "projection_watermark", "updated_at"}
+    }
+
+
+def _select_active_chain_id(
+    chains: Mapping[str, list[dict[str, Any]]],
+    row_times: Mapping[str, str],
+) -> str:
+    best_id = ""
+    best_key: tuple[str, int, str] = ("", -1, "")
+    for chain_id, records in chains.items():
+        latest_time = ""
+        latest_revision = 0
+        latest_execution = ""
+        for record in records:
+            execution_id = str(record.get("contract_execution_id") or "")
+            latest_time = max(latest_time, str(row_times.get(execution_id) or ""))
+            latest_revision = max(
+                latest_revision,
+                int(record.get("execution_state_revision") or 0),
+            )
+            latest_execution = max(latest_execution, execution_id)
+        key = (latest_time, latest_revision, latest_execution)
+        if key > best_key:
+            best_key = key
+            best_id = chain_id
+    return best_id
+
+
+def _select_root_record(records: list[dict[str, Any]]) -> dict[str, Any]:
+    for record in records:
+        execution_id = str(record.get("contract_execution_id") or "")
+        parent_id = str(record.get("parent_contract_execution_id") or "")
+        root_id = str(record.get("root_contract_execution_id") or "")
+        if not parent_id and (not root_id or root_id == execution_id):
+            return record
+    return records[0] if records else {}
+
+
+def _project_current_contract_state(
+    records: list[dict[str, Any]],
+    *,
+    root_record: Mapping[str, Any],
+    row_times: Mapping[str, str],
+) -> dict[str, Any]:
+    if not records:
+        return _empty_projected_state("missing_contract_runtime_execution")
+    direct_fix = _latest_record(
+        [
+            record
+            for record in records
+            if _record_contract_id(record) in DIRECT_FIX_CONTRACT_IDS
+        ],
+        row_times=row_times,
+    )
+    if direct_fix:
+        direct_state = _project_direct_fix_state(direct_fix, root_record=root_record)
+        if direct_state:
+            if direct_state.get("readiness_state") == (
+                "parent_resume_required_after_direct_fix_qa"
+            ):
+                later_successor = _latest_record(
+                    [
+                        record
+                        for record in records
+                        if _record_contract_id(record) not in DIRECT_FIX_CONTRACT_IDS
+                        and str(record.get("parent_contract_execution_id") or "").strip()
+                        and _record_order_key(record, row_times=row_times)
+                        > _record_order_key(direct_fix, row_times=row_times)
+                    ],
+                    row_times=row_times,
+                )
+                if later_successor:
+                    return _project_record_state(later_successor)
+            return direct_state
+    incomplete = [
+        record
+        for record in records
+        if not _record_is_complete(record)
+    ]
+    incomplete_children = [
+        record
+        for record in incomplete
+        if str(record.get("parent_contract_execution_id") or "").strip()
+    ]
+    current_record = _latest_record(
+        incomplete_children or incomplete or records,
+        row_times=row_times,
+    )
+    if not current_record:
+        return _empty_projected_state("missing_contract_runtime_execution")
+    return _project_record_state(current_record)
+
+
+def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
+    current_id = str(record.get("contract_execution_id") or "")
+    current_contract_id = _record_contract_id(record)
+    next_action = _next_action_from_record(record)
+    readiness = "contract_complete" if _record_is_complete(record) else "contract_active"
+    return {
+        "current_contract_execution_id": current_id,
+        "current_contract_id": current_contract_id,
+        "parent_to_resume_contract_execution_id": "",
+        "active_child_contract_execution_id": (
+            current_id if str(record.get("parent_contract_execution_id") or "") else ""
+        ),
+        "readiness_state": readiness,
+        "generation": int(record.get("execution_state_revision") or 0),
+        "next_legal_action": next_action,
+    }
+
+
+def _project_direct_fix_state(
+    child: Mapping[str, Any],
+    *,
+    root_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_id = str(child.get("contract_execution_id") or "")
+    parent_id = str(child.get("parent_contract_execution_id") or "")
+    generation = int(child.get("execution_state_revision") or 0)
+    if not child_id:
+        return {}
+    repair_line = _find_completed_line(
+        child,
+        line_ids={"direct_fix_candidate_repair"},
+        evidence_kinds={"direct_fix_repair_evidence"},
+    )
+    qa_line = _find_direct_fix_qa_line(child, generation=generation)
+    return_line = _find_completed_line(
+        child,
+        line_ids={"direct_fix_return_to_parent"},
+        evidence_kinds={"direct_fix_return_to_parent"},
+    )
+    if return_line and qa_line:
+        return {
+            "current_contract_execution_id": parent_id
+            or str(root_record.get("contract_execution_id") or ""),
+            "current_contract_id": _record_contract_id(root_record),
+            "parent_to_resume_contract_execution_id": parent_id,
+            "active_child_contract_execution_id": "",
+            "readiness_state": "parent_resume_required_after_direct_fix_qa",
+            "generation": generation,
+            "next_legal_action": _parent_resume_next_action(
+                child,
+                parent_id=parent_id,
+                generation=generation,
+                return_line=return_line,
+            ),
+        }
+    if qa_line:
+        return {
+            "current_contract_execution_id": child_id,
+            "current_contract_id": _record_contract_id(child),
+            "parent_to_resume_contract_execution_id": parent_id,
+            "active_child_contract_execution_id": child_id,
+            "readiness_state": "return_to_parent_after_direct_fix_qa",
+            "generation": generation,
+            "next_legal_action": _direct_fix_return_next_action(
+                child,
+                parent_id=parent_id,
+                generation=generation,
+                qa_line=qa_line,
+            ),
+        }
+    if repair_line:
+        return {
+            "current_contract_execution_id": child_id,
+            "current_contract_id": _record_contract_id(child),
+            "parent_to_resume_contract_execution_id": parent_id,
+            "active_child_contract_execution_id": child_id,
+            "readiness_state": "direct_fix_complete_awaiting_independent_qa",
+            "generation": generation,
+            "next_legal_action": _direct_fix_qa_next_action(
+                child,
+                generation=generation,
+                repair_line=repair_line,
+            ),
+        }
+    return {
+        "current_contract_execution_id": child_id,
+        "current_contract_id": _record_contract_id(child),
+        "parent_to_resume_contract_execution_id": "",
+        "active_child_contract_execution_id": child_id,
+        "readiness_state": "direct_fix_child_active",
+        "generation": generation,
+        "next_legal_action": _next_action_from_record(child),
+    }
+
+
+def _empty_projected_state(readiness_state: str) -> dict[str, Any]:
+    return {
+        "current_contract_execution_id": "",
+        "current_contract_id": "",
+        "parent_to_resume_contract_execution_id": "",
+        "active_child_contract_execution_id": "",
+        "readiness_state": readiness_state,
+        "generation": 0,
+        "next_legal_action": {},
+    }
+
+
+def _latest_record(
+    records: list[dict[str, Any]],
+    *,
+    row_times: Mapping[str, str],
+) -> dict[str, Any]:
+    if not records:
+        return {}
+    return max(
+        records,
+        key=lambda record: _record_order_key(record, row_times=row_times),
+    )
+
+
+def _record_order_key(
+    record: Mapping[str, Any],
+    *,
+    row_times: Mapping[str, str],
+) -> tuple[str, str, int]:
+    execution_id = str(record.get("contract_execution_id") or "")
+    return (
+        str(row_times.get(execution_id) or ""),
+        execution_id,
+        int(record.get("execution_state_revision") or 0),
+    )
+
+
+def _record_contract_id(record: Mapping[str, Any]) -> str:
+    return str(record.get("contract_id") or "").strip()
+
+
+def _record_is_complete(record: Mapping[str, Any]) -> bool:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    return guide.get("next_legal_action") is None
+
+
+def _next_action_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = guide.get("next_legal_action")
+    if not isinstance(next_line, Mapping):
+        return {}
+    evidence_kind = str(next_line.get("evidence_kind") or "")
+    line_id = str(next_line.get("line_id") or "")
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": line_id,
+        "action": str(next_line.get("action") or "").strip()
+        or (f"record_{evidence_kind}" if evidence_kind else "record_contract_line"),
+        "source": "backlog_contract_chain_current",
+        "precedence": "contract_runtime_first_missing_line",
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(record.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+        "contract_id": _record_contract_id(record),
+        "stage_id": str(next_line.get("stage_id") or ""),
+        "line_id": line_id,
+        "owner_role": str(next_line.get("owner_role") or ""),
+        "allowed_writer_roles": list(next_line.get("allowed_writer_roles") or []),
+        "evidence_kind": evidence_kind,
+        "execution_state_revision": int(record.get("execution_state_revision") or 0),
+        "route_token_ref": str(record.get("route_token_ref") or ""),
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _find_completed_line(
+    record: Mapping[str, Any],
+    *,
+    line_ids: set[str],
+    evidence_kinds: set[str],
+) -> dict[str, Any]:
+    lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    for index, line in reversed(list(enumerate(lines))):
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "")
+        evidence_kind = str(line.get("evidence_kind") or "")
+        if line_id in line_ids or evidence_kind in evidence_kinds:
+            enriched = dict(line)
+            enriched["_completed_line_index"] = index
+            return enriched
+    return {}
+
+
+def _find_direct_fix_qa_line(
+    record: Mapping[str, Any],
+    *,
+    generation: int,
+) -> dict[str, Any]:
+    lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    execution_id = str(record.get("contract_execution_id") or "")
+    for index, line in reversed(list(enumerate(lines))):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("actor_role") or "").strip() != "qa":
+            continue
+        if str(line.get("evidence_kind") or "").strip() not in DIRECT_FIX_QA_EVIDENCE_KINDS:
+            continue
+        if not _line_status_allows_direct_fix_qa(line):
+            continue
+        if not _line_scope_matches_direct_fix_child(
+            line,
+            contract_execution_id=execution_id,
+            generation=generation,
+        ):
+            continue
+        enriched = dict(line)
+        enriched["_completed_line_index"] = index
+        enriched["_source_ref"] = f"contract_runtime:{execution_id}:completed_lines:{index}"
+        return enriched
+    return {}
+
+
+def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
+    candidates = [line]
+    for key in ("payload", "verification", "artifact_refs"):
+        value = line.get(key)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    for candidate in candidates:
+        status = (
+            str(candidate.get("status") or candidate.get("verdict") or "")
+            .strip()
+            .lower()
+        )
+        if status in {"fail", "failed", "failure", "rejected", "blocked"}:
+            return False
+    return True
+
+
+def _line_scope_matches_direct_fix_child(
+    line: Mapping[str, Any],
+    *,
+    contract_execution_id: str,
+    generation: int,
+) -> bool:
+    evidence_scope = _line_evidence_scope(line)
+    execution_refs = set(
+        _deep_text_values(
+            evidence_scope,
+            {
+                "contract_execution_id",
+                "direct_fix_contract_execution_id",
+                "child_contract_execution_id",
+                "successor_contract_execution_id",
+            },
+        )
+    )
+    if contract_execution_id not in execution_refs:
+        return False
+    generation_refs = set(
+        _deep_text_values(
+            evidence_scope,
+            {
+                "generation",
+                "projection_generation",
+                "execution_state_revision",
+            },
+        )
+    )
+    if not generation_refs or not _generation_refs_allow_current(
+        generation_refs,
+        generation=generation,
+    ):
+        return False
+    source_refs = set(
+        _deep_text_values(
+            evidence_scope,
+            {
+                "source_ref",
+                "source_refs",
+                "artifact_ref",
+                "evidence_ref",
+                "evidence_refs",
+                "repair_evidence_ref",
+                "repair_evidence_refs",
+                "source_evidence_ref",
+                "source_evidence_refs",
+            },
+        )
+    )
+    source_refs.update(_top_level_artifact_ref_values(line))
+    if not source_refs:
+        return False
+    return True
+
+
+def _line_evidence_scope(line: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key in ("payload", "verification", "artifact_refs")
+        if (value := line.get(key)) is not None
+    }
+
+
+def _generation_refs_allow_current(
+    generation_refs: set[str],
+    *,
+    generation: int,
+) -> bool:
+    for ref in generation_refs:
+        try:
+            value = int(str(ref).strip())
+        except ValueError:
+            continue
+        if 0 < value <= generation:
+            return True
+    return False
+
+
+def _top_level_artifact_ref_values(line: Mapping[str, Any]) -> list[str]:
+    artifact_refs = line.get("artifact_refs")
+    if isinstance(artifact_refs, list) or isinstance(artifact_refs, str):
+        return _flatten_text_values(artifact_refs)
+    return []
+
+
+def _flatten_text_values(value: Any, *, depth: int = 0) -> list[str]:
+    if depth > 6:
+        return []
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for child in value.values():
+            values.extend(_flatten_text_values(child, depth=depth + 1))
+        return values
+    if isinstance(value, list):
+        values = []
+        for child in value:
+            values.extend(_flatten_text_values(child, depth=depth + 1))
+        return values
+    if isinstance(value, (str, int, float, bool)):
+        text = str(value).strip()
+        return [text] if text else []
+    return []
+
+
+def _deep_text_values(value: Any, keys: set[str], *, depth: int = 0) -> list[str]:
+    if depth > 6:
+        return []
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text in keys:
+                values.extend(_flatten_text_values(child, depth=depth + 1))
+            values.extend(_deep_text_values(child, keys, depth=depth + 1))
+    elif isinstance(value, list):
+        for child in value:
+            values.extend(_deep_text_values(child, keys, depth=depth + 1))
+    return values
+
+
+def _direct_fix_qa_next_action(
+    child: Mapping[str, Any],
+    *,
+    generation: int,
+    repair_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_id = str(child.get("contract_execution_id") or "")
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "qa_independent_verification",
+        "action": "record_direct_fix_independent_qa",
+        "source": "backlog_contract_chain_current",
+        "precedence": "direct_fix_qa_gate",
+        "role": "qa",
+        "work_type": "qa_verification",
+        "contract_execution_id": child_id,
+        "parent_contract_execution_id": str(
+            child.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(child.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(child.get("contract_chain_id") or ""),
+        "contract_id": _record_contract_id(child),
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "required": True,
+        "required_binding": {
+            "contract_execution_id": child_id,
+            "generation": generation,
+            "source_ref": f"contract_runtime:{child_id}:completed_lines:{repair_line.get('_completed_line_index', '')}",
+        },
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _direct_fix_return_next_action(
+    child: Mapping[str, Any],
+    *,
+    parent_id: str,
+    generation: int,
+    qa_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_id = str(child.get("contract_execution_id") or "")
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "return_to_parent_after_direct_fix_qa",
+        "action": "record_direct_fix_return_to_parent",
+        "source": "backlog_contract_chain_current",
+        "precedence": "direct_fix_independent_qa_passed",
+        "role": "observer",
+        "contract_execution_id": child_id,
+        "parent_contract_execution_id": parent_id,
+        "root_contract_execution_id": str(child.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(child.get("contract_chain_id") or ""),
+        "contract_id": _record_contract_id(child),
+        "stage_id": "return_to_parent",
+        "line_id": "direct_fix_return_to_parent",
+        "evidence_kind": "direct_fix_return_to_parent",
+        "required": True,
+        "qa_evidence_ref": qa_line.get("_source_ref", ""),
+        "generation": generation,
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _parent_resume_next_action(
+    child: Mapping[str, Any],
+    *,
+    parent_id: str,
+    generation: int,
+    return_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_id = str(child.get("contract_execution_id") or "")
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "resume_parent_after_successor_return",
+        "action": "resume_parent_after_successor_return",
+        "source": "backlog_contract_chain_current",
+        "precedence": "direct_fix_return_recorded",
+        "contract_execution_id": parent_id,
+        "successor_contract_execution_id": child_id,
+        "parent_contract_execution_id": parent_id,
+        "root_contract_execution_id": str(child.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(child.get("contract_chain_id") or ""),
+        "stage_id": "parent_resume",
+        "line_id": "resume_parent_after_successor_return",
+        "evidence_kind": "parent_recheck_after_direct_fix_qa",
+        "parent_close_gate_recheck_required": True,
+        "child_must_not_write_parent_close_evidence": True,
+        "return_line_ref": f"contract_runtime:{child_id}:completed_lines:{return_line.get('_completed_line_index', '')}",
+        "generation": generation,
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _projection_source_refs(records: list[dict[str, Any]]) -> list[str]:
+    refs: list[str] = []
+    for record in records:
+        execution_id = str(record.get("contract_execution_id") or "")
+        if not execution_id:
+            continue
+        refs.append(
+            f"contract_runtime:{execution_id}:revision:{int(record.get('execution_state_revision') or 0)}"
+        )
+    return refs
+
+
+def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+    data = dict(row) if isinstance(row, sqlite3.Row) else {}
+    if not data:
+        return {}
+    degraded_flags = _json_field(data.get("degraded_flags_json"), {})
+    next_legal_action = _json_field(data.get("next_legal_action_json"), {})
+    active_chain = _json_field(data.get("active_chain_json"), {})
+    source_refs = _json_field(data.get("source_refs_json"), [])
+    return {
+        "schema_version": "backlog_contract_chain_current.v1",
+        "project_id": str(data.get("project_id") or ""),
+        "backlog_id": str(data.get("backlog_id") or ""),
+        "contract_chain_id": str(data.get("contract_chain_id") or ""),
+        "active_chain": active_chain if isinstance(active_chain, dict) else {},
+        "root_contract_execution_id": str(
+            data.get("root_contract_execution_id") or ""
+        ),
+        "current_contract_execution_id": str(
+            data.get("current_contract_execution_id") or ""
+        ),
+        "current_contract_id": str(data.get("current_contract_id") or ""),
+        "parent_to_resume_contract_execution_id": str(
+            data.get("parent_to_resume_contract_execution_id") or ""
+        ),
+        "active_child_contract_execution_id": str(
+            data.get("active_child_contract_execution_id") or ""
+        ),
+        "readiness_state": str(data.get("readiness_state") or ""),
+        "generation": int(data.get("generation") or 0),
+        "next_legal_action": (
+            next_legal_action if isinstance(next_legal_action, dict) else {}
+        ),
+        "projection_watermark": int(data.get("projection_watermark") or 0),
+        "projection_hash": str(data.get("projection_hash") or ""),
+        "degraded_flags": degraded_flags if isinstance(degraded_flags, dict) else {},
+        "degraded": bool(degraded_flags),
+        "source_refs": source_refs if isinstance(source_refs, list) else [],
+        "updated_at": str(data.get("updated_at") or ""),
+        "projection_source": "backlog_contract_chain_current",
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+    }
+
+
+def _json_field(raw: Any, fallback: Any) -> Any:
+    try:
+        value = json.loads(str(raw or ""))
+    except json.JSONDecodeError:
+        return fallback
+    return value
 
 
 class ContractRuntime:
@@ -826,6 +2083,7 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "worker_slot_id",
     "worker_id",
     "payload",
+    "verification",
     "artifact_refs",
     "trace_id",
     "commit_sha",

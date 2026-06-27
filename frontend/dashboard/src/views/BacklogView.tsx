@@ -969,6 +969,7 @@ function BacklogDetailSummary({
   const related = relatedIdsFromBug(bug, []);
   const ledgerNextAction = taskPlaybackCompactLedgerNextActionLabel(compactLedgerRow?.next_legal_action);
   const ledgerBlocked = ledgerRowBlocked(compactLedgerRow);
+  const ledgerProjectionStatus = compactLedgerProjectionReadiness(compactLedgerRow);
   return (
     <div className="backlog-modal-summary">
       <SummaryItem label="Priority" value={normalizePriority(bug.priority)} tone={priorityTone(bug.priority)} />
@@ -977,6 +978,9 @@ function BacklogDetailSummary({
       {compactLedgerRow ? (
         <>
           <SummaryItem label="Contract exec" value={compactLedgerRow.contract_execution_id || "none"} mono />
+          <SummaryItem label="Chain" value={compactLedgerRow.contract_chain_id || "none"} mono />
+          <SummaryItem label="Current contract" value={compactLedgerCurrentContractLabel(compactLedgerRow)} mono />
+          <SummaryItem label="Ledger projection" value={ledgerProjectionStatus} tone={compactLedgerProjectionTone(compactLedgerRow)} />
           <SummaryItem label="Readiness" value={compactLedgerRow.readiness_state || "unknown"} tone={ledgerBlocked ? "status-failed" : compactLedgerRow.readiness_state === "close_ready" ? "status-complete" : "status-pending"} />
           <SummaryItem label="Latest event" value={compactLedgerRow.latest_event_id ? `${compactLedgerRow.latest_event_id} ${compactLedgerRow.latest_event_kind || ""}`.trim() : "none"} mono />
         </>
@@ -1019,6 +1023,7 @@ function CompactLedgerPanel({
   const nextAction = taskPlaybackCompactLedgerNextActionLabel(row?.next_legal_action);
   const blocker = taskPlaybackCompactLedgerBlockerLabel(row?.blocker_summary);
   const payloadRef = row?.latest_payload_ref;
+  const projectionStatus = compactLedgerProjectionReadiness(row);
   return (
     <div className="backlog-modal-section">
       <div className="backlog-modal-section-head">
@@ -1038,11 +1043,27 @@ function CompactLedgerPanel({
             </div>
             <div className="backlog-gate-facts">
               {row.contract_execution_id ? <span className="mono">{row.contract_execution_id}</span> : null}
+              {row.contract_chain_id ? <span className="mono">{row.contract_chain_id}</span> : null}
               {row.status ? <span>{row.status}</span> : null}
               {row.priority ? <span>{row.priority}</span> : null}
               {row.head_commit || row.commit ? <span className="mono">{shortCommit(row.head_commit || row.commit)}</span> : null}
             </div>
             <TokenList label="ledger refs" values={refs.map((ref) => `${ref.label}: ${ref.value}`)} empty="none" />
+          </div>
+
+          <div className={`backlog-gate-card ${compactLedgerProjectionCardTone(row)}`}>
+            <div className="backlog-gate-title">
+              <span>Current chain</span>
+              <span className={`status-badge ${compactLedgerProjectionTone(row)}`}>{projectionStatus}</span>
+            </div>
+            <div className="backlog-gate-facts">
+              {row.current_contract_id ? <span>{row.current_contract_id}</span> : null}
+              {row.current_contract_execution_id ? <span className="mono">{row.current_contract_execution_id}</span> : null}
+              {row.projection_watermark != null ? <span className="mono">{shortProjectionWatermark(row.projection_watermark)}</span> : null}
+              {row.projection_generation != null ? <span>generation {row.projection_generation}</span> : null}
+            </div>
+            <TokenList label="lineage" values={compactLedgerChainValues(row)} empty="none" />
+            <TokenList label="projection" values={compactLedgerProjectionValues(row)} empty="none" tone={row.projection_degraded ? "red" : "green"} />
           </div>
 
           <div className={`backlog-gate-card ${nextAction ? "neutral" : "fail"}`}>
@@ -1112,11 +1133,67 @@ function ledgerRowBlocked(row?: TaskPlaybackCompactLedgerRow | null): boolean {
   return [
     row.readiness_state,
     row.latest_status,
+    row.projection_degraded ? "projection_degraded" : "",
     row.blocker_summary.kind,
     row.blocker_summary.summary,
     row.blocker_summary.reason,
     row.blocker_summary.keys.join(" "),
   ].join(" ").toLowerCase().includes("block");
+}
+
+function compactLedgerCurrentContractLabel(row?: TaskPlaybackCompactLedgerRow | null): string {
+  if (!row) return "none";
+  return row.current_contract_execution_id || row.contract_execution_id || row.current_contract_id || "none";
+}
+
+function compactLedgerProjectionReadiness(row?: TaskPlaybackCompactLedgerRow | null): string {
+  if (!row) return "not loaded";
+  if (row.projection_degraded) return "degraded";
+  if (row.projection_hash && row.projection_watermark != null) return "ready";
+  if (row.projection_hash || row.projection_watermark != null || row.projection_generation != null) return "partial";
+  return "missing";
+}
+
+function compactLedgerProjectionTone(row?: TaskPlaybackCompactLedgerRow | null): string {
+  const status = compactLedgerProjectionReadiness(row);
+  if (status === "ready") return "status-complete";
+  if (status === "degraded" || status === "missing") return "status-failed";
+  if (status === "partial") return "status-running";
+  return "status-unknown";
+}
+
+function compactLedgerProjectionCardTone(row?: TaskPlaybackCompactLedgerRow | null): string {
+  const status = compactLedgerProjectionReadiness(row);
+  if (status === "ready") return "pass";
+  if (status === "degraded" || status === "missing") return "fail";
+  return "neutral";
+}
+
+function compactLedgerChainValues(row: TaskPlaybackCompactLedgerRow): string[] {
+  return [
+    row.contract_chain_id ? `chain ${row.contract_chain_id}` : "",
+    row.root_contract_execution_id ? `root ${row.root_contract_execution_id}` : "",
+    row.current_contract_execution_id ? `current ${row.current_contract_execution_id}` : "",
+    row.parent_to_resume_contract_execution_id ? `resume ${row.parent_to_resume_contract_execution_id}` : "",
+    row.active_child_contract_execution_id ? `child ${row.active_child_contract_execution_id}` : "",
+  ].filter((value): value is string => Boolean(value));
+}
+
+function compactLedgerProjectionValues(row: TaskPlaybackCompactLedgerRow): string[] {
+  return [
+    row.projection_generation != null ? `generation ${row.projection_generation}` : "",
+    row.projection_watermark != null ? `watermark ${shortProjectionWatermark(row.projection_watermark)}` : "",
+    row.projection_hash ? `hash ${shortProjectionWatermark(row.projection_hash)}` : "",
+    row.projection_degraded ? "degraded" : "not degraded",
+    ...compactLedgerProjectionFlagValues(row.projection_degraded_flags),
+  ].filter((value): value is string => Boolean(value));
+}
+
+function compactLedgerProjectionFlagValues(flags: Record<string, unknown>): string[] {
+  return Object.entries(flags)
+    .filter(([, value]) => Boolean(value))
+    .slice(0, 6)
+    .map(([key, value]) => `${compactProjectionReason(key)}: ${compactUnknown(value)}`);
 }
 
 function ledgerTone(row?: TaskPlaybackCompactLedgerRow | null): string {
