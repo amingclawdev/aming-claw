@@ -39308,6 +39308,10 @@ def handle_task_timeline_list(ctx: RequestContext):
     correlation_id = _first_query_value(ctx.query, "correlation_id")
     severity = _first_query_value(ctx.query, "severity")
     decision = _first_query_value(ctx.query, "decision")
+    include_compact_ledger = _truthy_flag(
+        _first_query_value(ctx.query, "include_compact_ledger")
+        or _first_query_value(ctx.query, "compact_ledger")
+    )
     try:
         parent_event_id = int(_first_query_value(ctx.query, "parent_event_id", "0") or "0")
     except (TypeError, ValueError):
@@ -39334,7 +39338,12 @@ def handle_task_timeline_list(ctx: RequestContext):
             parent_event_id=parent_event_id,
             limit=limit,
         )
-    return {
+        compact_ledger = (
+            task_timeline.build_compact_ledger(conn, project_id, events)
+            if include_compact_ledger
+            else None
+        )
+    response = {
         "ok": True,
         "project_id": project_id,
         "task_id": task_id,
@@ -39350,6 +39359,9 @@ def handle_task_timeline_list(ctx: RequestContext):
         "events": events,
         "count": len(events),
     }
+    if compact_ledger is not None:
+        response["compact_ledger"] = compact_ledger
+    return response
 
 
 @route("GET", "/api/task/{project_id}/timeline/recent")

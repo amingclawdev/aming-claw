@@ -12761,6 +12761,204 @@ def list_events(
     return [_row_to_dict(row) for row in rows]
 
 
+def _compact_payload_ref(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        "event_id": int(event.get("id") or 0),
+        "payload_sha256": "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "payload_bytes": len(raw.encode("utf-8")),
+    }
+
+
+def _compact_next_legal_action(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: str(value.get(key) or "")
+        for key in ("id", "action", "stage_id", "line_id", "owner_role")
+        if value.get(key) is not None
+    }
+
+
+def _compact_backlog_rows(
+    conn: sqlite3.Connection,
+    backlog_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    if not backlog_ids:
+        return {}
+    placeholders = ",".join("?" for _ in backlog_ids)
+    rows = conn.execute(
+        f"""
+        SELECT bug_id, title, status, priority, "commit"
+        FROM backlog_bugs
+        WHERE bug_id IN ({placeholders})
+        """,
+        tuple(sorted(backlog_ids)),
+    ).fetchall()
+    return {str(row["bug_id"] or ""): dict(row) for row in rows}
+
+
+def _compact_ledger_backlog_ids(event: Mapping[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    backlog_id = str(event.get("backlog_id") or "").strip()
+    if backlog_id:
+        ids.add(backlog_id)
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    for key in ("backlog_ids", "reviewed_rows"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            ids.update(str(value).strip() for value in values if str(value or "").strip())
+    merge_queue_plan = payload.get("merge_queue_plan")
+    if isinstance(merge_queue_plan, Mapping):
+        for item in merge_queue_plan.get("planned_items") or []:
+            if isinstance(item, Mapping):
+                item_backlog_id = str(item.get("backlog_id") or "").strip()
+                if item_backlog_id:
+                    ids.add(item_backlog_id)
+    return ids
+
+
+def build_compact_ledger(
+    conn: sqlite3.Connection,
+    project_id: str,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a row-sized multi-backlog ledger from structured runtime evidence."""
+    backlog_ids: set[str] = set()
+    for event in events:
+        backlog_ids.update(_compact_ledger_backlog_ids(event))
+    backlog_rows = _compact_backlog_rows(conn, backlog_ids)
+    ledger: dict[str, dict[str, Any]] = {}
+
+    def ensure(backlog_id: str) -> dict[str, Any]:
+        row = backlog_rows.get(backlog_id, {})
+        return ledger.setdefault(
+            backlog_id,
+            {
+                "backlog_id": backlog_id,
+                "title": str(row.get("title") or ""),
+                "priority": str(row.get("priority") or ""),
+                "status": str(row.get("status") or ""),
+                "commit": str(row.get("commit") or ""),
+                "contract_execution_id": "",
+                "merge_queue_id": "",
+                "merge_queue_index": 0,
+                "merge_queue_item_id": "",
+                "merge_queue_task_id": "",
+                "latest_event_id": 0,
+                "latest_event_kind": "",
+                "latest_event_type": "",
+                "latest_status": "",
+                "latest_payload_ref": {},
+                "next_legal_action": {},
+                "blocker_summary": {},
+                "head_commit": "",
+                "readiness_state": "unknown",
+            },
+        )
+
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        payload_ref = _compact_payload_ref(event)
+        event_backlog_ids = _compact_ledger_backlog_ids(event)
+        merge_queue_plan = payload.get("merge_queue_plan")
+        if isinstance(merge_queue_plan, Mapping):
+            for item in merge_queue_plan.get("planned_items") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                item_backlog_id = str(item.get("backlog_id") or "").strip()
+                if not item_backlog_id:
+                    continue
+                row = ensure(item_backlog_id)
+                row["merge_queue_id"] = str(
+                    item.get("merge_queue_id") or merge_queue_plan.get("merge_queue_id") or ""
+                )
+                row["merge_queue_index"] = int(item.get("queue_index") or 0)
+                row["merge_queue_item_id"] = str(item.get("queue_item_id") or "")
+                row["merge_queue_task_id"] = str(item.get("task_id") or "")
+
+        for backlog_id in event_backlog_ids:
+            row = ensure(backlog_id)
+            event_id = int(event.get("id") or 0)
+            if event_id < int(row.get("latest_event_id") or 0):
+                continue
+            row["latest_event_id"] = event_id
+            row["latest_event_kind"] = str(event.get("event_kind") or "")
+            row["latest_event_type"] = str(event.get("event_type") or "")
+            row["latest_status"] = str(event.get("status") or "")
+            row["latest_payload_ref"] = payload_ref
+            row["contract_execution_id"] = (
+                _first_deep_text(payload, "contract_execution_id")
+                or _first_deep_text(payload, "root_contract_execution_id")
+                or row["contract_execution_id"]
+            )
+            next_legal_action = _compact_next_legal_action(
+                _first_deep_value(payload, "next_legal_action")
+            )
+            if next_legal_action:
+                row["next_legal_action"] = next_legal_action
+            blockers = _first_deep_value(payload, "blockers")
+            blocker_evidence = _first_deep_value(payload, "blocker_evidence")
+            if isinstance(blockers, list) and blockers:
+                row["blocker_summary"] = {"kind": "blockers", "count": len(blockers)}
+            elif isinstance(blocker_evidence, Mapping) and blocker_evidence:
+                row["blocker_summary"] = {
+                    "kind": "blocker_evidence",
+                    "keys": sorted(str(key) for key in blocker_evidence.keys())[:8],
+                }
+            head_commit = (
+                str(event.get("commit_sha") or "")
+                or _first_deep_text(payload, "target_head_commit")
+                or _first_deep_text(payload, "head_commit")
+            )
+            if head_commit:
+                row["head_commit"] = head_commit
+            status = str(event.get("status") or "").lower()
+            kind = str(event.get("event_kind") or "").lower()
+            if status in {"blocked", "failed", "error"} or row["blocker_summary"]:
+                row["readiness_state"] = "blocked"
+            elif kind == "close_ready":
+                row["readiness_state"] = "close_ready"
+            elif kind in {"verification", "reconcile"} and status in {
+                "passed",
+                "accepted",
+                "succeeded",
+                "ok",
+            }:
+                row["readiness_state"] = "verified"
+            elif kind == "implementation" and status in {"passed", "accepted", "ok"}:
+                row["readiness_state"] = "implemented"
+            elif row["merge_queue_id"]:
+                row["readiness_state"] = "planned"
+
+    rows = sorted(
+        ledger.values(),
+        key=lambda row: (
+            _priority_sort_key(row.get("priority")),
+            int(row.get("merge_queue_index") or 1_000_000),
+            str(row.get("backlog_id") or ""),
+        ),
+    )
+    return {
+        "schema_version": "task_timeline.compact_multi_backlog_ledger.v1",
+        "project_id": project_id,
+        "row_count": len(rows),
+        "source_event_count": len(events),
+        "rows": rows,
+    }
+
+
+def _priority_sort_key(priority: Any) -> int:
+    text = str(priority or "").strip().upper()
+    if text.startswith("P"):
+        try:
+            return int(text[1:])
+        except ValueError:
+            return 99
+    return 99
+
+
 def list_backlog_gate_events(
     conn: sqlite3.Connection,
     project_id: str,

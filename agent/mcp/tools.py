@@ -65,6 +65,10 @@ def _task_timeline_query(args: dict) -> dict:
         query["parent_event_id"] = str(_int_arg(args, "parent_event_id", 0, minimum=1, maximum=1_000_000_000))
     if args.get("limit"):
         query["limit"] = str(_int_arg(args, "limit", 200, minimum=1, maximum=1000))
+    if args.get("include_compact_ledger") is not None:
+        query["include_compact_ledger"] = (
+            "true" if args.get("include_compact_ledger") else "false"
+        )
     return query
 
 
@@ -1050,6 +1054,10 @@ TOOLS: list[dict] = [
                 "decision": {"type": "string"},
                 "parent_event_id": {"type": "integer"},
                 "limit": {"type": "integer", "description": "Maximum events to return, default 200, max 1000"},
+                "include_compact_ledger": {
+                    "type": "boolean",
+                    "description": "Include a compact multi-backlog ledger alongside raw events.",
+                },
             },
             "required": ["project_id"],
         },

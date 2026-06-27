@@ -1677,6 +1677,96 @@ class TestTaskTimeline(unittest.TestCase):
         self.conn.commit()
         return contract
 
+    def test_timeline_list_can_include_compact_multi_backlog_ledger(self):
+        from agent.governance import server, task_timeline
+
+        for bug_id, priority in (
+            ("AC-BATCH", "P0"),
+            ("AC-ROW-A", "P1"),
+            ("AC-ROW-B", "P0"),
+        ):
+            self.conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', ?, '2026-06-27T00:00:00Z', '2026-06-27T00:00:00Z')""",
+                (bug_id, f"{bug_id} title", priority),
+            )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-BATCH",
+            task_id="batch-task",
+            event_type="mf_batch_parallel.entered",
+            event_kind="contract_binding",
+            status="accepted",
+            payload={
+                "contract_execution_id": "cex-batch",
+                "backlog_ids": ["AC-ROW-A", "AC-ROW-B"],
+                "target_head_commit": "head-1",
+                "next_legal_action": {
+                    "id": "observer_prefill_child_contracts",
+                    "action": "record_observer_prefill_child_contracts",
+                },
+                "merge_queue_plan": {
+                    "merge_queue_id": "mq-batch",
+                    "planned_items": [
+                        {
+                            "backlog_id": "AC-ROW-B",
+                            "merge_queue_id": "mq-batch",
+                            "queue_item_id": "mqitem-b",
+                            "queue_index": 1,
+                            "task_id": "batch-task:row:1",
+                        },
+                        {
+                            "backlog_id": "AC-ROW-A",
+                            "merge_queue_id": "mq-batch",
+                            "queue_item_id": "mqitem-a",
+                            "queue_index": 2,
+                            "task_id": "batch-task:row:2",
+                        },
+                    ],
+                },
+            },
+        )
+        blocked = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="AC-ROW-B",
+            task_id="direct-block",
+            event_type="mf.blocker",
+            event_kind="blocker",
+            status="blocked",
+            commit_sha="head-2",
+            payload={
+                "blocker_evidence": {
+                    "merge_queue_id": "mq-batch",
+                    "durable_queue_count": 0,
+                }
+            },
+        )
+        self.conn.commit()
+
+        result = server.handle_task_timeline_list(
+            _ctx({"include_compact_ledger": "true", "limit": "20"})
+        )
+
+        ledger = result["compact_ledger"]
+        self.assertEqual(
+            ledger["schema_version"],
+            "task_timeline.compact_multi_backlog_ledger.v1",
+        )
+        by_id = {row["backlog_id"]: row for row in ledger["rows"]}
+        self.assertEqual(by_id["AC-ROW-B"]["merge_queue_index"], 1)
+        self.assertEqual(by_id["AC-ROW-B"]["latest_event_id"], blocked["id"])
+        self.assertEqual(by_id["AC-ROW-B"]["readiness_state"], "blocked")
+        self.assertEqual(by_id["AC-ROW-B"]["blocker_summary"]["kind"], "blocker_evidence")
+        self.assertEqual(by_id["AC-ROW-B"]["head_commit"], "head-2")
+        self.assertEqual(
+            by_id["AC-ROW-A"]["next_legal_action"]["id"],
+            "observer_prefill_child_contracts",
+        )
+        self.assertGreater(by_id["AC-ROW-A"]["latest_payload_ref"]["payload_bytes"], 0)
+
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline
 

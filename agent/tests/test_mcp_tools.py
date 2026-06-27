@@ -653,6 +653,7 @@ def test_mcp_timeline_tools_route_to_governance_api():
             "project_id": "aming-claw",
             "backlog_id": "BUG-1",
             "event_kind": "implementation",
+            "include_compact_ledger": True,
             "limit": 25,
         },
     )
@@ -681,7 +682,7 @@ def test_mcp_timeline_tools_route_to_governance_api():
         ),
         (
             "GET",
-            "/api/task/aming-claw/timeline?backlog_id=BUG-1&event_kind=implementation&limit=25",
+            "/api/task/aming-claw/timeline?backlog_id=BUG-1&event_kind=implementation&limit=25&include_compact_ledger=true",
             None,
         ),
         (
