@@ -28160,6 +28160,7 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
         result["merge_queue_plan"]["planned_items"][0]["task_id"],
         result["merge_queue_plan"]["planned_items"][1]["task_id"],
     ]
+    assert [item.backlog_id for item in persisted_items] == [child_b, child_a]
     assert [item.current_target_head for item in persisted_items] == [
         "target-head-1",
         "target-head-1",
@@ -28184,6 +28185,170 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
     assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v1"
+
+
+def test_observer_route_context_issue_blocks_multi_backlog_task_mismatch(conn):
+    expected_backlog_id = "AC-MULTI-BINDING-EXPECTED"
+    wrong_backlog_id = "AC-MULTI-BINDING-WRONG"
+    task_id = "mf-batch-parallel-test:row:4"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id="mq-multi-binding",
+                queue_item_id="mqitem-row-4",
+                backlog_id=expected_backlog_id,
+                task_id=task_id,
+                branch_ref="",
+                queue_index=4,
+                status="planned",
+                target_ref="refs/heads/main",
+                base_commit="base",
+                validated_target_head="base",
+                current_target_head="base",
+            )
+        ],
+    )
+
+    status, payload = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "caller_role": "observer",
+                "backlog_id": wrong_backlog_id,
+                "task_id": task_id,
+                "target_files": ["agent/governance/server.py"],
+                "allowed_actions": ["task_timeline_append"],
+            },
+        )
+    )
+
+    assert status == 409
+    assert payload["error"] == "task_backlog_binding_mismatch"
+    assert payload["expected_backlog_id"] == expected_backlog_id
+    assert payload["received_backlog_id"] == wrong_backlog_id
+    assert payload["task_id"] == task_id
+    assert payload["merge_queue_id"] == "mq-multi-binding"
+    assert payload["queue_index"] == 4
+
+
+def test_task_timeline_append_blocks_multi_backlog_task_mismatch(conn):
+    expected_backlog_id = "AC-MULTI-TIMELINE-EXPECTED"
+    wrong_backlog_id = "AC-MULTI-TIMELINE-WRONG"
+    task_id = "mf-batch-parallel-test:row:7"
+    route_token_ref = "rtok-multi-timeline-wrong"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id="mq-multi-timeline",
+                queue_item_id="mqitem-row-7",
+                backlog_id=expected_backlog_id,
+                task_id=task_id,
+                branch_ref="",
+                queue_index=7,
+                status="planned",
+                target_ref="refs/heads/main",
+                base_commit="base",
+                validated_target_head="base",
+                current_target_head="base",
+            )
+        ],
+    )
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=wrong_backlog_id,
+        task_id=task_id,
+        route_id="route-multi-timeline-wrong",
+        route_context_hash=_fake_sha("route-multi-timeline-wrong"),
+        prompt_contract_id="prompt-multi-timeline-wrong",
+        prompt_contract_hash=_fake_sha("prompt-multi-timeline-wrong"),
+        visible_injection_manifest_hash=_fake_sha("manifest-multi-timeline-wrong"),
+        route_token_ref=route_token_ref,
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": wrong_backlog_id,
+                    "task_id": task_id,
+                    "event_type": "mf.direct_implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "accepted",
+                    "actor": "observer",
+                    "route_token_ref": route_token_ref,
+                    "payload": {"summary": "wrong row should be blocked"},
+                },
+            )
+    )
+
+    assert exc.value.code == "task_backlog_binding_mismatch"
+    assert exc.value.status == 409
+    assert exc.value.details["expected_backlog_id"] == expected_backlog_id
+    assert exc.value.details["received_backlog_id"] == wrong_backlog_id
+    assert exc.value.details["task_id"] == task_id
+
+
+def test_multi_backlog_task_binding_recovers_from_batch_enter_timeline(conn):
+    expected_backlog_id = "AC-MULTI-FALLBACK-EXPECTED"
+    wrong_backlog_id = "AC-MULTI-FALLBACK-WRONG"
+    task_id = "mf-batch-parallel-legacy:row:2"
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id="AC-MULTI-FALLBACK-BATCH",
+        task_id="onboard-service-test",
+        event_type="mf_batch_parallel.entered",
+        event_kind="contract_binding",
+        phase="orchestration",
+        status="accepted",
+        actor="observer",
+        payload={
+            "preflight_gate": {
+                "merge_queue_plan": {
+                    "planned_items": [
+                        {
+                            "backlog_id": expected_backlog_id,
+                            "task_id": task_id,
+                            "merge_queue_id": "mq-legacy-fallback",
+                            "queue_item_id": "mqitem-legacy-2",
+                            "queue_index": 2,
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    mismatch = server._multi_backlog_task_binding_mismatch(
+        conn,
+        project_id=PID,
+        backlog_id=wrong_backlog_id,
+        task_id=task_id,
+    )
+
+    assert mismatch["error"] == "task_backlog_binding_mismatch"
+    assert mismatch["expected_backlog_id"] == expected_backlog_id
+    assert mismatch["received_backlog_id"] == wrong_backlog_id
+    assert mismatch["merge_queue_id"] == "mq-legacy-fallback"
+    assert mismatch["queue_index"] == 2
+    assert (
+        server._multi_backlog_task_binding_mismatch(
+            conn,
+            project_id=PID,
+            backlog_id=expected_backlog_id,
+            task_id=task_id,
+        )
+        == {}
+    )
 
 
 def test_mf_batch_parallel_enter_blocks_without_preflight_target_head(conn):

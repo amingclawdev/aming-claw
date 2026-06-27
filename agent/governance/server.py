@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -2922,6 +2922,142 @@ def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     return expanded
 
 
+def _iter_nested_mappings(value: Any, *, _depth: int = 0) -> Iterable[Mapping[str, Any]]:
+    if _depth > 8:
+        return
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _iter_nested_mappings(child, _depth=_depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_nested_mappings(child, _depth=_depth + 1)
+
+
+def _multi_backlog_task_binding_from_timeline(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, payload_json
+            FROM task_timeline_events
+            WHERE project_id = ? AND event_type = 'mf_batch_parallel.entered'
+            ORDER BY id DESC
+            LIMIT 100
+            """,
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise
+    for row in rows:
+        raw_payload = row["payload_json"] if isinstance(row, sqlite3.Row) else row[1]
+        try:
+            payload = json.loads(raw_payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        for item in _iter_nested_mappings(payload):
+            if str(item.get("task_id") or "").strip() != task_id:
+                continue
+            backlog_id = str(item.get("backlog_id") or "").strip()
+            if not backlog_id:
+                continue
+            return {
+                "source": "task_timeline_events.mf_batch_parallel.entered",
+                "source_event_id": int(row["id"] if isinstance(row, sqlite3.Row) else row[0]),
+                "expected_backlog_id": backlog_id,
+                "task_id": task_id,
+                "merge_queue_id": str(item.get("merge_queue_id") or "").strip(),
+                "queue_item_id": str(item.get("queue_item_id") or "").strip(),
+                "queue_index": int(item.get("queue_index") or 0),
+            }
+    return {}
+
+
+def _multi_backlog_task_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    task = str(task_id or "").strip()
+    if not task:
+        return {}
+    try:
+        from .parallel_branch_runtime import ensure_branch_runtime_schema
+
+        ensure_branch_runtime_schema(conn)
+        row = conn.execute(
+            """
+            SELECT merge_queue_id, queue_item_id, backlog_id, task_id, queue_index
+            FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND task_id = ? AND backlog_id <> ''
+            ORDER BY updated_at DESC, queue_index DESC, queue_item_id DESC
+            LIMIT 1
+            """,
+            (project_id, task),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
+            row = None
+        else:
+            raise
+    if row:
+        return {
+            "source": "parallel_branch_merge_queue_items",
+            "expected_backlog_id": str(row["backlog_id"] or ""),
+            "task_id": str(row["task_id"] or ""),
+            "merge_queue_id": str(row["merge_queue_id"] or ""),
+            "queue_item_id": str(row["queue_item_id"] or ""),
+            "queue_index": int(row["queue_index"] or 0),
+        }
+    return _multi_backlog_task_binding_from_timeline(
+        conn,
+        project_id=project_id,
+        task_id=task,
+    )
+
+
+def _multi_backlog_task_binding_mismatch(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    received = str(backlog_id or "").strip()
+    task = str(task_id or "").strip()
+    if not received or not task:
+        return {}
+    binding = _multi_backlog_task_binding(conn, project_id=project_id, task_id=task)
+    expected = str(binding.get("expected_backlog_id") or "").strip()
+    if not expected or expected == received:
+        return {}
+    return {
+        "ok": False,
+        "error": "task_backlog_binding_mismatch",
+        "message": "task_id is already bound to a different multi-backlog row",
+        "schema_version": "multi_backlog_task_backlog_binding_gate.v1",
+        "project_id": project_id,
+        "task_id": task,
+        "expected_backlog_id": expected,
+        "received_backlog_id": received,
+        "merge_queue_id": str(binding.get("merge_queue_id") or ""),
+        "queue_item_id": str(binding.get("queue_item_id") or ""),
+        "queue_index": int(binding.get("queue_index") or 0),
+        "binding_source": str(binding.get("source") or ""),
+        "source_event_id": int(binding.get("source_event_id") or 0),
+        "next_action": "use the backlog_id bound to this task_id or allocate a distinct task_id",
+    }
+
+
 @route("POST", "/api/projects/{project_id}/observer/route-context/issue")
 def handle_observer_route_context_issue(ctx: RequestContext):
     """Mint an Aming-owned, write-authorizing observer route token.
@@ -2966,6 +3102,19 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         return 400, {"ok": False, "error": "task_id is required"}
     if not target_files:
         return 400, {"ok": False, "error": "target_files must be a non-empty list of file paths"}
+
+    conn = get_connection(project_id)
+    try:
+        binding_mismatch = _multi_backlog_task_binding_mismatch(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    finally:
+        conn.close()
+    if binding_mismatch:
+        return 409, binding_mismatch
 
     allowed_actions = body.get("allowed_actions")
     if allowed_actions is not None and not isinstance(allowed_actions, list):
@@ -38975,6 +39124,19 @@ def handle_task_timeline_append(ctx: RequestContext):
                 422,
                 legacy_route_gate,
             )
+        binding_mismatch = _multi_backlog_task_binding_mismatch(
+            conn,
+            project_id=project_id,
+            backlog_id=ctx.body.get("backlog_id", ""),
+            task_id=ctx.body.get("task_id", ""),
+        )
+        if binding_mismatch:
+            raise GovernanceError(
+                "task_backlog_binding_mismatch",
+                str(binding_mismatch.get("message") or "task/backlog binding mismatch"),
+                409,
+                binding_mismatch,
+            )
         trusted_contract_runtime_actor_role = ""
         contract_runtime_completed_projection_gate = {}
         if task_timeline.is_protected_close_evidence(event):
@@ -45904,6 +46066,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 project_id=project_id,
                 merge_queue_id=str(item.get("merge_queue_id") or merge_queue_id),
                 queue_item_id=str(item.get("queue_item_id") or ""),
+                backlog_id=str(item.get("backlog_id") or ""),
                 task_id=str(item.get("task_id") or ""),
                 branch_ref=str(item.get("branch_ref") or ""),
                 queue_index=int(item.get("queue_index") or 0),
