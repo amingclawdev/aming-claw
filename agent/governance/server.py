@@ -38503,6 +38503,125 @@ def _contract_runtime_close_authority_commit(
     return close_commit if event_kind in {"close_ready", "merge", "reconcile"} else ""
 
 
+def _contract_runtime_close_authority_text(
+    *values: Any,
+) -> str:
+    for value in values:
+        token = str(value or "").strip()
+        if token:
+            return token
+    return ""
+
+
+def _contract_runtime_close_authority_line_context_key(
+    line: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> str:
+    return _contract_runtime_close_authority_text(
+        payload.get("runtime_context_id"),
+        line.get("runtime_context_id"),
+        payload.get("task_id"),
+        line.get("task_id"),
+        payload.get("parent_task_id"),
+        line.get("parent_task_id"),
+    )
+
+
+def _contract_runtime_close_authority_line_context_seed(
+    line: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = _contract_runtime_close_authority_line_payload(line)
+    seed: dict[str, Any] = {}
+    for key in (
+        "runtime_context_id",
+        "parent_task_id",
+        "observer_command_id",
+        "target_project_root",
+        "actual_cwd",
+        "actual_git_root",
+        "fence_token_hash",
+        "fence_token_redacted",
+        "route_token_ref",
+    ):
+        value = payload.get(key) or line.get(key)
+        if value:
+            seed[key] = value
+    worker_slot_id = _contract_runtime_close_authority_text(
+        payload.get("worker_slot_id"),
+        line.get("worker_slot_id"),
+        payload.get("worker_id"),
+        line.get("worker_id"),
+        payload.get("worker_task_id"),
+        line.get("worker_task_id"),
+        payload.get("task_id"),
+        line.get("task_id"),
+    )
+    if worker_slot_id:
+        seed["worker_slot_id"] = worker_slot_id
+    worker_id = _contract_runtime_close_authority_text(
+        payload.get("worker_id"),
+        line.get("worker_id"),
+        payload.get("worker_slot_id"),
+        line.get("worker_slot_id"),
+        payload.get("worker_task_id"),
+        line.get("worker_task_id"),
+    )
+    if worker_id:
+        seed["worker_id"] = worker_id
+    task_id = _contract_runtime_close_authority_text(
+        payload.get("task_id"),
+        line.get("task_id"),
+        payload.get("worker_task_id"),
+        line.get("worker_task_id"),
+    )
+    if task_id:
+        seed["task_id"] = task_id
+    branch = _contract_runtime_close_authority_text(
+        payload.get("branch"),
+        payload.get("branch_ref"),
+        line.get("branch"),
+        line.get("branch_ref"),
+    )
+    if branch:
+        seed["branch"] = branch
+        seed["branch_ref"] = branch
+    head_commit = _contract_runtime_close_authority_text(
+        payload.get("head_commit"),
+        payload.get("branch_head"),
+        payload.get("target_head_commit"),
+        payload.get("base_commit"),
+        line.get("head_commit"),
+        line.get("branch_head"),
+        line.get("target_head_commit"),
+        line.get("base_commit"),
+        line.get("commit_sha"),
+        payload.get("commit_sha"),
+    )
+    if head_commit:
+        seed["head_commit"] = head_commit
+    return seed
+
+
+def _contract_runtime_close_authority_line_contexts(
+    lines: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collect sibling runtime-context identity needed by legacy close gates."""
+
+    buckets: dict[str, dict[str, Any]] = {}
+    line_keys: list[str] = []
+    for line in lines:
+        payload = _contract_runtime_close_authority_line_payload(line)
+        key = _contract_runtime_close_authority_line_context_key(line, payload)
+        line_keys.append(key)
+        if not key:
+            continue
+        bucket = buckets.setdefault(key, {})
+        for field, value in _contract_runtime_close_authority_line_context_seed(line).items():
+            bucket.setdefault(field, value)
+
+    return [dict(buckets.get(key, {})) for key in line_keys]
+
+
 def _contract_runtime_close_authority_event(
     *,
     record: Mapping[str, Any],
@@ -38510,6 +38629,7 @@ def _contract_runtime_close_authority_event(
     event_id: int,
     identity: Mapping[str, str],
     close_commit: str,
+    line_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     event_kind, phase, default_status = _contract_runtime_close_authority_event_kind(line)
     payload = _contract_runtime_close_authority_line_payload(line)
@@ -38524,6 +38644,12 @@ def _contract_runtime_close_authority_event(
         payload.setdefault("worker_role", "mf_sub")
     if _contract_runtime_close_normalized(line.get("evidence_kind")) == "graph_trace":
         payload.setdefault("query_source", "mf_subagent")
+    if event_kind == "mf_subagent_startup":
+        for key, value in dict(line_context or {}).items():
+            if value:
+                payload.setdefault(key, value)
+        if payload.get("fence_token_hash"):
+            payload.setdefault("fence_token_redacted", True)
     if _contract_runtime_close_normalized(line.get("evidence_kind")) == "mf_subagent_finish_gate":
         payload.pop("mf_subagent_finish_gate", None)
         payload["runtime_finish_gate_completed"] = True
@@ -38773,6 +38899,12 @@ def _contract_runtime_close_authority_projection(
         record=record,
         identity=identity,
     )
+    completed_line_mappings = [
+        line for line in completed_lines if isinstance(line, Mapping)
+    ]
+    line_contexts = _contract_runtime_close_authority_line_contexts(
+        completed_line_mappings
+    )
     projected_events.extend(
         _contract_runtime_close_authority_event(
             record=record,
@@ -38780,9 +38912,9 @@ def _contract_runtime_close_authority_projection(
             event_id=index + 10,
             identity=identity,
             close_commit=close_commit,
+            line_context=line_contexts[index] if index < len(line_contexts) else {},
         )
-        for index, line in enumerate(completed_lines)
-        if isinstance(line, Mapping)
+        for index, line in enumerate(completed_line_mappings)
     )
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,

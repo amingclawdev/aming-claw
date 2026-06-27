@@ -15704,19 +15704,23 @@ def _completed_mf_parallel_runtime_record(close_commit, worker_commit):
         "worker_role": "mf_sub",
         "worker_id": "mfsub-unit",
         "worker_slot_id": "mfsub-unit",
-        "fence_token_hash": "sha256:" + "1" * 64,
         "changed_files": ["agent/governance/server.py"],
         "owned_files": ["agent/governance/server.py"],
+    }
+    dispatch_payload = {
+        **worker_payload,
+        "branch_ref": "codex/unit",
+        "target_head_commit": worker_commit,
+        "fence_token_hash": "sha256:" + "1" * 64,
+        "observer_command_id": "cmd-unit",
     }
     startup_payload = {
         **worker_payload,
         "actual_cwd": "/tmp/aming-claw-worker",
         "actual_git_root": "/tmp/aming-claw-worker",
-        "branch": "codex/unit",
-        "head_commit": worker_commit,
     }
     finish_gate_payload = {
-        **worker_payload,
+        **dispatch_payload,
         "mf_subagent_finish_gate": {
             "status": "passed",
             "close_ready": True,
@@ -15731,7 +15735,12 @@ def _completed_mf_parallel_runtime_record(close_commit, worker_commit):
             },
             "startup_worker_identity_gate": {"passed": True},
             "worker_self_attestation_gate": {"passed": True},
-            "startup_evidence": startup_payload,
+            "startup_evidence": {
+                **startup_payload,
+                "branch_ref": "codex/unit",
+                "head_commit": worker_commit,
+                "fence_token_hash": "sha256:" + "1" * 64,
+            },
         },
     }
     lines = [
@@ -15746,7 +15755,7 @@ def _completed_mf_parallel_runtime_record(close_commit, worker_commit):
             "observer_dispatch_bounded_workers",
             "observer",
             "dispatch_bounded_worker",
-            payload=worker_payload,
+            payload=dispatch_payload,
         ),
         _contract_runtime_projection_line(
             "worker_read",
@@ -15884,6 +15893,9 @@ def test_backlog_close_contract_runtime_completed_lines_project_to_close_gate():
         record=record,
         identity=identity,
     )
+    line_contexts = server._contract_runtime_close_authority_line_contexts(
+        record["completed_lines"]
+    )
     events.extend(
         server._contract_runtime_close_authority_event(
             record=record,
@@ -15891,9 +15903,16 @@ def test_backlog_close_contract_runtime_completed_lines_project_to_close_gate():
             event_id=index + 10,
             identity=identity,
             close_commit=close_commit,
+            line_context=line_contexts[index],
         )
         for index, line in enumerate(record["completed_lines"])
     )
+    startup_event = next(
+        event for event in events if event["event_kind"] == "mf_subagent_startup"
+    )
+    assert startup_event["payload"]["branch_ref"] == "codex/unit"
+    assert startup_event["payload"]["head_commit"] == worker_commit
+    assert startup_event["payload"]["fence_token_hash"] == "sha256:" + "1" * 64
 
     gate = task_timeline.mf_close_gate_verification(
         events,
