@@ -23514,6 +23514,73 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     ] == "onboard_route_guide"
 
 
+def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
+    backlog_id = "AC-ONBOARD-ROUTE-GUIDE-RESUME-DIRECT-FIX"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="direct-fix-parent-worker",
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        payload={
+            "contract_execution_id": "cex-mf-parallel-blocked-parent",
+            "blockers": [
+                {
+                    "blocker_class": (
+                        "runtime_merge_queue_requires_raw_fence_after_worker_finish"
+                    )
+                }
+            ],
+            "next_legal_action": {
+                "id": "merge_queue_raw_fence",
+                "action": "record_raw_fence",
+            },
+        },
+    )
+    conn.commit()
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-onboard-resume-direct-fix",
+            },
+        )
+    )
+
+    next_action = result["next_legal_action"]
+    assert next_action["id"] == "resume_blocked_contract_chain"
+    assert next_action["action"] == "enter_direct_fix_successor"
+    assert next_action["recommended_successor_contract_id"] == "direct_fix"
+    assert next_action["successor_contract_template_id"] == "direct_fix.v1"
+    assert next_action["parent_contract_execution_id"] == (
+        "cex-mf-parallel-blocked-parent"
+    )
+    assert next_action["endpoint"] == f"/api/projects/{PID}/direct-fix/enter"
+    assert result["runtime_resume"]["mode"] == "resume_blocked_contract"
+    assert result["runtime_resume"]["source"] == "task_timeline_compact_ledger"
+    route_guide = result["onboard_route_guide"]
+    assert route_guide["backlog_chain_binding"]["runtime_resume"][
+        "next_legal_action"
+    ] == next_action
+    assert route_guide["backlog_chain_binding"]["create_successor"]["direct_fix"] == {
+        "interface": "direct_fix_enter",
+        "requires_role": "observer",
+        "requires_route_token_ref": True,
+        "requires_parent_contract_execution_id": True,
+        "blocked_parent_only": True,
+        "contract_template_id": "direct_fix.v1",
+    }
+
+
 def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
     backlog_id = "AC-CONTRACT-UPDATE-ONBOARD-SERVICE-WAIVER"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -24001,7 +24068,9 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
         )
     )
     assert rejected_source_write["ok"] is False
-    assert "observer_hotfix successor" in rejected_source_write["decision"]["errors"][0]
+    assert "enter_observer_hotfix_successor" in rejected_source_write["decision"][
+        "errors"
+    ][0]
 
     entered = server.handle_project_hotfix_enter(
         _ctx_with_role(
@@ -24064,6 +24133,129 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
     )
     assert resumed["next_legal_action"]["id"] == "worker_revision_source_proof"
     assert resumed["next_legal_action"].get("status") != "blocked"
+
+
+def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-BLOCKED-DIRECT-FIX"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update-direct-onboard",
+            },
+        )
+    )
+    parent = _complete_source_backed_onboarding(
+        conn,
+        onboard["contract_execution_id"],
+    )
+    started = server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-contract-update-direct",
+            },
+        )
+    )
+    execution_id = started["contract_execution_id"]
+
+    for actor_role, stage_id, line_id, evidence_kind in [
+        (
+            "observer",
+            "observer_request",
+            "observer_request_contract_update",
+            "contract_update_request",
+        ),
+        (
+            "mf_sub",
+            "worker_previous_source",
+            "worker_previous_source_proof",
+            "contract_previous_source_proof",
+        ),
+    ]:
+        result = server.handle_project_contract_update_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                actor_role,
+                method="POST",
+                body={
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                },
+            )
+        )
+        assert result["ok"] is True
+
+    blocked_precheck = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "stage_id": "worker_precheck",
+                "line_id": "worker_revision_precheck",
+                "evidence_kind": "contract_revision_precheck",
+                "payload": {
+                    "status": "blocked",
+                    "recommended_next_action": "direct_fix_successor",
+                    "blocker_class": (
+                        "runtime_merge_queue_requires_raw_fence_after_worker_finish"
+                    ),
+                    "block_reason": "merge queue raw fence needs runtime repair",
+                },
+            },
+        )
+    )
+    assert blocked_precheck["ok"] is True
+
+    current = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="GET",
+        )
+    )
+    next_action = current["next_legal_action"]
+    assert next_action["id"] == "direct_fix_successor"
+    assert next_action["action"] == "enter_direct_fix_successor"
+    assert next_action["recommended_successor_contract_id"] == "direct_fix"
+    assert next_action["successor_contract_template_id"] == "direct_fix.v1"
+    assert next_action["return_to_parent"]["parent_contract_execution_id"] == (
+        execution_id
+    )
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair blocked contract_update runtime gate.",
+                "backlog_id": backlog_id,
+                "task_id": "blocked-contract-update-direct-fix",
+                "parent_contract_execution_id": execution_id,
+                "route_token_ref": "rtok-contract-update-direct",
+            },
+        )
+    )
+
+    assert entered["contract_id"] == "direct_fix"
+    assert entered["parent_contract_execution_id"] == execution_id
+    assert entered["root_contract_execution_id"] == parent["root_contract_execution_id"]
+    assert entered["contract_chain_id"] == parent["contract_chain_id"]
+    assert entered["return_to_parent"]["parent_contract_execution_id"] == execution_id
+    assert entered["parent_close_gate"]["parent_close_gate_recheck_required"] is True
+    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
+    assert entered["next_legal_action"]["owner_role"] == "observer"
 
 
 def test_hotfix_enter_rejects_explicit_parent_without_allowed_successor(conn):

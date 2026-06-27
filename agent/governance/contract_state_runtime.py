@@ -253,10 +253,12 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
 
 _QA_EVIDENCE_CONTRACT_TEMPLATE_ID = "qa_evidence_gate_review.v1"
 _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID = "audit_close_with_qa_acceptance.v1"
+_DIRECT_FIX_CONTRACT_TEMPLATE_ID = "direct_fix.v1"
 
 _CONTRACT_FIRST_CANDIDATE_TEMPLATES = [
     "onboard_contract.v1",
     "observer_hotfix_direct_mutation.v1",
+    _DIRECT_FIX_CONTRACT_TEMPLATE_ID,
     "mf_parallel.v1",
     _QA_EVIDENCE_CONTRACT_TEMPLATE_ID,
     _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID,
@@ -265,6 +267,7 @@ _CONTRACT_FIRST_CANDIDATE_TEMPLATES = [
 _CONTRACT_FIRST_SUPPORTED_ROLES = [
     "onboard",
     "observer_hotfix",
+    "direct_fix",
     "parallel_worker",
     "qa",
     "merge",

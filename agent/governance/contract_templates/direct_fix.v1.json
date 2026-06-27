@@ -1,0 +1,136 @@
+{
+  "schema_version": "direct_fix_contract_template.v1",
+  "template_id": "direct_fix.v1",
+  "version": "v1",
+  "description": "Contract-driven successor lane for operator-supervised repair of a blocked parent contract. It freezes parent identity, scopes repair to the blocker, requires independent QA, and returns to the parent without satisfying parent close by itself.",
+  "task_types": [
+    "direct_fix",
+    "observer_direct_fix",
+    "chain_rescue",
+    "manual_fix"
+  ],
+  "stages": [
+    "blocked_parent_handoff",
+    "operator_approval",
+    "candidate_branch",
+    "repair_implementation",
+    "qa_verification",
+    "return_to_parent"
+  ],
+  "required_instance_fields": [
+    "contract_instance_id",
+    "backlog_id",
+    "parent_contract_execution_id",
+    "blocked_gate",
+    "return_to_contract_id",
+    "return_to_stage_id",
+    "return_to_line_id",
+    "allowed_files",
+    "operator_approval_ref",
+    "successor_route_token_ref"
+  ],
+  "applicability": {
+    "allowed_only_for": "blocked_parent_contract_runtime_or_governance_gate_repair",
+    "not_for": [
+      "root_onboarding",
+      "general_observer_direct_main",
+      "parent_close_gate_satisfaction",
+      "unscoped_product_implementation",
+      "raw_route_token_storage",
+      "candidate_graph_activation_as_target_truth"
+    ],
+    "eligibility_requires": [
+      "parent_contract_execution_id",
+      "blocked_parent_next_action",
+      "operator_approval_scope",
+      "successor_scoped_route_token_ref"
+    ]
+  },
+  "timeline_contract": {
+    "handoff_event": {
+      "event_type": "direct_fix.entered",
+      "event_kind": "contract_binding",
+      "phase": "direct_fix",
+      "close_satisfying": false,
+      "required_payload_fields": [
+        "parent_contract_execution_id",
+        "successor_contract_execution_id",
+        "blocked_gate",
+        "return_to_parent",
+        "route_token_ref"
+      ]
+    },
+    "return_event": {
+      "event_type": "direct_fix.return_to_parent",
+      "event_kind": "direct_fix_return_to_parent",
+      "phase": "return_to_parent",
+      "close_satisfying": false,
+      "required_payload_fields": [
+        "parent_contract_execution_id",
+        "successor_contract_execution_id",
+        "qa_evidence_refs",
+        "parent_close_gate_recheck_required"
+      ]
+    },
+    "close_gate_evidence_still_required": [
+      "implementation",
+      "verification",
+      "close_ready"
+    ]
+  },
+  "gate_policy": {
+    "schema_version": "direct_fix_gate_policy.v1",
+    "root_start_allowed": false,
+    "parent_blocked_handoff_required": true,
+    "operator_approval_required": true,
+    "successor_route_token_ref_required": true,
+    "independent_qa_required": true,
+    "parent_close_gate_recheck_required": true,
+    "child_must_not_write_parent_close_evidence": true
+  },
+  "runtime_contract_hints": {
+    "schema_version": "contract_template.runtime_hints.v1",
+    "contract_definition_id": "direct_fix",
+    "contract_definition_revision": "rev1",
+    "entrypoint": "direct_fix_enter",
+    "blocked_parent_projection": true,
+    "return_to_parent": {
+      "required": true,
+      "parent_close_gate_recheck_required": true
+    }
+  },
+  "evidence_requirements": [
+    {
+      "id": "direct_fix_handoff_request",
+      "owner_role": "observer",
+      "event_kind": "direct_fix_handoff_request"
+    },
+    {
+      "id": "direct_fix_operator_approval",
+      "owner_role": "observer",
+      "event_kind": "operator_approval"
+    },
+    {
+      "id": "direct_fix_candidate_repair",
+      "owner_role": "mf_sub",
+      "event_kind": "direct_fix_repair_evidence"
+    },
+    {
+      "id": "qa_independent_verification",
+      "owner_role": "qa",
+      "event_kind": "independent_verification"
+    },
+    {
+      "id": "direct_fix_return_to_parent",
+      "owner_role": "observer",
+      "event_kind": "direct_fix_return_to_parent"
+    }
+  ],
+  "forbidden_capabilities": [
+    "bypass_parent_close_gate",
+    "generalize_observer_direct_main",
+    "store_raw_route_token",
+    "activate_candidate_graph_as_target_truth",
+    "self_author_independent_qa"
+  ]
+}

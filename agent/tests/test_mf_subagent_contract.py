@@ -429,6 +429,65 @@ def test_observer_hotfix_enter_refuses_completed_successor_reuse(monkeypatch) ->
     assert details["raw_route_token_required"] is False
 
 
+def test_direct_fix_successor_projection_exposes_return_to_parent(monkeypatch) -> None:
+    from agent.governance import server as server_module
+
+    parent_record = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-FIX",
+        "contract_id": "contract_update",
+        "version": "v1",
+        "revision": "rev1",
+        "contract_execution_id": "cex-contract-update-parent",
+        "root_contract_execution_id": "cex-onboard-root",
+        "contract_chain_id": "chain-onboard-root",
+        "completed_lines": [
+            {
+                "stage_id": "worker_precheck",
+                "line_id": "worker_revision_precheck",
+                "actor_role": "mf_sub",
+                "evidence_kind": "contract_revision_precheck",
+                "payload": {
+                    "status": "blocked",
+                    "recommended_next_action": "direct_fix_successor",
+                    "blocker_class": (
+                        "runtime_merge_queue_requires_raw_fence_after_worker_finish"
+                    ),
+                },
+            }
+        ],
+    }
+
+    class FakeStore:
+        def get(self, _contract_execution_id):
+            raise server_module.ContractRuntimeError("not started")
+
+    class FakeRuntime:
+        store = FakeStore()
+
+    monkeypatch.setattr(server_module, "_contract_runtime", lambda _conn: FakeRuntime())
+
+    next_action = server_module._contract_runtime_blocked_successor_next_action(
+        object(),
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX",
+        record=parent_record,
+        actor_role="observer",
+    )
+
+    assert next_action["line_id"] == "direct_fix_successor"
+    assert next_action["action"] == "enter_direct_fix_successor"
+    assert next_action["recommended_successor_contract_id"] == "direct_fix"
+    assert next_action["successor_contract_template_id"] == "direct_fix.v1"
+    assert next_action["return_to_parent"]["parent_contract_execution_id"] == (
+        "cex-contract-update-parent"
+    )
+    assert next_action["return_to_parent"]["parent_close_gate_recheck_required"] is True
+    assert next_action["body"]["parent_contract_execution_id"] == (
+        "cex-contract-update-parent"
+    )
+
+
 def test_runtime_contract_view_reports_revision_polling_state() -> None:
     context = BranchTaskRuntimeContext(
         project_id="aming-claw",

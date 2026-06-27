@@ -1,0 +1,190 @@
+{
+  "compat_aliases": [
+    "direct_fix.v1",
+    "observer_direct_fix.v1"
+  ],
+  "contract_id": "direct_fix",
+  "contract_type": "direct_fix",
+  "instruction_layer": {
+    "inline": [
+      "This is a successor execution under a blocked parent contract.",
+      "Use it only to repair the blocker that prevents the parent contract from continuing.",
+      "The child execution must not write parent close evidence or broaden observer direct-main authority.",
+      "After independent QA, observer records a return-to-parent line and the parent contract is re-read."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "runtime_cutover": true,
+    "template_id": "direct_fix.v1"
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer records the blocked parent handoff and frozen return target.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Blocked parent handoff with parent execution, blocked stage/line/gate, exact scope, and return target.",
+            "evidence_kind": "direct_fix_handoff_request",
+            "line_id": "direct_fix_handoff_request",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "parent_blocked_handoff"
+      },
+      {
+        "description": "Observer records operator approval and successor-scoped route identity.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Operator approval with exact scope/files, risk, target head, graph anchor, token subject, expiry, and rationale.",
+            "evidence_kind": "operator_approval",
+            "line_id": "direct_fix_operator_approval",
+            "owner_role": "observer",
+            "requires": [
+              "direct_fix_handoff_request"
+            ]
+          }
+        ],
+        "stage_id": "operator_approval"
+      },
+      {
+        "description": "Bounded worker records candidate-lane repair evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Candidate branch/worktree repair evidence with changed files, tests, graph traces, and no target-truth activation.",
+            "evidence_kind": "direct_fix_repair_evidence",
+            "line_id": "direct_fix_candidate_repair",
+            "owner_role": "mf_sub",
+            "requires": [
+              "direct_fix_operator_approval"
+            ]
+          }
+        ],
+        "stage_id": "candidate_repair"
+      },
+      {
+        "description": "Independent QA verifies the blocker repair.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored independent verification of direct_fix repair evidence and parent-return safety.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "direct_fix_candidate_repair"
+            ]
+          }
+        ],
+        "stage_id": "qa"
+      },
+      {
+        "description": "Observer records server-verifiable return to the blocked parent contract.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Return-to-parent evidence after QA; parent close gate remains parent-owned and must be re-evaluated.",
+            "evidence_kind": "direct_fix_return_to_parent",
+            "line_id": "direct_fix_return_to_parent",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          }
+        ],
+        "stage_id": "return_to_parent"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "denied_reason": "direct_fix is a successor under a blocked parent contract, never a root entrypoint",
+      "requires_parent_execution": true,
+      "root_start_default": "deny"
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "allowed_parent_contracts": [
+        {
+          "contract_id": "contract_update",
+          "version": "v1"
+        },
+        {
+          "contract_id": "mf_parallel",
+          "version": "v1"
+        },
+        {
+          "contract_id": "mf_batch_parallel",
+          "version": "v1"
+        },
+        {
+          "contract_id": "observer_hotfix",
+          "version": "v1"
+        },
+        {
+          "contract_id": "onboard_route_guide",
+          "version": "service"
+        }
+      ],
+      "allowed_successors": [],
+      "requires_contract_chain_id": true,
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "successor_start_default": "deny_until_parent_exposes_eligible_blocked_handoff"
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "mutable_completed_lines_trust_root": false,
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state"
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "candidate_branch_graph_is_evidence_only": true,
+      "formatting_only_drift_must_remain_visible": true,
+      "independent_review_required": true,
+      "parent_close_gate_recheck_required": true,
+      "same_revision_semantic_change_allowed": false,
+      "semantic_change_requires_new_revision": true
+    },
+    "graph_binding_policy": {
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true,
+      "source_asset_materialization_required": true
+    }
+  },
+  "successors": [],
+  "version": "v1"
+}

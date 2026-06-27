@@ -19,10 +19,12 @@ DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "contract_templates"
 FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
 NON_TEMPLATE_CONTRACT_FILES = {"meta_contract.v1.json"}
 CONTRACT_TEMPLATE_ALIASES = {
+    "direct_fix": "direct_fix.v1",
     "hotfix.v1": "observer_hotfix_direct_mutation.v1",
     "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
 }
 CONTRACT_TASK_TYPE_ALIASES = {
+    "direct": "direct_fix",
     "hotfix": "observer_hotfix",
 }
 

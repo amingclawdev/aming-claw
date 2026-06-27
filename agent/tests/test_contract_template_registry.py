@@ -311,6 +311,24 @@ def test_hotfix_template_aliases_resolve_to_observer_direct_mutation_template():
     )
 
 
+def test_direct_fix_source_definition_is_registered_as_template_candidate():
+    template = get_contract_template("direct_fix.v1")
+
+    assert template["template_id"] == "direct_fix.v1"
+    assert template["version"] == "v1"
+    assert template["source"]["type"] == "source_controlled"
+    assert template["runtime_contract_hints"]["contract_definition_id"] == "direct_fix"
+    assert template["gate_policy"]["parent_blocked_handoff_required"] is True
+    assert "bypass_parent_close_gate" in template["forbidden_capabilities"]
+    assert resolve_contract_template(template_id="direct_fix")["template_id"] == (
+        "direct_fix.v1"
+    )
+    assert resolve_contract_template(
+        task_type="direct_fix",
+        stage="return_to_parent",
+    )["template_id"] == "direct_fix.v1"
+
+
 def test_resolution_by_task_type_and_stage():
     template = resolve_contract_template(
         task_type="design_review",
