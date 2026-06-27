@@ -56,6 +56,24 @@
         "stage_id": "operator_approval"
       },
       {
+        "description": "Observer binds a bounded worker runtime context before worker repair evidence.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Dispatch/context binding for the bounded worker that will record direct_fix repair evidence.",
+            "evidence_kind": "dispatch_bounded_worker",
+            "line_id": "direct_fix_dispatch_context",
+            "owner_role": "observer",
+            "requires": [
+              "direct_fix_operator_approval"
+            ]
+          }
+        ],
+        "stage_id": "dispatch_context"
+      },
+      {
         "description": "Bounded worker records candidate-lane repair evidence.",
         "lines": [
           {
@@ -67,7 +85,7 @@
             "line_id": "direct_fix_candidate_repair",
             "owner_role": "mf_sub",
             "requires": [
-              "direct_fix_operator_approval"
+              "direct_fix_dispatch_context"
             ]
           }
         ],

@@ -34047,6 +34047,142 @@ def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _onboard_service_record(value: Mapping[str, Any] | None) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if str(value.get("contract_id") or "") != ONBOARD_ROUTE_GUIDE_SERVICE_ID:
+        return False
+    metadata = value.get("metadata") if isinstance(value.get("metadata"), Mapping) else {}
+    return (
+        str(value.get("version") or "") == "service"
+        or str(metadata.get("service_source") or "") == "onboard_route_guide_service"
+        or bool(metadata.get("legacy_onboard_contract_waived"))
+    )
+
+
+def _contract_runtime_complete_direct_fix_child_for_parent(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    parent_contract_execution_id = str(parent_contract_execution_id or "").strip()
+    if not parent_contract_execution_id:
+        return {}
+    row = conn.execute(
+        """
+        SELECT contract_execution_id
+        FROM contract_runtime_executions
+        WHERE project_id = ?
+          AND backlog_id = ?
+          AND contract_id = ?
+          AND parent_contract_execution_id = ?
+        ORDER BY updated_at DESC, execution_state_revision DESC
+        LIMIT 5
+        """,
+        (project_id, backlog_id, DIRECT_FIX_CONTRACT_ID, parent_contract_execution_id),
+    ).fetchall()
+    runtime = _contract_runtime(conn)
+    for item in row:
+        execution_id = str(_row_get(item, "contract_execution_id", "") or "").strip()
+        if not execution_id:
+            continue
+        try:
+            runtime.current_guide(execution_id, actor_role=actor_role or "observer")
+            record = runtime.store.get(execution_id)
+        except (ContractRuntimeError, StalePinnedContractExecutionError):
+            continue
+        if _runtime_record_is_complete(record):
+            return record
+    return {}
+
+
+def _onboard_service_apply_successor_return_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    actor_role: str,
+) -> dict[str, Any]:
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    successor = _contract_runtime_complete_direct_fix_child_for_parent(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_execution_id,
+        actor_role=actor_role,
+    )
+    if not successor:
+        return dict(record)
+
+    guide = dict(record.get("runtime_guide") or {})
+    completed_lines = (
+        successor.get("completed_lines")
+        if isinstance(successor.get("completed_lines"), list)
+        else []
+    )
+    return_line = next(
+        (
+            line
+            for line in reversed(completed_lines)
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "") == "direct_fix_return_to_parent"
+        ),
+        {},
+    )
+    guide.pop("blocked_contract_runtime", None)
+    guide["successor_return"] = {
+        "schema_version": "onboard_route_guide.successor_return.v1",
+        "status": "returned",
+        "source": "completed_direct_fix_child",
+        "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+        "successor_contract_execution_id": str(
+            successor.get("contract_execution_id") or ""
+        ),
+        "parent_contract_execution_id": parent_execution_id,
+        "child_execution_state_revision": int(
+            successor.get("execution_state_revision") or 0
+        ),
+        "child_runtime_guide_hash": str(
+            (successor.get("runtime_guide") or {}).get("runtime_guide_hash") or ""
+        )
+        if isinstance(successor.get("runtime_guide"), Mapping)
+        else "",
+        "return_line_present": bool(return_line),
+    }
+    guide["next_legal_action"] = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": "resume_parent_after_successor_return",
+        "action": "re_read_parent_contract_and_continue",
+        "source": "onboard_route_guide_service",
+        "precedence": "successor_return_completed",
+        "contract_execution_id": parent_execution_id,
+        "stage_id": "successor_return",
+        "line_id": "resume_parent_after_successor_return",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "successor_return_acknowledgement",
+        "required": False,
+        "status": "ready",
+        "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+        "successor_contract_execution_id": str(
+            successor.get("contract_execution_id") or ""
+        ),
+        "parent_close_gate_recheck_required": True,
+        "child_must_not_write_parent_close_evidence": True,
+        "meta_contract_gate_decision_source": False,
+    }
+    guide["runtime_guide_hash"] = stable_sha256(
+        {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
+    )
+    projected = dict(record)
+    projected["runtime_guide"] = guide
+    return projected
+
+
 def _contract_runtime_read(
     conn,
     *,
@@ -34054,6 +34190,22 @@ def _contract_runtime_read(
     actor_role: str,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
+    stored = runtime.store.get(contract_execution_id)
+    if _onboard_service_record(stored):
+        projected = _contract_runtime_apply_blocked_projection(
+            conn,
+            project_id=str(stored.get("project_id") or ""),
+            backlog_id=str(stored.get("backlog_id") or ""),
+            record=stored,
+            actor_role=actor_role,
+        )
+        return _onboard_service_apply_successor_return_projection(
+            conn,
+            project_id=str(stored.get("project_id") or ""),
+            backlog_id=str(stored.get("backlog_id") or ""),
+            record=projected,
+            actor_role=actor_role,
+        )
     runtime.current_guide(contract_execution_id, actor_role=actor_role)
     record = runtime.store.get(contract_execution_id)
     return _contract_runtime_apply_blocked_projection(
@@ -34313,10 +34465,19 @@ def _contract_runtime_record_references_runtime_context(
             )
             if _matches_context(worker_context) or _matches_context(worker_dispatch):
                 return True
+        is_legacy_dispatch_line = (
+            str(line.get("stage_id") or "").strip() == "dispatch"
+            and str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+        )
+        is_direct_fix_dispatch_line = (
+            contract_id == DIRECT_FIX_CONTRACT_ID
+            and str(line.get("stage_id") or "").strip() == "dispatch_context"
+            and str(line.get("line_id") or "").strip()
+            == "direct_fix_dispatch_context"
+        )
         if (
-            str(line.get("stage_id") or "").strip() != "dispatch"
-            or str(line.get("line_id") or "").strip()
-            != "observer_dispatch_bounded_workers"
+            not (is_legacy_dispatch_line or is_direct_fix_dispatch_line)
             or str(line.get("evidence_kind") or "").strip()
             != "dispatch_bounded_worker"
             or str(line.get("actor_role") or "").strip() != "observer"
@@ -34742,12 +34903,119 @@ def _onboard_service_parent_record(
     }
 
 
+def _onboard_service_waiver_line() -> dict[str, Any]:
+    return {
+        "stage_id": "onboard_service",
+        "line_id": "legacy_onboard_contract_waived",
+        "actor_role": "observer",
+        "evidence_kind": "onboard_service_waiver",
+        "payload": {
+            "legacy_onboard_contract_waived": True,
+            "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        },
+    }
+
+
+def _onboard_service_blocked_successor_line(
+    blocked_successor_entry: Mapping[str, Any],
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    payload = dict(blocked_successor_entry)
+    payload.setdefault(
+        "schema_version", "onboard_service.successor_entry_blocked.v1"
+    )
+    payload["status"] = "blocked"
+    payload.setdefault("recommended_successor_contract_id", DIRECT_FIX_CONTRACT_ID)
+    payload.setdefault("recommended_next_action", "enter_direct_fix_successor")
+    if reason and not str(payload.get("block_reason") or "").strip():
+        payload["block_reason"] = reason
+    return {
+        "stage_id": "onboard_service_successor_entry",
+        "line_id": "successor_entry_gate_blocked",
+        "actor_role": "observer",
+        "evidence_kind": "successor_entry_gate_block",
+        "status": "blocked",
+        "payload": payload,
+    }
+
+
+def _onboard_service_refresh_execution_state(
+    record: Mapping[str, Any],
+    *,
+    completed_lines: list[Mapping[str, Any]],
+    route_token_ref: str,
+    revision: int,
+) -> dict[str, Any]:
+    execution_id = str(record.get("contract_execution_id") or "")
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    state = {
+        "schema_version": "contract_execution_state.v1",
+        "contract_execution_id": execution_id,
+        "execution_state_revision": revision,
+        "completed_lines": [dict(line) for line in completed_lines],
+    }
+    state["execution_state_hash"] = stable_sha256(state)
+    guide = dict(record.get("runtime_guide") or {})
+    guide["schema_version"] = "onboard_route_guide.runtime_parent.v1"
+    guide["execution"] = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "execution_state_revision": revision,
+        "execution_state_hash": state["execution_state_hash"],
+        "route_token_ref": route_token_ref,
+    }
+    guide["completed_lines"] = list(state["completed_lines"])
+    guide["runtime_guide_hash"] = stable_sha256(guide)
+    refreshed = dict(record)
+    refreshed.update(
+        {
+            "schema_version": "contract_runtime_execution_record.v1",
+            "definition_hash": stable_sha256(
+                {
+                    "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                    "version": "service",
+                    "revision": "v1",
+                }
+            ),
+            "definition_source_sha256": "",
+            "instruction_bundle_hash": stable_sha256(
+                {
+                    "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                    "instruction": "guide_service",
+                }
+            ),
+            "completed_lines": list(state["completed_lines"]),
+            "execution_state_revision": revision,
+            "execution_state": state,
+            "runtime_guide": guide,
+            "precheck_decision": {
+                "schema_version": "contract_gate_decision.v1",
+                "ok": True,
+                "decision": "allow",
+                "action": "onboard_route_guide",
+                "gate_id": "onboard_route_guide:service_parent",
+                "source_of_authority": "onboard_route_guide_service",
+            },
+            "role_binding": {
+                "observer": "observer",
+                "binding_source": "onboard_route_guide_service",
+            },
+        }
+    )
+    return refreshed
+
+
 def _onboard_service_materialize_parent_record(
     conn,
     *,
     project_id: str,
     backlog_id: str,
     route_token_ref: str = "",
+    blocked_successor_entry: Mapping[str, Any] | None = None,
+    blocked_reason: str = "",
 ) -> dict[str, Any]:
     record = _onboard_service_parent_record(
         project_id=project_id,
@@ -34756,76 +35024,54 @@ def _onboard_service_materialize_parent_record(
     )
     execution_id = str(record.get("contract_execution_id") or "")
     store = _contract_runtime_store(conn)
+    completed_lines = [_onboard_service_waiver_line()]
+    if isinstance(blocked_successor_entry, Mapping):
+        completed_lines.append(
+            _onboard_service_blocked_successor_line(
+                blocked_successor_entry,
+                reason=blocked_reason,
+            )
+        )
     try:
         existing = store.get(execution_id)
     except ContractRuntimeError:
-        state = {
-            "schema_version": "contract_execution_state.v1",
-            "contract_execution_id": execution_id,
-            "execution_state_revision": 1,
-            "completed_lines": [
-                {
-                    "stage_id": "onboard_service",
-                    "line_id": "legacy_onboard_contract_waived",
-                    "actor_role": "observer",
-                    "evidence_kind": "onboard_service_waiver",
-                    "payload": {
-                        "legacy_onboard_contract_waived": True,
-                        "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-                    },
-                }
-            ],
-        }
-        state["execution_state_hash"] = stable_sha256(state)
-        guide = dict(record["runtime_guide"])
-        guide["execution"] = {
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "contract_execution_id": execution_id,
-            "execution_state_revision": 1,
-            "execution_state_hash": state["execution_state_hash"],
-            "route_token_ref": route_token_ref,
-        }
-        guide["completed_lines"] = list(state["completed_lines"])
-        guide["runtime_guide_hash"] = stable_sha256(guide)
-        record.update(
-            {
-                "schema_version": "contract_runtime_execution_record.v1",
-                "definition_hash": stable_sha256(
-                    {
-                        "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-                        "version": "service",
-                        "revision": "v1",
-                    }
-                ),
-                "definition_source_sha256": "",
-                "instruction_bundle_hash": stable_sha256(
-                    {
-                        "service_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-                        "instruction": "guide_service",
-                    }
-                ),
-                "completed_lines": list(state["completed_lines"]),
-                "execution_state_revision": 1,
-                "execution_state": state,
-                "runtime_guide": guide,
-                "precheck_decision": {
-                    "schema_version": "contract_gate_decision.v1",
-                    "ok": True,
-                    "decision": "allow",
-                    "action": "onboard_route_guide",
-                    "gate_id": "onboard_route_guide:service_parent",
-                    "source_of_authority": "onboard_route_guide_service",
-                },
-                "role_binding": {
-                    "observer": "observer",
-                    "binding_source": "onboard_route_guide_service",
-                },
-            }
+        created = store.create(
+            _onboard_service_refresh_execution_state(
+                record,
+                completed_lines=completed_lines,
+                route_token_ref=route_token_ref,
+                revision=1,
+            )
         )
-        return store.create(record)
+        if blocked_successor_entry is None:
+            return created
+        projected = _contract_runtime_apply_blocked_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            record=created,
+            actor_role="observer",
+        )
+        return store.update(execution_id, projected)
     if route_token_ref and not str(existing.get("route_token_ref") or ""):
         existing["route_token_ref"] = route_token_ref
+    if blocked_successor_entry is not None:
+        revision = int(existing.get("execution_state_revision") or 0) + 1
+        existing = _onboard_service_refresh_execution_state(
+            existing,
+            completed_lines=completed_lines,
+            route_token_ref=route_token_ref or str(existing.get("route_token_ref") or ""),
+            revision=revision,
+        )
+        existing = _contract_runtime_apply_blocked_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            record=existing,
+            actor_role="observer",
+        )
+        return store.update(execution_id, existing)
+    if route_token_ref:
         return store.update(execution_id, existing)
     return existing
 
@@ -35795,6 +36041,73 @@ def _onboard_blocked_contract_resume_projection(
     for row in rows:
         execution_id = str(_row_get(row, "contract_execution_id", "") or "")
         if not execution_id:
+            continue
+        try:
+            record = runtime.store.get(execution_id)
+        except ContractRuntimeError:
+            continue
+        if _onboard_service_record(record):
+            projected = _contract_runtime_apply_blocked_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                record=record,
+                actor_role=actor_role or "observer",
+            )
+            projected = _onboard_service_apply_successor_return_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                record=projected,
+                actor_role=actor_role or "observer",
+            )
+            guide = (
+                projected.get("runtime_guide")
+                if isinstance(projected.get("runtime_guide"), Mapping)
+                else {}
+            )
+            successor_return = (
+                guide.get("successor_return")
+                if isinstance(guide.get("successor_return"), Mapping)
+                else {}
+            )
+            next_action = _runtime_next_action_from_guide(guide)
+            if successor_return and next_action:
+                return {
+                    "schema_version": "onboard_route_guide.runtime_resume.v1",
+                    "status": str(successor_return.get("status") or "returned"),
+                    "mode": "resume_parent_after_successor_return",
+                    "source": "onboard_route_guide_service_parent",
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "parent_contract_execution_id": execution_id,
+                    "next_legal_action": next_action,
+                    "successor_return": dict(successor_return),
+                }
+            next_action = _onboard_direct_fix_next_action_from_runtime(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                record=projected,
+            )
+            if next_action:
+                return {
+                    "schema_version": "onboard_route_guide.runtime_resume.v1",
+                    "status": "blocked",
+                    "mode": "resume_blocked_contract",
+                    "source": "onboard_route_guide_service_parent",
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "parent_contract_execution_id": execution_id,
+                    "next_legal_action": next_action,
+                    "blocked_contract_runtime": (
+                        projected.get("runtime_guide", {}).get(
+                            "blocked_contract_runtime"
+                        )
+                        if isinstance(projected.get("runtime_guide"), Mapping)
+                        else {}
+                    )
+                    or {},
+                }
             continue
         try:
             runtime.current_guide(execution_id, actor_role=actor_role or "observer")
@@ -36968,6 +37281,97 @@ def _contract_runtime_parent_for_successor(
             "next_legal_action": current_state.get("next_legal_action") or {},
         },
     )
+
+
+def _direct_fix_blocked_successor_entry_from_body(
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    for key in (
+        "blocked_successor_entry",
+        "blocked_parent_next_action",
+        "blocked_successor",
+        "successor_entry_blocker",
+    ):
+        value = body.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _direct_fix_onboard_service_parent_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    route_token_ref: str,
+    body: Mapping[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    expected_parent_execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    if parent_contract_execution_id != expected_parent_execution_id:
+        raise ValidationError(
+            "onboard service direct_fix parent id mismatch",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "expected_parent_contract_execution_id": expected_parent_execution_id,
+            },
+        )
+    blocked_entry = _direct_fix_blocked_successor_entry_from_body(body)
+    if not blocked_entry:
+        raise ValidationError(
+            "direct_fix onboard-service parent requires blocked successor evidence",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "required_body_field": "blocked_successor_entry",
+            },
+        )
+    status = str(blocked_entry.get("status") or "").strip().lower()
+    if status not in {
+        "blocked",
+        "blocker",
+        "failed_blocked",
+    } and not _direct_fix_blocker_signal(blocked_entry):
+        raise ValidationError(
+            "direct_fix onboard-service parent evidence must describe a blocker",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "status": status,
+            },
+        )
+    parent_record = _onboard_service_materialize_parent_record(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        blocked_successor_entry=blocked_entry,
+        blocked_reason=reason,
+    )
+    blocked_line = _contract_runtime_last_blocked_line(parent_record)
+    if _contract_runtime_block_successor_id(blocked_line) != DIRECT_FIX_CONTRACT_ID:
+        raise ValidationError(
+            "onboard-service parent blocker does not expose direct_fix successor",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "blocked_line": blocked_line,
+            },
+        )
+    direct_fix_definition = _contract_runtime(conn).registry.get(
+        DIRECT_FIX_CONTRACT_ID,
+        version="v1",
+        include_deprecated=True,
+    )
+    if not _direct_fix_definition_allows_parent(direct_fix_definition, parent_record):
+        raise ValidationError(
+            "direct_fix contract does not allow onboard-service parent contract",
+            {
+                "parent_contract_execution_id": parent_contract_execution_id,
+                "parent_contract_id": str(parent_record.get("contract_id") or ""),
+                "parent_contract_version": str(parent_record.get("version") or ""),
+                "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+            },
+        )
+    return parent_record
 
 
 def _contract_update_parent_for_successor(
@@ -46506,14 +46910,27 @@ def handle_project_direct_fix_enter(ctx: RequestContext):
                 },
             )
         try:
-            parent_record = _contract_runtime_parent_for_successor(
-                conn,
-                project_id=project_id,
-                backlog_id=backlog_id,
-                parent_contract_execution_id=parent_execution_id,
-                successor_contract_id=DIRECT_FIX_CONTRACT_ID,
-                actor_role=actor_role,
-            )
+            if parent_execution_id == _onboard_service_execution_id(
+                project_id, backlog_id
+            ):
+                parent_record = _direct_fix_onboard_service_parent_for_successor(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    parent_contract_execution_id=parent_execution_id,
+                    route_token_ref=route_token_ref,
+                    body=body,
+                    reason=reason,
+                )
+            else:
+                parent_record = _contract_runtime_parent_for_successor(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    parent_contract_execution_id=parent_execution_id,
+                    successor_contract_id=DIRECT_FIX_CONTRACT_ID,
+                    actor_role=actor_role,
+                )
         except StalePinnedContractExecutionError as exc:
             _raise_stale_contract_runtime_validation(
                 exc,

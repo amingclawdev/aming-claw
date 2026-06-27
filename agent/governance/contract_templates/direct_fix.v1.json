@@ -111,6 +111,11 @@
       "event_kind": "operator_approval"
     },
     {
+      "id": "direct_fix_dispatch_context",
+      "owner_role": "observer",
+      "event_kind": "dispatch_bounded_worker"
+    },
+    {
       "id": "direct_fix_candidate_repair",
       "owner_role": "mf_sub",
       "event_kind": "direct_fix_repair_evidence"

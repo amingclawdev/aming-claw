@@ -24258,6 +24258,313 @@ def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
     assert entered["next_legal_action"]["owner_role"] == "observer"
 
 
+def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
+    backlog_id = "AC-DIRECT-FIX-BLOCKED-ONBOARD-SERVICE-PARENT"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    direct_execution_id = "cex-direct-fix-onboard-service-parent-test"
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair successor entry gate blocked after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": "rtok-direct-fix-onboard-service-parent",
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocked_interface": "mf_parallel_enter",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "block_reason": (
+                        "mf_parallel enter rejected onboard service waiver evidence"
+                    ),
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+
+    assert entered["contract_id"] == "direct_fix"
+    assert entered["parent_contract_execution_id"] == parent_execution_id
+    assert entered["root_contract_execution_id"] == parent_execution_id
+    assert entered["contract_chain_id"] == server._onboard_service_chain_id(
+        PID, backlog_id
+    )
+    assert entered["return_to_parent"]["parent_contract_id"] == "onboard_route_guide"
+    assert entered["return_to_parent"]["blocked_gate"] == "successor_entry_gate_block"
+    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
+    assert entered["qa_independent_verification"]["required"] is True
+
+    parent = server._contract_runtime_store(conn).get(parent_execution_id)
+    blocked_line = parent["completed_lines"][-1]
+    assert blocked_line["status"] == "blocked"
+    assert blocked_line["payload"]["blocked_successor_contract_id"] == "mf_parallel"
+    assert parent["runtime_guide"]["next_legal_action"]["action"] == (
+        "enter_direct_fix_successor"
+    )
+
+
+def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_path):
+    backlog_id = "AC-DIRECT-FIX-DISPATCH-CONTEXT-BINDING"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    direct_execution_id = "cex-direct-fix-dispatch-context"
+    route_token_ref = "rtok-direct-fix-dispatch-context"
+    worker_task_id = "direct-fix-worker-task"
+    runtime_context_id = "mfrctx-direct-fix-worker"
+    parent_task_id = direct_execution_id
+    fence_token = "fence-direct-fix-dispatch-context"
+    worker_session_token = "worker-session-direct-fix"
+    target_root = str(tmp_path)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair successor entry gate blocked after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": route_token_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
+
+    approved = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "operator_approval",
+                "line_id": "direct_fix_operator_approval",
+                "evidence_kind": "operator_approval",
+                "route_token_ref": route_token_ref,
+                "payload": {
+                    "operator_approval_ref": "test:direct-fix-dispatch-context",
+                    "approved_scope": "bind worker before repair evidence",
+                },
+            },
+        )
+    )
+    assert approved["ok"] is True
+    next_action = approved["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["stage_id"] == "dispatch_context"
+    assert next_action["line_id"] == "direct_fix_dispatch_context"
+    assert next_action["owner_role"] == "observer"
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=worker_task_id,
+            parent_task_id=parent_task_id,
+            root_task_id=direct_execution_id,
+            stage_task_id=worker_task_id,
+            stage_type="direct_fix",
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            branch_ref="refs/heads/codex/direct-fix-dispatch-context",
+            ref_name="main",
+            status=STATE_WORKTREE_READY,
+            target_project_root=target_root,
+            governance_project_id=PID,
+            target_project_id=PID,
+            fence_token=fence_token,
+            session_token_hash=mf_subagent_session_token_hash(worker_session_token),
+        ),
+    )
+
+    dispatched = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch_context",
+                "line_id": "direct_fix_dispatch_context",
+                "evidence_kind": "dispatch_bounded_worker",
+                "route_token_ref": route_token_ref,
+                "runtime_context_id": runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": worker_task_id,
+                    "parent_task_id": parent_task_id,
+                    "worker_role": "mf_sub",
+                    "target_project_root": target_root,
+                    "candidate_runtime_id": "candrt-direct-fix-test",
+                },
+            },
+        )
+    )
+    assert dispatched["ok"] is True
+    next_action = dispatched["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["stage_id"] == "candidate_repair"
+    assert next_action["line_id"] == "direct_fix_candidate_repair"
+    assert next_action["owner_role"] == "mf_sub"
+
+    repaired = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "coordinator",
+            method="POST",
+            body={
+                "stage_id": "candidate_repair",
+                "line_id": "direct_fix_candidate_repair",
+                "evidence_kind": "direct_fix_repair_evidence",
+                "runtime_context_id": runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token": worker_session_token,
+                "target_project_root": target_root,
+                "payload": {
+                    "status": "implemented",
+                    "changed_files": [
+                        "agent/governance/contract_definitions/direct_fix.v1.rev1.json"
+                    ],
+                    "candidate_runtime_target_truth_activated": False,
+                },
+            },
+        )
+    )
+    assert repaired["ok"] is True
+    next_action = repaired["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["owner_role"] == "qa"
+
+    qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "verification": {
+                    "verdict": "PASS",
+                    "independent": True,
+                },
+                "payload": {
+                    "qa_summary": "dispatch context was required before repair",
+                },
+            },
+        )
+    )
+    assert qa["ok"] is True
+    next_action = qa["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["line_id"] == "direct_fix_return_to_parent"
+    assert next_action["owner_role"] == "observer"
+
+    returned = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "return_to_parent",
+                "line_id": "direct_fix_return_to_parent",
+                "evidence_kind": "direct_fix_return_to_parent",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "child_must_not_close_parent": True,
+                },
+            },
+        )
+    )
+    assert returned["ok"] is True
+    assert returned["next_legal_action"] == {}
+
+    parent_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    assert parent_current["ok"] is True
+    assert parent_current["contract_id"] == "onboard_route_guide"
+    parent_next = parent_current["next_legal_action"]
+    assert parent_next["id"] == "resume_parent_after_successor_return"
+    assert parent_next["successor_contract_execution_id"] == direct_execution_id
+    successor_return = parent_current["runtime_guide"]["successor_return"]
+    assert successor_return["status"] == "returned"
+    assert successor_return["return_line_present"] is True
+
+    onboard = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "direct_fix",
+            },
+        )
+    )
+    assert onboard["ok"] is True
+    assert onboard["runtime_resume"]["status"] == "returned"
+    assert onboard["next_legal_action"]["id"] == "resume_parent_after_successor_return"
+    assert (
+        onboard["next_legal_action"]["successor_contract_execution_id"]
+        == direct_execution_id
+    )
+
+
+def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):
+    backlog_id = "AC-DIRECT-FIX-ONBOARD-SERVICE-PARENT-NO-BLOCKER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+
+    with pytest.raises(
+        ValidationError,
+        match="requires blocked successor evidence",
+    ):
+        server.handle_project_direct_fix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Do not allow root direct_fix through onboard service.",
+                    "backlog_id": backlog_id,
+                    "task_id": "direct-fix-no-blocker",
+                    "parent_contract_execution_id": parent_execution_id,
+                    "contract_execution_id": "cex-direct-fix-no-blocker",
+                    "route_token_ref": "rtok-direct-fix-no-blocker",
+                },
+            )
+        )
+
+
 def test_hotfix_enter_rejects_explicit_parent_without_allowed_successor(conn):
     backlog_id = "AC-HOTFIX-BLOCK-PARENT-NOT-ALLOWING-SUCCESSOR"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
