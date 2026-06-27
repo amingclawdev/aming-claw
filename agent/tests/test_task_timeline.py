@@ -1679,6 +1679,10 @@ class TestTaskTimeline(unittest.TestCase):
 
     def test_timeline_list_can_include_compact_multi_backlog_ledger(self):
         from agent.governance import server, task_timeline
+        from agent.governance.parallel_branch_runtime import (
+            MergeQueueItem,
+            upsert_merge_queue_items,
+        )
 
         for bug_id, priority in (
             ("AC-BATCH", "P0"),
@@ -1732,7 +1736,7 @@ class TestTaskTimeline(unittest.TestCase):
             self.conn,
             project_id="proj",
             backlog_id="AC-ROW-B",
-            task_id="direct-block",
+            task_id="batch-task:row:1",
             event_type="mf.blocker",
             event_kind="blocker",
             status="blocked",
@@ -1743,6 +1747,34 @@ class TestTaskTimeline(unittest.TestCase):
                     "durable_queue_count": 0,
                 }
             },
+        )
+        upsert_merge_queue_items(
+            self.conn,
+            [
+                MergeQueueItem(
+                    project_id="proj",
+                    merge_queue_id="mq-batch",
+                    queue_item_id="mqitem-b",
+                    task_id="batch-task:row:1",
+                    branch_ref="refs/heads/row-b",
+                    queue_index=1,
+                    status="planned",
+                    base_commit="head-1",
+                    current_target_head="head-1",
+                ),
+                MergeQueueItem(
+                    project_id="proj",
+                    merge_queue_id="mq-batch",
+                    queue_item_id="mqitem-a",
+                    task_id="batch-task:row:2",
+                    branch_ref="refs/heads/row-a",
+                    queue_index=2,
+                    status="planned",
+                    base_commit="head-1",
+                    current_target_head="head-1",
+                ),
+            ],
+            now_iso="2026-06-27T00:00:00Z",
         )
         self.conn.commit()
 
@@ -1766,6 +1798,21 @@ class TestTaskTimeline(unittest.TestCase):
             "observer_prefill_child_contracts",
         )
         self.assertGreater(by_id["AC-ROW-A"]["latest_payload_ref"]["payload_bytes"], 0)
+        scoped = server.handle_task_timeline_list(
+            _ctx(
+                {
+                    "backlog_id": "AC-ROW-B",
+                    "include_compact_ledger": "true",
+                    "limit": "20",
+                }
+            )
+        )
+        scoped_rows = scoped["compact_ledger"]["rows"]
+        self.assertEqual(len(scoped_rows), 1)
+        self.assertEqual(scoped_rows[0]["merge_queue_id"], "mq-batch")
+        self.assertEqual(scoped_rows[0]["merge_queue_index"], 1)
+        self.assertEqual(scoped_rows[0]["merge_queue_item_id"], "mqitem-b")
+        self.assertEqual(scoped_rows[0]["merge_queue_status"], "planned")
 
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline

@@ -12799,6 +12799,62 @@ def _compact_backlog_rows(
     return {str(row["bug_id"] or ""): dict(row) for row in rows}
 
 
+def _compact_merge_queue_items_by_task(
+    conn: sqlite3.Connection,
+    project_id: str,
+    task_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    if not task_ids:
+        return {}
+    if not conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'parallel_branch_merge_queue_items'
+        """
+    ).fetchone():
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT merge_queue_id, queue_item_id, task_id, branch_ref, queue_index,
+               status, target_ref, base_commit, branch_head, current_target_head,
+               target_head_after_merge, merge_commit
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND task_id IN ({placeholders})
+        ORDER BY queue_index, queue_item_id
+        """,
+        (project_id, *tuple(sorted(task_ids))),
+    ).fetchall()
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        task_id = str(row["task_id"] or "")
+        if task_id and task_id not in found:
+            found[task_id] = dict(row)
+    return found
+
+
+def _apply_compact_merge_queue_item(
+    row: dict[str, Any],
+    item: Mapping[str, Any],
+) -> None:
+    row["merge_queue_id"] = str(item.get("merge_queue_id") or row.get("merge_queue_id") or "")
+    row["merge_queue_index"] = int(item.get("queue_index") or row.get("merge_queue_index") or 0)
+    row["merge_queue_item_id"] = str(
+        item.get("queue_item_id") or row.get("merge_queue_item_id") or ""
+    )
+    row["merge_queue_task_id"] = str(item.get("task_id") or row.get("merge_queue_task_id") or "")
+    row["merge_queue_status"] = str(item.get("status") or row.get("merge_queue_status") or "")
+    if not row.get("head_commit"):
+        row["head_commit"] = (
+            str(item.get("target_head_after_merge") or "")
+            or str(item.get("current_target_head") or "")
+            or str(item.get("branch_head") or "")
+            or str(item.get("base_commit") or "")
+        )
+    if row.get("readiness_state") == "unknown" and row.get("merge_queue_id"):
+        row["readiness_state"] = "planned"
+
+
 def _compact_ledger_backlog_ids(event: Mapping[str, Any]) -> set[str]:
     ids: set[str] = set()
     backlog_id = str(event.get("backlog_id") or "").strip()
@@ -12826,9 +12882,14 @@ def build_compact_ledger(
 ) -> dict[str, Any]:
     """Build a row-sized multi-backlog ledger from structured runtime evidence."""
     backlog_ids: set[str] = set()
+    task_ids: set[str] = set()
     for event in events:
         backlog_ids.update(_compact_ledger_backlog_ids(event))
+        task_id = str(event.get("task_id") or "").strip()
+        if task_id:
+            task_ids.add(task_id)
     backlog_rows = _compact_backlog_rows(conn, backlog_ids)
+    merge_queue_items_by_task = _compact_merge_queue_items_by_task(conn, project_id, task_ids)
     ledger: dict[str, dict[str, Any]] = {}
 
     def ensure(backlog_id: str) -> dict[str, Any]:
@@ -12846,6 +12907,7 @@ def build_compact_ledger(
                 "merge_queue_index": 0,
                 "merge_queue_item_id": "",
                 "merge_queue_task_id": "",
+                "merge_queue_status": "",
                 "latest_event_id": 0,
                 "latest_event_kind": "",
                 "latest_event_type": "",
@@ -12877,9 +12939,14 @@ def build_compact_ledger(
                 row["merge_queue_index"] = int(item.get("queue_index") or 0)
                 row["merge_queue_item_id"] = str(item.get("queue_item_id") or "")
                 row["merge_queue_task_id"] = str(item.get("task_id") or "")
+                row["merge_queue_status"] = str(item.get("status") or row["merge_queue_status"])
 
         for backlog_id in event_backlog_ids:
             row = ensure(backlog_id)
+            task_id = str(event.get("task_id") or "").strip()
+            queue_item = merge_queue_items_by_task.get(task_id)
+            if queue_item:
+                _apply_compact_merge_queue_item(row, queue_item)
             event_id = int(event.get("id") or 0)
             if event_id < int(row.get("latest_event_id") or 0):
                 continue
