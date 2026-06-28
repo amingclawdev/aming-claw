@@ -43788,6 +43788,363 @@ def _contract_runtime_close_authority_event(
     return event
 
 
+def _contract_runtime_server_derived_close_authority(
+    chain_projection: Mapping[str, Any],
+) -> bool:
+    active_chain = (
+        chain_projection.get("active_chain")
+        if isinstance(chain_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    execution_ids = [
+        str(execution_id or "").strip()
+        for execution_id in (active_chain.get("execution_ids") or [])
+        if str(execution_id or "").strip()
+    ]
+    return bool(
+        isinstance(chain_projection, Mapping)
+        and str(chain_projection.get("projection_source") or "")
+        == "backlog_contract_chain_current"
+        and str(chain_projection.get("source_of_proof") or "")
+        == "contract_runtime_executions.completed_lines"
+        and execution_ids
+    )
+
+
+def _contract_runtime_close_authority_chain_records(
+    runtime,
+    *,
+    chain_projection: Mapping[str, Any],
+    seed_record: Mapping[str, Any],
+    project_id: str,
+    bug_id: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    chain = chain_projection if isinstance(chain_projection, Mapping) else {}
+    active_chain = (
+        chain.get("active_chain")
+        if isinstance(chain.get("active_chain"), Mapping)
+        else {}
+    )
+    execution_ids = [
+        str(execution_id or "").strip()
+        for execution_id in (active_chain.get("execution_ids") or [])
+        if str(execution_id or "").strip()
+    ]
+    if not execution_ids:
+        return []
+    active_execution_ids = set(execution_ids)
+
+    def add_record(record: Mapping[str, Any]) -> None:
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        if not execution_id or execution_id in seen:
+            return
+        if active_execution_ids and execution_id not in active_execution_ids:
+            return
+        if str(record.get("project_id") or "").strip() != project_id:
+            return
+        if str(record.get("backlog_id") or "").strip() != bug_id:
+            return
+        seen.add(execution_id)
+        records.append(dict(record))
+
+    add_record(seed_record)
+    for execution_id in execution_ids:
+        if execution_id in seen:
+            continue
+        try:
+            add_record(runtime.store.get(execution_id))
+        except ContractRuntimeError:
+            continue
+    return records
+
+
+def _contract_runtime_completed_line_items(
+    record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    lines = guide.get("completed_lines")
+    if not isinstance(lines, list):
+        lines = record.get("completed_lines")
+    result: list[dict[str, Any]] = []
+    if not isinstance(lines, list):
+        return result
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        item = dict(line)
+        item.setdefault("_completed_line_index", index)
+        if execution_id:
+            item.setdefault(
+                "_source_ref",
+                f"contract_runtime:{execution_id}:completed_lines:{index}",
+            )
+        result.append(item)
+    return result
+
+
+def _contract_runtime_line_status_passes(line: Mapping[str, Any]) -> bool:
+    containers = [
+        line,
+        line.get("payload") if isinstance(line.get("payload"), Mapping) else {},
+        line.get("verification") if isinstance(line.get("verification"), Mapping) else {},
+        line.get("artifact_refs") if isinstance(line.get("artifact_refs"), Mapping) else {},
+    ]
+    for container in containers:
+        status = str(
+            container.get("status")
+            or container.get("verdict")
+            or container.get("decision")
+            or ""
+        ).strip().lower()
+        if status in {"fail", "failed", "failure", "reject", "rejected", "blocked"}:
+            return False
+    return True
+
+
+def _contract_runtime_direct_fix_line_matches(
+    line: Mapping[str, Any],
+    *,
+    line_ids: set[str],
+    evidence_kinds: set[str],
+    actor_roles: set[str] | None = None,
+) -> bool:
+    if actor_roles is not None:
+        actor_role = str(line.get("actor_role") or "").strip()
+        if actor_role not in actor_roles:
+            return False
+    line_id = str(line.get("line_id") or "").strip()
+    evidence_kind = str(line.get("evidence_kind") or "").strip()
+    return (
+        (line_id in line_ids or evidence_kind in evidence_kinds)
+        and _contract_runtime_line_status_passes(line)
+    )
+
+
+def _contract_runtime_direct_fix_parent_ack_matches(
+    line: Mapping[str, Any],
+    *,
+    parent_execution_id: str,
+    child_execution_id: str,
+) -> bool:
+    if not _contract_runtime_direct_fix_line_matches(
+        line,
+        line_ids={"resume_parent_after_successor_return"},
+        evidence_kinds={"successor_return_acknowledgement"},
+        actor_roles={"observer"},
+    ):
+        return False
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    payload_parent = str(payload.get("parent_contract_execution_id") or "").strip()
+    payload_child = str(
+        payload.get("successor_contract_execution_id")
+        or payload.get("child_contract_execution_id")
+        or ""
+    ).strip()
+    if payload_parent and payload_parent != parent_execution_id:
+        return False
+    if payload_child and payload_child != child_execution_id:
+        return False
+    return True
+
+
+def _contract_runtime_direct_fix_close_authority_gate(
+    records: list[dict[str, Any]],
+    *,
+    chain_projection: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    if not _contract_runtime_server_derived_close_authority(chain_projection):
+        return {}
+    direct_fix_records = [
+        record
+        for record in records
+        if str(record.get("contract_id") or "").strip() == DIRECT_FIX_CONTRACT_ID
+    ]
+    if not direct_fix_records:
+        return {}
+
+    child = direct_fix_records[-1]
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    parent_id = str(child.get("parent_contract_execution_id") or "").strip()
+    repair_line: dict[str, Any] = {}
+    qa_line: dict[str, Any] = {}
+    return_line: dict[str, Any] = {}
+    for line in _contract_runtime_completed_line_items(child):
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_candidate_repair"},
+            evidence_kinds={"direct_fix_repair_evidence"},
+            actor_roles={"mf_sub"},
+        ):
+            repair_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"qa_independent_verification"},
+            evidence_kinds={"independent_verification", "direct_fix_independent_qa"},
+            actor_roles={"qa"},
+        ):
+            qa_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_return_to_parent"},
+            evidence_kinds={"direct_fix_return_to_parent"},
+            actor_roles={"observer"},
+        ):
+            return_line = line
+
+    repair_index = int(repair_line.get("_completed_line_index", -1) or -1)
+    qa_index = int(qa_line.get("_completed_line_index", -1) or -1)
+    return_index = int(return_line.get("_completed_line_index", -1) or -1)
+    parent_ack_line: dict[str, Any] = {}
+    if parent_id and child_id:
+        for record in records:
+            if str(record.get("contract_execution_id") or "").strip() != parent_id:
+                continue
+            for line in _contract_runtime_completed_line_items(record):
+                if _contract_runtime_direct_fix_parent_ack_matches(
+                    line,
+                    parent_execution_id=parent_id,
+                    child_execution_id=child_id,
+                ):
+                    parent_ack_line = line
+
+    missing: list[str] = []
+    if not repair_line:
+        missing.append("direct_fix_repair_evidence")
+    if not qa_line:
+        missing.append("independent_qa")
+    if not return_line:
+        missing.append("direct_fix_return_to_parent")
+    if not parent_ack_line:
+        missing.append("parent_return_acknowledgement")
+    if repair_line and qa_line and qa_index <= repair_index:
+        missing.append("independent_qa_after_repair")
+    if qa_line and return_line and return_index <= qa_index:
+        missing.append("return_to_parent_after_qa")
+
+    passed = not missing
+    source_refs = [
+        str(line.get("_source_ref") or "")
+        for line in (repair_line, qa_line, return_line, parent_ack_line)
+        if str(line.get("_source_ref") or "")
+    ]
+    return {
+        "schema_version": "contract_runtime_direct_fix_close_authority_gate.v1",
+        "accepted": passed,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "source": "server_derived_contract_runtime_completed_lines",
+        "primary_decision_source": passed,
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": child_id,
+        "parent_contract_execution_id": parent_id,
+        "close_commit": close_commit,
+        "missing_requirement_ids": missing,
+        "source_refs": source_refs,
+        "checks": {
+            "has_direct_fix_repair_evidence": bool(repair_line),
+            "has_independent_qa": bool(qa_line),
+            "has_return_to_parent": bool(return_line),
+            "has_parent_return_acknowledgement": bool(parent_ack_line),
+            "independent_qa_after_repair": bool(qa_line and qa_index > repair_index),
+            "return_to_parent_after_qa": bool(return_line and return_index > qa_index),
+        },
+    }
+
+
+def _contract_runtime_authoritative_close_verification(
+    verification: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    direct_fix_gate = (
+        runtime_projection.get("direct_fix_close_authority_gate")
+        if isinstance(runtime_projection.get("direct_fix_close_authority_gate"), Mapping)
+        else {}
+    )
+    if not bool(direct_fix_gate.get("passed")):
+        return dict(verification)
+
+    result = dict(verification)
+    result["passed"] = True
+    result["can_close"] = True
+    result["status"] = "passed"
+    result["missing_event_kinds"] = []
+    result["ignored_required_events"] = []
+    result["contract_runtime_direct_fix_close_authority_gate"] = dict(direct_fix_gate)
+    result["close_authority"] = {
+        "schema_version": "contract_runtime_close_authority.v1",
+        "source": "contract_runtime_completed_direct_fix_chain",
+        "legacy": False,
+        "advisory": False,
+        "authoritative": True,
+        "close_authoritative": True,
+        "can_close_authoritative": True,
+        "contract_execution_id": str(direct_fix_gate.get("contract_execution_id") or ""),
+        "source_refs": list(direct_fix_gate.get("source_refs") or []),
+        "message": (
+            "backlog_close accepted server-derived completed ContractRuntime "
+            "direct-fix evidence with independent QA."
+        ),
+    }
+    result["legacy_advisory"] = False
+    result["authoritative"] = True
+    result["source_of_authority"] = "contract_runtime"
+    result["failed_gates"] = []
+
+    gate_keys = [
+        "contract_gate",
+        "route_context_gate",
+        "finish_gate_projection",
+        "lane_ownership_gate",
+        "worker_graph_trace_gate",
+        "independent_qa_gate",
+        "contract_projection_gate",
+        "post_verification_actions_gate",
+        "blocker_resolution_gate",
+        "cross_ref_gate",
+        "approval_scope_gate",
+        "command_disposition_gate",
+        "close_commit_evidence_gate",
+        "close_timeline_startup_gate",
+    ]
+    for key in gate_keys:
+        gate = result.get(key)
+        if not isinstance(gate, Mapping) or bool(gate.get("passed")):
+            continue
+        replaced = dict(gate)
+        replaced["passed"] = True
+        replaced["status"] = "passed"
+        replaced["missing_requirement_ids"] = []
+        replaced["replaced_by_contract_runtime_direct_fix_close_authority"] = True
+        replaced["authority_gate"] = {
+            "schema_version": str(direct_fix_gate.get("schema_version") or ""),
+            "contract_execution_id": str(
+                direct_fix_gate.get("contract_execution_id") or ""
+            ),
+            "source": str(direct_fix_gate.get("source") or ""),
+        }
+        result[key] = replaced
+
+    checks = dict(result.get("checks") or {})
+    checks.update({
+        "has_implementation": True,
+        "has_verification": True,
+        "has_close_ready": True,
+        "has_independent_qa": True,
+        "contract_runtime_direct_fix_close_authority": True,
+        "close_commit_has_timeline_evidence": True,
+    })
+    result["checks"] = checks
+    return result
+
+
 def _contract_runtime_close_authority_seed_events(
     *,
     record: Mapping[str, Any],
@@ -43977,6 +44334,30 @@ def _contract_runtime_close_authority_projection(
             "projected_events": [],
         }
 
+    try:
+        server_chain_projection = _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            rebuild_if_missing=True,
+            route_token_ref=str(body.get("route_token_ref") or ""),
+        )
+    except Exception:
+        server_chain_projection = {}
+
+    chain_records = _contract_runtime_close_authority_chain_records(
+        runtime,
+        chain_projection=server_chain_projection,
+        seed_record=record,
+        project_id=project_id,
+        bug_id=bug_id,
+    )
+    direct_fix_gate = _contract_runtime_direct_fix_close_authority_gate(
+        chain_records,
+        chain_projection=server_chain_projection,
+        close_commit=close_commit,
+    )
+
     projected_events = _contract_runtime_close_authority_seed_events(
         record=record,
         identity=identity,
@@ -44018,6 +44399,12 @@ def _contract_runtime_close_authority_projection(
         "execution_state_revision": current_state.get("execution_state_revision", 0),
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
+        "direct_fix_close_authority_gate": direct_fix_gate,
+        "server_contract_chain_current_projection": {
+            key: value
+            for key, value in server_chain_projection.items()
+            if key not in {"next_legal_action"}
+        },
         "projected_event_count": len(projected_events),
         "projected_events": projected_events,
     }
@@ -49071,6 +49458,7 @@ def _timeline_gate_contract_runtime_projection_body(
             else {}
         ),
         "contract_execution_id": execution_id,
+        "projection_source": "backlog_contract_chain_current_projection",
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="contract_runtime_current_chain_projection",
             contract_execution_id=execution_id,
@@ -49086,6 +49474,7 @@ def _timeline_gate_contract_runtime_projection_body(
         ),
         "legacy_advisory": True,
         "authoritative": False,
+        "projection_source": "backlog_contract_chain_current_projection",
         "replacement_authority": [
             "contract_runtime",
             "contract_gate_kernel",
@@ -49167,6 +49556,10 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                     for key, value in runtime_projection.items()
                     if key != "projected_events"
                 }
+                verification = _contract_runtime_authoritative_close_verification(
+                    verification,
+                    runtime_projection,
+                )
             else:
                 verification = _mf_close_gate_verification(
                     events,
@@ -53165,6 +53558,10 @@ def _verify_mf_close_timeline_gate(
             for key, value in runtime_projection.items()
             if key != "projected_events"
         }
+        verification = _contract_runtime_authoritative_close_verification(
+            verification,
+            runtime_projection,
+        )
     else:
         verification = _mf_close_gate_verification(
             events,
