@@ -25315,6 +25315,337 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     assert resumed_current["next_legal_action"] == {}
 
 
+def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-FIX-RUNTIME-TIMELINE-BRIDGE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    direct_execution_id = "cex-direct-fix-runtime-timeline-bridge"
+    route_token_ref = "rtok-direct-fix-runtime-timeline-bridge"
+    worker_task_id = "direct-fix-runtime-timeline-worker"
+    runtime_context_id = "mfrctx-direct-fix-runtime-timeline"
+    fence_token = "fence-direct-fix-runtime-timeline"
+    worker_session_token = "worker-session-direct-fix-runtime-timeline"
+    target_root = str(tmp_path)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair successor entry gate blocked after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": route_token_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
+
+    approved = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "operator_approval",
+                "line_id": "direct_fix_operator_approval",
+                "evidence_kind": "operator_approval",
+                "route_token_ref": route_token_ref,
+                "payload": {"approved_scope": "timeline bridge worker proof"},
+            },
+        )
+    )
+    assert approved["ok"] is True
+
+    runtime_context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=worker_task_id,
+            parent_task_id=direct_execution_id,
+            root_task_id=direct_execution_id,
+            stage_task_id=worker_task_id,
+            stage_type="direct_fix",
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            branch_ref="refs/heads/codex/direct-fix-runtime-timeline",
+            ref_name="main",
+            status=STATE_WORKTREE_READY,
+            target_project_root=target_root,
+            governance_project_id=PID,
+            target_project_id=PID,
+            fence_token=fence_token,
+            session_token_hash=mf_subagent_session_token_hash(worker_session_token),
+        ),
+    )
+
+    dispatched = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch_context",
+                "line_id": "direct_fix_dispatch_context",
+                "evidence_kind": "dispatch_bounded_worker",
+                "route_token_ref": route_token_ref,
+                "payload": {
+                    "bounded_worker": {
+                        "agent_id": f"mf_sub:{worker_task_id}",
+                        "branch": "refs/heads/codex/direct-fix-runtime-timeline",
+                        "role": "mf_sub",
+                    },
+                    "legacy_dispatch_without_runtime_context": True,
+                },
+            },
+        )
+    )
+    assert dispatched["ok"] is True
+
+    lineage_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": direct_execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": f"mf_sub:{worker_task_id}",
+        "worker_slot_id": f"mf_sub:{worker_task_id}",
+        "target_project_root": target_root,
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        event_type="mf_subagent.dispatch",
+        event_kind="bounded_implementation_worker_dispatch",
+        actor="observer",
+        status="accepted",
+        payload={
+            **lineage_payload,
+            "bounded_implementation_worker_dispatch": lineage_payload,
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        event_type="mf_subagent_startup",
+        event_kind="mf_subagent_startup",
+        actor=f"mf_sub:{worker_task_id}",
+        status="accepted",
+        payload=lineage_payload,
+    )
+    conn.execute(
+        """INSERT INTO task_timeline_events
+           (project_id, backlog_id, task_id, event_type, event_kind, actor,
+            status, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            PID,
+            backlog_id,
+            worker_task_id,
+            "implementation",
+            "implementation",
+            "observer",
+            "passed",
+            json.dumps(
+                {
+                    **lineage_payload,
+                    "changed_files": ["agent/governance/server.py"],
+                    "observer_authored_worker_evidence": True,
+                }
+            ),
+            "2026-06-28T03:30:00Z",
+        ),
+    )
+    conn.commit()
+
+    repair_body = {
+        "stage_id": "candidate_repair",
+        "line_id": "direct_fix_candidate_repair",
+        "evidence_kind": "direct_fix_repair_evidence",
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": direct_execution_id,
+        "worker_role": "mf_sub",
+        "fence_token": fence_token,
+        "session_token": worker_session_token,
+        "target_project_root": target_root,
+        "payload": {
+            "status": "implemented",
+            "changed_files": ["agent/governance/server.py"],
+            "source_backed_runtime_timeline": True,
+        },
+    }
+
+    with pytest.raises(PermissionDeniedError) as blocked:
+        server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": direct_execution_id},
+                "coordinator",
+                method="POST",
+                body=repair_body,
+            )
+        )
+    assert (
+        blocked.value.details["proof_error"]
+        == "runtime_context_not_dispatched_for_contract_execution"
+    )
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        event_type="implementation",
+        event_kind="implementation",
+        actor=f"mf_sub:{worker_task_id}",
+        status="passed",
+        payload={
+            **lineage_payload,
+            "changed_files": ["agent/governance/server.py"],
+        },
+    )
+    conn.commit()
+
+    repaired = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "coordinator",
+            method="POST",
+            body=repair_body,
+        )
+    )
+
+    assert repaired["ok"] is True
+    assert repaired["actor_role"] == "mf_sub"
+    assert (
+        repaired["contract_runtime_current_state"]["next_legal_action"]["line_id"]
+        == "qa_independent_verification"
+    )
+
+
+def test_direct_fix_timeline_bridge_rejects_modern_dispatch_context_mismatch(conn):
+    backlog_id = "AC-DIRECT-FIX-TIMELINE-BRIDGE-MODERN-MISMATCH"
+    task_id = "direct-fix-modern-dispatch-worker"
+    contract_execution_id = "cex-direct-fix-modern-dispatch"
+    runtime_context_id = "mfrctx-direct-fix-modern-dispatch"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=contract_execution_id,
+    )
+    lineage_payload = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": contract_execution_id,
+        "worker_role": "mf_sub",
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="mf_subagent.dispatch",
+        event_kind="bounded_implementation_worker_dispatch",
+        actor="observer",
+        status="accepted",
+        payload=lineage_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="mf_subagent_startup",
+        event_kind="mf_subagent_startup",
+        actor=f"mf_sub:{task_id}",
+        status="accepted",
+        payload=lineage_payload,
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="implementation",
+        event_kind="implementation",
+        actor=f"mf_sub:{task_id}",
+        status="passed",
+        payload=lineage_payload,
+    )
+    conn.commit()
+
+    legacy_record = {
+        "contract_id": server.DIRECT_FIX_CONTRACT_ID,
+        "backlog_id": backlog_id,
+        "runtime_guide": {
+            "next_legal_action": {"line_id": "direct_fix_candidate_repair"},
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch_context",
+                    "line_id": "direct_fix_dispatch_context",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {"legacy_dispatch_without_runtime_context": True},
+                }
+            ],
+        },
+    }
+    assert server._contract_runtime_timeline_references_runtime_context(
+        conn,
+        project_id=PID,
+        contract_execution_id=contract_execution_id,
+        record=legacy_record,
+        context=context,
+    )
+
+    modern_mismatch_record = {
+        **legacy_record,
+        "runtime_guide": {
+            "next_legal_action": {"line_id": "direct_fix_candidate_repair"},
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch_context",
+                    "line_id": "direct_fix_dispatch_context",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "runtime_context_id": "mfrctx-other-worker",
+                        "task_id": task_id,
+                        "parent_task_id": contract_execution_id,
+                        "worker_role": "mf_sub",
+                    },
+                }
+            ],
+        },
+    }
+    assert not server._contract_runtime_timeline_references_runtime_context(
+        conn,
+        project_id=PID,
+        contract_execution_id=contract_execution_id,
+        record=modern_mismatch_record,
+        context=context,
+    )
+
+
 def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn):
     backlog_id = "AC-DIRECT-FIX-GENERIC-QA-NO-PARENT-RESUME"
     _insert_simple_mf_close_backlog(conn, backlog_id)

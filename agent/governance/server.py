@@ -35090,6 +35090,70 @@ def _contract_runtime_next_line(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return next_line if isinstance(next_line, Mapping) else {}
 
 
+def _contract_runtime_mapping_candidates(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> list[Mapping[str, Any]]:
+    if depth > 6:
+        return []
+    if isinstance(value, Mapping):
+        candidates: list[Mapping[str, Any]] = [value]
+        for child in value.values():
+            candidates.extend(
+                _contract_runtime_mapping_candidates(child, depth=depth + 1)
+            )
+        return candidates
+    if isinstance(value, list):
+        candidates = []
+        for child in value:
+            candidates.extend(
+                _contract_runtime_mapping_candidates(child, depth=depth + 1)
+            )
+        return candidates
+    return []
+
+
+def _contract_runtime_mapping_value(value: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = str(value.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _contract_runtime_mapping_worker_role(value: Mapping[str, Any]) -> str:
+    return (
+        _contract_runtime_mapping_value(value, "worker_role", "role", "actor_role")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+
+
+def _contract_runtime_mapping_matches_context(
+    value: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    task_id_keys: tuple[str, ...] = ("task_id",),
+) -> bool:
+    for payload in _contract_runtime_mapping_candidates(value):
+        if (
+            _contract_runtime_mapping_value(payload, "runtime_context_id")
+            != runtime_context_id
+        ):
+            continue
+        if _contract_runtime_mapping_value(payload, *task_id_keys) != task_id:
+            continue
+        if _contract_runtime_mapping_value(payload, "parent_task_id") != parent_task_id:
+            continue
+        if _contract_runtime_mapping_worker_role(payload) == "mf_sub":
+            return True
+    return False
+
+
 def _contract_runtime_record_references_runtime_context(
     record: Mapping[str, Any] | None,
     context,
@@ -35113,28 +35177,6 @@ def _contract_runtime_record_references_runtime_context(
     if not isinstance(completed_lines, list):
         return False
 
-    def _mapping_candidates(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
-        if depth > 6:
-            return []
-        if isinstance(value, Mapping):
-            candidates: list[Mapping[str, Any]] = [value]
-            for child in value.values():
-                candidates.extend(_mapping_candidates(child, depth=depth + 1))
-            return candidates
-        if isinstance(value, list):
-            candidates = []
-            for child in value:
-                candidates.extend(_mapping_candidates(child, depth=depth + 1))
-            return candidates
-        return []
-
-    def _line_value(line: Mapping[str, Any], *keys: str) -> str:
-        for key in keys:
-            text = str(line.get(key) or "").strip()
-            if text:
-                return text
-        return ""
-
     contract_id = str((record or {}).get("contract_id") or "").strip()
 
     def _matches_context(
@@ -35142,22 +35184,13 @@ def _contract_runtime_record_references_runtime_context(
         *,
         task_id_keys: tuple[str, ...] = ("task_id",),
     ) -> bool:
-        for payload in _mapping_candidates(value):
-            if _line_value(payload, "runtime_context_id") != runtime_context_id:
-                continue
-            if _line_value(payload, *task_id_keys) != task_id:
-                continue
-            if _line_value(payload, "parent_task_id") != parent_task_id:
-                continue
-            if (
-                _line_value(payload, "worker_role", "role")
-                .strip()
-                .lower()
-                .replace("-", "_")
-                == "mf_sub"
-            ):
-                return True
-        return False
+        return _contract_runtime_mapping_matches_context(
+            value,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=task_id_keys,
+        )
 
     for line in completed_lines:
         if not isinstance(line, Mapping):
@@ -35209,6 +35242,204 @@ def _contract_runtime_record_references_runtime_context(
             payload,
             task_id_keys=dispatch_task_id_keys,
         ):
+            return True
+    return False
+
+
+def _contract_runtime_has_legacy_direct_fix_dispatch_without_context(
+    record: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if str(record.get("contract_id") or "").strip() != DIRECT_FIX_CONTRACT_ID:
+        return False
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return False
+
+    found_legacy_dispatch = False
+    for line in completed_lines:
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "").strip() != "dispatch_context"
+            or str(line.get("line_id") or "").strip()
+            != "direct_fix_dispatch_context"
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+            or str(line.get("actor_role") or "").strip() != "observer"
+        ):
+            continue
+        if any(
+            _contract_runtime_mapping_value(candidate, "runtime_context_id")
+            for candidate in _contract_runtime_mapping_candidates(line)
+        ):
+            return False
+        found_legacy_dispatch = True
+    return found_legacy_dispatch
+
+
+def _contract_runtime_timeline_references_runtime_context(
+    conn,
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    record: Mapping[str, Any] | None,
+    context,
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    contract_id = str(record.get("contract_id") or "").strip()
+    next_line = _contract_runtime_next_line(record)
+    if (
+        contract_id != DIRECT_FIX_CONTRACT_ID
+        or str(next_line.get("line_id") or "").strip() != "direct_fix_candidate_repair"
+    ):
+        return False
+    if not _contract_runtime_has_legacy_direct_fix_dispatch_without_context(record):
+        return False
+
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    required_identity = (
+        project_id,
+        backlog_id,
+        contract_execution_id,
+        runtime_context_id,
+        task_id,
+        parent_task_id,
+    )
+    if not all(required_identity):
+        return False
+    if parent_task_id != contract_execution_id:
+        return False
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, task_id, event_type, event_kind, actor, status,
+                   payload_json, verification_json, artifact_refs_json
+            FROM task_timeline_events
+            WHERE project_id = ?
+              AND backlog_id = ?
+              AND task_id IN (?, ?)
+            ORDER BY id ASC
+            LIMIT 300
+            """,
+            (project_id, backlog_id, task_id, parent_task_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+
+    def _row_value(row: Any, key: str) -> Any:
+        try:
+            return row[key]
+        except (KeyError, TypeError, IndexError):
+            return ""
+
+    def _json_mapping(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+    def _event_matches_context(event: Mapping[str, Any]) -> bool:
+        if not _contract_runtime_mapping_matches_context(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=("task_id", "worker_task_id"),
+        ):
+            return False
+        row_task_id = str(event.get("task_id") or "").strip()
+        return row_task_id in {task_id, parent_task_id}
+
+    def _has_mf_sub_worker_actor(event: Mapping[str, Any]) -> bool:
+        actor = str(event.get("actor") or "").strip().lower().replace("-", "_")
+        return actor == "mf_sub" or actor.startswith("mf_sub:")
+
+    accepted_statuses = {"accepted", "ok", "passed", "succeeded"}
+    dispatch_seen = False
+    worker_start_seen = False
+    worker_implementation_seen = False
+
+    for row in rows:
+        payload = _json_mapping(_row_value(row, "payload_json"))
+        verification = _json_mapping(_row_value(row, "verification_json"))
+        artifact_refs = _json_mapping(_row_value(row, "artifact_refs_json"))
+        event = {
+            "id": _row_value(row, "id"),
+            "task_id": _row_value(row, "task_id"),
+            "event_type": _row_value(row, "event_type"),
+            "event_kind": _row_value(row, "event_kind"),
+            "actor": _row_value(row, "actor"),
+            "status": _row_value(row, "status"),
+            "payload": payload,
+            "verification": verification,
+            "artifact_refs": artifact_refs,
+        }
+        if str(event["status"] or "").strip().lower() not in accepted_statuses:
+            continue
+        if not _event_matches_context(event):
+            continue
+
+        event_type = str(event["event_type"] or "").strip()
+        event_kind = str(event["event_kind"] or "").strip()
+        actor = str(event["actor"] or "").strip().lower().replace("-", "_")
+        is_observer_dispatch = (
+            actor == "observer"
+            and (
+                event_kind
+                in {
+                    "bounded_implementation_worker_dispatch",
+                    "dispatch_bounded_worker",
+                }
+                or event_type in {"mf_subagent.dispatch", "bounded_worker_dispatch"}
+            )
+        )
+        is_worker_start = (
+            event_kind
+            in {
+                "contract_context_read_receipt",
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            }
+            or event_type
+            in {
+                "contract_context_read_receipt",
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            }
+        )
+        is_worker_implementation = (
+            event_kind in {"implementation", "finish_time_worker_attestation"}
+            or event_type in {"implementation", "finish_time_worker_attestation"}
+        )
+
+        if is_observer_dispatch:
+            dispatch_seen = True
+        if _has_mf_sub_worker_actor(event):
+            if is_worker_start:
+                worker_start_seen = True
+            if is_worker_implementation:
+                worker_implementation_seen = True
+
+        if dispatch_seen and worker_start_seen and worker_implementation_seen:
             return True
     return False
 
@@ -35341,6 +35572,12 @@ def _resolve_contract_runtime_mf_sub_proof(
     if not _contract_runtime_record_references_runtime_context(
         record,
         context,
+    ) and not _contract_runtime_timeline_references_runtime_context(
+        conn,
+        project_id=project_id,
+        contract_execution_id=contract_execution_id,
+        record=record,
+        context=context,
     ):
         raise PermissionDeniedError(
             "coordinator",
