@@ -43175,6 +43175,57 @@ _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS = (
 )
 
 
+def _legacy_mf_timeline_precheck_close_authority_notice(
+    *,
+    source: str = "mf_timeline_precheck",
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    notice = {
+        "schema_version": "mf_timeline_precheck_close_authority.v1",
+        "source": source,
+        "legacy": True,
+        "advisory": True,
+        "authoritative": False,
+        "close_authoritative": False,
+        "can_close_authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+        "authoritative_entrypoints": {
+            "contract_runtime": "contract_runtime_current/contract_runtime_submit_line",
+            "contract_gate_kernel": "server-side backlog_close close gate",
+            "backlog_close": "/api/backlog/{project_id}/{bug_id}/close",
+        },
+        "message": (
+            "mf_timeline_precheck is a legacy diagnostic/advisory surface. "
+            "It does not authorize backlog close; backlog_close and the "
+            "server-side contract gate kernel remain authoritative."
+        ),
+    }
+    if contract_execution_id:
+        notice["contract_execution_id"] = contract_execution_id
+    return notice
+
+
+def _annotate_legacy_mf_timeline_precheck_authority(
+    value: Mapping[str, Any],
+    *,
+    source: str = "mf_timeline_precheck",
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    annotated = dict(value or {})
+    notice = _legacy_mf_timeline_precheck_close_authority_notice(
+        source=source,
+        contract_execution_id=contract_execution_id,
+    )
+    annotated["close_authority"] = notice
+    annotated["legacy_advisory"] = True
+    annotated["authoritative"] = False
+    return annotated
+
+
 def _contract_runtime_close_authority_identity(
     body: Mapping[str, Any],
     route_gate: Mapping[str, Any] | None,
@@ -43872,6 +43923,12 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "incomplete",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "next_legal_action": current_state.get("next_legal_action") or {},
             "projected_events": [],
@@ -43890,6 +43947,12 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_completed_lines",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
         }
@@ -43904,6 +43967,12 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_route_identity",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
         }
@@ -43936,6 +44005,13 @@ def _contract_runtime_close_authority_projection(
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": True,
         "status": "projected",
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=contract_execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "projection_authoritative": False,
         "contract_execution_id": contract_execution_id,
         "contract_id": str(record.get("contract_id") or "").strip(),
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
@@ -48995,8 +49071,27 @@ def _timeline_gate_contract_runtime_projection_body(
             else {}
         ),
         "contract_execution_id": execution_id,
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_current_chain_projection",
+            contract_execution_id=execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
     }
-    body["contract_chain_current"] = current
+    body["contract_chain_current"] = {
+        **dict(current),
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="backlog_contract_chain_current_projection",
+            contract_execution_id=execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+    }
     return body
 
 
@@ -49147,6 +49242,20 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             if normal_close_gate:
                 verification["normal_close_gate"] = normal_close_gate
             can_close = False
+        projection_execution_id = str(
+            runtime_projection.get("contract_execution_id")
+            if isinstance(runtime_projection, Mapping)
+            else ""
+        ).strip()
+        verification = _annotate_legacy_mf_timeline_precheck_authority(
+            verification,
+            source=(
+                "mf_timeline_precheck_contract_runtime_projection"
+                if projection_execution_id
+                else "mf_timeline_precheck"
+            ),
+            contract_execution_id=projection_execution_id,
+        )
         result = {
             "ok": True,
             "project_id": pid,
@@ -49154,6 +49263,9 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "applicable": applicable["is_mf"],
             "reason": applicable["reason"],
             "can_close": can_close,
+            "close_authority": verification["close_authority"],
+            "legacy_advisory": True,
+            "authoritative": False,
             "event_count": len(events),
         }
         if audit_archive:

@@ -10444,6 +10444,17 @@ def compact_gate_summary(
         "failed_gates": failed_gates,
         "event_count": int(full_result.get("event_count") or 0),
     }
+    close_authority = _mapping(full_result.get("close_authority"))
+    if close_authority:
+        summary["close_authority"] = {
+            "schema_version": str(close_authority.get("schema_version") or ""),
+            "legacy": bool(close_authority.get("legacy")),
+            "advisory": bool(close_authority.get("advisory")),
+            "authoritative": bool(close_authority.get("authoritative")),
+            "replacement_authority": list(
+                close_authority.get("replacement_authority") or []
+            ),
+        }
     observer_direct_gate = _mapping(full_result.get("observer_direct_close_exception_gate"))
     if observer_direct_gate.get("required") or observer_direct_gate.get("passed"):
         accepted_exception = _mapping(observer_direct_gate.get("accepted_exception"))
@@ -12064,6 +12075,17 @@ def repair_gate_summary(
         },
         "exceptional_archive_recovery": archive_recovery_decision,
     }
+    close_authority = _mapping(full_result.get("close_authority"))
+    if close_authority:
+        summary["close_authority"] = {
+            "schema_version": str(close_authority.get("schema_version") or ""),
+            "legacy": bool(close_authority.get("legacy")),
+            "advisory": bool(close_authority.get("advisory")),
+            "authoritative": bool(close_authority.get("authoritative")),
+            "replacement_authority": list(
+                close_authority.get("replacement_authority") or []
+            ),
+        }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
     if parent_successor_gap:
@@ -12248,6 +12270,27 @@ def _observer_command_explicit_close_gate_source(
     return False
 
 
+def _observer_command_legacy_advisory_close_source(
+    source: dict[str, Any],
+) -> bool:
+    authority = _mapping(source.get("close_authority") or source.get("authority"))
+    if authority:
+        if (
+            authority.get("authoritative") is False
+            or _truthy(authority.get("advisory"))
+            or _truthy(authority.get("legacy"))
+        ):
+            return True
+    return bool(
+        source.get("authoritative") is False
+        and (
+            _truthy(source.get("legacy_advisory"))
+            or _truthy(source.get("advisory"))
+            or _truthy(source.get("legacy"))
+        )
+    )
+
+
 def _observer_command_authoritative_backlog_close_source(
     source_name: str,
     source: dict[str, Any],
@@ -12307,6 +12350,7 @@ def _observer_command_close_gate_passed_source(
         status = str(source.get("status") or "").strip().lower()
         if (
             _observer_command_explicit_close_gate_source(source_name, source)
+            and not _observer_command_legacy_advisory_close_source(source)
             and status != "failed"
             and (bool(source.get("passed")) or _truthy(source.get("can_close")))
         ):
@@ -13076,6 +13120,18 @@ def _apply_compact_contract_chain_current(
 ) -> None:
     if not current:
         return
+    close_authority = {
+        "schema_version": "mf_timeline_precheck_close_authority.v1",
+        "source": "backlog_contract_chain_current_projection",
+        "legacy": True,
+        "advisory": True,
+        "authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+    }
     row["contract_chain_id"] = str(current.get("contract_chain_id") or "")
     row["root_contract_execution_id"] = str(
         current.get("root_contract_execution_id") or ""
@@ -13098,7 +13154,13 @@ def _apply_compact_contract_chain_current(
     row["projection_degraded_flags"] = (
         dict(degraded_flags) if isinstance(degraded_flags, Mapping) else {}
     )
-    row["contract_chain_current"] = dict(current)
+    row["contract_chain_current_authority"] = close_authority
+    row["contract_chain_current"] = {
+        **dict(current),
+        "close_authority": close_authority,
+        "legacy_advisory": True,
+        "authoritative": False,
+    }
 
 
 def build_compact_ledger(
@@ -13154,6 +13216,7 @@ def build_compact_ledger(
                 "projection_hash": "",
                 "projection_degraded": False,
                 "projection_degraded_flags": {},
+                "contract_chain_current_authority": {},
                 "contract_chain_current": {},
             },
         )

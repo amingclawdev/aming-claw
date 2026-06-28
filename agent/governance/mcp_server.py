@@ -664,7 +664,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "mf_timeline_precheck",
-        "description": "Precheck whether an MF/observer backlog row has the required timeline evidence before backlog_close.",
+        "description": (
+            "Legacy/advisory MF timeline diagnostic before backlog_close. "
+            "This is not final close authority; contract runtime, the "
+            "server-side contract gate kernel, and backlog_close remain authoritative."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -673,7 +677,7 @@ TOOLS: list[dict] = [
                 "view": {
                     "type": "string",
                     "enum": ["full", "compact", "repair"],
-                    "description": "Response projection: full gate tree, compact gate summary, or advisory repair payloads.",
+                    "description": "Response projection: full legacy gate tree, compact advisory gate summary, or advisory repair payloads. None of these are final close authority.",
                 },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
