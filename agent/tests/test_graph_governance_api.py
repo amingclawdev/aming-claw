@@ -30446,13 +30446,20 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
         conn,
         session_id="obs-mf-parallel-onboard-service",
     )
-    route_token_ref = "rtok-mf-parallel-onboard-service"
-    _persist_contract_runtime_observer_route_ref(
-        conn,
+    service_parent = server._onboard_service_execution_id(PID, backlog_id)
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
         backlog_id=backlog_id,
-        contract_execution_id="",
+        task_id=service_parent,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["mf_parallel_enter", "onboard_route_guide"],
+    )
+    route_token_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
         route_token_ref=route_token_ref,
-        allowed_actions=["mf_parallel_enter"],
+        token=parent_issue["route_token"],
     )
 
     result = server.handle_project_mf_parallel_enter(
@@ -30471,12 +30478,155 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
         )
     )
 
-    service_parent = server._onboard_service_execution_id(PID, backlog_id)
     assert result["ok"] is True
     assert result["parent_contract_execution_id"] == service_parent
     assert result["root_contract_execution_id"] == service_parent
     assert result["event"]["payload"]["legacy_onboard_contract_waived"] is True
     assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+    child_ref = result["route_token_ref"]
+    assert child_ref.startswith("rtok-")
+    assert child_ref != route_token_ref
+    assert result["route_token_ref_guidance"]["child_route_token_ref"] == child_ref
+    assert result["route_token_ref_guidance"]["parent_route_token_ref"] == route_token_ref
+    assert result["route_token_ref_guidance"]["pass_ref_to_next_runtime_write"] is True
+    assert result["next_legal_action"]["route_token_ref"] == child_ref
+
+    resolved_child = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_ref,
+        backlog_id=backlog_id,
+        task_id=result["contract_execution_id"],
+    )
+    assert resolved_child is not None
+    assert "contract_runtime_submit_line" in resolved_child["allowed_actions"]
+    assert resolved_child["scope"]["task_id"] == result["contract_execution_id"]
+    assert resolved_child["parent_route_lineage"]["route_token_ref"] == route_token_ref
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "worker",
+                "work_type": "parallel_worker",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    guide_next = guide["next_legal_action"]
+    guide_ref = guide["agent_onboard_guidance"]["route_token_ref_guidance"]
+    assert guide_next["contract_execution_id"] == result["contract_execution_id"]
+    assert guide_next["route_token_ref"] == child_ref
+    assert guide_next["route_token_ref_status"] == "current_contract_scope_verified"
+    assert guide_ref["current_route_token_ref"] == child_ref
+    assert guide_ref["target_contract_execution_id"] == result["contract_execution_id"]
+    assert guide_ref["pass_to_next_runtime_writes_as"] == [
+        "observer_route_token_ref",
+        "route_token_ref",
+    ]
+
+
+def test_onboard_route_guide_marks_onboard_service_ref_enter_only_for_mf_parallel_current(
+    conn,
+):
+    backlog_id = "AC-ONBOARD-ROUTE-GUIDE-MF-PARENT-REF-ENTER-ONLY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["onboard_route_guide", "mf_parallel_enter"],
+    )
+    parent_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_ref,
+        token=parent_issue["route_token"],
+    )
+    parent_record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=parent_ref,
+    )
+    child_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+        "parallel-route-token-scope-gap",
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.start_execution(
+        server.MF_PARALLEL_CONTRACT_ID,
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=child_execution_id,
+        parent_contract_execution_id=parent_execution_id,
+        root_contract_execution_id=parent_execution_id,
+        contract_chain_id=parent_record["contract_chain_id"],
+        route_token_ref=parent_ref,
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "test_unsafe_parent_ref_projection",
+        },
+        backlog_lineage={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": "parallel-route-token-scope-gap",
+        },
+    )
+    runtime.current_guide(child_execution_id, actor_role="observer")
+    child_record = runtime.store.get(child_execution_id)
+    server.upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=child_record,
+        edge_kind="mf_parallel_child",
+        binding_kind="mf_parallel_child_current",
+    )
+
+    response = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "worker",
+                "work_type": "parallel_worker",
+                "route_token_ref": parent_ref,
+            },
+        )
+    )
+
+    next_action = response["next_legal_action"]
+    guidance = response["agent_onboard_guidance"]["route_token_ref_guidance"]
+    issue_payload = guidance["observer_route_context_issue_payload"]
+    assert next_action["contract_execution_id"] == child_execution_id
+    assert next_action["route_token_ref"] == ""
+    assert next_action["route_token_ref_status"] == (
+        "issue_required_for_current_contract_runtime"
+    )
+    assert next_action["enter_only_route_token_ref"] == parent_ref
+    assert guidance["current_route_token_ref"] == ""
+    assert guidance["current_ref_present"] is False
+    assert guidance["enter_only_route_token_ref"] == parent_ref
+    assert guidance["target_contract_execution_id"] == child_execution_id
+    assert guidance["pass_to_next_runtime_writes_as"] == []
+    assert issue_payload["task_id"] == child_execution_id
+    assert issue_payload["parent_route_token_ref"] == parent_ref
+    assert "contract_runtime_submit_line" in issue_payload["allowed_actions"]
+    assert response["runtime_resume"]["next_legal_action"]["route_token_ref"] == ""
+    assert response["onboard_route_guide"]["backlog_chain_binding"]["continue"][
+        "next_legal_action"
+    ]["route_token_ref"] == ""
 
 
 def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
