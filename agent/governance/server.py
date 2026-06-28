@@ -53,8 +53,12 @@ from .contracts.runtime import (
     ContractRuntimeError,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     is_legacy_primary_contract_route,
+    read_backlog_contract_chain_current,
+    rebuild_backlog_contract_chain_projection,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    upsert_contract_chain_root_current_binding,
+    upsert_contract_chain_successor_binding,
 )
 from .contracts.hash import stable_sha256
 
@@ -2891,6 +2895,7 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
 
 
 _OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS = {
+    "runtime_context_read_receipt",
     "submit_mf_subagent_read_receipt",
     "record_mf_subagent_startup",
     "record_implementation_evidence",
@@ -8731,6 +8736,7 @@ def _runtime_context_executable_contract_envelope(
             "endpoint": {
                 "facade": "runtime_context.read_receipts",
                 "tool": "submit_mf_subagent_read_receipt",
+                "mcp_tool": "runtime_context_read_receipt",
                 "method": "POST",
                 "path": (
                     "/api/graph-governance/{project_id}/runtime-contexts/"
@@ -9049,6 +9055,48 @@ def _runtime_context_worker_guide_response(
         or current_state_response.get("worktree_path")
         or target_project_root
     )
+    current_branch_head_commit = _runtime_context_git_head_commit(
+        target_project_root,
+        worktree_path,
+    )
+    row_scoped_finish_head_projection = (
+        _runtime_context_row_scoped_finish_head_projection(
+            row_scoped_implementation_head_commit=str(
+                finish_attestation_hint.get("head_commit")
+                or timeline_refs.get("head_commit")
+                or timeline_refs.get("commit_sha")
+                or ""
+            ),
+            runtime_context_head_commit=str(
+                branch_view.get("head_commit")
+                or task.get("head_commit")
+                or ""
+            ),
+            current_branch_head_commit=current_branch_head_commit,
+            base_commit=str(
+                graph_identity.get("base_commit")
+                or task.get("base_commit")
+                or branch_view.get("base_commit")
+                or ""
+            ),
+            target_head_commit=str(
+                graph_identity.get("target_head_commit")
+                or task.get("target_head_commit")
+                or branch_view.get("target_head_commit")
+                or ""
+            ),
+            implementation_event_ref=str(
+                finish_attestation_hint.get("implementation_event_ref")
+                or timeline_refs.get("latest_implementation_event_ref")
+                or ""
+            ),
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+        )
+    )
+    finish_submission_head_commit = str(
+        row_scoped_finish_head_projection.get("submission_head_commit") or ""
+    ).strip()
     graph_payload_shape = dict(graph_identity.get("payload_shape") or {})
     if target_project_root:
         graph_payload_shape["target_project_root"] = target_project_root
@@ -9137,6 +9185,40 @@ def _runtime_context_worker_guide_response(
         or action_plan.get("next_legal_action")
         or ""
     )
+    branch_head_scope_mismatch = (
+        row_scoped_finish_head_projection.get("status")
+        == "branch_head_scope_mismatch"
+    )
+    scope_blocking_reasons: list[str] = []
+    if branch_head_scope_mismatch:
+        next_legal_action = "stop_for_row_scope_reconciliation"
+        next_required_evidence = [
+            {
+                "id": "row_scoped_finish_head_resolution",
+                "status": "blocked",
+                "producer": "runtime_context_service",
+                "worker_owned": False,
+                "next_legal_action": next_legal_action,
+                "row_scoped_finish_head_projection": (
+                    row_scoped_finish_head_projection
+                ),
+            },
+            *next_required_evidence,
+        ]
+        scope_blocking_reasons.append("branch_head_scope_mismatch")
+    missing_evidence = list(
+        control_plane.get("missing_evidence")
+        or action_plan.get("missing_evidence")
+        or []
+    )
+    blocking_reasons = [
+        *list(
+            control_plane.get("blocking_reasons")
+            or action_plan.get("blocking_reasons")
+            or []
+        ),
+        *scope_blocking_reasons,
+    ]
     def _auth_guide(location: str) -> dict[str, Any]:
         return {
             "primary": "runtime_context_session_token_or_ref",
@@ -9471,8 +9553,11 @@ def _runtime_context_worker_guide_response(
         ),
         "head_commit": str(
             finish_attestation_hint.get("head_commit")
-            or "<worker-worktree-head-commit>"
+            or finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
         ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": attestation_owned_files or ["<owned-file>"],
         "owned_files": attestation_owned_files or ["<owned-file>"],
         "actual_cwd": str(
@@ -9571,6 +9656,11 @@ def _runtime_context_worker_guide_response(
                 "self_attestation/artifact_refs copies are tolerated only as a "
                 "recovery source, not the preferred happy-path shape."
             ),
+            "head_scope": (
+                "Use row_scoped_finish_head_projection.submission_head_commit "
+                "for this row. current_branch_head_commit is informational when "
+                "successor repairs continue on the same branch."
+            ),
             "observer_must_not_author": True,
             "raw_tokens_exposed": False,
             "test_results_source": (
@@ -9599,7 +9689,12 @@ def _runtime_context_worker_guide_response(
         "session_token_ref": session_token_ref_placeholder,
         "target_project_root": target_project_root,
         "checkpoint_id": "<finish-gate-checkpoint-id>",
-        "head_commit": "<worker-worktree-head-commit>",
+        "head_commit": (
+            finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(worker_scope_files) or ["<owned-file>"],
         "owned_files": list(worker_scope_files) or ["<owned-file>"],
         "status": "review_ready",
@@ -9624,7 +9719,12 @@ def _runtime_context_worker_guide_response(
             "session_token_ref": session_token_ref_placeholder,
             "target_project_root": target_project_root,
             "checkpoint_id": "<finish-gate-checkpoint-id>",
-            "head_commit": "<worker-worktree-head-commit>",
+            "head_commit": (
+                finish_submission_head_commit
+                or "<row-scoped-worker-implementation-head-commit>"
+            ),
+            "current_branch_head_commit": current_branch_head_commit,
+            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "changed_files": list(worker_scope_files) or ["<owned-file>"],
             "owned_files": list(worker_scope_files) or ["<owned-file>"],
             "status": "review_ready",
@@ -9652,6 +9752,11 @@ def _runtime_context_worker_guide_response(
                 "read_receipt_event_id",
                 "finish_time_worker_self_attestation",
             ],
+            "head_scope": (
+                "Do not replace head_commit with current_branch_head_commit when "
+                "row_scoped_finish_head_projection.status is "
+                "branch_head_scope_mismatch."
+            ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },
@@ -9675,6 +9780,7 @@ def _runtime_context_worker_guide_response(
                 "event_kind": "mf_subagent_read_receipt",
             },
             "canonical_facade_status": "available",
+            "mcp_tool": "runtime_context_read_receipt",
             "path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/read-receipts"
@@ -10061,6 +10167,9 @@ def _runtime_context_worker_guide_response(
     actionable_payloads["finish_time_worker_attestation_body"] = dict(
         finish_attestation_submission["body"]
     )
+    actionable_payloads["row_scoped_finish_head_projection"] = (
+        row_scoped_finish_head_projection
+    )
     _runtime_context_patch_actionable_payload_worker_scope(
         actionable_payloads,
         worker_scope_files,
@@ -10084,6 +10193,7 @@ def _runtime_context_worker_guide_response(
         "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
         "owned_files": list(worker_scope_files),
         "target_files": list(worker_scope_files),
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "session_token_ref": str(worker_view.get("session_token_ref") or ""),
@@ -10093,16 +10203,8 @@ def _runtime_context_worker_guide_response(
         "actionable_payloads": actionable_payloads,
         "next_legal_action": next_legal_action,
         "next_required_evidence": next_required_evidence,
-        "missing_evidence": list(
-            control_plane.get("missing_evidence")
-            or action_plan.get("missing_evidence")
-            or []
-        ),
-        "blocking_reasons": list(
-            control_plane.get("blocking_reasons")
-            or action_plan.get("blocking_reasons")
-            or []
-        ),
+        "missing_evidence": missing_evidence,
+        "blocking_reasons": blocking_reasons,
         "worker_session_lifecycle_policy": actionable_payloads.get(
             "worker_session_lifecycle_policy",
             {},
@@ -10142,18 +10244,11 @@ def _runtime_context_worker_guide_response(
             "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
             "owned_files": list(worker_scope_files),
             "target_files": list(worker_scope_files),
+            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "next_legal_action": next_legal_action,
             "next_required_evidence": next_required_evidence,
-            "missing_evidence": list(
-                control_plane.get("missing_evidence")
-                or action_plan.get("missing_evidence")
-                or []
-            ),
-            "blocking_reasons": list(
-                control_plane.get("blocking_reasons")
-                or action_plan.get("blocking_reasons")
-                or []
-            ),
+            "missing_evidence": missing_evidence,
+            "blocking_reasons": blocking_reasons,
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,
@@ -10476,6 +10571,92 @@ def _runtime_context_effective_target_project_root(context) -> str:
     from .parallel_branch_runtime import runtime_context_effective_target_project_root
 
     return runtime_context_effective_target_project_root(context)
+
+
+def _runtime_context_git_head_commit(*paths: str) -> str:
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            from . import batch_jobs
+
+            return str(batch_jobs.git_commit(path) or "").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _runtime_context_row_scoped_finish_head_projection(
+    *,
+    row_scoped_implementation_head_commit: str = "",
+    runtime_context_head_commit: str = "",
+    current_branch_head_commit: str = "",
+    base_commit: str = "",
+    target_head_commit: str = "",
+    implementation_event_ref: str = "",
+    worktree_path: str = "",
+    target_project_root: str = "",
+) -> dict[str, Any]:
+    row_head = _runtime_context_non_placeholder_text(
+        row_scoped_implementation_head_commit
+    )
+    context_head = _runtime_context_non_placeholder_text(runtime_context_head_commit)
+    current_head = _runtime_context_non_placeholder_text(current_branch_head_commit)
+    submission_head = row_head or context_head
+    mismatch = bool(row_head and current_head and row_head != current_head)
+    status = (
+        "branch_head_scope_mismatch"
+        if mismatch
+        else (
+            "in_sync"
+            if row_head and current_head and row_head == current_head
+            else "pending_row_scoped_implementation_head"
+        )
+    )
+    next_legal_action = (
+        "stop_for_row_scope_reconciliation"
+        if mismatch
+        else "record_finish_time_worker_attestation"
+    )
+    return {
+        "schema_version": "runtime_context.row_scoped_finish_head_projection.v1",
+        "status": status,
+        "row_scoped_implementation_head_commit": row_head,
+        "runtime_context_head_commit": context_head,
+        "current_branch_head_commit": current_head,
+        "base_commit": str(base_commit or "").strip(),
+        "target_head_commit": str(target_head_commit or "").strip(),
+        "implementation_event_ref": str(implementation_event_ref or "").strip(),
+        "target_project_root": str(target_project_root or "").strip(),
+        "worktree_path": str(worktree_path or "").strip(),
+        "submission_head_commit": (
+            submission_head or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "finish_gate_allowed_against_current_branch_head": not mismatch,
+        "worker_finish_scope_requires_row_head": True,
+        "later_branch_commits_must_not_widen_row_scope": True,
+        "current_branch_head_is_later_than_row_head": mismatch,
+        "next_legal_action": next_legal_action,
+        "guide": (
+            "Do not submit finish-time or finish-gate evidence for the row using "
+            "the current branch HEAD. Use the row-scoped implementation head from "
+            "the implementation event, or stop and request a row-scope recovery "
+            "decision before close."
+            if mismatch
+            else (
+                "Use the row-scoped worker implementation head for finish-time "
+                "and finish-gate evidence. The current branch head is only a "
+                "service/deployment head when successor repairs continue on the "
+                "same branch."
+            )
+        ),
+        "merge_queue_policy": (
+            "Record per-row finish evidence against the row-scoped implementation "
+            "head before final ordered merge/reconcile; successor repair commits "
+            "on the same branch do not widen the earlier row scope."
+        ),
+    }
 
 
 def _runtime_context_worker_recovery_payloads(
@@ -10921,6 +11102,7 @@ def _runtime_context_worker_recovery_payloads(
                 "method": "POST",
                 "path": read_receipt_path,
                 "tool": "submit_mf_subagent_read_receipt",
+                "mcp_tool": "runtime_context_read_receipt",
                 "facade": "runtime_context.read_receipts",
                 "body_source": "read_receipt_facade_payload_skeleton.copy_safe_body",
             },
@@ -10959,6 +11141,8 @@ def _runtime_context_worker_recovery_payloads(
             "method": "POST",
             "path": read_receipt_path,
             "facade": "runtime_context.read_receipts",
+            "mcp_tool": "runtime_context_read_receipt",
+            "legacy_tool": "submit_mf_subagent_read_receipt",
             "top_level_body_required": True,
             "body_is_top_level_post_json": True,
             "body_source": "copy_safe_body",
@@ -12326,13 +12510,122 @@ def _runtime_context_implementation_resolved_ref_route_identity(
         resolved,
         route_token_ref=route_token_ref,
     )
-    return _runtime_context_validate_parent_bound_route_identity(
+    identity, lineage_payload = _runtime_context_validate_parent_bound_route_identity(
         resolved,
         child_route_identity=child_route_identity,
         runtime_context_id=runtime_context_id,
         context=context,
         parent_route_identity=parent_route_identity,
     )
+    lineage_payload = dict(lineage_payload)
+    lineage_payload["_runtime_context_route_ref_resolved"] = True
+    return identity, lineage_payload
+
+
+def _runtime_context_timeline_route_gate(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    event_route_identity: Mapping[str, Any],
+    parent_route_identity: Mapping[str, Any],
+    route_lineage_payload: Mapping[str, Any] | None = None,
+    parent_task_id: str = "",
+    action: str = "task_timeline_append",
+) -> dict[str, Any]:
+    route_token_ref = str(event_route_identity.get("route_token_ref") or "").strip()
+    if not route_token_ref:
+        return {}
+
+    lineage_payload = (
+        dict(route_lineage_payload)
+        if isinstance(route_lineage_payload, Mapping)
+        else {}
+    )
+    if lineage_payload.get("_runtime_context_route_ref_resolved") is not True:
+        return {}
+    parent_lineage = (
+        dict(lineage_payload.get("parent_route_lineage"))
+        if isinstance(lineage_payload.get("parent_route_lineage"), Mapping)
+        else _route_identity_public_summary(parent_route_identity)
+    )
+    if not parent_lineage:
+        parent_lineage = _route_identity_public_summary(event_route_identity)
+    parent_lineage.setdefault("route_token_ref", route_token_ref)
+
+    child_lineage = (
+        dict(lineage_payload.get("child_route_lineage"))
+        if isinstance(lineage_payload.get("child_route_lineage"), Mapping)
+        else _route_identity_public_summary(event_route_identity)
+    )
+    if not child_lineage:
+        child_lineage = _route_identity_public_summary(event_route_identity)
+    child_lineage.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "parent_task_id": parent_task_id
+            or _runtime_context_mf_sub_parent_task_id(context),
+            "worker_role": "mf_sub",
+            "parent_route_token_ref": str(
+                parent_lineage.get("route_token_ref") or route_token_ref
+            ),
+            "route_token_ref": route_token_ref,
+        }
+    )
+
+    route_lineage = (
+        dict(lineage_payload.get("route_lineage"))
+        if isinstance(lineage_payload.get("route_lineage"), Mapping)
+        else {}
+    )
+    if not route_lineage:
+        route_lineage = {
+            "schema_version": "runtime_context.worker_route_lineage.v1",
+            "status": "parent_bound_worker_task",
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+        }
+
+    scope_task_id = parent_task_id or str(
+        parent_lineage.get("selected_task_id")
+        or parent_lineage.get("task_id")
+        or getattr(context, "root_task_id", "")
+        or getattr(context, "backlog_id", "")
+        or ""
+    )
+    return {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "status": "passed",
+        "action": action,
+        "decision": "route_token_ref_resolved",
+        "route_token_ref": route_token_ref,
+        "route_id": str(event_route_identity.get("route_id") or ""),
+        "route_context_hash": str(event_route_identity.get("route_context_hash") or ""),
+        "prompt_contract_id": str(event_route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(event_route_identity.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            event_route_identity.get("visible_injection_manifest_hash") or ""
+        ),
+        "server_issued_binding": True,
+        "resolved_from_ref": True,
+        "registry_verified": True,
+        "binding_source": "observer_route_token_refs",
+        "protected_lane": "runtime_context_worker",
+        "legal_next_action": "record_worker_timeline_evidence",
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": parent_task_id,
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+            "task_id": scope_task_id,
+        },
+        "parent_route_lineage": parent_lineage,
+        "child_route_lineage": child_lineage,
+        "route_lineage": route_lineage,
+    }
 
 
 def _runtime_context_implementation_observer_command_id(
@@ -12479,6 +12772,7 @@ def _runtime_context_forward_request(
     ctx: RequestContext,
     *,
     body: Mapping[str, Any],
+    trusted_route_gate: Mapping[str, Any] | None = None,
 ) -> RequestContext:
     forward = RequestContext(
         ctx.handler,
@@ -12491,6 +12785,8 @@ def _runtime_context_forward_request(
         ctx.idem_key,
     )
     forward._session = ctx._session
+    if isinstance(trusted_route_gate, Mapping) and trusted_route_gate:
+        forward._trusted_route_token_gate = dict(trusted_route_gate)
     return forward
 
 
@@ -12843,6 +13139,24 @@ def _runtime_context_finish_gate_submission_payload(
         or getattr(context, "worktree_path", "")
         or ""
     ).strip()
+    worktree_path = str(
+        getattr(context, "worktree_path", "") or target_project_root
+    ).strip()
+    current_branch_head_commit = _runtime_context_git_head_commit(
+        target_project_root,
+        worktree_path,
+    )
+    row_scoped_finish_head_projection = (
+        _runtime_context_row_scoped_finish_head_projection(
+            row_scoped_implementation_head_commit=head_commit,
+            runtime_context_head_commit=str(getattr(context, "head_commit", "") or ""),
+            current_branch_head_commit=current_branch_head_commit,
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+        )
+    )
     checkpoint_id = str(
         body.get("checkpoint_id") or getattr(context, "checkpoint_id", "") or ""
     ).strip()
@@ -12850,7 +13164,11 @@ def _runtime_context_finish_gate_submission_payload(
         checkpoint_seed = re.sub(
             r"[^A-Za-z0-9_.-]+",
             "-",
-            (head_commit or runtime_context_id or str(getattr(context, "task_id", "") or ""))
+            (
+                head_commit
+                or runtime_context_id
+                or str(getattr(context, "task_id", "") or "")
+            )
         ).strip("-")
         checkpoint_id = f"ckpt-finish-{checkpoint_seed[:24] or 'worker'}"
     action = "record_finish_gate"
@@ -12876,6 +13194,8 @@ def _runtime_context_finish_gate_submission_payload(
         "target_project_root": target_project_root,
         "checkpoint_id": checkpoint_id,
         "head_commit": head_commit,
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(changed_files),
         "owned_files": list(changed_files),
         "status": "review_ready",
@@ -12917,6 +13237,8 @@ def _runtime_context_finish_gate_submission_payload(
         "target_project_root": target_project_root,
         "checkpoint_id": checkpoint_id,
         "head_commit": head_commit,
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(changed_files),
         "test_results": dict(test_results),
         "graph_trace_ids": list(graph_trace_ids),
@@ -12931,6 +13253,11 @@ def _runtime_context_finish_gate_submission_payload(
             "fence_token": "Use the same lane fence_token from the worker launch envelope.",
             "session_token": "Use the current runtime_context_session_token; raw token is not echoed.",
             "target_project_root": "Keep this equal to the assigned worker worktree/root.",
+            "head_scope": (
+                "Keep head_commit equal to the row-scoped implementation head. "
+                "current_branch_head_commit is informational when successor "
+                "repairs continue on the same branch."
+            ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },
@@ -13912,8 +14239,20 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "trace_id": body.get("trace_id") or "",
         "commit_sha": body.get("commit_sha") or "",
     }
+    trusted_route_gate = _runtime_context_timeline_route_gate(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        event_route_identity=route_identity,
+        parent_route_identity=route_identity,
+        parent_task_id=parent_task_id,
+    )
     result = handle_task_timeline_append(
-        _runtime_context_forward_request(ctx, body=event_body)
+        _runtime_context_forward_request(
+            ctx,
+            body=event_body,
+            trusted_route_gate=trusted_route_gate,
+        )
     )
     response = _runtime_context_write_response(
         action="read_receipt",
@@ -14666,7 +15005,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         raw_session_token=raw_session_token,
     )
     for key, value in route_lineage_payload.items():
-        if value:
+        if key in {"parent_route_lineage", "child_route_lineage", "route_lineage"} and value:
             payload[key] = value
     parent_task_id = (
         str(body.get("parent_task_id") or "").strip()
@@ -14780,8 +15119,21 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 },
             )
 
+    trusted_route_gate = _runtime_context_timeline_route_gate(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        event_route_identity=event_route_identity,
+        parent_route_identity=parent_route_identity,
+        route_lineage_payload=route_lineage_payload,
+        parent_task_id=parent_task_id,
+    )
     result = handle_task_timeline_append(
-        _runtime_context_forward_request(ctx, body=event_body)
+        _runtime_context_forward_request(
+            ctx,
+            body=event_body,
+            trusted_route_gate=trusted_route_gate,
+        )
     )
     response = _runtime_context_write_response(
         action="implementation_evidence",
@@ -15916,12 +16268,23 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
         )
         with sqlite_write_lock():
             task_timeline.ensure_schema(conn)
+            startup_payload, dispatch_identity_bridge = (
+                _contract_runtime_dispatch_bridge_for_startup(
+                    conn,
+                    project_id=project_id,
+                    payload=ctx.body or {},
+                )
+            )
             result = record_mf_subagent_startup(
                 conn,
                 project_id=project_id,
                 task_id=task_id,
-                payload=ctx.body or {},
-                now_iso=str(ctx.body.get("now_iso") or ""),
+                payload=startup_payload,
+                now_iso=str(startup_payload.get("now_iso") or ""),
+            )
+            result = _apply_contract_runtime_dispatch_bridge_to_startup_result(
+                result,
+                dispatch_identity_bridge,
             )
             event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
             if event:
@@ -15969,6 +16332,9 @@ _PARALLEL_BRANCH_PARENT_ROUTE_ACTIONS = {
     "merge_execute",
     "merge_result",
 }
+_PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS = frozenset(
+    {"route_token", "route_token_ref_resolved"}
+)
 
 
 def _body_has_route_token_reference(body: Mapping[str, Any] | None) -> bool:
@@ -16040,6 +16406,46 @@ def _require_parallel_branch_merge_route_gate(
         gate["backlog_id"] = backlog_id
         gate["fallback_reason"] = str(exc.message or exc)
         return gate
+
+
+def _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+    *,
+    status: str,
+) -> bool:
+    if str(body.get("fence_token") or "").strip():
+        return False
+    if str(status or "").strip() != "merged":
+        return False
+    for required_field in (
+        "merge_commit",
+        "target_head_before_merge",
+        "target_head_after_merge",
+    ):
+        if not str(body.get(required_field) or "").strip():
+            return False
+    if route_gate.get("allowed") is not True:
+        return False
+    if str(route_gate.get("status") or "").strip() != "accepted":
+        return False
+    if (
+        str(route_gate.get("decision") or "").strip()
+        not in _PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS
+    ):
+        return False
+    if str(route_gate.get("action") or "").strip() != "merge_result":
+        return False
+    authorized_action = str(
+        route_gate.get("authorized_action")
+        or route_gate.get("allowed_action")
+        or route_gate.get("action")
+        or ""
+    ).strip()
+    return authorized_action in {
+        "merge_result",
+        _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
+    }
 
 
 def _parallel_branch_parent_scope_from_recorded_merge(
@@ -16500,6 +16906,13 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             action="merge_result",
             task_id=str(ctx.body.get("task_id") or ""),
         )
+        allow_reclaimed_fence = (
+            _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
+                ctx.body,
+                route_gate,
+                status=status,
+            )
+        )
         with sqlite_write_lock():
             recorded = record_merge_queue_result(
                 conn,
@@ -16516,6 +16929,7 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 snapshot_id=str(ctx.body.get("snapshot_id") or ""),
                 projection_id=str(ctx.body.get("projection_id") or ""),
                 fence_token=str(ctx.body.get("fence_token") or ""),
+                allow_route_gated_reclaimed_fence_without_token=allow_reclaimed_fence,
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(
@@ -17426,7 +17840,7 @@ def _scope_reconcile_operator_next_action(fallback_reason: str) -> str:
     fallback_reason = str(fallback_reason or "").strip()
     if fallback_reason == "source_function_identity_changed":
         return (
-            "run_full_reconcile; function identities changed, so incremental "
+            "run_current_full_reconcile; function identities changed, so incremental "
             "dependency facts may be stale"
         )
     if fallback_reason:
@@ -17563,6 +17977,7 @@ def _scope_reconcile_operation_trace(
     *,
     status: str,
     target_commit_sha: str,
+    operation_type: str = "scope_reconcile",
     parent_commit_sha: str = "",
     snapshot_id: str = "",
     run_id: str = "",
@@ -17583,7 +17998,7 @@ def _scope_reconcile_operation_trace(
     )
     trace = {
         "schema_version": "scope_reconcile_operation_trace.v1",
-        "operation_type": "scope_reconcile",
+        "operation_type": operation_type or "scope_reconcile",
         "status": normalized_status,
         "progress": _operation_unit_progress(normalized_status),
         "target_commit_sha": str(target_commit_sha or ""),
@@ -17672,6 +18087,22 @@ def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str
     except Exception:
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_dirty_paths(project_root: Path, *, limit: int | None = 50) -> list[str]:
+    raw = _git_output(project_root, ["status", "--porcelain"], timeout=10)
+    paths: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            paths.append(path.replace("\\", "/"))
+        if limit is not None and len(paths) >= limit:
+            break
+    return paths
 
 
 def _git_refs_for_root(project_root: Path) -> dict[str, Any]:
@@ -17874,6 +18305,7 @@ def _direct_update_graph_activation_guidance(
         "activate": True,
         "semantic_use_ai": False,
         "enqueue_stale": False,
+        "require_clean": True,
         "actor": str(actor or "observer"),
     }
     if parent_commit_sha:
@@ -17887,16 +18319,20 @@ def _direct_update_graph_activation_guidance(
             body[key] = value
     return {
         "schema_version": "graph_reconcile_next_action.v1",
-        "action": "materialize_and_activate_pending_scope",
+        "action": "run_current_full_reconcile",
         "description": (
-            "To make the active graph reflect the target commit, call the direct "
-            "pending-scope reconcile endpoint with activate=true. Omitting "
-            "activate creates a candidate snapshot only."
+            "To make the active graph reflect the current clean HEAD, call the "
+            "canonical current-full reconcile endpoint. It rebuilds a full "
+            "snapshot and activates it by default; pending-scope rows are only "
+            "legacy recovery bookkeeping."
         ),
-        "endpoint": f"/api/graph-governance/{project_id}/reconcile/pending-scope",
+        "endpoint": f"/api/graph-governance/{project_id}/reconcile/current-full",
         "method": "POST",
         "request": {"body": body},
-        "candidate_only_if_activate_false": True,
+        "defaults": {
+            "target_commit_sha": "current_clean_head",
+            "activate": True,
+        },
     }
 
 
@@ -17980,12 +18416,17 @@ def _graph_stale_scope_operation(
             stale_summary.update({
                 "is_stale": True,
                 "stale_reason": "rule_fingerprint_mismatch",
-                "recommended_action": "run_full_reconcile",
+                "recommended_action": "run_current_full_reconcile",
                 "requires_reconcile": True,
             })
+            stale_summary["next_action"] = _direct_update_graph_activation_guidance(
+                project_id,
+                target_commit_sha=head_commit,
+                actor="dashboard_user",
+            )
             operation = {
-                "operation_id": f"scope-reconcile:rule-fingerprint:{head_commit[:12]}",
-                "operation_type": "scope_reconcile",
+                "operation_id": f"current-full-reconcile:rule-fingerprint:{head_commit[:12]}",
+                "operation_type": "current_full_reconcile",
                 "target_scope": "snapshot",
                 "target_id": head_commit,
                 "target_label": head_commit[:12],
@@ -17998,20 +18439,25 @@ def _graph_stale_scope_operation(
                 "lease_expires_at": "",
                 "last_error": "",
                 "last_result": "graph rule fingerprint changed; run full reconcile before trusting active graph",
-                "supported_actions": ["run_full_reconcile", "view_trace", "file_backlog"],
+                "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
                 "active_graph_commit": graph_commit,
                 "head_commit": head_commit,
                 "changed_files": [],
                 "warnings": active_warnings,
                 "rule_fingerprint": rule_fingerprint,
-                "recommended_action": "run_full_reconcile",
+                "recommended_action": "run_current_full_reconcile",
+                "next_action": _direct_update_graph_activation_guidance(
+                    project_id,
+                    target_commit_sha=head_commit,
+                    actor="dashboard_user",
+                ),
             }
             return operation, stale_summary
         if not active_warnings:
             return None, stale_summary
         operation = {
-            "operation_id": f"scope-reconcile:suspect-root:{graph_commit[:12]}",
-            "operation_type": "scope_reconcile",
+            "operation_id": f"current-full-reconcile:suspect-root:{graph_commit[:12]}",
+            "operation_type": "current_full_reconcile",
             "target_scope": "snapshot",
             "target_id": graph_commit,
             "target_label": graph_commit[:12],
@@ -18024,11 +18470,17 @@ def _graph_stale_scope_operation(
             "lease_expires_at": "",
             "last_error": "",
             "last_result": "active graph snapshot has materialization provenance warnings",
-            "supported_actions": ["queue_scope_reconcile", "view_trace", "file_backlog"],
+            "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
             "active_graph_commit": graph_commit,
             "head_commit": head_commit,
             "changed_files": [],
             "warnings": active_warnings,
+            "recommended_action": "run_current_full_reconcile",
+            "next_action": _direct_update_graph_activation_guidance(
+                project_id,
+                target_commit_sha=head_commit,
+                actor="dashboard_user",
+            ),
         }
         return operation, stale_summary
     all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
@@ -18043,7 +18495,7 @@ def _graph_stale_scope_operation(
     if rule_fingerprint_mismatch:
         stale_summary.update({
             "stale_reason": "commit_and_rule_fingerprint_mismatch",
-            "recommended_action": "run_full_reconcile",
+            "recommended_action": "run_current_full_reconcile",
             "requires_reconcile": True,
         })
     pending_for_head = any(
@@ -18067,8 +18519,8 @@ def _graph_stale_scope_operation(
         "next_action": next_action,
     })
     operation = {
-        "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
-        "operation_type": "scope_reconcile",
+        "operation_id": f"current-full-reconcile:stale:{head_commit[:12]}",
+        "operation_type": "current_full_reconcile",
         "target_scope": "snapshot",
         "target_id": head_commit,
         "target_label": head_commit[:12],
@@ -18081,7 +18533,7 @@ def _graph_stale_scope_operation(
         "lease_expires_at": "",
         "last_error": "",
         "last_result": f"active graph at {graph_commit[:12]}, HEAD at {head_commit[:12]}{changed_hint}",
-        "supported_actions": ["materialize_and_activate_pending_scope", "queue_scope_reconcile", "view_trace", "file_backlog"],
+        "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
         "active_graph_commit": graph_commit,
         "head_commit": head_commit,
         "changed_files": changed_files,
@@ -21207,7 +21659,7 @@ def handle_graph_governance_drift_file_backlog(ctx: RequestContext):
                 acceptance = [
                     "Drift row is fixed, waived, or converted into a more precise graph/document/test task.",
                     "Backlog close evidence references the graph snapshot and affected path.",
-                    "Scope reconcile materializes graph state after any merge.",
+                    "Update graph runs current full reconcile after any merge.",
                 ]
             priority = str(body.get("priority") or "P2")
             target_files = body.get("target_files") if isinstance(body.get("target_files"), list) else [drift["path"]]
@@ -21525,7 +21977,12 @@ def handle_graph_governance_import_existing(ctx: RequestContext):
 
 @route("POST", "/api/graph-governance/{project_id}/reconcile/full")
 def handle_graph_governance_full_reconcile(ctx: RequestContext):
-    """Create a state-only full-reconcile candidate snapshot at current HEAD."""
+    """Create a state-only full-reconcile snapshot.
+
+    Legacy callers may still use this lower-level endpoint for candidate builds.
+    Normal operator Update Graph uses /reconcile/current-full, which defaults to
+    clean HEAD and activate=true.
+    """
     project_id = ctx.get_project_id()
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
@@ -21581,14 +22038,191 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/reconcile/current-full")
+def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
+    """Rebuild and activate a full graph snapshot for the current clean HEAD."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_state_only_full_reconcile
+    from . import graph_snapshot_store as store
+
+    request_started_at = _utc_now()
+    request_started_monotonic = time.monotonic()
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.current-full")
+        head_commit = _git_head_commit(root)
+        target_commit = str(
+            body.get("target_commit_sha")
+            or body.get("commit_sha")
+            or head_commit
+            or ""
+        ).strip()
+        if not head_commit or not target_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "reason": "current_head_required",
+                "message": "current-full reconcile requires a git HEAD commit",
+                "head_commit": head_commit,
+                "target_commit_sha": target_commit,
+            }
+        if target_commit != head_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "target_not_head",
+                "message": "current-full reconcile rebuilds the current worktree; target_commit_sha must equal HEAD",
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+            }
+        dirty_paths = _git_dirty_paths(root) if bool(body.get("require_clean", True)) else []
+        if dirty_paths:
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "dirty_worktree",
+                "message": "current-full reconcile requires a clean worktree by default",
+                "dirty_files": dirty_paths,
+                "dirty_file_count": len(dirty_paths),
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+            }
+
+        semantic_use_ai = _semantic_use_ai_from_body(body)
+        semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
+        activate_requested = bool(body.get("activate", True))
+        notes_extra = body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else {}
+        notes_extra = {
+            **notes_extra,
+            "current_full_reconcile": {
+                "schema_version": "current_full_reconcile.v1",
+                "source": "graph_governance_api",
+                "normal_update_path": True,
+                "target_commit_sha": target_commit,
+                "activate": activate_requested,
+                "pending_scope_policy": "supersede_hidden_legacy_recovery_rows",
+            },
+        }
+        try:
+            result = run_state_only_full_reconcile(
+                conn,
+                project_id,
+                root,
+                run_id=str(body.get("run_id") or f"current-full-{target_commit[:7]}"),
+                commit_sha=target_commit,
+                snapshot_id=body.get("snapshot_id"),
+                snapshot_kind="full",
+                created_by=str(body.get("actor") or "dashboard_user"),
+                activate=activate_requested,
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                ref_name=str(body.get("ref_name") or "active"),
+                branch_ref=str(body.get("branch_ref") or ""),
+                notes_extra=notes_extra,
+                semantic_enrich=bool(body.get("semantic_enrich", True)),
+                semantic_use_ai=semantic_use_ai,
+                semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
+                semantic_feedback_round=body.get("semantic_feedback_round"),
+                semantic_max_excerpt_chars=(
+                    int(body["semantic_max_excerpt_chars"])
+                    if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_ai_call=semantic_ai_call,
+                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_batch_kwargs_from_body(body),
+                **_semantic_state_kwargs_from_body(body),
+                semantic_classify_feedback=bool(
+                    _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
+                ),
+                **_semantic_ai_config_kwargs_from_body(body),
+                **_semantic_selector_kwargs_from_body(body),
+                semantic_config_path=body.get("semantic_config_path"),
+                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+
+        elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
+        if isinstance(result, dict) and result.get("ok", True):
+            result = dict(result)
+            result["status"] = result.get("status") or result.get("snapshot_status") or "complete"
+            result["target_commit_sha"] = target_commit
+            result["head_commit"] = head_commit
+            result["current_full_reconcile"] = True
+            result["strategy"] = "current_full_reconcile"
+            result["scope_reconcile_strategy"] = "current_full_reconcile"
+            result["graph_delta_mode"] = "full_rebuild"
+            result["scope_graph_delta_mode"] = "full_rebuild"
+            result["fallback_reason"] = ""
+            result["fallback_required"] = False
+            result["operator_next_action"] = ""
+            result["elapsed_ms"] = int(result.get("elapsed_ms") or elapsed_ms)
+            identity = store.normalize_pending_scope_identity(
+                ref_name=str(body.get("ref_name") or "active"),
+                branch_ref=str(body.get("branch_ref") or ""),
+            )
+            result["operation_trace"] = _scope_reconcile_operation_trace(
+                operation_type="current_full_reconcile",
+                status=str(result.get("snapshot_status") or result.get("status") or "complete"),
+                target_commit_sha=target_commit,
+                snapshot_id=str(result.get("snapshot_id") or ""),
+                run_id=str(result.get("run_id") or body.get("run_id") or ""),
+                identity=identity,
+                result=result,
+                elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+                started_at=request_started_at,
+                updated_at=_utc_now(),
+            )
+            if activate_requested:
+                activation_verification = _pending_scope_activation_verification(
+                    conn,
+                    store,
+                    project_id,
+                    root=root,
+                    target_commit_sha=target_commit,
+                    activate_requested=True,
+                    identity=identity,
+                )
+                result["activation_verification"] = activation_verification
+                result["activated"] = bool(activation_verification.get("verified"))
+                if activation_verification.get("verified"):
+                    result["snapshot_status"] = "active"
+                    result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
+                    result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
+            else:
+                result["activated"] = False
+                result.setdefault("candidate_only", True)
+            timeline_event = _record_pending_scope_reconcile_contract_event(
+                conn,
+                project_id=project_id,
+                body=body,
+                result=result,
+                target_commit_sha=target_commit,
+            )
+            if timeline_event:
+                result["timeline_event_recorded"] = {
+                    "id": timeline_event.get("id"),
+                    "ref": f"timeline:{timeline_event.get('id')}",
+                    "event_kind": timeline_event.get("event_kind"),
+                    "phase": timeline_event.get("phase"),
+                    "status": timeline_event.get("status"),
+                    "requirement_id": "reconcile",
+                }
+        conn.commit()
+        return 201, result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope")
 def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
-    """Create a state-only scope candidate and activate it when requested.
+    """Legacy recovery: create a state-only scope candidate and optionally activate.
 
-    The old dashboard contract required callers to POST /pending-scope first,
-    which left a visible queued operation while the long synchronous build ran.
-    The direct Update graph contract lets this endpoint create the transient
-    pending row itself, mark it running, then consume it in the same request.
+    Normal operator Update Graph now uses /reconcile/current-full. This endpoint
+    remains for internal/deprecated recovery when a specific pending-scope row
+    must be inspected or retried.
     """
     project_id = ctx.get_project_id()
     body = ctx.body
@@ -33760,6 +34394,171 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _contract_chain_current_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    rebuild_if_missing: bool = False,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    try:
+        current_projection = read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
+        if current_projection or not rebuild_if_missing:
+            return current_projection
+        try:
+            rebuilt_projection = rebuild_backlog_contract_chain_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        except sqlite3.Error:
+            rebuilt_projection = {}
+        if rebuilt_projection:
+            return rebuilt_projection
+        record = _onboard_service_materialize_parent_record(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
+        projected = record.get("contract_chain_current")
+        if isinstance(projected, Mapping) and projected:
+            return dict(projected)
+        return read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=True,
+        )
+    except sqlite3.Error as exc:
+        return {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "degraded": True,
+            "degraded_flags": {
+                "projection_read_failed": str(exc),
+            },
+            "projection_source": "backlog_contract_chain_current",
+        }
+
+
+def _contract_chain_current_response(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    rebuild_if_missing: bool = False,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=rebuild_if_missing,
+        route_token_ref=route_token_ref,
+    )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_chain_current": current_projection,
+        "projection_missing": not bool(current_projection),
+        "rebuild_if_missing": rebuild_if_missing,
+    }
+
+
+def _onboard_runtime_resume_from_current_projection(
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not current_projection:
+        return {}
+    next_action = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    readiness_state = str(current_projection.get("readiness_state") or "unknown")
+    status = readiness_state
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        status = "returned"
+    return {
+        "schema_version": "onboard_route_guide.runtime_resume.v1",
+        "status": status,
+        "readiness_state": readiness_state,
+        "mode": "contract_chain_current_projection",
+        "source": "backlog_contract_chain_current",
+        "project_id": str(current_projection.get("project_id") or ""),
+        "backlog_id": str(current_projection.get("backlog_id") or ""),
+        "contract_chain_id": str(current_projection.get("contract_chain_id") or ""),
+        "root_contract_execution_id": str(
+            current_projection.get("root_contract_execution_id") or ""
+        ),
+        "current_contract_execution_id": str(
+            current_projection.get("current_contract_execution_id") or ""
+        ),
+        "current_contract_id": str(current_projection.get("current_contract_id") or ""),
+        "parent_to_resume_contract_execution_id": str(
+            current_projection.get("parent_to_resume_contract_execution_id") or ""
+        ),
+        "active_child_contract_execution_id": str(
+            current_projection.get("active_child_contract_execution_id") or ""
+        ),
+        "next_legal_action": dict(next_action),
+        "projection_watermark": int(
+            current_projection.get("projection_watermark") or 0
+        ),
+        "projection_hash": str(current_projection.get("projection_hash") or ""),
+    }
+
+
+def _source_backed_contract_chain_is_complete(
+    current_projection: Mapping[str, Any],
+) -> bool:
+    if not current_projection:
+        return False
+    if str(current_projection.get("projection_source") or "") != (
+        "backlog_contract_chain_current"
+    ):
+        return False
+    if str(current_projection.get("readiness_state") or "") != "contract_complete":
+        return False
+    next_action = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return not next_action and not str(
+        current_projection.get("active_child_contract_execution_id") or ""
+    ).strip()
+
+
+def _backlog_has_source_backed_onboarding(
+    conn,
+    *,
+    backlog_id: str,
+) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    contract = backlog_runtime.parse_json_object(
+        _row_get(row, "chain_trigger_json", "{}")
+    )
+    return _source_backed_onboarding_enabled(contract)
+
+
 def _contract_runtime_stale_recovery_id(
     stale: StalePinnedContractExecutionError,
 ) -> str:
@@ -34013,7 +34812,11 @@ def _contract_runtime_write_from_record(
     evidence_kind: str,
 ) -> dict[str, Any]:
     state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
-    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
     return {
         "project_id": record.get("project_id"),
         "backlog_id": record.get("backlog_id"),
@@ -34094,7 +34897,18 @@ def _contract_runtime_complete_direct_fix_child_for_parent(
             record = runtime.store.get(execution_id)
         except (ContractRuntimeError, StalePinnedContractExecutionError):
             continue
-        if _runtime_record_is_complete(record):
+        projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_contract_execution_id,
+            child_contract_execution_id=execution_id,
+        )
+        if (
+            _runtime_record_is_complete(record)
+            and str(projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        ):
             return record
     return {}
 
@@ -34181,6 +34995,239 @@ def _onboard_service_apply_successor_return_projection(
     projected = dict(record)
     projected["runtime_guide"] = guide
     return projected
+
+
+def _onboard_service_line_write_decision(
+    *,
+    ok: bool,
+    errors: Sequence[str] = (),
+) -> dict[str, Any]:
+    return {
+        "schema_version": "contract_write_gate_decision.v1",
+        "ok": ok,
+        "decision": "allow" if ok else "block",
+        "errors": list(errors),
+        "source_of_authority": "onboard_route_guide_service",
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _onboard_service_line_evidence_from_write(
+    write: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> dict[str, Any]:
+    line = {
+        "stage_id": str(write.get("stage_id") or ""),
+        "line_id": str(write.get("line_id") or ""),
+        "actor_role": actor_role,
+        "evidence_kind": str(write.get("evidence_kind") or ""),
+    }
+    for key in (
+        "line_instance_id",
+        "payload",
+        "verification",
+        "artifact_refs",
+        "trace_id",
+        "commit_sha",
+    ):
+        if key in write:
+            line[key] = write[key]
+    return line
+
+
+def _onboard_service_ack_failed(write: Mapping[str, Any]) -> bool:
+    candidates: list[Mapping[str, Any]] = [write]
+    for key in ("payload", "verification"):
+        value = write.get(key)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    for candidate in candidates:
+        status = (
+            str(candidate.get("status") or candidate.get("verdict") or "")
+            .strip()
+            .lower()
+        )
+        if status in {"fail", "failed", "failure", "rejected", "blocked"}:
+            return True
+    return False
+
+
+def _onboard_service_submit_line_write(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    actor_role: str,
+    mutate: bool = True,
+) -> dict[str, Any]:
+    """Append the service-root parent-resume line without a source definition."""
+
+    if str(record.get("parent_contract_execution_id") or "").strip():
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=("onboard service parent resume requires root record",),
+            ),
+            "record": dict(record),
+        }
+    if actor_role != "observer":
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=("onboard service parent resume requires observer role",),
+            ),
+            "record": dict(record),
+        }
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    expected = {
+        "stage_id": "successor_return",
+        "line_id": "resume_parent_after_successor_return",
+        "evidence_kind": "successor_return_acknowledgement",
+    }
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    expected_successor_id = str(next_line.get("successor_contract_execution_id") or "")
+    expected_successor_contract = str(next_line.get("successor_contract_id") or "")
+    errors: list[str] = []
+    if str(next_line.get("line_id") or "") != expected["line_id"]:
+        errors.append("onboard service parent is not awaiting successor return ack")
+    if not expected_successor_id:
+        errors.append("onboard service parent resume is missing successor contract id")
+    if not expected_successor_contract:
+        errors.append(
+            "onboard service parent resume is missing successor contract type"
+        )
+    if _onboard_service_ack_failed(write):
+        errors.append("onboard service parent resume acknowledgement cannot be failed")
+    for key, expected_value in expected.items():
+        if str(write.get(key) or "") != expected_value:
+            errors.append(f"{key} mismatch for onboard service parent resume")
+    raw_payload = (
+        dict(write.get("payload") or {})
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    supplied_parent_id = str(
+        raw_payload.get("parent_contract_execution_id") or ""
+    ).strip()
+    if supplied_parent_id and supplied_parent_id != parent_execution_id:
+        errors.append(
+            "parent_contract_execution_id mismatch for onboard service parent resume"
+        )
+    supplied_successor_contract = str(
+        raw_payload.get("successor_contract_id") or ""
+    ).strip()
+    if (
+        supplied_successor_contract
+        and supplied_successor_contract != expected_successor_contract
+    ):
+        errors.append("successor_contract_id mismatch for onboard service parent resume")
+    supplied_successor_id = str(
+        raw_payload.get("successor_contract_execution_id") or ""
+    ).strip()
+    if supplied_successor_id and supplied_successor_id != expected_successor_id:
+        errors.append(
+            "successor_contract_execution_id mismatch for onboard service parent resume"
+        )
+    if errors:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=errors,
+            ),
+            "record": dict(record),
+        }
+
+    payload = raw_payload
+    payload.setdefault("schema_version", "successor_return_acknowledgement.v1")
+    payload.setdefault("source", "onboard_route_guide_service")
+    payload["parent_contract_execution_id"] = parent_execution_id
+    payload["successor_contract_execution_id"] = expected_successor_id
+    payload["successor_contract_id"] = expected_successor_contract
+    payload.setdefault("parent_close_gate_recheck_required", True)
+    payload.setdefault("child_must_not_write_parent_close_evidence", True)
+    effective_write = dict(write)
+    effective_write["payload"] = payload
+    if not mutate:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": True,
+            "decision": _onboard_service_line_write_decision(ok=True),
+            "record": dict(record),
+            "would_mutate_completed_lines": False,
+            "completed_lines_count": len(record.get("completed_lines") or []),
+            "execution_state_revision": int(
+                record.get("execution_state_revision") or 0
+            ),
+            "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+            "write": effective_write,
+        }
+    completed_lines = list(record.get("completed_lines") or [])
+    completed_lines.append(
+        _onboard_service_line_evidence_from_write(
+            effective_write,
+            actor_role=actor_role,
+        )
+    )
+    expected_revision = int(record.get("execution_state_revision") or 0)
+    updated = _onboard_service_refresh_execution_state(
+        record,
+        completed_lines=completed_lines,
+        route_token_ref=str(record.get("route_token_ref") or ""),
+        revision=expected_revision + 1,
+    )
+    updated_guide = dict(updated.get("runtime_guide") or {})
+    updated_guide["successor_return_acknowledged"] = {
+        "schema_version": "onboard_route_guide.successor_return_acknowledged.v1",
+        "status": "acknowledged",
+        "source": "contract_runtime_submit_line",
+        "successor_contract_id": payload["successor_contract_id"],
+        "successor_contract_execution_id": payload["successor_contract_execution_id"],
+        "parent_contract_execution_id": payload["parent_contract_execution_id"],
+    }
+    updated_guide["next_legal_action"] = None
+    updated_guide["runtime_guide_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in updated_guide.items()
+            if key != "runtime_guide_hash"
+        }
+    )
+    updated["runtime_guide"] = updated_guide
+    store = _contract_runtime_store(conn)
+    try:
+        stored = store.update(
+            str(record.get("contract_execution_id") or ""),
+            updated,
+            expected_revision=expected_revision,
+        )
+    except ContractRuntimeError as exc:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=(str(exc),),
+            ),
+            "record": store.get(str(record.get("contract_execution_id") or "")),
+        }
+    return {
+        "schema_version": "contract_runtime_write_result.v1",
+        "ok": True,
+        "decision": _onboard_service_line_write_decision(ok=True),
+        "record": stored,
+    }
 
 
 def _contract_runtime_read(
@@ -34372,18 +35419,89 @@ def _contract_runtime_next_line(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return next_line if isinstance(next_line, Mapping) else {}
 
 
-def _contract_runtime_record_references_runtime_context(
-    record: Mapping[str, Any] | None,
-    context,
+def _contract_runtime_mapping_candidates(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> list[Mapping[str, Any]]:
+    if depth > 6:
+        return []
+    if isinstance(value, Mapping):
+        candidates: list[Mapping[str, Any]] = [value]
+        for child in value.values():
+            candidates.extend(
+                _contract_runtime_mapping_candidates(child, depth=depth + 1)
+            )
+        return candidates
+    if isinstance(value, list):
+        candidates = []
+        for child in value:
+            candidates.extend(
+                _contract_runtime_mapping_candidates(child, depth=depth + 1)
+            )
+        return candidates
+    return []
+
+
+def _contract_runtime_mapping_value(value: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = str(value.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _contract_runtime_mapping_worker_role(value: Mapping[str, Any]) -> str:
+    return (
+        _contract_runtime_mapping_value(value, "worker_role", "role", "actor_role")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+
+
+def _contract_runtime_mapping_matches_context(
+    value: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    task_id_keys: tuple[str, ...] = ("task_id",),
 ) -> bool:
+    for payload in _contract_runtime_mapping_candidates(value):
+        if (
+            _contract_runtime_mapping_value(payload, "runtime_context_id")
+            != runtime_context_id
+        ):
+            continue
+        if _contract_runtime_mapping_value(payload, *task_id_keys) != task_id:
+            continue
+        if _contract_runtime_mapping_value(payload, "parent_task_id") != parent_task_id:
+            continue
+        if _contract_runtime_mapping_worker_role(payload) == "mf_sub":
+            return True
+    return False
+
+
+def _contract_runtime_context_identity(context) -> tuple[str, str, str]:
     runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    if not runtime_context_id and context is not None:
+        try:
+            from .parallel_branch_runtime import runtime_context_id_for_branch_context
+
+            runtime_context_id = runtime_context_id_for_branch_context(context)
+        except Exception:
+            runtime_context_id = ""
     task_id = str(getattr(context, "task_id", "") or "").strip()
     parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
-    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
-        record, Mapping
-    ):
-        return False
+    return runtime_context_id, task_id, parent_task_id
 
+
+def _contract_runtime_completed_lines(
+    record: Mapping[str, Any] | None,
+) -> list[tuple[int, Mapping[str, Any]]]:
+    if not isinstance(record, Mapping):
+        return []
     guide = (
         record.get("runtime_guide")
         if isinstance(record.get("runtime_guide"), Mapping)
@@ -34393,29 +35511,161 @@ def _contract_runtime_record_references_runtime_context(
     if not isinstance(completed_lines, list):
         completed_lines = record.get("completed_lines")
     if not isinstance(completed_lines, list):
-        return False
-
-    def _mapping_candidates(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
-        if depth > 6:
-            return []
-        if isinstance(value, Mapping):
-            candidates: list[Mapping[str, Any]] = [value]
-            for child in value.values():
-                candidates.extend(_mapping_candidates(child, depth=depth + 1))
-            return candidates
-        if isinstance(value, list):
-            candidates = []
-            for child in value:
-                candidates.extend(_mapping_candidates(child, depth=depth + 1))
-            return candidates
         return []
+    return [
+        (index, line)
+        for index, line in enumerate(completed_lines)
+        if isinstance(line, Mapping)
+    ]
 
-    def _line_value(line: Mapping[str, Any], *keys: str) -> str:
-        for key in keys:
-            text = str(line.get(key) or "").strip()
-            if text:
-                return text
-        return ""
+
+def _contract_runtime_dispatch_line_match(
+    record: Mapping[str, Any] | None,
+    context,
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
+        record, Mapping
+    ):
+        return {}
+
+    contract_id = str(record.get("contract_id") or "").strip()
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+
+    def _matches_context(
+        value: Mapping[str, Any],
+        *,
+        task_id_keys: tuple[str, ...] = ("task_id",),
+    ) -> bool:
+        return _contract_runtime_mapping_matches_context(
+            value,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=task_id_keys,
+        )
+
+    for index, line in _contract_runtime_completed_lines(record):
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        is_legacy_dispatch_line = (
+            str(line.get("stage_id") or "").strip() == "dispatch"
+            and str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+        )
+        is_direct_fix_dispatch_line = (
+            contract_id == DIRECT_FIX_CONTRACT_ID
+            and str(line.get("stage_id") or "").strip() == "dispatch_context"
+            and str(line.get("line_id") or "").strip()
+            == "direct_fix_dispatch_context"
+        )
+        if (
+            not (is_legacy_dispatch_line or is_direct_fix_dispatch_line)
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+            or str(line.get("actor_role") or "").strip() != "observer"
+        ):
+            continue
+        dispatch_task_id_keys = ("task_id", "worker_task_id")
+        if not (
+            _matches_context(line, task_id_keys=dispatch_task_id_keys)
+            or _matches_context(payload, task_id_keys=dispatch_task_id_keys)
+        ):
+            continue
+        return {
+            "schema_version": "contract_runtime.dispatch_line_match.v1",
+            "contract_id": contract_id,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "line_index": index,
+            "stage_id": str(line.get("stage_id") or "").strip(),
+            "line_id": str(line.get("line_id") or "").strip(),
+            "evidence_kind": str(line.get("evidence_kind") or "").strip(),
+            "actor_role": str(line.get("actor_role") or "").strip(),
+            "line": dict(line),
+            "payload": dict(payload),
+            "source_ref": (
+                f"contract_runtime:{contract_execution_id}:completed_lines:{index}"
+            ),
+        }
+    return {}
+
+
+def _contract_runtime_dispatch_identity_bridge(
+    record: Mapping[str, Any] | None,
+    dispatch_match: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(record, Mapping) or not isinstance(dispatch_match, Mapping):
+        return {}
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        return {}
+    line = (
+        dispatch_match.get("line")
+        if isinstance(dispatch_match.get("line"), Mapping)
+        else {}
+    )
+    payload = (
+        dispatch_match.get("payload")
+        if isinstance(dispatch_match.get("payload"), Mapping)
+        else {}
+    )
+    legacy_observer_command_id = (
+        _contract_runtime_mapping_value(line, "observer_command_id", "command_id")
+        or _contract_runtime_mapping_value(payload, "observer_command_id", "command_id")
+    )
+    if legacy_observer_command_id:
+        observer_command_id = legacy_observer_command_id
+        observer_command_id_source = "legacy_observer_command_id"
+        observer_command_id_kind = "legacy_observer_command_id"
+        dispatch_identity_source = "legacy_observer_command_id"
+        dispatch_identity_field = "observer_command_id"
+        legacy_present = True
+    else:
+        observer_command_id = contract_execution_id
+        observer_command_id_source = "contract_runtime_execution_id_bridge"
+        observer_command_id_kind = "contract_runtime_execution"
+        dispatch_identity_source = "contract_runtime_execution"
+        dispatch_identity_field = "contract_execution_id"
+        legacy_present = False
+    return {
+        "schema_version": "contract_runtime.dispatch_identity_bridge.v1",
+        "accepted": True,
+        "source": dispatch_identity_source,
+        "source_label": f"{dispatch_identity_source}/{dispatch_identity_field}",
+        "dispatch_identity": observer_command_id,
+        "dispatch_identity_field": dispatch_identity_field,
+        "observer_command_id": observer_command_id,
+        "observer_command_id_source": observer_command_id_source,
+        "observer_command_id_kind": observer_command_id_kind,
+        "legacy_observer_command_id": legacy_observer_command_id,
+        "legacy_observer_command_id_present": legacy_present,
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": str(dispatch_match.get("runtime_context_id") or ""),
+        "task_id": str(dispatch_match.get("task_id") or ""),
+        "parent_task_id": str(dispatch_match.get("parent_task_id") or ""),
+        "stage_id": str(dispatch_match.get("stage_id") or ""),
+        "line_id": str(dispatch_match.get("line_id") or ""),
+        "evidence_kind": str(dispatch_match.get("evidence_kind") or ""),
+        "source_ref": str(dispatch_match.get("source_ref") or ""),
+    }
+
+
+def _contract_runtime_record_references_runtime_context(
+    record: Mapping[str, Any] | None,
+    context,
+) -> bool:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
+        record, Mapping
+    ):
+        return False
 
     contract_id = str((record or {}).get("contract_id") or "").strip()
 
@@ -34424,26 +35674,15 @@ def _contract_runtime_record_references_runtime_context(
         *,
         task_id_keys: tuple[str, ...] = ("task_id",),
     ) -> bool:
-        for payload in _mapping_candidates(value):
-            if _line_value(payload, "runtime_context_id") != runtime_context_id:
-                continue
-            if _line_value(payload, *task_id_keys) != task_id:
-                continue
-            if _line_value(payload, "parent_task_id") != parent_task_id:
-                continue
-            if (
-                _line_value(payload, "worker_role", "role")
-                .strip()
-                .lower()
-                .replace("-", "_")
-                == "mf_sub"
-            ):
-                return True
-        return False
+        return _contract_runtime_mapping_matches_context(
+            value,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=task_id_keys,
+        )
 
-    for line in completed_lines:
-        if not isinstance(line, Mapping):
-            continue
+    for _, line in _contract_runtime_completed_lines(record):
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         if contract_id == CONTRACT_UPDATE_CONTRACT_ID and (
             str(line.get("stage_id") or "").strip() == "observer_request"
@@ -34465,32 +35704,374 @@ def _contract_runtime_record_references_runtime_context(
             )
             if _matches_context(worker_context) or _matches_context(worker_dispatch):
                 return True
-        is_legacy_dispatch_line = (
-            str(line.get("stage_id") or "").strip() == "dispatch"
-            and str(line.get("line_id") or "").strip()
-            == "observer_dispatch_bounded_workers"
+    return bool(_contract_runtime_dispatch_line_match(record, context))
+
+
+def _contract_runtime_dispatch_bridge_for_startup(
+    conn,
+    *,
+    project_id: str,
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    startup_payload = dict(payload)
+    if str(startup_payload.get("observer_command_id") or "").strip():
+        return startup_payload, {}
+
+    runtime_context_id = str(startup_payload.get("runtime_context_id") or "").strip()
+    task_id = str(startup_payload.get("task_id") or "").strip()
+    if not (runtime_context_id or task_id):
+        return startup_payload, {}
+
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+        runtime_context_id_for_branch_context,
+    )
+
+    context = (
+        get_branch_context_by_runtime_context_id(conn, project_id, runtime_context_id)
+        if runtime_context_id
+        else None
+    )
+    if context is None and task_id:
+        context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        return startup_payload, {}
+    expected_runtime_context_id = runtime_context_id_for_branch_context(context)
+    if runtime_context_id and runtime_context_id != expected_runtime_context_id:
+        return startup_payload, {}
+
+    store = _contract_runtime_store(conn)
+    candidate_ids: list[str] = []
+    for key in (
+        "contract_execution_id",
+        "parent_contract_execution_id",
+        "successor_contract_execution_id",
+        "host_startup_id",
+        "parent_task_id",
+    ):
+        candidate = str(startup_payload.get(key) or "").strip()
+        if candidate.startswith("cex-") and candidate not in candidate_ids:
+            candidate_ids.append(candidate)
+
+    records: list[Mapping[str, Any]] = []
+    for contract_execution_id in candidate_ids:
+        try:
+            records.append(store.get(contract_execution_id))
+        except ContractRuntimeError:
+            continue
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT record_json
+            FROM contract_runtime_executions
+            WHERE project_id = ?
+              AND contract_id IN (?, ?)
+            ORDER BY updated_at DESC, contract_execution_id DESC
+            LIMIT 200
+            """,
+            (project_id, MF_PARALLEL_RECORD_CONTRACT_ID, DIRECT_FIX_CONTRACT_ID),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            record = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        contract_execution_id = str(record.get("contract_execution_id") or "")
+        if not contract_execution_id or contract_execution_id in {
+            str(existing.get("contract_execution_id") or "") for existing in records
+        }:
+            continue
+        records.append(record)
+
+    for record in records:
+        dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+        bridge = _contract_runtime_dispatch_identity_bridge(record, dispatch_match)
+        if not bridge:
+            continue
+        startup_payload.update(
+            {
+                "observer_command_id": bridge["observer_command_id"],
+                "observer_command_id_source": bridge["observer_command_id_source"],
+                "observer_command_id_kind": bridge["observer_command_id_kind"],
+                "legacy_observer_command_id": bridge["legacy_observer_command_id"],
+                "legacy_observer_command_id_present": bridge[
+                    "legacy_observer_command_id_present"
+                ],
+                "dispatch_identity_source": bridge["source"],
+                "dispatch_identity_source_label": bridge["source_label"],
+                "contract_runtime_dispatch_identity": bridge,
+            }
         )
-        is_direct_fix_dispatch_line = (
-            contract_id == DIRECT_FIX_CONTRACT_ID
-            and str(line.get("stage_id") or "").strip() == "dispatch_context"
-            and str(line.get("line_id") or "").strip()
-            == "direct_fix_dispatch_context"
+        startup_payload.setdefault("startup_source", bridge["source"])
+        return startup_payload, bridge
+    return startup_payload, {}
+
+
+def _apply_contract_runtime_dispatch_bridge_to_startup_result(
+    result: dict[str, Any],
+    bridge: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(result, dict) or not isinstance(bridge, Mapping) or not bridge:
+        return result
+    bridge_payload = dict(bridge)
+    labels = {
+        "contract_runtime_dispatch_identity": bridge_payload,
+        "dispatch_identity_source": str(bridge.get("source") or ""),
+        "dispatch_identity_source_label": str(bridge.get("source_label") or ""),
+        "observer_command_id_source": str(
+            bridge.get("observer_command_id_source") or ""
+        ),
+        "observer_command_id_kind": str(
+            bridge.get("observer_command_id_kind") or ""
+        ),
+        "legacy_observer_command_id": str(
+            bridge.get("legacy_observer_command_id") or ""
+        ),
+        "legacy_observer_command_id_present": bool(
+            bridge.get("legacy_observer_command_id_present")
+        ),
+        "contract_execution_id": str(bridge.get("contract_execution_id") or ""),
+        "contract_id": str(bridge.get("contract_id") or ""),
+    }
+    gate = result.get("startup_gate")
+    if isinstance(gate, dict):
+        gate.update(labels)
+    event = result.get("timeline_event")
+    if isinstance(event, dict):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_gate = (
+            payload.get("mf_subagent_startup_gate")
+            if isinstance(payload.get("mf_subagent_startup_gate"), dict)
+            else {}
         )
+        if event_gate:
+            event_gate.update(labels)
+        artifact_refs = (
+            event.get("artifact_refs")
+            if isinstance(event.get("artifact_refs"), dict)
+            else {}
+        )
+        artifact_refs.update(
+            {
+                "contract_runtime_dispatch_identity_source": labels[
+                    "dispatch_identity_source"
+                ],
+                "dispatch_identity_source_label": labels[
+                    "dispatch_identity_source_label"
+                ],
+                "observer_command_id_source": labels["observer_command_id_source"],
+                "observer_command_id_kind": labels["observer_command_id_kind"],
+                "legacy_observer_command_id_present": labels[
+                    "legacy_observer_command_id_present"
+                ],
+                "contract_execution_id": labels["contract_execution_id"],
+                "contract_id": labels["contract_id"],
+            }
+        )
+        event["artifact_refs"] = artifact_refs
+    result["contract_runtime_dispatch_identity"] = bridge_payload
+    return result
+
+
+def _contract_runtime_has_legacy_direct_fix_dispatch_without_context(
+    record: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if str(record.get("contract_id") or "").strip() != DIRECT_FIX_CONTRACT_ID:
+        return False
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return False
+
+    found_legacy_dispatch = False
+    for line in completed_lines:
+        if not isinstance(line, Mapping):
+            continue
         if (
-            not (is_legacy_dispatch_line or is_direct_fix_dispatch_line)
+            str(line.get("stage_id") or "").strip() != "dispatch_context"
+            or str(line.get("line_id") or "").strip()
+            != "direct_fix_dispatch_context"
             or str(line.get("evidence_kind") or "").strip()
             != "dispatch_bounded_worker"
             or str(line.get("actor_role") or "").strip() != "observer"
         ):
             continue
-        dispatch_task_id_keys = ("task_id", "worker_task_id")
-        if _matches_context(
-            line,
-            task_id_keys=dispatch_task_id_keys,
-        ) or _matches_context(
-            payload,
-            task_id_keys=dispatch_task_id_keys,
+        if any(
+            _contract_runtime_mapping_value(candidate, "runtime_context_id")
+            for candidate in _contract_runtime_mapping_candidates(line)
         ):
+            return False
+        found_legacy_dispatch = True
+    return found_legacy_dispatch
+
+
+def _contract_runtime_timeline_references_runtime_context(
+    conn,
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    record: Mapping[str, Any] | None,
+    context,
+) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    contract_id = str(record.get("contract_id") or "").strip()
+    next_line = _contract_runtime_next_line(record)
+    if (
+        contract_id != DIRECT_FIX_CONTRACT_ID
+        or str(next_line.get("line_id") or "").strip() != "direct_fix_candidate_repair"
+    ):
+        return False
+    if not _contract_runtime_has_legacy_direct_fix_dispatch_without_context(record):
+        return False
+
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    required_identity = (
+        project_id,
+        backlog_id,
+        contract_execution_id,
+        runtime_context_id,
+        task_id,
+        parent_task_id,
+    )
+    if not all(required_identity):
+        return False
+    if parent_task_id != contract_execution_id:
+        return False
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, task_id, event_type, event_kind, actor, status,
+                   payload_json, verification_json, artifact_refs_json
+            FROM task_timeline_events
+            WHERE project_id = ?
+              AND backlog_id = ?
+              AND task_id IN (?, ?)
+            ORDER BY id ASC
+            LIMIT 300
+            """,
+            (project_id, backlog_id, task_id, parent_task_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+
+    def _row_value(row: Any, key: str) -> Any:
+        try:
+            return row[key]
+        except (KeyError, TypeError, IndexError):
+            return ""
+
+    def _json_mapping(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+    def _event_matches_context(event: Mapping[str, Any]) -> bool:
+        if not _contract_runtime_mapping_matches_context(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=("task_id", "worker_task_id"),
+        ):
+            return False
+        row_task_id = str(event.get("task_id") or "").strip()
+        return row_task_id in {task_id, parent_task_id}
+
+    def _has_mf_sub_worker_actor(event: Mapping[str, Any]) -> bool:
+        actor = str(event.get("actor") or "").strip().lower().replace("-", "_")
+        return actor == "mf_sub" or actor.startswith("mf_sub:")
+
+    accepted_statuses = {"accepted", "ok", "passed", "succeeded"}
+    dispatch_seen = False
+    worker_start_seen = False
+    worker_implementation_seen = False
+
+    for row in rows:
+        payload = _json_mapping(_row_value(row, "payload_json"))
+        verification = _json_mapping(_row_value(row, "verification_json"))
+        artifact_refs = _json_mapping(_row_value(row, "artifact_refs_json"))
+        event = {
+            "id": _row_value(row, "id"),
+            "task_id": _row_value(row, "task_id"),
+            "event_type": _row_value(row, "event_type"),
+            "event_kind": _row_value(row, "event_kind"),
+            "actor": _row_value(row, "actor"),
+            "status": _row_value(row, "status"),
+            "payload": payload,
+            "verification": verification,
+            "artifact_refs": artifact_refs,
+        }
+        if str(event["status"] or "").strip().lower() not in accepted_statuses:
+            continue
+        if not _event_matches_context(event):
+            continue
+
+        event_type = str(event["event_type"] or "").strip()
+        event_kind = str(event["event_kind"] or "").strip()
+        actor = str(event["actor"] or "").strip().lower().replace("-", "_")
+        is_observer_dispatch = (
+            actor == "observer"
+            and (
+                event_kind
+                in {
+                    "bounded_implementation_worker_dispatch",
+                    "dispatch_bounded_worker",
+                }
+                or event_type in {"mf_subagent.dispatch", "bounded_worker_dispatch"}
+            )
+        )
+        is_worker_start = (
+            event_kind
+            in {
+                "contract_context_read_receipt",
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            }
+            or event_type
+            in {
+                "contract_context_read_receipt",
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            }
+        )
+        is_worker_implementation = (
+            event_kind in {"implementation", "finish_time_worker_attestation"}
+            or event_type in {"implementation", "finish_time_worker_attestation"}
+        )
+
+        if is_observer_dispatch:
+            dispatch_seen = True
+        if _has_mf_sub_worker_actor(event):
+            if is_worker_start:
+                worker_start_seen = True
+            if is_worker_implementation:
+                worker_implementation_seen = True
+
+        if dispatch_seen and worker_start_seen and worker_implementation_seen:
             return True
     return False
 
@@ -34623,6 +36204,12 @@ def _resolve_contract_runtime_mf_sub_proof(
     if not _contract_runtime_record_references_runtime_context(
         record,
         context,
+    ) and not _contract_runtime_timeline_references_runtime_context(
+        conn,
+        project_id=project_id,
+        contract_execution_id=contract_execution_id,
+        record=record,
+        context=context,
     ):
         raise PermissionDeniedError(
             "coordinator",
@@ -34717,6 +36304,20 @@ def _contract_runtime_line_write_body(
         "artifact_refs",
         "trace_id",
         "commit_sha",
+        "actor_session_principal",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "evidence_owner_session",
+        "evidence_owner_session_ref",
+        "submitter_session",
+        "submitter_principal",
+        "materialized_from",
+        "materialized_from_report",
+        "authorization_source",
+        "observer_impersonation",
+        "qa_session_token_ref",
+        "parent_materialization_authorized",
+        "qa_evidence_provenance",
     ):
         if key in body:
             write[key] = body[key]
@@ -34830,11 +36431,24 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_update_submit_line",
     "contract_runtime_current",
     "contract_runtime_submit_line",
+    "runtime_context_read_receipt",
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
     "task_timeline_append",
 )
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
+_CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_submit_line",
+)
+_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_guide",
+    "contract_runtime_submit_line",
+    "parallel_branch_allocate",
+    "runtime_context_read_receipt",
+    "task_timeline_append",
+)
 
 
 def _onboard_contract_execution_id(
@@ -35043,6 +36657,8 @@ def _onboard_service_materialize_parent_record(
                 revision=1,
             )
         )
+        current_projection = upsert_contract_chain_root_current_binding(conn, created)
+        created["contract_chain_current"] = current_projection
         if blocked_successor_entry is None:
             return created
         projected = _contract_runtime_apply_blocked_projection(
@@ -35052,7 +36668,12 @@ def _onboard_service_materialize_parent_record(
             record=created,
             actor_role="observer",
         )
-        return store.update(execution_id, projected)
+        updated = store.update(execution_id, projected)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
     if route_token_ref and not str(existing.get("route_token_ref") or ""):
         existing["route_token_ref"] = route_token_ref
     if blocked_successor_entry is not None:
@@ -35070,9 +36691,23 @@ def _onboard_service_materialize_parent_record(
             record=existing,
             actor_role="observer",
         )
-        return store.update(execution_id, existing)
+        updated = store.update(execution_id, existing)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
     if route_token_ref:
-        return store.update(execution_id, existing)
+        updated = store.update(execution_id, existing)
+        updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+            conn,
+            updated,
+        )
+        return updated
+    existing["contract_chain_current"] = upsert_contract_chain_root_current_binding(
+        conn,
+        existing,
+    )
     return existing
 
 
@@ -35091,7 +36726,29 @@ def _onboard_service_waiver_requested(
     )
     if isinstance(raw, bool):
         return raw
+    if isinstance(raw, Mapping):
+        return (
+            bool(raw.get("legacy_onboard_contract_waived"))
+            or bool(raw.get("onboard_contract_waived"))
+            or str(raw.get("service_id") or "").strip()
+            == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+        )
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "waive"}
+
+
+def _onboard_service_parent_materialized(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> bool:
+    try:
+        record = _contract_runtime_store(conn).get(
+            _onboard_service_execution_id(project_id, backlog_id)
+        )
+    except ContractRuntimeError:
+        return False
+    return _onboard_service_record(record)
 
 
 def _onboard_contract_route_issue_target_files_from_record(
@@ -35152,6 +36809,63 @@ def _onboard_contract_route_issue_target_files(
         seen.add(text)
         deduped.append(text)
     return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _onboard_graph_first_policy() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.graph_first_policy.v1",
+        "default_sequence": [
+            "call_graph_query_with_query_purpose",
+            "preserve_graph_query_trace_ids_in_evidence",
+            "fallback_to_source_search_only_when_graph_has_no_match_or_is_unavailable",
+            "record_source_search_fallback_in_timeline_or_contract_payload",
+        ],
+        "intent_query_purpose_map": {
+            "observer_implementation_context": "global_architecture_review",
+            "worker_context": "subagent_context_build",
+            "worker_gate_validation": "subagent_gate_validation",
+            "qa_independent_verification": "independent_verification",
+            "gate_validation": "gate_validation",
+            "prompt_context": "prompt_context_build",
+            "semantic_enrichment": "semantic_enrichment",
+            "source_hint_lookup": "global_architecture_review",
+        },
+        "graph_query_tools": [
+            "query_schema",
+            "function_index",
+            "search_structure",
+            "get_file_excerpt",
+        ],
+        "trace_evidence": {
+            "preserve_fields": [
+                "graph_trace_id",
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            ],
+            "evidence_locations": [
+                "contract_runtime_submit_line.payload",
+                "task_timeline_append.payload",
+                "runtime_context_read_receipt",
+            ],
+        },
+        "source_hint_policy": {
+            "scope": "docs_config_tests_or_other_source_controlled_context_not_materialized_in_graph",
+            "source_paths": [
+                "agent/governance/governance_hints.py",
+                "agent/governance/graph_structure_ops.py",
+            ],
+            "status_fields": [
+                "graph_status.active_snapshot_rule_fingerprint.components.source_hints.hint_count",
+                "graph_status.pending_scope_reconcile",
+                "graph_operations_queue.pending",
+            ],
+            "next_action": (
+                "If graph_query misses source-controlled docs/config/tests, inspect "
+                "source_hints status, add or update a governance hint, then update "
+                "the graph before relying on the source fact as graph-backed."
+            ),
+        },
+    }
 
 
 def _onboard_contract_route_guide(
@@ -35255,6 +36969,13 @@ def _onboard_contract_route_guide(
             "method": "POST",
             "path": "/api/projects/{project_id}/onboard-route-guide",
         },
+        "contract_chain_current": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "contract_chain_current",
+            "method": "GET",
+            "path": "/api/projects/{project_id}/contract-chain-current",
+            "query_params": ["backlog_id", "rebuild_if_missing"],
+        },
         "onboard_start": {
             "kind": "http",
             "method": "POST",
@@ -35354,6 +37075,17 @@ def _onboard_contract_route_guide(
                 "{runtime_context_id}/worker-guide"
             ),
         },
+        "runtime_context_read_receipt": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "runtime_context_read_receipt",
+            "method": "POST",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/read-receipts"
+            ),
+            "facade": "runtime_context.read_receipts",
+            "legacy_action": "submit_mf_subagent_read_receipt",
+        },
         "qa_session_register": {
             "kind": "mcp_or_http",
             "mcp_tool": "qa_session_register",
@@ -35386,6 +37118,17 @@ def _onboard_contract_route_guide(
             "kind": "mcp",
             "mcp_tool": "backlog_list",
         },
+        "source_hints": {
+            "kind": "source_control_and_graph_status",
+            "source_paths": [
+                "agent/governance/governance_hints.py",
+                "agent/governance/graph_structure_ops.py",
+            ],
+            "status_interfaces": [
+                "graph_status",
+                "graph_operations_queue",
+            ],
+        },
     }
     worker_entry = {
         "role": "worker",
@@ -35400,7 +37143,7 @@ def _onboard_contract_route_guide(
             "session_token_ref",
         ],
         "required_token_refs": ["session_token_ref", "route_token_ref"],
-        "next_action": "read runtime_context_worker_guide, then submit the next required worker evidence line",
+        "next_action": "read runtime_context_worker_guide, then use runtime_context_read_receipt or the next required worker evidence facade",
         "raw_session_token_required": False,
         "raw_session_token_exposed": False,
         "raw_route_token_exposed": False,
@@ -35464,6 +37207,7 @@ def _onboard_contract_route_guide(
         "raw_operator_token_required": False,
         "raw_route_token_exposed": False,
     }
+    graph_first_policy = _onboard_graph_first_policy()
     return {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
@@ -35625,15 +37369,19 @@ def _onboard_contract_route_guide(
                 "interface_index",
                 "system_operation_index",
                 "backlog_chain_binding",
+                "graph_first_policy",
+                "source_hints",
             ],
             "interfaces": [
                 "graph_query",
                 "backlog_get",
                 "backlog_list",
+                "contract_chain_current",
                 "observer_route_context_issue",
                 "contract_add_start",
                 "contract_update_start",
                 "runtime_context_worker_guide",
+                "runtime_context_read_receipt",
                 "qa_session_register",
                 "contract_runtime_current",
                 "contract_runtime_submit_line",
@@ -35642,6 +37390,7 @@ def _onboard_contract_route_guide(
                 "direct_fix_enter",
                 "mf_parallel_enter",
                 "mf_batch_parallel_enter",
+                "source_hints",
             ],
             "index_paths": {
                 "roles": "agent_onboard_guidance.onboard_route_guide.role_entries",
@@ -35651,6 +37400,13 @@ def _onboard_contract_route_guide(
                     "system_operation_index"
                 ),
                 "chain": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
+                "graph_first_policy": (
+                    "agent_onboard_guidance.onboard_route_guide.graph_first_policy"
+                ),
+                "source_hints": (
+                    "agent_onboard_guidance.onboard_route_guide.graph_first_policy."
+                    "source_hint_policy"
+                ),
             },
         },
         "system_operation_index": {
@@ -35689,14 +37445,35 @@ def _onboard_contract_route_guide(
                     "kind": "mcp_or_http",
                     "mcp_tools": [
                         "graph_operations_queue",
-                        "graph_pending_scope_queue",
+                        "graph_current_full_reconcile",
                     ],
                     "status_path": "/api/graph-governance/{project_id}/operations/queue",
-                    "queue_path": "/api/graph-governance/{project_id}/pending-scope",
+                    "run_path": "/api/graph-governance/{project_id}/reconcile/current-full",
+                    "gated": True,
+                    "legacy_recovery": {
+                        "pending_scope_queue_path": "/api/graph-governance/{project_id}/pending-scope",
+                        "pending_scope_materialize_path": "/api/graph-governance/{project_id}/reconcile/pending-scope",
+                        "internal_only": True,
+                    },
+                },
+                "source_hints": {
+                    "kind": "graph_status_index",
+                    "mcp_tools": [
+                        "graph_status",
+                        "graph_operations_queue",
+                    ],
+                    "source_paths": [
+                        "agent/governance/governance_hints.py",
+                        "agent/governance/graph_structure_ops.py",
+                    ],
+                    "status_fields": graph_first_policy["source_hint_policy"][
+                        "status_fields"
+                    ],
                     "gated": True,
                 },
             },
         },
+        "graph_first_policy": graph_first_policy,
         "interface_index": interface_index,
         "next_legal_action": dict(next_legal_action),
         "route_token_ref": route_token_ref,
@@ -35877,6 +37654,264 @@ def _onboard_contract_agent_guidance(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+
+
+def _onboard_route_guide_target_contract_execution_id(
+    *,
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+) -> str:
+    for source in (next_action, current_projection, runtime_resume):
+        if not isinstance(source, Mapping):
+            continue
+        for key in (
+            "contract_execution_id",
+            "current_contract_execution_id",
+            "active_child_contract_execution_id",
+        ):
+            text = str(source.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _onboard_route_guide_parent_route_resolution(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    route_token_ref = str(route_token_ref or "").strip()
+    if not route_token_ref:
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    return dict(resolved) if isinstance(resolved, Mapping) else {}
+
+
+def _onboard_route_guide_patch_next_action(
+    container: Any,
+    *,
+    target_contract_execution_id: str,
+    patched_next_action: Mapping[str, Any],
+) -> None:
+    if not isinstance(container, dict):
+        return
+    next_action = container.get("next_legal_action")
+    if isinstance(next_action, Mapping):
+        action_execution_id = str(next_action.get("contract_execution_id") or "")
+        if not action_execution_id or action_execution_id == target_contract_execution_id:
+            container["next_legal_action"] = dict(patched_next_action)
+
+
+def _onboard_route_guide_apply_runtime_route_token_scope(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    guidance: dict[str, Any],
+    next_action: dict[str, Any],
+    current_projection: dict[str, Any],
+    runtime_resume: dict[str, Any],
+) -> None:
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    target_execution_id = _onboard_route_guide_target_contract_execution_id(
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    if not project_id or not target_execution_id or target_execution_id == parent_execution_id:
+        return
+
+    candidate_refs: list[str] = []
+    for source in (
+        next_action,
+        guidance,
+        guidance.get("route_token_ref_guidance")
+        if isinstance(guidance.get("route_token_ref_guidance"), Mapping)
+        else {},
+        record,
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("route_token_ref", "current_route_token_ref"):
+            value = str(source.get(key) or "").strip()
+            if value and value not in candidate_refs:
+                candidate_refs.append(value)
+
+    verified_ref = ""
+    verified_binding: dict[str, Any] = {}
+    fallback_ref = ""
+    fallback_binding: dict[str, Any] = {}
+    for ref in candidate_refs:
+        binding = _contract_runtime_route_token_ref_binding(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=target_execution_id,
+            route_token_ref=ref,
+        )
+        if not fallback_ref:
+            fallback_ref = ref
+            fallback_binding = binding
+        if str(binding.get("status") or "") == "current_contract_scope_verified":
+            verified_ref = ref
+            verified_binding = binding
+            break
+
+    parent_resolved = (
+        fallback_binding.get("resolved")
+        if isinstance(fallback_binding.get("resolved"), Mapping)
+        else {}
+    )
+    if not parent_resolved and fallback_ref:
+        parent_resolved = _onboard_route_guide_parent_route_resolution(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=fallback_ref,
+        )
+    target_files = _onboard_contract_route_issue_target_files_from_record(record)
+    issue_payload = _contract_runtime_route_token_issue_payload(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=target_execution_id,
+        parent_contract_execution_id=parent_execution_id,
+        target_files=target_files,
+        parent_route_token_ref=fallback_ref,
+        parent_resolved=parent_resolved,
+    )
+
+    patched_next_action = dict(next_action)
+    target_contract_id = str(
+        patched_next_action.get("contract_id")
+        or current_projection.get("current_contract_id")
+        or runtime_resume.get("current_contract_id")
+        or ""
+    )
+    status = "current_contract_scope_verified"
+    pass_aliases = ["observer_route_token_ref", "route_token_ref"]
+    current_ref = verified_ref
+    if verified_ref:
+        patched_next_action["route_token_ref"] = verified_ref
+        patched_next_action["route_token_ref_status"] = status
+        patched_next_action["route_token_ref_scope"] = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": target_execution_id,
+        }
+    else:
+        status = "issue_required_for_current_contract_runtime"
+        pass_aliases = []
+        current_ref = ""
+        patched_next_action["route_token_ref"] = ""
+        patched_next_action["route_token_ref_status"] = status
+        patched_next_action["observer_route_context_issue_payload"] = issue_payload
+        if fallback_ref:
+            patched_next_action["enter_only_route_token_ref"] = fallback_ref
+            patched_next_action["enter_only_route_token_ref_binding"] = fallback_binding
+
+    guidance["route_token_ref_guidance"] = {
+        "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+        "status": status,
+        "current_route_token_ref": current_ref,
+        "current_ref_present": bool(current_ref),
+        "target_contract_execution_id": target_execution_id,
+        "target_contract_id": target_contract_id,
+        "pass_to_next_runtime_writes_as": pass_aliases,
+        "observer_route_context_issue_payload": issue_payload,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if verified_binding:
+        guidance["route_token_ref_guidance"][
+            "current_contract_route_token_binding"
+        ] = verified_binding
+    if fallback_ref and not verified_ref:
+        guidance["route_token_ref_guidance"]["enter_only_route_token_ref"] = fallback_ref
+        guidance["route_token_ref_guidance"][
+            "enter_only_route_token_ref_binding"
+        ] = fallback_binding
+
+    guidance["route_token_ref"] = current_ref
+    guidance["route_token_ref_present"] = bool(current_ref)
+    guidance["route_token_issue"] = {
+        "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+        "status": "current_ref_present" if current_ref else status,
+        "mcp_entrypoint": {"tool": "observer_route_context_issue"},
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": project_id},
+        },
+        "observer_route_context_issue_payload": issue_payload,
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": target_execution_id,
+        },
+        "allowed_actions": list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+    next_action.clear()
+    next_action.update(patched_next_action)
+    guidance["next_legal_action"] = dict(patched_next_action)
+    for container in (current_projection, runtime_resume, guidance.get("contract_chain")):
+        _onboard_route_guide_patch_next_action(
+            container,
+            target_contract_execution_id=target_execution_id,
+            patched_next_action=patched_next_action,
+        )
+    route_guide = guidance.get("onboard_route_guide")
+    if isinstance(route_guide, dict):
+        route_guide["route_token_ref"] = current_ref
+        route_guide["route_token_ref_present"] = bool(current_ref)
+        _onboard_route_guide_patch_next_action(
+            route_guide,
+            target_contract_execution_id=target_execution_id,
+            patched_next_action=patched_next_action,
+        )
+        chain_binding = route_guide.get("backlog_chain_binding")
+        if isinstance(chain_binding, dict):
+            continue_binding = chain_binding.get("continue")
+            if isinstance(continue_binding, dict):
+                continue_binding["next_legal_action"] = dict(patched_next_action)
+            _onboard_route_guide_patch_next_action(
+                chain_binding.get("current_projection"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
+            _onboard_route_guide_patch_next_action(
+                chain_binding.get("runtime_resume"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
+        role_entries = route_guide.get("role_entries")
+        observer_entry = (
+            role_entries.get("observer")
+            if isinstance(role_entries, Mapping)
+            else {}
+        )
+        if isinstance(observer_entry, dict):
+            _onboard_route_guide_patch_next_action(
+                observer_entry.get("runtime_resume"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
 
 
 def _onboard_route_guide_service_next_action(
@@ -36192,7 +38227,8 @@ def _onboard_route_guide_service_response(
     role: str = "",
     work_type: str = "",
 ) -> dict[str, Any]:
-    record = _onboard_service_parent_record(
+    record = _onboard_service_materialize_parent_record(
+        conn,
         project_id=project_id,
         backlog_id=backlog_id,
         route_token_ref=route_token_ref,
@@ -36203,29 +38239,124 @@ def _onboard_route_guide_service_response(
         body={},
         metadata={},
     )
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+        route_token_ref=route_token_ref,
+    )
+    projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
     }
-    runtime_resume = _onboard_blocked_contract_resume_projection(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        actor_role=str(role or "").strip() or "observer",
-        route_token_ref=route_token_ref,
-    )
+    runtime_resume = {}
+    if current_projection and not projection_degraded:
+        runtime_resume = _onboard_runtime_resume_from_current_projection(
+            current_projection
+        )
+        selected_work_type = str(work_type or "").strip()
+        current_projection_complete = _source_backed_contract_chain_is_complete(
+            current_projection
+        )
+        if (
+            selected_work_type
+            in {"continue_contract_chain", "rollback_or_recover_contract", "direct_fix"}
+            and not runtime_resume.get("next_legal_action")
+            and not str(
+                current_projection.get("active_child_contract_execution_id") or ""
+            ).strip()
+            and not current_projection_complete
+        ):
+            blocked_resume = _onboard_blocked_contract_resume_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=str(role or "").strip() or "observer",
+                route_token_ref=route_token_ref,
+            )
+            if blocked_resume:
+                blocked_resume["shadowed_current_projection"] = {
+                    "source": "backlog_contract_chain_current",
+                    "readiness_state": str(
+                        current_projection.get("readiness_state") or ""
+                    ),
+                    "current_contract_execution_id": str(
+                        current_projection.get("current_contract_execution_id") or ""
+                    ),
+                    "projection_hash": str(
+                        current_projection.get("projection_hash") or ""
+                    ),
+                }
+                runtime_resume = blocked_resume
+        elif (
+            selected_work_type
+            in {"continue_contract_chain", "rollback_or_recover_contract", "direct_fix"}
+            and current_projection_complete
+        ):
+            blocked_resume = _onboard_blocked_contract_resume_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=str(role or "").strip() or "observer",
+                route_token_ref=route_token_ref,
+            )
+            if blocked_resume:
+                runtime_resume["projection_conflict"] = {
+                    "schema_version": "onboard_route_guide.projection_conflict.v1",
+                    "status": "suppressed_stale_resume",
+                    "authoritative_source": "backlog_contract_chain_current",
+                    "authoritative_readiness_state": str(
+                        current_projection.get("readiness_state") or ""
+                    ),
+                    "shadowed_source": str(blocked_resume.get("source") or ""),
+                    "shadowed_mode": str(blocked_resume.get("mode") or ""),
+                    "shadowed_next_legal_action": dict(
+                        blocked_resume.get("next_legal_action")
+                        if isinstance(blocked_resume.get("next_legal_action"), Mapping)
+                        else {}
+                    ),
+                    "safe_next_step": (
+                        "do_not_enter_duplicate_successor; continue from "
+                        "backlog_contract_chain_current"
+                    ),
+                }
+                runtime_resume["stale_compact_ledger_suppressed"] = True
+    else:
+        runtime_resume = _onboard_blocked_contract_resume_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=str(role or "").strip() or "observer",
+            route_token_ref=route_token_ref,
+        )
+        if current_projection:
+            runtime_resume["projection_degraded"] = True
+            runtime_resume["projection_degraded_reason"] = (
+                current_projection.get("degraded_flags") or {}
+            )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
     )
     if runtime_resume:
         resume_next = runtime_resume.get("next_legal_action")
-        if isinstance(resume_next, Mapping):
+        if isinstance(resume_next, Mapping) and resume_next:
             next_action = dict(resume_next)
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
     )
+    if current_projection:
+        guidance["contract_chain_current"] = current_projection
+        guidance["contract_chain"]["current_projection"] = current_projection
+        route_guide = guidance.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["contract_chain_current"] = current_projection
+            chain_binding = route_guide.get("backlog_chain_binding")
+            if isinstance(chain_binding, dict):
+                chain_binding["current_projection"] = current_projection
     if runtime_resume:
         guidance["runtime_resume"] = runtime_resume
         guidance["contract_chain"]["runtime_resume"] = runtime_resume
@@ -36242,6 +38373,14 @@ def _onboard_route_guide_service_response(
             )
             if isinstance(observer_entry, dict):
                 observer_entry["runtime_resume"] = runtime_resume
+    _onboard_route_guide_apply_runtime_route_token_scope(
+        conn,
+        record=record,
+        guidance=guidance,
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
     return {
         "schema_version": "onboard_route_guide.service_response.v1",
         "ok": True,
@@ -36267,6 +38406,11 @@ def _onboard_route_guide_service_response(
         },
         "agent_onboard_guidance": guidance,
         "onboard_route_guide": guidance["onboard_route_guide"],
+        "contract_chain_current": current_projection,
+        "projection_degraded": projection_degraded,
+        "projection_degraded_reason": (
+            current_projection.get("degraded_flags") if projection_degraded else {}
+        ),
         "runtime_resume": runtime_resume,
         "next_legal_action": next_action,
         "raw_route_token_required": False,
@@ -36741,6 +38885,17 @@ def _contract_add_effective_actor_role(
 CONTRACT_UPDATE_CONTRACT_ID = "contract_update"
 DIRECT_FIX_CONTRACT_ID = "direct_fix"
 DIRECT_FIX_TEMPLATE_ID = "direct_fix.v1"
+_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_guide",
+    "contract_runtime_submit_line",
+    "parallel_branch_allocate",
+    "task_timeline_append",
+)
+_DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES = (
+    "agent/governance/server.py",
+    "agent/governance/contracts/runtime.py",
+)
 
 
 def _contract_update_execution_id(
@@ -36860,6 +39015,1270 @@ def _direct_fix_successor_execution_id(
         parent_execution_id,
         DIRECT_FIX_CONTRACT_ID,
     )
+
+
+def _direct_fix_child_route_token_target_files(
+    conn,
+    *,
+    backlog_id: str,
+) -> list[str]:
+    candidates: list[str] = []
+    if backlog_id:
+        try:
+            row = conn.execute(
+                "SELECT target_files FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is not None:
+            candidates.extend(_string_list_field(_row_get(row, "target_files", "")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        text = str(path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped or list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _contract_runtime_route_token_ref_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    route_token_ref = str(route_token_ref or "").strip()
+    contract_execution_id = str(contract_execution_id or "").strip()
+    proof: dict[str, Any] = {
+        "schema_version": "contract_runtime.route_token_ref_binding.v1",
+        "status": "missing",
+        "route_token_ref": route_token_ref,
+        "target_contract_execution_id": contract_execution_id,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not route_token_ref:
+        proof["reason"] = "missing_route_token_ref"
+        return proof
+    if not contract_execution_id:
+        proof["reason"] = "missing_contract_execution_id"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "status": "invalid",
+                "reason": "route_token_ref_invalid",
+                "resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved:
+        proof.update(
+            {
+                "status": "unknown",
+                "reason": "route_token_ref_unknown",
+            }
+        )
+        return proof
+
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    scope_task_id = str(scope.get("task_id") or "").strip()
+    allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    }
+    proof.update(
+        {
+            "resolved": dict(resolved),
+            "scope": dict(scope),
+            "scope_task_id": scope_task_id,
+            "allowed_actions": sorted(allowed),
+        }
+    )
+    if scope_task_id != contract_execution_id:
+        proof.update(
+            {
+                "status": "scope_mismatch",
+                "reason": "route_token_ref_task_scope_mismatch",
+            }
+        )
+        return proof
+
+    required = {
+        _normalized_contract_runtime_action(item)
+        for item in _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS
+    }
+    missing_actions = sorted(required - allowed)
+    if missing_actions:
+        proof.update(
+            {
+                "status": "action_not_allowed",
+                "reason": "route_token_ref_missing_contract_runtime_actions",
+                "missing_allowed_actions": missing_actions,
+            }
+        )
+        return proof
+
+    proof.update(
+        {
+            "status": "current_contract_scope_verified",
+            "reason": "route_token_ref_matches_contract_runtime_scope",
+        }
+    )
+    return proof
+
+
+def _route_token_parent_identity(
+    resolved_parent: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+) -> dict[str, str]:
+    identity = {
+        "route_id": str(resolved_parent.get("route_id") or ""),
+        "route_context_hash": str(resolved_parent.get("route_context_hash") or ""),
+        "prompt_contract_id": str(resolved_parent.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(resolved_parent.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            resolved_parent.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": str(route_token_ref or ""),
+        "selected_project": project_id,
+        "selected_backlog_id": backlog_id,
+    }
+    return {key: value for key, value in identity.items() if value}
+
+
+def _contract_runtime_route_token_issue_payload(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    parent_contract_execution_id: str = "",
+    target_files: Sequence[str] = (),
+    parent_route_token_ref: str = "",
+    parent_resolved: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    allowed_actions = _observer_route_context_issue_allowed_actions(
+        list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS)
+    )
+    evidence_refs = [
+        ref
+        for ref in (
+            f"contract_runtime:{contract_execution_id}"
+            if contract_execution_id
+            else "",
+            f"contract_runtime:{parent_contract_execution_id}"
+            if parent_contract_execution_id
+            else "",
+            f"backlog:{backlog_id}" if backlog_id else "",
+        )
+        if ref
+    ]
+    payload: dict[str, Any] = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": contract_execution_id,
+        "target_files": [str(path) for path in target_files if str(path or "").strip()],
+        "allowed_actions": allowed_actions,
+        "evidence_refs": evidence_refs,
+    }
+    parent_ref = str(parent_route_token_ref or "").strip()
+    if parent_ref:
+        payload["parent_route_token_ref"] = parent_ref
+    if parent_resolved:
+        parent_identity = _route_token_parent_identity(
+            parent_resolved,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=parent_ref,
+        )
+        if parent_identity:
+            payload["parent_route_identity"] = parent_identity
+            field_map = {
+                "route_id": "parent_route_id",
+                "route_context_hash": "parent_route_context_hash",
+                "prompt_contract_id": "parent_prompt_contract_id",
+                "prompt_contract_hash": "parent_prompt_contract_hash",
+                "visible_injection_manifest_hash": (
+                    "parent_visible_injection_manifest_hash"
+                ),
+            }
+            for source_key, target_key in field_map.items():
+                value = str(parent_identity.get(source_key) or "").strip()
+                if value:
+                    payload[target_key] = value
+    return payload
+
+
+def _contract_runtime_issue_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+    target_files: Sequence[str],
+    source: str,
+) -> dict[str, Any]:
+    child_contract_execution_id = str(child_contract_execution_id or "").strip()
+    parent_route_token_ref = str(parent_route_token_ref or "").strip()
+    target_files = [str(path) for path in target_files if str(path or "").strip()]
+    proof: dict[str, Any] = {
+        "schema_version": "contract_runtime.child_route_token_binding.v1",
+        "source": source,
+        "status": "skipped",
+        "route_token_ref": "",
+        "parent_route_token_ref": parent_route_token_ref,
+        "child_contract_execution_id": child_contract_execution_id,
+        "target_files": target_files,
+        "allowed_actions": list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not child_contract_execution_id or not parent_route_token_ref:
+        proof["reason"] = "missing_child_execution_or_route_ref"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved_parent = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=parent_route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "reason": "parent_route_token_ref_invalid",
+                "parent_ref_resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved_parent:
+        proof["reason"] = "parent_route_token_ref_unregistered"
+        return proof
+
+    parent_identity = _route_token_parent_identity(
+        resolved_parent,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=parent_route_token_ref,
+    )
+    missing_parent_identity = [
+        field
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if not parent_identity.get(field)
+    ]
+    if missing_parent_identity:
+        proof.update(
+            {
+                "reason": "parent_route_identity_incomplete",
+                "missing_parent_route_identity_fields": missing_parent_identity,
+            }
+        )
+        return proof
+
+    issue_payload = _contract_runtime_route_token_issue_payload(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=child_contract_execution_id,
+        parent_contract_execution_id=str(
+            parent_record.get("contract_execution_id") or ""
+        ),
+        target_files=target_files,
+        parent_route_token_ref=parent_route_token_ref,
+        parent_resolved=resolved_parent,
+    )
+    proof["observer_route_context_issue_payload"] = issue_payload
+    try:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=child_contract_execution_id,
+            target_files=target_files,
+            allowed_actions=list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            evidence_refs=issue_payload.get("evidence_refs") or [],
+            parent_route_identity=parent_identity,
+        )
+        child_ref = str(issued.get("route_token_ref") or "").strip()
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            token=issued.get("route_token")
+            if isinstance(issued.get("route_token"), Mapping)
+            else {},
+        )
+        parent_lineage = (
+            issued.get("parent_route_lineage")
+            if isinstance(issued.get("parent_route_lineage"), Mapping)
+            else {}
+        )
+        child_lineage = (
+            issued.get("child_route_lineage")
+            if isinstance(issued.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        if parent_lineage and child_lineage:
+            observer_route_context.persist_route_token_ref_lineage(
+                conn,
+                project_id=project_id,
+                route_token_ref=child_ref,
+                parent_route_lineage=parent_lineage,
+                child_route_lineage=child_lineage,
+                route_lineage=issued.get("route_lineage")
+                if isinstance(issued.get("route_lineage"), Mapping)
+                else {},
+            )
+    except (ValueError, observer_route_context.RouteTokenRefError) as exc:
+        proof.update(
+            {
+                "reason": "child_route_token_issue_failed",
+                "issue_error": str(exc),
+            }
+        )
+        return proof
+    if not child_ref:
+        proof["reason"] = "child_route_token_ref_missing_after_issue"
+        return proof
+
+    proof.update(
+        {
+            "status": "issued_child_ref",
+            "reason": "issued_current_contract_route_token_ref",
+            "route_token_ref": child_ref,
+            "child_route_token_ref": child_ref,
+            "parent_route_identity": parent_identity,
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+            "route_lineage": dict(issued.get("route_lineage") or {})
+            if isinstance(issued.get("route_lineage"), Mapping)
+            else {},
+        }
+    )
+    return proof
+
+
+def _contract_runtime_apply_route_token_binding(
+    record: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_ref = str(binding.get("route_token_ref") or "").strip()
+    updated = dict(record)
+    metadata = (
+        dict(updated.get("metadata"))
+        if isinstance(updated.get("metadata"), Mapping)
+        else {}
+    )
+    backlog_lineage = (
+        dict(updated.get("backlog_lineage"))
+        if isinstance(updated.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    parent_ref = str(binding.get("parent_route_token_ref") or "")
+    metadata["route_token_ref_binding"] = dict(binding)
+    metadata["parent_route_token_ref"] = parent_ref
+    if child_ref:
+        updated["route_token_ref"] = child_ref
+        metadata["child_route_token_ref"] = child_ref
+        backlog_lineage["child_route_token_ref"] = child_ref
+    elif str(binding.get("status") or "") != "current_contract_scope_verified":
+        updated["route_token_ref"] = ""
+        if parent_ref:
+            metadata["enter_only_route_token_ref"] = parent_ref
+            backlog_lineage["enter_only_route_token_ref"] = parent_ref
+    if parent_ref:
+        backlog_lineage["parent_route_token_ref"] = parent_ref
+    updated["metadata"] = metadata
+    updated["backlog_lineage"] = backlog_lineage
+    return updated
+
+
+def _contract_runtime_existing_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+    source: str,
+) -> dict[str, Any]:
+    child_ref = str(child_record.get("route_token_ref") or "").strip()
+    child_id = str(child_record.get("contract_execution_id") or "").strip()
+    if not child_ref or not child_id:
+        return {}
+    binding = _contract_runtime_route_token_ref_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=child_id,
+        route_token_ref=child_ref,
+    )
+    if str(binding.get("status") or "") != "current_contract_scope_verified":
+        return {}
+    metadata = (
+        child_record.get("metadata")
+        if isinstance(child_record.get("metadata"), Mapping)
+        else {}
+    )
+    prior = (
+        metadata.get("route_token_ref_binding")
+        if isinstance(metadata.get("route_token_ref_binding"), Mapping)
+        else {}
+    )
+    return {
+        **dict(prior),
+        "schema_version": "contract_runtime.child_route_token_binding.v1",
+        "source": source,
+        "status": "existing_child_ref",
+        "reason": "existing_ref_matches_current_contract_scope",
+        "route_token_ref": child_ref,
+        "child_route_token_ref": child_ref,
+        "parent_route_token_ref": str(parent_route_token_ref or "").strip(),
+        "child_contract_execution_id": child_id,
+        "scope": dict(binding.get("scope") or {})
+        if isinstance(binding.get("scope"), Mapping)
+        else {},
+        "allowed_actions": list(binding.get("allowed_actions") or []),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _contract_runtime_with_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+    target_files: Sequence[str],
+    source: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing = _contract_runtime_existing_child_route_token_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_record=child_record,
+        parent_route_token_ref=parent_route_token_ref,
+        source=source,
+    )
+    if existing:
+        updated = _contract_runtime_apply_route_token_binding(
+            child_record,
+            binding=existing,
+        )
+        child_id = str(updated.get("contract_execution_id") or "").strip()
+        if child_id and updated != dict(child_record):
+            updated = _contract_runtime_store(conn).update(child_id, updated)
+        return updated, existing
+
+    binding = _contract_runtime_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=str(child_record.get("contract_execution_id") or ""),
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+        target_files=target_files,
+        source=source,
+    )
+    updated = _contract_runtime_apply_route_token_binding(
+        child_record,
+        binding=binding,
+    )
+    child_id = str(updated.get("contract_execution_id") or "").strip()
+    if child_id and updated != dict(child_record):
+        updated = _contract_runtime_store(conn).update(child_id, updated)
+    return updated, binding
+
+
+def _direct_fix_issue_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mint a child-scoped route-token ref under a registered parent ref."""
+
+    child_contract_execution_id = str(child_contract_execution_id or "").strip()
+    parent_route_token_ref = str(parent_route_token_ref or "").strip()
+    proof: dict[str, Any] = {
+        "schema_version": "direct_fix.child_route_token_binding.v1",
+        "source": "direct_fix_successor_runtime",
+        "status": "skipped",
+        "route_token_ref": parent_route_token_ref,
+        "parent_route_token_ref": parent_route_token_ref,
+        "child_contract_execution_id": child_contract_execution_id,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not child_contract_execution_id or not parent_route_token_ref:
+        proof["reason"] = "missing_child_execution_or_route_ref"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved_parent = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=parent_route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_token_ref_invalid",
+                "parent_ref_resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved_parent:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_token_ref_unregistered",
+            }
+        )
+        return proof
+
+    parent_identity = {
+        "route_id": str(resolved_parent.get("route_id") or ""),
+        "route_context_hash": str(resolved_parent.get("route_context_hash") or ""),
+        "prompt_contract_id": str(resolved_parent.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(resolved_parent.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            resolved_parent.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": parent_route_token_ref,
+        "selected_project": project_id,
+        "selected_backlog_id": backlog_id,
+    }
+    missing_parent_identity = [
+        field
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if not parent_identity.get(field)
+    ]
+    if missing_parent_identity:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_identity_incomplete",
+                "missing_parent_route_identity_fields": missing_parent_identity,
+            }
+        )
+        return proof
+
+    target_files = _direct_fix_child_route_token_target_files(
+        conn,
+        backlog_id=backlog_id,
+    )
+    evidence_refs = [
+        ref
+        for ref in (
+            f"contract_runtime:{child_contract_execution_id}",
+            f"contract_runtime:{str(parent_record.get('contract_execution_id') or '')}",
+            f"backlog:{backlog_id}" if backlog_id else "",
+        )
+        if ref
+    ]
+    try:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=child_contract_execution_id,
+            target_files=target_files,
+            allowed_actions=list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            evidence_refs=evidence_refs,
+            parent_route_identity=parent_identity,
+        )
+        child_ref = str(issued.get("route_token_ref") or "").strip()
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            token=issued.get("route_token")
+            if isinstance(issued.get("route_token"), Mapping)
+            else {},
+        )
+        parent_lineage = (
+            issued.get("parent_route_lineage")
+            if isinstance(issued.get("parent_route_lineage"), Mapping)
+            else {}
+        )
+        child_lineage = (
+            issued.get("child_route_lineage")
+            if isinstance(issued.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        if parent_lineage and child_lineage:
+            observer_route_context.persist_route_token_ref_lineage(
+                conn,
+                project_id=project_id,
+                route_token_ref=child_ref,
+                parent_route_lineage=parent_lineage,
+                child_route_lineage=child_lineage,
+                route_lineage=issued.get("route_lineage")
+                if isinstance(issued.get("route_lineage"), Mapping)
+                else {},
+            )
+    except (ValueError, observer_route_context.RouteTokenRefError) as exc:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "child_route_token_issue_failed",
+                "issue_error": str(exc),
+            }
+        )
+        return proof
+    if not child_ref:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "child_route_token_ref_missing_after_issue",
+            }
+        )
+        return proof
+
+    proof.update(
+        {
+            "status": "issued_child_ref",
+            "route_token_ref": child_ref,
+            "parent_route_token_ref": parent_route_token_ref,
+            "target_files": target_files,
+            "allowed_actions": list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            "parent_route_identity": parent_identity,
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+            "route_lineage": dict(issued.get("route_lineage") or {})
+            if isinstance(issued.get("route_lineage"), Mapping)
+            else {},
+        }
+    )
+    return proof
+
+
+def _direct_fix_apply_route_token_binding(
+    record: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_ref = str(binding.get("route_token_ref") or "").strip()
+    if not child_ref:
+        return dict(record)
+    updated = dict(record)
+    updated["route_token_ref"] = child_ref
+    metadata = (
+        dict(updated.get("metadata"))
+        if isinstance(updated.get("metadata"), Mapping)
+        else {}
+    )
+    backlog_lineage = (
+        dict(updated.get("backlog_lineage"))
+        if isinstance(updated.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    parent_ref = str(binding.get("parent_route_token_ref") or "")
+    metadata["route_token_ref_binding"] = dict(binding)
+    metadata["parent_route_token_ref"] = parent_ref
+    metadata["child_route_token_ref"] = child_ref
+    backlog_lineage["parent_route_token_ref"] = parent_ref
+    backlog_lineage["child_route_token_ref"] = child_ref
+    updated["metadata"] = metadata
+    updated["backlog_lineage"] = backlog_lineage
+    return updated
+
+
+def _direct_fix_existing_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+) -> dict[str, Any]:
+    child_ref = str(child_record.get("route_token_ref") or "").strip()
+    child_id = str(child_record.get("contract_execution_id") or "").strip()
+    if (
+        not child_ref
+        or child_ref == str(parent_route_token_ref or "").strip()
+        or not child_id
+    ):
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            backlog_id=backlog_id,
+            task_id=child_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    if not resolved:
+        return {}
+    allowed = {
+        str(item or "").strip()
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    }
+    if "contract_runtime_submit_line" not in allowed:
+        return {}
+    metadata = (
+        child_record.get("metadata")
+        if isinstance(child_record.get("metadata"), Mapping)
+        else {}
+    )
+    prior = (
+        metadata.get("route_token_ref_binding")
+        if isinstance(metadata.get("route_token_ref_binding"), Mapping)
+        else {}
+    )
+    return {
+        **dict(prior),
+        "schema_version": "direct_fix.child_route_token_binding.v1",
+        "source": "direct_fix_successor_runtime",
+        "status": "existing_child_ref",
+        "route_token_ref": child_ref,
+        "parent_route_token_ref": str(parent_route_token_ref or "").strip(),
+        "child_contract_execution_id": child_id,
+        "allowed_actions": sorted(allowed),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _direct_fix_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _direct_fix_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=child_contract_execution_id,
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+    )
+
+
+def _direct_fix_with_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing = _direct_fix_existing_child_route_token_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_record=child_record,
+        parent_route_token_ref=parent_route_token_ref,
+    )
+    if existing:
+        return dict(child_record), existing
+
+    binding = _direct_fix_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=str(child_record.get("contract_execution_id") or ""),
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+    )
+    if str(binding.get("status") or "") != "issued_child_ref":
+        return dict(child_record), binding
+
+    updated = _direct_fix_apply_route_token_binding(child_record, binding=binding)
+    child_id = str(updated.get("contract_execution_id") or "").strip()
+    if child_id:
+        updated = _contract_runtime_store(conn).update(child_id, updated)
+    return updated, binding
+
+
+def _direct_fix_dispatch_text(value: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = str(value.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _direct_fix_dispatch_payload(write: Mapping[str, Any]) -> dict[str, Any]:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    return dict(payload)
+
+
+def _direct_fix_dispatch_branch_ref(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text.startswith("refs/heads/"):
+            return text
+        return f"refs/heads/{text}"
+    return ""
+
+
+def _direct_fix_dispatch_task_id(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> str:
+    for source in (write, payload):
+        text = _direct_fix_dispatch_text(
+            source,
+            "task_id",
+            "worker_task_id",
+            "stage_task_id",
+        )
+        if text:
+            return text
+    branch_ref = _direct_fix_dispatch_branch_ref(
+        payload.get("branch_ref"),
+        payload.get("branch"),
+        write.get("branch_ref"),
+        write.get("branch"),
+    )
+    if branch_ref:
+        branch_name = branch_ref.removeprefix("refs/heads/")
+        if branch_name.startswith("codex/"):
+            branch_name = branch_name.split("/", 1)[1]
+        slug = _parallel_branch_allocate_slug(branch_name)
+        if slug:
+            return slug
+    worker_id = _direct_fix_dispatch_text(
+        payload,
+        "worker_slot_id",
+        "worker_id",
+        "worker_agent_id",
+        "agent_id",
+    )
+    if worker_id:
+        slug = _parallel_branch_allocate_slug(worker_id)
+        if slug:
+            return slug
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    return f"{contract_execution_id}-worker" if contract_execution_id else ""
+
+
+def _direct_fix_dispatch_route_identity(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    if not route_token_ref:
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    if not isinstance(resolved, Mapping) or not resolved:
+        return {}
+    return {
+        key: str(resolved.get(key) or "").strip()
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+        if str(resolved.get(key) or "").strip()
+    }
+
+
+def _direct_fix_materialize_dispatch_runtime_context(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Allocate the mf_sub runtime context behind a direct_fix dispatch line."""
+
+    if str(record.get("contract_id") or "").strip() != DIRECT_FIX_CONTRACT_ID:
+        return dict(write)
+    if (
+        str(write.get("stage_id") or "").strip() != "dispatch_context"
+        or str(write.get("line_id") or "").strip() != "direct_fix_dispatch_context"
+        or str(write.get("evidence_kind") or "").strip() != "dispatch_bounded_worker"
+    ):
+        return dict(write)
+
+    payload = _direct_fix_dispatch_payload(write)
+    if _truthy_flag(payload.get("legacy_dispatch_without_runtime_context")):
+        return dict(write)
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not contract_execution_id or not backlog_id:
+        return dict(write)
+
+    runtime_context_id = _direct_fix_dispatch_text(
+        write,
+        "runtime_context_id",
+    ) or _direct_fix_dispatch_text(payload, "runtime_context_id")
+    task_id = _direct_fix_dispatch_task_id(record, write, payload)
+    parent_task_id = _direct_fix_dispatch_text(
+        write,
+        "parent_task_id",
+    ) or _direct_fix_dispatch_text(payload, "parent_task_id") or contract_execution_id
+    worker_slot_id = _direct_fix_dispatch_text(
+        write,
+        "worker_slot_id",
+        "worker_id",
+    ) or _direct_fix_dispatch_text(
+        payload,
+        "worker_slot_id",
+        "worker_id",
+        "worker_agent_id",
+        "agent_id",
+    )
+    allocation_owner = _direct_fix_dispatch_text(
+        payload,
+        "allocation_owner",
+        "observer_allocation_owner",
+        "worker_agent_id",
+        "agent_id",
+    ) or worker_slot_id or "direct_fix_worker"
+    branch_ref = _direct_fix_dispatch_branch_ref(
+        payload.get("branch_ref"),
+        payload.get("branch"),
+        write.get("branch_ref"),
+        write.get("branch"),
+    )
+    worktree_path = _direct_fix_dispatch_text(
+        payload,
+        "worktree_path",
+        "assigned_worktree",
+        "worker_worktree_path",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "worktree_path",
+        "assigned_worktree",
+        "worker_worktree_path",
+    )
+    workspace_root = _direct_fix_dispatch_text(
+        payload,
+        "workspace_root",
+        "repo_root_path",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "workspace_root",
+        "repo_root_path",
+    ) or os.getcwd()
+    target_project_root = _direct_fix_dispatch_text(
+        payload,
+        "target_project_root",
+        "target_graph_root",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "target_project_root",
+        "target_graph_root",
+    ) or worktree_path or workspace_root
+    owned_files = _runtime_context_service_query_values(payload, "owned_files", "target_files")
+    if not owned_files:
+        owned_files = _runtime_context_service_query_values(
+            write,
+            "owned_files",
+            "target_files",
+        )
+    if not owned_files:
+        owned_files = _direct_fix_child_route_token_target_files(conn, backlog_id=backlog_id)
+    base_commit = _direct_fix_dispatch_text(payload, "base_commit") or _direct_fix_dispatch_text(write, "base_commit")
+    target_head_commit = (
+        _direct_fix_dispatch_text(payload, "target_head_commit")
+        or _direct_fix_dispatch_text(write, "target_head_commit")
+        or base_commit
+    )
+    fence_token = (
+        _direct_fix_dispatch_text(write, "fence_token", "worker_fence_token")
+        or _direct_fix_dispatch_text(payload, "fence_token", "worker_fence_token")
+        or f"fence-{uuid.uuid4().hex[:12]}"
+    )
+    if not task_id:
+        return dict(write)
+
+    from .parallel_branch_runtime import (
+        STATE_ALLOCATED,
+        STATE_WORKTREE_READY,
+        append_branch_contract_revision,
+        branch_context_to_dict,
+        branch_contract_revision_to_dict,
+        branch_runtime_allocation_evidence,
+        get_branch_context,
+        issue_mf_subagent_session_token,
+        preserve_materialized_context_for_allocation,
+        runtime_context_session_token_ref,
+        upsert_branch_context,
+        plan_branch_runtime_context,
+    )
+
+    context = plan_branch_runtime_context(
+        project_id=project_id,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        batch_id=_direct_fix_dispatch_text(payload, "batch_id"),
+        backlog_id=backlog_id,
+        parent_task_id=parent_task_id,
+        chain_id=str(record.get("contract_chain_id") or ""),
+        root_task_id=contract_execution_id,
+        stage_task_id=task_id,
+        stage_type="direct_fix",
+        agent_id=allocation_owner,
+        worker_id=worker_slot_id,
+        allocation_owner=allocation_owner,
+        worker_slot_id=worker_slot_id,
+        governance_project_id=project_id,
+        target_project_id=project_id,
+        target_project_root=target_project_root,
+        target_files=owned_files,
+        owned_files=owned_files,
+        branch_prefix="codex",
+        worktree_root=str(payload.get("worktree_root") or ".worktrees/direct-fix"),
+        ref_name=str(payload.get("ref_name") or payload.get("target_branch") or "main"),
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=_direct_fix_dispatch_text(payload, "merge_queue_id"),
+        fence_token=fence_token,
+        status=STATE_WORKTREE_READY if worktree_path else STATE_ALLOCATED,
+    )
+    normalize_body = dict(payload)
+    if worktree_path:
+        normalize_body["worktree_path"] = worktree_path
+    context = _parallel_branch_allocate_normalize_worktree_path(
+        context,
+        normalize_body,
+        worktree_root=str(payload.get("worktree_root") or ".worktrees/direct-fix"),
+    )
+    if branch_ref:
+        context = replace(context, branch_ref=branch_ref)
+    if runtime_context_id:
+        context = replace(context, runtime_context_id=runtime_context_id)
+
+    existing = get_branch_context(conn, project_id, task_id)
+    context = preserve_materialized_context_for_allocation(existing, context)
+    saved = upsert_branch_context(conn, context)
+    if not saved.session_token_hash:
+        session = issue_mf_subagent_session_token(saved)
+        saved = upsert_branch_context(
+            conn,
+            replace(saved, session_token_hash=str(session.get("session_token_hash") or "")),
+        )
+    session_token_ref = runtime_context_session_token_ref(saved)
+    saved_context = branch_context_to_dict(saved)
+
+    route_token_ref = (
+        str(write.get("route_token_ref") or "").strip()
+        or str(record.get("route_token_ref") or "").strip()
+    )
+    route_identity = _direct_fix_dispatch_route_identity(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+    if route_token_ref and not route_identity.get("route_token_ref"):
+        route_identity["route_token_ref"] = route_token_ref
+
+    runtime_contract_revision: dict[str, Any] = {}
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    )
+    if owned_files and all(route_identity.get(field) for field in required_route_fields):
+        revision = append_branch_contract_revision(
+            conn,
+            saved,
+            contract_version=DIRECT_FIX_TEMPLATE_ID,
+            payload={
+                **_parallel_branch_allocate_contract_revision_payload(
+                    {
+                        **dict(payload),
+                        **dict(route_identity),
+                        "observer_command_id": contract_execution_id,
+                        "owned_files": owned_files,
+                    },
+                    saved_context,
+                    route_identity,
+                    owned_files,
+                ),
+                "source": "direct_fix_dispatch_context",
+                "contract_execution_id": contract_execution_id,
+            },
+            route_gate={
+                **_parallel_branch_allocate_route_gate(
+                    {
+                        **dict(payload),
+                        **dict(route_identity),
+                        "caller_role": "observer",
+                    },
+                    route_identity,
+                ),
+                "source": "direct_fix_dispatch_context",
+                "allowed_action": "dispatch_bounded_worker",
+            },
+            route_identity=route_identity,
+            route_evidence_type="direct_fix_dispatch_context",
+            actor="direct_fix_dispatch_context",
+        )
+        runtime_contract_revision = branch_contract_revision_to_dict(revision)
+
+    branch_runtime_evidence = branch_runtime_allocation_evidence(
+        saved,
+        source_ref=(
+            f"contract_runtime:{contract_execution_id}:"
+            "direct_fix_dispatch_context"
+        ),
+        registration_source="direct_fix_dispatch_context",
+        route_identity=route_identity,
+    )
+    dispatch_body = {
+        **dict(payload),
+        **dict(route_identity),
+        "runtime_context_id": saved_context["runtime_context_id"],
+        "task_id": saved.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "observer_command_id": contract_execution_id,
+        "worker_id": saved_context.get("worker_id") or worker_slot_id,
+        "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+        "agent_id": saved_context.get("agent_id") or allocation_owner,
+        "fence_token": saved.fence_token,
+        "worktree_path": saved_context.get("worktree_path") or worktree_path,
+        "branch_ref": saved_context.get("branch_ref") or branch_ref,
+        "base_commit": saved_context.get("base_commit") or base_commit,
+        "target_head_commit": saved_context.get("target_head_commit")
+        or target_head_commit,
+        "merge_queue_id": saved_context.get("merge_queue_id")
+        or _direct_fix_dispatch_text(payload, "merge_queue_id")
+        or f"direct-fix:{contract_execution_id}",
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "route_token_ref": route_token_ref,
+    }
+    dispatch_timeline_event = _record_bounded_worker_dispatch_event(
+        conn,
+        project_id,
+        body=dispatch_body,
+        prepared={"parent_task_id": parent_task_id, **dict(route_identity)},
+        branch_runtime_evidence=branch_runtime_evidence,
+        source="direct_fix_dispatch_context",
+        request_id=request_id,
+    )
+
+    enriched_payload = {
+        **dict(payload),
+        "runtime_context_id": saved_context["runtime_context_id"],
+        "task_id": saved.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": saved_context.get("worker_id") or worker_slot_id,
+        "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+        "target_project_root": saved_context.get("target_project_root")
+        or target_project_root,
+        "worktree_path": saved_context.get("worktree_path") or worktree_path,
+        "branch_ref": saved_context.get("branch_ref") or branch_ref,
+        "base_commit": saved_context.get("base_commit") or base_commit,
+        "target_head_commit": saved_context.get("target_head_commit")
+        or target_head_commit,
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "fence_token_present": bool(saved.fence_token),
+        "fence_token_delivery": "runtime_context_private_envelope",
+        "session_token_ref": session_token_ref,
+        "worker_session_token_ref": session_token_ref,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "branch_runtime_evidence": branch_runtime_evidence,
+        "runtime_contract_revision": runtime_contract_revision,
+        "dispatch_timeline_event": dispatch_timeline_event,
+    }
+    enriched = dict(write)
+    enriched.update(
+        {
+            "runtime_context_id": saved_context["runtime_context_id"],
+            "task_id": saved.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": saved_context.get("worker_id") or worker_slot_id,
+            "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+            "fence_token": saved.fence_token,
+            "session_token_ref": session_token_ref,
+            "worker_session_token_ref": session_token_ref,
+            "payload": enriched_payload,
+        }
+    )
+    return enriched
 
 
 def _direct_fix_return_to_parent_projection(
@@ -37023,6 +40442,137 @@ def _contract_runtime_block_successor_id(blocked_line: Mapping[str, Any]) -> str
     return ""
 
 
+def _direct_fix_projection_for_successor(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    child_contract_execution_id: str,
+) -> dict[str, Any]:
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    if not projection or projection.get("degraded"):
+        return {}
+    readiness_state = str(projection.get("readiness_state") or "").strip()
+    if readiness_state not in {
+        "direct_fix_child_active",
+        "direct_fix_complete_awaiting_independent_qa",
+        "return_to_parent_after_direct_fix_qa",
+        "parent_resume_required_after_direct_fix_qa",
+    }:
+        return {}
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    current_id = str(projection.get("current_contract_execution_id") or "")
+    active_child_id = str(projection.get("active_child_contract_execution_id") or "")
+    parent_to_resume = str(
+        projection.get("parent_to_resume_contract_execution_id") or ""
+    )
+    action_child_id = str(
+        next_action.get("successor_contract_execution_id")
+        or next_action.get("contract_execution_id")
+        or ""
+    )
+    child_matches = child_contract_execution_id in {
+        current_id,
+        active_child_id,
+        action_child_id,
+    }
+    if not child_matches:
+        return {}
+    if parent_to_resume and parent_to_resume != parent_contract_execution_id:
+        return {}
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        parent_matches = (
+            current_id == parent_contract_execution_id
+            or parent_to_resume == parent_contract_execution_id
+        )
+        if not parent_matches:
+            return {}
+    return dict(projection)
+
+
+def _direct_fix_projection_next_action_for_parent(
+    projection: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_contract_execution_id: str,
+    blocked_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    readiness_state = str(projection.get("readiness_state") or "").strip()
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        return {}
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if not next_action:
+        return {}
+    projected = dict(next_action)
+    projected.setdefault("schema_version", "contract_runtime_next_legal_action.v1")
+    projected["source"] = "backlog_contract_chain_current"
+    projected["precedence"] = "direct_fix_projection_current_child"
+    projected["status"] = "blocked"
+    projected["mode"] = "direct_fix_child_resume"
+    projected["readiness_state"] = readiness_state
+    projected["successor_contract_id"] = DIRECT_FIX_CONTRACT_ID
+    projected["successor_contract_template_id"] = DIRECT_FIX_TEMPLATE_ID
+    projected["successor_contract_execution_id"] = child_contract_execution_id
+    projected["recommended_successor_contract_id"] = DIRECT_FIX_CONTRACT_ID
+    projected["recommended_successor_contract_template_id"] = DIRECT_FIX_TEMPLATE_ID
+    projected["requires_route_token_ref"] = True
+    projected["endpoint"] = (
+        f"/api/projects/{project_id}/contract-runtime/"
+        f"{child_contract_execution_id}/line-writes"
+    )
+    projected["body"] = {
+        "backlog_id": backlog_id,
+        "stage_id": str(next_action.get("stage_id") or ""),
+        "line_id": str(next_action.get("line_id") or ""),
+        "evidence_kind": str(next_action.get("evidence_kind") or ""),
+        "contract_execution_id": child_contract_execution_id,
+    }
+    projected["return_to_parent"] = _direct_fix_return_to_parent_projection(
+        parent_record=parent_record,
+        blocked_line=blocked_line,
+    )
+    projected["blocked_by_line"] = {
+        "stage_id": str(blocked_line.get("stage_id") or ""),
+        "line_id": str(blocked_line.get("line_id") or ""),
+        "actor_role": str(blocked_line.get("actor_role") or ""),
+        "evidence_kind": str(blocked_line.get("evidence_kind") or ""),
+    }
+    if readiness_state == "direct_fix_complete_awaiting_independent_qa":
+        projected["next_operator_action"] = "record_direct_fix_independent_qa"
+        projected["block_reason"] = (
+            "direct_fix child repair is complete, but independent QA is not "
+            "projection-bound yet"
+        )
+    elif readiness_state == "return_to_parent_after_direct_fix_qa":
+        projected["next_operator_action"] = "record_direct_fix_return_to_parent"
+        projected["block_reason"] = (
+            "direct_fix independent QA passed; record the child return line "
+            "before resuming the parent"
+        )
+    else:
+        projected["next_operator_action"] = "continue_direct_fix_child"
+        projected["block_reason"] = (
+            "direct_fix child remains the current contract-chain projection"
+        )
+    return projected
+
+
 def _contract_runtime_successor_complete(
     conn,
     *,
@@ -37059,6 +40609,18 @@ def _contract_runtime_successor_complete(
     except StalePinnedContractExecutionError:
         return False
     successor = runtime.store.get(successor_execution_id)
+    if successor_contract_id == DIRECT_FIX_CONTRACT_ID:
+        projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_execution_id,
+            child_contract_execution_id=successor_execution_id,
+        )
+        return (
+            str(projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        )
     return _runtime_record_is_complete(successor)
 
 
@@ -37092,6 +40654,28 @@ def _contract_runtime_blocked_successor_next_action(
             backlog_id,
             parent_execution_id,
         )
+        direct_fix_projection = _direct_fix_projection_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_execution_id,
+            child_contract_execution_id=successor_execution_id,
+        )
+        projected_child_next = _direct_fix_projection_next_action_for_parent(
+            direct_fix_projection,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_record=record,
+            child_contract_execution_id=successor_execution_id,
+            blocked_line=blocked_line,
+        )
+        if projected_child_next:
+            return projected_child_next
+        if (
+            str(direct_fix_projection.get("readiness_state") or "")
+            == "parent_resume_required_after_direct_fix_qa"
+        ):
+            return {}
         return_to_parent = _direct_fix_return_to_parent_projection(
             parent_record=record,
             blocked_line=blocked_line,
@@ -37838,6 +41422,20 @@ def _direct_fix_successor_runtime_enter(
     try:
         successor = store.get(successor_execution_id)
     except ContractRuntimeError:
+        child_route_binding = _direct_fix_child_route_token_binding(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            child_contract_execution_id=successor_execution_id,
+            parent_route_token_ref=route_token_ref,
+            parent_record=parent_record,
+        )
+        successor_route_token_ref = str(
+            child_route_binding.get("route_token_ref") or route_token_ref
+        )
+        parent_route_token_ref = str(
+            child_route_binding.get("parent_route_token_ref") or route_token_ref
+        )
         successor = runtime.start_execution(
             DIRECT_FIX_CONTRACT_ID,
             project_id=project_id,
@@ -37847,7 +41445,7 @@ def _direct_fix_successor_runtime_enter(
             parent_contract_execution_id=parent_execution_id,
             root_contract_execution_id=root_execution_id,
             contract_chain_id=chain_id,
-            route_token_ref=route_token_ref,
+            route_token_ref=successor_route_token_ref,
             role_binding={
                 "observer": actor_role,
                 "mf_sub": "mf_sub",
@@ -37861,6 +41459,8 @@ def _direct_fix_successor_runtime_enter(
                 "parent_contract_execution_id": parent_execution_id,
                 "root_contract_execution_id": root_execution_id,
                 "return_to_parent": return_to_parent,
+                "parent_route_token_ref": parent_route_token_ref,
+                "child_route_token_ref": successor_route_token_ref,
             },
             metadata={
                 "handoff_reason": reason,
@@ -37868,10 +41468,29 @@ def _direct_fix_successor_runtime_enter(
                 "blocked_line": dict(blocked_line),
                 "return_to_parent": return_to_parent,
                 "parent_close_gate_recheck_required": True,
+                "parent_route_token_ref": parent_route_token_ref,
+                "child_route_token_ref": successor_route_token_ref,
+                "route_token_ref_binding": dict(child_route_binding),
             },
         )
     else:
         successor_existed = True
+        successor, child_route_binding = _direct_fix_with_child_route_token_ref(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_record=parent_record,
+            child_record=successor,
+            parent_route_token_ref=route_token_ref,
+        )
+        successor_route_token_ref = str(
+            child_route_binding.get("route_token_ref")
+            or successor.get("route_token_ref")
+            or route_token_ref
+        )
+        parent_route_token_ref = str(
+            child_route_binding.get("parent_route_token_ref") or route_token_ref
+        )
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
@@ -37896,7 +41515,10 @@ def _direct_fix_successor_runtime_enter(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": task_id,
+            "parent_route_token_ref": parent_route_token_ref,
+            "child_route_token_ref": successor_route_token_ref,
         },
+        "route_token_ref_binding": dict(child_route_binding),
     }
     runtime.current_guide(successor_execution_id, actor_role=actor_role)
     successor = store.get(successor_execution_id)
@@ -37945,6 +41567,13 @@ def _direct_fix_successor_runtime_enter(
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
+    current_projection = upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=successor,
+        edge_kind="direct_fix_child",
+        binding_kind="direct_fix_child_current",
+    )
     return {
         "schema_version": "direct_fix_successor_runtime_enter.v1",
         "successor_contract": successor_contract,
@@ -37958,10 +41587,16 @@ def _direct_fix_successor_runtime_enter(
         "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
+        "contract_chain_current": current_projection,
         "route_token_ref": str(successor.get("route_token_ref") or ""),
         "route_token_ref_guidance": {
+            "schema_version": "direct_fix.child_route_token_ref_guidance.v1",
             "route_token_ref": str(successor.get("route_token_ref") or ""),
+            "child_route_token_ref": str(successor.get("route_token_ref") or ""),
+            "parent_route_token_ref": parent_route_token_ref,
+            "binding": dict(child_route_binding),
             "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
             "pass_ref_to_next_runtime_write": True,
         },
         "return_to_parent": return_to_parent,
@@ -38091,6 +41726,22 @@ def _mf_parallel_successor_runtime_enter(
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
+    child_route_target_files = _onboard_contract_route_issue_target_files(
+        conn,
+        backlog_id=backlog_id,
+        body={},
+        metadata=metadata if isinstance(metadata, Mapping) else {},
+    )
+    successor, child_route_binding = _contract_runtime_with_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_record=parent_record,
+        child_record=successor,
+        parent_route_token_ref=route_token_ref,
+        target_files=child_route_target_files,
+        source="mf_parallel_successor_runtime",
+    )
     successor_contract = {
         "schema_version": "contract_successor_handoff.v1",
         "contract_chain_id": chain_id,
@@ -38116,6 +41767,53 @@ def _mf_parallel_successor_runtime_enter(
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
+    route_token_ref_binding = (
+        successor.get("metadata", {}).get("route_token_ref_binding")
+        if isinstance(successor.get("metadata"), Mapping)
+        else {}
+    )
+    if not isinstance(route_token_ref_binding, Mapping) or not route_token_ref_binding:
+        route_token_ref_binding = child_route_binding
+    successor_route_ref = str(successor.get("route_token_ref") or "")
+    route_token_ref_guidance: dict[str, Any] = {
+        "schema_version": "mf_parallel.child_route_token_ref_guidance.v1",
+        "status": str(route_token_ref_binding.get("status") or ""),
+        "route_token_ref": successor_route_ref,
+        "child_route_token_ref": successor_route_ref,
+        "parent_route_token_ref": route_token_ref,
+        "binding": dict(route_token_ref_binding),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "pass_ref_to_next_runtime_write": bool(successor_route_ref),
+    }
+    if not successor_route_ref:
+        issue_payload = _contract_runtime_route_token_issue_payload(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=successor_execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            target_files=child_route_target_files,
+            parent_route_token_ref=route_token_ref,
+            parent_resolved=(
+                route_token_ref_binding.get("resolved")
+                if isinstance(route_token_ref_binding.get("resolved"), Mapping)
+                else {}
+            ),
+        )
+        route_token_ref_guidance.update(
+            {
+                "status": "issue_required_for_current_contract_runtime",
+                "enter_only_route_token_ref": route_token_ref,
+                "observer_route_context_issue_payload": issue_payload,
+            }
+        )
+    current_projection = upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=successor,
+        edge_kind="mf_parallel_child",
+        binding_kind="mf_parallel_child_current",
+    )
     return {
         "schema_version": "mf_parallel_successor_runtime_enter.v1",
         "successor_contract": successor_contract,
@@ -38129,12 +41827,9 @@ def _mf_parallel_successor_runtime_enter(
         "next_legal_action": _runtime_next_action_from_guide(runtime_guide),
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
-        "route_token_ref": str(successor.get("route_token_ref") or ""),
-        "route_token_ref_guidance": {
-            "route_token_ref": str(successor.get("route_token_ref") or ""),
-            "raw_route_token_required": False,
-            "pass_ref_to_next_runtime_write": True,
-        },
+        "contract_chain_current": current_projection,
+        "route_token_ref": successor_route_ref,
+        "route_token_ref_guidance": route_token_ref_guidance,
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {
             "required": True,
@@ -39696,6 +43391,65 @@ _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION = (
     "contract_runtime_close_authority_projection.v1"
 )
 
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+)
+
+
+def _legacy_mf_timeline_precheck_close_authority_notice(
+    *,
+    source: str = "mf_timeline_precheck",
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    notice = {
+        "schema_version": "mf_timeline_precheck_close_authority.v1",
+        "source": source,
+        "legacy": True,
+        "advisory": True,
+        "authoritative": False,
+        "close_authoritative": False,
+        "can_close_authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+        "authoritative_entrypoints": {
+            "contract_runtime": "contract_runtime_current/contract_runtime_submit_line",
+            "contract_gate_kernel": "server-side backlog_close close gate",
+            "backlog_close": "/api/backlog/{project_id}/{bug_id}/close",
+        },
+        "message": (
+            "mf_timeline_precheck is a legacy diagnostic/advisory surface. "
+            "It does not authorize backlog close; backlog_close and the "
+            "server-side contract gate kernel remain authoritative."
+        ),
+    }
+    if contract_execution_id:
+        notice["contract_execution_id"] = contract_execution_id
+    return notice
+
+
+def _annotate_legacy_mf_timeline_precheck_authority(
+    value: Mapping[str, Any],
+    *,
+    source: str = "mf_timeline_precheck",
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    annotated = dict(value or {})
+    notice = _legacy_mf_timeline_precheck_close_authority_notice(
+        source=source,
+        contract_execution_id=contract_execution_id,
+    )
+    annotated["close_authority"] = notice
+    annotated["legacy_advisory"] = True
+    annotated["authoritative"] = False
+    return annotated
+
 
 def _contract_runtime_close_authority_identity(
     body: Mapping[str, Any],
@@ -39703,13 +43457,7 @@ def _contract_runtime_close_authority_identity(
 ) -> dict[str, str]:
     gate = route_gate if isinstance(route_gate, Mapping) else {}
     identity: dict[str, str] = {}
-    for field in (
-        "route_id",
-        "route_context_hash",
-        "prompt_contract_id",
-        "prompt_contract_hash",
-        "visible_injection_manifest_hash",
-    ):
+    for field in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS:
         value = (
             _route_request_identity_value(body, field)
             or str(gate.get(field) or "").strip()
@@ -39717,6 +43465,99 @@ def _contract_runtime_close_authority_identity(
         if value:
             identity[field] = value
     return identity
+
+
+def _contract_runtime_close_authority_record_identity(
+    conn,
+    record: Mapping[str, Any],
+    *,
+    seed_identity: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Derive public route identity from source-backed runtime evidence."""
+
+    identity = {
+        field: str((seed_identity or {}).get(field) or "").strip()
+        for field in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS
+        if str((seed_identity or {}).get(field) or "").strip()
+    }
+
+    def collect_mapping(value: Any) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for field in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS:
+            if identity.get(field):
+                continue
+            found = _deep_route_public_text(
+                _strip_route_action_scope_lineage_value(value),
+                field,
+            )
+            if found:
+                identity[field] = found
+
+    collect_mapping(record)
+    for key in (
+        "route_identity",
+        "canonical_route_identity",
+        "runtime_guide",
+        "execution_state",
+        "contract_chain_current",
+    ):
+        collect_mapping(record.get(key))
+
+    completed_lines = record.get("completed_lines")
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    if not isinstance(completed_lines, list):
+        completed_lines = guide.get("completed_lines")
+    if isinstance(completed_lines, list):
+        for line in completed_lines:
+            collect_mapping(line)
+
+    if identity.get("route_context_hash") and identity.get("prompt_contract_id"):
+        return dict(identity)
+
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    candidate_refs: list[str] = []
+
+    def add_ref(value: Any) -> None:
+        ref = str(value or "").strip()
+        if ref.startswith("rtok-") and ref not in candidate_refs:
+            candidate_refs.append(ref)
+
+    add_ref(record.get("route_token_ref"))
+    if isinstance(completed_lines, list):
+        for line in completed_lines:
+            if not isinstance(line, Mapping):
+                continue
+            add_ref(line.get("route_token_ref"))
+            for key in ("payload", "verification", "artifact_refs"):
+                container = line.get(key)
+                if isinstance(container, Mapping):
+                    add_ref(container.get("route_token_ref"))
+
+    task_id_candidates = [
+        execution_id,
+        str(record.get("root_contract_execution_id") or "").strip(),
+        str(record.get("parent_contract_execution_id") or "").strip(),
+        "",
+    ]
+    for route_token_ref in candidate_refs:
+        for task_id in dict.fromkeys(task_id_candidates):
+            projection = _observer_root_route_identity_from_route_token_ref(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+            )
+            resolved = projection.get("identity")
+            if not isinstance(resolved, Mapping):
+                continue
+            collect_mapping(resolved)
+            if identity.get("route_context_hash") and identity.get("prompt_contract_id"):
+                return dict(identity)
+    return dict(identity)
 
 
 def _contract_runtime_close_authority_line_payload(
@@ -39946,8 +43787,89 @@ def _contract_runtime_close_authority_line_context_seed(
     return seed
 
 
+def _contract_runtime_close_authority_runtime_context_seed(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    runtime_context_id: str,
+) -> dict[str, Any]:
+    runtime_id = str(runtime_context_id or "").strip()
+    if conn is None or not project_id or not runtime_id:
+        return {}
+    try:
+        from .parallel_branch_runtime import (
+            get_branch_context_by_runtime_context_id,
+            runtime_context_effective_target_project_root,
+            runtime_context_secret_hash,
+        )
+
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_id,
+        )
+    except Exception:
+        return {}
+    if (
+        context is None
+        or str(getattr(context, "project_id", "") or "").strip() != project_id
+    ):
+        return {}
+    context_backlog = str(getattr(context, "backlog_id", "") or "").strip()
+    context_parent = str(getattr(context, "parent_task_id", "") or "").strip()
+    if (
+        backlog_id
+        and context_backlog
+        and context_backlog != backlog_id
+        and context_parent != backlog_id
+    ):
+        return {}
+
+    seed: dict[str, Any] = {}
+
+    def put(key: str, value: Any) -> None:
+        token = str(value or "").strip()
+        if token:
+            seed[key] = token
+
+    put("runtime_context_id", runtime_id)
+    put("task_id", getattr(context, "task_id", ""))
+    put("parent_task_id", context_parent or context_backlog)
+    put("worker_id", getattr(context, "worker_id", ""))
+    put("worker_slot_id", getattr(context, "worker_slot_id", ""))
+    put("merge_queue_id", getattr(context, "merge_queue_id", ""))
+    target_root = runtime_context_effective_target_project_root(context)
+    put("target_project_root", target_root)
+    put("actual_cwd", target_root)
+    put("actual_git_root", target_root)
+    branch = str(
+        getattr(context, "branch_ref", "") or getattr(context, "ref_name", "") or ""
+    ).strip()
+    put("branch", branch)
+    put("branch_ref", branch)
+    put(
+        "head_commit",
+        getattr(context, "target_head_commit", "")
+        or getattr(context, "head_commit", ""),
+    )
+    fence_hash = (
+        runtime_context_secret_hash(getattr(context, "fence_token", ""))
+        if getattr(context, "fence_token", "")
+        else ""
+    )
+    put("fence_token_hash", fence_hash)
+    if fence_hash:
+        seed["fence_token_redacted"] = True
+    return seed
+
+
 def _contract_runtime_close_authority_line_contexts(
     lines: list[Mapping[str, Any]],
+    *,
+    conn=None,
+    project_id: str = "",
+    backlog_id: str = "",
 ) -> list[dict[str, Any]]:
     """Collect sibling runtime-context identity needed by legacy close gates."""
 
@@ -39960,7 +43882,14 @@ def _contract_runtime_close_authority_line_contexts(
         if not key:
             continue
         bucket = buckets.setdefault(key, {})
-        for field, value in _contract_runtime_close_authority_line_context_seed(line).items():
+        seed = _contract_runtime_close_authority_line_context_seed(line)
+        runtime_seed = _contract_runtime_close_authority_runtime_context_seed(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            runtime_context_id=str(seed.get("runtime_context_id") or ""),
+        )
+        for field, value in {**runtime_seed, **seed}.items():
             bucket.setdefault(field, value)
 
     return [dict(buckets.get(key, {})) for key in line_keys]
@@ -39992,6 +43921,18 @@ def _contract_runtime_close_authority_event(
         for key, value in dict(line_context or {}).items():
             if value:
                 payload.setdefault(key, value)
+        target_root = str(payload.get("target_project_root") or "").strip()
+        if target_root:
+            payload.setdefault("actual_cwd", target_root)
+            payload.setdefault("actual_git_root", target_root)
+            payload.setdefault("project_root", target_root)
+            payload.setdefault("repo_root", target_root)
+        if payload.get("branch_ref"):
+            payload.setdefault("branch", payload.get("branch_ref"))
+        if payload.get("branch"):
+            payload.setdefault("branch_ref", payload.get("branch"))
+        if payload.get("target_head_commit"):
+            payload.setdefault("head_commit", payload.get("target_head_commit"))
         if payload.get("fence_token_hash"):
             payload.setdefault("fence_token_redacted", True)
     if _contract_runtime_close_normalized(line.get("evidence_kind")) == "mf_subagent_finish_gate":
@@ -40070,6 +44011,363 @@ def _contract_runtime_close_authority_event(
         **dict(identity),
     }
     return event
+
+
+def _contract_runtime_server_derived_close_authority(
+    chain_projection: Mapping[str, Any],
+) -> bool:
+    active_chain = (
+        chain_projection.get("active_chain")
+        if isinstance(chain_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    execution_ids = [
+        str(execution_id or "").strip()
+        for execution_id in (active_chain.get("execution_ids") or [])
+        if str(execution_id or "").strip()
+    ]
+    return bool(
+        isinstance(chain_projection, Mapping)
+        and str(chain_projection.get("projection_source") or "")
+        == "backlog_contract_chain_current"
+        and str(chain_projection.get("source_of_proof") or "")
+        == "contract_runtime_executions.completed_lines"
+        and execution_ids
+    )
+
+
+def _contract_runtime_close_authority_chain_records(
+    runtime,
+    *,
+    chain_projection: Mapping[str, Any],
+    seed_record: Mapping[str, Any],
+    project_id: str,
+    bug_id: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    chain = chain_projection if isinstance(chain_projection, Mapping) else {}
+    active_chain = (
+        chain.get("active_chain")
+        if isinstance(chain.get("active_chain"), Mapping)
+        else {}
+    )
+    execution_ids = [
+        str(execution_id or "").strip()
+        for execution_id in (active_chain.get("execution_ids") or [])
+        if str(execution_id or "").strip()
+    ]
+    if not execution_ids:
+        return []
+    active_execution_ids = set(execution_ids)
+
+    def add_record(record: Mapping[str, Any]) -> None:
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        if not execution_id or execution_id in seen:
+            return
+        if active_execution_ids and execution_id not in active_execution_ids:
+            return
+        if str(record.get("project_id") or "").strip() != project_id:
+            return
+        if str(record.get("backlog_id") or "").strip() != bug_id:
+            return
+        seen.add(execution_id)
+        records.append(dict(record))
+
+    add_record(seed_record)
+    for execution_id in execution_ids:
+        if execution_id in seen:
+            continue
+        try:
+            add_record(runtime.store.get(execution_id))
+        except ContractRuntimeError:
+            continue
+    return records
+
+
+def _contract_runtime_completed_line_items(
+    record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    lines = guide.get("completed_lines")
+    if not isinstance(lines, list):
+        lines = record.get("completed_lines")
+    result: list[dict[str, Any]] = []
+    if not isinstance(lines, list):
+        return result
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        item = dict(line)
+        item.setdefault("_completed_line_index", index)
+        if execution_id:
+            item.setdefault(
+                "_source_ref",
+                f"contract_runtime:{execution_id}:completed_lines:{index}",
+            )
+        result.append(item)
+    return result
+
+
+def _contract_runtime_line_status_passes(line: Mapping[str, Any]) -> bool:
+    containers = [
+        line,
+        line.get("payload") if isinstance(line.get("payload"), Mapping) else {},
+        line.get("verification") if isinstance(line.get("verification"), Mapping) else {},
+        line.get("artifact_refs") if isinstance(line.get("artifact_refs"), Mapping) else {},
+    ]
+    for container in containers:
+        status = str(
+            container.get("status")
+            or container.get("verdict")
+            or container.get("decision")
+            or ""
+        ).strip().lower()
+        if status in {"fail", "failed", "failure", "reject", "rejected", "blocked"}:
+            return False
+    return True
+
+
+def _contract_runtime_direct_fix_line_matches(
+    line: Mapping[str, Any],
+    *,
+    line_ids: set[str],
+    evidence_kinds: set[str],
+    actor_roles: set[str] | None = None,
+) -> bool:
+    if actor_roles is not None:
+        actor_role = str(line.get("actor_role") or "").strip()
+        if actor_role not in actor_roles:
+            return False
+    line_id = str(line.get("line_id") or "").strip()
+    evidence_kind = str(line.get("evidence_kind") or "").strip()
+    return (
+        (line_id in line_ids or evidence_kind in evidence_kinds)
+        and _contract_runtime_line_status_passes(line)
+    )
+
+
+def _contract_runtime_direct_fix_parent_ack_matches(
+    line: Mapping[str, Any],
+    *,
+    parent_execution_id: str,
+    child_execution_id: str,
+) -> bool:
+    if not _contract_runtime_direct_fix_line_matches(
+        line,
+        line_ids={"resume_parent_after_successor_return"},
+        evidence_kinds={"successor_return_acknowledgement"},
+        actor_roles={"observer"},
+    ):
+        return False
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    payload_parent = str(payload.get("parent_contract_execution_id") or "").strip()
+    payload_child = str(
+        payload.get("successor_contract_execution_id")
+        or payload.get("child_contract_execution_id")
+        or ""
+    ).strip()
+    if payload_parent and payload_parent != parent_execution_id:
+        return False
+    if payload_child and payload_child != child_execution_id:
+        return False
+    return True
+
+
+def _contract_runtime_direct_fix_close_authority_gate(
+    records: list[dict[str, Any]],
+    *,
+    chain_projection: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    if not _contract_runtime_server_derived_close_authority(chain_projection):
+        return {}
+    direct_fix_records = [
+        record
+        for record in records
+        if str(record.get("contract_id") or "").strip() == DIRECT_FIX_CONTRACT_ID
+    ]
+    if not direct_fix_records:
+        return {}
+
+    child = direct_fix_records[-1]
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    parent_id = str(child.get("parent_contract_execution_id") or "").strip()
+    repair_line: dict[str, Any] = {}
+    qa_line: dict[str, Any] = {}
+    return_line: dict[str, Any] = {}
+    for line in _contract_runtime_completed_line_items(child):
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_candidate_repair"},
+            evidence_kinds={"direct_fix_repair_evidence"},
+            actor_roles={"mf_sub"},
+        ):
+            repair_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"qa_independent_verification"},
+            evidence_kinds={"independent_verification", "direct_fix_independent_qa"},
+            actor_roles={"qa"},
+        ):
+            qa_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_return_to_parent"},
+            evidence_kinds={"direct_fix_return_to_parent"},
+            actor_roles={"observer"},
+        ):
+            return_line = line
+
+    repair_index = int(repair_line.get("_completed_line_index", -1) or -1)
+    qa_index = int(qa_line.get("_completed_line_index", -1) or -1)
+    return_index = int(return_line.get("_completed_line_index", -1) or -1)
+    parent_ack_line: dict[str, Any] = {}
+    if parent_id and child_id:
+        for record in records:
+            if str(record.get("contract_execution_id") or "").strip() != parent_id:
+                continue
+            for line in _contract_runtime_completed_line_items(record):
+                if _contract_runtime_direct_fix_parent_ack_matches(
+                    line,
+                    parent_execution_id=parent_id,
+                    child_execution_id=child_id,
+                ):
+                    parent_ack_line = line
+
+    missing: list[str] = []
+    if not repair_line:
+        missing.append("direct_fix_repair_evidence")
+    if not qa_line:
+        missing.append("independent_qa")
+    if not return_line:
+        missing.append("direct_fix_return_to_parent")
+    if not parent_ack_line:
+        missing.append("parent_return_acknowledgement")
+    if repair_line and qa_line and qa_index <= repair_index:
+        missing.append("independent_qa_after_repair")
+    if qa_line and return_line and return_index <= qa_index:
+        missing.append("return_to_parent_after_qa")
+
+    passed = not missing
+    source_refs = [
+        str(line.get("_source_ref") or "")
+        for line in (repair_line, qa_line, return_line, parent_ack_line)
+        if str(line.get("_source_ref") or "")
+    ]
+    return {
+        "schema_version": "contract_runtime_direct_fix_close_authority_gate.v1",
+        "accepted": passed,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "source": "server_derived_contract_runtime_completed_lines",
+        "primary_decision_source": passed,
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": child_id,
+        "parent_contract_execution_id": parent_id,
+        "close_commit": close_commit,
+        "missing_requirement_ids": missing,
+        "source_refs": source_refs,
+        "checks": {
+            "has_direct_fix_repair_evidence": bool(repair_line),
+            "has_independent_qa": bool(qa_line),
+            "has_return_to_parent": bool(return_line),
+            "has_parent_return_acknowledgement": bool(parent_ack_line),
+            "independent_qa_after_repair": bool(qa_line and qa_index > repair_index),
+            "return_to_parent_after_qa": bool(return_line and return_index > qa_index),
+        },
+    }
+
+
+def _contract_runtime_authoritative_close_verification(
+    verification: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    direct_fix_gate = (
+        runtime_projection.get("direct_fix_close_authority_gate")
+        if isinstance(runtime_projection.get("direct_fix_close_authority_gate"), Mapping)
+        else {}
+    )
+    if not bool(direct_fix_gate.get("passed")):
+        return dict(verification)
+
+    result = dict(verification)
+    result["passed"] = True
+    result["can_close"] = True
+    result["status"] = "passed"
+    result["missing_event_kinds"] = []
+    result["ignored_required_events"] = []
+    result["contract_runtime_direct_fix_close_authority_gate"] = dict(direct_fix_gate)
+    result["close_authority"] = {
+        "schema_version": "contract_runtime_close_authority.v1",
+        "source": "contract_runtime_completed_direct_fix_chain",
+        "legacy": False,
+        "advisory": False,
+        "authoritative": True,
+        "close_authoritative": True,
+        "can_close_authoritative": True,
+        "contract_execution_id": str(direct_fix_gate.get("contract_execution_id") or ""),
+        "source_refs": list(direct_fix_gate.get("source_refs") or []),
+        "message": (
+            "backlog_close accepted server-derived completed ContractRuntime "
+            "direct-fix evidence with independent QA."
+        ),
+    }
+    result["legacy_advisory"] = False
+    result["authoritative"] = True
+    result["source_of_authority"] = "contract_runtime"
+    result["failed_gates"] = []
+
+    gate_keys = [
+        "contract_gate",
+        "route_context_gate",
+        "finish_gate_projection",
+        "lane_ownership_gate",
+        "worker_graph_trace_gate",
+        "independent_qa_gate",
+        "contract_projection_gate",
+        "post_verification_actions_gate",
+        "blocker_resolution_gate",
+        "cross_ref_gate",
+        "approval_scope_gate",
+        "command_disposition_gate",
+        "close_commit_evidence_gate",
+        "close_timeline_startup_gate",
+    ]
+    for key in gate_keys:
+        gate = result.get(key)
+        if not isinstance(gate, Mapping) or bool(gate.get("passed")):
+            continue
+        replaced = dict(gate)
+        replaced["passed"] = True
+        replaced["status"] = "passed"
+        replaced["missing_requirement_ids"] = []
+        replaced["replaced_by_contract_runtime_direct_fix_close_authority"] = True
+        replaced["authority_gate"] = {
+            "schema_version": str(direct_fix_gate.get("schema_version") or ""),
+            "contract_execution_id": str(
+                direct_fix_gate.get("contract_execution_id") or ""
+            ),
+            "source": str(direct_fix_gate.get("source") or ""),
+        }
+        result[key] = replaced
+
+    checks = dict(result.get("checks") or {})
+    checks.update({
+        "has_implementation": True,
+        "has_verification": True,
+        "has_close_ready": True,
+        "has_independent_qa": True,
+        "contract_runtime_direct_fix_close_authority": True,
+        "close_commit_has_timeline_evidence": True,
+    })
+    result["checks"] = checks
+    return result
 
 
 def _contract_runtime_close_authority_seed_events(
@@ -40207,6 +44505,12 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "incomplete",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "next_legal_action": current_state.get("next_legal_action") or {},
             "projected_events": [],
@@ -40225,19 +44529,59 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_completed_lines",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
         }
 
-    identity = _contract_runtime_close_authority_identity(body, route_gate)
+    identity = _contract_runtime_close_authority_record_identity(
+        conn,
+        record,
+        seed_identity=_contract_runtime_close_authority_identity(body, route_gate),
+    )
     if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
         return {
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_route_identity",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
         }
+
+    try:
+        server_chain_projection = _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            rebuild_if_missing=True,
+            route_token_ref=str(body.get("route_token_ref") or ""),
+        )
+    except Exception:
+        server_chain_projection = {}
+
+    chain_records = _contract_runtime_close_authority_chain_records(
+        runtime,
+        chain_projection=server_chain_projection,
+        seed_record=record,
+        project_id=project_id,
+        bug_id=bug_id,
+    )
+    direct_fix_gate = _contract_runtime_direct_fix_close_authority_gate(
+        chain_records,
+        chain_projection=server_chain_projection,
+        close_commit=close_commit,
+    )
 
     projected_events = _contract_runtime_close_authority_seed_events(
         record=record,
@@ -40247,7 +44591,10 @@ def _contract_runtime_close_authority_projection(
         line for line in completed_lines if isinstance(line, Mapping)
     ]
     line_contexts = _contract_runtime_close_authority_line_contexts(
-        completed_line_mappings
+        completed_line_mappings,
+        conn=conn,
+        project_id=project_id,
+        backlog_id=bug_id,
     )
     projected_events.extend(
         _contract_runtime_close_authority_event(
@@ -40264,12 +44611,25 @@ def _contract_runtime_close_authority_projection(
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": True,
         "status": "projected",
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=contract_execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "projection_authoritative": False,
         "contract_execution_id": contract_execution_id,
         "contract_id": str(record.get("contract_id") or "").strip(),
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
         "execution_state_revision": current_state.get("execution_state_revision", 0),
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
+        "direct_fix_close_authority_gate": direct_fix_gate,
+        "server_contract_chain_current_projection": {
+            key: value
+            for key, value in server_chain_projection.items()
+            if key not in {"next_legal_action"}
+        },
         "projected_event_count": len(projected_events),
         "projected_events": projected_events,
     }
@@ -40308,7 +44668,8 @@ def handle_task_timeline_append(ctx: RequestContext):
         "phase": ctx.body.get("phase", ""),
         "event_kind": ctx.body.get("event_kind", ""),
     }
-    route_gate = {}
+    trusted_route_gate = getattr(ctx, "_trusted_route_token_gate", {})
+    route_gate = dict(trusted_route_gate) if isinstance(trusted_route_gate, Mapping) else {}
 
     with DBContext(project_id) as conn:
         legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
@@ -41458,6 +45819,55 @@ def _record_bounded_worker_dispatch_event(
     runtime_context_id = _first_field("runtime_context_id")
     worker_slot_id = _first_field("worker_slot_id", "worker_id")
     observer_command_id = _first_field("observer_command_id")
+    legacy_observer_command_id = observer_command_id
+    dispatch_identity_bridge: dict[str, Any] = {}
+    contract_runtime_execution_id = _first_field(
+        "contract_execution_id",
+        "successor_contract_execution_id",
+    )
+    if not observer_command_id and contract_runtime_execution_id:
+        observer_command_id = contract_runtime_execution_id
+        dispatch_identity_bridge = {
+            "schema_version": "contract_runtime.dispatch_identity_bridge.v1",
+            "accepted": True,
+            "source": "contract_runtime_execution",
+            "source_label": "contract_runtime_execution/contract_execution_id",
+            "dispatch_identity": contract_runtime_execution_id,
+            "dispatch_identity_field": "contract_execution_id",
+            "observer_command_id": observer_command_id,
+            "observer_command_id_source": "contract_runtime_execution_id_bridge",
+            "observer_command_id_kind": "contract_runtime_execution",
+            "legacy_observer_command_id": "",
+            "legacy_observer_command_id_present": False,
+            "contract_execution_id": contract_runtime_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }
+    observer_command_id_source = (
+        str(dispatch_identity_bridge.get("observer_command_id_source") or "")
+        or _first_field("observer_command_id_source")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    observer_command_id_kind = (
+        str(dispatch_identity_bridge.get("observer_command_id_kind") or "")
+        or _first_field("observer_command_id_kind")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    dispatch_identity_source = (
+        str(dispatch_identity_bridge.get("source") or "")
+        or _first_field("dispatch_identity_source")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    dispatch_identity_source_label = (
+        str(dispatch_identity_bridge.get("source_label") or "")
+        or _first_field("dispatch_identity_source_label")
+        or (
+            "legacy_observer_command_id/observer_command_id"
+            if legacy_observer_command_id
+            else ""
+        )
+    )
     dispatch_actor = _first_text(
         body.get("actor"),
         prepared.get("actor"),
@@ -41486,6 +45896,17 @@ def _record_bounded_worker_dispatch_event(
         "parent_task_id": parent_task_id,
         "backlog_id": backlog_id,
         "observer_command_id": observer_command_id,
+        "observer_command_id_source": observer_command_id_source,
+        "observer_command_id_kind": observer_command_id_kind,
+        "legacy_observer_command_id": legacy_observer_command_id,
+        "legacy_observer_command_id_present": bool(legacy_observer_command_id),
+        "dispatch_identity_source": dispatch_identity_source,
+        "dispatch_identity_source_label": dispatch_identity_source_label,
+        **(
+            {"contract_runtime_dispatch_identity": dict(dispatch_identity_bridge)}
+            if dispatch_identity_bridge
+            else {}
+        ),
         "worker_role": "mf_sub",
         "worker_slot_id": worker_slot_id,
         "worker_id": worker_slot_id,
@@ -41853,6 +46274,205 @@ def _record_bounded_worker_dispatch_event(
         "event_kind": event.get("event_kind"),
         "runtime_context_id": runtime_context_id,
     }
+
+
+def _contract_runtime_context_for_dispatch_line(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+):
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    for candidate in _contract_runtime_mapping_candidates(line):
+        if _contract_runtime_mapping_worker_role(candidate) != "mf_sub":
+            continue
+        runtime_context_id = _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+        )
+        task_id = _contract_runtime_mapping_value(
+            candidate,
+            "task_id",
+            "worker_task_id",
+        )
+        context = (
+            get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if runtime_context_id
+            else None
+        )
+        if context is None and task_id:
+            context = get_branch_context(conn, project_id, task_id)
+        if context is None:
+            continue
+        if _contract_runtime_dispatch_line_match(record, context):
+            return context
+    return None
+
+
+def _record_contract_runtime_mf_parallel_dispatch_event(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    result: Mapping[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
+        return {}
+    if (
+        str(write.get("stage_id") or "").strip() != "dispatch"
+        or str(write.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(write.get("evidence_kind") or "").strip()
+        != "dispatch_bounded_worker"
+        or not result.get("ok")
+    ):
+        return {}
+    stored_record = (
+        result.get("record") if isinstance(result.get("record"), Mapping) else record
+    )
+    context = _contract_runtime_context_for_dispatch_line(
+        conn,
+        project_id=project_id,
+        record=stored_record,
+        line=write,
+    )
+    if context is None:
+        return {}
+
+    from .parallel_branch_runtime import runtime_context_id_for_branch_context
+
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    owned_files = list(getattr(context, "owned_files", ()) or ())
+    if not owned_files:
+        owned_files = list(getattr(context, "target_files", ()) or ())
+    if not owned_files:
+        owned_files = _runtime_context_service_query_values(
+            payload,
+            "owned_files",
+            "target_files",
+        )
+    route_token_ref = (
+        str(write.get("route_token_ref") or "").strip()
+        or str(payload.get("route_token_ref") or "").strip()
+        or str(record.get("route_token_ref") or "").strip()
+    )
+    dispatch_body = {
+        **dict(payload),
+        **dict(write),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "backlog_id": str(getattr(context, "backlog_id", "") or record.get("backlog_id") or ""),
+        "worker_role": "mf_sub",
+        "worker_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "agent_id": str(
+            getattr(context, "agent_id", "")
+            or getattr(context, "allocation_owner", "")
+            or ""
+        ),
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "")
+            or write.get("worktree_path")
+            or payload.get("worktree_path")
+            or ""
+        ),
+        "branch_ref": str(
+            getattr(context, "branch_ref", "")
+            or write.get("branch_ref")
+            or write.get("branch")
+            or payload.get("branch_ref")
+            or payload.get("branch")
+            or ""
+        ),
+        "base_commit": str(
+            getattr(context, "base_commit", "")
+            or write.get("base_commit")
+            or payload.get("base_commit")
+            or ""
+        ),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "")
+            or write.get("target_head_commit")
+            or payload.get("target_head_commit")
+            or ""
+        ),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "")
+            or write.get("merge_queue_id")
+            or payload.get("merge_queue_id")
+            or ""
+        ),
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "route_token_ref": route_token_ref,
+    }
+    dispatch_result = _record_bounded_worker_dispatch_event(
+        conn,
+        project_id,
+        body=dispatch_body,
+        prepared={
+            "contract_execution_id": str(record.get("contract_execution_id") or ""),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        },
+        branch_runtime_evidence={
+            "context": {
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+                "root_task_id": _runtime_context_mf_sub_parent_task_id(context),
+                "worker_id": str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                "worker_slot_id": str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                "agent_id": str(getattr(context, "agent_id", "") or ""),
+                "fence_token": str(getattr(context, "fence_token", "") or ""),
+                "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+                "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+                "base_commit": str(getattr(context, "base_commit", "") or ""),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ),
+                "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+                "owned_files": owned_files,
+            }
+        },
+        source="contract_runtime_execution",
+        request_id=request_id,
+    )
+    if dispatch_result:
+        dispatch_result["contract_execution_id"] = str(
+            record.get("contract_execution_id") or ""
+        )
+        dispatch_result["dispatch_identity_source"] = "contract_runtime_execution"
+    return dispatch_result
 
 
 def _observer_runtime_text_contract_revision_payload(
@@ -45029,6 +49649,77 @@ def handle_backlog_get(ctx: RequestContext):
         conn.close()
 
 
+def _timeline_gate_contract_runtime_projection_body(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    query: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = dict(query or {})
+    if _contract_runtime_close_execution_id(body):
+        return body
+    try:
+        current = _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=True,
+            route_token_ref=str(body.get("route_token_ref") or ""),
+        )
+    except Exception:
+        return body
+    execution_id = str(current.get("current_contract_execution_id") or "").strip()
+    if not execution_id.startswith("cex-"):
+        active_chain = (
+            current.get("active_chain")
+            if isinstance(current.get("active_chain"), Mapping)
+            else {}
+        )
+        for candidate in reversed(list(active_chain.get("execution_ids") or [])):
+            candidate_id = str(candidate or "").strip()
+            if candidate_id.startswith("cex-"):
+                execution_id = candidate_id
+                break
+    if not execution_id.startswith("cex-"):
+        return body
+    next_action = current.get("next_legal_action")
+    if str(current.get("readiness_state") or "").strip() != "contract_complete" and next_action:
+        return body
+    body["contract_execution_id"] = execution_id
+    body["contract_runtime"] = {
+        **(
+            dict(body.get("contract_runtime"))
+            if isinstance(body.get("contract_runtime"), Mapping)
+            else {}
+        ),
+        "contract_execution_id": execution_id,
+        "projection_source": "backlog_contract_chain_current_projection",
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_current_chain_projection",
+            contract_execution_id=execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+    }
+    body["contract_chain_current"] = {
+        **dict(current),
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="backlog_contract_chain_current_projection",
+            contract_execution_id=execution_id,
+        ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "projection_source": "backlog_contract_chain_current_projection",
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+    }
+    return body
+
+
 @route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
 def handle_backlog_timeline_gate(ctx: RequestContext):
     """Read-only MF close-gate precheck for backlog timeline evidence.
@@ -45066,6 +49757,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         )
         contract: dict[str, Any] = {}
         route_context_gate: dict[str, Any] = {}
+        runtime_projection: dict[str, Any] = {}
         if applicable["is_mf"]:
             contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
             contract = _mf_close_contract_with_route_context(contract, row, ctx.query)
@@ -45073,12 +49765,51 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 events,
                 contract=contract,
             )
-            verification = _mf_close_gate_verification(
-                events,
-                contract=contract,
-                conn=conn,
+            projection_body = _timeline_gate_contract_runtime_projection_body(
+                conn,
                 project_id=pid,
+                backlog_id=bug_id,
+                query=ctx.query,
             )
+            runtime_projection = _contract_runtime_close_authority_projection(
+                conn,
+                project_id=pid,
+                bug_id=bug_id,
+                body=projection_body,
+                route_gate=route_context_gate,
+                close_commit=_audit_recovery_close_commit(row, projection_body),
+            )
+            if runtime_projection.get("accepted"):
+                verification = _mf_close_gate_verification(
+                    list(runtime_projection.get("projected_events") or []),
+                    contract=contract,
+                    conn=conn,
+                    project_id=pid,
+                )
+                verification = dict(verification)
+                verification["contract_runtime_close_authority_projection"] = {
+                    key: value
+                    for key, value in runtime_projection.items()
+                    if key != "projected_events"
+                }
+                verification = _contract_runtime_authoritative_close_verification(
+                    verification,
+                    runtime_projection,
+                )
+            else:
+                verification = _mf_close_gate_verification(
+                    events,
+                    contract=contract,
+                    conn=conn,
+                    project_id=pid,
+                )
+                if runtime_projection:
+                    verification = dict(verification)
+                    verification["contract_runtime_close_authority_projection"] = {
+                        key: value
+                        for key, value in runtime_projection.items()
+                        if key != "projected_events"
+                    }
         else:
             repair_reason = {
                 "code": "timeline_gate_not_applicable",
@@ -45140,6 +49871,20 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             if normal_close_gate:
                 verification["normal_close_gate"] = normal_close_gate
             can_close = False
+        projection_execution_id = str(
+            runtime_projection.get("contract_execution_id")
+            if isinstance(runtime_projection, Mapping)
+            else ""
+        ).strip()
+        verification = _annotate_legacy_mf_timeline_precheck_authority(
+            verification,
+            source=(
+                "mf_timeline_precheck_contract_runtime_projection"
+                if projection_execution_id
+                else "mf_timeline_precheck"
+            ),
+            contract_execution_id=projection_execution_id,
+        )
         result = {
             "ok": True,
             "project_id": pid,
@@ -45147,6 +49892,9 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             "applicable": applicable["is_mf"],
             "reason": applicable["reason"],
             "can_close": can_close,
+            "close_authority": verification["close_authority"],
+            "legacy_advisory": True,
+            "authoritative": False,
             "event_count": len(events),
         }
         if audit_archive:
@@ -47017,6 +51765,7 @@ def handle_project_direct_fix_enter(ctx: RequestContext):
         "next_legal_action": successor_runtime.get("next_legal_action") or {},
         "execution_state_revision": successor_runtime.get("execution_state_revision", 0),
         "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
+        "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
         "route_token_ref": successor_runtime.get("route_token_ref", ""),
         "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
         or {},
@@ -47246,6 +51995,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "execution_state_revision", 0
         ),
         "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
+        "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
         "route_token_ref": successor_runtime.get("route_token_ref", ""),
         "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
         or {},
@@ -47652,6 +52402,31 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     return response
 
 
+@route("GET", "/api/projects/{project_id}/contract-chain-current")
+def handle_project_contract_chain_current(ctx: RequestContext):
+    """Read the durable backlog_contract_chain_current projection for a row."""
+    project_id = ctx.get_project_id()
+    backlog_id = str(
+        _first_query_value(ctx.query, "backlog_id")
+        or _first_query_value(ctx.query, "bug_id")
+        or ""
+    ).strip()
+    if not backlog_id:
+        raise ValidationError("contract_chain_current requires backlog_id or bug_id")
+    rebuild_if_missing = _query_bool(ctx.query, "rebuild_if_missing", False)
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    with DBContext(project_id) as conn:
+        return _contract_chain_current_response(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=rebuild_if_missing,
+            route_token_ref=route_token_ref,
+        )
+
+
 @route("POST", "/api/projects/{project_id}/onboard-contract/start")
 @route("POST", "/api/projects/{project_id}/onboard-contract/enter")
 def handle_project_onboard_contract_start(ctx: RequestContext):
@@ -48008,18 +52783,33 @@ def handle_project_contract_update_start(ctx: RequestContext):
     contract_execution_id = str(body.get("contract_execution_id") or "").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
-    if onboard_service_waiver:
-        metadata = {
-            **dict(metadata),
-            "entrypoint": "onboard_service_waiver",
-            "legacy_onboard_contract_waived": True,
-            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-        }
     recovery_policy = str(body.get("recovery_policy") or "").strip()
     stale_contract_execution_id = str(
         body.get("stale_contract_execution_id") or ""
     ).strip()
     with DBContext(project_id) as conn:
+        inferred_onboard_service_waiver = (
+            not onboard_service_waiver
+            and _onboard_service_parent_materialized(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+        )
+        if inferred_onboard_service_waiver:
+            onboard_service_waiver = True
+        if onboard_service_waiver:
+            metadata = {
+                **dict(metadata),
+                "entrypoint": "onboard_service_waiver",
+                "legacy_onboard_contract_waived": True,
+                "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                "onboard_service_waiver_source": (
+                    "contract_chain_current_projection"
+                    if inferred_onboard_service_waiver
+                    else "request"
+                ),
+            }
         actor_role = _contract_update_effective_actor_role(
             ctx,
             conn,
@@ -48042,7 +52832,10 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 route_token_ref=route_token_ref,
                 allow_onboard_service_waiver=onboard_service_waiver,
             )
-            if not _runtime_record_is_complete(parent_record):
+            if (
+                not _runtime_record_is_complete(parent_record)
+                and not _onboard_service_record(parent_record)
+            ):
                 current_state = _runtime_current_state_from_record(parent_record)
                 raise ValidationError(
                     "observer onboarding contract must complete before contract_update successor",
@@ -48078,6 +52871,18 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 project_id,
                 backlog_id,
             )
+            if not onboard_service_waiver:
+                raise ValidationError(
+                    "onboard_contract runtime must be started before contract_update successor",
+                    {
+                        "contract_execution_id": deterministic_onboard_id,
+                        "contract_id": ONBOARD_CONTRACT_ID,
+                        "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+                        "agent_facing_decision_source": (
+                            "contract_runtime_first_missing_line"
+                        ),
+                    },
+                ) from exc
             raise ValidationError(
                 "onboard_route_guide service waiver or returned legacy onboard_contract facade is required before contract_update successor",
                 {
@@ -48307,18 +53112,53 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
-            write = _contract_runtime_line_write_body(
-                record,
-                actor_role=actor_role,
-                body=body,
-            )
-            result = runtime.submit_line_write(
-                contract_execution_id,
-                write,
-                actor_role=actor_role,
-            )
+            if _onboard_service_record(record):
+                record = _contract_runtime_read(
+                    conn,
+                    contract_execution_id=contract_execution_id,
+                    actor_role=actor_role,
+                )
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = _onboard_service_submit_line_write(
+                    conn,
+                    record=record,
+                    write=write,
+                    actor_role=actor_role,
+                )
+            else:
+                runtime.current_guide(contract_execution_id, actor_role=actor_role)
+                record = runtime.store.get(contract_execution_id)
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                write = _direct_fix_materialize_dispatch_runtime_context(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
+                    request_id=ctx.request_id,
+                )
+                result = runtime.submit_line_write(
+                    contract_execution_id,
+                    write,
+                    actor_role=actor_role,
+                )
+                dispatch_timeline_event = (
+                    _record_contract_runtime_mf_parallel_dispatch_event(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        write=write,
+                        result=result,
+                        request_id=str(ctx.request_id),
+                    )
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
@@ -48348,6 +53188,8 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}
         response["actor_role"] = actor_role
+    if "dispatch_timeline_event" in locals() and dispatch_timeline_event:
+        response["contract_runtime_dispatch_timeline_event"] = dispatch_timeline_event
     return response
 
 
@@ -48371,18 +53213,37 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
-            write = _contract_runtime_line_write_body(
-                record,
-                actor_role=actor_role,
-                body=body,
-            )
-            result = runtime.precheck_line_write(
-                contract_execution_id,
-                write,
-                actor_role=actor_role,
-            )
+            if _onboard_service_record(record):
+                record = _contract_runtime_read(
+                    conn,
+                    contract_execution_id=contract_execution_id,
+                    actor_role=actor_role,
+                )
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = _onboard_service_submit_line_write(
+                    conn,
+                    record=record,
+                    write=write,
+                    actor_role=actor_role,
+                    mutate=False,
+                )
+            else:
+                runtime.current_guide(contract_execution_id, actor_role=actor_role)
+                record = runtime.store.get(contract_execution_id)
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = runtime.precheck_line_write(
+                    contract_execution_id,
+                    write,
+                    actor_role=actor_role,
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
@@ -48903,16 +53764,22 @@ def _verify_mf_close_timeline_gate(
             verification,
         )
 
+    gate_body = _timeline_gate_contract_runtime_projection_body(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        query=body,
+    )
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
-    contract = _mf_close_contract_with_route_context(contract, row, body)
+    contract = _mf_close_contract_with_route_context(contract, row, gate_body)
     runtime_projection = _contract_runtime_close_authority_projection(
         conn,
         project_id=project_id,
         bug_id=bug_id,
-        body=body,
+        body=gate_body,
         route_gate=route_gate,
-        close_commit=_audit_recovery_close_commit(row, body),
+        close_commit=_audit_recovery_close_commit(row, gate_body),
     )
     if runtime_projection.get("accepted"):
         verification = _mf_close_gate_verification(
@@ -48927,6 +53794,10 @@ def _verify_mf_close_timeline_gate(
             for key, value in runtime_projection.items()
             if key != "projected_events"
         }
+        verification = _contract_runtime_authoritative_close_verification(
+            verification,
+            runtime_projection,
+        )
     else:
         verification = _mf_close_gate_verification(
             events,

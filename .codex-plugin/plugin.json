@@ -36,9 +36,9 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Start from the active aming-claw-onboard skill and MCP onboard_route_guide tool (the onboard route guide) before changing governed code; use the HTTP endpoint only as fallback.",
-      "If governance is offline, ask the user to run aming-claw start; do not use archived skills as active instructions.",
-      "Call runtime_status, graph_status, graph_operations_queue, and backlog checks before implementation."
+      "Start with active aming-claw-onboard skill plus MCP onboard_route_guide before governed mutations.",
+      "If governance is offline, ask the user to run aming-claw start; do not treat archived skills as active.",
+      "Before implementation, run runtime_status, graph_status, graph_operations_queue, and backlog checks."
     ],
     "brandColor": "#0F766E"
   }

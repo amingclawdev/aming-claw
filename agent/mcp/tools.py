@@ -166,10 +166,33 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
         {
             "task_id": {"type": "string"},
             "worker_session_id": {"type": "string"},
+            "worker_id": {"type": "string"},
+            "worker_slot_id": {"type": "string"},
             "filer_principal": {"type": "string"},
             "worker_transcript_ref": {"type": "string"},
             "worker_transcript_path": {"type": "string"},
             "harness_type": {"type": "string"},
+            "launch_text_hash": {"type": "string"},
+            "receipt_hash": {"type": "string"},
+            "context_hash": {"type": "string"},
+            "contract_hash": {"type": "string"},
+            "acknowledged_at": {"type": "string"},
+            "actor_role": {"type": "string"},
+            "actor_session_principal": {"type": "string"},
+            "evidence_owner_actor": {"type": "string"},
+            "evidence_owner_role": {"type": "string"},
+            "evidence_owner_session": {"type": "string"},
+            "evidence_owner_session_ref": {"type": "string"},
+            "submitter_session": {"type": "string"},
+            "submitter_principal": {"type": "string"},
+            "materialized_from": {"type": "string"},
+            "materialized_from_report": {"type": "string"},
+            "authorization_source": {"type": "string"},
+            "observer_impersonation": {"type": "boolean"},
+            "qa_session_token_ref": {"type": "string"},
+            "parent_materialization_authorized": {"type": "boolean"},
+            "qa_evidence_provenance": {"type": "object"},
+            "contract_context_read_receipt": {"type": "object"},
             "checkpoint_id": {"type": "string"},
             "head_commit": {"type": "string"},
             "changed_files": {"type": "array", "items": {"type": "string"}},
@@ -1064,7 +1087,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "mf_timeline_precheck",
-        "description": "Precheck whether an MF/observer backlog row has the required timeline evidence before backlog_close.",
+        "description": (
+            "Legacy/advisory MF timeline diagnostic before backlog_close. "
+            "This is not final close authority; contract runtime, the "
+            "server-side contract gate kernel, and backlog_close remain authoritative."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1073,7 +1100,7 @@ TOOLS: list[dict] = [
                 "view": {
                     "type": "string",
                     "enum": ["compact", "full", "repair"],
-                    "description": "compact returns a ledger-sized gate_summary. repair returns advisory next-step payloads. full (default) returns the complete timeline_gate tree.",
+                    "description": "compact returns a ledger-sized advisory gate_summary. repair returns advisory next-step payloads. full (default) returns the complete legacy timeline_gate tree, still not final close authority.",
                 },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
@@ -1817,6 +1844,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "graph_current_full_reconcile",
+        "description": "Run the canonical current-commit full graph reconcile path. Defaults to current clean HEAD and activate=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "target_commit_sha": {"type": "string"},
+                "commit_sha": {"type": "string"},
+                "run_id": {"type": "string"},
+                "snapshot_id": {"type": "string"},
+                "expected_old_snapshot_id": {"type": "string"},
+                "actor": {"type": "string"},
+                "activate": {"type": "boolean", "default": True},
+                "require_clean": {"type": "boolean", "default": True},
+                "semantic_use_ai": {"type": "boolean"},
+                "semantic_enrich": {"type": "boolean"},
+                "enqueue_stale": {"type": "boolean", "default": False},
+                "notes_extra": {"type": "object"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "stale_artifact_cleanup",
         "description": "Dry-run stale governance artifact cleanup projection for stale batch worktrees and retained append-only evidence.",
         "inputSchema": {
@@ -1952,6 +2002,15 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
+        "name": "runtime_context_read_receipt",
+        "description": "Worker-authored canonical Runtime Context read-receipt facade. Prefer this over legacy task_timeline_append or generic ContractRuntime line writes for mf_sub happy paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
             "required": ["project_id", "runtime_context_id"],
         },
     },
@@ -2169,7 +2228,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "graph_pending_scope_queue",
-        "description": "Queue or update a pending scope-reconcile row for a target commit.",
+        "description": "Deprecated/internal recovery only: queue or update a pending scope-reconcile row for a target commit. Normal graph updates should use graph_current_full_reconcile.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2983,11 +3042,20 @@ class ToolDispatcher:
         if name == "onboard_contract_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+                and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
@@ -3233,6 +3301,19 @@ class ToolDispatcher:
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/graph-governance/{pid}/operations/queue{qs}")
 
+        if name == "graph_current_full_reconcile":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/reconcile/current-full",
+                body,
+            )
+
         if name == "stale_artifact_cleanup":
             pid = args["project_id"]
             query = {}
@@ -3282,6 +3363,7 @@ class ToolDispatcher:
             )
 
         if name in {
+            "runtime_context_read_receipt",
             "runtime_context_implementation_evidence",
             "runtime_context_finish_time_worker_attestation",
             "runtime_context_finish_gate",
@@ -3291,6 +3373,7 @@ class ToolDispatcher:
             pid = args["project_id"]
             runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
             suffix_by_name = {
+                "runtime_context_read_receipt": "read-receipts",
                 "runtime_context_implementation_evidence": "implementation-evidence",
                 "runtime_context_finish_time_worker_attestation": (
                     "finish-time-worker-attestation"

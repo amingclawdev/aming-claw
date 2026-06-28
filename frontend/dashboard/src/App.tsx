@@ -540,8 +540,8 @@ export default function App() {
       return;
     }
     const ok = window.confirm(
-      `Catch the active graph up to HEAD ${headCommit.slice(0, 7)}? Runs the ` +
-        "scope reconcile inline (materialize+activate → projection rebuild). " +
+      `Update the active graph to HEAD ${headCommit.slice(0, 7)}? Runs the ` +
+        "current full reconcile inline (rebuild+activate → projection rebuild). " +
         "The banner shows live progress.",
     );
     if (!ok) return;
@@ -552,25 +552,31 @@ export default function App() {
     setReconcilePhase("materializing");
     setReconcileDetail(`target ${headCommit.slice(0, 7)}`);
     try {
-      // Direct materialize + activate in one round-trip. The backend creates
-      // and consumes any transient pending-scope bookkeeping internally, so the
-      // operator does not see a separate queued scope-reconcile task.
+      // Direct current-full reconcile in one round-trip. Pending-scope remains
+      // internal recovery bookkeeping, not the normal operator path.
       setReconcilePhase("materializing");
       setReconcileDetail(`building snapshot for ${headCommit.slice(0, 7)}`);
-      const runRes = await api.materializeAndActivatePendingScope({
+      const runRes = await api.currentFullReconcile({
         target_commit_sha: headCommit,
         parent_commit_sha: snapCommit ?? undefined,
         semantic_use_ai: false, // rule-based + carry-forward only; no AI billed
         actor: "dashboard_user",
       });
-      const newSid = runRes.snapshot_id || runRes.activation?.snapshot_id || "(unknown)";
-      const projection = runRes.activation?.projection_status ?? "(unknown)";
+      const newSid =
+        runRes.snapshot_id ||
+        runRes.activation_verification?.active_snapshot_id ||
+        runRes.activation?.snapshot_id ||
+        "(unknown)";
+      const projection =
+        runRes.activation?.projection_status ||
+        runRes.activation_verification?.projection_status ||
+        "(unknown)";
       setReconcilePhase("rebuilding");
       setReconcileDetail(`activated ${newSid.slice(0, 20)} · projection ${projection}`);
       setToast({
         kind: "success",
         msg:
-          `Scope reconcile complete · snapshot=${newSid.slice(0, 24)} · ` +
+          `Graph update complete · snapshot=${newSid.slice(0, 24)} · ` +
           `projection=${projection}. Refreshing dashboard…`,
       });
       await fetchAll();

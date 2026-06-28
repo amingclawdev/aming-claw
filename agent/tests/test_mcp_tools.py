@@ -1080,6 +1080,14 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
         "session_token_ref",
         "fence_token",
         "target_project_root",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "submitter_session",
+        "submitter_principal",
+        "materialized_from",
+        "authorization_source",
+        "qa_session_token_ref",
+        "qa_evidence_provenance",
     }
     assert _tool_properties("contract_runtime_precheck_line") == submit_properties
 
@@ -1189,6 +1197,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     assert {"qa_session_register", "qa_session_heartbeat"}.issubset(names)
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
     for tool_name in (
+        "onboard_contract_submit_line",
         "contract_add_current",
         "contract_add_submit_line",
         "contract_update_current",
@@ -1231,6 +1240,18 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "project_id": "aming-claw",
             "contract_execution_id": "cex-hotfix",
             "qa_session_token": "gov-qa-token",
+        },
+    )
+    dispatcher.dispatch(
+        "onboard_contract_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "qa_session_token": "gov-qa-token",
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "payload": {"decision": "pass"},
         },
     )
     dispatcher.dispatch(
@@ -1280,6 +1301,17 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "GET",
             "/api/projects/aming-claw/contract-runtime/cex-hotfix/current-state",
             None,
+            "gov-qa-token",
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/onboard-contract/cex-onboard/line-writes",
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "payload": {"decision": "pass"},
+            },
             "gov-qa-token",
         ),
         (
@@ -1362,6 +1394,14 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "fence_token",
         "target_project_root",
         "qa_session_token",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "submitter_session",
+        "submitter_principal",
+        "materialized_from",
+        "authorization_source",
+        "qa_session_token_ref",
+        "qa_evidence_provenance",
     }
     assert _tool_properties("contract_runtime_precheck_line") == _tool_properties(
         "contract_runtime_submit_line"

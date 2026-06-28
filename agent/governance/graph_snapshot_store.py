@@ -12,7 +12,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 GRAPH_SNAPSHOT_SCHEMA_SQL = """
@@ -192,6 +192,7 @@ PENDING_STATUS_RUNNING = "running"
 PENDING_STATUS_MATERIALIZED = "materialized"
 PENDING_STATUS_FAILED = "failed"
 PENDING_STATUS_WAIVED = "waived"
+PENDING_STATUS_SUPERSEDED = "superseded"
 
 ALLOWED_PENDING_STATUSES = {
     PENDING_STATUS_QUEUED,
@@ -199,6 +200,7 @@ ALLOWED_PENDING_STATUSES = {
     PENDING_STATUS_MATERIALIZED,
     PENDING_STATUS_FAILED,
     PENDING_STATUS_WAIVED,
+    PENDING_STATUS_SUPERSEDED,
 }
 GRAPH_REF_OPERATION_TYPES = {
     "activate",
@@ -3308,6 +3310,24 @@ def list_pending_scope_reconcile(
     return [dict(row) for row in rows]
 
 
+def _pending_scope_hidden_from_normal_paths(row: Mapping[str, Any]) -> bool:
+    status = str(row.get("status") or "").strip().lower()
+    if status == PENDING_STATUS_SUPERSEDED:
+        return True
+    evidence = _decode_json(row.get("evidence_json"), {})
+    if not isinstance(evidence, Mapping):
+        return False
+    if evidence.get("hidden_from_normal_operator_paths"):
+        return True
+    if evidence.get("normal_operator_hidden"):
+        return True
+    if evidence.get("superseded_by_current_full_reconcile"):
+        return True
+    if evidence.get("superseded_by"):
+        return True
+    return False
+
+
 def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
     from .graph_rule_fingerprint import compact_rule_fingerprint, snapshot_rule_fingerprint
 
@@ -3325,6 +3345,10 @@ def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[s
             PENDING_STATUS_FAILED,
         ],
     )
+    pending = [
+        row for row in pending
+        if not _pending_scope_hidden_from_normal_paths(row)
+    ]
     return {
         "project_id": project_id,
         "active_snapshot_id": active.get("snapshot_id") if active else "",

@@ -570,6 +570,13 @@ export const api = {
       signal,
     );
   },
+  currentFullReconcileFor(projectId: string, payload: GraphReconcilePayload, signal?: AbortSignal) {
+    return postJSON<GraphReconcileResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/reconcile/current-full`,
+      payload,
+      signal,
+    );
+  },
   queuePendingScopeFor(projectId: string, payload: PendingScopePayload, signal?: AbortSignal) {
     return postJSON<{ ok?: boolean; pending_scope_reconcile?: unknown }>(
       `/api/graph-governance/${pidFor(projectId)}/pending-scope`,
@@ -577,6 +584,7 @@ export const api = {
       signal,
     );
   },
+  // Deprecated recovery API. Normal Update graph uses currentFullReconcileFor.
   materializePendingScopeFor(projectId: string, payload: GraphReconcilePayload, signal?: AbortSignal) {
     return postJSON<GraphReconcileResponse>(
       `/api/graph-governance/${pidFor(projectId)}/reconcile/pending-scope`,
@@ -750,30 +758,47 @@ export const api = {
       signal,
     );
   },
-  // Direct Update graph: materialize a scope candidate and activate it in one
-  // round-trip. Backend creates/consumes transient pending-scope bookkeeping
-  // when no queued row exists.
+  // Canonical Update graph: rebuild and activate a full snapshot for current HEAD.
   // dry_run=false here means "really build the snapshot"; AI is opt-in via
   // semantic_use_ai (default false → rule-based + carry-forward only).
-  materializeAndActivatePendingScope(
-    opts: { target_commit_sha: string; parent_commit_sha?: string; semantic_use_ai?: boolean; actor?: string },
+  currentFullReconcile(
+    opts: {
+      target_commit_sha: string;
+      parent_commit_sha?: string;
+      semantic_use_ai?: boolean;
+      actor?: string;
+      require_clean?: boolean;
+    },
     signal?: AbortSignal,
   ) {
     return postJSON<{
       ok: boolean;
       snapshot_id: string;
       activation?: { snapshot_id?: string; previous_snapshot_id?: string; projection_status?: string };
+      activation_verification?: {
+        active_snapshot_id?: string;
+        active_graph_commit?: string;
+        projection_status?: string;
+      };
     }>(
-      `/api/graph-governance/${pid()}/reconcile/pending-scope`,
+      `/api/graph-governance/${pid()}/reconcile/current-full`,
       {
         target_commit_sha: opts.target_commit_sha,
         parent_commit_sha: opts.parent_commit_sha,
         actor: opts.actor ?? "dashboard_user",
         semantic_use_ai: opts.semantic_use_ai ?? false,
         activate: true,
+        require_clean: opts.require_clean ?? true,
       },
       signal,
     );
+  },
+  // Deprecated compatibility wrapper; routes to currentFullReconcile.
+  materializeAndActivatePendingScope(
+    opts: { target_commit_sha: string; parent_commit_sha?: string; semantic_use_ai?: boolean; actor?: string },
+    signal?: AbortSignal,
+  ) {
+    return api.currentFullReconcile(opts, signal);
   },
   cancelScopeReconcile(
     opts: { commit_sha?: string; operation_id?: string; actor?: string; reason?: string },
@@ -1155,6 +1180,7 @@ export interface GraphReconcilePayload {
   semantic_use_ai?: boolean;
   enqueue_stale?: boolean;
   semantic_skip_completed?: boolean;
+  require_clean?: boolean;
   notes_extra?: Record<string, unknown>;
 }
 
@@ -1166,6 +1192,11 @@ export interface GraphReconcileResponse {
   snapshot_id?: string;
   snapshot_status?: string;
   activation?: { snapshot_id?: string; projection_status?: string };
+  activation_verification?: {
+    active_snapshot_id?: string;
+    active_graph_commit?: string;
+    projection_status?: string;
+  };
   graph_stats?: { nodes?: number; edges?: number; node_count?: number; edge_count?: number };
 }
 

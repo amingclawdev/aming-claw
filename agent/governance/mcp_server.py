@@ -187,10 +187,33 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
         {
             "task_id": {"type": "string"},
             "worker_session_id": {"type": "string"},
+            "worker_id": {"type": "string"},
+            "worker_slot_id": {"type": "string"},
             "filer_principal": {"type": "string"},
             "worker_transcript_ref": {"type": "string"},
             "worker_transcript_path": {"type": "string"},
             "harness_type": {"type": "string"},
+            "launch_text_hash": {"type": "string"},
+            "receipt_hash": {"type": "string"},
+            "context_hash": {"type": "string"},
+            "contract_hash": {"type": "string"},
+            "acknowledged_at": {"type": "string"},
+            "actor_role": {"type": "string"},
+            "actor_session_principal": {"type": "string"},
+            "evidence_owner_actor": {"type": "string"},
+            "evidence_owner_role": {"type": "string"},
+            "evidence_owner_session": {"type": "string"},
+            "evidence_owner_session_ref": {"type": "string"},
+            "submitter_session": {"type": "string"},
+            "submitter_principal": {"type": "string"},
+            "materialized_from": {"type": "string"},
+            "materialized_from_report": {"type": "string"},
+            "authorization_source": {"type": "string"},
+            "observer_impersonation": {"type": "boolean"},
+            "qa_session_token_ref": {"type": "string"},
+            "parent_materialization_authorized": {"type": "boolean"},
+            "qa_evidence_provenance": {"type": "object"},
+            "contract_context_read_receipt": {"type": "object"},
             "checkpoint_id": {"type": "string"},
             "head_commit": {"type": "string"},
             "changed_files": {"type": "array", "items": {"type": "string"}},
@@ -253,6 +276,10 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
         "observer_session_id": {
             "type": "string",
             "description": "Opaque active observer session id used with observer_route_token_ref.",
+        },
+        "qa_session_token": {
+            "type": "string",
+            "description": "Raw QA role token used only as X-Gov-Token; never forwarded as evidence body.",
         },
         "worker_role": {
             "type": "string",
@@ -637,7 +664,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "mf_timeline_precheck",
-        "description": "Precheck whether an MF/observer backlog row has the required timeline evidence before backlog_close.",
+        "description": (
+            "Legacy/advisory MF timeline diagnostic before backlog_close. "
+            "This is not final close authority; contract runtime, the "
+            "server-side contract gate kernel, and backlog_close remain authoritative."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -646,7 +677,7 @@ TOOLS: list[dict] = [
                 "view": {
                     "type": "string",
                     "enum": ["full", "compact", "repair"],
-                    "description": "Response projection: full gate tree, compact gate summary, or advisory repair payloads.",
+                    "description": "Response projection: full legacy gate tree, compact advisory gate summary, or advisory repair payloads. None of these are final close authority.",
                 },
                 "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
                 "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
@@ -704,6 +735,36 @@ TOOLS: list[dict] = [
                 "observer_route_token_ref": {
                     "type": "string",
                     "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "contract_chain_current",
+        "description": (
+            "Read the durable backlog_contract_chain_current projection for a "
+            "backlog row. This does not timeline-scan as a normal fallback; "
+            "set rebuild_if_missing only for an explicit projection rebuild."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier.",
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Backlog row id to read from the current projection.",
+                },
+                "bug_id": {
+                    "type": "string",
+                    "description": "Alias for backlog_id.",
+                },
+                "rebuild_if_missing": {
+                    "type": "boolean",
+                    "description": "Explicitly rebuild the projection if no current row exists.",
                 },
             },
             "required": ["project_id"],
@@ -1177,6 +1238,15 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "runtime_context_read_receipt",
+        "description": "Worker-authored canonical Runtime Context read-receipt facade. Prefer this over legacy task_timeline_append or generic ContractRuntime line writes for mf_sub happy paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
         "name": "runtime_context_implementation_evidence",
         "description": "Worker-authored canonical Runtime Context implementation-evidence facade. Prefer this over legacy task_timeline_append for mf_sub happy paths.",
         "inputSchema": {
@@ -1443,7 +1513,13 @@ def _gov_token() -> str:
     return os.environ.get("GOV_TOKEN", "")
 
 
-def _http(method: str, path: str, body: dict | None = None) -> dict:
+def _http(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    gov_token: str | None = None,
+) -> dict:
     """Make an HTTP request to the governance service."""
     url = f"{_gov_url()}{path}"
     data = json.dumps(body, ensure_ascii=False).encode() if body else None
@@ -1453,7 +1529,7 @@ def _http(method: str, path: str, body: dict | None = None) -> dict:
         method=method,
         headers={
             "Content-Type": "application/json",
-            "X-Gov-Token": _gov_token(),
+            "X-Gov-Token": gov_token if gov_token is not None else _gov_token(),
         },
     )
     try:
@@ -1467,6 +1543,18 @@ def _http(method: str, path: str, body: dict | None = None) -> dict:
             return {"error": str(exc), "body": raw}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def _http_with_optional_gov_token(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    gov_token: str = "",
+) -> dict:
+    if gov_token:
+        return _http(method, path, body, gov_token=gov_token)
+    return _http(method, path, body)
 
 
 # ---------------------------------------------------------------------------
@@ -1561,6 +1649,19 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             _onboard_route_guide_body(args),
         )
 
+    if name == "contract_chain_current":
+        pid = args["project_id"]
+        backlog_id = str(args.get("backlog_id") or args.get("bug_id") or "").strip()
+        query = {}
+        if backlog_id:
+            query["backlog_id"] = backlog_id
+        if "rebuild_if_missing" in args:
+            query["rebuild_if_missing"] = (
+                "true" if args.get("rebuild_if_missing") else "false"
+            )
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http("GET", f"/api/projects/{pid}/contract-chain-current{qs}")
+
     if name == "observer_hotfix_enter":
         pid = args["project_id"]
         body = {
@@ -1618,15 +1719,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "onboard_contract_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name == "contract_add_start":
@@ -1680,6 +1784,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "contract_update_current":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         query = {
             key: value
             for key, value in args.items()
@@ -1688,29 +1793,34 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             and value is not None
         }
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-        return _http(
+        return _http_with_optional_gov_token(
             "GET",
             f"/api/projects/{pid}/contract-update/{execution_id}/current-state{qs}",
+            gov_token=qa_session_token,
         )
 
     if name == "contract_update_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-update/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name in {"contract_runtime_current", "contract_runtime_guide"}:
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
         suffix = "guide" if name == "contract_runtime_guide" else "current-state"
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         query = {
             key: value
             for key, value in args.items()
@@ -1719,37 +1829,44 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             and value is not None
         }
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-        return _http(
+        return _http_with_optional_gov_token(
             "GET",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}{qs}",
+            gov_token=qa_session_token,
         )
 
     if name == "contract_runtime_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name == "contract_runtime_precheck_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
             body,
+            gov_token=qa_session_token,
         )
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
@@ -1765,6 +1882,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         )
 
     if name in {
+        "runtime_context_read_receipt",
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -1774,6 +1892,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
         suffix_by_name = {
+            "runtime_context_read_receipt": "read-receipts",
             "runtime_context_implementation_evidence": "implementation-evidence",
             "runtime_context_finish_time_worker_attestation": (
                 "finish-time-worker-attestation"

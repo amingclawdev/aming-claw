@@ -8947,6 +8947,7 @@ def record_merge_queue_result(
     snapshot_id: str = "",
     projection_id: str = "",
     fence_token: str = "",
+    allow_route_gated_reclaimed_fence_without_token: bool = False,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Record an externally performed merge attempt without running git."""
@@ -8970,8 +8971,17 @@ def record_merge_queue_result(
         task_id=task_id,
     )
     context = get_branch_context(conn, project_id, selected.task_id)
+    route_gated_reclaimed_fence = (
+        bool(allow_route_gated_reclaimed_fence_without_token)
+        and result_status == STATE_MERGED
+        and not str(fence_token or "").strip()
+        and bool(str(merge_commit or "").strip())
+        and bool(str(target_head_before_merge or "").strip())
+        and bool(str(target_head_after_merge or "").strip())
+    )
     if context is not None and (context.fence_token or fence_token):
-        _require_current_fence(context, fence_token)
+        if fence_token or not route_gated_reclaimed_fence:
+            _require_current_fence(context, fence_token)
 
     now = now_iso or utc_now()
     before = (

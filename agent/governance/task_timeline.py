@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Any, Mapping
 
+from .contracts.runtime import read_backlog_contract_chain_current
+
 log = logging.getLogger(__name__)
 
 
@@ -4060,6 +4062,10 @@ def _runtime_dispatch_evidence(value: Any) -> dict[str, Any]:
         or _first_deep_value(value, "target_files")
         or []
     )
+    contract_runtime_dispatch_identity = _first_deep_mapping(
+        value,
+        "contract_runtime_dispatch_identity",
+    )
     return {
         "route_id": _first_deep_text(value, "route_id"),
         "route_context_hash": _first_deep_text(value, "route_context_hash"),
@@ -4072,6 +4078,37 @@ def _runtime_dispatch_evidence(value: Any) -> dict[str, Any]:
         "runtime_context_id": _first_deep_text(value, "runtime_context_id"),
         "task_id": _first_deep_text(value, "task_id"),
         "parent_task_id": _first_deep_text(value, "parent_task_id"),
+        "observer_command_id": _first_deep_text(value, "observer_command_id"),
+        "observer_command_id_source": _first_deep_text(
+            value,
+            "observer_command_id_source",
+        ),
+        "observer_command_id_kind": _first_deep_text(
+            value,
+            "observer_command_id_kind",
+        ),
+        "legacy_observer_command_id": _first_deep_text(
+            value,
+            "legacy_observer_command_id",
+        ),
+        "legacy_observer_command_id_present": _truthy(
+            _first_deep_value(value, "legacy_observer_command_id_present")
+        ),
+        "dispatch_identity_source": _first_deep_text(
+            value,
+            "dispatch_identity_source",
+        ),
+        "dispatch_identity_source_label": _first_deep_text(
+            value,
+            "dispatch_identity_source_label",
+        ),
+        "contract_execution_id": (
+            _first_deep_text(value, "contract_execution_id")
+            or str(contract_runtime_dispatch_identity.get("contract_execution_id") or "")
+        ),
+        "contract_runtime_dispatch_identity": dict(
+            contract_runtime_dispatch_identity
+        ),
         "worker_slot_id": (
             _first_deep_text(value, "worker_slot_id")
             or _first_deep_text(value, "worker_id")
@@ -4232,13 +4269,55 @@ def _route_parent_child_startup_identity(
                 or _first_deep_text(value, "worker_id")
             )
             observer_command_id = _first_deep_text(value, "observer_command_id")
+            contract_runtime_identity = _first_deep_mapping(
+                value,
+                "contract_runtime_dispatch_identity",
+            )
+            contract_execution_id = (
+                _first_deep_text(value, "contract_execution_id")
+                or str(contract_runtime_identity.get("contract_execution_id") or "").strip()
+            )
+            dispatch_identity_source = (
+                _first_deep_text(value, "dispatch_identity_source")
+                or str(contract_runtime_identity.get("source") or "").strip()
+            )
+            dispatch_identity_source_label = (
+                _first_deep_text(value, "dispatch_identity_source_label")
+                or str(contract_runtime_identity.get("source_label") or "").strip()
+            )
+            observer_command_id_source = (
+                _first_deep_text(value, "observer_command_id_source")
+                or str(
+                    contract_runtime_identity.get("observer_command_id_source")
+                    or ""
+                ).strip()
+            )
+            observer_command_id_kind = (
+                _first_deep_text(value, "observer_command_id_kind")
+                or str(
+                    contract_runtime_identity.get("observer_command_id_kind")
+                    or ""
+                ).strip()
+            )
+            contract_runtime_bridge_accepted = bool(
+                contract_runtime_identity
+                and contract_execution_id
+                and (
+                    _truthy(contract_runtime_identity.get("accepted"))
+                    or observer_command_id_source
+                    == "contract_runtime_execution_id_bridge"
+                )
+            )
+            dispatch_identity = observer_command_id
+            if not dispatch_identity and contract_runtime_bridge_accepted:
+                dispatch_identity = contract_execution_id
             if all(
                 (
                     runtime_context_id,
                     task_id,
                     parent_task_id,
                     worker_slot_id,
-                    observer_command_id,
+                    dispatch_identity,
                     route_token_ref,
                     not expected_parent or parent_task_id == expected_parent,
                 )
@@ -4253,7 +4332,26 @@ def _route_parent_child_startup_identity(
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
                     "worker_slot_id": worker_slot_id,
-                    "observer_command_id": observer_command_id,
+                    "observer_command_id": dispatch_identity,
+                    "dispatch_identity": dispatch_identity,
+                    "observer_command_id_source": observer_command_id_source,
+                    "observer_command_id_kind": observer_command_id_kind,
+                    "legacy_observer_command_id": _first_deep_text(
+                        value,
+                        "legacy_observer_command_id",
+                    ),
+                    "legacy_observer_command_id_present": _truthy(
+                        _first_deep_value(
+                            value,
+                            "legacy_observer_command_id_present",
+                        )
+                    ),
+                    "dispatch_identity_source": dispatch_identity_source,
+                    "dispatch_identity_source_label": dispatch_identity_source_label,
+                    "contract_execution_id": contract_execution_id,
+                    "contract_runtime_dispatch_identity": dict(
+                        contract_runtime_identity
+                    ),
                     "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
                     "child_route_context_hash": child_route_context_hash,
                     "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
@@ -10346,6 +10444,17 @@ def compact_gate_summary(
         "failed_gates": failed_gates,
         "event_count": int(full_result.get("event_count") or 0),
     }
+    close_authority = _mapping(full_result.get("close_authority"))
+    if close_authority:
+        summary["close_authority"] = {
+            "schema_version": str(close_authority.get("schema_version") or ""),
+            "legacy": bool(close_authority.get("legacy")),
+            "advisory": bool(close_authority.get("advisory")),
+            "authoritative": bool(close_authority.get("authoritative")),
+            "replacement_authority": list(
+                close_authority.get("replacement_authority") or []
+            ),
+        }
     observer_direct_gate = _mapping(full_result.get("observer_direct_close_exception_gate"))
     if observer_direct_gate.get("required") or observer_direct_gate.get("passed"):
         accepted_exception = _mapping(observer_direct_gate.get("accepted_exception"))
@@ -10825,7 +10934,26 @@ def _finish_gate_facade_payload_skeleton() -> dict[str, Any]:
             "session_token": "<current_runtime_context_session_token>",
             "target_project_root": "<assigned_worker_worktree_or_project_root>",
             "checkpoint_id": "<finish-gate-checkpoint-id>",
-            "head_commit": "<worker_worktree_head_commit>",
+            "head_commit": "<row_scoped_worker_implementation_head_commit>",
+            "current_branch_head_commit": (
+                "<current_branch_or_service_head_commit_if_different>"
+            ),
+            "row_scoped_finish_head_projection": {
+                "schema_version": (
+                    "runtime_context.row_scoped_finish_head_projection.v1"
+                ),
+                "row_scoped_implementation_head_commit": (
+                    "<row_scoped_worker_implementation_head_commit>"
+                ),
+                "current_branch_head_commit": (
+                    "<current_branch_or_service_head_commit_if_different>"
+                ),
+                "worker_finish_scope_requires_row_head": True,
+                "later_branch_commits_must_not_widen_row_scope": True,
+                "next_legal_action": (
+                    "record_finish_gate_or_stop_for_row_scope_reconciliation"
+                ),
+            },
             "changed_files": ["<owned-file>"],
             "status": "review_ready",
             "test_results": {"status": "passed", "passed": True},
@@ -10840,6 +10968,11 @@ def _finish_gate_facade_payload_skeleton() -> dict[str, Any]:
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
             "use_runtime_context_facade": True,
+            "head_scope": (
+                "Use the row-scoped worker implementation head. Do not replace it "
+                "with the current branch/service HEAD after successor repairs "
+                "continue on the same branch."
+            ),
         },
     }
 
@@ -11942,6 +12075,17 @@ def repair_gate_summary(
         },
         "exceptional_archive_recovery": archive_recovery_decision,
     }
+    close_authority = _mapping(full_result.get("close_authority"))
+    if close_authority:
+        summary["close_authority"] = {
+            "schema_version": str(close_authority.get("schema_version") or ""),
+            "legacy": bool(close_authority.get("legacy")),
+            "advisory": bool(close_authority.get("advisory")),
+            "authoritative": bool(close_authority.get("authoritative")),
+            "replacement_authority": list(
+                close_authority.get("replacement_authority") or []
+            ),
+        }
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
     if parent_successor_gap:
@@ -12126,6 +12270,27 @@ def _observer_command_explicit_close_gate_source(
     return False
 
 
+def _observer_command_legacy_advisory_close_source(
+    source: dict[str, Any],
+) -> bool:
+    authority = _mapping(source.get("close_authority") or source.get("authority"))
+    if authority:
+        if (
+            authority.get("authoritative") is False
+            or _truthy(authority.get("advisory"))
+            or _truthy(authority.get("legacy"))
+        ):
+            return True
+    return bool(
+        source.get("authoritative") is False
+        and (
+            _truthy(source.get("legacy_advisory"))
+            or _truthy(source.get("advisory"))
+            or _truthy(source.get("legacy"))
+        )
+    )
+
+
 def _observer_command_authoritative_backlog_close_source(
     source_name: str,
     source: dict[str, Any],
@@ -12185,6 +12350,7 @@ def _observer_command_close_gate_passed_source(
         status = str(source.get("status") or "").strip().lower()
         if (
             _observer_command_explicit_close_gate_source(source_name, source)
+            and not _observer_command_legacy_advisory_close_source(source)
             and status != "failed"
             and (bool(source.get("passed")) or _truthy(source.get("can_close")))
         ):
@@ -12930,6 +13096,73 @@ def _compact_ledger_backlog_ids(event: Mapping[str, Any]) -> set[str]:
     return ids
 
 
+def _compact_contract_chain_current_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    backlog_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    projections: dict[str, dict[str, Any]] = {}
+    for backlog_id in sorted(backlog_ids):
+        current = read_backlog_contract_chain_current(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
+        if current:
+            projections[backlog_id] = current
+    return projections
+
+
+def _apply_compact_contract_chain_current(
+    row: dict[str, Any],
+    current: Mapping[str, Any],
+) -> None:
+    if not current:
+        return
+    close_authority = {
+        "schema_version": "mf_timeline_precheck_close_authority.v1",
+        "source": "backlog_contract_chain_current_projection",
+        "legacy": True,
+        "advisory": True,
+        "authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+    }
+    row["contract_chain_id"] = str(current.get("contract_chain_id") or "")
+    row["root_contract_execution_id"] = str(
+        current.get("root_contract_execution_id") or ""
+    )
+    row["current_contract_execution_id"] = str(
+        current.get("current_contract_execution_id") or ""
+    )
+    row["current_contract_id"] = str(current.get("current_contract_id") or "")
+    row["parent_to_resume_contract_execution_id"] = str(
+        current.get("parent_to_resume_contract_execution_id") or ""
+    )
+    row["active_child_contract_execution_id"] = str(
+        current.get("active_child_contract_execution_id") or ""
+    )
+    row["projection_generation"] = int(current.get("generation") or 0)
+    row["projection_watermark"] = int(current.get("projection_watermark") or 0)
+    row["projection_hash"] = str(current.get("projection_hash") or "")
+    row["projection_degraded"] = bool(current.get("degraded"))
+    degraded_flags = current.get("degraded_flags")
+    row["projection_degraded_flags"] = (
+        dict(degraded_flags) if isinstance(degraded_flags, Mapping) else {}
+    )
+    row["contract_chain_current_authority"] = close_authority
+    row["contract_chain_current"] = {
+        **dict(current),
+        "close_authority": close_authority,
+        "legacy_advisory": True,
+        "authoritative": False,
+    }
+
+
 def build_compact_ledger(
     conn: sqlite3.Connection,
     project_id: str,
@@ -12972,6 +13205,19 @@ def build_compact_ledger(
                 "blocker_summary": {},
                 "head_commit": "",
                 "readiness_state": "unknown",
+                "contract_chain_id": "",
+                "root_contract_execution_id": "",
+                "current_contract_execution_id": "",
+                "current_contract_id": "",
+                "parent_to_resume_contract_execution_id": "",
+                "active_child_contract_execution_id": "",
+                "projection_generation": 0,
+                "projection_watermark": 0,
+                "projection_hash": "",
+                "projection_degraded": False,
+                "projection_degraded_flags": {},
+                "contract_chain_current_authority": {},
+                "contract_chain_current": {},
             },
         )
 
@@ -13053,6 +13299,15 @@ def build_compact_ledger(
                 row["readiness_state"] = "implemented"
             elif row["merge_queue_id"]:
                 row["readiness_state"] = "planned"
+
+    current_projections = _compact_contract_chain_current_rows(
+        conn,
+        project_id,
+        backlog_ids,
+    )
+    for backlog_id, current in current_projections.items():
+        if backlog_id in ledger:
+            _apply_compact_contract_chain_current(ledger[backlog_id], current)
 
     rows = sorted(
         ledger.values(),

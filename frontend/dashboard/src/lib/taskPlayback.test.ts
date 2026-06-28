@@ -3,6 +3,8 @@ import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent } from 
 import {
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
+  normalizeTaskPlaybackCompactLedger,
+  taskPlaybackLedgerRowsToTimelineEvents,
   displayPlaybackFrames,
   latestPlaybackFrameId,
   pushPlaybackNavStack,
@@ -1172,10 +1174,148 @@ export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackNarrativeFocusFixtureAssertions(),
   ...taskPlaybackWorkModeFixtureAssertions(),
   ...taskPlaybackRouteContextEvidenceFixtureAssertions(),
+  ...taskPlaybackCompactLedgerProjectionAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
+}
+
+function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
+  const backlog: BacklogBug = {
+    bug_id: "AC-BACKLOG-CONTRACT-CHAIN-MAPPING-MODEL-20260627",
+    title: "Compact ledger projection playback",
+    status: "OPEN",
+    priority: "P0",
+  };
+  const ledger = normalizeTaskPlaybackCompactLedger({
+    schema_version: "task_timeline.compact_multi_backlog_ledger.v1",
+    project_id: "aming-claw",
+    row_count: 1,
+    source_event_count: 3,
+    rows: [
+      {
+        backlog_id: backlog.bug_id,
+        title: backlog.title,
+        priority: "P0",
+        status: "OPEN",
+        commit: "10aa2d3a1ed0c981f50b7e01f552f443f9c965af",
+        contract_execution_id: "onboard-service-312c9c53d0112cfa0397",
+        contract_chain_id: "cchain-312c9c53d0112cfa0397",
+        root_contract_execution_id: "onboard-service-312c9c53d0112cfa0397",
+        current_contract_execution_id: "mf-parallel-current-001",
+        current_contract_id: "mf_parallel.v1",
+        parent_to_resume_contract_execution_id: "onboard-service-312c9c53d0112cfa0397",
+        active_child_contract_execution_id: "direct-fix-child-001",
+        projection_generation: 7,
+        projection_watermark: 312,
+        projection_hash: "sha256:fixture-contract-chain-current",
+        projection_degraded: false,
+        projection_degraded_flags: {
+          current_graph_resource_degraded: false,
+          route_token_ref: "rtok-private-fixture",
+        },
+        contract_chain_current: {
+          contract_chain_id: "cchain-312c9c53d0112cfa0397",
+          root_contract_execution_id: "onboard-service-312c9c53d0112cfa0397",
+          current_contract_execution_id: "mf-parallel-current-001",
+          current_contract_id: "mf_parallel.v1",
+          parent_to_resume_contract_execution_id: "onboard-service-312c9c53d0112cfa0397",
+          active_child_contract_execution_id: "direct-fix-child-001",
+          projection_generation: 7,
+          projection_watermark: 312,
+          projection_hash: "sha256:fixture-contract-chain-current",
+          degraded: false,
+          route_token_ref: "rtok-private-fixture",
+        },
+        merge_queue_id: "mq-fixture-chain",
+        merge_queue_index: 2,
+        merge_queue_item_id: "mqi-fixture-chain",
+        merge_queue_task_id: "task-fixture-chain",
+        merge_queue_status: "waiting_merge",
+        latest_event_id: "7312",
+        latest_event_kind: "verification",
+        latest_event_type: "runtime_context_implementation_evidence",
+        latest_status: "passed",
+        latest_payload_ref: {
+          event_id: "7312",
+          payload_sha256: "sha256:fixture-ledger-payload",
+          payload_bytes: 2048,
+        },
+        next_legal_action: {
+          id: "return_to_parent_after_direct_fix_qa",
+          action: "return_to_parent",
+          stage_id: "handoff_gate",
+          line_id: "qa-pass-line",
+          owner_role: "observer",
+          description: "Return to the parent contract after independent QA passes.",
+        },
+        blocker_summary: {
+          kind: "",
+          count: 0,
+          keys: [],
+          summary: "",
+          reason: "",
+        },
+        head_commit: "10aa2d3a1ed0c981f50b7e01f552f443f9c965af",
+        readiness_state: "close_ready",
+      },
+    ],
+  }, "aming-claw");
+
+  const row = ledger.rows[0];
+  assertFixture(row.contract_chain_id === "cchain-312c9c53d0112cfa0397", "compact ledger: contract_chain_id should normalize");
+  assertFixture(row.root_contract_execution_id === "onboard-service-312c9c53d0112cfa0397", "compact ledger: root execution should normalize");
+  assertFixture(row.current_contract_execution_id === "mf-parallel-current-001", "compact ledger: current execution should normalize");
+  assertFixture(row.current_contract_id === "mf_parallel.v1", "compact ledger: current contract id should normalize");
+  assertFixture(row.parent_to_resume_contract_execution_id === "onboard-service-312c9c53d0112cfa0397", "compact ledger: parent resume target should normalize");
+  assertFixture(row.active_child_contract_execution_id === "direct-fix-child-001", "compact ledger: active child execution should normalize");
+  assertFixture(row.projection_generation === 7, "compact ledger: projection_generation should normalize");
+  assertFixture(row.projection_watermark === 312, "compact ledger: projection_watermark should normalize");
+  assertFixture(row.projection_hash === "sha256:fixture-contract-chain-current", "compact ledger: projection_hash should normalize");
+  assertFixture(row.projection_degraded === false, "compact ledger: projection_degraded should normalize");
+  assertFixture(row.contract_chain_current.route_token_ref === "[private detail redacted]", "compact ledger: nested current projection should redact token refs");
+  assertFixture(row.projection_degraded_flags.route_token_ref === "[private detail redacted]", "compact ledger: degraded flags should redact token refs");
+
+  const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(ledger, "2026-06-27T21:45:00Z");
+  assertFixture(ledgerEvents.length === 1, "compact ledger: one row should produce one timeline event");
+  const event = ledgerEvents[0];
+  const containers = [
+    ["payload", event.payload],
+    ["verification", event.verification],
+    ["artifact_refs", event.artifact_refs],
+  ] as const;
+  for (const [label, value] of containers) {
+    const record = value as Record<string, unknown>;
+    assertFixture(record.contract_chain_id === row.contract_chain_id, `compact ledger: ${label} should carry contract_chain_id`);
+    assertFixture(record.current_contract_execution_id === row.current_contract_execution_id, `compact ledger: ${label} should carry current_contract_execution_id`);
+    assertFixture(record.projection_generation === row.projection_generation, `compact ledger: ${label} should carry projection_generation`);
+    assertFixture(record.projection_watermark === row.projection_watermark, `compact ledger: ${label} should carry projection_watermark`);
+    assertFixture(record.projection_hash === row.projection_hash, `compact ledger: ${label} should carry projection_hash`);
+    assertFixture(record.contract_chain_current === row.contract_chain_current, `compact ledger: ${label} should carry contract_chain_current`);
+  }
+
+  const trace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog,
+    compactLedger: ledger,
+    taskTimeline: { project_id: "aming-claw", backlog_id: backlog.bug_id, events: [], count: 0 },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-27T21:45:00Z",
+  });
+  const frame = trace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
+  assertFixture(Boolean(frame), "compact ledger: generated frame should be present in playback trace");
+  assertFixture(frame?.specific_facts.some((fact) => fact.kind === "contract_chain_id" && fact.value === row.contract_chain_id) === true, "compact ledger: frame facts should expose chain id");
+  assertFixture(frame?.specific_facts.some((fact) => fact.kind === "projection_hash" && fact.value === row.projection_hash) === true, "compact ledger: frame facts should expose projection hash");
+  const rawSections = JSON.stringify(frame?.detail_inspector.raw_sections ?? []);
+  assertFixture(rawSections.includes("contract_chain_current") && rawSections.includes("projection_watermark"), "compact ledger: inspector raw sections should include compact projection fields");
+  assertFixture(!rawSections.includes("rtok-private-fixture"), "compact ledger: inspector raw sections should not expose token refs");
+
+  return [
+    "compact ledger projection fields normalize and project into timeline payload/verification/artifacts",
+    "compact ledger generated frame exposes chain/projection facts and safe inspector data",
+  ];
 }
 
 function taskPlaybackAuditCloseAssertions(): string[] {

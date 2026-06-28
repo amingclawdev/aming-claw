@@ -201,6 +201,18 @@ export interface TaskPlaybackCompactLedgerRow {
   status: string;
   commit: string;
   contract_execution_id: string;
+  contract_chain_id: string;
+  root_contract_execution_id: string;
+  current_contract_execution_id: string;
+  current_contract_id: string;
+  parent_to_resume_contract_execution_id: string;
+  active_child_contract_execution_id: string;
+  projection_generation: number | null;
+  projection_watermark: number | null;
+  projection_hash: string;
+  projection_degraded: boolean;
+  projection_degraded_flags: Record<string, unknown>;
+  contract_chain_current: Record<string, unknown>;
   merge_queue_id: string;
   merge_queue_index: number | null;
   merge_queue_item_id: string;
@@ -452,6 +464,14 @@ export function taskPlaybackLedgerRowRefs(row: TaskPlaybackCompactLedgerRow): Ta
   if (row.merge_queue_id) refs.push({ kind: "artifact", label: "merge queue", value: row.merge_queue_id });
   if (row.merge_queue_item_id) refs.push({ kind: "artifact", label: "merge queue item", value: row.merge_queue_item_id });
   if (row.merge_queue_task_id) refs.push({ kind: "artifact", label: "merge queue task", value: row.merge_queue_task_id });
+  if (row.contract_chain_id) refs.push({ kind: "artifact", label: "contract chain", value: row.contract_chain_id });
+  if (row.root_contract_execution_id) refs.push({ kind: "artifact", label: "root contract", value: row.root_contract_execution_id });
+  if (row.current_contract_execution_id) refs.push({ kind: "artifact", label: "current contract execution", value: row.current_contract_execution_id });
+  if (row.current_contract_id) refs.push({ kind: "artifact", label: "current contract", value: row.current_contract_id });
+  if (row.parent_to_resume_contract_execution_id) refs.push({ kind: "artifact", label: "parent resume", value: row.parent_to_resume_contract_execution_id });
+  if (row.active_child_contract_execution_id) refs.push({ kind: "artifact", label: "active child", value: row.active_child_contract_execution_id });
+  if (row.projection_watermark != null) refs.push({ kind: "artifact", label: "projection watermark", value: String(row.projection_watermark) });
+  if (row.projection_hash) refs.push({ kind: "artifact", label: "projection hash", value: row.projection_hash });
   if (row.head_commit || row.commit) refs.push({ kind: "commit", label: "head commit", value: shortCommit(row.head_commit || row.commit) });
   return stableEvidence(refs);
 }
@@ -519,6 +539,11 @@ function findCompactLedgerSource(source: unknown): unknown {
 
 function normalizeCompactLedgerRow(value: unknown): TaskPlaybackCompactLedgerRow {
   const record = asRecord(value);
+  const contractChainCurrent = safePublicRecord(record.contract_chain_current, "contract_chain_current");
+  const projectionDegradedFlags = safePublicRecord(
+    firstUnknownField(record, ["projection_degraded_flags", "projection_degraded_reason"]) || contractChainCurrent.degraded_flags,
+    "projection_degraded_flags",
+  );
   const latestPayloadRef = normalizeLedgerPayloadRef(record.latest_payload_ref);
   return {
     backlog_id: firstStringField(record, ["backlog_id", "bug_id"]),
@@ -527,6 +552,18 @@ function normalizeCompactLedgerRow(value: unknown): TaskPlaybackCompactLedgerRow
     status: firstStringField(record, ["status"]),
     commit: firstStringField(record, ["commit"]),
     contract_execution_id: firstStringField(record, ["contract_execution_id", "cex_id"]),
+    contract_chain_id: firstStringField(record, ["contract_chain_id"]) || firstStringField(contractChainCurrent, ["contract_chain_id"]),
+    root_contract_execution_id: firstStringField(record, ["root_contract_execution_id"]) || firstStringField(contractChainCurrent, ["root_contract_execution_id"]),
+    current_contract_execution_id: firstStringField(record, ["current_contract_execution_id"]) || firstStringField(contractChainCurrent, ["current_contract_execution_id"]),
+    current_contract_id: firstStringField(record, ["current_contract_id", "contract_id"]) || firstStringField(contractChainCurrent, ["current_contract_id", "contract_id"]),
+    parent_to_resume_contract_execution_id: firstStringField(record, ["parent_to_resume_contract_execution_id"]) || firstStringField(contractChainCurrent, ["parent_to_resume_contract_execution_id"]),
+    active_child_contract_execution_id: firstStringField(record, ["active_child_contract_execution_id"]) || firstStringField(contractChainCurrent, ["active_child_contract_execution_id"]),
+    projection_generation: numberFrom(record.projection_generation) ?? numberFrom(contractChainCurrent.projection_generation),
+    projection_watermark: numberFrom(record.projection_watermark) ?? numberFrom(contractChainCurrent.projection_watermark),
+    projection_hash: firstStringField(record, ["projection_hash"]) || firstStringField(contractChainCurrent, ["projection_hash"]),
+    projection_degraded: booleanFrom(record.projection_degraded) || booleanFrom(contractChainCurrent.projection_degraded) || booleanFrom(contractChainCurrent.degraded),
+    projection_degraded_flags: projectionDegradedFlags,
+    contract_chain_current: contractChainCurrent,
     merge_queue_id: firstStringField(record, ["merge_queue_id"]),
     merge_queue_index: numberFrom(record.merge_queue_index),
     merge_queue_item_id: firstStringField(record, ["merge_queue_item_id"]),
@@ -588,6 +625,7 @@ function compactLedgerEventFromRow(
 ): TaskTimelineEvent {
   const refs = taskPlaybackLedgerRowRefs(row);
   const nextAction = row.next_legal_action;
+  const projectionFields = compactLedgerProjectionFields(row);
   const payload = {
     schema_version: ledger.schema_version,
     lane: "gate",
@@ -596,6 +634,7 @@ function compactLedgerEventFromRow(
     priority: row.priority,
     row_status: row.status,
     contract_execution_id: row.contract_execution_id,
+    ...projectionFields,
     merge_queue_id: row.merge_queue_id,
     merge_queue_index: row.merge_queue_index,
     merge_queue_item_id: row.merge_queue_item_id,
@@ -627,15 +666,24 @@ function compactLedgerEventFromRow(
     commit_sha: row.head_commit || row.commit || undefined,
     payload,
     verification: {
+      contract_execution_id: row.contract_execution_id,
+      ...projectionFields,
       readiness_state: row.readiness_state,
       close_ready: row.readiness_state === "close_ready",
       blocked: compactLedgerStatus(row) === "blocked",
+      latest_event_id: row.latest_event_id,
+      latest_event_kind: row.latest_event_kind,
+      latest_event_type: row.latest_event_type,
+      latest_status: row.latest_status,
+      latest_payload_ref: row.latest_payload_ref,
+      head_commit: row.head_commit,
       next_legal_action: nextAction,
       blocker_summary: row.blocker_summary,
     },
     artifact_refs: {
       compact_ledger_schema: ledger.schema_version,
       contract_execution_id: row.contract_execution_id,
+      ...projectionFields,
       latest_payload_ref: row.latest_payload_ref,
       merge_queue_id: row.merge_queue_id,
       merge_queue_index: row.merge_queue_index,
@@ -647,6 +695,23 @@ function compactLedgerEventFromRow(
       source_event_refs: refs.filter((ref) => ref.kind === "source_event").map((ref) => ref.value),
     },
     created_at: generatedAt,
+  };
+}
+
+function compactLedgerProjectionFields(row: TaskPlaybackCompactLedgerRow): Record<string, unknown> {
+  return {
+    contract_chain_id: row.contract_chain_id,
+    root_contract_execution_id: row.root_contract_execution_id,
+    current_contract_execution_id: row.current_contract_execution_id,
+    current_contract_id: row.current_contract_id,
+    parent_to_resume_contract_execution_id: row.parent_to_resume_contract_execution_id,
+    active_child_contract_execution_id: row.active_child_contract_execution_id,
+    projection_generation: row.projection_generation,
+    projection_watermark: row.projection_watermark,
+    projection_hash: row.projection_hash,
+    projection_degraded: row.projection_degraded,
+    projection_degraded_flags: row.projection_degraded_flags,
+    contract_chain_current: row.contract_chain_current,
   };
 }
 
@@ -1214,6 +1279,61 @@ function pushCompactLedgerFacts(facts: TaskPlaybackStructuredFact[], event: Task
     "payload.contract_execution_id",
     "verification.contract_execution_id",
     "artifact_refs.contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "contract_chain_id", "contract chain id", [
+    "payload.contract_chain_id",
+    "verification.contract_chain_id",
+    "artifact_refs.contract_chain_id",
+  ]);
+  pushFirstFact(facts, event, "root_contract_execution_id", "root contract execution id", [
+    "payload.root_contract_execution_id",
+    "verification.root_contract_execution_id",
+    "artifact_refs.root_contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "current_contract_execution_id", "current contract execution id", [
+    "payload.current_contract_execution_id",
+    "verification.current_contract_execution_id",
+    "artifact_refs.current_contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "current_contract_id", "current contract id", [
+    "payload.current_contract_id",
+    "verification.current_contract_id",
+    "artifact_refs.current_contract_id",
+  ]);
+  pushFirstFact(facts, event, "parent_to_resume_contract_execution_id", "parent resume execution id", [
+    "payload.parent_to_resume_contract_execution_id",
+    "verification.parent_to_resume_contract_execution_id",
+    "artifact_refs.parent_to_resume_contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "active_child_contract_execution_id", "active child execution id", [
+    "payload.active_child_contract_execution_id",
+    "verification.active_child_contract_execution_id",
+    "artifact_refs.active_child_contract_execution_id",
+  ]);
+  pushFirstFact(facts, event, "projection_generation", "projection generation", [
+    "payload.projection_generation",
+    "verification.projection_generation",
+    "artifact_refs.projection_generation",
+  ]);
+  pushFirstFact(facts, event, "projection_watermark", "projection watermark", [
+    "payload.projection_watermark",
+    "verification.projection_watermark",
+    "artifact_refs.projection_watermark",
+  ]);
+  pushFirstFact(facts, event, "projection_hash", "projection hash", [
+    "payload.projection_hash",
+    "verification.projection_hash",
+    "artifact_refs.projection_hash",
+  ]);
+  pushFirstFact(facts, event, "projection_degraded", "projection degraded", [
+    "payload.projection_degraded",
+    "verification.projection_degraded",
+    "artifact_refs.projection_degraded",
+  ]);
+  pushFirstFact(facts, event, "projection_degraded_flags", "projection degraded flags", [
+    "payload.projection_degraded_flags",
+    "verification.projection_degraded_flags",
+    "artifact_refs.projection_degraded_flags",
   ]);
   pushFirstFact(facts, event, "readiness_state", "readiness", [
     "payload.readiness_state",
@@ -3472,6 +3592,43 @@ function numberFrom(value: unknown): number | null {
     if (Number.isFinite(parsed)) return parsed;
   }
   return null;
+}
+
+function booleanFrom(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "degraded";
+  }
+  return false;
+}
+
+function firstUnknownField(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    const value = record[key];
+    if (value != null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function safePublicRecord(value: unknown, path: string): Record<string, unknown> {
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(record)) {
+    const nextPath = `${path}.${key}`;
+    out[key] = isSensitiveEvidencePath(nextPath) ? "[private detail redacted]" : safePublicValue(item, nextPath);
+  }
+  return out;
+}
+
+function safePublicValue(value: unknown, path: string): unknown {
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.map((item, index) => safePublicValue(item, `${path}.${index}`));
+  if (typeof value === "object") return safePublicRecord(value, path);
+  if (typeof value === "string") return sanitizeEvidenceString(value, path);
+  return value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

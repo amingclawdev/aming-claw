@@ -28,7 +28,12 @@ instructions.
 6. Follow only the returned role/token guidance, `next_legal_action`, and index
    paths under `agent_onboard_guidance.onboard_route_guide`, including
    `interface_index`, `capability_index`, `system_operation_index`,
-   `backlog_chain_binding`, and archive/resource paths.
+   `backlog_chain_binding`, `graph_first_policy`, source-hint status paths,
+   and archive/resource paths.
+7. Before source search fallback, use the returned `graph_first_policy` to pick
+   the correct `graph_query` `query_purpose`, preserve graph trace ids in the
+   contract/timeline payload, and only then use source search when the graph has
+   no match or the source-hint status says docs/config/tests are not materialized.
 
 ## Guardrails
 
@@ -39,6 +44,9 @@ instructions.
   evidence before mutation and stay inside the approved target files.
 - For worker or QA work, use the runtime context or QA session entry returned
   by the onboard guide.
+- For QA evidence that is materialized by a parent observer, keep the QA owner,
+  submitter, materialized-from, and authorization provenance fields returned by
+  the runtime guide; do not collapse it into observer-authored QA.
 
 ## Archive
 

@@ -298,18 +298,21 @@ export default function ProjectConsoleView({
     setActionStartedAt(Date.now());
     setNotice({ kind: "info", message: `Updating graph for ${project.project_id}...` });
     try {
-      const graphStale = row?.status?.current_state?.graph_stale;
-      const result = await api.materializePendingScopeFor(project.project_id, {
+      const result = await api.currentFullReconcileFor(project.project_id, {
         target_commit_sha: targetCommit,
-        parent_commit_sha: graphStale?.active_graph_commit || row?.status?.graph_snapshot_commit || "",
         run_id: `dashboard-scope-${project.project_id}-${shortCommit(targetCommit)}-${Date.now()}`,
         actor: "dashboard",
         activate: true,
+        require_clean: true,
         semantic_enrich: true,
         semantic_use_ai: false,
         enqueue_stale: false,
         semantic_skip_completed: true,
-        notes_extra: { source: "dashboard_project_console", action: "update_graph" },
+        notes_extra: {
+          source: "dashboard_project_console",
+          action: "update_graph",
+          update_graph_path: "current_full_reconcile",
+        },
       });
       setNotice({
         kind: "success",
@@ -481,7 +484,7 @@ export default function ProjectConsoleView({
         </div>
         <div className="project-console-guide">
           <span><strong>Build graph</strong> runs a full local scan for a new or broken graph.</span>
-          <span><strong>Update graph</strong> catches an existing graph up to the selected ref/HEAD without live AI calls.</span>
+          <span><strong>Update graph</strong> rebuilds and activates the current clean HEAD without live AI calls.</span>
         </div>
         <div className="card project-console-table-card">
           <div className="project-console-table-wrap">
@@ -666,7 +669,7 @@ function ProjectRow({
               className="action-btn"
               disabled={actionDisabled}
               onClick={onUpdateGraph}
-              title="Run scope reconcile without AI enrichment"
+              title="Run current full reconcile without AI enrichment"
             >
               Update graph
             </button>
@@ -975,6 +978,7 @@ function operationLabel(operation?: string): string {
   if (operation === "bootstrap") return "Bootstrap";
   if (operation === "build_graph") return "Build graph";
   if (operation === "update_graph") return "Update graph";
+  if (operation === "current_full_reconcile") return "Update graph";
   return "Project operation";
 }
 

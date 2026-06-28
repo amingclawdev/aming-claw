@@ -62,6 +62,10 @@ context:
 5. Confirm role and work type in the returned onboard guide.
 6. Follow the returned role/token guidance, next legal action, capability,
    interface, system-operation, archive/resource, and backlog-chain index paths.
+7. Follow `agent_onboard_guidance.onboard_route_guide.graph_first_policy` before
+   source search fallback: pick the returned `graph_query` `query_purpose`,
+   preserve graph trace ids in runtime/timeline evidence, and inspect the
+   source-hints status paths when docs/config/tests are missing from the graph.
 
 Use the current-context project id, governance URL, dashboard URL, graph state,
 and guardrails as the session anchor before observer root-route-context,
@@ -89,6 +93,11 @@ source-code searches are orientation only; they do not authorize a step. If the
 runtime guidance is missing, stale, contradictory, or too vague to act on, file
 that as blocker evidence and stop instead of reconstructing the flow from old
 context prose.
+
+When a parent observer materializes QA evidence from a QA-owned packet or role
+session, preserve evidence-owner, submitter, materialized-from, and
+authorization provenance in the contract line. This records delegated
+materialization without treating the observer as the QA evidence owner.
 
 If `aming-claw://current-context` is missing, stop normal governed work. Reload
 or open a new Codex/Claude host session from a root whose MCP config actually
@@ -295,8 +304,9 @@ The normal worker order is:
 1. Read the worker guide and confirm the next legal action. A fresh worker
    should normally see `submit_mf_subagent_read_receipt`.
 2. Record a worker-authored read receipt through the runtime-context
-   `read-receipts` facade, using the guide hash material and public route
-   identity. Do not persist raw session, route, or launch-text tokens.
+   `runtime_context_read_receipt` MCP tool or HTTP `read-receipts` facade,
+   using the guide hash material and public route identity. Do not persist raw
+   session, route, or launch-text tokens.
 3. Record real startup before implementation through `parallel_branch_startup`
    or the runtime-context `startup` facade, including actual cwd/git root,
    branch/head, base/target head, merge queue id, owned files, read-receipt

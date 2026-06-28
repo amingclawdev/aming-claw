@@ -1814,6 +1814,62 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(scoped_rows[0]["merge_queue_item_id"], "mqitem-b")
         self.assertEqual(scoped_rows[0]["merge_queue_status"], "planned")
 
+    def test_compact_ledger_includes_contract_chain_current_projection(self):
+        from agent.governance import server, task_timeline
+
+        backlog_id = "AC-COMPACT-CONTRACT-CHAIN-CURRENT"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P0', '2026-06-27T00:00:00Z', '2026-06-27T00:00:00Z')""",
+            (backlog_id, "Compact ledger projection test"),
+        )
+        parent = server._onboard_service_materialize_parent_record(
+            self.conn,
+            project_id="proj",
+            backlog_id=backlog_id,
+            route_token_ref="rtok-compact-ledger-current",
+        )
+        event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=backlog_id,
+            task_id="compact-ledger-current-task",
+            event_type="onboard_route_guide.current",
+            event_kind="contract_binding",
+            status="accepted",
+            payload={
+                "contract_execution_id": parent["contract_execution_id"],
+            },
+        )
+
+        ledger = task_timeline.build_compact_ledger(self.conn, "proj", [event])
+
+        self.assertEqual(ledger["row_count"], 1)
+        row = ledger["rows"][0]
+        current = row["contract_chain_current"]
+        self.assertEqual(row["backlog_id"], backlog_id)
+        self.assertEqual(row["latest_event_id"], event["id"])
+        self.assertEqual(row["contract_chain_id"], parent["contract_chain_id"])
+        self.assertEqual(
+            row["root_contract_execution_id"],
+            parent["contract_execution_id"],
+        )
+        self.assertEqual(
+            row["current_contract_execution_id"],
+            parent["contract_execution_id"],
+        )
+        self.assertEqual(row["current_contract_id"], "onboard_route_guide")
+        self.assertEqual(row["parent_to_resume_contract_execution_id"], "")
+        self.assertEqual(row["active_child_contract_execution_id"], "")
+        self.assertGreaterEqual(row["projection_generation"], 1)
+        self.assertGreaterEqual(row["projection_watermark"], 1)
+        self.assertTrue(row["projection_hash"].startswith("sha256:"))
+        self.assertFalse(row["projection_degraded"])
+        self.assertEqual(row["projection_degraded_flags"], {})
+        self.assertEqual(current["projection_source"], "backlog_contract_chain_current")
+        self.assertEqual(current["projection_hash"], row["projection_hash"])
+
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline
 
@@ -14764,7 +14820,14 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
     assert facade_skeleton["body"]["finish_time_worker_self_attestation"] == (
         "<accepted_finish_time_worker_self_attestation>"
     )
+    assert facade_skeleton["body"]["head_commit"] == (
+        "<row_scoped_worker_implementation_head_commit>"
+    )
+    assert facade_skeleton["body"]["row_scoped_finish_head_projection"][
+        "worker_finish_scope_requires_row_head"
+    ] is True
     assert facade_skeleton["body"]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+    assert "head_scope" in facade_skeleton["reminders"]
     assert facade_skeleton["reminders"][
         "raw_finish_time_attestation_alone_close_satisfying"
     ] is False
