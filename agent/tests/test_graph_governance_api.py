@@ -23002,6 +23002,213 @@ def _complete_source_backed_onboarding(conn, contract_execution_id: str) -> dict
     return record
 
 
+def _complete_source_backed_mf_parallel_successor(
+    conn,
+    contract_execution_id: str,
+    *,
+    backlog_id: str,
+    close_commit: str,
+    worker_commit: str,
+    route_identity: dict,
+) -> dict:
+    runtime = server._contract_runtime(conn)
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=f"{backlog_id.lower()}-worker",
+        fence_token=f"fence-{backlog_id.lower()}",
+        token=f"token-{backlog_id.lower()}",
+        base_commit="base-" + worker_commit[:12],
+        target_head_commit=worker_commit,
+        merge_queue_id=f"mq-{backlog_id.lower()}",
+        owned_files=("agent/governance/server.py",),
+    )
+    worker_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "worker_role": "mf_sub",
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "branch_ref": runtime_context.branch_ref,
+        "target_project_root": runtime_context.target_project_root,
+        "owned_files": ["agent/governance/server.py"],
+        "changed_files": ["agent/governance/server.py"],
+        **route_identity,
+    }
+    line_specs = [
+        (
+            "observer",
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "contract_binding",
+            {**route_identity, "owned_files": ["agent/governance/server.py"]},
+            "",
+        ),
+        (
+            "observer",
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "dispatch_bounded_worker",
+            worker_payload,
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_read",
+            "worker_read_runtime_guide",
+            "read_receipt",
+            {**worker_payload, "read_receipt_hash": _fake_sha("read-receipt")},
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_startup",
+            "worker_startup",
+            "mf_subagent_startup",
+            {**worker_payload, "actual_cwd": runtime_context.target_project_root},
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_context",
+            "worker_graph_context",
+            "graph_trace",
+            {**worker_payload, "graph_query_trace_ids": ["gqt-20260628-feed"]},
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+            worker_payload,
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+            {**worker_payload, "finish_time_worker_self_attestation": True},
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            {
+                **worker_payload,
+                "mf_subagent_finish_gate": {
+                    "status": "passed",
+                    "close_ready": True,
+                    "head_commit": worker_commit,
+                    "changed_files": ["agent/governance/server.py"],
+                    "receipt_gate": {
+                        "status": "passed",
+                        "read_receipt_present": True,
+                        "read_receipt_event_id_present": True,
+                        "startup_present": True,
+                        "observer_command_id_present": True,
+                    },
+                    "startup_worker_identity_gate": {"passed": True},
+                    "worker_self_attestation_gate": {"passed": True},
+                    "startup_evidence": {
+                        **worker_payload,
+                        "head_commit": worker_commit,
+                    },
+                },
+            },
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "qa_handoff",
+            "worker_review_ready_handoff",
+            "review_ready",
+            {**worker_payload, "review_ready": True, "stop_state": "review_ready"},
+            worker_commit,
+        ),
+        (
+            "qa",
+            "qa",
+            "qa_independent_verification",
+            "independent_verification",
+            {
+                **route_identity,
+                "principal_id": "qa:contract-runtime-projection",
+                "verdict": "passed",
+                "verified_commit": worker_commit,
+                "changed_files": ["agent/governance/server.py"],
+            },
+            worker_commit,
+        ),
+        (
+            "observer",
+            "observer_integration",
+            "observer_merge",
+            "merge",
+            {**route_identity, "merge_commit": close_commit},
+            close_commit,
+        ),
+        (
+            "observer",
+            "observer_integration",
+            "observer_reconcile",
+            "reconcile",
+            {**route_identity, "graph_reconciled": True, "scope_reconciled": True},
+            close_commit,
+        ),
+        (
+            "observer",
+            "observer_integration",
+            "observer_close_ready",
+            "close_ready",
+            {
+                **route_identity,
+                "merge_commit": close_commit,
+                "close_readiness": {
+                    "qa_independent_verification": True,
+                    "governance_redeploy": True,
+                    "graph_reconcile": True,
+                },
+            },
+            close_commit,
+        ),
+    ]
+    record = runtime.store.get(contract_execution_id)
+    for actor_role, stage_id, line_id, evidence_kind, payload, commit_sha in line_specs:
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_role"):
+            if payload.get(key):
+                write[key] = payload[key]
+        if payload.get("worker_id"):
+            write["worker_id"] = payload["worker_id"]
+        if payload.get("worker_slot_id"):
+            write["worker_slot_id"] = payload["worker_slot_id"]
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+        record = result["record"]
+    assert record["runtime_guide"]["next_legal_action"] is None
+    return record
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -23055,6 +23262,82 @@ def test_timeline_gate_non_applicable_open_row_never_reports_can_close_true(conn
         "timeline_gate_not_applicable"
     )
     assert repair["repair_summary"]["next_legal_actions"]
+
+
+def test_timeline_gate_auto_projects_completed_contract_runtime_chain(conn):
+    backlog_id = "AC-TIMELINE-GATE-CONTRACT-RUNTIME-AUTO-PROJECTION"
+    close_commit = "f149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "c05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    route_identity = {
+        "route_id": "route-runtime-auto-projection",
+        "route_context_hash": _fake_sha("route-runtime-auto-projection"),
+        "prompt_contract_id": "rprompt-runtime-auto-projection",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-auto-projection"),
+        "visible_injection_manifest_hash": _fake_sha("visible-runtime-auto-projection"),
+        "route_token_ref": "rtok-runtime-auto-projection",
+    }
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": "timeline-gate-runtime-auto-parent",
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": f"fence-{backlog_id.lower()}",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    _complete_source_backed_mf_parallel_successor(
+        conn,
+        successor["contract_execution_id"],
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_identity=route_identity,
+    )
+
+    compact = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"view": "compact", "commit": close_commit},
+        )
+    )
+    assert compact["can_close"] is True
+    assert compact["gate_summary"]["can_close"] is True
+    assert compact["gate_summary"]["failed_gates"] == []
+
+    full = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"commit": close_commit},
+        )
+    )
+    projection = full["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["accepted"] is True
+    assert projection["contract_execution_id"] == successor["contract_execution_id"]
+    assert full["timeline_gate"]["checks"]["has_independent_qa"] is True
+    assert full["timeline_gate"]["checks"]["close_commit_has_timeline_evidence"] is True
 
 
 def test_timeline_repair_summary_names_missing_startup_identity_fields():
