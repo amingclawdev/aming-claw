@@ -43373,8 +43373,89 @@ def _contract_runtime_close_authority_line_context_seed(
     return seed
 
 
+def _contract_runtime_close_authority_runtime_context_seed(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    runtime_context_id: str,
+) -> dict[str, Any]:
+    runtime_id = str(runtime_context_id or "").strip()
+    if conn is None or not project_id or not runtime_id:
+        return {}
+    try:
+        from .parallel_branch_runtime import (
+            get_branch_context_by_runtime_context_id,
+            runtime_context_effective_target_project_root,
+            runtime_context_secret_hash,
+        )
+
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_id,
+        )
+    except Exception:
+        return {}
+    if (
+        context is None
+        or str(getattr(context, "project_id", "") or "").strip() != project_id
+    ):
+        return {}
+    context_backlog = str(getattr(context, "backlog_id", "") or "").strip()
+    context_parent = str(getattr(context, "parent_task_id", "") or "").strip()
+    if (
+        backlog_id
+        and context_backlog
+        and context_backlog != backlog_id
+        and context_parent != backlog_id
+    ):
+        return {}
+
+    seed: dict[str, Any] = {}
+
+    def put(key: str, value: Any) -> None:
+        token = str(value or "").strip()
+        if token:
+            seed[key] = token
+
+    put("runtime_context_id", runtime_id)
+    put("task_id", getattr(context, "task_id", ""))
+    put("parent_task_id", context_parent or context_backlog)
+    put("worker_id", getattr(context, "worker_id", ""))
+    put("worker_slot_id", getattr(context, "worker_slot_id", ""))
+    put("merge_queue_id", getattr(context, "merge_queue_id", ""))
+    target_root = runtime_context_effective_target_project_root(context)
+    put("target_project_root", target_root)
+    put("actual_cwd", target_root)
+    put("actual_git_root", target_root)
+    branch = str(
+        getattr(context, "branch_ref", "") or getattr(context, "ref_name", "") or ""
+    ).strip()
+    put("branch", branch)
+    put("branch_ref", branch)
+    put(
+        "head_commit",
+        getattr(context, "target_head_commit", "")
+        or getattr(context, "head_commit", ""),
+    )
+    fence_hash = (
+        runtime_context_secret_hash(getattr(context, "fence_token", ""))
+        if getattr(context, "fence_token", "")
+        else ""
+    )
+    put("fence_token_hash", fence_hash)
+    if fence_hash:
+        seed["fence_token_redacted"] = True
+    return seed
+
+
 def _contract_runtime_close_authority_line_contexts(
     lines: list[Mapping[str, Any]],
+    *,
+    conn=None,
+    project_id: str = "",
+    backlog_id: str = "",
 ) -> list[dict[str, Any]]:
     """Collect sibling runtime-context identity needed by legacy close gates."""
 
@@ -43387,7 +43468,14 @@ def _contract_runtime_close_authority_line_contexts(
         if not key:
             continue
         bucket = buckets.setdefault(key, {})
-        for field, value in _contract_runtime_close_authority_line_context_seed(line).items():
+        seed = _contract_runtime_close_authority_line_context_seed(line)
+        runtime_seed = _contract_runtime_close_authority_runtime_context_seed(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            runtime_context_id=str(seed.get("runtime_context_id") or ""),
+        )
+        for field, value in {**runtime_seed, **seed}.items():
             bucket.setdefault(field, value)
 
     return [dict(buckets.get(key, {})) for key in line_keys]
@@ -43419,6 +43507,18 @@ def _contract_runtime_close_authority_event(
         for key, value in dict(line_context or {}).items():
             if value:
                 payload.setdefault(key, value)
+        target_root = str(payload.get("target_project_root") or "").strip()
+        if target_root:
+            payload.setdefault("actual_cwd", target_root)
+            payload.setdefault("actual_git_root", target_root)
+            payload.setdefault("project_root", target_root)
+            payload.setdefault("repo_root", target_root)
+        if payload.get("branch_ref"):
+            payload.setdefault("branch", payload.get("branch_ref"))
+        if payload.get("branch"):
+            payload.setdefault("branch_ref", payload.get("branch"))
+        if payload.get("target_head_commit"):
+            payload.setdefault("head_commit", payload.get("target_head_commit"))
         if payload.get("fence_token_hash"):
             payload.setdefault("fence_token_redacted", True)
     if _contract_runtime_close_normalized(line.get("evidence_kind")) == "mf_subagent_finish_gate":
@@ -43678,7 +43778,10 @@ def _contract_runtime_close_authority_projection(
         line for line in completed_lines if isinstance(line, Mapping)
     ]
     line_contexts = _contract_runtime_close_authority_line_contexts(
-        completed_line_mappings
+        completed_line_mappings,
+        conn=conn,
+        project_id=project_id,
+        backlog_id=bug_id,
     )
     projected_events.extend(
         _contract_runtime_close_authority_event(
