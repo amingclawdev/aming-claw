@@ -4062,6 +4062,10 @@ def _runtime_dispatch_evidence(value: Any) -> dict[str, Any]:
         or _first_deep_value(value, "target_files")
         or []
     )
+    contract_runtime_dispatch_identity = _first_deep_mapping(
+        value,
+        "contract_runtime_dispatch_identity",
+    )
     return {
         "route_id": _first_deep_text(value, "route_id"),
         "route_context_hash": _first_deep_text(value, "route_context_hash"),
@@ -4074,6 +4078,37 @@ def _runtime_dispatch_evidence(value: Any) -> dict[str, Any]:
         "runtime_context_id": _first_deep_text(value, "runtime_context_id"),
         "task_id": _first_deep_text(value, "task_id"),
         "parent_task_id": _first_deep_text(value, "parent_task_id"),
+        "observer_command_id": _first_deep_text(value, "observer_command_id"),
+        "observer_command_id_source": _first_deep_text(
+            value,
+            "observer_command_id_source",
+        ),
+        "observer_command_id_kind": _first_deep_text(
+            value,
+            "observer_command_id_kind",
+        ),
+        "legacy_observer_command_id": _first_deep_text(
+            value,
+            "legacy_observer_command_id",
+        ),
+        "legacy_observer_command_id_present": _truthy(
+            _first_deep_value(value, "legacy_observer_command_id_present")
+        ),
+        "dispatch_identity_source": _first_deep_text(
+            value,
+            "dispatch_identity_source",
+        ),
+        "dispatch_identity_source_label": _first_deep_text(
+            value,
+            "dispatch_identity_source_label",
+        ),
+        "contract_execution_id": (
+            _first_deep_text(value, "contract_execution_id")
+            or str(contract_runtime_dispatch_identity.get("contract_execution_id") or "")
+        ),
+        "contract_runtime_dispatch_identity": dict(
+            contract_runtime_dispatch_identity
+        ),
         "worker_slot_id": (
             _first_deep_text(value, "worker_slot_id")
             or _first_deep_text(value, "worker_id")
@@ -4234,13 +4269,55 @@ def _route_parent_child_startup_identity(
                 or _first_deep_text(value, "worker_id")
             )
             observer_command_id = _first_deep_text(value, "observer_command_id")
+            contract_runtime_identity = _first_deep_mapping(
+                value,
+                "contract_runtime_dispatch_identity",
+            )
+            contract_execution_id = (
+                _first_deep_text(value, "contract_execution_id")
+                or str(contract_runtime_identity.get("contract_execution_id") or "").strip()
+            )
+            dispatch_identity_source = (
+                _first_deep_text(value, "dispatch_identity_source")
+                or str(contract_runtime_identity.get("source") or "").strip()
+            )
+            dispatch_identity_source_label = (
+                _first_deep_text(value, "dispatch_identity_source_label")
+                or str(contract_runtime_identity.get("source_label") or "").strip()
+            )
+            observer_command_id_source = (
+                _first_deep_text(value, "observer_command_id_source")
+                or str(
+                    contract_runtime_identity.get("observer_command_id_source")
+                    or ""
+                ).strip()
+            )
+            observer_command_id_kind = (
+                _first_deep_text(value, "observer_command_id_kind")
+                or str(
+                    contract_runtime_identity.get("observer_command_id_kind")
+                    or ""
+                ).strip()
+            )
+            contract_runtime_bridge_accepted = bool(
+                contract_runtime_identity
+                and contract_execution_id
+                and (
+                    _truthy(contract_runtime_identity.get("accepted"))
+                    or observer_command_id_source
+                    == "contract_runtime_execution_id_bridge"
+                )
+            )
+            dispatch_identity = observer_command_id
+            if not dispatch_identity and contract_runtime_bridge_accepted:
+                dispatch_identity = contract_execution_id
             if all(
                 (
                     runtime_context_id,
                     task_id,
                     parent_task_id,
                     worker_slot_id,
-                    observer_command_id,
+                    dispatch_identity,
                     route_token_ref,
                     not expected_parent or parent_task_id == expected_parent,
                 )
@@ -4255,7 +4332,26 @@ def _route_parent_child_startup_identity(
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
                     "worker_slot_id": worker_slot_id,
-                    "observer_command_id": observer_command_id,
+                    "observer_command_id": dispatch_identity,
+                    "dispatch_identity": dispatch_identity,
+                    "observer_command_id_source": observer_command_id_source,
+                    "observer_command_id_kind": observer_command_id_kind,
+                    "legacy_observer_command_id": _first_deep_text(
+                        value,
+                        "legacy_observer_command_id",
+                    ),
+                    "legacy_observer_command_id_present": _truthy(
+                        _first_deep_value(
+                            value,
+                            "legacy_observer_command_id_present",
+                        )
+                    ),
+                    "dispatch_identity_source": dispatch_identity_source,
+                    "dispatch_identity_source_label": dispatch_identity_source_label,
+                    "contract_execution_id": contract_execution_id,
+                    "contract_runtime_dispatch_identity": dict(
+                        contract_runtime_identity
+                    ),
                     "parent_route_context_hash": parent_hint.get("route_context_hash", ""),
                     "child_route_context_hash": child_route_context_hash,
                     "parent_prompt_contract_id": parent_hint.get("prompt_contract_id", ""),
