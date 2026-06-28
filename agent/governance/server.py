@@ -52885,16 +52885,22 @@ def _verify_mf_close_timeline_gate(
             verification,
         )
 
+    gate_body = _timeline_gate_contract_runtime_projection_body(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        query=body,
+    )
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
-    contract = _mf_close_contract_with_route_context(contract, row, body)
+    contract = _mf_close_contract_with_route_context(contract, row, gate_body)
     runtime_projection = _contract_runtime_close_authority_projection(
         conn,
         project_id=project_id,
         bug_id=bug_id,
-        body=body,
+        body=gate_body,
         route_gate=route_gate,
-        close_commit=_audit_recovery_close_commit(row, body),
+        close_commit=_audit_recovery_close_commit(row, gate_body),
     )
     if runtime_projection.get("accepted"):
         verification = _mf_close_gate_verification(
