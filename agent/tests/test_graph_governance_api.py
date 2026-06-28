@@ -23066,7 +23066,7 @@ def _complete_source_backed_mf_parallel_successor(
             "worker_startup",
             "worker_startup",
             "mf_subagent_startup",
-            {**worker_payload, "actual_cwd": runtime_context.target_project_root},
+            worker_payload,
             "",
         ),
         (
@@ -23336,6 +23336,9 @@ def test_timeline_gate_auto_projects_completed_contract_runtime_chain(conn):
     projection = full["timeline_gate"]["contract_runtime_close_authority_projection"]
     assert projection["accepted"] is True
     assert projection["contract_execution_id"] == successor["contract_execution_id"]
+    route_gate = full["timeline_gate"]["route_context_gate"]
+    assert route_gate["passed"] is True
+    assert route_gate["checks"]["mf_subagent_startup_present"] is True
     assert full["timeline_gate"]["checks"]["has_independent_qa"] is True
     assert full["timeline_gate"]["checks"]["close_commit_has_timeline_evidence"] is True
 
