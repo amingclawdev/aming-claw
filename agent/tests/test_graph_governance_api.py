@@ -24809,6 +24809,191 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
         == direct_execution_id
     )
 
+    precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "successor_contract_id": "direct_fix",
+                },
+            },
+        )
+    )
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    after_precheck = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert after_precheck["readiness_state"] == (
+        "parent_resume_required_after_direct_fix_qa"
+    )
+
+    wrong_parent_line = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "return_to_parent",
+                "line_id": "direct_fix_return_to_parent",
+                "evidence_kind": "direct_fix_return_to_parent",
+            },
+        )
+    )
+    assert wrong_parent_line["ok"] is False
+    assert any(
+        "line_id mismatch" in error
+        for error in wrong_parent_line["decision"]["errors"]
+    )
+
+    wrong_successor_id = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": "cex-other-direct-fix",
+                    "successor_contract_id": "direct_fix",
+                },
+            },
+        )
+    )
+    assert wrong_successor_id["ok"] is False
+    assert any(
+        "successor_contract_execution_id mismatch" in error
+        for error in wrong_successor_id["decision"]["errors"]
+    )
+
+    wrong_successor_contract = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "successor_contract_id": "mf_parallel",
+                },
+            },
+        )
+    )
+    assert wrong_successor_contract["ok"] is False
+    assert any(
+        "successor_contract_id mismatch" in error
+        for error in wrong_successor_contract["decision"]["errors"]
+    )
+
+    failed_ack = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "successor_contract_id": "direct_fix",
+                    "status": "failed",
+                },
+            },
+        )
+    )
+    assert failed_ack["ok"] is False
+    assert any(
+        "acknowledgement cannot be failed" in error
+        for error in failed_ack["decision"]["errors"]
+    )
+
+    store = server._contract_runtime_store(conn)
+    parent_before_ack = store.get(parent_execution_id)
+    forged_lines = list(parent_before_ack["completed_lines"])
+    forged_lines.append(
+        {
+            "stage_id": "successor_return",
+            "line_id": "resume_parent_after_successor_return",
+            "actor_role": "observer",
+            "evidence_kind": "successor_return_acknowledgement",
+            "payload": {
+                "parent_contract_execution_id": parent_execution_id,
+                "successor_contract_execution_id": "cex-other-direct-fix",
+                "successor_contract_id": "direct_fix",
+            },
+            "artifact_refs": {
+                "successor_contract_execution_id": direct_execution_id,
+            },
+            "verification": {
+                "child_contract_execution_id": direct_execution_id,
+            },
+        }
+    )
+    forged_parent = server._onboard_service_refresh_execution_state(
+        parent_before_ack,
+        completed_lines=forged_lines,
+        route_token_ref=str(parent_before_ack.get("route_token_ref") or ""),
+        revision=int(parent_before_ack.get("execution_state_revision") or 0) + 1,
+    )
+    store.update(parent_execution_id, forged_parent)
+    forged_current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert forged_current["readiness_state"] == (
+        "parent_resume_required_after_direct_fix_qa"
+    )
+    assert forged_current["next_legal_action"]["id"] == (
+        "resume_parent_after_successor_return"
+    )
+
+    parent_ack = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "successor_contract_id": "direct_fix",
+                },
+            },
+        )
+    )
+    assert parent_ack["ok"] is True
+    assert parent_ack["contract_id"] == "onboard_route_guide"
+    assert parent_ack["next_legal_action"] == {}
+    assert parent_ack["runtime_guide"]["successor_return_acknowledged"]["status"] == (
+        "acknowledged"
+    )
+
+    resumed_current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert resumed_current["readiness_state"] == "contract_complete"
+    assert resumed_current["current_contract_execution_id"] == parent_execution_id
+    assert resumed_current["active_child_contract_execution_id"] == ""
+    assert resumed_current["next_legal_action"] == {}
+
 
 def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn):
     backlog_id = "AC-DIRECT-FIX-GENERIC-QA-NO-PARENT-RESUME"

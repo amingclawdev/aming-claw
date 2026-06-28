@@ -34278,7 +34278,11 @@ def _contract_runtime_write_from_record(
     evidence_kind: str,
 ) -> dict[str, Any]:
     state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
-    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
     return {
         "project_id": record.get("project_id"),
         "backlog_id": record.get("backlog_id"),
@@ -34457,6 +34461,239 @@ def _onboard_service_apply_successor_return_projection(
     projected = dict(record)
     projected["runtime_guide"] = guide
     return projected
+
+
+def _onboard_service_line_write_decision(
+    *,
+    ok: bool,
+    errors: Sequence[str] = (),
+) -> dict[str, Any]:
+    return {
+        "schema_version": "contract_write_gate_decision.v1",
+        "ok": ok,
+        "decision": "allow" if ok else "block",
+        "errors": list(errors),
+        "source_of_authority": "onboard_route_guide_service",
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _onboard_service_line_evidence_from_write(
+    write: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> dict[str, Any]:
+    line = {
+        "stage_id": str(write.get("stage_id") or ""),
+        "line_id": str(write.get("line_id") or ""),
+        "actor_role": actor_role,
+        "evidence_kind": str(write.get("evidence_kind") or ""),
+    }
+    for key in (
+        "line_instance_id",
+        "payload",
+        "verification",
+        "artifact_refs",
+        "trace_id",
+        "commit_sha",
+    ):
+        if key in write:
+            line[key] = write[key]
+    return line
+
+
+def _onboard_service_ack_failed(write: Mapping[str, Any]) -> bool:
+    candidates: list[Mapping[str, Any]] = [write]
+    for key in ("payload", "verification"):
+        value = write.get(key)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    for candidate in candidates:
+        status = (
+            str(candidate.get("status") or candidate.get("verdict") or "")
+            .strip()
+            .lower()
+        )
+        if status in {"fail", "failed", "failure", "rejected", "blocked"}:
+            return True
+    return False
+
+
+def _onboard_service_submit_line_write(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    actor_role: str,
+    mutate: bool = True,
+) -> dict[str, Any]:
+    """Append the service-root parent-resume line without a source definition."""
+
+    if str(record.get("parent_contract_execution_id") or "").strip():
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=("onboard service parent resume requires root record",),
+            ),
+            "record": dict(record),
+        }
+    if actor_role != "observer":
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=("onboard service parent resume requires observer role",),
+            ),
+            "record": dict(record),
+        }
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    expected = {
+        "stage_id": "successor_return",
+        "line_id": "resume_parent_after_successor_return",
+        "evidence_kind": "successor_return_acknowledgement",
+    }
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    expected_successor_id = str(next_line.get("successor_contract_execution_id") or "")
+    expected_successor_contract = str(next_line.get("successor_contract_id") or "")
+    errors: list[str] = []
+    if str(next_line.get("line_id") or "") != expected["line_id"]:
+        errors.append("onboard service parent is not awaiting successor return ack")
+    if not expected_successor_id:
+        errors.append("onboard service parent resume is missing successor contract id")
+    if not expected_successor_contract:
+        errors.append(
+            "onboard service parent resume is missing successor contract type"
+        )
+    if _onboard_service_ack_failed(write):
+        errors.append("onboard service parent resume acknowledgement cannot be failed")
+    for key, expected_value in expected.items():
+        if str(write.get(key) or "") != expected_value:
+            errors.append(f"{key} mismatch for onboard service parent resume")
+    raw_payload = (
+        dict(write.get("payload") or {})
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    supplied_parent_id = str(
+        raw_payload.get("parent_contract_execution_id") or ""
+    ).strip()
+    if supplied_parent_id and supplied_parent_id != parent_execution_id:
+        errors.append(
+            "parent_contract_execution_id mismatch for onboard service parent resume"
+        )
+    supplied_successor_contract = str(
+        raw_payload.get("successor_contract_id") or ""
+    ).strip()
+    if (
+        supplied_successor_contract
+        and supplied_successor_contract != expected_successor_contract
+    ):
+        errors.append("successor_contract_id mismatch for onboard service parent resume")
+    supplied_successor_id = str(
+        raw_payload.get("successor_contract_execution_id") or ""
+    ).strip()
+    if supplied_successor_id and supplied_successor_id != expected_successor_id:
+        errors.append(
+            "successor_contract_execution_id mismatch for onboard service parent resume"
+        )
+    if errors:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=errors,
+            ),
+            "record": dict(record),
+        }
+
+    payload = raw_payload
+    payload.setdefault("schema_version", "successor_return_acknowledgement.v1")
+    payload.setdefault("source", "onboard_route_guide_service")
+    payload["parent_contract_execution_id"] = parent_execution_id
+    payload["successor_contract_execution_id"] = expected_successor_id
+    payload["successor_contract_id"] = expected_successor_contract
+    payload.setdefault("parent_close_gate_recheck_required", True)
+    payload.setdefault("child_must_not_write_parent_close_evidence", True)
+    effective_write = dict(write)
+    effective_write["payload"] = payload
+    if not mutate:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": True,
+            "decision": _onboard_service_line_write_decision(ok=True),
+            "record": dict(record),
+            "would_mutate_completed_lines": False,
+            "completed_lines_count": len(record.get("completed_lines") or []),
+            "execution_state_revision": int(
+                record.get("execution_state_revision") or 0
+            ),
+            "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+            "write": effective_write,
+        }
+    completed_lines = list(record.get("completed_lines") or [])
+    completed_lines.append(
+        _onboard_service_line_evidence_from_write(
+            effective_write,
+            actor_role=actor_role,
+        )
+    )
+    expected_revision = int(record.get("execution_state_revision") or 0)
+    updated = _onboard_service_refresh_execution_state(
+        record,
+        completed_lines=completed_lines,
+        route_token_ref=str(record.get("route_token_ref") or ""),
+        revision=expected_revision + 1,
+    )
+    updated_guide = dict(updated.get("runtime_guide") or {})
+    updated_guide["successor_return_acknowledged"] = {
+        "schema_version": "onboard_route_guide.successor_return_acknowledged.v1",
+        "status": "acknowledged",
+        "source": "contract_runtime_submit_line",
+        "successor_contract_id": payload["successor_contract_id"],
+        "successor_contract_execution_id": payload["successor_contract_execution_id"],
+        "parent_contract_execution_id": payload["parent_contract_execution_id"],
+    }
+    updated_guide["next_legal_action"] = None
+    updated_guide["runtime_guide_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in updated_guide.items()
+            if key != "runtime_guide_hash"
+        }
+    )
+    updated["runtime_guide"] = updated_guide
+    store = _contract_runtime_store(conn)
+    try:
+        stored = store.update(
+            str(record.get("contract_execution_id") or ""),
+            updated,
+            expected_revision=expected_revision,
+        )
+    except ContractRuntimeError as exc:
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": False,
+            "decision": _onboard_service_line_write_decision(
+                ok=False,
+                errors=(str(exc),),
+            ),
+            "record": store.get(str(record.get("contract_execution_id") or "")),
+        }
+    return {
+        "schema_version": "contract_runtime_write_result.v1",
+        "ok": True,
+        "decision": _onboard_service_line_write_decision(ok=True),
+        "record": stored,
+    }
 
 
 def _contract_runtime_read(
@@ -48907,18 +49144,36 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
-            write = _contract_runtime_line_write_body(
-                record,
-                actor_role=actor_role,
-                body=body,
-            )
-            result = runtime.submit_line_write(
-                contract_execution_id,
-                write,
-                actor_role=actor_role,
-            )
+            if _onboard_service_record(record):
+                record = _contract_runtime_read(
+                    conn,
+                    contract_execution_id=contract_execution_id,
+                    actor_role=actor_role,
+                )
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = _onboard_service_submit_line_write(
+                    conn,
+                    record=record,
+                    write=write,
+                    actor_role=actor_role,
+                )
+            else:
+                runtime.current_guide(contract_execution_id, actor_role=actor_role)
+                record = runtime.store.get(contract_execution_id)
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = runtime.submit_line_write(
+                    contract_execution_id,
+                    write,
+                    actor_role=actor_role,
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
@@ -48971,18 +49226,37 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(contract_execution_id, actor_role=actor_role)
-            record = runtime.store.get(contract_execution_id)
-            write = _contract_runtime_line_write_body(
-                record,
-                actor_role=actor_role,
-                body=body,
-            )
-            result = runtime.precheck_line_write(
-                contract_execution_id,
-                write,
-                actor_role=actor_role,
-            )
+            if _onboard_service_record(record):
+                record = _contract_runtime_read(
+                    conn,
+                    contract_execution_id=contract_execution_id,
+                    actor_role=actor_role,
+                )
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = _onboard_service_submit_line_write(
+                    conn,
+                    record=record,
+                    write=write,
+                    actor_role=actor_role,
+                    mutate=False,
+                )
+            else:
+                runtime.current_guide(contract_execution_id, actor_role=actor_role)
+                record = runtime.store.get(contract_execution_id)
+                write = _contract_runtime_line_write_body(
+                    record,
+                    actor_role=actor_role,
+                    body=body,
+                )
+                result = runtime.precheck_line_write(
+                    contract_execution_id,
+                    write,
+                    actor_role=actor_role,
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,

@@ -1051,6 +1051,8 @@ def _project_current_contract_state(
                 )
                 if later_successor:
                     return _project_record_state(later_successor)
+                if _parent_resume_acknowledged(root_record, direct_fix):
+                    return _project_record_state(root_record)
             return direct_state
     incomplete = [
         record
@@ -1349,6 +1351,52 @@ def _direct_fix_return_follows_qa(
     if return_index < 0 or qa_index < 0:
         return False
     return return_index > qa_index
+
+
+def _parent_resume_acknowledged(
+    parent: Mapping[str, Any],
+    child: Mapping[str, Any],
+) -> bool:
+    child_id = str(child.get("contract_execution_id") or "").strip()
+    parent_id = str(parent.get("contract_execution_id") or "").strip()
+    if not child_id:
+        return False
+    line = _find_parent_resume_ack_line(parent)
+    if not line:
+        return False
+    if str(line.get("actor_role") or "").strip() != "observer":
+        return False
+    if not _line_status_allows_direct_fix_qa(line):
+        return False
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    if str(payload.get("parent_contract_execution_id") or "").strip() != parent_id:
+        return False
+    successor_contract_id = str(payload.get("successor_contract_id") or "").strip()
+    if successor_contract_id not in DIRECT_FIX_CONTRACT_IDS:
+        return False
+    successor_execution_id = str(
+        payload.get("successor_contract_execution_id") or ""
+    ).strip()
+    return successor_execution_id == child_id
+
+
+def _find_parent_resume_ack_line(record: Mapping[str, Any]) -> dict[str, Any]:
+    lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    for index, line in reversed(list(enumerate(lines))):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "") != "resume_parent_after_successor_return":
+            continue
+        if str(line.get("evidence_kind") or "") != "successor_return_acknowledgement":
+            continue
+        enriched = dict(line)
+        enriched["_completed_line_index"] = index
+        return enriched
+    return {}
 
 
 def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
