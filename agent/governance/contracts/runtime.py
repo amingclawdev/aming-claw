@@ -1167,7 +1167,7 @@ def _project_direct_fix_state(
     return {
         "current_contract_execution_id": child_id,
         "current_contract_id": _record_contract_id(child),
-        "parent_to_resume_contract_execution_id": "",
+        "parent_to_resume_contract_execution_id": parent_id,
         "active_child_contract_execution_id": child_id,
         "readiness_state": "direct_fix_child_active",
         "generation": generation,

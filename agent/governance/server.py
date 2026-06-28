@@ -37544,6 +37544,16 @@ def _contract_add_effective_actor_role(
 CONTRACT_UPDATE_CONTRACT_ID = "contract_update"
 DIRECT_FIX_CONTRACT_ID = "direct_fix"
 DIRECT_FIX_TEMPLATE_ID = "direct_fix.v1"
+_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_guide",
+    "contract_runtime_submit_line",
+    "task_timeline_append",
+)
+_DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES = (
+    "agent/governance/server.py",
+    "agent/governance/contracts/runtime.py",
+)
 
 
 def _contract_update_execution_id(
@@ -37663,6 +37673,357 @@ def _direct_fix_successor_execution_id(
         parent_execution_id,
         DIRECT_FIX_CONTRACT_ID,
     )
+
+
+def _direct_fix_child_route_token_target_files(
+    conn,
+    *,
+    backlog_id: str,
+) -> list[str]:
+    candidates: list[str] = []
+    if backlog_id:
+        try:
+            row = conn.execute(
+                "SELECT target_files FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is not None:
+            candidates.extend(_string_list_field(_row_get(row, "target_files", "")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        text = str(path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped or list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _direct_fix_issue_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mint a child-scoped route-token ref under a registered parent ref."""
+
+    child_contract_execution_id = str(child_contract_execution_id or "").strip()
+    parent_route_token_ref = str(parent_route_token_ref or "").strip()
+    proof: dict[str, Any] = {
+        "schema_version": "direct_fix.child_route_token_binding.v1",
+        "source": "direct_fix_successor_runtime",
+        "status": "skipped",
+        "route_token_ref": parent_route_token_ref,
+        "parent_route_token_ref": parent_route_token_ref,
+        "child_contract_execution_id": child_contract_execution_id,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not child_contract_execution_id or not parent_route_token_ref:
+        proof["reason"] = "missing_child_execution_or_route_ref"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved_parent = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=parent_route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_token_ref_invalid",
+                "parent_ref_resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved_parent:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_token_ref_unregistered",
+            }
+        )
+        return proof
+
+    parent_identity = {
+        "route_id": str(resolved_parent.get("route_id") or ""),
+        "route_context_hash": str(resolved_parent.get("route_context_hash") or ""),
+        "prompt_contract_id": str(resolved_parent.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(resolved_parent.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            resolved_parent.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": parent_route_token_ref,
+        "selected_project": project_id,
+        "selected_backlog_id": backlog_id,
+    }
+    missing_parent_identity = [
+        field
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if not parent_identity.get(field)
+    ]
+    if missing_parent_identity:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "parent_route_identity_incomplete",
+                "missing_parent_route_identity_fields": missing_parent_identity,
+            }
+        )
+        return proof
+
+    target_files = _direct_fix_child_route_token_target_files(
+        conn,
+        backlog_id=backlog_id,
+    )
+    evidence_refs = [
+        ref
+        for ref in (
+            f"contract_runtime:{child_contract_execution_id}",
+            f"contract_runtime:{str(parent_record.get('contract_execution_id') or '')}",
+            f"backlog:{backlog_id}" if backlog_id else "",
+        )
+        if ref
+    ]
+    try:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=child_contract_execution_id,
+            target_files=target_files,
+            allowed_actions=list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            evidence_refs=evidence_refs,
+            parent_route_identity=parent_identity,
+        )
+        child_ref = str(issued.get("route_token_ref") or "").strip()
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            token=issued.get("route_token")
+            if isinstance(issued.get("route_token"), Mapping)
+            else {},
+        )
+        parent_lineage = (
+            issued.get("parent_route_lineage")
+            if isinstance(issued.get("parent_route_lineage"), Mapping)
+            else {}
+        )
+        child_lineage = (
+            issued.get("child_route_lineage")
+            if isinstance(issued.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        if parent_lineage and child_lineage:
+            observer_route_context.persist_route_token_ref_lineage(
+                conn,
+                project_id=project_id,
+                route_token_ref=child_ref,
+                parent_route_lineage=parent_lineage,
+                child_route_lineage=child_lineage,
+                route_lineage=issued.get("route_lineage")
+                if isinstance(issued.get("route_lineage"), Mapping)
+                else {},
+            )
+    except (ValueError, observer_route_context.RouteTokenRefError) as exc:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "child_route_token_issue_failed",
+                "issue_error": str(exc),
+            }
+        )
+        return proof
+    if not child_ref:
+        proof.update(
+            {
+                "status": "skipped",
+                "reason": "child_route_token_ref_missing_after_issue",
+            }
+        )
+        return proof
+
+    proof.update(
+        {
+            "status": "issued_child_ref",
+            "route_token_ref": child_ref,
+            "parent_route_token_ref": parent_route_token_ref,
+            "target_files": target_files,
+            "allowed_actions": list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            "parent_route_identity": parent_identity,
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+            "route_lineage": dict(issued.get("route_lineage") or {})
+            if isinstance(issued.get("route_lineage"), Mapping)
+            else {},
+        }
+    )
+    return proof
+
+
+def _direct_fix_apply_route_token_binding(
+    record: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_ref = str(binding.get("route_token_ref") or "").strip()
+    if not child_ref:
+        return dict(record)
+    updated = dict(record)
+    updated["route_token_ref"] = child_ref
+    metadata = (
+        dict(updated.get("metadata"))
+        if isinstance(updated.get("metadata"), Mapping)
+        else {}
+    )
+    backlog_lineage = (
+        dict(updated.get("backlog_lineage"))
+        if isinstance(updated.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    parent_ref = str(binding.get("parent_route_token_ref") or "")
+    metadata["route_token_ref_binding"] = dict(binding)
+    metadata["parent_route_token_ref"] = parent_ref
+    metadata["child_route_token_ref"] = child_ref
+    backlog_lineage["parent_route_token_ref"] = parent_ref
+    backlog_lineage["child_route_token_ref"] = child_ref
+    updated["metadata"] = metadata
+    updated["backlog_lineage"] = backlog_lineage
+    return updated
+
+
+def _direct_fix_existing_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+) -> dict[str, Any]:
+    child_ref = str(child_record.get("route_token_ref") or "").strip()
+    child_id = str(child_record.get("contract_execution_id") or "").strip()
+    if (
+        not child_ref
+        or child_ref == str(parent_route_token_ref or "").strip()
+        or not child_id
+    ):
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            backlog_id=backlog_id,
+            task_id=child_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    if not resolved:
+        return {}
+    allowed = {
+        str(item or "").strip()
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    }
+    if "contract_runtime_submit_line" not in allowed:
+        return {}
+    metadata = (
+        child_record.get("metadata")
+        if isinstance(child_record.get("metadata"), Mapping)
+        else {}
+    )
+    prior = (
+        metadata.get("route_token_ref_binding")
+        if isinstance(metadata.get("route_token_ref_binding"), Mapping)
+        else {}
+    )
+    return {
+        **dict(prior),
+        "schema_version": "direct_fix.child_route_token_binding.v1",
+        "source": "direct_fix_successor_runtime",
+        "status": "existing_child_ref",
+        "route_token_ref": child_ref,
+        "parent_route_token_ref": str(parent_route_token_ref or "").strip(),
+        "child_contract_execution_id": child_id,
+        "allowed_actions": sorted(allowed),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _direct_fix_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _direct_fix_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=child_contract_execution_id,
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+    )
+
+
+def _direct_fix_with_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing = _direct_fix_existing_child_route_token_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_record=child_record,
+        parent_route_token_ref=parent_route_token_ref,
+    )
+    if existing:
+        return dict(child_record), existing
+
+    binding = _direct_fix_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=str(child_record.get("contract_execution_id") or ""),
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+    )
+    if str(binding.get("status") or "") != "issued_child_ref":
+        return dict(child_record), binding
+
+    updated = _direct_fix_apply_route_token_binding(child_record, binding=binding)
+    child_id = str(updated.get("contract_execution_id") or "").strip()
+    if child_id:
+        updated = _contract_runtime_store(conn).update(child_id, updated)
+    return updated, binding
 
 
 def _direct_fix_return_to_parent_projection(
@@ -38806,6 +39167,20 @@ def _direct_fix_successor_runtime_enter(
     try:
         successor = store.get(successor_execution_id)
     except ContractRuntimeError:
+        child_route_binding = _direct_fix_child_route_token_binding(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            child_contract_execution_id=successor_execution_id,
+            parent_route_token_ref=route_token_ref,
+            parent_record=parent_record,
+        )
+        successor_route_token_ref = str(
+            child_route_binding.get("route_token_ref") or route_token_ref
+        )
+        parent_route_token_ref = str(
+            child_route_binding.get("parent_route_token_ref") or route_token_ref
+        )
         successor = runtime.start_execution(
             DIRECT_FIX_CONTRACT_ID,
             project_id=project_id,
@@ -38815,7 +39190,7 @@ def _direct_fix_successor_runtime_enter(
             parent_contract_execution_id=parent_execution_id,
             root_contract_execution_id=root_execution_id,
             contract_chain_id=chain_id,
-            route_token_ref=route_token_ref,
+            route_token_ref=successor_route_token_ref,
             role_binding={
                 "observer": actor_role,
                 "mf_sub": "mf_sub",
@@ -38829,6 +39204,8 @@ def _direct_fix_successor_runtime_enter(
                 "parent_contract_execution_id": parent_execution_id,
                 "root_contract_execution_id": root_execution_id,
                 "return_to_parent": return_to_parent,
+                "parent_route_token_ref": parent_route_token_ref,
+                "child_route_token_ref": successor_route_token_ref,
             },
             metadata={
                 "handoff_reason": reason,
@@ -38836,10 +39213,29 @@ def _direct_fix_successor_runtime_enter(
                 "blocked_line": dict(blocked_line),
                 "return_to_parent": return_to_parent,
                 "parent_close_gate_recheck_required": True,
+                "parent_route_token_ref": parent_route_token_ref,
+                "child_route_token_ref": successor_route_token_ref,
+                "route_token_ref_binding": dict(child_route_binding),
             },
         )
     else:
         successor_existed = True
+        successor, child_route_binding = _direct_fix_with_child_route_token_ref(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_record=parent_record,
+            child_record=successor,
+            parent_route_token_ref=route_token_ref,
+        )
+        successor_route_token_ref = str(
+            child_route_binding.get("route_token_ref")
+            or successor.get("route_token_ref")
+            or route_token_ref
+        )
+        parent_route_token_ref = str(
+            child_route_binding.get("parent_route_token_ref") or route_token_ref
+        )
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
@@ -38864,7 +39260,10 @@ def _direct_fix_successor_runtime_enter(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": task_id,
+            "parent_route_token_ref": parent_route_token_ref,
+            "child_route_token_ref": successor_route_token_ref,
         },
+        "route_token_ref_binding": dict(child_route_binding),
     }
     runtime.current_guide(successor_execution_id, actor_role=actor_role)
     successor = store.get(successor_execution_id)
@@ -38936,8 +39335,13 @@ def _direct_fix_successor_runtime_enter(
         "contract_chain_current": current_projection,
         "route_token_ref": str(successor.get("route_token_ref") or ""),
         "route_token_ref_guidance": {
+            "schema_version": "direct_fix.child_route_token_ref_guidance.v1",
             "route_token_ref": str(successor.get("route_token_ref") or ""),
+            "child_route_token_ref": str(successor.get("route_token_ref") or ""),
+            "parent_route_token_ref": parent_route_token_ref,
+            "binding": dict(child_route_binding),
             "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
             "pass_ref_to_next_runtime_write": True,
         },
         "return_to_parent": return_to_parent,

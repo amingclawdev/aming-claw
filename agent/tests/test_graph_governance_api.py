@@ -24548,6 +24548,255 @@ def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     )
 
 
+def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
+    backlog_id = "AC-DIRECT-FIX-CHILD-ROUTE-REF"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-direct-fix-child-route-ref",
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["direct_fix_enter"],
+    )
+    parent_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_ref,
+        token=parent_issue["route_token"],
+    )
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair blocked successor entry from onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": "direct-fix-child-route-ref",
+                "parent_contract_execution_id": parent_execution_id,
+                "observer_session_id": observer_session_id,
+                "route_token_ref": parent_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+
+    direct_execution_id = entered["contract_execution_id"]
+    child_ref = entered["route_token_ref"]
+    assert child_ref.startswith("rtok-")
+    assert child_ref != parent_ref
+    assert entered["route_token_ref_guidance"]["child_route_token_ref"] == child_ref
+    assert (
+        entered["route_token_ref_guidance"]["parent_route_token_ref"] == parent_ref
+    )
+    assert entered["next_legal_action"]["route_token_ref"] == child_ref
+
+    resolved_child = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_ref,
+        backlog_id=backlog_id,
+        task_id=direct_execution_id,
+    )
+    assert resolved_child is not None
+    assert "contract_runtime_submit_line" in resolved_child["allowed_actions"]
+    assert resolved_child["parent_route_lineage"]["route_token_ref"] == parent_ref
+
+    child_refs = [
+        row["route_token_ref"]
+        for row in conn.execute(
+            """
+            SELECT route_token_ref FROM observer_route_token_refs
+            WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+            ORDER BY route_token_ref
+            """,
+            (PID, backlog_id, direct_execution_id),
+        ).fetchall()
+    ]
+    assert child_refs == [child_ref]
+
+    retry = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Retry blocked successor entry from onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": "direct-fix-child-route-ref",
+                "parent_contract_execution_id": parent_execution_id,
+                "observer_session_id": observer_session_id,
+                "route_token_ref": parent_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "mf_parallel",
+                    "blocker_id": "successor_entry_blocked_before_parent_runtime",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert retry["contract_execution_id"] == direct_execution_id
+    assert retry["route_token_ref"] == child_ref
+    retry_child_refs = [
+        row["route_token_ref"]
+        for row in conn.execute(
+            """
+            SELECT route_token_ref FROM observer_route_token_refs
+            WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+            ORDER BY route_token_ref
+            """,
+            (PID, backlog_id, direct_execution_id),
+        ).fetchall()
+    ]
+    assert retry_child_refs == [child_ref]
+
+    current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert current["current_contract_execution_id"] == direct_execution_id
+    assert current["active_child_contract_execution_id"] == direct_execution_id
+    assert current["parent_to_resume_contract_execution_id"] == parent_execution_id
+    assert current["next_legal_action"]["route_token_ref"] == child_ref
+
+    approval = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "coordinator",
+            method="POST",
+            body={
+                "observer_session_id": observer_session_id,
+                "route_token_ref": child_ref,
+                "stage_id": "operator_approval",
+                "line_id": "direct_fix_operator_approval",
+                "evidence_kind": "operator_approval",
+                "payload": {
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    }
+                },
+            },
+        )
+    )
+    assert approval["ok"] is True
+    assert approval["actor_role"] == "observer"
+    assert approval["next_legal_action"]["line_id"] == "direct_fix_dispatch_context"
+
+
+def test_direct_fix_enter_binds_legacy_existing_successor_once(conn):
+    backlog_id = "AC-DIRECT-FIX-LEGACY-EXISTING-CHILD-ROUTE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-direct-fix-legacy-existing-child-route",
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["direct_fix_enter"],
+    )
+    parent_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_ref,
+        token=parent_issue["route_token"],
+    )
+    blocked_entry = {
+        "status": "blocked",
+        "blocked_successor_contract_id": "mf_parallel",
+        "blocker_id": "successor_entry_blocked_before_parent_runtime",
+        "recommended_successor_contract_id": "direct_fix",
+        "recommended_next_action": "enter_direct_fix_successor",
+    }
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=parent_ref,
+        blocked_successor_entry=blocked_entry,
+        blocked_reason="Legacy successor existed before child refs were introduced.",
+    )
+    direct_execution_id = server._direct_fix_successor_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+    )
+    server._contract_runtime(conn).start_execution(
+        server.DIRECT_FIX_CONTRACT_ID,
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=direct_execution_id,
+        parent_contract_execution_id=parent_execution_id,
+        root_contract_execution_id=parent_execution_id,
+        contract_chain_id=server._onboard_service_chain_id(PID, backlog_id),
+        route_token_ref=parent_ref,
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "qa_independent": True,
+        },
+    )
+    conn.commit()
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Bind legacy direct-fix successor to child route ref.",
+                "backlog_id": backlog_id,
+                "task_id": "direct-fix-legacy-existing-child-route",
+                "parent_contract_execution_id": parent_execution_id,
+                "observer_session_id": observer_session_id,
+                "route_token_ref": parent_ref,
+                "blocked_successor_entry": blocked_entry,
+            },
+        )
+    )
+
+    child_ref = entered["route_token_ref"]
+    assert child_ref.startswith("rtok-")
+    assert child_ref != parent_ref
+    assert entered["route_token_ref_guidance"]["child_route_token_ref"] == child_ref
+    child_refs = [
+        row["route_token_ref"]
+        for row in conn.execute(
+            """
+            SELECT route_token_ref FROM observer_route_token_refs
+            WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+            ORDER BY route_token_ref
+            """,
+            (PID, backlog_id, direct_execution_id),
+        ).fetchall()
+    ]
+    assert child_refs == [child_ref]
+
+
 def test_onboard_route_guide_returns_contract_chain_current_projection(conn):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-CURRENT-PROJECTION"
     _insert_simple_mf_close_backlog(conn, backlog_id)
