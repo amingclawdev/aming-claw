@@ -4121,6 +4121,127 @@ def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
     assert "route_token" not in payload
 
 
+def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-RUNTIME-CONTEXT-PARENT-BOUND-ROUTE-REF"
+    parent_task_id = "runtime-parent-bound-parent"
+    worker_task_id = "runtime-parent-bound-worker"
+    runtime_context_id = "mfrctx-runtime-parent-bound-route-ref"
+    session_token = "session-runtime-parent-bound-route-ref"
+    worktree = tmp_path / "runtime-parent-bound-worker"
+    worktree.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(worktree),
+            task_id=worker_task_id,
+            parent_task_id=parent_task_id,
+            root_task_id=parent_task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            stage_task_id=worker_task_id,
+            stage_type="mf_sub",
+            worker_id="worker-parent-bound",
+            worker_slot_id="slot-parent-bound",
+            attempt=1,
+            fence_token="fence-runtime-parent-bound",
+            session_token_hash=mf_subagent_session_token_hash(session_token),
+            branch_ref="refs/heads/codex/runtime-parent-bound",
+            worktree_id="wt-runtime-parent-bound",
+            worktree_path=str(worktree),
+            base_commit="base-parent-bound",
+            target_head_commit="target-parent-bound",
+            merge_queue_id="mq-runtime-parent-bound",
+            status=STATE_WORKTREE_READY,
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["timeline:parent-bound-route-ref"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_issue["route_token_ref"],
+        token=parent_issue["route_token"],
+    )
+    parent_route_identity = {
+        "route_id": parent_issue["route_id"],
+        "route_context_hash": parent_issue["route_context_hash"],
+        "prompt_contract_id": parent_issue["prompt_contract_id"],
+        "prompt_contract_hash": parent_issue["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": parent_issue[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": parent_issue["route_token_ref"],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-parent-bound-route-ref",
+        contract_version="direct_fix.v1",
+        payload={
+            "summary": "worker uses parent-bound route ref for first evidence",
+            "parent_route_identity": parent_route_identity,
+        },
+        route_identity=parent_route_identity,
+        route_evidence_type="observer_route_token_ref",
+        actor="observer",
+        now_iso="2026-06-28T00:00:00Z",
+    )
+
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": parent_task_id,
+                "fence_token": "fence-runtime-parent-bound",
+                "session_token": session_token,
+                "target_project_root": str(worktree),
+                **parent_route_identity,
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "parent-bound route ref accepted for worker evidence",
+                },
+                "route_token_ref": parent_issue["route_token_ref"],
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["timeline_event"]["task_id"] == worker_task_id
+    gate = response["route_token_gate"]
+    assert gate["decision"] == "route_token_ref_resolved"
+    assert gate["route_token_ref"] == parent_issue["route_token_ref"]
+    assert gate["scope"]["task_id"] == parent_task_id
+    stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (response["timeline_event"]["id"],),
+    ).fetchone()
+    payload = json.loads(stored["payload_json"])
+    assert payload["route_token_gate"]["route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert payload["route_token_gate"]["scope"]["task_id"] == parent_task_id
+    assert payload["source_backed_contract_gate_authority"][
+        "source_of_authority"
+    ] == "route_token_gate"
+
+
 def test_timeline_precheck_enrichment_rejects_event_local_lineage_without_registry_binding(
     conn,
 ):

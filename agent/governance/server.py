@@ -12330,13 +12330,122 @@ def _runtime_context_implementation_resolved_ref_route_identity(
         resolved,
         route_token_ref=route_token_ref,
     )
-    return _runtime_context_validate_parent_bound_route_identity(
+    identity, lineage_payload = _runtime_context_validate_parent_bound_route_identity(
         resolved,
         child_route_identity=child_route_identity,
         runtime_context_id=runtime_context_id,
         context=context,
         parent_route_identity=parent_route_identity,
     )
+    lineage_payload = dict(lineage_payload)
+    lineage_payload["_runtime_context_route_ref_resolved"] = True
+    return identity, lineage_payload
+
+
+def _runtime_context_timeline_route_gate(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    event_route_identity: Mapping[str, Any],
+    parent_route_identity: Mapping[str, Any],
+    route_lineage_payload: Mapping[str, Any] | None = None,
+    parent_task_id: str = "",
+    action: str = "task_timeline_append",
+) -> dict[str, Any]:
+    route_token_ref = str(event_route_identity.get("route_token_ref") or "").strip()
+    if not route_token_ref:
+        return {}
+
+    lineage_payload = (
+        dict(route_lineage_payload)
+        if isinstance(route_lineage_payload, Mapping)
+        else {}
+    )
+    if lineage_payload.get("_runtime_context_route_ref_resolved") is not True:
+        return {}
+    parent_lineage = (
+        dict(lineage_payload.get("parent_route_lineage"))
+        if isinstance(lineage_payload.get("parent_route_lineage"), Mapping)
+        else _route_identity_public_summary(parent_route_identity)
+    )
+    if not parent_lineage:
+        parent_lineage = _route_identity_public_summary(event_route_identity)
+    parent_lineage.setdefault("route_token_ref", route_token_ref)
+
+    child_lineage = (
+        dict(lineage_payload.get("child_route_lineage"))
+        if isinstance(lineage_payload.get("child_route_lineage"), Mapping)
+        else _route_identity_public_summary(event_route_identity)
+    )
+    if not child_lineage:
+        child_lineage = _route_identity_public_summary(event_route_identity)
+    child_lineage.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "parent_task_id": parent_task_id
+            or _runtime_context_mf_sub_parent_task_id(context),
+            "worker_role": "mf_sub",
+            "parent_route_token_ref": str(
+                parent_lineage.get("route_token_ref") or route_token_ref
+            ),
+            "route_token_ref": route_token_ref,
+        }
+    )
+
+    route_lineage = (
+        dict(lineage_payload.get("route_lineage"))
+        if isinstance(lineage_payload.get("route_lineage"), Mapping)
+        else {}
+    )
+    if not route_lineage:
+        route_lineage = {
+            "schema_version": "runtime_context.worker_route_lineage.v1",
+            "status": "parent_bound_worker_task",
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+        }
+
+    scope_task_id = parent_task_id or str(
+        parent_lineage.get("selected_task_id")
+        or parent_lineage.get("task_id")
+        or getattr(context, "root_task_id", "")
+        or getattr(context, "backlog_id", "")
+        or ""
+    )
+    return {
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "status": "passed",
+        "action": action,
+        "decision": "route_token_ref_resolved",
+        "route_token_ref": route_token_ref,
+        "route_id": str(event_route_identity.get("route_id") or ""),
+        "route_context_hash": str(event_route_identity.get("route_context_hash") or ""),
+        "prompt_contract_id": str(event_route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(event_route_identity.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            event_route_identity.get("visible_injection_manifest_hash") or ""
+        ),
+        "server_issued_binding": True,
+        "resolved_from_ref": True,
+        "registry_verified": True,
+        "binding_source": "observer_route_token_refs",
+        "protected_lane": "runtime_context_worker",
+        "legal_next_action": "record_worker_timeline_evidence",
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": parent_task_id,
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+            "task_id": scope_task_id,
+        },
+        "parent_route_lineage": parent_lineage,
+        "child_route_lineage": child_lineage,
+        "route_lineage": route_lineage,
+    }
 
 
 def _runtime_context_implementation_observer_command_id(
@@ -12483,6 +12592,7 @@ def _runtime_context_forward_request(
     ctx: RequestContext,
     *,
     body: Mapping[str, Any],
+    trusted_route_gate: Mapping[str, Any] | None = None,
 ) -> RequestContext:
     forward = RequestContext(
         ctx.handler,
@@ -12495,6 +12605,8 @@ def _runtime_context_forward_request(
         ctx.idem_key,
     )
     forward._session = ctx._session
+    if isinstance(trusted_route_gate, Mapping) and trusted_route_gate:
+        forward._trusted_route_token_gate = dict(trusted_route_gate)
     return forward
 
 
@@ -13916,8 +14028,20 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "trace_id": body.get("trace_id") or "",
         "commit_sha": body.get("commit_sha") or "",
     }
+    trusted_route_gate = _runtime_context_timeline_route_gate(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        event_route_identity=route_identity,
+        parent_route_identity=route_identity,
+        parent_task_id=parent_task_id,
+    )
     result = handle_task_timeline_append(
-        _runtime_context_forward_request(ctx, body=event_body)
+        _runtime_context_forward_request(
+            ctx,
+            body=event_body,
+            trusted_route_gate=trusted_route_gate,
+        )
     )
     response = _runtime_context_write_response(
         action="read_receipt",
@@ -14670,7 +14794,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         raw_session_token=raw_session_token,
     )
     for key, value in route_lineage_payload.items():
-        if value:
+        if key in {"parent_route_lineage", "child_route_lineage", "route_lineage"} and value:
             payload[key] = value
     parent_task_id = (
         str(body.get("parent_task_id") or "").strip()
@@ -14784,8 +14908,21 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 },
             )
 
+    trusted_route_gate = _runtime_context_timeline_route_gate(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        event_route_identity=event_route_identity,
+        parent_route_identity=parent_route_identity,
+        route_lineage_payload=route_lineage_payload,
+        parent_task_id=parent_task_id,
+    )
     result = handle_task_timeline_append(
-        _runtime_context_forward_request(ctx, body=event_body)
+        _runtime_context_forward_request(
+            ctx,
+            body=event_body,
+            trusted_route_gate=trusted_route_gate,
+        )
     )
     response = _runtime_context_write_response(
         action="implementation_evidence",
@@ -40713,7 +40850,8 @@ def handle_task_timeline_append(ctx: RequestContext):
         "phase": ctx.body.get("phase", ""),
         "event_kind": ctx.body.get("event_kind", ""),
     }
-    route_gate = {}
+    trusted_route_gate = getattr(ctx, "_trusted_route_token_gate", {})
+    route_gate = dict(trusted_route_gate) if isinstance(trusted_route_gate, Mapping) else {}
 
     with DBContext(project_id) as conn:
         legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
