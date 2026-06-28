@@ -12542,6 +12542,133 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
     assert row["target_graph_activation_allowed"] is True
 
 
+def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_without_raw_fence(conn):
+    parent_task_id = "parent-close-ready-result"
+    child_task_id = f"{parent_task_id}:row:1"
+    queue_id = "mergeq-api-result-parent-route"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=parent_task_id,
+        task_id=parent_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:worker-qa-close-ready"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-result-parent-route",
+            backlog_id=parent_task_id,
+            root_task_id=parent_task_id,
+            task_id=child_task_id,
+            branch_ref="refs/heads/codex/result-parent-route",
+            status="reclaimable",
+            fence_token="fence-result-reclaimed",
+            target_head_commit="target-before-parent-route",
+            merge_queue_id=queue_id,
+            merge_preview_id="preview-parent-route",
+        ),
+        now_iso="2026-05-17T08:27:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-result-parent-route",
+                task_id=child_task_id,
+                branch_ref="refs/heads/codex/result-parent-route",
+                queue_index=1,
+                status="planned",
+                target_ref="refs/heads/main",
+                branch_head="head-parent-route",
+                validated_target_head="target-before-parent-route",
+                current_target_head="target-before-parent-route",
+                merge_preview_id="preview-parent-route",
+                snapshot_id="scope-parent-route",
+                projection_id="semproj-parent-route",
+            )
+        ],
+        now_iso="2026-05-17T08:27:00Z",
+    )
+    conn.commit()
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_result(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "merge_queue_id": queue_id,
+                    "queue_item_id": "item-result-parent-route",
+                    "task_id": child_task_id,
+                    "status": "merged",
+                    "merge_commit": "merge-parent-route",
+                    "target_head_after_merge": "target-after-parent-route",
+                    "route_token_ref": issued["route_token_ref"],
+                },
+            )
+        )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_result(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "merge_queue_id": queue_id,
+                    "queue_item_id": "item-result-parent-route",
+                    "task_id": child_task_id,
+                    "status": "merged",
+                    "merge_commit": "merge-parent-route",
+                    "target_head_before_merge": "target-before-parent-route",
+                    "target_head_after_merge": "target-after-parent-route",
+                    "fence_token": "fence-stale-parent-route",
+                    "route_token_ref": issued["route_token_ref"],
+                },
+            )
+        )
+
+    result = server.handle_graph_governance_parallel_branch_merge_result(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "queue_item_id": "item-result-parent-route",
+                "task_id": child_task_id,
+                "status": "merged",
+                "merge_commit": "merge-parent-route",
+                "target_head_before_merge": "target-before-parent-route",
+                "target_head_after_merge": "target-after-parent-route",
+                "route_token_ref": issued["route_token_ref"],
+                "now_iso": "2026-05-17T08:28:00Z",
+            },
+        )
+    )
+
+    gate = result["route_token_gate"]
+    assert result["ok"] is True
+    assert gate["decision"] == "route_token_ref_resolved"
+    assert gate["action"] == "merge_result"
+    assert gate["authorized_action"] == "close_or_merge_after_evidence"
+    assert gate["parent_task_scope_accepted"] is True
+    assert result["queue_item"]["status"] == "merged"
+    assert result["queue_item"]["merge_commit"] == "merge-parent-route"
+    assert result["queue_item"]["target_head_before_merge"] == "target-before-parent-route"
+    assert result["queue_item"]["target_head_after_merge"] == "target-after-parent-route"
+    assert result["context"]["status"] == "merged"
+    assert result["context"]["target_head_commit"] == "target-after-parent-route"
+
+
 def test_parallel_branch_batch_runtime_route_returns_rollback_plan(conn):
     batch_id = "PB-api-batch"
     upsert_branch_context(

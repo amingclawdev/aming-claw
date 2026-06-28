@@ -16321,6 +16321,9 @@ _PARALLEL_BRANCH_PARENT_ROUTE_ACTIONS = {
     "merge_execute",
     "merge_result",
 }
+_PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS = frozenset(
+    {"route_token", "route_token_ref_resolved"}
+)
 
 
 def _body_has_route_token_reference(body: Mapping[str, Any] | None) -> bool:
@@ -16392,6 +16395,46 @@ def _require_parallel_branch_merge_route_gate(
         gate["backlog_id"] = backlog_id
         gate["fallback_reason"] = str(exc.message or exc)
         return gate
+
+
+def _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+    *,
+    status: str,
+) -> bool:
+    if str(body.get("fence_token") or "").strip():
+        return False
+    if str(status or "").strip() != "merged":
+        return False
+    for required_field in (
+        "merge_commit",
+        "target_head_before_merge",
+        "target_head_after_merge",
+    ):
+        if not str(body.get(required_field) or "").strip():
+            return False
+    if route_gate.get("allowed") is not True:
+        return False
+    if str(route_gate.get("status") or "").strip() != "accepted":
+        return False
+    if (
+        str(route_gate.get("decision") or "").strip()
+        not in _PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS
+    ):
+        return False
+    if str(route_gate.get("action") or "").strip() != "merge_result":
+        return False
+    authorized_action = str(
+        route_gate.get("authorized_action")
+        or route_gate.get("allowed_action")
+        or route_gate.get("action")
+        or ""
+    ).strip()
+    return authorized_action in {
+        "merge_result",
+        _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
+    }
 
 
 def _parallel_branch_parent_scope_from_recorded_merge(
@@ -16852,6 +16895,13 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             action="merge_result",
             task_id=str(ctx.body.get("task_id") or ""),
         )
+        allow_reclaimed_fence = (
+            _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
+                ctx.body,
+                route_gate,
+                status=status,
+            )
+        )
         with sqlite_write_lock():
             recorded = record_merge_queue_result(
                 conn,
@@ -16868,6 +16918,7 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 snapshot_id=str(ctx.body.get("snapshot_id") or ""),
                 projection_id=str(ctx.body.get("projection_id") or ""),
                 fence_token=str(ctx.body.get("fence_token") or ""),
+                allow_route_gated_reclaimed_fence_without_token=allow_reclaimed_fence,
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(
