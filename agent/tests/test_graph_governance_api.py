@@ -24213,6 +24213,22 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert guide["interface_index"]["mf_batch_parallel_enter"]["path"] == (
         "/api/projects/{project_id}/mf-batch-parallel/enter"
     )
+    graph_first = guide["graph_first_policy"]
+    assert graph_first["intent_query_purpose_map"]["worker_context"] == (
+        "subagent_context_build"
+    )
+    assert graph_first["intent_query_purpose_map"]["qa_independent_verification"] == (
+        "independent_verification"
+    )
+    assert "source_hints" in guide["capability_index"]["query_returns"]
+    assert guide["capability_index"]["index_paths"]["graph_first_policy"] == (
+        "agent_onboard_guidance.onboard_route_guide.graph_first_policy"
+    )
+    assert guide["interface_index"]["source_hints"]["status_interfaces"] == [
+        "graph_status",
+        "graph_operations_queue",
+    ]
+    assert "source_hints" in guide["system_operation_index"]["operations"]
     observer_next = {
         item["contract_id"]: item
         for item in guide["role_entries"]["observer"]["next_contracts"]
@@ -24232,6 +24248,72 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert result["agent_onboard_guidance"]["entrypoints"]["onboard_start"][
         "entrypoint"
     ] == "onboard_route_guide"
+
+
+def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
+    backlog_id = "AC-ONBOARD-COMPLETE-PROJECTION-SUPPRESSES-STALE-LEDGER"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    first = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-onboard-complete-projection",
+            },
+        )
+    )
+    assert first["contract_chain_current"]["readiness_state"] == "contract_complete"
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="stale-direct-fix-parent-worker",
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="passed",
+        payload={
+            "contract_execution_id": "cex-stale-compact-ledger-parent",
+            "blockers": [
+                {
+                    "blocker_class": "stale_compact_ledger_after_contract_complete"
+                }
+            ],
+            "next_legal_action": {
+                "id": "merge_queue_raw_fence",
+                "action": "record_raw_fence",
+            },
+        },
+    )
+    conn.commit()
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-onboard-complete-projection",
+            },
+        )
+    )
+
+    resume = result["runtime_resume"]
+    assert resume["source"] == "backlog_contract_chain_current"
+    assert resume["readiness_state"] == "contract_complete"
+    assert resume.get("next_legal_action") == {}
+    assert resume["projection_conflict"]["status"] == "suppressed_stale_resume"
+    assert resume["projection_conflict"]["shadowed_source"] == (
+        "task_timeline_compact_ledger"
+    )
+    assert result["next_legal_action"]["id"] != "resume_blocked_contract_chain"
 
 
 def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
@@ -25692,6 +25774,9 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     parent_next = parent_current["next_legal_action"]
     assert parent_next["id"] == "resume_parent_after_successor_return"
     assert parent_next["successor_contract_execution_id"] == direct_execution_id
+    assert parent_next["stage_id"] == "successor_return"
+    assert parent_next["line_id"] == "resume_parent_after_successor_return"
+    assert parent_next["evidence_kind"] == "successor_return_acknowledgement"
     successor_return = parent_current["runtime_guide"]["successor_return"]
     assert successor_return["status"] == "returned"
     assert successor_return["return_line_present"] is True

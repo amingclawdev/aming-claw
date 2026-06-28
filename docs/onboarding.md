@@ -62,6 +62,10 @@ context:
 5. Confirm role and work type in the returned onboard guide.
 6. Follow the returned role/token guidance, next legal action, capability,
    interface, system-operation, archive/resource, and backlog-chain index paths.
+7. Follow `agent_onboard_guidance.onboard_route_guide.graph_first_policy` before
+   source search fallback: pick the returned `graph_query` `query_purpose`,
+   preserve graph trace ids in runtime/timeline evidence, and inspect the
+   source-hints status paths when docs/config/tests are missing from the graph.
 
 Use the current-context project id, governance URL, dashboard URL, graph state,
 and guardrails as the session anchor before observer root-route-context,
@@ -89,6 +93,11 @@ source-code searches are orientation only; they do not authorize a step. If the
 runtime guidance is missing, stale, contradictory, or too vague to act on, file
 that as blocker evidence and stop instead of reconstructing the flow from old
 context prose.
+
+When a parent observer materializes QA evidence from a QA-owned packet or role
+session, preserve evidence-owner, submitter, materialized-from, and
+authorization provenance in the contract line. This records delegated
+materialization without treating the observer as the QA evidence owner.
 
 If `aming-claw://current-context` is missing, stop normal governed work. Reload
 or open a new Codex/Claude host session from a root whose MCP config actually

@@ -1518,6 +1518,15 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "session_token_ref",
         "fence_token",
         "target_project_root",
+        "qa_session_token",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "submitter_session",
+        "submitter_principal",
+        "materialized_from",
+        "authorization_source",
+        "qa_session_token_ref",
+        "qa_evidence_provenance",
     }
     assert (
         tool_by_name["contract_runtime_precheck_line"]["inputSchema"]["properties"]
@@ -1541,6 +1550,73 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         properties = tool_by_name[tool_name]["inputSchema"]["properties"]
         assert "observer_session_id" in properties
         assert "observer_route_token_ref" in properties
+
+
+def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
+    calls = []
+
+    def fake_http(method: str, path: str, data: dict | None = None, *, gov_token=None):
+        calls.append((method, path, data, gov_token))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    assert governance_mcp_server._dispatch_tool(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-direct-fix",
+            "qa_session_token": "gov-qa-token",
+        },
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "onboard_contract_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-onboard",
+            "qa_session_token": "gov-qa-token",
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "materialized_from": "qa_packet:qapkt-onboard",
+            "submitter_principal": "observer:parent",
+        },
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-direct-fix",
+            "qa_session_token": "gov-qa-token",
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "materialized_from": "qa_packet:qapkt-curie",
+            "submitter_principal": "observer:parent",
+        },
+    )["ok"] is True
+
+    assert calls[0] == (
+        "GET",
+        "/api/projects/aming-claw/contract-runtime/cex-direct-fix/current-state",
+        None,
+        "gov-qa-token",
+    )
+    assert calls[1][0:2] == (
+        "POST",
+        "/api/projects/aming-claw/onboard-contract/cex-onboard/line-writes",
+    )
+    assert calls[1][2]["materialized_from"] == "qa_packet:qapkt-onboard"
+    assert "qa_session_token" not in calls[1][2]
+    assert calls[1][3] == "gov-qa-token"
+    assert calls[2][0:2] == (
+        "POST",
+        "/api/projects/aming-claw/contract-runtime/cex-direct-fix/line-writes",
+    )
+    assert calls[2][2]["materialized_from"] == "qa_packet:qapkt-curie"
+    assert calls[2][2]["submitter_principal"] == "observer:parent"
+    assert "qa_session_token" not in calls[2][2]
+    assert calls[2][3] == "gov-qa-token"
 
 
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):

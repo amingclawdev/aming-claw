@@ -1622,9 +1622,11 @@ def _parent_resume_next_action(
         "parent_contract_execution_id": parent_id,
         "root_contract_execution_id": str(child.get("root_contract_execution_id") or ""),
         "contract_chain_id": str(child.get("contract_chain_id") or ""),
-        "stage_id": "parent_resume",
+        "stage_id": "successor_return",
         "line_id": "resume_parent_after_successor_return",
-        "evidence_kind": "parent_recheck_after_direct_fix_qa",
+        "evidence_kind": "successor_return_acknowledgement",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
         "parent_close_gate_recheck_required": True,
         "child_must_not_write_parent_close_evidence": True,
         "return_line_ref": f"contract_runtime:{child_id}:completed_lines:{return_line.get('_completed_line_index', '')}",
@@ -1907,6 +1909,7 @@ class ContractRuntime:
         if body_actor_role and effective_actor_role and body_actor_role != effective_actor_role:
             effective_write["body_actor_role"] = body_actor_role
         _enrich_line_instance_fields(effective_write)
+        _enrich_qa_evidence_provenance(effective_write, effective_actor_role)
         guide = self.current_guide(
             contract_execution_id,
             actor_role=effective_actor_role,
@@ -2177,6 +2180,35 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "artifact_refs",
     "trace_id",
     "commit_sha",
+    "actor_session_principal",
+    "evidence_owner_actor",
+    "evidence_owner_role",
+    "evidence_owner_session",
+    "evidence_owner_session_ref",
+    "submitter_session",
+    "submitter_principal",
+    "materialized_from",
+    "materialized_from_report",
+    "authorization_source",
+    "observer_impersonation",
+    "qa_session_token_ref",
+    "parent_materialization_authorized",
+    "qa_evidence_provenance",
+)
+_QA_EVIDENCE_PROVENANCE_FIELDS = (
+    "actor_session_principal",
+    "evidence_owner_actor",
+    "evidence_owner_role",
+    "evidence_owner_session",
+    "evidence_owner_session_ref",
+    "submitter_session",
+    "submitter_principal",
+    "materialized_from",
+    "materialized_from_report",
+    "authorization_source",
+    "observer_impersonation",
+    "qa_session_token_ref",
+    "parent_materialization_authorized",
 )
 _RAW_TOKEN_FIELD_NAMES = {
     "governance_token",
@@ -2205,6 +2237,69 @@ def _line_evidence_from_write(
             continue
         evidence[field] = _sanitize_line_evidence_value(write.get(field))
     return evidence
+
+
+def _enrich_qa_evidence_provenance(
+    write: dict[str, Any],
+    effective_actor_role: str,
+) -> None:
+    if effective_actor_role != "qa":
+        return
+    if str(write.get("line_id") or "") != "qa_independent_verification":
+        return
+    if str(write.get("evidence_kind") or "") != "independent_verification":
+        return
+
+    owner_actor = str(
+        write.get("evidence_owner_actor")
+        or write.get("actor_session_principal")
+        or effective_actor_role
+    ).strip()
+    submitter_principal = str(
+        write.get("submitter_principal")
+        or write.get("actor_session_principal")
+        or owner_actor
+        or effective_actor_role
+    ).strip()
+    write.setdefault("evidence_owner_role", "qa")
+    if owner_actor:
+        write.setdefault("evidence_owner_actor", owner_actor)
+    if submitter_principal:
+        write.setdefault("submitter_principal", submitter_principal)
+    write.setdefault(
+        "authorization_source",
+        "qa_session_token_ref" if write.get("qa_session_token_ref") else "qa_role_session",
+    )
+    write.setdefault("observer_impersonation", False)
+    write.setdefault(
+        "parent_materialization_authorized",
+        bool(
+            write.get("submitter_session")
+            or write.get("materialized_from")
+            or write.get("materialized_from_report")
+        ),
+    )
+
+    provenance = (
+        dict(write.get("qa_evidence_provenance"))
+        if isinstance(write.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    for field in _QA_EVIDENCE_PROVENANCE_FIELDS:
+        if field in write:
+            provenance[field] = write[field]
+    provenance.setdefault("evidence_owner_role", "qa")
+    if owner_actor:
+        provenance.setdefault("evidence_owner_actor", owner_actor)
+    if submitter_principal:
+        provenance.setdefault("submitter_principal", submitter_principal)
+    provenance.setdefault("authorization_source", write.get("authorization_source"))
+    provenance.setdefault("observer_impersonation", write.get("observer_impersonation"))
+    provenance.setdefault(
+        "parent_materialization_authorized",
+        write.get("parent_materialization_authorized"),
+    )
+    write["qa_evidence_provenance"] = provenance
 
 
 def _enrich_line_instance_fields(write: dict[str, Any]) -> None:

@@ -179,6 +179,19 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "acknowledged_at": {"type": "string"},
             "actor_role": {"type": "string"},
             "actor_session_principal": {"type": "string"},
+            "evidence_owner_actor": {"type": "string"},
+            "evidence_owner_role": {"type": "string"},
+            "evidence_owner_session": {"type": "string"},
+            "evidence_owner_session_ref": {"type": "string"},
+            "submitter_session": {"type": "string"},
+            "submitter_principal": {"type": "string"},
+            "materialized_from": {"type": "string"},
+            "materialized_from_report": {"type": "string"},
+            "authorization_source": {"type": "string"},
+            "observer_impersonation": {"type": "boolean"},
+            "qa_session_token_ref": {"type": "string"},
+            "parent_materialization_authorized": {"type": "boolean"},
+            "qa_evidence_provenance": {"type": "object"},
             "contract_context_read_receipt": {"type": "object"},
             "checkpoint_id": {"type": "string"},
             "head_commit": {"type": "string"},
@@ -3002,11 +3015,20 @@ class ToolDispatcher:
         if name == "onboard_contract_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id"} and value is not None
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+                and value is not None
             }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",

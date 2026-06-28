@@ -36084,6 +36084,20 @@ def _contract_runtime_line_write_body(
         "artifact_refs",
         "trace_id",
         "commit_sha",
+        "actor_session_principal",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "evidence_owner_session",
+        "evidence_owner_session_ref",
+        "submitter_session",
+        "submitter_principal",
+        "materialized_from",
+        "materialized_from_report",
+        "authorization_source",
+        "observer_impersonation",
+        "qa_session_token_ref",
+        "parent_materialization_authorized",
+        "qa_evidence_provenance",
     ):
         if key in body:
             write[key] = body[key]
@@ -36577,6 +36591,63 @@ def _onboard_contract_route_issue_target_files(
     return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
 
 
+def _onboard_graph_first_policy() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.graph_first_policy.v1",
+        "default_sequence": [
+            "call_graph_query_with_query_purpose",
+            "preserve_graph_query_trace_ids_in_evidence",
+            "fallback_to_source_search_only_when_graph_has_no_match_or_is_unavailable",
+            "record_source_search_fallback_in_timeline_or_contract_payload",
+        ],
+        "intent_query_purpose_map": {
+            "observer_implementation_context": "global_architecture_review",
+            "worker_context": "subagent_context_build",
+            "worker_gate_validation": "subagent_gate_validation",
+            "qa_independent_verification": "independent_verification",
+            "gate_validation": "gate_validation",
+            "prompt_context": "prompt_context_build",
+            "semantic_enrichment": "semantic_enrichment",
+            "source_hint_lookup": "global_architecture_review",
+        },
+        "graph_query_tools": [
+            "query_schema",
+            "function_index",
+            "search_structure",
+            "get_file_excerpt",
+        ],
+        "trace_evidence": {
+            "preserve_fields": [
+                "graph_trace_id",
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            ],
+            "evidence_locations": [
+                "contract_runtime_submit_line.payload",
+                "task_timeline_append.payload",
+                "runtime_context_read_receipt",
+            ],
+        },
+        "source_hint_policy": {
+            "scope": "docs_config_tests_or_other_source_controlled_context_not_materialized_in_graph",
+            "source_paths": [
+                "agent/governance/governance_hints.py",
+                "agent/governance/graph_structure_ops.py",
+            ],
+            "status_fields": [
+                "graph_status.active_snapshot_rule_fingerprint.components.source_hints.hint_count",
+                "graph_status.pending_scope_reconcile",
+                "graph_operations_queue.pending",
+            ],
+            "next_action": (
+                "If graph_query misses source-controlled docs/config/tests, inspect "
+                "source_hints status, add or update a governance hint, then update "
+                "the graph before relying on the source fact as graph-backed."
+            ),
+        },
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -36827,6 +36898,17 @@ def _onboard_contract_route_guide(
             "kind": "mcp",
             "mcp_tool": "backlog_list",
         },
+        "source_hints": {
+            "kind": "source_control_and_graph_status",
+            "source_paths": [
+                "agent/governance/governance_hints.py",
+                "agent/governance/graph_structure_ops.py",
+            ],
+            "status_interfaces": [
+                "graph_status",
+                "graph_operations_queue",
+            ],
+        },
     }
     worker_entry = {
         "role": "worker",
@@ -36905,6 +36987,7 @@ def _onboard_contract_route_guide(
         "raw_operator_token_required": False,
         "raw_route_token_exposed": False,
     }
+    graph_first_policy = _onboard_graph_first_policy()
     return {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
@@ -37066,6 +37149,8 @@ def _onboard_contract_route_guide(
                 "interface_index",
                 "system_operation_index",
                 "backlog_chain_binding",
+                "graph_first_policy",
+                "source_hints",
             ],
             "interfaces": [
                 "graph_query",
@@ -37085,6 +37170,7 @@ def _onboard_contract_route_guide(
                 "direct_fix_enter",
                 "mf_parallel_enter",
                 "mf_batch_parallel_enter",
+                "source_hints",
             ],
             "index_paths": {
                 "roles": "agent_onboard_guidance.onboard_route_guide.role_entries",
@@ -37094,6 +37180,13 @@ def _onboard_contract_route_guide(
                     "system_operation_index"
                 ),
                 "chain": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
+                "graph_first_policy": (
+                    "agent_onboard_guidance.onboard_route_guide.graph_first_policy"
+                ),
+                "source_hints": (
+                    "agent_onboard_guidance.onboard_route_guide.graph_first_policy."
+                    "source_hint_policy"
+                ),
             },
         },
         "system_operation_index": {
@@ -37138,8 +37231,24 @@ def _onboard_contract_route_guide(
                     "queue_path": "/api/graph-governance/{project_id}/pending-scope",
                     "gated": True,
                 },
+                "source_hints": {
+                    "kind": "graph_status_index",
+                    "mcp_tools": [
+                        "graph_status",
+                        "graph_operations_queue",
+                    ],
+                    "source_paths": [
+                        "agent/governance/governance_hints.py",
+                        "agent/governance/graph_structure_ops.py",
+                    ],
+                    "status_fields": graph_first_policy["source_hint_policy"][
+                        "status_fields"
+                    ],
+                    "gated": True,
+                },
             },
         },
+        "graph_first_policy": graph_first_policy,
         "interface_index": interface_index,
         "next_legal_action": dict(next_legal_action),
         "route_token_ref": route_token_ref,
@@ -37913,10 +38022,6 @@ def _onboard_route_guide_service_response(
         route_token_ref=route_token_ref,
     )
     projection_degraded = bool(current_projection.get("degraded"))
-    source_backed_onboarding = _backlog_has_source_backed_onboarding(
-        conn,
-        backlog_id=backlog_id,
-    )
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
@@ -37927,6 +38032,9 @@ def _onboard_route_guide_service_response(
             current_projection
         )
         selected_work_type = str(work_type or "").strip()
+        current_projection_complete = _source_backed_contract_chain_is_complete(
+            current_projection
+        )
         if (
             selected_work_type
             in {"continue_contract_chain", "rollback_or_recover_contract", "direct_fix"}
@@ -37934,10 +38042,7 @@ def _onboard_route_guide_service_response(
             and not str(
                 current_projection.get("active_child_contract_execution_id") or ""
             ).strip()
-            and not (
-                source_backed_onboarding
-                and _source_backed_contract_chain_is_complete(current_projection)
-            )
+            and not current_projection_complete
         ):
             blocked_resume = _onboard_blocked_contract_resume_projection(
                 conn,
@@ -37960,6 +38065,39 @@ def _onboard_route_guide_service_response(
                     ),
                 }
                 runtime_resume = blocked_resume
+        elif (
+            selected_work_type
+            in {"continue_contract_chain", "rollback_or_recover_contract", "direct_fix"}
+            and current_projection_complete
+        ):
+            blocked_resume = _onboard_blocked_contract_resume_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=str(role or "").strip() or "observer",
+                route_token_ref=route_token_ref,
+            )
+            if blocked_resume:
+                runtime_resume["projection_conflict"] = {
+                    "schema_version": "onboard_route_guide.projection_conflict.v1",
+                    "status": "suppressed_stale_resume",
+                    "authoritative_source": "backlog_contract_chain_current",
+                    "authoritative_readiness_state": str(
+                        current_projection.get("readiness_state") or ""
+                    ),
+                    "shadowed_source": str(blocked_resume.get("source") or ""),
+                    "shadowed_mode": str(blocked_resume.get("mode") or ""),
+                    "shadowed_next_legal_action": dict(
+                        blocked_resume.get("next_legal_action")
+                        if isinstance(blocked_resume.get("next_legal_action"), Mapping)
+                        else {}
+                    ),
+                    "safe_next_step": (
+                        "do_not_enter_duplicate_successor; continue from "
+                        "backlog_contract_chain_current"
+                    ),
+                }
+                runtime_resume["stale_compact_ledger_suppressed"] = True
     else:
         runtime_resume = _onboard_blocked_contract_resume_projection(
             conn,

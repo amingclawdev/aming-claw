@@ -710,6 +710,12 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     assert current_after_return["readiness_state"] == (
         "parent_resume_required_after_direct_fix_qa"
     )
+    parent_next = current_after_return["next_legal_action"]
+    assert parent_next["id"] == "resume_parent_after_successor_return"
+    assert parent_next["stage_id"] == "successor_return"
+    assert parent_next["line_id"] == "resume_parent_after_successor_return"
+    assert parent_next["evidence_kind"] == "successor_return_acknowledgement"
+    assert parent_next["owner_role"] == "observer"
 
     mf_parallel = runtime.start_execution(
         "mf_parallel.v1",
@@ -736,6 +742,99 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     )
     assert current["current_contract_id"] == "mf_parallel.v1"
     assert current["readiness_state"] == "contract_active"
+
+
+def test_direct_fix_qa_evidence_preserves_owner_submitter_provenance(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    _, direct_fix, generation, repair_ref = _start_repaired_direct_fix(
+        runtime,
+        backlog_id="AC-DIRECT-FIX-QA-PROVENANCE",
+    )
+    write = _direct_fix_qa_write(
+        direct_fix,
+        generation=generation,
+        repair_ref=repair_ref,
+    )
+    write.update(
+        {
+            "actor_session_principal": "qa:curie",
+            "evidence_owner_actor": "qa:curie",
+            "evidence_owner_session_ref": "qstok-curie",
+            "submitter_session": "obs-parent-materializer",
+            "submitter_principal": "observer:parent",
+            "materialized_from": "qa_packet:qapkt-curie",
+            "authorization_source": "qa_session_token_ref",
+            "qa_session_token_ref": "qstok-curie",
+        }
+    )
+
+    result = runtime.submit_line_write(
+        direct_fix["contract_execution_id"],
+        write,
+        actor_role="qa",
+    )
+
+    assert result["ok"] is True
+    line = result["record"]["completed_lines"][-1]
+    assert line["actor_role"] == "qa"
+    assert line["evidence_owner_role"] == "qa"
+    assert line["evidence_owner_actor"] == "qa:curie"
+    assert line["submitter_session"] == "obs-parent-materializer"
+    assert line["submitter_principal"] == "observer:parent"
+    assert line["materialized_from"] == "qa_packet:qapkt-curie"
+    assert line["authorization_source"] == "qa_session_token_ref"
+    assert line["observer_impersonation"] is False
+    assert line["qa_evidence_provenance"]["evidence_owner_actor"] == "qa:curie"
+    assert line["qa_evidence_provenance"]["submitter_principal"] == "observer:parent"
+
+
+def test_direct_fix_qa_materialization_defaults_do_not_make_observer_owner(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    _, direct_fix, generation, repair_ref = _start_repaired_direct_fix(
+        runtime,
+        backlog_id="AC-DIRECT-FIX-QA-MATERIALIZER-NOT-OWNER",
+    )
+    write = _direct_fix_qa_write(
+        direct_fix,
+        generation=generation,
+        repair_ref=repair_ref,
+    )
+    write.update(
+        {
+            "submitter_session": "obs-parent-materializer",
+            "submitter_principal": "observer:parent",
+            "materialized_from": "qa_packet:qapkt-unowned",
+        }
+    )
+
+    result = runtime.submit_line_write(
+        direct_fix["contract_execution_id"],
+        write,
+        actor_role="qa",
+    )
+
+    assert result["ok"] is True
+    line = result["record"]["completed_lines"][-1]
+    assert line["actor_role"] == "qa"
+    assert line["evidence_owner_role"] == "qa"
+    assert line["evidence_owner_actor"] == "qa"
+    assert line["submitter_principal"] == "observer:parent"
+    assert line["qa_evidence_provenance"]["evidence_owner_actor"] == "qa"
+    assert line["qa_evidence_provenance"]["submitter_principal"] == "observer:parent"
 
 
 def test_upsert_contract_chain_successor_binding_rejects_lineage_mismatch(tmp_path):

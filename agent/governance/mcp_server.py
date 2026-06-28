@@ -200,6 +200,19 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "acknowledged_at": {"type": "string"},
             "actor_role": {"type": "string"},
             "actor_session_principal": {"type": "string"},
+            "evidence_owner_actor": {"type": "string"},
+            "evidence_owner_role": {"type": "string"},
+            "evidence_owner_session": {"type": "string"},
+            "evidence_owner_session_ref": {"type": "string"},
+            "submitter_session": {"type": "string"},
+            "submitter_principal": {"type": "string"},
+            "materialized_from": {"type": "string"},
+            "materialized_from_report": {"type": "string"},
+            "authorization_source": {"type": "string"},
+            "observer_impersonation": {"type": "boolean"},
+            "qa_session_token_ref": {"type": "string"},
+            "parent_materialization_authorized": {"type": "boolean"},
+            "qa_evidence_provenance": {"type": "object"},
             "contract_context_read_receipt": {"type": "object"},
             "checkpoint_id": {"type": "string"},
             "head_commit": {"type": "string"},
@@ -263,6 +276,10 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
         "observer_session_id": {
             "type": "string",
             "description": "Opaque active observer session id used with observer_route_token_ref.",
+        },
+        "qa_session_token": {
+            "type": "string",
+            "description": "Raw QA role token used only as X-Gov-Token; never forwarded as evidence body.",
         },
         "worker_role": {
             "type": "string",
@@ -1492,7 +1509,13 @@ def _gov_token() -> str:
     return os.environ.get("GOV_TOKEN", "")
 
 
-def _http(method: str, path: str, body: dict | None = None) -> dict:
+def _http(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    gov_token: str | None = None,
+) -> dict:
     """Make an HTTP request to the governance service."""
     url = f"{_gov_url()}{path}"
     data = json.dumps(body, ensure_ascii=False).encode() if body else None
@@ -1502,7 +1525,7 @@ def _http(method: str, path: str, body: dict | None = None) -> dict:
         method=method,
         headers={
             "Content-Type": "application/json",
-            "X-Gov-Token": _gov_token(),
+            "X-Gov-Token": gov_token if gov_token is not None else _gov_token(),
         },
     )
     try:
@@ -1516,6 +1539,18 @@ def _http(method: str, path: str, body: dict | None = None) -> dict:
             return {"error": str(exc), "body": raw}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def _http_with_optional_gov_token(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    gov_token: str = "",
+) -> dict:
+    if gov_token:
+        return _http(method, path, body, gov_token=gov_token)
+    return _http(method, path, body)
 
 
 # ---------------------------------------------------------------------------
@@ -1680,15 +1715,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "onboard_contract_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/onboard-contract/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name == "contract_add_start":
@@ -1742,6 +1780,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "contract_update_current":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         query = {
             key: value
             for key, value in args.items()
@@ -1750,29 +1789,34 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             and value is not None
         }
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-        return _http(
+        return _http_with_optional_gov_token(
             "GET",
             f"/api/projects/{pid}/contract-update/{execution_id}/current-state{qs}",
+            gov_token=qa_session_token,
         )
 
     if name == "contract_update_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-update/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name in {"contract_runtime_current", "contract_runtime_guide"}:
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
         suffix = "guide" if name == "contract_runtime_guide" else "current-state"
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         query = {
             key: value
             for key, value in args.items()
@@ -1781,37 +1825,44 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             and value is not None
         }
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
-        return _http(
+        return _http_with_optional_gov_token(
             "GET",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/{suffix}{qs}",
+            gov_token=qa_session_token,
         )
 
     if name == "contract_runtime_submit_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
             body,
+            gov_token=qa_session_token,
         )
 
     if name == "contract_runtime_precheck_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "contract_execution_id"} and value is not None
+            if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            and value is not None
         }
-        return _http(
+        return _http_with_optional_gov_token(
             "POST",
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
             body,
+            gov_token=qa_session_token,
         )
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
