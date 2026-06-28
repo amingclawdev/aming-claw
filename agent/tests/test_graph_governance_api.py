@@ -6686,6 +6686,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
             body={
                 **common_body,
                 "changed_files": [changed_path],
+                "commit_sha": head_commit,
                 "tests": [{"command": "pytest -q", "status": "passed"}],
                 "test_results": {
                     "status": "passed",
@@ -6757,6 +6758,14 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish_attestation_submission["body"]["read_receipt_hash"] == (
         "sha256:read-facade"
     )
+    assert finish_attestation_submission["body"]["head_commit"] == head_commit
+    head_scope = finish_attestation_submission["body"][
+        "row_scoped_finish_head_projection"
+    ]
+    assert head_scope["status"] == "in_sync"
+    assert head_scope["row_scoped_implementation_head_commit"] == head_commit
+    assert head_scope["current_branch_head_commit"] == head_commit
+    assert head_scope["worker_finish_scope_requires_row_head"] is True
     assert finish_attestation_submission["body"]["worker_session_id"] == (
         "worker-session-facade"
     )
@@ -6767,6 +6776,8 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "finish_time_worker_attestation"
     ]["finish_gate_submission"]
     assert finish_gate_template["body"]["observer_command_id"] == "cmd-facade"
+    assert finish_gate_template["body"]["head_commit"] == head_commit
+    assert finish_gate_template["body"]["current_branch_head_commit"] == head_commit
     assert finish_gate_template["copy_safe_body"]["observer_command_id"] == (
         "cmd-facade"
     )
@@ -7481,6 +7492,66 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         assert "fence-facade" not in response_json
         assert "facade-session" not in response_json
         assert "raw-route-token-facade" not in response_json
+
+    successor_path = worktree / "agent/governance/mcp_server.py"
+    successor_path.parent.mkdir(parents=True, exist_ok=True)
+    successor_path.write_text(
+        "# successor repair continued on same branch\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "agent/governance/mcp_server.py"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "successor repair same branch"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    successor_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    scope_mismatch_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                query={**common_body, "view": "current"},
+            )
+        )
+    )
+    mismatch_projection = scope_mismatch_guide["worker_guide"][
+        "row_scoped_finish_head_projection"
+    ]
+    assert mismatch_projection["status"] == "branch_head_scope_mismatch"
+    assert mismatch_projection["row_scoped_implementation_head_commit"] == head_commit
+    assert mismatch_projection["current_branch_head_commit"] == successor_head
+    assert mismatch_projection["next_legal_action"] == (
+        "stop_for_row_scope_reconciliation"
+    )
+    assert scope_mismatch_guide["worker_guide"]["next_legal_action"] == (
+        "stop_for_row_scope_reconciliation"
+    )
+    assert scope_mismatch_guide["worker_guide"]["next_required_evidence"][0][
+        "id"
+    ] == "row_scoped_finish_head_resolution"
+    mismatch_finish_gate = scope_mismatch_guide["worker_guide"]["write_guides"][
+        "finish_gate"
+    ]["copy_safe_body"]
+    assert mismatch_finish_gate["head_commit"] == head_commit
+    assert mismatch_finish_gate["current_branch_head_commit"] == successor_head
 
 
 def test_runtime_context_finish_attestation_accepts_uncommitted_owned_diff(

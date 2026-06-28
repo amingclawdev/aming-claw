@@ -10827,7 +10827,26 @@ def _finish_gate_facade_payload_skeleton() -> dict[str, Any]:
             "session_token": "<current_runtime_context_session_token>",
             "target_project_root": "<assigned_worker_worktree_or_project_root>",
             "checkpoint_id": "<finish-gate-checkpoint-id>",
-            "head_commit": "<worker_worktree_head_commit>",
+            "head_commit": "<row_scoped_worker_implementation_head_commit>",
+            "current_branch_head_commit": (
+                "<current_branch_or_service_head_commit_if_different>"
+            ),
+            "row_scoped_finish_head_projection": {
+                "schema_version": (
+                    "runtime_context.row_scoped_finish_head_projection.v1"
+                ),
+                "row_scoped_implementation_head_commit": (
+                    "<row_scoped_worker_implementation_head_commit>"
+                ),
+                "current_branch_head_commit": (
+                    "<current_branch_or_service_head_commit_if_different>"
+                ),
+                "worker_finish_scope_requires_row_head": True,
+                "later_branch_commits_must_not_widen_row_scope": True,
+                "next_legal_action": (
+                    "record_finish_gate_or_stop_for_row_scope_reconciliation"
+                ),
+            },
             "changed_files": ["<owned-file>"],
             "status": "review_ready",
             "test_results": {"status": "passed", "passed": True},
@@ -10842,6 +10861,11 @@ def _finish_gate_facade_payload_skeleton() -> dict[str, Any]:
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
             "use_runtime_context_facade": True,
+            "head_scope": (
+                "Use the row-scoped worker implementation head. Do not replace it "
+                "with the current branch/service HEAD after successor repairs "
+                "continue on the same branch."
+            ),
         },
     }
 

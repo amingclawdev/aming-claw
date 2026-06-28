@@ -9053,6 +9053,48 @@ def _runtime_context_worker_guide_response(
         or current_state_response.get("worktree_path")
         or target_project_root
     )
+    current_branch_head_commit = _runtime_context_git_head_commit(
+        target_project_root,
+        worktree_path,
+    )
+    row_scoped_finish_head_projection = (
+        _runtime_context_row_scoped_finish_head_projection(
+            row_scoped_implementation_head_commit=str(
+                finish_attestation_hint.get("head_commit")
+                or timeline_refs.get("head_commit")
+                or timeline_refs.get("commit_sha")
+                or ""
+            ),
+            runtime_context_head_commit=str(
+                branch_view.get("head_commit")
+                or task.get("head_commit")
+                or ""
+            ),
+            current_branch_head_commit=current_branch_head_commit,
+            base_commit=str(
+                graph_identity.get("base_commit")
+                or task.get("base_commit")
+                or branch_view.get("base_commit")
+                or ""
+            ),
+            target_head_commit=str(
+                graph_identity.get("target_head_commit")
+                or task.get("target_head_commit")
+                or branch_view.get("target_head_commit")
+                or ""
+            ),
+            implementation_event_ref=str(
+                finish_attestation_hint.get("implementation_event_ref")
+                or timeline_refs.get("latest_implementation_event_ref")
+                or ""
+            ),
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+        )
+    )
+    finish_submission_head_commit = str(
+        row_scoped_finish_head_projection.get("submission_head_commit") or ""
+    ).strip()
     graph_payload_shape = dict(graph_identity.get("payload_shape") or {})
     if target_project_root:
         graph_payload_shape["target_project_root"] = target_project_root
@@ -9141,6 +9183,40 @@ def _runtime_context_worker_guide_response(
         or action_plan.get("next_legal_action")
         or ""
     )
+    branch_head_scope_mismatch = (
+        row_scoped_finish_head_projection.get("status")
+        == "branch_head_scope_mismatch"
+    )
+    scope_blocking_reasons: list[str] = []
+    if branch_head_scope_mismatch:
+        next_legal_action = "stop_for_row_scope_reconciliation"
+        next_required_evidence = [
+            {
+                "id": "row_scoped_finish_head_resolution",
+                "status": "blocked",
+                "producer": "runtime_context_service",
+                "worker_owned": False,
+                "next_legal_action": next_legal_action,
+                "row_scoped_finish_head_projection": (
+                    row_scoped_finish_head_projection
+                ),
+            },
+            *next_required_evidence,
+        ]
+        scope_blocking_reasons.append("branch_head_scope_mismatch")
+    missing_evidence = list(
+        control_plane.get("missing_evidence")
+        or action_plan.get("missing_evidence")
+        or []
+    )
+    blocking_reasons = [
+        *list(
+            control_plane.get("blocking_reasons")
+            or action_plan.get("blocking_reasons")
+            or []
+        ),
+        *scope_blocking_reasons,
+    ]
     def _auth_guide(location: str) -> dict[str, Any]:
         return {
             "primary": "runtime_context_session_token_or_ref",
@@ -9475,8 +9551,11 @@ def _runtime_context_worker_guide_response(
         ),
         "head_commit": str(
             finish_attestation_hint.get("head_commit")
-            or "<worker-worktree-head-commit>"
+            or finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
         ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": attestation_owned_files or ["<owned-file>"],
         "owned_files": attestation_owned_files or ["<owned-file>"],
         "actual_cwd": str(
@@ -9575,6 +9654,11 @@ def _runtime_context_worker_guide_response(
                 "self_attestation/artifact_refs copies are tolerated only as a "
                 "recovery source, not the preferred happy-path shape."
             ),
+            "head_scope": (
+                "Use row_scoped_finish_head_projection.submission_head_commit "
+                "for this row. current_branch_head_commit is informational when "
+                "successor repairs continue on the same branch."
+            ),
             "observer_must_not_author": True,
             "raw_tokens_exposed": False,
             "test_results_source": (
@@ -9603,7 +9687,12 @@ def _runtime_context_worker_guide_response(
         "session_token_ref": session_token_ref_placeholder,
         "target_project_root": target_project_root,
         "checkpoint_id": "<finish-gate-checkpoint-id>",
-        "head_commit": "<worker-worktree-head-commit>",
+        "head_commit": (
+            finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(worker_scope_files) or ["<owned-file>"],
         "owned_files": list(worker_scope_files) or ["<owned-file>"],
         "status": "review_ready",
@@ -9628,7 +9717,12 @@ def _runtime_context_worker_guide_response(
             "session_token_ref": session_token_ref_placeholder,
             "target_project_root": target_project_root,
             "checkpoint_id": "<finish-gate-checkpoint-id>",
-            "head_commit": "<worker-worktree-head-commit>",
+            "head_commit": (
+                finish_submission_head_commit
+                or "<row-scoped-worker-implementation-head-commit>"
+            ),
+            "current_branch_head_commit": current_branch_head_commit,
+            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "changed_files": list(worker_scope_files) or ["<owned-file>"],
             "owned_files": list(worker_scope_files) or ["<owned-file>"],
             "status": "review_ready",
@@ -9656,6 +9750,11 @@ def _runtime_context_worker_guide_response(
                 "read_receipt_event_id",
                 "finish_time_worker_self_attestation",
             ],
+            "head_scope": (
+                "Do not replace head_commit with current_branch_head_commit when "
+                "row_scoped_finish_head_projection.status is "
+                "branch_head_scope_mismatch."
+            ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },
@@ -10065,6 +10164,9 @@ def _runtime_context_worker_guide_response(
     actionable_payloads["finish_time_worker_attestation_body"] = dict(
         finish_attestation_submission["body"]
     )
+    actionable_payloads["row_scoped_finish_head_projection"] = (
+        row_scoped_finish_head_projection
+    )
     _runtime_context_patch_actionable_payload_worker_scope(
         actionable_payloads,
         worker_scope_files,
@@ -10088,6 +10190,7 @@ def _runtime_context_worker_guide_response(
         "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
         "owned_files": list(worker_scope_files),
         "target_files": list(worker_scope_files),
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "session_token_ref": str(worker_view.get("session_token_ref") or ""),
@@ -10097,16 +10200,8 @@ def _runtime_context_worker_guide_response(
         "actionable_payloads": actionable_payloads,
         "next_legal_action": next_legal_action,
         "next_required_evidence": next_required_evidence,
-        "missing_evidence": list(
-            control_plane.get("missing_evidence")
-            or action_plan.get("missing_evidence")
-            or []
-        ),
-        "blocking_reasons": list(
-            control_plane.get("blocking_reasons")
-            or action_plan.get("blocking_reasons")
-            or []
-        ),
+        "missing_evidence": missing_evidence,
+        "blocking_reasons": blocking_reasons,
         "worker_session_lifecycle_policy": actionable_payloads.get(
             "worker_session_lifecycle_policy",
             {},
@@ -10146,18 +10241,11 @@ def _runtime_context_worker_guide_response(
             "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
             "owned_files": list(worker_scope_files),
             "target_files": list(worker_scope_files),
+            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "next_legal_action": next_legal_action,
             "next_required_evidence": next_required_evidence,
-            "missing_evidence": list(
-                control_plane.get("missing_evidence")
-                or action_plan.get("missing_evidence")
-                or []
-            ),
-            "blocking_reasons": list(
-                control_plane.get("blocking_reasons")
-                or action_plan.get("blocking_reasons")
-                or []
-            ),
+            "missing_evidence": missing_evidence,
+            "blocking_reasons": blocking_reasons,
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,
@@ -10480,6 +10568,92 @@ def _runtime_context_effective_target_project_root(context) -> str:
     from .parallel_branch_runtime import runtime_context_effective_target_project_root
 
     return runtime_context_effective_target_project_root(context)
+
+
+def _runtime_context_git_head_commit(*paths: str) -> str:
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            from . import batch_jobs
+
+            return str(batch_jobs.git_commit(path) or "").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _runtime_context_row_scoped_finish_head_projection(
+    *,
+    row_scoped_implementation_head_commit: str = "",
+    runtime_context_head_commit: str = "",
+    current_branch_head_commit: str = "",
+    base_commit: str = "",
+    target_head_commit: str = "",
+    implementation_event_ref: str = "",
+    worktree_path: str = "",
+    target_project_root: str = "",
+) -> dict[str, Any]:
+    row_head = _runtime_context_non_placeholder_text(
+        row_scoped_implementation_head_commit
+    )
+    context_head = _runtime_context_non_placeholder_text(runtime_context_head_commit)
+    current_head = _runtime_context_non_placeholder_text(current_branch_head_commit)
+    submission_head = row_head or context_head
+    mismatch = bool(row_head and current_head and row_head != current_head)
+    status = (
+        "branch_head_scope_mismatch"
+        if mismatch
+        else (
+            "in_sync"
+            if row_head and current_head and row_head == current_head
+            else "pending_row_scoped_implementation_head"
+        )
+    )
+    next_legal_action = (
+        "stop_for_row_scope_reconciliation"
+        if mismatch
+        else "record_finish_time_worker_attestation"
+    )
+    return {
+        "schema_version": "runtime_context.row_scoped_finish_head_projection.v1",
+        "status": status,
+        "row_scoped_implementation_head_commit": row_head,
+        "runtime_context_head_commit": context_head,
+        "current_branch_head_commit": current_head,
+        "base_commit": str(base_commit or "").strip(),
+        "target_head_commit": str(target_head_commit or "").strip(),
+        "implementation_event_ref": str(implementation_event_ref or "").strip(),
+        "target_project_root": str(target_project_root or "").strip(),
+        "worktree_path": str(worktree_path or "").strip(),
+        "submission_head_commit": (
+            submission_head or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "finish_gate_allowed_against_current_branch_head": not mismatch,
+        "worker_finish_scope_requires_row_head": True,
+        "later_branch_commits_must_not_widen_row_scope": True,
+        "current_branch_head_is_later_than_row_head": mismatch,
+        "next_legal_action": next_legal_action,
+        "guide": (
+            "Do not submit finish-time or finish-gate evidence for the row using "
+            "the current branch HEAD. Use the row-scoped implementation head from "
+            "the implementation event, or stop and request a row-scope recovery "
+            "decision before close."
+            if mismatch
+            else (
+                "Use the row-scoped worker implementation head for finish-time "
+                "and finish-gate evidence. The current branch head is only a "
+                "service/deployment head when successor repairs continue on the "
+                "same branch."
+            )
+        ),
+        "merge_queue_policy": (
+            "Record per-row finish evidence against the row-scoped implementation "
+            "head before final ordered merge/reconcile; successor repair commits "
+            "on the same branch do not widen the earlier row scope."
+        ),
+    }
 
 
 def _runtime_context_worker_recovery_payloads(
@@ -12959,6 +13133,24 @@ def _runtime_context_finish_gate_submission_payload(
         or getattr(context, "worktree_path", "")
         or ""
     ).strip()
+    worktree_path = str(
+        getattr(context, "worktree_path", "") or target_project_root
+    ).strip()
+    current_branch_head_commit = _runtime_context_git_head_commit(
+        target_project_root,
+        worktree_path,
+    )
+    row_scoped_finish_head_projection = (
+        _runtime_context_row_scoped_finish_head_projection(
+            row_scoped_implementation_head_commit=head_commit,
+            runtime_context_head_commit=str(getattr(context, "head_commit", "") or ""),
+            current_branch_head_commit=current_branch_head_commit,
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+        )
+    )
     checkpoint_id = str(
         body.get("checkpoint_id") or getattr(context, "checkpoint_id", "") or ""
     ).strip()
@@ -12966,7 +13158,11 @@ def _runtime_context_finish_gate_submission_payload(
         checkpoint_seed = re.sub(
             r"[^A-Za-z0-9_.-]+",
             "-",
-            (head_commit or runtime_context_id or str(getattr(context, "task_id", "") or ""))
+            (
+                head_commit
+                or runtime_context_id
+                or str(getattr(context, "task_id", "") or "")
+            )
         ).strip("-")
         checkpoint_id = f"ckpt-finish-{checkpoint_seed[:24] or 'worker'}"
     action = "record_finish_gate"
@@ -12992,6 +13188,8 @@ def _runtime_context_finish_gate_submission_payload(
         "target_project_root": target_project_root,
         "checkpoint_id": checkpoint_id,
         "head_commit": head_commit,
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(changed_files),
         "owned_files": list(changed_files),
         "status": "review_ready",
@@ -13033,6 +13231,8 @@ def _runtime_context_finish_gate_submission_payload(
         "target_project_root": target_project_root,
         "checkpoint_id": checkpoint_id,
         "head_commit": head_commit,
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "changed_files": list(changed_files),
         "test_results": dict(test_results),
         "graph_trace_ids": list(graph_trace_ids),
@@ -13047,6 +13247,11 @@ def _runtime_context_finish_gate_submission_payload(
             "fence_token": "Use the same lane fence_token from the worker launch envelope.",
             "session_token": "Use the current runtime_context_session_token; raw token is not echoed.",
             "target_project_root": "Keep this equal to the assigned worker worktree/root.",
+            "head_scope": (
+                "Keep head_commit equal to the row-scoped implementation head. "
+                "current_branch_head_commit is informational when successor "
+                "repairs continue on the same branch."
+            ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
         },

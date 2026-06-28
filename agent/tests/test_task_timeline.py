@@ -14820,7 +14820,14 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
     assert facade_skeleton["body"]["finish_time_worker_self_attestation"] == (
         "<accepted_finish_time_worker_self_attestation>"
     )
+    assert facade_skeleton["body"]["head_commit"] == (
+        "<row_scoped_worker_implementation_head_commit>"
+    )
+    assert facade_skeleton["body"]["row_scoped_finish_head_projection"][
+        "worker_finish_scope_requires_row_head"
+    ] is True
     assert facade_skeleton["body"]["graph_trace_ids"] == ["<worker_owned_gqt_id>"]
+    assert "head_scope" in facade_skeleton["reminders"]
     assert facade_skeleton["reminders"][
         "raw_finish_time_attestation_alone_close_satisfying"
     ] is False
