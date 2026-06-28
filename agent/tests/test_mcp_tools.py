@@ -200,6 +200,7 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "backlog_import",
         "graph_status",
         "graph_operations_queue",
+        "graph_current_full_reconcile",
         "stale_artifact_cleanup",
         "stale_artifact_cleanup_apply",
         "graph_query",
@@ -231,6 +232,61 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "onboard_contract_current",
         "onboard_contract_submit_line",
     }.issubset(names)
+
+
+def test_mcp_graph_current_full_reconcile_schema_exposes_route_proof_fields():
+    props = _tool_properties("graph_current_full_reconcile")
+
+    for key in (
+        "backlog_id",
+        "task_id",
+        "contract_execution_id",
+        "observer_session_id",
+        "observer_route_token_ref",
+        "route_token_ref",
+    ):
+        assert key in props
+
+    assert props["observer_session_id"]["type"] == "string"
+    assert "raw route tokens are not accepted" in props["observer_route_token_ref"][
+        "description"
+    ]
+    assert props["route_token_ref"]["description"] == "Alias for observer_route_token_ref."
+
+
+def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "target_commit_sha": "head",
+            "activate": True,
+            "semantic_use_ai": False,
+            "backlog_id": "AC-CURRENT-FULL",
+            "contract_execution_id": "cex-current-full",
+            "observer_session_id": "obs-current-full",
+            "observer_route_token_ref": "rtok-current-full",
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/reconcile/current-full",
+            {
+                "target_commit_sha": "head",
+                "activate": True,
+                "semantic_use_ai": False,
+                "backlog_id": "AC-CURRENT-FULL",
+                "contract_execution_id": "cex-current-full",
+                "observer_session_id": "obs-current-full",
+                "observer_route_token_ref": "rtok-current-full",
+            },
+        )
+    ]
 
 
 def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
@@ -1022,6 +1078,19 @@ def test_mcp_graph_tools_route_to_governance_api():
         },
     )
     dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "target_commit_sha": "head",
+            "activate": True,
+            "semantic_use_ai": False,
+            "backlog_id": "AC-CURRENT-FULL",
+            "contract_execution_id": "cex-current-full",
+            "observer_session_id": "obs-current-full",
+            "observer_route_token_ref": "rtok-current-full",
+        },
+    )
+    dispatcher.dispatch(
         "graph_query",
         {
             "project_id": "aming-claw",
@@ -1064,6 +1133,19 @@ def test_mcp_graph_tools_route_to_governance_api():
     )
     assert recorder.calls[1] == (
         "POST",
+        "/api/graph-governance/aming-claw/reconcile/current-full",
+        {
+            "target_commit_sha": "head",
+            "activate": True,
+            "semantic_use_ai": False,
+            "backlog_id": "AC-CURRENT-FULL",
+            "contract_execution_id": "cex-current-full",
+            "observer_session_id": "obs-current-full",
+            "observer_route_token_ref": "rtok-current-full",
+        },
+    )
+    assert recorder.calls[2] == (
+        "POST",
         "/api/graph-governance/aming-claw/query",
         {
             "tool": "search_semantic",
@@ -1073,12 +1155,12 @@ def test_mcp_graph_tools_route_to_governance_api():
             "query_purpose": "prompt_context_build",
         },
     )
-    assert recorder.calls[2] == (
+    assert recorder.calls[3] == (
         "GET",
         "/api/graph-governance/aming-claw/stale-artifact-cleanup?repo_root=%2Frepo&include_unowned=false",
         None,
     )
-    assert recorder.calls[3] == (
+    assert recorder.calls[4] == (
         "POST",
         "/api/graph-governance/aming-claw/stale-artifact-cleanup/apply",
         {
@@ -1088,7 +1170,7 @@ def test_mcp_graph_tools_route_to_governance_api():
             "reason": "terminal cleanup",
         },
     )
-    assert recorder.calls[4] == (
+    assert recorder.calls[5] == (
         "POST",
         "/api/graph-governance/aming-claw/pending-scope",
         {"commit_sha": "head", "parent_commit_sha": "old", "evidence": {"source": "test"}},

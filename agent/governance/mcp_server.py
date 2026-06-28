@@ -1220,6 +1220,45 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "graph_current_full_reconcile",
+        "description": "Run the canonical current-commit full graph reconcile path. Defaults to current clean HEAD and activate=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "target_commit_sha": {"type": "string"},
+                "commit_sha": {"type": "string"},
+                "run_id": {"type": "string"},
+                "snapshot_id": {"type": "string"},
+                "expected_old_snapshot_id": {"type": "string"},
+                "actor": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string", "description": "Alias for backlog_id."},
+                "task_id": {"type": "string"},
+                "contract_execution_id": {"type": "string", "description": "Alias for task_id."},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Alias for observer_route_token_ref.",
+                },
+                "activate": {"type": "boolean", "default": True},
+                "require_clean": {"type": "boolean", "default": True},
+                "semantic_use_ai": {"type": "boolean"},
+                "semantic_enrich": {"type": "boolean"},
+                "enqueue_stale": {"type": "boolean", "default": False},
+                "notes_extra": {"type": "object"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "runtime_context_current",
         "description": "Read the Runtime Context Service current-state projection. mf_sub callers receive only the role-filtered worker view.",
         "inputSchema": {
@@ -1867,6 +1906,19 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
             body,
             gov_token=qa_session_token,
+        )
+
+    if name == "graph_current_full_reconcile":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/graph-governance/{pid}/reconcile/current-full",
+            body,
         )
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
