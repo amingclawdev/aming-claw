@@ -34287,6 +34287,47 @@ def _onboard_runtime_resume_from_current_projection(
     }
 
 
+def _source_backed_contract_chain_is_complete(
+    current_projection: Mapping[str, Any],
+) -> bool:
+    if not current_projection:
+        return False
+    if str(current_projection.get("projection_source") or "") != (
+        "backlog_contract_chain_current"
+    ):
+        return False
+    if str(current_projection.get("readiness_state") or "") != "contract_complete":
+        return False
+    next_action = (
+        current_projection.get("next_legal_action")
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return not next_action and not str(
+        current_projection.get("active_child_contract_execution_id") or ""
+    ).strip()
+
+
+def _backlog_has_source_backed_onboarding(
+    conn,
+    *,
+    backlog_id: str,
+) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    contract = backlog_runtime.parse_json_object(
+        _row_get(row, "chain_trigger_json", "{}")
+    )
+    return _source_backed_onboarding_enabled(contract)
+
+
 def _contract_runtime_stale_recovery_id(
     stale: StalePinnedContractExecutionError,
 ) -> str:
@@ -37288,6 +37329,10 @@ def _onboard_route_guide_service_response(
         route_token_ref=route_token_ref,
     )
     projection_degraded = bool(current_projection.get("degraded"))
+    source_backed_onboarding = _backlog_has_source_backed_onboarding(
+        conn,
+        backlog_id=backlog_id,
+    )
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
         "route_token_issue_target_files": target_files,
@@ -37305,6 +37350,10 @@ def _onboard_route_guide_service_response(
             and not str(
                 current_projection.get("active_child_contract_execution_id") or ""
             ).strip()
+            and not (
+                source_backed_onboarding
+                and _source_backed_contract_chain_is_complete(current_projection)
+            )
         ):
             blocked_resume = _onboard_blocked_contract_resume_projection(
                 conn,
