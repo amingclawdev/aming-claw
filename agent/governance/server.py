@@ -16268,12 +16268,23 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
         )
         with sqlite_write_lock():
             task_timeline.ensure_schema(conn)
+            startup_payload, dispatch_identity_bridge = (
+                _contract_runtime_dispatch_bridge_for_startup(
+                    conn,
+                    project_id=project_id,
+                    payload=ctx.body or {},
+                )
+            )
             result = record_mf_subagent_startup(
                 conn,
                 project_id=project_id,
                 task_id=task_id,
-                payload=ctx.body or {},
-                now_iso=str(ctx.body.get("now_iso") or ""),
+                payload=startup_payload,
+                now_iso=str(startup_payload.get("now_iso") or ""),
+            )
+            result = _apply_contract_runtime_dispatch_bridge_to_startup_result(
+                result,
+                dispatch_identity_bridge,
             )
             event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
             if event:
@@ -35252,18 +35263,25 @@ def _contract_runtime_mapping_matches_context(
     return False
 
 
-def _contract_runtime_record_references_runtime_context(
-    record: Mapping[str, Any] | None,
-    context,
-) -> bool:
+def _contract_runtime_context_identity(context) -> tuple[str, str, str]:
     runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
+    if not runtime_context_id and context is not None:
+        try:
+            from .parallel_branch_runtime import runtime_context_id_for_branch_context
+
+            runtime_context_id = runtime_context_id_for_branch_context(context)
+        except Exception:
+            runtime_context_id = ""
     task_id = str(getattr(context, "task_id", "") or "").strip()
     parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
-    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
-        record, Mapping
-    ):
-        return False
+    return runtime_context_id, task_id, parent_task_id
 
+
+def _contract_runtime_completed_lines(
+    record: Mapping[str, Any] | None,
+) -> list[tuple[int, Mapping[str, Any]]]:
+    if not isinstance(record, Mapping):
+        return []
     guide = (
         record.get("runtime_guide")
         if isinstance(record.get("runtime_guide"), Mapping)
@@ -35273,6 +35291,160 @@ def _contract_runtime_record_references_runtime_context(
     if not isinstance(completed_lines, list):
         completed_lines = record.get("completed_lines")
     if not isinstance(completed_lines, list):
+        return []
+    return [
+        (index, line)
+        for index, line in enumerate(completed_lines)
+        if isinstance(line, Mapping)
+    ]
+
+
+def _contract_runtime_dispatch_line_match(
+    record: Mapping[str, Any] | None,
+    context,
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
+        record, Mapping
+    ):
+        return {}
+
+    contract_id = str(record.get("contract_id") or "").strip()
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+
+    def _matches_context(
+        value: Mapping[str, Any],
+        *,
+        task_id_keys: tuple[str, ...] = ("task_id",),
+    ) -> bool:
+        return _contract_runtime_mapping_matches_context(
+            value,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            task_id_keys=task_id_keys,
+        )
+
+    for index, line in _contract_runtime_completed_lines(record):
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        is_legacy_dispatch_line = (
+            str(line.get("stage_id") or "").strip() == "dispatch"
+            and str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+        )
+        is_direct_fix_dispatch_line = (
+            contract_id == DIRECT_FIX_CONTRACT_ID
+            and str(line.get("stage_id") or "").strip() == "dispatch_context"
+            and str(line.get("line_id") or "").strip()
+            == "direct_fix_dispatch_context"
+        )
+        if (
+            not (is_legacy_dispatch_line or is_direct_fix_dispatch_line)
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+            or str(line.get("actor_role") or "").strip() != "observer"
+        ):
+            continue
+        dispatch_task_id_keys = ("task_id", "worker_task_id")
+        if not (
+            _matches_context(line, task_id_keys=dispatch_task_id_keys)
+            or _matches_context(payload, task_id_keys=dispatch_task_id_keys)
+        ):
+            continue
+        return {
+            "schema_version": "contract_runtime.dispatch_line_match.v1",
+            "contract_id": contract_id,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "line_index": index,
+            "stage_id": str(line.get("stage_id") or "").strip(),
+            "line_id": str(line.get("line_id") or "").strip(),
+            "evidence_kind": str(line.get("evidence_kind") or "").strip(),
+            "actor_role": str(line.get("actor_role") or "").strip(),
+            "line": dict(line),
+            "payload": dict(payload),
+            "source_ref": (
+                f"contract_runtime:{contract_execution_id}:completed_lines:{index}"
+            ),
+        }
+    return {}
+
+
+def _contract_runtime_dispatch_identity_bridge(
+    record: Mapping[str, Any] | None,
+    dispatch_match: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(record, Mapping) or not isinstance(dispatch_match, Mapping):
+        return {}
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not contract_execution_id:
+        return {}
+    line = (
+        dispatch_match.get("line")
+        if isinstance(dispatch_match.get("line"), Mapping)
+        else {}
+    )
+    payload = (
+        dispatch_match.get("payload")
+        if isinstance(dispatch_match.get("payload"), Mapping)
+        else {}
+    )
+    legacy_observer_command_id = (
+        _contract_runtime_mapping_value(line, "observer_command_id", "command_id")
+        or _contract_runtime_mapping_value(payload, "observer_command_id", "command_id")
+    )
+    if legacy_observer_command_id:
+        observer_command_id = legacy_observer_command_id
+        observer_command_id_source = "legacy_observer_command_id"
+        observer_command_id_kind = "legacy_observer_command_id"
+        dispatch_identity_source = "legacy_observer_command_id"
+        dispatch_identity_field = "observer_command_id"
+        legacy_present = True
+    else:
+        observer_command_id = contract_execution_id
+        observer_command_id_source = "contract_runtime_execution_id_bridge"
+        observer_command_id_kind = "contract_runtime_execution"
+        dispatch_identity_source = "contract_runtime_execution"
+        dispatch_identity_field = "contract_execution_id"
+        legacy_present = False
+    return {
+        "schema_version": "contract_runtime.dispatch_identity_bridge.v1",
+        "accepted": True,
+        "source": dispatch_identity_source,
+        "source_label": f"{dispatch_identity_source}/{dispatch_identity_field}",
+        "dispatch_identity": observer_command_id,
+        "dispatch_identity_field": dispatch_identity_field,
+        "observer_command_id": observer_command_id,
+        "observer_command_id_source": observer_command_id_source,
+        "observer_command_id_kind": observer_command_id_kind,
+        "legacy_observer_command_id": legacy_observer_command_id,
+        "legacy_observer_command_id_present": legacy_present,
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": str(dispatch_match.get("runtime_context_id") or ""),
+        "task_id": str(dispatch_match.get("task_id") or ""),
+        "parent_task_id": str(dispatch_match.get("parent_task_id") or ""),
+        "stage_id": str(dispatch_match.get("stage_id") or ""),
+        "line_id": str(dispatch_match.get("line_id") or ""),
+        "evidence_kind": str(dispatch_match.get("evidence_kind") or ""),
+        "source_ref": str(dispatch_match.get("source_ref") or ""),
+    }
+
+
+def _contract_runtime_record_references_runtime_context(
+    record: Mapping[str, Any] | None,
+    context,
+) -> bool:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    if not all((runtime_context_id, task_id, parent_task_id)) or not isinstance(
+        record, Mapping
+    ):
         return False
 
     contract_id = str((record or {}).get("contract_id") or "").strip()
@@ -35290,9 +35462,7 @@ def _contract_runtime_record_references_runtime_context(
             task_id_keys=task_id_keys,
         )
 
-    for line in completed_lines:
-        if not isinstance(line, Mapping):
-            continue
+    for _, line in _contract_runtime_completed_lines(record):
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         if contract_id == CONTRACT_UPDATE_CONTRACT_ID and (
             str(line.get("stage_id") or "").strip() == "observer_request"
@@ -35314,34 +35484,178 @@ def _contract_runtime_record_references_runtime_context(
             )
             if _matches_context(worker_context) or _matches_context(worker_dispatch):
                 return True
-        is_legacy_dispatch_line = (
-            str(line.get("stage_id") or "").strip() == "dispatch"
-            and str(line.get("line_id") or "").strip()
-            == "observer_dispatch_bounded_workers"
-        )
-        is_direct_fix_dispatch_line = (
-            contract_id == DIRECT_FIX_CONTRACT_ID
-            and str(line.get("stage_id") or "").strip() == "dispatch_context"
-            and str(line.get("line_id") or "").strip()
-            == "direct_fix_dispatch_context"
-        )
-        if (
-            not (is_legacy_dispatch_line or is_direct_fix_dispatch_line)
-            or str(line.get("evidence_kind") or "").strip()
-            != "dispatch_bounded_worker"
-            or str(line.get("actor_role") or "").strip() != "observer"
-        ):
+    return bool(_contract_runtime_dispatch_line_match(record, context))
+
+
+def _contract_runtime_dispatch_bridge_for_startup(
+    conn,
+    *,
+    project_id: str,
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    startup_payload = dict(payload)
+    if str(startup_payload.get("observer_command_id") or "").strip():
+        return startup_payload, {}
+
+    runtime_context_id = str(startup_payload.get("runtime_context_id") or "").strip()
+    task_id = str(startup_payload.get("task_id") or "").strip()
+    if not (runtime_context_id or task_id):
+        return startup_payload, {}
+
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+        runtime_context_id_for_branch_context,
+    )
+
+    context = (
+        get_branch_context_by_runtime_context_id(conn, project_id, runtime_context_id)
+        if runtime_context_id
+        else None
+    )
+    if context is None and task_id:
+        context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        return startup_payload, {}
+    expected_runtime_context_id = runtime_context_id_for_branch_context(context)
+    if runtime_context_id and runtime_context_id != expected_runtime_context_id:
+        return startup_payload, {}
+
+    store = _contract_runtime_store(conn)
+    candidate_ids: list[str] = []
+    for key in (
+        "contract_execution_id",
+        "parent_contract_execution_id",
+        "successor_contract_execution_id",
+        "host_startup_id",
+        "parent_task_id",
+    ):
+        candidate = str(startup_payload.get(key) or "").strip()
+        if candidate.startswith("cex-") and candidate not in candidate_ids:
+            candidate_ids.append(candidate)
+
+    records: list[Mapping[str, Any]] = []
+    for contract_execution_id in candidate_ids:
+        try:
+            records.append(store.get(contract_execution_id))
+        except ContractRuntimeError:
             continue
-        dispatch_task_id_keys = ("task_id", "worker_task_id")
-        if _matches_context(
-            line,
-            task_id_keys=dispatch_task_id_keys,
-        ) or _matches_context(
-            payload,
-            task_id_keys=dispatch_task_id_keys,
-        ):
-            return True
-    return False
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT record_json
+            FROM contract_runtime_executions
+            WHERE project_id = ?
+              AND contract_id IN (?, ?)
+            ORDER BY updated_at DESC, contract_execution_id DESC
+            LIMIT 200
+            """,
+            (project_id, MF_PARALLEL_RECORD_CONTRACT_ID, DIRECT_FIX_CONTRACT_ID),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            record = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        contract_execution_id = str(record.get("contract_execution_id") or "")
+        if not contract_execution_id or contract_execution_id in {
+            str(existing.get("contract_execution_id") or "") for existing in records
+        }:
+            continue
+        records.append(record)
+
+    for record in records:
+        dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+        bridge = _contract_runtime_dispatch_identity_bridge(record, dispatch_match)
+        if not bridge:
+            continue
+        startup_payload.update(
+            {
+                "observer_command_id": bridge["observer_command_id"],
+                "observer_command_id_source": bridge["observer_command_id_source"],
+                "observer_command_id_kind": bridge["observer_command_id_kind"],
+                "legacy_observer_command_id": bridge["legacy_observer_command_id"],
+                "legacy_observer_command_id_present": bridge[
+                    "legacy_observer_command_id_present"
+                ],
+                "dispatch_identity_source": bridge["source"],
+                "dispatch_identity_source_label": bridge["source_label"],
+                "contract_runtime_dispatch_identity": bridge,
+            }
+        )
+        startup_payload.setdefault("startup_source", bridge["source"])
+        return startup_payload, bridge
+    return startup_payload, {}
+
+
+def _apply_contract_runtime_dispatch_bridge_to_startup_result(
+    result: dict[str, Any],
+    bridge: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(result, dict) or not isinstance(bridge, Mapping) or not bridge:
+        return result
+    bridge_payload = dict(bridge)
+    labels = {
+        "contract_runtime_dispatch_identity": bridge_payload,
+        "dispatch_identity_source": str(bridge.get("source") or ""),
+        "dispatch_identity_source_label": str(bridge.get("source_label") or ""),
+        "observer_command_id_source": str(
+            bridge.get("observer_command_id_source") or ""
+        ),
+        "observer_command_id_kind": str(
+            bridge.get("observer_command_id_kind") or ""
+        ),
+        "legacy_observer_command_id": str(
+            bridge.get("legacy_observer_command_id") or ""
+        ),
+        "legacy_observer_command_id_present": bool(
+            bridge.get("legacy_observer_command_id_present")
+        ),
+        "contract_execution_id": str(bridge.get("contract_execution_id") or ""),
+        "contract_id": str(bridge.get("contract_id") or ""),
+    }
+    gate = result.get("startup_gate")
+    if isinstance(gate, dict):
+        gate.update(labels)
+    event = result.get("timeline_event")
+    if isinstance(event, dict):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_gate = (
+            payload.get("mf_subagent_startup_gate")
+            if isinstance(payload.get("mf_subagent_startup_gate"), dict)
+            else {}
+        )
+        if event_gate:
+            event_gate.update(labels)
+        artifact_refs = (
+            event.get("artifact_refs")
+            if isinstance(event.get("artifact_refs"), dict)
+            else {}
+        )
+        artifact_refs.update(
+            {
+                "contract_runtime_dispatch_identity_source": labels[
+                    "dispatch_identity_source"
+                ],
+                "dispatch_identity_source_label": labels[
+                    "dispatch_identity_source_label"
+                ],
+                "observer_command_id_source": labels["observer_command_id_source"],
+                "observer_command_id_kind": labels["observer_command_id_kind"],
+                "legacy_observer_command_id_present": labels[
+                    "legacy_observer_command_id_present"
+                ],
+                "contract_execution_id": labels["contract_execution_id"],
+                "contract_id": labels["contract_id"],
+            }
+        )
+        event["artifact_refs"] = artifact_refs
+    result["contract_runtime_dispatch_identity"] = bridge_payload
+    return result
 
 
 def _contract_runtime_has_legacy_direct_fix_dispatch_without_context(
@@ -43668,6 +43982,55 @@ def _record_bounded_worker_dispatch_event(
     runtime_context_id = _first_field("runtime_context_id")
     worker_slot_id = _first_field("worker_slot_id", "worker_id")
     observer_command_id = _first_field("observer_command_id")
+    legacy_observer_command_id = observer_command_id
+    dispatch_identity_bridge: dict[str, Any] = {}
+    contract_runtime_execution_id = _first_field(
+        "contract_execution_id",
+        "successor_contract_execution_id",
+    )
+    if not observer_command_id and contract_runtime_execution_id:
+        observer_command_id = contract_runtime_execution_id
+        dispatch_identity_bridge = {
+            "schema_version": "contract_runtime.dispatch_identity_bridge.v1",
+            "accepted": True,
+            "source": "contract_runtime_execution",
+            "source_label": "contract_runtime_execution/contract_execution_id",
+            "dispatch_identity": contract_runtime_execution_id,
+            "dispatch_identity_field": "contract_execution_id",
+            "observer_command_id": observer_command_id,
+            "observer_command_id_source": "contract_runtime_execution_id_bridge",
+            "observer_command_id_kind": "contract_runtime_execution",
+            "legacy_observer_command_id": "",
+            "legacy_observer_command_id_present": False,
+            "contract_execution_id": contract_runtime_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }
+    observer_command_id_source = (
+        str(dispatch_identity_bridge.get("observer_command_id_source") or "")
+        or _first_field("observer_command_id_source")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    observer_command_id_kind = (
+        str(dispatch_identity_bridge.get("observer_command_id_kind") or "")
+        or _first_field("observer_command_id_kind")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    dispatch_identity_source = (
+        str(dispatch_identity_bridge.get("source") or "")
+        or _first_field("dispatch_identity_source")
+        or ("legacy_observer_command_id" if legacy_observer_command_id else "")
+    )
+    dispatch_identity_source_label = (
+        str(dispatch_identity_bridge.get("source_label") or "")
+        or _first_field("dispatch_identity_source_label")
+        or (
+            "legacy_observer_command_id/observer_command_id"
+            if legacy_observer_command_id
+            else ""
+        )
+    )
     dispatch_actor = _first_text(
         body.get("actor"),
         prepared.get("actor"),
@@ -43696,6 +44059,17 @@ def _record_bounded_worker_dispatch_event(
         "parent_task_id": parent_task_id,
         "backlog_id": backlog_id,
         "observer_command_id": observer_command_id,
+        "observer_command_id_source": observer_command_id_source,
+        "observer_command_id_kind": observer_command_id_kind,
+        "legacy_observer_command_id": legacy_observer_command_id,
+        "legacy_observer_command_id_present": bool(legacy_observer_command_id),
+        "dispatch_identity_source": dispatch_identity_source,
+        "dispatch_identity_source_label": dispatch_identity_source_label,
+        **(
+            {"contract_runtime_dispatch_identity": dict(dispatch_identity_bridge)}
+            if dispatch_identity_bridge
+            else {}
+        ),
         "worker_role": "mf_sub",
         "worker_slot_id": worker_slot_id,
         "worker_id": worker_slot_id,
@@ -44063,6 +44437,205 @@ def _record_bounded_worker_dispatch_event(
         "event_kind": event.get("event_kind"),
         "runtime_context_id": runtime_context_id,
     }
+
+
+def _contract_runtime_context_for_dispatch_line(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+):
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    for candidate in _contract_runtime_mapping_candidates(line):
+        if _contract_runtime_mapping_worker_role(candidate) != "mf_sub":
+            continue
+        runtime_context_id = _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+        )
+        task_id = _contract_runtime_mapping_value(
+            candidate,
+            "task_id",
+            "worker_task_id",
+        )
+        context = (
+            get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if runtime_context_id
+            else None
+        )
+        if context is None and task_id:
+            context = get_branch_context(conn, project_id, task_id)
+        if context is None:
+            continue
+        if _contract_runtime_dispatch_line_match(record, context):
+            return context
+    return None
+
+
+def _record_contract_runtime_mf_parallel_dispatch_event(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    result: Mapping[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
+        return {}
+    if (
+        str(write.get("stage_id") or "").strip() != "dispatch"
+        or str(write.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(write.get("evidence_kind") or "").strip()
+        != "dispatch_bounded_worker"
+        or not result.get("ok")
+    ):
+        return {}
+    stored_record = (
+        result.get("record") if isinstance(result.get("record"), Mapping) else record
+    )
+    context = _contract_runtime_context_for_dispatch_line(
+        conn,
+        project_id=project_id,
+        record=stored_record,
+        line=write,
+    )
+    if context is None:
+        return {}
+
+    from .parallel_branch_runtime import runtime_context_id_for_branch_context
+
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    owned_files = list(getattr(context, "owned_files", ()) or ())
+    if not owned_files:
+        owned_files = list(getattr(context, "target_files", ()) or ())
+    if not owned_files:
+        owned_files = _runtime_context_service_query_values(
+            payload,
+            "owned_files",
+            "target_files",
+        )
+    route_token_ref = (
+        str(write.get("route_token_ref") or "").strip()
+        or str(payload.get("route_token_ref") or "").strip()
+        or str(record.get("route_token_ref") or "").strip()
+    )
+    dispatch_body = {
+        **dict(payload),
+        **dict(write),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "runtime_context_id": runtime_context_id_for_branch_context(context),
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "backlog_id": str(getattr(context, "backlog_id", "") or record.get("backlog_id") or ""),
+        "worker_role": "mf_sub",
+        "worker_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "agent_id": str(
+            getattr(context, "agent_id", "")
+            or getattr(context, "allocation_owner", "")
+            or ""
+        ),
+        "fence_token": str(getattr(context, "fence_token", "") or ""),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "")
+            or write.get("worktree_path")
+            or payload.get("worktree_path")
+            or ""
+        ),
+        "branch_ref": str(
+            getattr(context, "branch_ref", "")
+            or write.get("branch_ref")
+            or write.get("branch")
+            or payload.get("branch_ref")
+            or payload.get("branch")
+            or ""
+        ),
+        "base_commit": str(
+            getattr(context, "base_commit", "")
+            or write.get("base_commit")
+            or payload.get("base_commit")
+            or ""
+        ),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "")
+            or write.get("target_head_commit")
+            or payload.get("target_head_commit")
+            or ""
+        ),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "")
+            or write.get("merge_queue_id")
+            or payload.get("merge_queue_id")
+            or ""
+        ),
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "route_token_ref": route_token_ref,
+    }
+    dispatch_result = _record_bounded_worker_dispatch_event(
+        conn,
+        project_id,
+        body=dispatch_body,
+        prepared={
+            "contract_execution_id": str(record.get("contract_execution_id") or ""),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        },
+        branch_runtime_evidence={
+            "context": {
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+                "root_task_id": _runtime_context_mf_sub_parent_task_id(context),
+                "worker_id": str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                "worker_slot_id": str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ),
+                "agent_id": str(getattr(context, "agent_id", "") or ""),
+                "fence_token": str(getattr(context, "fence_token", "") or ""),
+                "worktree_path": str(getattr(context, "worktree_path", "") or ""),
+                "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+                "base_commit": str(getattr(context, "base_commit", "") or ""),
+                "target_head_commit": str(
+                    getattr(context, "target_head_commit", "") or ""
+                ),
+                "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+                "owned_files": owned_files,
+            }
+        },
+        source="contract_runtime_execution",
+        request_id=request_id,
+    )
+    if dispatch_result:
+        dispatch_result["contract_execution_id"] = str(
+            record.get("contract_execution_id") or ""
+        )
+        dispatch_result["dispatch_identity_source"] = "contract_runtime_execution"
+    return dispatch_result
 
 
 def _observer_runtime_text_contract_revision_payload(
@@ -50611,6 +51184,16 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     write,
                     actor_role=actor_role,
                 )
+                dispatch_timeline_event = (
+                    _record_contract_runtime_mf_parallel_dispatch_event(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        write=write,
+                        result=result,
+                        request_id=str(ctx.request_id),
+                    )
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
@@ -50640,6 +51223,8 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["ok"] = bool(result.get("ok"))
         response["decision"] = result.get("decision") or {}
         response["actor_role"] = actor_role
+    if "dispatch_timeline_event" in locals() and dispatch_timeline_event:
+        response["contract_runtime_dispatch_timeline_event"] = dispatch_timeline_event
     return response
 
 
