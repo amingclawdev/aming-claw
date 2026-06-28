@@ -66,6 +66,17 @@ class _RuntimeGovRecorder(_Recorder):
                 "runtime_match": True,
                 "gov_runtime_version": "abc1234",
                 "sm_runtime_version": "abc1234",
+                "target_project_version": {
+                    "head": "abc1234",
+                    "chain_version": "abc1234",
+                    "dirty": False,
+                    "synced_with_governance": True,
+                    "legacy_project_version": {
+                        "chain_version": "abc1234",
+                        "git_head": "abc1234",
+                        "synced_with_target": True,
+                    },
+                },
             }
         return {"ok": True, "method": method, "path": path, "data": data}
 
@@ -89,6 +100,36 @@ class _RuntimeMismatchGovRecorder(_Recorder):
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _LegacyRuntimeDriftGovRecorder(_Recorder):
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        self.calls.append((method, path, data))
+        if path == "/api/health":
+            return {"status": "ok", "version": "new1234"}
+        if path == "/api/version-check/aming-claw":
+            return {
+                "ok": False,
+                "head": "new1234",
+                "chain_version": "new1234",
+                "dirty": False,
+                "runtime_match": True,
+                "gov_runtime_version": "new1234",
+                "sm_runtime_version": "new1234",
+                "target_project_version": {
+                    "head": "new1234",
+                    "chain_version": "new1234",
+                    "dirty": False,
+                    "synced_with_governance": True,
+                    "legacy_project_version": {
+                        "chain_version": "legacy123",
+                        "git_head": "new1234",
+                        "synced_with_target": True,
+                    },
+                },
+                "message": "legacy project_version CHAIN_VERSION drift",
+            }
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+
 class _AdvancedRuntimeMismatchGovRecorder(_Recorder):
     def api(self, method: str, path: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
@@ -103,6 +144,23 @@ class _AdvancedRuntimeMismatchGovRecorder(_Recorder):
                 "runtime_match": False,
                 "gov_runtime_version": "new1234",
                 "sm_runtime_version": "old1234",
+                "target_project_version": {
+                    "head": "new1234",
+                    "chain_version": "new1234",
+                    "dirty": False,
+                    "synced_with_governance": True,
+                    "legacy_project_version": {
+                        "chain_version": "legacy123",
+                        "git_head": "new1234",
+                        "synced_with_target": True,
+                    },
+                },
+                "governance_runtime": {
+                    "chain_version": "new1234",
+                    "gov_runtime_version": "new1234",
+                    "sm_runtime_version": "old1234",
+                    "runtime_match": False,
+                },
                 "message": "ServiceManager runtime is behind",
             }
         return {"ok": True, "method": method, "path": path, "data": data}
@@ -1940,6 +1998,7 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert status["version_check"]["runtime_match"] is True
     assert status["target_project_version"]["head"] == "abc1234"
     assert status["governance_runtime"]["runtime_match"] is True
+    assert status["legacy_runtime_waivers"] == []
     assert governance.calls == [
         ("GET", "/api/health", None),
         ("GET", "/api/version-check/aming-claw", None),
@@ -1947,7 +2006,7 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert manager.calls == [("GET", "/api/manager/health", None)]
 
 
-def test_mcp_runtime_status_runtime_mismatch_is_advanced_ops_only():
+def test_mcp_runtime_status_current_target_chain_mismatch_blocks_core():
     governance = _RuntimeMismatchGovRecorder()
     manager = _Recorder()
     dispatcher = _dispatcher(governance, manager)
@@ -1964,7 +2023,42 @@ def test_mcp_runtime_status_runtime_mismatch_is_advanced_ops_only():
     assert status["capabilities"]["advanced_chain_ops"] is False
     assert status["capabilities"]["executor"] is False
     assert "version metadata needs attention" in status["summary"]
+    assert status["legacy_runtime_waivers"] == []
     assert "advanced_chain_ops_redeploy_or_restart" in status["recommended_actions"]
+
+
+def test_mcp_runtime_status_legacy_chain_drift_has_nonblocking_waiver():
+    governance = _LegacyRuntimeDriftGovRecorder()
+    manager = _Recorder()
+    dispatcher = _dispatcher(governance, manager)
+
+    status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
+
+    assert status["ok"] is True
+    assert status["strict_ok"] is True
+    assert status["severity"] == "ok"
+    assert status["capabilities"]["core_runtime"] is True
+    assert status["capabilities"]["advanced_chain_ops"] is True
+    assert status["recommended_actions"] == []
+    assert status["legacy_runtime_waivers"] == [
+        {
+            "id": "legacy_project_version_chain_drift",
+            "scope": "legacy_project_version",
+            "blocking": False,
+            "capability": "core_runtime",
+            "reason": (
+                "legacy project_version/CHAIN_VERSION metadata differs from "
+                "the current target version but target runtime evidence is clean"
+            ),
+            "evidence": {
+                "legacy_chain_version": "legacy123",
+                "target_chain_version": "new1234",
+                "target_head": "new1234",
+                "legacy_synced_with_target": True,
+                "legacy_git_head": "new1234",
+            },
+        }
+    ]
 
 
 def test_mcp_runtime_status_service_manager_mismatch_keeps_core_ok():
@@ -1980,7 +2074,19 @@ def test_mcp_runtime_status_service_manager_mismatch_keeps_core_ok():
     assert status["capabilities"]["core_runtime"] is True
     assert status["capabilities"]["advanced_chain_ops"] is False
     assert status["capabilities"]["executor"] is False
-    assert "Governance core is healthy" in status["summary"]
+    assert "legacy/advanced runtime drift is waived" in status["summary"]
+    assert {waiver["id"] for waiver in status["legacy_runtime_waivers"]} == {
+        "advanced_runtime_version_mismatch",
+        "legacy_project_version_chain_drift",
+    }
+    assert all(waiver["blocking"] is False for waiver in status["legacy_runtime_waivers"])
+    advanced_waiver = next(
+        waiver
+        for waiver in status["legacy_runtime_waivers"]
+        if waiver["id"] == "advanced_runtime_version_mismatch"
+    )
+    assert advanced_waiver["scope"] == "advanced_chain_ops/executor"
+    assert advanced_waiver["evidence"]["sm_runtime_version"] == "old1234"
     assert "advanced_chain_ops_redeploy_or_restart" in status["recommended_actions"]
 
 
