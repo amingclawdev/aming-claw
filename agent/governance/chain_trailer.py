@@ -31,9 +31,13 @@ log = logging.getLogger(__name__)
 
 # 4-field trailer regexes per §4.1
 _RE_SOURCE_TASK = re.compile(r"^Chain-Source-Task:\s*(\S+)", re.MULTILINE)
+_RE_SOURCE_CONTRACT = re.compile(
+    r"^Chain-Source-Contract-Execution:\s*(\S+)", re.MULTILINE
+)
 _RE_SOURCE_STAGE = re.compile(r"^Chain-Source-Stage:\s*(\S+)", re.MULTILINE)
 _RE_PARENT = re.compile(r"^Chain-Parent:\s*(\S+)", re.MULTILINE)
 _RE_BUG_ID = re.compile(r"^Chain-Bug-Id:\s*(\S+)", re.MULTILINE)
+_RE_MERGE_QUEUE_ID = re.compile(r"^Chain-Merge-Queue-Id:\s*(\S+)", re.MULTILINE)
 
 # Legacy single-field regex (for backfill detection)
 _LEGACY_TRAILER_RE = re.compile(r"^Chain-Version:\s*(\S+)", re.MULTILINE)
@@ -72,9 +76,17 @@ def _parse_4field_trailer(message: str) -> dict[str, str | None]:
     """Extract all 4 trailer fields from a commit message."""
     return {
         "task_id": (_m.group(1) if (_m := _RE_SOURCE_TASK.search(message)) else None),
+        "source_contract_id": (
+            _m_contract.group(1)
+            if (_m_contract := _RE_SOURCE_CONTRACT.search(message))
+            else None
+        ),
         "stage": (_m2.group(1) if (_m2 := _RE_SOURCE_STAGE.search(message)) else None),
         "parent_sha": (_m3.group(1) if (_m3 := _RE_PARENT.search(message)) else None),
         "bug_id": (_m4.group(1) if (_m4 := _RE_BUG_ID.search(message)) else None),
+        "merge_queue_id": (
+            _m_queue.group(1) if (_m_queue := _RE_MERGE_QUEUE_ID.search(message)) else None
+        ),
     }
 
 
@@ -85,8 +97,10 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
     Chain-Source-Stage trailer. Returns dict with keys:
         chain_sha   — commit hash of the trailer commit (short)
         task_id     — Chain-Source-Task value
+        source_contract_id — optional Chain-Source-Contract-Execution value
         stage       — Chain-Source-Stage value
         parent_sha  — Chain-Parent value
+        merge_queue_id — optional Chain-Merge-Queue-Id value
         version     — compat alias for chain_sha
         dirty       — bool, True if workspace has non-ignored uncommitted changes
         dirty_files — list of dirty file paths (filtered by _DIRTY_IGNORE)
@@ -100,8 +114,10 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
 
     chain_sha = None
     task_id = None
+    source_contract_id = None
     stage = None
     parent_sha = None
+    merge_queue_id = None
     source = "head"
 
     if log_output:
@@ -121,8 +137,10 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
                 short_proc = _git(["rev-parse", "--short", commit_hash], cwd=root)
                 chain_sha = short_proc.stdout.strip() if short_proc.returncode == 0 else commit_hash[:7]
                 task_id = fields["task_id"]
+                source_contract_id = fields["source_contract_id"]
                 stage = fields["stage"]
                 parent_sha = fields["parent_sha"]
+                merge_queue_id = fields["merge_queue_id"]
                 source = "trailer"
                 break
             # Also check legacy Chain-Version
@@ -145,8 +163,10 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
     return {
         "chain_sha": chain_sha,
         "task_id": task_id,
+        "source_contract_id": source_contract_id,
         "stage": stage,
         "parent_sha": parent_sha,
+        "merge_queue_id": merge_queue_id,
         "version": chain_sha,  # compat alias
         "dirty": bool(dirty_files),
         "dirty_files": dirty_files,
@@ -467,8 +487,10 @@ def write_merge_with_trailer(
     cwd: str | None = None,
     extra_args: list[str] | None = None,
     task_id: str | None = None,
+    source_contract_id: str | None = None,
     parent_chain_sha: str | None = None,
     bug_id: str | None = None,
+    merge_queue_id: str | None = None,
 ) -> tuple[bool, str, str]:
     """Create a merge/commit with 4-field Chain trailer lines.
 
@@ -484,8 +506,10 @@ def write_merge_with_trailer(
         cwd: Optional working directory
         extra_args: Additional git args
         task_id: Chain-Source-Task value (task ID)
+        source_contract_id: Optional Chain-Source-Contract-Execution value
         parent_chain_sha: Chain-Parent value (parent chain commit SHA)
         bug_id: Chain-Bug-Id value (backlog bug ID)
+        merge_queue_id: Optional Chain-Merge-Queue-Id value
 
     Returns:
         (success, commit_hash, error_message)
@@ -506,9 +530,13 @@ def write_merge_with_trailer(
     # Build trailer lines
     trailer_lines = []
     trailer_lines.append(f"Chain-Source-Task: {task_id or 'unknown'}")
+    if source_contract_id:
+        trailer_lines.append(f"Chain-Source-Contract-Execution: {source_contract_id}")
     trailer_lines.append(f"Chain-Source-Stage: merge")
     trailer_lines.append(f"Chain-Parent: {parent_chain_sha or 'none'}")
     trailer_lines.append(f"Chain-Bug-Id: {bug_id or 'none'}")
+    if merge_queue_id:
+        trailer_lines.append(f"Chain-Merge-Queue-Id: {merge_queue_id}")
     trailer_block = "\n".join(trailer_lines)
 
     # Build commit message with trailers

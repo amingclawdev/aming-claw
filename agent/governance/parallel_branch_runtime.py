@@ -13092,6 +13092,7 @@ def execute_merge_queue_item(
     allow_target_ref_mutation: bool = False,
     message: str = "",
     bug_id: str = "",
+    source_contract_id: str = "",
     fence_token: str = "",
     now_iso: str = "",
     timeout_seconds: int = 30,
@@ -13214,8 +13215,10 @@ def execute_merge_queue_item(
         branch=branch_name,
         cwd=str(repo_root),
         task_id=item.task_id,
+        source_contract_id=source_contract_id,
         parent_chain_sha=before_commit,
-        bug_id=bug_id or item.task_id,
+        bug_id=bug_id or item.backlog_id or item.task_id,
+        merge_queue_id=item.merge_queue_id,
     )
     if not ok:
         recorded = record_merge_queue_result(
