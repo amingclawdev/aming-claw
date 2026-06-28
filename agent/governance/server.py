@@ -49446,6 +49446,17 @@ def _timeline_gate_contract_runtime_projection_body(
         return body
     execution_id = str(current.get("current_contract_execution_id") or "").strip()
     if not execution_id.startswith("cex-"):
+        active_chain = (
+            current.get("active_chain")
+            if isinstance(current.get("active_chain"), Mapping)
+            else {}
+        )
+        for candidate in reversed(list(active_chain.get("execution_ids") or [])):
+            candidate_id = str(candidate or "").strip()
+            if candidate_id.startswith("cex-"):
+                execution_id = candidate_id
+                break
+    if not execution_id.startswith("cex-"):
         return body
     next_action = current.get("next_legal_action")
     if str(current.get("readiness_state") or "").strip() != "contract_complete" and next_action:

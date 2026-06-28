@@ -23458,6 +23458,218 @@ def test_backlog_close_uses_same_completed_contract_runtime_projection_as_preche
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TIMELINE-GATE-DIRECT-FIX-ROOT-CURRENT"
+    close_commit = "2ee991b4e21942f36500ce4f6b791652bde0c101"
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    direct_execution_id = "cex-direct-fix-root-current-close-authority"
+    route_token_ref = "rtok-direct-fix-root-current-parent"
+    close_route_token_ref = "rtok-direct-fix-root-current-close"
+    route_identity = {
+        "route_id": "route-direct-fix-root-current",
+        "route_context_hash": _fake_sha("route-direct-fix-root-current"),
+        "prompt_contract_id": "rprompt-direct-fix-root-current",
+        "prompt_contract_hash": _fake_sha("prompt-direct-fix-root-current"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-direct-fix-root-current"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair close gate after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": route_token_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "backlog_close",
+                    "blocker_id": "mf_timeline_gate_failed",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == direct_execution_id
+
+    runtime = server._contract_runtime(conn)
+
+    def write_runtime_line(
+        contract_execution_id: str,
+        *,
+        actor_role: str,
+        stage_id: str,
+        line_id: str,
+        evidence_kind: str,
+        payload: dict | None = None,
+        commit_sha: str = "",
+    ) -> dict:
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if payload is not None:
+            write["payload"] = payload
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+        return result
+
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="observer",
+        stage_id="operator_approval",
+        line_id="direct_fix_operator_approval",
+        evidence_kind="operator_approval",
+        payload=route_identity,
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="observer",
+        stage_id="dispatch_context",
+        line_id="direct_fix_dispatch_context",
+        evidence_kind="dispatch_bounded_worker",
+        payload={**route_identity, "owned_files": ["agent/governance/server.py"]},
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="mf_sub",
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        evidence_kind="direct_fix_repair_evidence",
+        payload={
+            **route_identity,
+            "status": "implemented",
+            "changed_files": ["agent/governance/server.py"],
+            "commit_sha": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+        evidence_kind="independent_verification",
+        payload={
+            **route_identity,
+            "status": "pass",
+            "verdict": "PASS",
+            "independent": True,
+            "verified_commit": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="observer",
+        stage_id="return_to_parent",
+        line_id="direct_fix_return_to_parent",
+        evidence_kind="direct_fix_return_to_parent",
+        payload={
+            **route_identity,
+            "parent_contract_execution_id": parent_execution_id,
+            "successor_contract_execution_id": direct_execution_id,
+            "successor_contract_id": "direct_fix",
+        },
+    )
+    parent_ack = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": parent_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": parent_execution_id,
+                    "successor_contract_execution_id": direct_execution_id,
+                    "successor_contract_id": "direct_fix",
+                },
+            },
+        )
+    )
+    assert parent_ack["ok"] is True
+
+    current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert current["readiness_state"] == "contract_complete"
+    assert current["current_contract_execution_id"] == parent_execution_id
+
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[
+            f"contract_runtime:{parent_execution_id}",
+            f"contract_runtime:{direct_execution_id}",
+        ],
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["accepted"] is True
+    assert projection["contract_execution_id"] == direct_execution_id
+    assert projection["direct_fix_close_authority_gate"]["passed"] is True
+    assert precheck["can_close"] is True
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
 def test_timeline_repair_summary_names_missing_startup_identity_fields():
     summary = task_timeline.repair_gate_summary(
         {
