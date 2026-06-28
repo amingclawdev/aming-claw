@@ -1856,6 +1856,22 @@ TOOLS: list[dict] = [
                 "snapshot_id": {"type": "string"},
                 "expected_old_snapshot_id": {"type": "string"},
                 "actor": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string", "description": "Alias for backlog_id."},
+                "task_id": {"type": "string"},
+                "contract_execution_id": {"type": "string", "description": "Alias for task_id."},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id used with observer_route_token_ref.",
+                },
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": "Opaque observer route-token ref; raw route tokens are not accepted.",
+                },
+                "route_token_ref": {
+                    "type": "string",
+                    "description": "Alias for observer_route_token_ref.",
+                },
                 "activate": {"type": "boolean", "default": True},
                 "require_clean": {"type": "boolean", "default": True},
                 "semantic_use_ai": {"type": "boolean"},

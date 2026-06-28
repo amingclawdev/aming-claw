@@ -531,6 +531,161 @@ def _graph(node_id: str = "L7.1") -> dict:
     }
 
 
+def _stub_current_full_reconcile(monkeypatch, tmp_path):
+    head = "a" * 40
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: str(tmp_path),
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: head)
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+
+    def fake_reconcile(_conn, project_id, root, **kwargs):
+        calls.append({"project_id": project_id, "root": root, **kwargs})
+        return {
+            "ok": True,
+            "snapshot_id": "full-current",
+            "snapshot_status": "candidate",
+            "run_id": kwargs.get("run_id", ""),
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_pending_scope_reconcile_contract_event",
+        lambda *_args, **_kwargs: None,
+    )
+    return head, calls
+
+
+def test_current_full_reconcile_accepts_observer_route_token_proof(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-ROUTE-PROOF"
+    task_id = "cex-current-full-route-proof"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-route-proof",
+    )
+    route_token_ref = "rtok-current-full-route-proof"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("operator auth path should not run for route proof")
+        ),
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "semantic_enrich": False,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["current_full_reconcile"] is True
+    assert calls[0]["commit_sha"] == head
+    assert calls[0]["activate"] is False
+
+
+def test_current_full_reconcile_operator_token_path_unchanged(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    auth_calls: list[tuple[str, str]] = []
+
+    def fake_operator(ctx, _conn, action):
+        auth_calls.append((action, ctx.token))
+        return {"role": "observer"}
+
+    monkeypatch.setattr(server, "_require_graph_governance_operator", fake_operator)
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "target_commit_sha": head,
+            "activate": False,
+            "semantic_enrich": False,
+        },
+    )
+    ctx.token = "operator-token"
+
+    status, result = server.handle_graph_governance_current_full_reconcile(ctx)
+
+    assert status == 201
+    assert result["current_full_reconcile"] is True
+    assert auth_calls == [("graph-governance.reconcile.current-full", "operator-token")]
+    assert calls[0]["commit_sha"] == head
+
+
+def test_current_full_reconcile_route_proof_reports_missing_scope_fields(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, _calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-missing-scope",
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("operator auth path should not run for partial route proof")
+        ),
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "observer_session_id": observer_session_id,
+                    "route_token_ref": "rtok-current-full-missing-scope",
+                },
+            )
+        )
+
+    assert exc.value.code == "observer_route_token_proof_required"
+    assert exc.value.details["proof_error"] == "missing_route_proof_fields"
+    assert exc.value.details["missing_fields"] == [
+        "backlog_id",
+        "task_id_or_contract_execution_id",
+    ]
+
+
 def _write_dashboard_dist(root: Path, asset_name: str) -> Path:
     (root / "assets").mkdir(parents=True, exist_ok=True)
     (root / "index.html").write_text(

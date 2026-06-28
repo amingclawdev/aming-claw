@@ -5724,6 +5724,177 @@ def _require_graph_governance_operator(ctx: RequestContext, conn, action: str) -
     return session
 
 
+def _current_full_route_ref(ctx: RequestContext) -> str:
+    return _contract_runtime_ref_value(
+        ctx,
+        "observer_route_token_ref",
+        "route_token_ref",
+    )
+
+
+def _current_full_route_proof_requested(ctx: RequestContext) -> bool:
+    return bool(
+        _contract_runtime_ref_value(ctx, "observer_session_id", "observer_session_ref")
+        or _current_full_route_ref(ctx)
+    )
+
+
+def _current_full_route_action_allowed(
+    allowed_actions: Sequence[Any],
+) -> tuple[bool, list[str]]:
+    allowed = {
+        str(item or "").strip().lower().replace("-", "_").replace(".", "_")
+        for item in allowed_actions
+        if str(item or "").strip()
+    }
+    accepted = {
+        "graph_current_full_reconcile",
+        "graph_governance_reconcile_current_full",
+    }
+    return bool(allowed & accepted), sorted(allowed)
+
+
+def _raise_current_full_route_proof(
+    proof_error: str,
+    message: str,
+    *,
+    status: int = 403,
+    **details: Any,
+) -> None:
+    raise GovernanceError(
+        "observer_route_token_proof_required",
+        message,
+        status,
+        {
+            "required_role": "observer",
+            "required_action": "graph_current_full_reconcile",
+            "proof_error": proof_error,
+            **details,
+        },
+    )
+
+
+def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str) -> dict:
+    """Allow the normal operator gate or a scoped observer route-token proof."""
+    if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
+        return _require_graph_governance_operator(ctx, conn, action)
+
+    project_id = ctx.get_project_id()
+    observer_session_id = _contract_runtime_ref_value(
+        ctx, "observer_session_id", "observer_session_ref"
+    )
+    route_token_ref = _current_full_route_ref(ctx)
+    backlog_id = _contract_runtime_ref_value(ctx, "backlog_id", "bug_id")
+    task_id = _contract_runtime_ref_value(ctx, "task_id", "contract_execution_id")
+
+    missing = []
+    if not observer_session_id:
+        missing.append("observer_session_id")
+    if not route_token_ref:
+        missing.append("observer_route_token_ref")
+    if not backlog_id:
+        missing.append("backlog_id")
+    if not task_id:
+        missing.append("task_id_or_contract_execution_id")
+    if missing:
+        _raise_current_full_route_proof(
+            "missing_route_proof_fields",
+            "current-full reconcile observer route proof is missing required fields",
+            missing_fields=missing,
+            aliases={
+                "observer_route_token_ref": ["observer_route_token_ref", "route_token_ref"],
+                "task_id_or_contract_execution_id": ["task_id", "contract_execution_id"],
+            },
+        )
+
+    session = observer_session.get_session(
+        conn,
+        project_id=project_id,
+        session_id=observer_session_id,
+    )
+    if not session or str(session.get("computed_status") or "") != "active":
+        _raise_current_full_route_proof(
+            "observer_session_not_active",
+            "current-full reconcile observer route proof requires an active observer session",
+            observer_session_id=observer_session_id,
+        )
+
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except _orc.RouteTokenRefError as exc:
+        _raise_current_full_route_proof(
+            "route_token_ref_invalid",
+            str(exc),
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+
+    if not resolved:
+        _raise_current_full_route_proof(
+            "route_token_ref_unknown",
+            "current-full reconcile observer route proof uses an unknown route_token_ref",
+            route_token_ref=route_token_ref,
+        )
+    if str(resolved.get("caller_role") or "") != "observer":
+        _raise_current_full_route_proof(
+            "route_token_ref_not_observer",
+            "current-full reconcile route_token_ref must be issued for caller_role=observer",
+            route_token_ref=route_token_ref,
+            caller_role=str(resolved.get("caller_role") or ""),
+        )
+
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    scope_mismatches: dict[str, dict[str, str]] = {}
+    expected_scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    for key, expected in expected_scope.items():
+        actual = str(scope.get(key) or "").strip()
+        if actual != expected:
+            scope_mismatches[key] = {"expected": expected, "actual": actual}
+    if scope_mismatches:
+        _raise_current_full_route_proof(
+            "route_token_ref_scope_mismatch",
+            "current-full reconcile route_token_ref scope does not match the request",
+            route_token_ref=route_token_ref,
+            scope_mismatches=scope_mismatches,
+        )
+
+    allowed, normalized_allowed = _current_full_route_action_allowed(
+        resolved.get("allowed_actions") or []
+    )
+    if not allowed:
+        _raise_current_full_route_proof(
+            "route_token_ref_action_not_allowed",
+            "current-full reconcile route_token_ref does not allow graph_current_full_reconcile",
+            route_token_ref=route_token_ref,
+            allowed_actions=normalized_allowed,
+            accepted_actions=[
+                "graph_current_full_reconcile",
+                "graph-governance.reconcile.current-full",
+            ],
+        )
+
+    return {
+        "role": "observer",
+        "role_source": "observer_session_route_token_ref",
+        "observer_session_id": observer_session_id,
+        "route_token_ref": route_token_ref,
+        "route_token_scope": expected_scope,
+    }
+
+
 def _require_graph_governance_mf_subagent(ctx: RequestContext, conn, action: str) -> dict:
     session = ctx.require_auth(conn)
     from .permissions import require_mf_subagent_capability
@@ -22051,7 +22222,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     request_started_monotonic = time.monotonic()
     conn = get_connection(project_id)
     try:
-        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.current-full")
+        _require_current_full_reconcile_auth(
+            ctx,
+            conn,
+            "graph-governance.reconcile.current-full",
+        )
         head_commit = _git_head_commit(root)
         target_commit = str(
             body.get("target_commit_sha")
