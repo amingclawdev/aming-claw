@@ -35889,6 +35889,18 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "task_timeline_append",
 )
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
+_CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_submit_line",
+)
+_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "contract_runtime_current",
+    "contract_runtime_guide",
+    "contract_runtime_submit_line",
+    "parallel_branch_allocate",
+    "runtime_context_read_receipt",
+    "task_timeline_append",
+)
 
 
 def _onboard_contract_execution_id(
@@ -36996,6 +37008,264 @@ def _onboard_contract_agent_guidance(
     }
 
 
+def _onboard_route_guide_target_contract_execution_id(
+    *,
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+) -> str:
+    for source in (next_action, current_projection, runtime_resume):
+        if not isinstance(source, Mapping):
+            continue
+        for key in (
+            "contract_execution_id",
+            "current_contract_execution_id",
+            "active_child_contract_execution_id",
+        ):
+            text = str(source.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _onboard_route_guide_parent_route_resolution(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    route_token_ref = str(route_token_ref or "").strip()
+    if not route_token_ref:
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    return dict(resolved) if isinstance(resolved, Mapping) else {}
+
+
+def _onboard_route_guide_patch_next_action(
+    container: Any,
+    *,
+    target_contract_execution_id: str,
+    patched_next_action: Mapping[str, Any],
+) -> None:
+    if not isinstance(container, dict):
+        return
+    next_action = container.get("next_legal_action")
+    if isinstance(next_action, Mapping):
+        action_execution_id = str(next_action.get("contract_execution_id") or "")
+        if not action_execution_id or action_execution_id == target_contract_execution_id:
+            container["next_legal_action"] = dict(patched_next_action)
+
+
+def _onboard_route_guide_apply_runtime_route_token_scope(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    guidance: dict[str, Any],
+    next_action: dict[str, Any],
+    current_projection: dict[str, Any],
+    runtime_resume: dict[str, Any],
+) -> None:
+    project_id = str(record.get("project_id") or "")
+    backlog_id = str(record.get("backlog_id") or "")
+    parent_execution_id = str(record.get("contract_execution_id") or "")
+    target_execution_id = _onboard_route_guide_target_contract_execution_id(
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    if not project_id or not target_execution_id or target_execution_id == parent_execution_id:
+        return
+
+    candidate_refs: list[str] = []
+    for source in (
+        next_action,
+        guidance,
+        guidance.get("route_token_ref_guidance")
+        if isinstance(guidance.get("route_token_ref_guidance"), Mapping)
+        else {},
+        record,
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("route_token_ref", "current_route_token_ref"):
+            value = str(source.get(key) or "").strip()
+            if value and value not in candidate_refs:
+                candidate_refs.append(value)
+
+    verified_ref = ""
+    verified_binding: dict[str, Any] = {}
+    fallback_ref = ""
+    fallback_binding: dict[str, Any] = {}
+    for ref in candidate_refs:
+        binding = _contract_runtime_route_token_ref_binding(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=target_execution_id,
+            route_token_ref=ref,
+        )
+        if not fallback_ref:
+            fallback_ref = ref
+            fallback_binding = binding
+        if str(binding.get("status") or "") == "current_contract_scope_verified":
+            verified_ref = ref
+            verified_binding = binding
+            break
+
+    parent_resolved = (
+        fallback_binding.get("resolved")
+        if isinstance(fallback_binding.get("resolved"), Mapping)
+        else {}
+    )
+    if not parent_resolved and fallback_ref:
+        parent_resolved = _onboard_route_guide_parent_route_resolution(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=fallback_ref,
+        )
+    target_files = _onboard_contract_route_issue_target_files_from_record(record)
+    issue_payload = _contract_runtime_route_token_issue_payload(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=target_execution_id,
+        parent_contract_execution_id=parent_execution_id,
+        target_files=target_files,
+        parent_route_token_ref=fallback_ref,
+        parent_resolved=parent_resolved,
+    )
+
+    patched_next_action = dict(next_action)
+    target_contract_id = str(
+        patched_next_action.get("contract_id")
+        or current_projection.get("current_contract_id")
+        or runtime_resume.get("current_contract_id")
+        or ""
+    )
+    status = "current_contract_scope_verified"
+    pass_aliases = ["observer_route_token_ref", "route_token_ref"]
+    current_ref = verified_ref
+    if verified_ref:
+        patched_next_action["route_token_ref"] = verified_ref
+        patched_next_action["route_token_ref_status"] = status
+        patched_next_action["route_token_ref_scope"] = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": target_execution_id,
+        }
+    else:
+        status = "issue_required_for_current_contract_runtime"
+        pass_aliases = []
+        current_ref = ""
+        patched_next_action["route_token_ref"] = ""
+        patched_next_action["route_token_ref_status"] = status
+        patched_next_action["observer_route_context_issue_payload"] = issue_payload
+        if fallback_ref:
+            patched_next_action["enter_only_route_token_ref"] = fallback_ref
+            patched_next_action["enter_only_route_token_ref_binding"] = fallback_binding
+
+    guidance["route_token_ref_guidance"] = {
+        "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+        "status": status,
+        "current_route_token_ref": current_ref,
+        "current_ref_present": bool(current_ref),
+        "target_contract_execution_id": target_execution_id,
+        "target_contract_id": target_contract_id,
+        "pass_to_next_runtime_writes_as": pass_aliases,
+        "observer_route_context_issue_payload": issue_payload,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if verified_binding:
+        guidance["route_token_ref_guidance"][
+            "current_contract_route_token_binding"
+        ] = verified_binding
+    if fallback_ref and not verified_ref:
+        guidance["route_token_ref_guidance"]["enter_only_route_token_ref"] = fallback_ref
+        guidance["route_token_ref_guidance"][
+            "enter_only_route_token_ref_binding"
+        ] = fallback_binding
+
+    guidance["route_token_ref"] = current_ref
+    guidance["route_token_ref_present"] = bool(current_ref)
+    guidance["route_token_issue"] = {
+        "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+        "status": "current_ref_present" if current_ref else status,
+        "mcp_entrypoint": {"tool": "observer_route_context_issue"},
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": project_id},
+        },
+        "observer_route_context_issue_payload": issue_payload,
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": target_execution_id,
+        },
+        "allowed_actions": list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+    next_action.clear()
+    next_action.update(patched_next_action)
+    guidance["next_legal_action"] = dict(patched_next_action)
+    for container in (current_projection, runtime_resume, guidance.get("contract_chain")):
+        _onboard_route_guide_patch_next_action(
+            container,
+            target_contract_execution_id=target_execution_id,
+            patched_next_action=patched_next_action,
+        )
+    route_guide = guidance.get("onboard_route_guide")
+    if isinstance(route_guide, dict):
+        route_guide["route_token_ref"] = current_ref
+        route_guide["route_token_ref_present"] = bool(current_ref)
+        _onboard_route_guide_patch_next_action(
+            route_guide,
+            target_contract_execution_id=target_execution_id,
+            patched_next_action=patched_next_action,
+        )
+        chain_binding = route_guide.get("backlog_chain_binding")
+        if isinstance(chain_binding, dict):
+            continue_binding = chain_binding.get("continue")
+            if isinstance(continue_binding, dict):
+                continue_binding["next_legal_action"] = dict(patched_next_action)
+            _onboard_route_guide_patch_next_action(
+                chain_binding.get("current_projection"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
+            _onboard_route_guide_patch_next_action(
+                chain_binding.get("runtime_resume"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
+        role_entries = route_guide.get("role_entries")
+        observer_entry = (
+            role_entries.get("observer")
+            if isinstance(role_entries, Mapping)
+            else {}
+        )
+        if isinstance(observer_entry, dict):
+            _onboard_route_guide_patch_next_action(
+                observer_entry.get("runtime_resume"),
+                target_contract_execution_id=target_execution_id,
+                patched_next_action=patched_next_action,
+            )
+
+
 def _onboard_route_guide_service_next_action(
     *,
     role: str = "",
@@ -37426,6 +37696,14 @@ def _onboard_route_guide_service_response(
             )
             if isinstance(observer_entry, dict):
                 observer_entry["runtime_resume"] = runtime_resume
+    _onboard_route_guide_apply_runtime_route_token_scope(
+        conn,
+        record=record,
+        guidance=guidance,
+        next_action=next_action,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
     return {
         "schema_version": "onboard_route_guide.service_response.v1",
         "ok": True,
@@ -38087,6 +38365,485 @@ def _direct_fix_child_route_token_target_files(
         seen.add(text)
         deduped.append(text)
     return deduped or list(_DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
+
+
+def _contract_runtime_route_token_ref_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    route_token_ref = str(route_token_ref or "").strip()
+    contract_execution_id = str(contract_execution_id or "").strip()
+    proof: dict[str, Any] = {
+        "schema_version": "contract_runtime.route_token_ref_binding.v1",
+        "status": "missing",
+        "route_token_ref": route_token_ref,
+        "target_contract_execution_id": contract_execution_id,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not route_token_ref:
+        proof["reason"] = "missing_route_token_ref"
+        return proof
+    if not contract_execution_id:
+        proof["reason"] = "missing_contract_execution_id"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "status": "invalid",
+                "reason": "route_token_ref_invalid",
+                "resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved:
+        proof.update(
+            {
+                "status": "unknown",
+                "reason": "route_token_ref_unknown",
+            }
+        )
+        return proof
+
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    scope_task_id = str(scope.get("task_id") or "").strip()
+    allowed = {
+        _normalized_contract_runtime_action(item)
+        for item in (resolved.get("allowed_actions") or [])
+        if str(item or "").strip()
+    }
+    proof.update(
+        {
+            "resolved": dict(resolved),
+            "scope": dict(scope),
+            "scope_task_id": scope_task_id,
+            "allowed_actions": sorted(allowed),
+        }
+    )
+    if scope_task_id != contract_execution_id:
+        proof.update(
+            {
+                "status": "scope_mismatch",
+                "reason": "route_token_ref_task_scope_mismatch",
+            }
+        )
+        return proof
+
+    required = {
+        _normalized_contract_runtime_action(item)
+        for item in _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS
+    }
+    missing_actions = sorted(required - allowed)
+    if missing_actions:
+        proof.update(
+            {
+                "status": "action_not_allowed",
+                "reason": "route_token_ref_missing_contract_runtime_actions",
+                "missing_allowed_actions": missing_actions,
+            }
+        )
+        return proof
+
+    proof.update(
+        {
+            "status": "current_contract_scope_verified",
+            "reason": "route_token_ref_matches_contract_runtime_scope",
+        }
+    )
+    return proof
+
+
+def _route_token_parent_identity(
+    resolved_parent: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+) -> dict[str, str]:
+    identity = {
+        "route_id": str(resolved_parent.get("route_id") or ""),
+        "route_context_hash": str(resolved_parent.get("route_context_hash") or ""),
+        "prompt_contract_id": str(resolved_parent.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(resolved_parent.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            resolved_parent.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": str(route_token_ref or ""),
+        "selected_project": project_id,
+        "selected_backlog_id": backlog_id,
+    }
+    return {key: value for key, value in identity.items() if value}
+
+
+def _contract_runtime_route_token_issue_payload(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    parent_contract_execution_id: str = "",
+    target_files: Sequence[str] = (),
+    parent_route_token_ref: str = "",
+    parent_resolved: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    allowed_actions = _observer_route_context_issue_allowed_actions(
+        list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS)
+    )
+    evidence_refs = [
+        ref
+        for ref in (
+            f"contract_runtime:{contract_execution_id}"
+            if contract_execution_id
+            else "",
+            f"contract_runtime:{parent_contract_execution_id}"
+            if parent_contract_execution_id
+            else "",
+            f"backlog:{backlog_id}" if backlog_id else "",
+        )
+        if ref
+    ]
+    payload: dict[str, Any] = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": contract_execution_id,
+        "target_files": [str(path) for path in target_files if str(path or "").strip()],
+        "allowed_actions": allowed_actions,
+        "evidence_refs": evidence_refs,
+    }
+    parent_ref = str(parent_route_token_ref or "").strip()
+    if parent_ref:
+        payload["parent_route_token_ref"] = parent_ref
+    if parent_resolved:
+        parent_identity = _route_token_parent_identity(
+            parent_resolved,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=parent_ref,
+        )
+        if parent_identity:
+            payload["parent_route_identity"] = parent_identity
+            field_map = {
+                "route_id": "parent_route_id",
+                "route_context_hash": "parent_route_context_hash",
+                "prompt_contract_id": "parent_prompt_contract_id",
+                "prompt_contract_hash": "parent_prompt_contract_hash",
+                "visible_injection_manifest_hash": (
+                    "parent_visible_injection_manifest_hash"
+                ),
+            }
+            for source_key, target_key in field_map.items():
+                value = str(parent_identity.get(source_key) or "").strip()
+                if value:
+                    payload[target_key] = value
+    return payload
+
+
+def _contract_runtime_issue_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_contract_execution_id: str,
+    parent_route_token_ref: str,
+    parent_record: Mapping[str, Any],
+    target_files: Sequence[str],
+    source: str,
+) -> dict[str, Any]:
+    child_contract_execution_id = str(child_contract_execution_id or "").strip()
+    parent_route_token_ref = str(parent_route_token_ref or "").strip()
+    target_files = [str(path) for path in target_files if str(path or "").strip()]
+    proof: dict[str, Any] = {
+        "schema_version": "contract_runtime.child_route_token_binding.v1",
+        "source": source,
+        "status": "skipped",
+        "route_token_ref": "",
+        "parent_route_token_ref": parent_route_token_ref,
+        "child_contract_execution_id": child_contract_execution_id,
+        "target_files": target_files,
+        "allowed_actions": list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if not child_contract_execution_id or not parent_route_token_ref:
+        proof["reason"] = "missing_child_execution_or_route_ref"
+        return proof
+
+    from . import observer_route_context
+
+    try:
+        resolved_parent = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=parent_route_token_ref,
+            backlog_id=backlog_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        proof.update(
+            {
+                "reason": "parent_route_token_ref_invalid",
+                "parent_ref_resolution_error": str(exc),
+            }
+        )
+        return proof
+    if not resolved_parent:
+        proof["reason"] = "parent_route_token_ref_unregistered"
+        return proof
+
+    parent_identity = _route_token_parent_identity(
+        resolved_parent,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=parent_route_token_ref,
+    )
+    missing_parent_identity = [
+        field
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if not parent_identity.get(field)
+    ]
+    if missing_parent_identity:
+        proof.update(
+            {
+                "reason": "parent_route_identity_incomplete",
+                "missing_parent_route_identity_fields": missing_parent_identity,
+            }
+        )
+        return proof
+
+    issue_payload = _contract_runtime_route_token_issue_payload(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=child_contract_execution_id,
+        parent_contract_execution_id=str(
+            parent_record.get("contract_execution_id") or ""
+        ),
+        target_files=target_files,
+        parent_route_token_ref=parent_route_token_ref,
+        parent_resolved=resolved_parent,
+    )
+    proof["observer_route_context_issue_payload"] = issue_payload
+    try:
+        issued = observer_route_context.issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=child_contract_execution_id,
+            target_files=target_files,
+            allowed_actions=list(_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS),
+            evidence_refs=issue_payload.get("evidence_refs") or [],
+            parent_route_identity=parent_identity,
+        )
+        child_ref = str(issued.get("route_token_ref") or "").strip()
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=child_ref,
+            token=issued.get("route_token")
+            if isinstance(issued.get("route_token"), Mapping)
+            else {},
+        )
+        parent_lineage = (
+            issued.get("parent_route_lineage")
+            if isinstance(issued.get("parent_route_lineage"), Mapping)
+            else {}
+        )
+        child_lineage = (
+            issued.get("child_route_lineage")
+            if isinstance(issued.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        if parent_lineage and child_lineage:
+            observer_route_context.persist_route_token_ref_lineage(
+                conn,
+                project_id=project_id,
+                route_token_ref=child_ref,
+                parent_route_lineage=parent_lineage,
+                child_route_lineage=child_lineage,
+                route_lineage=issued.get("route_lineage")
+                if isinstance(issued.get("route_lineage"), Mapping)
+                else {},
+            )
+    except (ValueError, observer_route_context.RouteTokenRefError) as exc:
+        proof.update(
+            {
+                "reason": "child_route_token_issue_failed",
+                "issue_error": str(exc),
+            }
+        )
+        return proof
+    if not child_ref:
+        proof["reason"] = "child_route_token_ref_missing_after_issue"
+        return proof
+
+    proof.update(
+        {
+            "status": "issued_child_ref",
+            "reason": "issued_current_contract_route_token_ref",
+            "route_token_ref": child_ref,
+            "child_route_token_ref": child_ref,
+            "parent_route_identity": parent_identity,
+            "parent_route_lineage": dict(parent_lineage),
+            "child_route_lineage": dict(child_lineage),
+            "route_lineage": dict(issued.get("route_lineage") or {})
+            if isinstance(issued.get("route_lineage"), Mapping)
+            else {},
+        }
+    )
+    return proof
+
+
+def _contract_runtime_apply_route_token_binding(
+    record: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_ref = str(binding.get("route_token_ref") or "").strip()
+    updated = dict(record)
+    metadata = (
+        dict(updated.get("metadata"))
+        if isinstance(updated.get("metadata"), Mapping)
+        else {}
+    )
+    backlog_lineage = (
+        dict(updated.get("backlog_lineage"))
+        if isinstance(updated.get("backlog_lineage"), Mapping)
+        else {}
+    )
+    parent_ref = str(binding.get("parent_route_token_ref") or "")
+    metadata["route_token_ref_binding"] = dict(binding)
+    metadata["parent_route_token_ref"] = parent_ref
+    if child_ref:
+        updated["route_token_ref"] = child_ref
+        metadata["child_route_token_ref"] = child_ref
+        backlog_lineage["child_route_token_ref"] = child_ref
+    elif str(binding.get("status") or "") != "current_contract_scope_verified":
+        updated["route_token_ref"] = ""
+        if parent_ref:
+            metadata["enter_only_route_token_ref"] = parent_ref
+            backlog_lineage["enter_only_route_token_ref"] = parent_ref
+    if parent_ref:
+        backlog_lineage["parent_route_token_ref"] = parent_ref
+    updated["metadata"] = metadata
+    updated["backlog_lineage"] = backlog_lineage
+    return updated
+
+
+def _contract_runtime_existing_child_route_token_binding(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+    source: str,
+) -> dict[str, Any]:
+    child_ref = str(child_record.get("route_token_ref") or "").strip()
+    child_id = str(child_record.get("contract_execution_id") or "").strip()
+    if not child_ref or not child_id:
+        return {}
+    binding = _contract_runtime_route_token_ref_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=child_id,
+        route_token_ref=child_ref,
+    )
+    if str(binding.get("status") or "") != "current_contract_scope_verified":
+        return {}
+    metadata = (
+        child_record.get("metadata")
+        if isinstance(child_record.get("metadata"), Mapping)
+        else {}
+    )
+    prior = (
+        metadata.get("route_token_ref_binding")
+        if isinstance(metadata.get("route_token_ref_binding"), Mapping)
+        else {}
+    )
+    return {
+        **dict(prior),
+        "schema_version": "contract_runtime.child_route_token_binding.v1",
+        "source": source,
+        "status": "existing_child_ref",
+        "reason": "existing_ref_matches_current_contract_scope",
+        "route_token_ref": child_ref,
+        "child_route_token_ref": child_ref,
+        "parent_route_token_ref": str(parent_route_token_ref or "").strip(),
+        "child_contract_execution_id": child_id,
+        "scope": dict(binding.get("scope") or {})
+        if isinstance(binding.get("scope"), Mapping)
+        else {},
+        "allowed_actions": list(binding.get("allowed_actions") or []),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _contract_runtime_with_child_route_token_ref(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    child_record: Mapping[str, Any],
+    parent_route_token_ref: str,
+    target_files: Sequence[str],
+    source: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing = _contract_runtime_existing_child_route_token_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_record=child_record,
+        parent_route_token_ref=parent_route_token_ref,
+        source=source,
+    )
+    if existing:
+        updated = _contract_runtime_apply_route_token_binding(
+            child_record,
+            binding=existing,
+        )
+        child_id = str(updated.get("contract_execution_id") or "").strip()
+        if child_id and updated != dict(child_record):
+            updated = _contract_runtime_store(conn).update(child_id, updated)
+        return updated, existing
+
+    binding = _contract_runtime_issue_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        child_contract_execution_id=str(child_record.get("contract_execution_id") or ""),
+        parent_route_token_ref=parent_route_token_ref,
+        parent_record=parent_record,
+        target_files=target_files,
+        source=source,
+    )
+    updated = _contract_runtime_apply_route_token_binding(
+        child_record,
+        binding=binding,
+    )
+    child_id = str(updated.get("contract_execution_id") or "").strip()
+    if child_id and updated != dict(child_record):
+        updated = _contract_runtime_store(conn).update(child_id, updated)
+    return updated, binding
 
 
 def _direct_fix_issue_child_route_token_ref(
@@ -40292,6 +41049,22 @@ def _mf_parallel_successor_runtime_enter(
         if route_token_ref and not str(successor.get("route_token_ref") or ""):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
+    child_route_target_files = _onboard_contract_route_issue_target_files(
+        conn,
+        backlog_id=backlog_id,
+        body={},
+        metadata=metadata if isinstance(metadata, Mapping) else {},
+    )
+    successor, child_route_binding = _contract_runtime_with_child_route_token_ref(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_record=parent_record,
+        child_record=successor,
+        parent_route_token_ref=route_token_ref,
+        target_files=child_route_target_files,
+        source="mf_parallel_successor_runtime",
+    )
     successor_contract = {
         "schema_version": "contract_successor_handoff.v1",
         "contract_chain_id": chain_id,
@@ -40317,6 +41090,46 @@ def _mf_parallel_successor_runtime_enter(
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
+    route_token_ref_binding = (
+        successor.get("metadata", {}).get("route_token_ref_binding")
+        if isinstance(successor.get("metadata"), Mapping)
+        else {}
+    )
+    if not isinstance(route_token_ref_binding, Mapping) or not route_token_ref_binding:
+        route_token_ref_binding = child_route_binding
+    successor_route_ref = str(successor.get("route_token_ref") or "")
+    route_token_ref_guidance: dict[str, Any] = {
+        "schema_version": "mf_parallel.child_route_token_ref_guidance.v1",
+        "status": str(route_token_ref_binding.get("status") or ""),
+        "route_token_ref": successor_route_ref,
+        "child_route_token_ref": successor_route_ref,
+        "parent_route_token_ref": route_token_ref,
+        "binding": dict(route_token_ref_binding),
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "pass_ref_to_next_runtime_write": bool(successor_route_ref),
+    }
+    if not successor_route_ref:
+        issue_payload = _contract_runtime_route_token_issue_payload(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=successor_execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            target_files=child_route_target_files,
+            parent_route_token_ref=route_token_ref,
+            parent_resolved=(
+                route_token_ref_binding.get("resolved")
+                if isinstance(route_token_ref_binding.get("resolved"), Mapping)
+                else {}
+            ),
+        )
+        route_token_ref_guidance.update(
+            {
+                "status": "issue_required_for_current_contract_runtime",
+                "enter_only_route_token_ref": route_token_ref,
+                "observer_route_context_issue_payload": issue_payload,
+            }
+        )
     current_projection = upsert_contract_chain_successor_binding(
         conn,
         parent_record=parent_record,
@@ -40338,12 +41151,8 @@ def _mf_parallel_successor_runtime_enter(
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
         "contract_chain_current": current_projection,
-        "route_token_ref": str(successor.get("route_token_ref") or ""),
-        "route_token_ref_guidance": {
-            "route_token_ref": str(successor.get("route_token_ref") or ""),
-            "raw_route_token_required": False,
-            "pass_ref_to_next_runtime_write": True,
-        },
+        "route_token_ref": successor_route_ref,
+        "route_token_ref_guidance": route_token_ref_guidance,
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {
             "required": True,
