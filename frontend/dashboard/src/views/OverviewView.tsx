@@ -293,6 +293,8 @@ function labelOpType(t: string): string {
       return "Node semantic";
     case "edge_semantic":
       return "Edge semantic";
+    case "current_full_reconcile":
+      return "Current full reconcile";
     case "scope_reconcile":
       return "Scope reconcile";
     default:

@@ -1844,6 +1844,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "graph_current_full_reconcile",
+        "description": "Run the canonical current-commit full graph reconcile path. Defaults to current clean HEAD and activate=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "target_commit_sha": {"type": "string"},
+                "commit_sha": {"type": "string"},
+                "run_id": {"type": "string"},
+                "snapshot_id": {"type": "string"},
+                "expected_old_snapshot_id": {"type": "string"},
+                "actor": {"type": "string"},
+                "activate": {"type": "boolean", "default": True},
+                "require_clean": {"type": "boolean", "default": True},
+                "semantic_use_ai": {"type": "boolean"},
+                "semantic_enrich": {"type": "boolean"},
+                "enqueue_stale": {"type": "boolean", "default": False},
+                "notes_extra": {"type": "object"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "stale_artifact_cleanup",
         "description": "Dry-run stale governance artifact cleanup projection for stale batch worktrees and retained append-only evidence.",
         "inputSchema": {
@@ -2205,7 +2228,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "graph_pending_scope_queue",
-        "description": "Queue or update a pending scope-reconcile row for a target commit.",
+        "description": "Deprecated/internal recovery only: queue or update a pending scope-reconcile row for a target commit. Normal graph updates should use graph_current_full_reconcile.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3277,6 +3300,19 @@ class ToolDispatcher:
                     query[key] = "true" if args.get(key) else "false"
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/graph-governance/{pid}/operations/queue{qs}")
+
+        if name == "graph_current_full_reconcile":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            return self._api(
+                "POST",
+                f"/api/graph-governance/{pid}/reconcile/current-full",
+                body,
+            )
 
         if name == "stale_artifact_cleanup":
             pid = args["project_id"]

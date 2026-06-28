@@ -365,6 +365,8 @@ function labelOpType(t: string): string {
       return "Edge semantic";
     case "ai_summary":
       return "AI Summary";
+    case "current_full_reconcile":
+      return "Current full reconcile";
     case "scope_reconcile":
       return "Scope reconcile";
     default:

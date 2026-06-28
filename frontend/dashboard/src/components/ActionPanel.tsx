@@ -236,7 +236,7 @@ export default function ActionPanel({
                     onRunReconcile();
                   }}
                 >
-                  <div className="action-preset-title">Run scope reconcile</div>
+                  <div className="action-preset-title">Run graph reconcile</div>
                   <div className="action-preset-desc">Dry-run preview · structure + queue enrichment</div>
                 </button>
                 <button

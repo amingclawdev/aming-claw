@@ -17840,7 +17840,7 @@ def _scope_reconcile_operator_next_action(fallback_reason: str) -> str:
     fallback_reason = str(fallback_reason or "").strip()
     if fallback_reason == "source_function_identity_changed":
         return (
-            "run_full_reconcile; function identities changed, so incremental "
+            "run_current_full_reconcile; function identities changed, so incremental "
             "dependency facts may be stale"
         )
     if fallback_reason:
@@ -17977,6 +17977,7 @@ def _scope_reconcile_operation_trace(
     *,
     status: str,
     target_commit_sha: str,
+    operation_type: str = "scope_reconcile",
     parent_commit_sha: str = "",
     snapshot_id: str = "",
     run_id: str = "",
@@ -17997,7 +17998,7 @@ def _scope_reconcile_operation_trace(
     )
     trace = {
         "schema_version": "scope_reconcile_operation_trace.v1",
-        "operation_type": "scope_reconcile",
+        "operation_type": operation_type or "scope_reconcile",
         "status": normalized_status,
         "progress": _operation_unit_progress(normalized_status),
         "target_commit_sha": str(target_commit_sha or ""),
@@ -18086,6 +18087,22 @@ def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str
     except Exception:
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_dirty_paths(project_root: Path, *, limit: int | None = 50) -> list[str]:
+    raw = _git_output(project_root, ["status", "--porcelain"], timeout=10)
+    paths: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            paths.append(path.replace("\\", "/"))
+        if limit is not None and len(paths) >= limit:
+            break
+    return paths
 
 
 def _git_refs_for_root(project_root: Path) -> dict[str, Any]:
@@ -18288,6 +18305,7 @@ def _direct_update_graph_activation_guidance(
         "activate": True,
         "semantic_use_ai": False,
         "enqueue_stale": False,
+        "require_clean": True,
         "actor": str(actor or "observer"),
     }
     if parent_commit_sha:
@@ -18301,16 +18319,20 @@ def _direct_update_graph_activation_guidance(
             body[key] = value
     return {
         "schema_version": "graph_reconcile_next_action.v1",
-        "action": "materialize_and_activate_pending_scope",
+        "action": "run_current_full_reconcile",
         "description": (
-            "To make the active graph reflect the target commit, call the direct "
-            "pending-scope reconcile endpoint with activate=true. Omitting "
-            "activate creates a candidate snapshot only."
+            "To make the active graph reflect the current clean HEAD, call the "
+            "canonical current-full reconcile endpoint. It rebuilds a full "
+            "snapshot and activates it by default; pending-scope rows are only "
+            "legacy recovery bookkeeping."
         ),
-        "endpoint": f"/api/graph-governance/{project_id}/reconcile/pending-scope",
+        "endpoint": f"/api/graph-governance/{project_id}/reconcile/current-full",
         "method": "POST",
         "request": {"body": body},
-        "candidate_only_if_activate_false": True,
+        "defaults": {
+            "target_commit_sha": "current_clean_head",
+            "activate": True,
+        },
     }
 
 
@@ -18394,12 +18416,17 @@ def _graph_stale_scope_operation(
             stale_summary.update({
                 "is_stale": True,
                 "stale_reason": "rule_fingerprint_mismatch",
-                "recommended_action": "run_full_reconcile",
+                "recommended_action": "run_current_full_reconcile",
                 "requires_reconcile": True,
             })
+            stale_summary["next_action"] = _direct_update_graph_activation_guidance(
+                project_id,
+                target_commit_sha=head_commit,
+                actor="dashboard_user",
+            )
             operation = {
-                "operation_id": f"scope-reconcile:rule-fingerprint:{head_commit[:12]}",
-                "operation_type": "scope_reconcile",
+                "operation_id": f"current-full-reconcile:rule-fingerprint:{head_commit[:12]}",
+                "operation_type": "current_full_reconcile",
                 "target_scope": "snapshot",
                 "target_id": head_commit,
                 "target_label": head_commit[:12],
@@ -18412,20 +18439,25 @@ def _graph_stale_scope_operation(
                 "lease_expires_at": "",
                 "last_error": "",
                 "last_result": "graph rule fingerprint changed; run full reconcile before trusting active graph",
-                "supported_actions": ["run_full_reconcile", "view_trace", "file_backlog"],
+                "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
                 "active_graph_commit": graph_commit,
                 "head_commit": head_commit,
                 "changed_files": [],
                 "warnings": active_warnings,
                 "rule_fingerprint": rule_fingerprint,
-                "recommended_action": "run_full_reconcile",
+                "recommended_action": "run_current_full_reconcile",
+                "next_action": _direct_update_graph_activation_guidance(
+                    project_id,
+                    target_commit_sha=head_commit,
+                    actor="dashboard_user",
+                ),
             }
             return operation, stale_summary
         if not active_warnings:
             return None, stale_summary
         operation = {
-            "operation_id": f"scope-reconcile:suspect-root:{graph_commit[:12]}",
-            "operation_type": "scope_reconcile",
+            "operation_id": f"current-full-reconcile:suspect-root:{graph_commit[:12]}",
+            "operation_type": "current_full_reconcile",
             "target_scope": "snapshot",
             "target_id": graph_commit,
             "target_label": graph_commit[:12],
@@ -18438,11 +18470,17 @@ def _graph_stale_scope_operation(
             "lease_expires_at": "",
             "last_error": "",
             "last_result": "active graph snapshot has materialization provenance warnings",
-            "supported_actions": ["queue_scope_reconcile", "view_trace", "file_backlog"],
+            "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
             "active_graph_commit": graph_commit,
             "head_commit": head_commit,
             "changed_files": [],
             "warnings": active_warnings,
+            "recommended_action": "run_current_full_reconcile",
+            "next_action": _direct_update_graph_activation_guidance(
+                project_id,
+                target_commit_sha=head_commit,
+                actor="dashboard_user",
+            ),
         }
         return operation, stale_summary
     all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
@@ -18457,7 +18495,7 @@ def _graph_stale_scope_operation(
     if rule_fingerprint_mismatch:
         stale_summary.update({
             "stale_reason": "commit_and_rule_fingerprint_mismatch",
-            "recommended_action": "run_full_reconcile",
+            "recommended_action": "run_current_full_reconcile",
             "requires_reconcile": True,
         })
     pending_for_head = any(
@@ -18481,8 +18519,8 @@ def _graph_stale_scope_operation(
         "next_action": next_action,
     })
     operation = {
-        "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
-        "operation_type": "scope_reconcile",
+        "operation_id": f"current-full-reconcile:stale:{head_commit[:12]}",
+        "operation_type": "current_full_reconcile",
         "target_scope": "snapshot",
         "target_id": head_commit,
         "target_label": head_commit[:12],
@@ -18495,7 +18533,7 @@ def _graph_stale_scope_operation(
         "lease_expires_at": "",
         "last_error": "",
         "last_result": f"active graph at {graph_commit[:12]}, HEAD at {head_commit[:12]}{changed_hint}",
-        "supported_actions": ["materialize_and_activate_pending_scope", "queue_scope_reconcile", "view_trace", "file_backlog"],
+        "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
         "active_graph_commit": graph_commit,
         "head_commit": head_commit,
         "changed_files": changed_files,
@@ -21621,7 +21659,7 @@ def handle_graph_governance_drift_file_backlog(ctx: RequestContext):
                 acceptance = [
                     "Drift row is fixed, waived, or converted into a more precise graph/document/test task.",
                     "Backlog close evidence references the graph snapshot and affected path.",
-                    "Scope reconcile materializes graph state after any merge.",
+                    "Update graph runs current full reconcile after any merge.",
                 ]
             priority = str(body.get("priority") or "P2")
             target_files = body.get("target_files") if isinstance(body.get("target_files"), list) else [drift["path"]]
@@ -21939,7 +21977,12 @@ def handle_graph_governance_import_existing(ctx: RequestContext):
 
 @route("POST", "/api/graph-governance/{project_id}/reconcile/full")
 def handle_graph_governance_full_reconcile(ctx: RequestContext):
-    """Create a state-only full-reconcile candidate snapshot at current HEAD."""
+    """Create a state-only full-reconcile snapshot.
+
+    Legacy callers may still use this lower-level endpoint for candidate builds.
+    Normal operator Update Graph uses /reconcile/current-full, which defaults to
+    clean HEAD and activate=true.
+    """
     project_id = ctx.get_project_id()
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
@@ -21995,14 +22038,191 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/reconcile/current-full")
+def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
+    """Rebuild and activate a full graph snapshot for the current clean HEAD."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_state_only_full_reconcile
+    from . import graph_snapshot_store as store
+
+    request_started_at = _utc_now()
+    request_started_monotonic = time.monotonic()
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.current-full")
+        head_commit = _git_head_commit(root)
+        target_commit = str(
+            body.get("target_commit_sha")
+            or body.get("commit_sha")
+            or head_commit
+            or ""
+        ).strip()
+        if not head_commit or not target_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "reason": "current_head_required",
+                "message": "current-full reconcile requires a git HEAD commit",
+                "head_commit": head_commit,
+                "target_commit_sha": target_commit,
+            }
+        if target_commit != head_commit:
+            return 400, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "target_not_head",
+                "message": "current-full reconcile rebuilds the current worktree; target_commit_sha must equal HEAD",
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+            }
+        dirty_paths = _git_dirty_paths(root) if bool(body.get("require_clean", True)) else []
+        if dirty_paths:
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": "dirty_worktree",
+                "message": "current-full reconcile requires a clean worktree by default",
+                "dirty_files": dirty_paths,
+                "dirty_file_count": len(dirty_paths),
+                "target_commit_sha": target_commit,
+                "head_commit": head_commit,
+            }
+
+        semantic_use_ai = _semantic_use_ai_from_body(body)
+        semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
+        activate_requested = bool(body.get("activate", True))
+        notes_extra = body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else {}
+        notes_extra = {
+            **notes_extra,
+            "current_full_reconcile": {
+                "schema_version": "current_full_reconcile.v1",
+                "source": "graph_governance_api",
+                "normal_update_path": True,
+                "target_commit_sha": target_commit,
+                "activate": activate_requested,
+                "pending_scope_policy": "supersede_hidden_legacy_recovery_rows",
+            },
+        }
+        try:
+            result = run_state_only_full_reconcile(
+                conn,
+                project_id,
+                root,
+                run_id=str(body.get("run_id") or f"current-full-{target_commit[:7]}"),
+                commit_sha=target_commit,
+                snapshot_id=body.get("snapshot_id"),
+                snapshot_kind="full",
+                created_by=str(body.get("actor") or "dashboard_user"),
+                activate=activate_requested,
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                ref_name=str(body.get("ref_name") or "active"),
+                branch_ref=str(body.get("branch_ref") or ""),
+                notes_extra=notes_extra,
+                semantic_enrich=bool(body.get("semantic_enrich", True)),
+                semantic_use_ai=semantic_use_ai,
+                semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
+                semantic_feedback_round=body.get("semantic_feedback_round"),
+                semantic_max_excerpt_chars=(
+                    int(body["semantic_max_excerpt_chars"])
+                    if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_ai_call=semantic_ai_call,
+                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_batch_kwargs_from_body(body),
+                **_semantic_state_kwargs_from_body(body),
+                semantic_classify_feedback=bool(
+                    _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
+                ),
+                **_semantic_ai_config_kwargs_from_body(body),
+                **_semantic_selector_kwargs_from_body(body),
+                semantic_config_path=body.get("semantic_config_path"),
+                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+
+        elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
+        if isinstance(result, dict) and result.get("ok", True):
+            result = dict(result)
+            result["status"] = result.get("status") or result.get("snapshot_status") or "complete"
+            result["target_commit_sha"] = target_commit
+            result["head_commit"] = head_commit
+            result["current_full_reconcile"] = True
+            result["strategy"] = "current_full_reconcile"
+            result["scope_reconcile_strategy"] = "current_full_reconcile"
+            result["graph_delta_mode"] = "full_rebuild"
+            result["scope_graph_delta_mode"] = "full_rebuild"
+            result["fallback_reason"] = ""
+            result["fallback_required"] = False
+            result["operator_next_action"] = ""
+            result["elapsed_ms"] = int(result.get("elapsed_ms") or elapsed_ms)
+            identity = store.normalize_pending_scope_identity(
+                ref_name=str(body.get("ref_name") or "active"),
+                branch_ref=str(body.get("branch_ref") or ""),
+            )
+            result["operation_trace"] = _scope_reconcile_operation_trace(
+                operation_type="current_full_reconcile",
+                status=str(result.get("snapshot_status") or result.get("status") or "complete"),
+                target_commit_sha=target_commit,
+                snapshot_id=str(result.get("snapshot_id") or ""),
+                run_id=str(result.get("run_id") or body.get("run_id") or ""),
+                identity=identity,
+                result=result,
+                elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+                started_at=request_started_at,
+                updated_at=_utc_now(),
+            )
+            if activate_requested:
+                activation_verification = _pending_scope_activation_verification(
+                    conn,
+                    store,
+                    project_id,
+                    root=root,
+                    target_commit_sha=target_commit,
+                    activate_requested=True,
+                    identity=identity,
+                )
+                result["activation_verification"] = activation_verification
+                result["activated"] = bool(activation_verification.get("verified"))
+                if activation_verification.get("verified"):
+                    result["snapshot_status"] = "active"
+                    result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
+                    result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
+            else:
+                result["activated"] = False
+                result.setdefault("candidate_only", True)
+            timeline_event = _record_pending_scope_reconcile_contract_event(
+                conn,
+                project_id=project_id,
+                body=body,
+                result=result,
+                target_commit_sha=target_commit,
+            )
+            if timeline_event:
+                result["timeline_event_recorded"] = {
+                    "id": timeline_event.get("id"),
+                    "ref": f"timeline:{timeline_event.get('id')}",
+                    "event_kind": timeline_event.get("event_kind"),
+                    "phase": timeline_event.get("phase"),
+                    "status": timeline_event.get("status"),
+                    "requirement_id": "reconcile",
+                }
+        conn.commit()
+        return 201, result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope")
 def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
-    """Create a state-only scope candidate and activate it when requested.
+    """Legacy recovery: create a state-only scope candidate and optionally activate.
 
-    The old dashboard contract required callers to POST /pending-scope first,
-    which left a visible queued operation while the long synchronous build ran.
-    The direct Update graph contract lets this endpoint create the transient
-    pending row itself, mark it running, then consume it in the same request.
+    Normal operator Update Graph now uses /reconcile/current-full. This endpoint
+    remains for internal/deprecated recovery when a specific pending-scope row
+    must be inspected or retried.
     """
     project_id = ctx.get_project_id()
     body = ctx.body
@@ -37225,11 +37445,16 @@ def _onboard_contract_route_guide(
                     "kind": "mcp_or_http",
                     "mcp_tools": [
                         "graph_operations_queue",
-                        "graph_pending_scope_queue",
+                        "graph_current_full_reconcile",
                     ],
                     "status_path": "/api/graph-governance/{project_id}/operations/queue",
-                    "queue_path": "/api/graph-governance/{project_id}/pending-scope",
+                    "run_path": "/api/graph-governance/{project_id}/reconcile/current-full",
                     "gated": True,
+                    "legacy_recovery": {
+                        "pending_scope_queue_path": "/api/graph-governance/{project_id}/pending-scope",
+                        "pending_scope_materialize_path": "/api/graph-governance/{project_id}/reconcile/pending-scope",
+                        "internal_only": True,
+                    },
                 },
                 "source_hints": {
                     "kind": "graph_status_index",

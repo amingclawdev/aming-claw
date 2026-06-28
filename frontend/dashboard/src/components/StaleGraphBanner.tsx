@@ -28,10 +28,10 @@ interface Props {
 // to snapshot commit in the browser would produce false stale banners.
 //
 // MF-016 banner P3: banner has two display modes —
-// 1. **stale**: HEAD ≠ snapshot. Default state; shows the queue button.
+// 1. **stale**: HEAD != snapshot. Default state; shows the update button.
 // 2. **in-progress / just done**: while handleQueueReconcile runs, replace the
 //    button with phase chips + progress bar so the operator can read off what
-//    is happening (queue → materialize → projection rebuild → done).
+//    is happening (rebuild snapshot -> projection rebuild -> done).
 //    Banner auto-hides once status.current_state.graph_stale.is_stale clears.
 export default function StaleGraphBanner({
   health,
@@ -94,7 +94,7 @@ export default function StaleGraphBanner({
           <button
             onClick={onQueueReconcile}
             disabled={busy}
-            title="Materialize new snapshot + rebuild projection — runs inline"
+            title="Rebuild and activate a current full snapshot, then rebuild projection"
           >
             {busy ? "Updating…" : "Update graph"}
           </button>
@@ -109,7 +109,7 @@ export default function StaleGraphBanner({
 // no signal. Phase=queueing maps to currentIdx=-1, which the label
 // fallback below treats as "Starting…" until materializing fires.
 const PHASE_STEPS: { id: ReconcilePhase; label: string }[] = [
-  { id: "materializing", label: "Build snapshot" },
+  { id: "materializing", label: "Rebuild snapshot" },
   { id: "rebuilding", label: "Rebuild projection" },
   { id: "done", label: "Done" },
 ];
