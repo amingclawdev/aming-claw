@@ -1104,13 +1104,20 @@ def _project_direct_fix_state(
         line_ids={"direct_fix_candidate_repair"},
         evidence_kinds={"direct_fix_repair_evidence"},
     )
-    qa_line = _find_direct_fix_qa_line(child, generation=generation)
     return_line = _find_completed_line(
         child,
         line_ids={"direct_fix_return_to_parent"},
         evidence_kinds={"direct_fix_return_to_parent"},
     )
-    if return_line and qa_line:
+    qa_line = _find_direct_fix_qa_line(
+        child,
+        generation=generation,
+        repair_line=repair_line,
+    )
+    if return_line and qa_line and _direct_fix_return_follows_qa(
+        return_line,
+        qa_line=qa_line,
+    ):
         return {
             "current_contract_execution_id": parent_id
             or str(root_record.get("contract_execution_id") or ""),
@@ -1280,6 +1287,7 @@ def _find_direct_fix_qa_line(
     record: Mapping[str, Any],
     *,
     generation: int,
+    repair_line: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     lines = (
         record.get("completed_lines")
@@ -1287,6 +1295,7 @@ def _find_direct_fix_qa_line(
         else []
     )
     execution_id = str(record.get("contract_execution_id") or "")
+    repair_index = _completed_line_index(repair_line or {})
     for index, line in reversed(list(enumerate(lines))):
         if not isinstance(line, Mapping):
             continue
@@ -1296,10 +1305,14 @@ def _find_direct_fix_qa_line(
             continue
         if not _line_status_allows_direct_fix_qa(line):
             continue
-        if not _line_scope_matches_direct_fix_child(
+        explicit_scope_matches = _line_scope_matches_direct_fix_child(
             line,
             contract_execution_id=execution_id,
             generation=generation,
+        )
+        if not explicit_scope_matches and not _line_is_post_repair_child_qa(
+            index,
+            repair_index=repair_index,
         ):
             continue
         enriched = dict(line)
@@ -1307,6 +1320,35 @@ def _find_direct_fix_qa_line(
         enriched["_source_ref"] = f"contract_runtime:{execution_id}:completed_lines:{index}"
         return enriched
     return {}
+
+
+def _completed_line_index(line: Mapping[str, Any]) -> int:
+    try:
+        return int(line.get("_completed_line_index"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _line_is_post_repair_child_qa(
+    index: int,
+    *,
+    repair_index: int,
+) -> bool:
+    if repair_index < 0:
+        return False
+    return index > repair_index
+
+
+def _direct_fix_return_follows_qa(
+    return_line: Mapping[str, Any],
+    *,
+    qa_line: Mapping[str, Any],
+) -> bool:
+    return_index = _completed_line_index(return_line)
+    qa_index = _completed_line_index(qa_line)
+    if return_index < 0 or qa_index < 0:
+        return False
+    return return_index > qa_index
 
 
 def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:

@@ -540,7 +540,7 @@ def test_contract_chain_mapping_schema_idempotent_and_rebuilds_projection(tmp_pa
     )
 
 
-def test_direct_fix_qa_without_explicit_binding_is_not_counted(tmp_path):
+def test_direct_fix_qa_without_explicit_binding_counts_after_repair(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -577,9 +577,9 @@ def test_direct_fix_qa_without_explicit_binding_is_not_counted(tmp_path):
         project_id="aming-claw",
         backlog_id="AC-DIRECT-FIX-QA-GENERIC",
     )
-    assert current["readiness_state"] == "direct_fix_complete_awaiting_independent_qa"
+    assert current["readiness_state"] == "return_to_parent_after_direct_fix_qa"
     assert current["current_contract_execution_id"] == direct_fix["contract_execution_id"]
-    assert current["next_legal_action"]["id"] == "qa_independent_verification"
+    assert current["next_legal_action"]["id"] == "return_to_parent_after_direct_fix_qa"
 
 
 def test_direct_fix_qa_with_child_generation_and_source_refs_is_counted(tmp_path):
@@ -618,6 +618,51 @@ def test_direct_fix_qa_with_child_generation_and_source_refs_is_counted(tmp_path
     assert current["next_legal_action"]["qa_evidence_ref"] == (
         f"contract_runtime:{direct_fix['contract_execution_id']}:completed_lines:1"
     )
+
+
+def test_direct_fix_projection_does_not_resume_parent_when_return_precedes_qa(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    _, direct_fix, generation, repair_ref = _start_repaired_direct_fix(
+        runtime,
+        backlog_id="AC-DIRECT-FIX-RETURN-BEFORE-QA",
+    )
+
+    record = runtime.store.get(direct_fix["contract_execution_id"])
+    return_line = _write_from(
+        record,
+        actor_role="observer",
+        stage_id="return_to_parent",
+        line_id="direct_fix_return_to_parent",
+        evidence_kind="direct_fix_return_to_parent",
+    )
+    qa_line = _direct_fix_qa_write(
+        record,
+        generation=generation,
+        repair_ref=repair_ref,
+    )
+    mutated = dict(record)
+    mutated["completed_lines"] = list(record["completed_lines"]) + [
+        return_line,
+        qa_line,
+    ]
+    runtime.store.update(mutated["contract_execution_id"], mutated)
+
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX-RETURN-BEFORE-QA",
+        rebuild_if_missing=True,
+    )
+    assert current["readiness_state"] == "return_to_parent_after_direct_fix_qa"
+    assert current["current_contract_execution_id"] == direct_fix["contract_execution_id"]
+    assert current["next_legal_action"]["id"] == "return_to_parent_after_direct_fix_qa"
 
 
 def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp_path):

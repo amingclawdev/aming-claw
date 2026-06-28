@@ -24810,7 +24810,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     )
 
 
-def test_direct_fix_generic_qa_cannot_resume_parent_without_projection_binding(conn):
+def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn):
     backlog_id = "AC-DIRECT-FIX-GENERIC-QA-NO-PARENT-RESUME"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
@@ -24912,9 +24912,9 @@ def test_direct_fix_generic_qa_cannot_resume_parent_without_projection_binding(c
     current = server.handle_project_contract_chain_current(
         _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
     )["contract_chain_current"]
-    assert current["readiness_state"] == "direct_fix_complete_awaiting_independent_qa"
-    assert current["current_contract_execution_id"] == direct_execution_id
-    assert current["next_legal_action"]["id"] == "qa_independent_verification"
+    assert current["readiness_state"] == "parent_resume_required_after_direct_fix_qa"
+    assert current["current_contract_execution_id"] == parent_execution_id
+    assert current["next_legal_action"]["id"] == "resume_parent_after_successor_return"
 
     parent_current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -24924,10 +24924,10 @@ def test_direct_fix_generic_qa_cannot_resume_parent_without_projection_binding(c
         )
     )
     parent_next = parent_current["next_legal_action"]
-    assert parent_next["id"] == "qa_independent_verification"
-    assert parent_next["source"] == "backlog_contract_chain_current"
+    assert parent_next["id"] == "resume_parent_after_successor_return"
+    assert parent_next["source"] == "onboard_route_guide_service"
     assert parent_next["successor_contract_execution_id"] == direct_execution_id
-    assert parent_current["runtime_guide"].get("successor_return", {}) == {}
+    assert parent_current["runtime_guide"]["successor_return"]["status"] == "returned"
 
 
 def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):
