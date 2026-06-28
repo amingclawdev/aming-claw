@@ -187,10 +187,20 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
         {
             "task_id": {"type": "string"},
             "worker_session_id": {"type": "string"},
+            "worker_id": {"type": "string"},
+            "worker_slot_id": {"type": "string"},
             "filer_principal": {"type": "string"},
             "worker_transcript_ref": {"type": "string"},
             "worker_transcript_path": {"type": "string"},
             "harness_type": {"type": "string"},
+            "launch_text_hash": {"type": "string"},
+            "receipt_hash": {"type": "string"},
+            "context_hash": {"type": "string"},
+            "contract_hash": {"type": "string"},
+            "acknowledged_at": {"type": "string"},
+            "actor_role": {"type": "string"},
+            "actor_session_principal": {"type": "string"},
+            "contract_context_read_receipt": {"type": "object"},
             "checkpoint_id": {"type": "string"},
             "head_commit": {"type": "string"},
             "changed_files": {"type": "array", "items": {"type": "string"}},
@@ -1207,6 +1217,15 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "runtime_context_read_receipt",
+        "description": "Worker-authored canonical Runtime Context read-receipt facade. Prefer this over legacy task_timeline_append or generic ContractRuntime line writes for mf_sub happy paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": ["project_id", "runtime_context_id"],
+        },
+    },
+    {
         "name": "runtime_context_implementation_evidence",
         "description": "Worker-authored canonical Runtime Context implementation-evidence facade. Prefer this over legacy task_timeline_append for mf_sub happy paths.",
         "inputSchema": {
@@ -1808,6 +1827,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         )
 
     if name in {
+        "runtime_context_read_receipt",
         "runtime_context_implementation_evidence",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
@@ -1817,6 +1837,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
         suffix_by_name = {
+            "runtime_context_read_receipt": "read-receipts",
             "runtime_context_implementation_evidence": "implementation-evidence",
             "runtime_context_finish_time_worker_attestation": (
                 "finish-time-worker-attestation"

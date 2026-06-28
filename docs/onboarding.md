@@ -295,8 +295,9 @@ The normal worker order is:
 1. Read the worker guide and confirm the next legal action. A fresh worker
    should normally see `submit_mf_subagent_read_receipt`.
 2. Record a worker-authored read receipt through the runtime-context
-   `read-receipts` facade, using the guide hash material and public route
-   identity. Do not persist raw session, route, or launch-text tokens.
+   `runtime_context_read_receipt` MCP tool or HTTP `read-receipts` facade,
+   using the guide hash material and public route identity. Do not persist raw
+   session, route, or launch-text tokens.
 3. Record real startup before implementation through `parallel_branch_startup`
    or the runtime-context `startup` facade, including actual cwd/git root,
    branch/head, base/target head, merge queue id, owned files, read-receipt

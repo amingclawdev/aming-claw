@@ -2895,6 +2895,7 @@ def handle_observer_repair_run_route_evidence(ctx: RequestContext):
 
 
 _OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS = {
+    "runtime_context_read_receipt",
     "submit_mf_subagent_read_receipt",
     "record_mf_subagent_startup",
     "record_implementation_evidence",
@@ -8735,6 +8736,7 @@ def _runtime_context_executable_contract_envelope(
             "endpoint": {
                 "facade": "runtime_context.read_receipts",
                 "tool": "submit_mf_subagent_read_receipt",
+                "mcp_tool": "runtime_context_read_receipt",
                 "method": "POST",
                 "path": (
                     "/api/graph-governance/{project_id}/runtime-contexts/"
@@ -9778,6 +9780,7 @@ def _runtime_context_worker_guide_response(
                 "event_kind": "mf_subagent_read_receipt",
             },
             "canonical_facade_status": "available",
+            "mcp_tool": "runtime_context_read_receipt",
             "path": (
                 "/api/graph-governance/{project_id}/runtime-contexts/"
                 "{runtime_context_id}/read-receipts"
@@ -11099,6 +11102,7 @@ def _runtime_context_worker_recovery_payloads(
                 "method": "POST",
                 "path": read_receipt_path,
                 "tool": "submit_mf_subagent_read_receipt",
+                "mcp_tool": "runtime_context_read_receipt",
                 "facade": "runtime_context.read_receipts",
                 "body_source": "read_receipt_facade_payload_skeleton.copy_safe_body",
             },
@@ -11137,6 +11141,8 @@ def _runtime_context_worker_recovery_payloads(
             "method": "POST",
             "path": read_receipt_path,
             "facade": "runtime_context.read_receipts",
+            "mcp_tool": "runtime_context_read_receipt",
+            "legacy_tool": "submit_mf_subagent_read_receipt",
             "top_level_body_required": True,
             "body_is_top_level_post_json": True,
             "body_source": "copy_safe_body",
@@ -35785,6 +35791,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_update_submit_line",
     "contract_runtime_current",
     "contract_runtime_submit_line",
+    "runtime_context_read_receipt",
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
     "task_timeline_append",
@@ -36359,6 +36366,17 @@ def _onboard_contract_route_guide(
                 "{runtime_context_id}/worker-guide"
             ),
         },
+        "runtime_context_read_receipt": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "runtime_context_read_receipt",
+            "method": "POST",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/read-receipts"
+            ),
+            "facade": "runtime_context.read_receipts",
+            "legacy_action": "submit_mf_subagent_read_receipt",
+        },
         "qa_session_register": {
             "kind": "mcp_or_http",
             "mcp_tool": "qa_session_register",
@@ -36405,7 +36423,7 @@ def _onboard_contract_route_guide(
             "session_token_ref",
         ],
         "required_token_refs": ["session_token_ref", "route_token_ref"],
-        "next_action": "read runtime_context_worker_guide, then submit the next required worker evidence line",
+        "next_action": "read runtime_context_worker_guide, then use runtime_context_read_receipt or the next required worker evidence facade",
         "raw_session_token_required": False,
         "raw_session_token_exposed": False,
         "raw_route_token_exposed": False,
@@ -36640,6 +36658,7 @@ def _onboard_contract_route_guide(
                 "contract_add_start",
                 "contract_update_start",
                 "runtime_context_worker_guide",
+                "runtime_context_read_receipt",
                 "qa_session_register",
                 "contract_runtime_current",
                 "contract_runtime_submit_line",
