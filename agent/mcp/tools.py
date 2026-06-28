@@ -2571,8 +2571,15 @@ def _runtime_status_classification(
     manager_ok = bool(manager.get("ok"))
     version_ok = bool(version.get("ok"))
     runtime_match = bool(version.get("runtime_match"))
-    dirty = bool(version.get("dirty"))
-    core_ok = bool(gov_ok and version_ok and not dirty)
+    dirty = _runtime_status_target_dirty(version)
+    target_clean = _runtime_status_target_clean(version)
+    legacy_runtime_waivers = (
+        _runtime_status_legacy_runtime_waivers(manager, version)
+        if target_clean
+        else []
+    )
+    core_version_ok = bool(version_ok or (target_clean and legacy_runtime_waivers))
+    core_ok = bool(gov_ok and core_version_ok and not dirty)
     advanced_chain_ops_ok = bool(manager_ok and runtime_match and not dirty)
     strict_ok = core_ok
 
@@ -2582,9 +2589,15 @@ def _runtime_status_classification(
     elif dirty:
         severity = "warning"
         summary = "Governance is usable, but the worktree has uncommitted files."
-    elif not version_ok:
+    elif not core_version_ok:
         severity = "warning"
         summary = "Governance is usable, but version metadata needs attention."
+    elif legacy_runtime_waivers:
+        severity = "ok"
+        summary = (
+            "Governance core is healthy; legacy/advanced runtime drift is waived "
+            "for current contract-runtime workflows."
+        )
     elif not manager_ok or not runtime_match:
         severity = "ok"
         summary = "Governance core is healthy; advanced chain/ops readiness needs attention."
@@ -2608,7 +2621,142 @@ def _runtime_status_classification(
             "service_manager": manager_ok,
             "executor": advanced_chain_ops_ok,
         },
+        "legacy_runtime_waivers": legacy_runtime_waivers,
     }
+
+
+def _runtime_status_target_dirty(version: dict[str, Any]) -> bool:
+    target_version = version.get("target_project_version")
+    if not isinstance(target_version, dict):
+        target_version = {}
+    return bool(version.get("target_dirty", target_version.get("dirty", version.get("dirty", False))))
+
+
+def _runtime_status_hash_match(left: Any, right: Any) -> bool:
+    left_s = str(left or "")
+    right_s = str(right or "")
+    if not left_s or not right_s or left_s == "(not set)" or right_s == "(not set)":
+        return True
+    return left_s.startswith(right_s) or right_s.startswith(left_s)
+
+
+def _runtime_status_target_clean(version: dict[str, Any]) -> bool:
+    target_version = version.get("target_project_version")
+    if not isinstance(target_version, dict):
+        target_version = {}
+    target_head = (
+        version.get("target_head")
+        or target_version.get("head")
+        or version.get("head")
+        or ""
+    )
+    target_chain = (
+        version.get("target_chain_version")
+        or target_version.get("chain_version")
+        or version.get("chain_version")
+        or ""
+    )
+    target_synced = version.get(
+        "target_synced_with_governance",
+        target_version.get("synced_with_governance", True),
+    )
+    return bool(
+        not _runtime_status_target_dirty(version)
+        and target_synced is not False
+        and _runtime_status_hash_match(target_head, target_chain)
+    )
+
+
+def _runtime_status_legacy_runtime_waivers(
+    manager: dict[str, Any],
+    version: dict[str, Any],
+) -> list[dict[str, Any]]:
+    target_version = version.get("target_project_version")
+    if not isinstance(target_version, dict):
+        target_version = {}
+    legacy_project_version = target_version.get("legacy_project_version")
+    if not isinstance(legacy_project_version, dict):
+        legacy_project_version = version.get("legacy_project_version")
+    if not isinstance(legacy_project_version, dict):
+        legacy_project_version = {}
+    governance_runtime = version.get("governance_runtime")
+    if not isinstance(governance_runtime, dict):
+        governance_runtime = {}
+
+    target_chain = (
+        version.get("target_chain_version")
+        or target_version.get("chain_version")
+        or version.get("chain_version")
+        or ""
+    )
+    target_head = (
+        version.get("target_head")
+        or target_version.get("head")
+        or version.get("head")
+        or ""
+    )
+    legacy_chain = legacy_project_version.get("chain_version", "")
+    waivers: list[dict[str, Any]] = []
+
+    if legacy_chain and not _runtime_status_hash_match(legacy_chain, target_chain or target_head):
+        waivers.append(
+            {
+                "id": "legacy_project_version_chain_drift",
+                "scope": "legacy_project_version",
+                "blocking": False,
+                "capability": "core_runtime",
+                "reason": (
+                    "legacy project_version/CHAIN_VERSION metadata differs from "
+                    "the current target version but target runtime evidence is clean"
+                ),
+                "evidence": {
+                    "legacy_chain_version": legacy_chain,
+                    "target_chain_version": target_chain,
+                    "target_head": target_head,
+                    "legacy_synced_with_target": legacy_project_version.get("synced_with_target"),
+                    "legacy_git_head": legacy_project_version.get("git_head", ""),
+                },
+            }
+        )
+
+    runtime_match = version.get("runtime_match")
+    gov_runtime_version = (
+        governance_runtime.get("gov_runtime_version")
+        or version.get("gov_runtime_version")
+        or ""
+    )
+    sm_runtime_version = (
+        governance_runtime.get("sm_runtime_version")
+        or version.get("sm_runtime_version")
+        or ""
+    )
+    governance_chain_version = (
+        governance_runtime.get("chain_version")
+        or version.get("governance_chain_version")
+        or target_chain
+    )
+    if runtime_match is False and (gov_runtime_version or sm_runtime_version or governance_chain_version):
+        waivers.append(
+            {
+                "id": "advanced_runtime_version_mismatch",
+                "scope": "advanced_chain_ops/executor",
+                "blocking": False,
+                "capability": "advanced_chain_ops",
+                "reason": (
+                    "ServiceManager/executor runtime version drift only limits "
+                    "advanced chain operations"
+                ),
+                "evidence": {
+                    "manager_ok": bool(manager.get("ok")),
+                    "governance_chain_version": governance_chain_version,
+                    "gov_runtime_version": gov_runtime_version,
+                    "sm_runtime_version": sm_runtime_version,
+                    "runtime_match": False,
+                },
+            }
+        )
+
+    return waivers
 
 
 def _governance_offline_hint(payload: dict[str, Any]) -> dict[str, Any]:
