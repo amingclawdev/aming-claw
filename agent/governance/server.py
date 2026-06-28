@@ -37246,6 +37246,36 @@ def _onboard_route_guide_service_response(
         runtime_resume = _onboard_runtime_resume_from_current_projection(
             current_projection
         )
+        selected_work_type = str(work_type or "").strip()
+        if (
+            selected_work_type
+            in {"continue_contract_chain", "rollback_or_recover_contract", "direct_fix"}
+            and not runtime_resume.get("next_legal_action")
+            and not str(
+                current_projection.get("active_child_contract_execution_id") or ""
+            ).strip()
+        ):
+            blocked_resume = _onboard_blocked_contract_resume_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=str(role or "").strip() or "observer",
+                route_token_ref=route_token_ref,
+            )
+            if blocked_resume:
+                blocked_resume["shadowed_current_projection"] = {
+                    "source": "backlog_contract_chain_current",
+                    "readiness_state": str(
+                        current_projection.get("readiness_state") or ""
+                    ),
+                    "current_contract_execution_id": str(
+                        current_projection.get("current_contract_execution_id") or ""
+                    ),
+                    "projection_hash": str(
+                        current_projection.get("projection_hash") or ""
+                    ),
+                }
+                runtime_resume = blocked_resume
     else:
         runtime_resume = _onboard_blocked_contract_resume_projection(
             conn,
@@ -37804,6 +37834,7 @@ _DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_runtime_current",
     "contract_runtime_guide",
     "contract_runtime_submit_line",
+    "parallel_branch_allocate",
     "task_timeline_append",
 )
 _DIRECT_FIX_CHILD_ROUTE_TOKEN_DEFAULT_TARGET_FILES = (
@@ -38280,6 +38311,440 @@ def _direct_fix_with_child_route_token_ref(
     if child_id:
         updated = _contract_runtime_store(conn).update(child_id, updated)
     return updated, binding
+
+
+def _direct_fix_dispatch_text(value: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = str(value.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _direct_fix_dispatch_payload(write: Mapping[str, Any]) -> dict[str, Any]:
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    return dict(payload)
+
+
+def _direct_fix_dispatch_branch_ref(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text.startswith("refs/heads/"):
+            return text
+        return f"refs/heads/{text}"
+    return ""
+
+
+def _direct_fix_dispatch_task_id(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> str:
+    for source in (write, payload):
+        text = _direct_fix_dispatch_text(
+            source,
+            "task_id",
+            "worker_task_id",
+            "stage_task_id",
+        )
+        if text:
+            return text
+    branch_ref = _direct_fix_dispatch_branch_ref(
+        payload.get("branch_ref"),
+        payload.get("branch"),
+        write.get("branch_ref"),
+        write.get("branch"),
+    )
+    if branch_ref:
+        branch_name = branch_ref.removeprefix("refs/heads/")
+        if branch_name.startswith("codex/"):
+            branch_name = branch_name.split("/", 1)[1]
+        slug = _parallel_branch_allocate_slug(branch_name)
+        if slug:
+            return slug
+    worker_id = _direct_fix_dispatch_text(
+        payload,
+        "worker_slot_id",
+        "worker_id",
+        "worker_agent_id",
+        "agent_id",
+    )
+    if worker_id:
+        slug = _parallel_branch_allocate_slug(worker_id)
+        if slug:
+            return slug
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    return f"{contract_execution_id}-worker" if contract_execution_id else ""
+
+
+def _direct_fix_dispatch_route_identity(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    if not route_token_ref:
+        return {}
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    if not isinstance(resolved, Mapping) or not resolved:
+        return {}
+    return {
+        key: str(resolved.get(key) or "").strip()
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+        if str(resolved.get(key) or "").strip()
+    }
+
+
+def _direct_fix_materialize_dispatch_runtime_context(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Allocate the mf_sub runtime context behind a direct_fix dispatch line."""
+
+    if str(record.get("contract_id") or "").strip() != DIRECT_FIX_CONTRACT_ID:
+        return dict(write)
+    if (
+        str(write.get("stage_id") or "").strip() != "dispatch_context"
+        or str(write.get("line_id") or "").strip() != "direct_fix_dispatch_context"
+        or str(write.get("evidence_kind") or "").strip() != "dispatch_bounded_worker"
+    ):
+        return dict(write)
+
+    payload = _direct_fix_dispatch_payload(write)
+    if _truthy_flag(payload.get("legacy_dispatch_without_runtime_context")):
+        return dict(write)
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not contract_execution_id or not backlog_id:
+        return dict(write)
+
+    runtime_context_id = _direct_fix_dispatch_text(
+        write,
+        "runtime_context_id",
+    ) or _direct_fix_dispatch_text(payload, "runtime_context_id")
+    task_id = _direct_fix_dispatch_task_id(record, write, payload)
+    parent_task_id = _direct_fix_dispatch_text(
+        write,
+        "parent_task_id",
+    ) or _direct_fix_dispatch_text(payload, "parent_task_id") or contract_execution_id
+    worker_slot_id = _direct_fix_dispatch_text(
+        write,
+        "worker_slot_id",
+        "worker_id",
+    ) or _direct_fix_dispatch_text(
+        payload,
+        "worker_slot_id",
+        "worker_id",
+        "worker_agent_id",
+        "agent_id",
+    )
+    allocation_owner = _direct_fix_dispatch_text(
+        payload,
+        "allocation_owner",
+        "observer_allocation_owner",
+        "worker_agent_id",
+        "agent_id",
+    ) or worker_slot_id or "direct_fix_worker"
+    branch_ref = _direct_fix_dispatch_branch_ref(
+        payload.get("branch_ref"),
+        payload.get("branch"),
+        write.get("branch_ref"),
+        write.get("branch"),
+    )
+    worktree_path = _direct_fix_dispatch_text(
+        payload,
+        "worktree_path",
+        "assigned_worktree",
+        "worker_worktree_path",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "worktree_path",
+        "assigned_worktree",
+        "worker_worktree_path",
+    )
+    workspace_root = _direct_fix_dispatch_text(
+        payload,
+        "workspace_root",
+        "repo_root_path",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "workspace_root",
+        "repo_root_path",
+    ) or os.getcwd()
+    target_project_root = _direct_fix_dispatch_text(
+        payload,
+        "target_project_root",
+        "target_graph_root",
+    ) or _direct_fix_dispatch_text(
+        write,
+        "target_project_root",
+        "target_graph_root",
+    ) or worktree_path or workspace_root
+    owned_files = _runtime_context_service_query_values(payload, "owned_files", "target_files")
+    if not owned_files:
+        owned_files = _runtime_context_service_query_values(
+            write,
+            "owned_files",
+            "target_files",
+        )
+    if not owned_files:
+        owned_files = _direct_fix_child_route_token_target_files(conn, backlog_id=backlog_id)
+    base_commit = _direct_fix_dispatch_text(payload, "base_commit") or _direct_fix_dispatch_text(write, "base_commit")
+    target_head_commit = (
+        _direct_fix_dispatch_text(payload, "target_head_commit")
+        or _direct_fix_dispatch_text(write, "target_head_commit")
+        or base_commit
+    )
+    fence_token = (
+        _direct_fix_dispatch_text(write, "fence_token", "worker_fence_token")
+        or _direct_fix_dispatch_text(payload, "fence_token", "worker_fence_token")
+        or f"fence-{uuid.uuid4().hex[:12]}"
+    )
+    if not task_id:
+        return dict(write)
+
+    from .parallel_branch_runtime import (
+        STATE_ALLOCATED,
+        STATE_WORKTREE_READY,
+        append_branch_contract_revision,
+        branch_context_to_dict,
+        branch_contract_revision_to_dict,
+        branch_runtime_allocation_evidence,
+        get_branch_context,
+        issue_mf_subagent_session_token,
+        preserve_materialized_context_for_allocation,
+        runtime_context_session_token_ref,
+        upsert_branch_context,
+        plan_branch_runtime_context,
+    )
+
+    context = plan_branch_runtime_context(
+        project_id=project_id,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        batch_id=_direct_fix_dispatch_text(payload, "batch_id"),
+        backlog_id=backlog_id,
+        parent_task_id=parent_task_id,
+        chain_id=str(record.get("contract_chain_id") or ""),
+        root_task_id=contract_execution_id,
+        stage_task_id=task_id,
+        stage_type="direct_fix",
+        agent_id=allocation_owner,
+        worker_id=worker_slot_id,
+        allocation_owner=allocation_owner,
+        worker_slot_id=worker_slot_id,
+        governance_project_id=project_id,
+        target_project_id=project_id,
+        target_project_root=target_project_root,
+        target_files=owned_files,
+        owned_files=owned_files,
+        branch_prefix="codex",
+        worktree_root=str(payload.get("worktree_root") or ".worktrees/direct-fix"),
+        ref_name=str(payload.get("ref_name") or payload.get("target_branch") or "main"),
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=_direct_fix_dispatch_text(payload, "merge_queue_id"),
+        fence_token=fence_token,
+        status=STATE_WORKTREE_READY if worktree_path else STATE_ALLOCATED,
+    )
+    normalize_body = dict(payload)
+    if worktree_path:
+        normalize_body["worktree_path"] = worktree_path
+    context = _parallel_branch_allocate_normalize_worktree_path(
+        context,
+        normalize_body,
+        worktree_root=str(payload.get("worktree_root") or ".worktrees/direct-fix"),
+    )
+    if branch_ref:
+        context = replace(context, branch_ref=branch_ref)
+    if runtime_context_id:
+        context = replace(context, runtime_context_id=runtime_context_id)
+
+    existing = get_branch_context(conn, project_id, task_id)
+    context = preserve_materialized_context_for_allocation(existing, context)
+    saved = upsert_branch_context(conn, context)
+    if not saved.session_token_hash:
+        session = issue_mf_subagent_session_token(saved)
+        saved = upsert_branch_context(
+            conn,
+            replace(saved, session_token_hash=str(session.get("session_token_hash") or "")),
+        )
+    session_token_ref = runtime_context_session_token_ref(saved)
+    saved_context = branch_context_to_dict(saved)
+
+    route_token_ref = (
+        str(write.get("route_token_ref") or "").strip()
+        or str(record.get("route_token_ref") or "").strip()
+    )
+    route_identity = _direct_fix_dispatch_route_identity(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+    if route_token_ref and not route_identity.get("route_token_ref"):
+        route_identity["route_token_ref"] = route_token_ref
+
+    runtime_contract_revision: dict[str, Any] = {}
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    )
+    if owned_files and all(route_identity.get(field) for field in required_route_fields):
+        revision = append_branch_contract_revision(
+            conn,
+            saved,
+            contract_version=DIRECT_FIX_TEMPLATE_ID,
+            payload={
+                **_parallel_branch_allocate_contract_revision_payload(
+                    {
+                        **dict(payload),
+                        **dict(route_identity),
+                        "observer_command_id": contract_execution_id,
+                        "owned_files": owned_files,
+                    },
+                    saved_context,
+                    route_identity,
+                    owned_files,
+                ),
+                "source": "direct_fix_dispatch_context",
+                "contract_execution_id": contract_execution_id,
+            },
+            route_gate={
+                **_parallel_branch_allocate_route_gate(
+                    {
+                        **dict(payload),
+                        **dict(route_identity),
+                        "caller_role": "observer",
+                    },
+                    route_identity,
+                ),
+                "source": "direct_fix_dispatch_context",
+                "allowed_action": "dispatch_bounded_worker",
+            },
+            route_identity=route_identity,
+            route_evidence_type="direct_fix_dispatch_context",
+            actor="direct_fix_dispatch_context",
+        )
+        runtime_contract_revision = branch_contract_revision_to_dict(revision)
+
+    branch_runtime_evidence = branch_runtime_allocation_evidence(
+        saved,
+        source_ref=(
+            f"contract_runtime:{contract_execution_id}:"
+            "direct_fix_dispatch_context"
+        ),
+        registration_source="direct_fix_dispatch_context",
+        route_identity=route_identity,
+    )
+    dispatch_body = {
+        **dict(payload),
+        **dict(route_identity),
+        "runtime_context_id": saved_context["runtime_context_id"],
+        "task_id": saved.task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "observer_command_id": contract_execution_id,
+        "worker_id": saved_context.get("worker_id") or worker_slot_id,
+        "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+        "agent_id": saved_context.get("agent_id") or allocation_owner,
+        "fence_token": saved.fence_token,
+        "worktree_path": saved_context.get("worktree_path") or worktree_path,
+        "branch_ref": saved_context.get("branch_ref") or branch_ref,
+        "base_commit": saved_context.get("base_commit") or base_commit,
+        "target_head_commit": saved_context.get("target_head_commit")
+        or target_head_commit,
+        "merge_queue_id": saved_context.get("merge_queue_id")
+        or _direct_fix_dispatch_text(payload, "merge_queue_id")
+        or f"direct-fix:{contract_execution_id}",
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "route_token_ref": route_token_ref,
+    }
+    dispatch_timeline_event = _record_bounded_worker_dispatch_event(
+        conn,
+        project_id,
+        body=dispatch_body,
+        prepared={"parent_task_id": parent_task_id, **dict(route_identity)},
+        branch_runtime_evidence=branch_runtime_evidence,
+        source="direct_fix_dispatch_context",
+        request_id=request_id,
+    )
+
+    enriched_payload = {
+        **dict(payload),
+        "runtime_context_id": saved_context["runtime_context_id"],
+        "task_id": saved.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": saved_context.get("worker_id") or worker_slot_id,
+        "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+        "target_project_root": saved_context.get("target_project_root")
+        or target_project_root,
+        "worktree_path": saved_context.get("worktree_path") or worktree_path,
+        "branch_ref": saved_context.get("branch_ref") or branch_ref,
+        "base_commit": saved_context.get("base_commit") or base_commit,
+        "target_head_commit": saved_context.get("target_head_commit")
+        or target_head_commit,
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "fence_token_present": bool(saved.fence_token),
+        "fence_token_delivery": "runtime_context_private_envelope",
+        "session_token_ref": session_token_ref,
+        "worker_session_token_ref": session_token_ref,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "branch_runtime_evidence": branch_runtime_evidence,
+        "runtime_contract_revision": runtime_contract_revision,
+        "dispatch_timeline_event": dispatch_timeline_event,
+    }
+    enriched = dict(write)
+    enriched.update(
+        {
+            "runtime_context_id": saved_context["runtime_context_id"],
+            "task_id": saved.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": saved_context.get("worker_id") or worker_slot_id,
+            "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+            "fence_token": saved.fence_token,
+            "session_token_ref": session_token_ref,
+            "worker_session_token_ref": session_token_ref,
+            "payload": enriched_payload,
+        }
+    )
+    return enriched
 
 
 def _direct_fix_return_to_parent_projection(
@@ -50033,6 +50498,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     record,
                     actor_role=actor_role,
                     body=body,
+                )
+                write = _direct_fix_materialize_dispatch_runtime_context(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
+                    request_id=ctx.request_id,
                 )
                 result = runtime.submit_line_write(
                     contract_execution_id,

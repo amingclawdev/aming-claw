@@ -24896,11 +24896,20 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     direct_execution_id = "cex-direct-fix-dispatch-context"
     route_token_ref = "rtok-direct-fix-dispatch-context"
     worker_task_id = "direct-fix-worker-task"
-    runtime_context_id = "mfrctx-direct-fix-worker"
     parent_task_id = direct_execution_id
-    fence_token = "fence-direct-fix-dispatch-context"
-    worker_session_token = "worker-session-direct-fix"
     target_root = str(tmp_path)
+    worktree_path = str(tmp_path / "direct-fix-worker")
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=direct_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "contract_runtime_submit_line",
+            "contract_runtime_current",
+            "task_timeline_append",
+        ],
+    )
 
     entered = server.handle_project_direct_fix_enter(
         _ctx_with_role(
@@ -24950,28 +24959,6 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     assert next_action["line_id"] == "direct_fix_dispatch_context"
     assert next_action["owner_role"] == "observer"
 
-    upsert_branch_context(
-        conn,
-        BranchTaskRuntimeContext(
-            project_id=PID,
-            task_id=worker_task_id,
-            parent_task_id=parent_task_id,
-            root_task_id=direct_execution_id,
-            stage_task_id=worker_task_id,
-            stage_type="direct_fix",
-            runtime_context_id=runtime_context_id,
-            backlog_id=backlog_id,
-            branch_ref="refs/heads/codex/direct-fix-dispatch-context",
-            ref_name="main",
-            status=STATE_WORKTREE_READY,
-            target_project_root=target_root,
-            governance_project_id=PID,
-            target_project_id=PID,
-            fence_token=fence_token,
-            session_token_hash=mf_subagent_session_token_hash(worker_session_token),
-        ),
-    )
-
     dispatched = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": direct_execution_id},
@@ -24982,26 +24969,98 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
                 "line_id": "direct_fix_dispatch_context",
                 "evidence_kind": "dispatch_bounded_worker",
                 "route_token_ref": route_token_ref,
-                "runtime_context_id": runtime_context_id,
                 "task_id": worker_task_id,
                 "parent_task_id": parent_task_id,
                 "worker_role": "mf_sub",
                 "payload": {
-                    "runtime_context_id": runtime_context_id,
                     "task_id": worker_task_id,
                     "parent_task_id": parent_task_id,
                     "worker_role": "mf_sub",
+                    "worker_id": "direct-fix-worker",
+                    "worker_slot_id": "direct-fix-worker",
                     "target_project_root": target_root,
+                    "worktree_path": worktree_path,
+                    "branch": "codex/direct-fix-dispatch-context",
+                    "base_commit": "base-direct-fix-dispatch-context",
+                    "target_head_commit": "target-direct-fix-dispatch-context",
+                    "owned_files": ["agent/governance/server.py"],
                     "candidate_runtime_id": "candrt-direct-fix-test",
                 },
             },
         )
     )
     assert dispatched["ok"] is True
+    direct_record = server._contract_runtime_store(conn).get(direct_execution_id)
+    dispatch_line = direct_record["completed_lines"][-1]
+    dispatch_payload = dispatch_line["payload"]
+    runtime_context_id = dispatch_payload["runtime_context_id"]
+    session_token_ref = dispatch_payload["session_token_ref"]
+    assert dispatch_line["runtime_context_id"] == runtime_context_id
+    assert dispatch_line["worker_role"] == "mf_sub"
+    assert "session_token" not in dispatch_line
+    assert "route_token" not in dispatch_line
+    assert "fence_token" not in dispatch_line
+    assert dispatch_payload["raw_session_token_exposed"] is False
+    assert dispatch_payload["raw_fence_token_exposed"] is False
+    assert dispatch_payload["fence_token_present"] is True
+    assert dispatch_payload["fence_token_delivery"] == (
+        "runtime_context_private_envelope"
+    )
+    assert "session_token" not in dispatch_payload
+    assert "fence_token" not in dispatch_payload
+    runtime_context = get_branch_context(conn, PID, worker_task_id)
+    assert runtime_context is not None
+    assert runtime_context.runtime_context_id == runtime_context_id
+    fence_token = runtime_context.fence_token
+    assert runtime_context.parent_task_id == parent_task_id
+    assert runtime_context.stage_type == "direct_fix"
+    assert runtime_context.target_project_root == target_root
+    assert runtime_context.worktree_path == worktree_path
+    assert runtime_context_session_token_ref(runtime_context) == session_token_ref
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_marker = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_marker["runtime_context_id"] == runtime_context_id
+    assert dispatch_marker["source"] == "direct_fix_dispatch_context"
     next_action = dispatched["contract_runtime_current_state"]["next_legal_action"]
     assert next_action["stage_id"] == "candidate_repair"
     assert next_action["line_id"] == "direct_fix_candidate_repair"
     assert next_action["owner_role"] == "mf_sub"
+
+    observer_repair = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "candidate_repair",
+                "line_id": "direct_fix_candidate_repair",
+                "evidence_kind": "direct_fix_repair_evidence",
+                "runtime_context_id": runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token_ref": session_token_ref,
+                "target_project_root": target_root,
+                "payload": {"status": "observer must not write worker repair"},
+            },
+        )
+    )
+    assert observer_repair["ok"] is False
+    assert observer_repair["actor_role"] == "observer"
+    assert any(
+        "actor_role 'observer' cannot write line" in error
+        for error in observer_repair["decision"]["errors"]
+    )
 
     repaired = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -25017,7 +25076,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
                 "parent_task_id": parent_task_id,
                 "worker_role": "mf_sub",
                 "fence_token": fence_token,
-                "session_token": worker_session_token,
+                "session_token_ref": session_token_ref,
                 "target_project_root": target_root,
                 "payload": {
                     "status": "implemented",
