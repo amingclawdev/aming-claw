@@ -65,8 +65,11 @@ from .contracts.hash import stable_sha256
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 DASHBOARD_ROUTE_PREFIX = "/dashboard"
 
@@ -35097,8 +35100,68 @@ def _contract_runtime_write_from_record(
     }
 
 
-def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
+def _branch_service_validation_runtime_guide(guide: Mapping[str, Any]) -> dict[str, Any]:
+    enriched = dict(guide)
+    enriched.setdefault(
+        "branch_service_validation",
+        {
+            "schema_version": "branch_service_validation.runtime_guide.v1",
+            "status": "supported",
+            "command": (
+                "aming-claw branch-service validate "
+                "--worktree <assigned-worktree> --port <non-40000-port> --json-output"
+            ),
+            "api": {
+                "method": "POST",
+                "path": "/api/branch-service/validate",
+                "required_body_fields": ["worktree_path", "port"],
+                "optional_body_fields": [
+                    "runtime_workspace",
+                    "shared_volume_path",
+                    "timeout_sec",
+                    "keep_running",
+                    "python",
+                ],
+            },
+            "required_context": {
+                "port": "Explicit non-main governance port; 40000 is refused by default.",
+                "cwd": "The branch/worker checkout root used as subprocess cwd.",
+                "worktree_path": "Absolute path to the branch/worker checkout under validation.",
+                "env": [
+                    "GOVERNANCE_PORT",
+                    "AMING_CLAW_HOME",
+                    "SHARED_VOLUME_PATH",
+                    "PYTHONPATH",
+                ],
+            },
+            "expected_health_fields": [
+                "requested_port",
+                "actual_listening_port",
+                "worktree_root",
+                "cwd",
+                "runtime_version",
+                "runtime_commit",
+                "pid",
+                "isolation_status",
+            ],
+            "main_service_isolation": {
+                "main_governance_port": PORT,
+                "must_not_replace_main_service": True,
+            },
+        },
+    )
+    return enriched
+
+
+def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    if str(record.get("contract_id") or "").strip() == "direct_fix":
+        return _branch_service_validation_runtime_guide(guide)
+    return dict(guide)
+
+
+def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
+    guide = _contract_runtime_guide_for_response(record)
     current_state = _runtime_current_state_from_record(record)
     return {
         "schema_version": "contract_runtime.runtime_facade_response.v1",
@@ -41953,7 +42016,7 @@ def _direct_fix_successor_runtime_enter(
     runtime.current_guide(successor_execution_id, actor_role=actor_role)
     successor = store.get(successor_execution_id)
     current_state = _runtime_current_state_from_record(successor)
-    runtime_guide = successor.get("runtime_guide") or {}
+    runtime_guide = _contract_runtime_guide_for_response(successor)
     current_projection = upsert_contract_chain_successor_binding(
         conn,
         parent_record=parent_record,
@@ -47527,6 +47590,264 @@ def handle_task_recover(ctx: RequestContext):
 def handle_health(ctx: RequestContext):
     return {"status": "ok", "service": "governance", "port": PORT,
             "version": get_server_version(), "pid": SERVER_PID}
+
+
+def _branch_service_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _branch_service_git_output(worktree: Path, args: Sequence[str]) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _branch_service_tail(text: str | None, limit: int = 2000) -> str:
+    return (text or "")[-limit:]
+
+
+def _branch_service_poll_health(
+    host: str,
+    port: int,
+    *,
+    timeout_sec: float,
+) -> dict[str, Any]:
+    url = f"http://{host}:{port}/api/health"
+    deadline = time.time() + max(1.0, timeout_sec)
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return {
+                    "ok": str(payload.get("status") or "").lower() == "ok",
+                    "url": url,
+                    "health": payload,
+                }
+            last_error = "non_object_health_response"
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        time.sleep(0.25)
+    return {"ok": False, "url": url, "error": last_error or "health_probe_timeout"}
+
+
+def _branch_service_stop_process(proc: subprocess.Popen) -> dict[str, Any]:
+    if proc.poll() is not None:
+        stdout, stderr = proc.communicate(timeout=1)
+        return {
+            "stopped": True,
+            "already_exited": True,
+            "returncode": proc.returncode,
+            "stdout_tail": _branch_service_tail(stdout),
+            "stderr_tail": _branch_service_tail(stderr),
+        }
+    proc.terminate()
+    try:
+        stdout, stderr = proc.communicate(timeout=5)
+        return {
+            "stopped": True,
+            "returncode": proc.returncode,
+            "stdout_tail": _branch_service_tail(stdout),
+            "stderr_tail": _branch_service_tail(stderr),
+        }
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        return {
+            "stopped": True,
+            "killed": True,
+            "returncode": proc.returncode,
+            "stdout_tail": _branch_service_tail(stdout),
+            "stderr_tail": _branch_service_tail(stderr),
+        }
+
+
+@route("POST", "/api/branch-service/validate")
+def handle_branch_service_validate(ctx: RequestContext):
+    """Start and probe an isolated branch governance service on an explicit port."""
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    raw_worktree = str(
+        body.get("worktree_path")
+        or body.get("worktree")
+        or body.get("cwd")
+        or ""
+    ).strip()
+    if not raw_worktree:
+        raise ValidationError("branch-service validation requires worktree_path")
+    worktree = Path(raw_worktree).expanduser().resolve()
+    if not worktree.is_dir():
+        raise ValidationError(
+            "branch-service validation worktree_path does not exist",
+            {"worktree_path": str(worktree)},
+        )
+    start_script = worktree / "start_governance.py"
+    if not start_script.exists():
+        raise ValidationError(
+            "branch-service validation requires start_governance.py in worktree",
+            {"worktree_path": str(worktree), "start_script": str(start_script)},
+        )
+
+    try:
+        requested_port = int(body.get("port") or body.get("requested_port") or 0)
+    except (TypeError, ValueError):
+        requested_port = 0
+    if requested_port <= 0 or requested_port > 65535:
+        raise ValidationError("branch-service validation requires a valid port")
+    if requested_port == PORT:
+        return {
+            "ok": False,
+            "schema_version": "branch_service_validation.v1",
+            "error": "branch_service_port_must_differ_from_main",
+            "requested_port": requested_port,
+            "main_governance_port": PORT,
+            "isolation_status": "refused_main_port",
+        }
+
+    host = str(body.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValidationError("branch-service validation only supports localhost host")
+    if _branch_service_port_open(host, requested_port):
+        return {
+            "ok": False,
+            "schema_version": "branch_service_validation.v1",
+            "error": "branch_service_port_in_use",
+            "requested_port": requested_port,
+            "main_governance_port": PORT,
+            "worktree_path": str(worktree),
+            "isolation_status": "port_unavailable",
+        }
+
+    timeout_sec = _clamped_float(
+        body.get("timeout_sec"),
+        default=30.0,
+        minimum=2.0,
+        maximum=120.0,
+    )
+    keep_running = _truthy_flag(body.get("keep_running"))
+    python_bin = str(body.get("python") or sys.executable).strip() or sys.executable
+    runtime_workspace_raw = str(body.get("runtime_workspace") or "").strip()
+    if runtime_workspace_raw:
+        runtime_workspace = Path(runtime_workspace_raw).expanduser().resolve()
+    else:
+        runtime_workspace = Path(
+            tempfile.mkdtemp(prefix=f"aming-claw-branch-service-{requested_port}-")
+        ).resolve()
+    shared_volume_path = Path(
+        str(body.get("shared_volume_path") or (runtime_workspace / "shared-volume"))
+    ).expanduser().resolve()
+    runtime_workspace.mkdir(parents=True, exist_ok=True)
+    shared_volume_path.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    prior_pythonpath = env.get("PYTHONPATH", "")
+    env.update(
+        {
+            "GOVERNANCE_PORT": str(requested_port),
+            "AMING_CLAW_HOME": str(runtime_workspace),
+            "SHARED_VOLUME_PATH": str(shared_volume_path),
+            "PYTHONPATH": (
+                str(worktree)
+                if not prior_pythonpath
+                else f"{worktree}{os.pathsep}{prior_pythonpath}"
+            ),
+        }
+    )
+    command = [python_bin, str(start_script)]
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=worktree,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return {
+            "ok": False,
+            "schema_version": "branch_service_validation.v1",
+            "error": "branch_service_start_failed",
+            "detail": str(exc),
+            "requested_port": requested_port,
+            "main_governance_port": PORT,
+            "worktree_path": str(worktree),
+            "cwd": str(worktree),
+            "command": command,
+            "env": {
+                "GOVERNANCE_PORT": str(requested_port),
+                "AMING_CLAW_HOME": str(runtime_workspace),
+                "SHARED_VOLUME_PATH": str(shared_volume_path),
+                "PYTHONPATH_prefix": str(worktree),
+            },
+            "isolation_status": "start_failed",
+        }
+    probe = _branch_service_poll_health(host, requested_port, timeout_sec=timeout_sec)
+    health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
+    actual_port = int(health.get("port") or 0) if health else 0
+    health_pid = int(health.get("pid") or 0) if health else 0
+    runtime_commit = _branch_service_git_output(worktree, ["rev-parse", "HEAD"])
+    worktree_root = _branch_service_git_output(worktree, ["rev-parse", "--show-toplevel"])
+    branch = _branch_service_git_output(worktree, ["branch", "--show-current"])
+    isolation_ok = bool(
+        probe.get("ok")
+        and actual_port == requested_port
+        and requested_port != PORT
+        and health_pid
+        and health_pid != SERVER_PID
+    )
+
+    stop_result: dict[str, Any] = {}
+    if not keep_running:
+        stop_result = _branch_service_stop_process(proc)
+    elif not probe.get("ok"):
+        stop_result = _branch_service_stop_process(proc)
+
+    return {
+        "ok": bool(isolation_ok),
+        "schema_version": "branch_service_validation.v1",
+        "requested_port": requested_port,
+        "actual_listening_port": actual_port,
+        "host": host,
+        "main_governance_port": PORT,
+        "main_governance_pid": SERVER_PID,
+        "pid": health_pid or proc.pid,
+        "process_pid": proc.pid,
+        "worktree_path": str(worktree),
+        "worktree_root": worktree_root or str(worktree),
+        "cwd": str(worktree),
+        "branch": branch,
+        "runtime_commit": runtime_commit,
+        "runtime_version": str(health.get("version") or ""),
+        "health_url": probe.get("url", ""),
+        "health": dict(health),
+        "expected_health_fields": ["status", "service", "port", "version", "pid"],
+        "env": {
+            "GOVERNANCE_PORT": str(requested_port),
+            "AMING_CLAW_HOME": str(runtime_workspace),
+            "SHARED_VOLUME_PATH": str(shared_volume_path),
+            "PYTHONPATH_prefix": str(worktree),
+        },
+        "command": command,
+        "keep_running": keep_running,
+        "stop_result": stop_result,
+        "isolation_status": "isolated" if isolation_ok else "health_probe_failed",
+        "probe": {k: v for k, v in probe.items() if k != "health"},
+    }
 
 
 @route("GET", "/api/version-check/{project_id}")

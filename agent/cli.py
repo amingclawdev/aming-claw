@@ -12,6 +12,7 @@ Usage:
     aming-claw open            - open the dashboard URL
     aming-claw launcher        - write a local launcher HTML artifact
     aming-claw run-executor    - start executor worker
+    aming-claw branch-service validate - validate isolated branch governance
     aming-claw observer run    - build or execute route-bound observer invocation
     aming-claw observer poll   - claim observer command and plan route-bound work
     aming-claw observer dogfood - plan controlled dogfood observer/subagent run
@@ -323,6 +324,69 @@ def start(workspace, port):
     import start_governance
 
     start_governance.main(workspace_root=runtime_workspace)
+
+
+@main.group("branch-service")
+def branch_service():
+    """Validate isolated branch governance services."""
+    pass
+
+
+@branch_service.command("validate")
+@click.option(
+    "--worktree",
+    "worktree_path",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+    help="Branch/worker checkout root to start as the service cwd.",
+)
+@click.option("--port", required=True, type=int, help="Explicit non-main governance port.")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Main governance service URL.")
+@click.option("--runtime-workspace", default="", help="Isolated AMING_CLAW_HOME for the branch service.")
+@click.option("--shared-volume-path", default="", help="Isolated SHARED_VOLUME_PATH for the branch service.")
+@click.option("--python", "python_bin", default="", help="Python executable for the branch service. Defaults to current Python.")
+@click.option("--timeout-sec", default=30.0, type=float, help="Seconds to wait for branch /api/health.")
+@click.option("--keep-running", is_flag=True, help="Leave the validated branch service running.")
+@click.option("--json-output", is_flag=True, help="Print full structured validation evidence.")
+def branch_service_validate(
+    worktree_path,
+    port,
+    governance_url,
+    runtime_workspace,
+    shared_volume_path,
+    python_bin,
+    timeout_sec,
+    keep_running,
+    json_output,
+):
+    """Start and health-check a branch governance service without replacing main."""
+    payload: dict[str, Any] = {
+        "worktree_path": str(Path(worktree_path).expanduser().resolve()),
+        "port": port,
+        "timeout_sec": timeout_sec,
+        "keep_running": keep_running,
+    }
+    if runtime_workspace:
+        payload["runtime_workspace"] = str(Path(runtime_workspace).expanduser().resolve())
+    if shared_volume_path:
+        payload["shared_volume_path"] = str(Path(shared_volume_path).expanduser().resolve())
+    if python_bin:
+        payload["python"] = python_bin
+    url = governance_url.rstrip("/") + "/api/branch-service/validate"
+    status, result = _http_json("POST", url, payload, timeout=timeout_sec + 20)
+    if json_output or status >= 400 or not result.get("ok"):
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            "Branch service validation ok: "
+            f"port={result.get('actual_listening_port') or result.get('requested_port')} "
+            f"pid={result.get('pid')} "
+            f"worktree={result.get('worktree_root') or result.get('worktree_path')}"
+        )
+    if status >= 400 or not result.get("ok"):
+        raise click.ClickException(
+            str(result.get("error") or result.get("detail") or "branch service validation failed")
+        )
 
 
 @main.command("open")
