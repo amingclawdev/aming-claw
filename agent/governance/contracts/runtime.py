@@ -1101,11 +1101,7 @@ def _project_direct_fix_state(
     generation = int(child.get("execution_state_revision") or 0)
     if not child_id:
         return {}
-    repair_line = _find_completed_line(
-        child,
-        line_ids={"direct_fix_candidate_repair"},
-        evidence_kinds={"direct_fix_repair_evidence"},
-    )
+    repair_line = _find_direct_fix_repair_line(child)
     return_line = _find_completed_line(
         child,
         line_ids={"direct_fix_return_to_parent"},
@@ -1267,6 +1263,7 @@ def _find_completed_line(
     *,
     line_ids: set[str],
     evidence_kinds: set[str],
+    after_index: int = -1,
 ) -> dict[str, Any]:
     lines = (
         record.get("completed_lines")
@@ -1274,6 +1271,8 @@ def _find_completed_line(
         else []
     )
     for index, line in reversed(list(enumerate(lines))):
+        if index <= after_index:
+            continue
         if not isinstance(line, Mapping):
             continue
         line_id = str(line.get("line_id") or "")
@@ -1283,6 +1282,20 @@ def _find_completed_line(
             enriched["_completed_line_index"] = index
             return enriched
     return {}
+
+
+def _find_direct_fix_repair_line(record: Mapping[str, Any]) -> dict[str, Any]:
+    lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    return _find_completed_line(
+        record,
+        line_ids={"direct_fix_candidate_repair"},
+        evidence_kinds={"direct_fix_repair_evidence"},
+        after_index=_last_failed_qa_line_index(lines),
+    )
 
 
 def _find_direct_fix_qa_line(
@@ -1417,14 +1430,82 @@ _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
 def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
+    last_failed_qa_index = _last_failed_qa_line_index(lines)
     satisfying: list[Mapping[str, Any]] = []
-    for line in lines:
+    for index, line in enumerate(lines):
+        if isinstance(line, Mapping) and not _line_shape_allows_contract_completion(
+            line
+        ):
+            continue
+        if last_failed_qa_index >= 0 and index <= last_failed_qa_index:
+            if not _line_survives_failed_qa_retry_reset(line):
+                continue
         if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
             line
         ):
             continue
         satisfying.append(line)
     return satisfying
+
+
+def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
+    failed_index = -1
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "qa_independent_verification":
+            continue
+        if not _line_status_allows_contract_completion(line):
+            failed_index = index
+    return failed_index
+
+
+_FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
+    {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+)
+
+
+def _line_survives_failed_qa_retry_reset(line: Mapping[str, Any]) -> bool:
+    actor_role = str(line.get("actor_role") or "").strip().lower().replace("-", "_")
+    line_id = str(line.get("line_id") or "").strip()
+    if actor_role in {"mf_sub", "qa"}:
+        return False
+    if line_id in _FAILED_QA_RETRY_RESET_LINE_IDS:
+        return False
+    return True
+
+
+_LINE_PAYLOAD_SCHEMA_BLOCKLIST = {
+    "worker_implementation": frozenset(
+        {
+            "worker_runtime_guide_read_after_failed_qa_revision.v1",
+            "contract_context_read_receipt.v1",
+            "mf_subagent_read_receipt.v1",
+            "mf_subagent_startup.v1",
+            "worker_graph_context.v1",
+        }
+    ),
+}
+
+
+def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
+    line_id = str(line.get("line_id") or "").strip()
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    schema_version = str(payload.get("schema_version") or "").strip()
+    blocked_schemas = _LINE_PAYLOAD_SCHEMA_BLOCKLIST.get(line_id)
+    return not (blocked_schemas and schema_version in blocked_schemas)
 
 
 def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:

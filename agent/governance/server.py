@@ -37670,7 +37670,7 @@ def _contract_runtime_effective_actor_role(
 ) -> str:
     session = ctx.require_auth(conn)
     role = str(session.get("role") or "").strip()
-    if role == "observer":
+    if role in {"observer", "qa"}:
         return role
     project_id = ctx.get_project_id()
     mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(

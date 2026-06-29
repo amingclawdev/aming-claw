@@ -208,6 +208,50 @@ def _start_direct_fix_successor(
     )
 
 
+def test_contract_runtime_effective_actor_role_accepts_qa_session(monkeypatch):
+    from agent.governance import server as server_module
+
+    class QaContext:
+        body = {}
+
+        def get_project_id(self):
+            return "proj"
+
+        def require_auth(self, conn):
+            return {
+                "session_id": "qa-session",
+                "principal_id": "qa:test",
+                "project_id": "proj",
+                "role": "qa",
+            }
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("QA role should not be downgraded to observer or mf_sub proof")
+
+    monkeypatch.setattr(
+        server_module,
+        "_resolve_contract_runtime_mf_sub_proof",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_resolve_contract_runtime_observer_proof",
+        fail_if_called,
+    )
+
+    assert (
+        server_module._contract_runtime_effective_actor_role(
+            QaContext(),
+            object(),
+            action="contract_runtime_submit_line",
+            backlog_id="BUG-QA",
+            contract_execution_id="cex-qa",
+            record={"contract_execution_id": "cex-qa"},
+        )
+        == "qa"
+    )
+
+
 def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     service = ContractCrudService(tmp_path)
 
@@ -966,8 +1010,8 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
     assert accepted_failed_qa["ok"] is True
     record = accepted_failed_qa["record"]
     next_action = record["runtime_guide"]["next_legal_action"]
-    assert next_action["line_id"] == "qa_independent_verification"
-    assert next_action["owner_role"] == "qa"
+    assert next_action["line_id"] == "worker_read_runtime_guide"
+    assert next_action["owner_role"] == "mf_sub"
     assert next_action["line_id"] != "observer_merge"
 
     runtime.current_guide(
@@ -992,6 +1036,34 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
         or "cannot write line" in error
         for error in rejected_merge["decision"]["errors"]
     )
+
+    for stage_id, line_id in [
+        ("worker_read", "worker_read_runtime_guide"),
+        ("worker_startup", "worker_startup"),
+        ("worker_context", "worker_graph_context"),
+        ("worker_implementation", "worker_implementation"),
+        ("worker_attestation", "worker_finish_time_attestation"),
+        ("worker_finish", "worker_finish_gate"),
+        ("qa_handoff", "worker_review_ready_handoff"),
+    ]:
+        runtime.current_guide(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+            actor_role="mf_sub",
+        )
+        record = runtime.store.get(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test"
+        )
+        accepted_retry = runtime.submit_line_write(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted_retry["ok"] is True
+        record = accepted_retry["record"]
 
     runtime.current_guide(
         f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
@@ -1069,8 +1141,30 @@ def test_mf_parallel_repeated_failed_qa_payload_outcome_does_not_unlock_observer
         accepted_failed_verdict["record"]["runtime_guide"]["next_legal_action"][
             "line_id"
         ]
-        == "qa_independent_verification"
+        == "worker_read_runtime_guide"
     )
+
+    for stage_id, line_id in [
+        ("worker_read", "worker_read_runtime_guide"),
+        ("worker_startup", "worker_startup"),
+        ("worker_context", "worker_graph_context"),
+        ("worker_implementation", "worker_implementation"),
+        ("worker_attestation", "worker_finish_time_attestation"),
+        ("worker_finish", "worker_finish_gate"),
+        ("qa_handoff", "worker_review_ready_handoff"),
+    ]:
+        runtime.current_guide(execution_id, actor_role="mf_sub")
+        record = runtime.store.get(execution_id)
+        accepted_retry = runtime.submit_line_write(
+            execution_id,
+            _runtime_write_from(
+                record,
+                actor_role="mf_sub",
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted_retry["ok"] is True
 
     runtime.current_guide(execution_id, actor_role="qa")
     record = runtime.store.get(execution_id)
@@ -1089,9 +1183,78 @@ def test_mf_parallel_repeated_failed_qa_payload_outcome_does_not_unlock_observer
     next_action = accepted_failed_outcome["record"]["runtime_guide"][
         "next_legal_action"
     ]
-    assert next_action["line_id"] == "qa_independent_verification"
-    assert next_action["owner_role"] == "qa"
+    assert next_action["line_id"] == "worker_read_runtime_guide"
+    assert next_action["owner_role"] == "mf_sub"
     assert next_action["line_id"] != "observer_merge"
+
+
+def test_mf_parallel_failed_qa_retry_ignores_malformed_worker_implementation_payload():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    execution_id = "cex-mf-parallel-malformed-retry-implementation-test"
+    record = _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-MALFORMED-RETRY-IMPLEMENTATION-20260629",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-test",
+    )
+
+    for stage_id, line_id, actor_role in [
+        ("orchestration", "observer_prefill_child_contracts", "observer"),
+        ("dispatch", "observer_dispatch_bounded_workers", "observer"),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub"),
+        ("worker_startup", "worker_startup", "mf_sub"),
+        ("worker_context", "worker_graph_context", "mf_sub"),
+        ("worker_implementation", "worker_implementation", "mf_sub"),
+        ("worker_attestation", "worker_finish_time_attestation", "mf_sub"),
+        ("worker_finish", "worker_finish_gate", "mf_sub"),
+        ("qa_handoff", "worker_review_ready_handoff", "mf_sub"),
+    ]:
+        runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.store.get(execution_id)
+        accepted = runtime.submit_line_write(
+            execution_id,
+            _runtime_write_from(
+                record,
+                actor_role=actor_role,
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+
+    runtime.current_guide(execution_id, actor_role="qa")
+    record = runtime.store.get(execution_id)
+    failed_qa = _runtime_write_from(
+        record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+    )
+    failed_qa["payload"] = {"outcome": "failed"}
+    accepted_failed_qa = runtime.submit_line_write(execution_id, failed_qa)
+    assert accepted_failed_qa["ok"] is True
+
+    record = runtime.store.get(execution_id)
+    malformed = _runtime_write_from(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+    )
+    malformed["payload"] = {
+        "schema_version": "worker_runtime_guide_read_after_failed_qa_revision.v1",
+        "summary": "This is read/continuation evidence, not implementation.",
+    }
+    record["completed_lines"].append(malformed)
+    runtime.store.update(execution_id, record)
+
+    runtime.current_guide(execution_id, actor_role="mf_sub")
+    record = runtime.store.get(execution_id)
+    next_action = record["runtime_guide"]["next_legal_action"]
+    assert next_action["line_id"] == "worker_read_runtime_guide"
+    assert next_action["owner_role"] == "mf_sub"
 
 
 def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
@@ -1140,10 +1303,8 @@ def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
         project_id="aming-claw",
         backlog_id=backlog_id,
     )
-    assert projection["readiness_state"] == (
-        "direct_fix_complete_awaiting_independent_qa"
-    )
-    assert projection["next_legal_action"]["line_id"] == "qa_independent_verification"
+    assert projection["readiness_state"] == "direct_fix_child_active"
+    assert projection["next_legal_action"]["line_id"] == "direct_fix_candidate_repair"
 
     runtime.current_guide(child_id, actor_role="observer")
     record = runtime.store.get(child_id)
@@ -1165,6 +1326,9 @@ def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
         or "cannot write line" in error
         for error in rejected_return["decision"]["errors"]
     )
+
+    retry_repair = _submit_next_runtime_line(runtime, child_id, actor_role="mf_sub")
+    assert retry_repair["ok"] is True
 
     passed_qa = _submit_next_runtime_line(
         runtime,
