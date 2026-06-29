@@ -26099,6 +26099,23 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
     assert resumed["next_legal_action"]["id"] == "worker_revision_source_proof"
     assert resumed["next_legal_action"].get("status") != "blocked"
 
+    resumed_source_write = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "stage_id": "worker_source",
+                "line_id": "worker_revision_source_proof",
+                "evidence_kind": "contract_revision_source_proof",
+            },
+        )
+    )
+    assert resumed_source_write["ok"] is True
+    assert resumed_source_write["next_legal_action"]["id"] == (
+        "worker_runtime_visibility_proof"
+    )
+
 
 def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
     backlog_id = "AC-CONTRACT-UPDATE-BLOCKED-DIRECT-FIX"

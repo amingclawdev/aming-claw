@@ -12,6 +12,7 @@ import sys
 import uuid
 import hashlib
 import traceback
+from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -42257,6 +42258,30 @@ def _contract_runtime_last_blocked_line(
     return dict(line)
 
 
+def _contract_runtime_latest_blocked_successor_line(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return {}
+    for index, line in reversed(list(enumerate(completed_lines))):
+        if not isinstance(line, Mapping):
+            continue
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        status = str(payload.get("status") or line.get("status") or "").strip().lower()
+        if status not in {"blocked", "blocker", "failed_blocked"}:
+            continue
+        if _contract_runtime_block_successor_id(line) not in {
+            "observer_hotfix",
+            DIRECT_FIX_CONTRACT_ID,
+        }:
+            continue
+        enriched = dict(line)
+        enriched["_completed_line_index"] = index
+        return enriched
+    return {}
+
+
 def _contract_runtime_block_successor_id(blocked_line: Mapping[str, Any]) -> str:
     payload = blocked_line.get("payload") if isinstance(blocked_line.get("payload"), Mapping) else {}
     refs = (
@@ -42592,6 +42617,151 @@ def _contract_runtime_blocked_successor_next_action(
     }
 
 
+def _contract_runtime_next_rule_line_after_blocked_line(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    blocked_line: Mapping[str, Any],
+    fallback: Mapping[str, Any],
+) -> dict[str, Any]:
+    blocked_stage_id = str(blocked_line.get("stage_id") or "").strip()
+    blocked_line_id = str(blocked_line.get("line_id") or "").strip()
+    fallback_line_id = str(fallback.get("line_id") or "").strip()
+    if not blocked_line_id or fallback_line_id != blocked_line_id:
+        return dict(fallback)
+    fallback_stage_id = str(fallback.get("stage_id") or "").strip()
+    if blocked_stage_id and fallback_stage_id and fallback_stage_id != blocked_stage_id:
+        return dict(fallback)
+    try:
+        definition = _contract_runtime(conn).registry.get(
+            str(record.get("contract_id") or ""),
+            version=str(record.get("version") or "") or None,
+            revision=str(record.get("revision") or "") or None,
+            include_deprecated=True,
+        )
+    except Exception:
+        return dict(fallback)
+    read_model = (
+        definition.get("read_model")
+        if isinstance(definition.get("read_model"), Mapping)
+        else {}
+    )
+    rule_lines = read_model.get("rule_lines")
+    if not isinstance(rule_lines, list):
+        return dict(fallback)
+    for index, item in enumerate(rule_lines):
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("line_id") or "").strip() != blocked_line_id:
+            continue
+        item_stage_id = str(item.get("stage_id") or "").strip()
+        if blocked_stage_id and item_stage_id and item_stage_id != blocked_stage_id:
+            continue
+        for candidate in rule_lines[index + 1 :]:
+            if not isinstance(candidate, Mapping):
+                continue
+            if candidate.get("required", True) is False:
+                continue
+            return dict(candidate)
+        return dict(fallback)
+    return dict(fallback)
+
+
+_RESUMED_SUCCESSOR_STATUS_FIELDS = frozenset(
+    {"status", "verdict", "outcome", "decision", "result"}
+)
+_RESUMED_SUCCESSOR_BLOCKING_STATUSES = frozenset(
+    {"fail", "failed", "failure", "rejected", "blocked"}
+)
+
+
+def _contract_runtime_scrub_blocker_statuses_for_resume(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        scrubbed: dict[Any, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if (
+                key in _RESUMED_SUCCESSOR_STATUS_FIELDS
+                and str(item or "").strip().lower()
+                in _RESUMED_SUCCESSOR_BLOCKING_STATUSES
+            ):
+                scrubbed[raw_key] = "resumed"
+            else:
+                scrubbed[raw_key] = _contract_runtime_scrub_blocker_statuses_for_resume(
+                    item
+                )
+        return scrubbed
+    if isinstance(value, list):
+        return [
+            _contract_runtime_scrub_blocker_statuses_for_resume(item)
+            for item in value
+        ]
+    return value
+
+
+def _contract_runtime_resumed_successor_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    actor_role: str,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    blocked_line = _contract_runtime_latest_blocked_successor_line(record)
+    if not blocked_line:
+        return None, {}
+    successor_contract_id = _contract_runtime_block_successor_id(blocked_line)
+    if not successor_contract_id:
+        return None, {}
+    if not _contract_runtime_successor_complete(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_record=record,
+        successor_contract_id=successor_contract_id,
+        actor_role=actor_role,
+    ):
+        return None, {}
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return None, {}
+    blocked_index = int(blocked_line.get("_completed_line_index") or -1)
+    projected_lines: list[dict[str, Any]] = []
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        projected_line = deepcopy(dict(line))
+        if index == blocked_index:
+            projected_line = _contract_runtime_scrub_blocker_statuses_for_resume(
+                projected_line
+            )
+            projected_line["status"] = "resumed"
+            payload = (
+                projected_line.get("payload")
+                if isinstance(projected_line.get("payload"), Mapping)
+                else {}
+            )
+            payload = dict(payload)
+            payload["status"] = "resumed"
+            payload["successor_contract_id"] = successor_contract_id
+            payload["successor_completed"] = True
+            payload["successor_resume_projection"] = True
+            projected_line["payload"] = payload
+        projected_lines.append(projected_line)
+    if blocked_index < 0 or blocked_index >= len(projected_lines):
+        return None, {}
+    projection = {
+        "schema_version": "contract_runtime.resumed_successor_projection.v1",
+        "source": "completed_successor_contract",
+        "status": "resumed",
+        "successor_contract_id": successor_contract_id,
+        "blocked_line_index": blocked_index,
+        "blocked_line_id": str(blocked_line.get("line_id") or ""),
+        "blocked_stage_id": str(blocked_line.get("stage_id") or ""),
+    }
+    return projected_lines, projection
+
+
 def _contract_runtime_apply_blocked_projection(
     conn,
     *,
@@ -42609,12 +42779,51 @@ def _contract_runtime_apply_blocked_projection(
         actor_role=actor_role,
     )
     if not next_action:
+        projected_lines, projection = _contract_runtime_resumed_successor_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            actor_role=actor_role,
+            record=result,
+        )
+        if projected_lines is not None:
+            try:
+                projected_record = _contract_runtime(conn).projected_record(
+                    str(result.get("contract_execution_id") or ""),
+                    actor_role=actor_role,
+                    completed_lines=projected_lines,
+                    projection=projection,
+                )
+            except Exception:
+                return result
+            guide = dict(projected_record.get("runtime_guide") or {})
+            guide["blocked_contract_runtime"] = {
+                "schema_version": "contract_runtime_blocked_projection.v1",
+                "status": "resumed",
+                "source": "completed_successor_contract",
+                "successor_contract_id": projection.get("successor_contract_id", ""),
+                "mode": "resume_after_blocked_successor",
+            }
+            result["runtime_guide"] = guide
+            result["execution_state"] = projected_record.get("execution_state") or result.get(
+                "execution_state"
+            )
+            result["completed_lines_projection"] = projection
+            result["projected_completed_lines_count"] = len(projected_lines)
         return result
     guide = dict(result.get("runtime_guide") or {})
     blocked_next_action = guide.get("next_legal_action")
     projected = dict(next_action)
     if isinstance(blocked_next_action, Mapping):
-        projected["blocked_next_action"] = dict(blocked_next_action)
+        blocked_line = _contract_runtime_last_blocked_line(result)
+        projected["blocked_next_action"] = (
+            _contract_runtime_next_rule_line_after_blocked_line(
+                conn,
+                record=result,
+                blocked_line=blocked_line,
+                fallback=blocked_next_action,
+            )
+        )
     guide["next_legal_action"] = projected
     guide["blocked_contract_runtime"] = {
         "schema_version": "contract_runtime_blocked_projection.v1",
@@ -55687,8 +55896,22 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
                 response["actor_role"] = actor_role
                 response["agent_facing_decision_source"] = "contract_runtime_blocked_line"
                 return response
+            projected_completed_lines, successor_projection = (
+                _contract_runtime_resumed_successor_projection(
+                    conn,
+                    project_id=str(record.get("project_id") or ""),
+                    backlog_id=str(record.get("backlog_id") or ""),
+                    record=record,
+                    actor_role=actor_role,
+                )
+            )
+            write_record = (
+                blocked_record
+                if projected_completed_lines is not None
+                else record
+            )
             write = _contract_runtime_line_write_body(
-                record,
+                write_record,
                 actor_role=actor_role,
                 body=body,
             )
@@ -55696,6 +55919,8 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
                 contract_execution_id,
                 write,
                 actor_role=actor_role,
+                projected_completed_lines=projected_completed_lines,
+                projection=successor_projection,
             )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
