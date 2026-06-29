@@ -23680,6 +23680,157 @@ def test_backlog_close_uses_same_completed_contract_runtime_projection_as_preche
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_projects_successor_runtime_lines_when_close_scoped_to_parent(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TIMELINE-GATE-CONTRACT-RUNTIME-PARENT-SCOPED-CLOSE"
+    close_commit = "fa9d8e6c5b4a3210cdef9876543210abcdef1234"
+    worker_commit = "d05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    route_identity = {
+        "route_id": "route-runtime-parent-scoped-close",
+        "route_context_hash": _fake_sha("route-runtime-parent-scoped-close"),
+        "prompt_contract_id": "rprompt-runtime-parent-scoped-close",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-parent-scoped-close"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-runtime-parent-scoped-close"
+        ),
+        "route_token_ref": "rtok-runtime-parent-scoped-parent",
+    }
+    close_route_token_ref = "rtok-runtime-parent-scoped-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    parent_execution_id = started["contract_execution_id"]
+    _complete_source_backed_onboarding(conn, parent_execution_id)
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": "timeline-gate-runtime-parent-scoped-parent",
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": f"fence-{backlog_id.lower()}",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    _complete_source_backed_mf_parallel_successor(
+        conn,
+        successor["contract_execution_id"],
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_identity=route_identity,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=close_route_token_ref,
+        token={
+            **route_identity,
+            "route_token_ref": close_route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                f"contract_runtime:{parent_execution_id}",
+                f"contract_runtime:{successor['contract_execution_id']}",
+            ],
+        },
+    )
+
+    assert (
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="independent_verification",
+        )
+        == []
+    )
+    assert (
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="close_ready",
+        )
+        == []
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={
+                "close_commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+            },
+        )
+    )
+    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["accepted"] is True, projection
+    assert projection["contract_execution_id"] == parent_execution_id
+    assert (
+        successor["contract_execution_id"]
+        in projection["source_contract_execution_ids"]
+    )
+    assert projection["projected_completed_line_event_count"] >= 1
+    assert precheck["can_close"] is True
+    assert precheck["timeline_gate"]["checks"]["has_independent_qa"] is True
+    assert (
+        precheck["timeline_gate"]["checks"]["close_commit_has_timeline_evidence"]
+        is True
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
 def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projection_lacks_manifest(
     conn,
     monkeypatch,
