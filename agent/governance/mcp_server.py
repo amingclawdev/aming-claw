@@ -410,6 +410,161 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
     }
 
 
+_MERGE_QUEUE_FLOW_VALUES = [
+    "direct_fix",
+    "hotfix",
+    "mf_parallel",
+    "mf_batch_parallel",
+]
+
+
+def _merge_queue_query_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value if str(item or "").strip())
+    return str(value)
+
+
+def _parallel_branch_merge_queue_status_schema_properties() -> dict[str, Any]:
+    return {
+        "project_id": {"type": "string"},
+        "flow": {
+            "type": "string",
+            "enum": _MERGE_QUEUE_FLOW_VALUES,
+            "description": "Client hint; merge_queue_id and persisted queue rows are authoritative.",
+        },
+        "merge_queue_id": {"type": "string"},
+        "batch_id": {"type": "string"},
+        "target_ref": {"type": "string"},
+        "current_target_head": {"type": "string"},
+        "latest_target_head": {
+            "type": "string",
+            "description": "Alias for current_target_head.",
+        },
+        "limit": {"type": "integer"},
+        "scenario_id": {"type": "string"},
+        "severe_integration_failure": {"type": "boolean"},
+        "corrected_replay_order": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    }
+
+
+def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
+    return {
+        "project_id": {"type": "string"},
+        "flow": {
+            "type": "string",
+            "enum": _MERGE_QUEUE_FLOW_VALUES,
+            "description": "Client hint for direct-fix, hotfix, mf_parallel, or mf_batch_parallel callers.",
+        },
+        "merge_queue_id": {"type": "string"},
+        "queue_item_id": {"type": "string"},
+        "task_id": {"type": "string"},
+        "backlog_id": {"type": "string"},
+        "repo_root_path": {"type": "string"},
+        "workspace_root": {"type": "string"},
+        "target_ref": {"type": "string"},
+        "evidence": {"type": "object"},
+        "qa_evidence": {
+            "type": "object",
+            "description": "Copied into evidence.qa_evidence for live merge evidence records.",
+        },
+        "batch_status": {"type": "string"},
+        "dry_run": {"type": "boolean", "description": "Defaults to true."},
+        "allow_target_ref_mutation": {"type": "boolean"},
+        "message": {"type": "string"},
+        "bug_id": {"type": "string"},
+        "source_contract_execution_id": {"type": "string"},
+        "source_contract_id": {"type": "string"},
+        "contract_execution_id": {"type": "string"},
+        "active_contract_execution_id": {"type": "string"},
+        "fence_token": {"type": "string"},
+        "route_token": {
+            "type": "object",
+            "description": "Route-token evidence required for live target-ref mutation.",
+        },
+        "route_token_ref": {
+            "type": "string",
+            "description": "Opaque server-registered route token reference.",
+        },
+        "route_waiver": {"type": "object"},
+        "route_token_waiver": {"type": "object"},
+        "timeout_seconds": {"type": "integer"},
+        "scenario_id": {"type": "string"},
+        "now_iso": {"type": "string"},
+        "actor": {"type": "string"},
+        "contract_actor": {"type": "string"},
+    }
+
+
+def _parallel_branch_merge_queue_status_query(args: dict) -> dict[str, str]:
+    query: dict[str, str] = {}
+    for key in (
+        "merge_queue_id",
+        "batch_id",
+        "target_ref",
+        "current_target_head",
+        "limit",
+        "scenario_id",
+        "severe_integration_failure",
+        "corrected_replay_order",
+    ):
+        if key in args and args[key] is not None:
+            query[key] = _merge_queue_query_value(args[key])
+    latest_target_head = str(args.get("latest_target_head") or "").strip()
+    if latest_target_head and not query.get("current_target_head"):
+        query["current_target_head"] = latest_target_head
+    return query
+
+
+def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
+    allowed_keys = {
+        "merge_queue_id",
+        "queue_item_id",
+        "task_id",
+        "backlog_id",
+        "repo_root_path",
+        "workspace_root",
+        "target_ref",
+        "evidence",
+        "batch_status",
+        "dry_run",
+        "allow_target_ref_mutation",
+        "message",
+        "bug_id",
+        "source_contract_execution_id",
+        "source_contract_id",
+        "contract_execution_id",
+        "active_contract_execution_id",
+        "fence_token",
+        "route_token",
+        "route_token_ref",
+        "route_waiver",
+        "route_token_waiver",
+        "timeout_seconds",
+        "scenario_id",
+        "now_iso",
+        "actor",
+        "contract_actor",
+    }
+    body = {
+        key: value
+        for key, value in args.items()
+        if key in allowed_keys and value is not None
+    }
+    if body.get("backlog_id") and not body.get("bug_id"):
+        body["bug_id"] = body["backlog_id"]
+    if args.get("qa_evidence") is not None:
+        evidence = body.get("evidence") if isinstance(body.get("evidence"), dict) else {}
+        evidence = dict(evidence)
+        evidence.setdefault("qa_evidence", args["qa_evidence"])
+        body["evidence"] = evidence
+    return body
+
+
 def _runtime_context_write_body(args: dict) -> dict:
     return {
         key: value
@@ -1349,6 +1504,33 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_merge_queue_status",
+        "description": (
+            "Copy-safe merge queue status for direct-fix, hotfix, mf_parallel, "
+            "and mf_batch_parallel flows. Returns the durable ordered queue "
+            "read model without mutating refs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _parallel_branch_merge_queue_status_schema_properties(),
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "parallel_branch_merge_queue_apply",
+        "description": (
+            "Copy-safe ordered merge queue apply path. Defaults to dry_run; "
+            "live target-ref mutation requires dry_run=false, "
+            "allow_target_ref_mutation=true, route authorization, and merge "
+            "gate evidence."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _parallel_branch_merge_queue_apply_schema_properties(),
+            "required": ["project_id", "merge_queue_id"],
+        },
+    },
+    {
         "name": "observer_repair_run_plan",
         "description": "Build a read-only replayable observer repair-run plan for cross-system recovery. Does not authorize protected writes.",
         "inputSchema": {
@@ -1981,6 +2163,24 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http(
             "POST",
             f"/api/graph-governance/{pid}/parallel-branches/allocate",
+            body,
+        )
+
+    if name == "parallel_branch_merge_queue_status":
+        pid = args["project_id"]
+        query = _parallel_branch_merge_queue_status_query(args)
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http(
+            "GET",
+            f"/api/graph-governance/{pid}/parallel-branches{qs}",
+        )
+
+    if name == "parallel_branch_merge_queue_apply":
+        pid = args["project_id"]
+        body = _parallel_branch_merge_queue_apply_body(args)
+        return _http(
+            "POST",
+            f"/api/graph-governance/{pid}/parallel-branches/merge-execute",
             body,
         )
 
