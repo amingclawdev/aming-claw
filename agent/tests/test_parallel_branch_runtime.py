@@ -1262,7 +1262,9 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ).to_dict()
 
     current_values = projection["views"]["current"]["current_values"]
-    read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
+    action_plan = projection["views"]["action_plan"]
+    read_action = action_plan["read_receipt_hash_action"]
+    handoff = action_plan["worker_handoff_projection"]
 
     assert current_values["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert read_action["status"] == "missing"
@@ -1352,6 +1354,29 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ]
     assert "merge" in read_action["worker_constraints"]["blocked_actions"]
     assert read_action["observer_remediation_actions"][0]["role"] == "observer"
+    assert read_action["observer_remediation_actions"][0]["id"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert handoff["status"] == "no_worker_startup_evidence"
+    assert handoff["observer_next_action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert handoff["missing_worker_lineage"] == [
+        "mf_subagent_read_receipt",
+        "mf_subagent_startup",
+    ]
+    assert handoff["no_progress_reissue_policy"][
+        "observer_must_not_backfill_worker_evidence"
+    ] is True
+    assert handoff["direct_fix_return_contract"][
+        "requires_independent_qa_after_repair"
+    ] is True
+    assert projection["views"]["control_plane"]["worker_handoff_projection"][
+        "status"
+    ] == "no_worker_startup_evidence"
+    assert projection["views"]["gate_projection"]["worker_handoff_projection"][
+        "observer_next_action"
+    ] == "request_runtime_context_initial_join_host_envelope"
 
     with_receipt = build_runtime_context_projection(
         context,
@@ -1368,10 +1393,14 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ).to_dict()
 
     present_action = with_receipt["views"]["action_plan"]["read_receipt_hash_action"]
+    present_handoff = with_receipt["views"]["action_plan"]["worker_handoff_projection"]
     assert present_action["status"] == "present"
     assert present_action["next_action"] == "none"
     assert present_action["read_receipt_event_ref"] == "timeline:read-runtime-context"
     assert present_action["ordered_worker_startup_bridge"]["status"] == "ready"
+    assert present_handoff["status"] == "no_worker_startup_evidence"
+    assert present_handoff["missing_worker_lineage"] == ["mf_subagent_startup"]
+    assert present_handoff["worker_next_action"] == "record_mf_subagent_startup"
 
 
 def test_runtime_context_worker_guide_carries_nested_dispatch_owned_files() -> None:

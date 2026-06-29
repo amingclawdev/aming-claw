@@ -5737,6 +5737,13 @@ def _runtime_context_read_receipt_hash_action(
         },
         "observer_remediation_actions": [
             {
+                "id": "request_runtime_context_initial_join_host_envelope",
+                "role": "observer",
+                "when": (
+                    "dispatch_exists_but_worker_read_receipt_or_startup_is_missing"
+                ),
+            },
+            {
                 "id": "refresh_route_token_ref",
                 "role": "observer",
                 "when": "route_token_ref_missing_stale_or_scope_mismatch",
@@ -5764,6 +5771,152 @@ def _runtime_context_read_receipt_hash_action(
                 "raw_launch_text_persisted": False,
             },
         },
+    }
+
+
+def _runtime_context_worker_handoff_projection(
+    *,
+    values: Mapping[str, Any],
+    read_receipt_hash_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_context_id = _runtime_context_text(values.get("runtime_context_id"))
+    task_id = _runtime_context_text(values.get("task_id"))
+    parent_task_id = _runtime_context_text(values.get("parent_task_id"))
+    dispatch_event_ref = _runtime_context_text(values.get("dispatch_event_ref"))
+    read_receipt_event_ref = _runtime_context_text(
+        values.get("read_receipt_event_ref")
+    )
+    startup_event_ref = _runtime_context_text(values.get("startup_event_ref"))
+    heartbeat_event_ref = _runtime_context_text(
+        values.get("heartbeat_event_ref")
+        or values.get("last_heartbeat_event_ref")
+        or values.get("progress_event_ref")
+    )
+    dispatch_present = bool(
+        dispatch_event_ref
+        or (
+            runtime_context_id
+            and (
+                task_id
+                or values.get("worktree_path")
+                or values.get("branch_ref")
+                or values.get("worker_id")
+            )
+        )
+    )
+    missing_lineage: list[str] = []
+    if not read_receipt_event_ref:
+        missing_lineage.append("mf_subagent_read_receipt")
+    if not startup_event_ref:
+        missing_lineage.append("mf_subagent_startup")
+
+    if not dispatch_present:
+        status = "not_dispatched"
+        observer_next_action = "refresh_branch_runtime_context"
+    elif missing_lineage:
+        status = (
+            "no_worker_startup_evidence"
+            if "mf_subagent_startup" in missing_lineage
+            else "read_receipt_missing"
+        )
+        observer_next_action = "request_runtime_context_initial_join_host_envelope"
+    else:
+        status = "worker_lineage_present"
+        observer_next_action = "none"
+
+    worker_next_action = _runtime_context_text(
+        read_receipt_hash_action.get("next_action")
+    )
+    if worker_next_action == "none" and not startup_event_ref:
+        worker_next_action = "record_mf_subagent_startup"
+
+    recovery_actions: list[dict[str, Any]] = []
+    if status == "not_dispatched":
+        recovery_actions.append(
+            {
+                "id": "refresh_branch_runtime_context",
+                "role": "observer",
+                "allowed_when": "runtime_context_has_no_dispatch_or_worker_assignment",
+            }
+        )
+    if missing_lineage:
+        recovery_actions.extend(
+            [
+                {
+                    "id": "request_runtime_context_initial_join_host_envelope",
+                    "role": "observer",
+                    "allowed_when": (
+                        "dispatch_is_present_but_worker_lineage_is_missing"
+                    ),
+                    "result": (
+                        "host returns the worker identity, session token ref, "
+                        "fence token, target worktree, and runtime_context_id"
+                    ),
+                },
+                {
+                    "id": "cancel_or_mark_stale_no_progress_worker",
+                    "role": "observer",
+                    "allowed_when": (
+                        "a spawned worker has no read receipt, startup, heartbeat, "
+                        "or worktree mutation evidence"
+                    ),
+                },
+                {
+                    "id": "reissue_mf_sub_worker_with_same_scope",
+                    "role": "observer",
+                    "allowed_when": (
+                        "no-progress dispatch has been marked stale or cancelled"
+                    ),
+                    "scope_must_match": [
+                        "runtime_context_id",
+                        "task_id",
+                        "parent_task_id",
+                        "owned_files",
+                        "worktree_path",
+                        "route_token_ref",
+                    ],
+                },
+            ]
+        )
+
+    return {
+        "schema_version": "runtime_context.worker_handoff_projection.v1",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "status": status,
+        "dispatch_present": dispatch_present,
+        "dispatch_event_ref": dispatch_event_ref,
+        "observed_evidence": {
+            "read_receipt_event_ref": read_receipt_event_ref,
+            "startup_event_ref": startup_event_ref,
+            "heartbeat_event_ref": heartbeat_event_ref,
+            "worktree_path": _runtime_context_text(values.get("worktree_path")),
+            "branch_ref": _runtime_context_text(values.get("branch_ref")),
+        },
+        "missing_worker_lineage": missing_lineage,
+        "heartbeat_status": "present" if heartbeat_event_ref else "missing",
+        "worker_next_action": worker_next_action,
+        "observer_next_action": observer_next_action,
+        "recovery_actions": recovery_actions,
+        "no_progress_reissue_policy": {
+            "legal_when": (
+                "dispatch is present and no worker read receipt, startup, "
+                "heartbeat, or worktree mutation evidence exists"
+            ),
+            "must_record_before_reissue": "cancel_or_mark_stale_no_progress_worker",
+            "duplicate_worker_evidence_close_satisfying": False,
+            "observer_must_not_backfill_worker_evidence": True,
+            "reuse_runtime_scope": True,
+        },
+        "direct_fix_return_contract": {
+            "after_repair": "run_independent_qa_then_resume_parent_contract",
+            "requires_independent_qa_after_repair": True,
+            "resume_parent_without_reconcile": True,
+        },
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
     }
 
 
@@ -6750,6 +6903,13 @@ def build_runtime_context_action_plan_view(
         values=values,
         close_gate_view=close_gate,
     )
+    worker_handoff_projection = _runtime_context_worker_handoff_projection(
+        values={
+            **values,
+            "runtime_context_id": current_view.get("runtime_context_id", ""),
+        },
+        read_receipt_hash_action=read_receipt_hash_action,
+    )
     failed_qa_revision_projection = _runtime_context_failed_qa_revision_projection(
         lane_plan=lane_plan,
         values=values,
@@ -6827,6 +6987,24 @@ def build_runtime_context_action_plan_view(
                 "next_action": read_receipt_hash_action.get("next_action", ""),
             }
         )
+    if worker_handoff_projection.get("status") in {
+        "no_worker_startup_evidence",
+        "read_receipt_missing",
+    }:
+        blocking_reasons.append(
+            {
+                "code": "worker_handoff_no_startup_progress",
+                "message": (
+                    "worker dispatch has no startup lineage; observer must "
+                    "request the initial-join envelope or reissue the worker "
+                    "instead of backfilling worker evidence"
+                ),
+                "next_action": worker_handoff_projection.get(
+                    "observer_next_action",
+                    "",
+                ),
+            }
+        )
     for gap in close_precheck_gap_projection.get("gaps") or []:
         if isinstance(gap, Mapping):
             blocking_reasons.append(
@@ -6867,6 +7045,7 @@ def build_runtime_context_action_plan_view(
         "blocking_reasons": blocking_reasons,
         "route_token_action": route_token_action,
         "read_receipt_hash_action": read_receipt_hash_action,
+        "worker_handoff_projection": worker_handoff_projection,
         "audit_archive_action": audit_archive_action,
         "merge_dependency_projection": merge_dependency_projection,
         "close_precheck_gap_projection": close_precheck_gap_projection,
@@ -7057,6 +7236,9 @@ def build_runtime_context_gate_projection_view(
     audit_archive_action = _runtime_context_mapping(
         action_plan.get("audit_archive_action")
     )
+    worker_handoff_projection = _runtime_context_mapping(
+        action_plan.get("worker_handoff_projection")
+    )
     audit_archive_entrypoint = _runtime_context_mapping(
         audit_archive_action.get("entrypoint")
     )
@@ -7189,6 +7371,7 @@ def build_runtime_context_gate_projection_view(
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
+        "worker_handoff_projection": copy.deepcopy(worker_handoff_projection),
         "audit_archive_action": sanitized_audit_archive_action,
         "close_precheck_gap_projection": copy.deepcopy(
             dict(action_plan.get("close_precheck_gap_projection") or {})
@@ -7279,6 +7462,9 @@ def build_runtime_context_control_plane_view(
         "route_token_action": dict(action_plan.get("route_token_action") or {}),
         "read_receipt_hash_action": dict(
             action_plan.get("read_receipt_hash_action") or {}
+        ),
+        "worker_handoff_projection": dict(
+            action_plan.get("worker_handoff_projection") or {}
         ),
         "audit_archive_action": dict(action_plan.get("audit_archive_action") or {}),
         "merge_dependency_projection": dict(
