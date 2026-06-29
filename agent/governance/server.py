@@ -17201,6 +17201,13 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 ),
                 message=str(ctx.body.get("message") or ""),
                 bug_id=str(ctx.body.get("bug_id") or ""),
+                source_contract_id=str(
+                    ctx.body.get("source_contract_execution_id")
+                    or ctx.body.get("source_contract_id")
+                    or ctx.body.get("contract_execution_id")
+                    or ctx.body.get("active_contract_execution_id")
+                    or ""
+                ),
                 fence_token=str(ctx.body.get("fence_token") or ""),
                 now_iso=str(ctx.body.get("now_iso") or ""),
                 timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
@@ -18538,6 +18545,50 @@ def _direct_update_graph_activation_guidance(
     }
 
 
+def _pending_scope_reconcile_activation_guidance(
+    project_id: str,
+    *,
+    target_commit_sha: str,
+    parent_commit_sha: str = "",
+    actor: str = "observer",
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return legacy pending-scope activation guidance for dashboard queues."""
+    body: dict[str, Any] = {
+        "target_commit_sha": str(target_commit_sha or ""),
+        "activate": True,
+        "actor": str(actor or "observer"),
+    }
+    if parent_commit_sha:
+        body["parent_commit_sha"] = str(parent_commit_sha)
+    identity = identity if isinstance(identity, Mapping) else {}
+    for key in ("ref_name", "branch_ref", "worktree_id", "worktree_path"):
+        value = str(identity.get(key) or "").strip()
+        if value:
+            body[key] = value
+    return {
+        "schema_version": "graph_reconcile_next_action.v1",
+        "action": "materialize_and_activate_pending_scope",
+        "description": (
+            "Materialize a pending-scope graph for the target commit and "
+            "activate it. The current-full reconcile path remains the canonical "
+            "full rebuild path, but dashboard stale-scope rows keep this "
+            "legacy recovery action."
+        ),
+        "endpoint": f"/api/graph-governance/{project_id}/reconcile/pending-scope",
+        "method": "POST",
+        "request": {"body": body},
+        "candidate_only_if_activate_false": True,
+        "canonical_full_reconcile": _direct_update_graph_activation_guidance(
+            project_id,
+            target_commit_sha=target_commit_sha,
+            parent_commit_sha=parent_commit_sha,
+            actor=actor,
+            identity=identity,
+        ),
+    }
+
+
 def _candidate_snapshot_finalize_guidance(
     project_id: str,
     *,
@@ -18618,7 +18669,7 @@ def _graph_stale_scope_operation(
             stale_summary.update({
                 "is_stale": True,
                 "stale_reason": "rule_fingerprint_mismatch",
-                "recommended_action": "run_current_full_reconcile",
+                "recommended_action": "run_full_reconcile",
                 "requires_reconcile": True,
             })
             stale_summary["next_action"] = _direct_update_graph_activation_guidance(
@@ -18627,8 +18678,8 @@ def _graph_stale_scope_operation(
                 actor="dashboard_user",
             )
             operation = {
-                "operation_id": f"current-full-reconcile:rule-fingerprint:{head_commit[:12]}",
-                "operation_type": "current_full_reconcile",
+                "operation_id": f"scope-reconcile:rule-fingerprint:{head_commit[:12]}",
+                "operation_type": "scope_reconcile",
                 "target_scope": "snapshot",
                 "target_id": head_commit,
                 "target_label": head_commit[:12],
@@ -18641,13 +18692,13 @@ def _graph_stale_scope_operation(
                 "lease_expires_at": "",
                 "last_error": "",
                 "last_result": "graph rule fingerprint changed; run full reconcile before trusting active graph",
-                "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
+                "supported_actions": ["run_full_reconcile", "view_trace", "file_backlog"],
                 "active_graph_commit": graph_commit,
                 "head_commit": head_commit,
                 "changed_files": [],
                 "warnings": active_warnings,
                 "rule_fingerprint": rule_fingerprint,
-                "recommended_action": "run_current_full_reconcile",
+                "recommended_action": "run_full_reconcile",
                 "next_action": _direct_update_graph_activation_guidance(
                     project_id,
                     target_commit_sha=head_commit,
@@ -18658,11 +18709,11 @@ def _graph_stale_scope_operation(
         if not active_warnings:
             return None, stale_summary
         operation = {
-            "operation_id": f"current-full-reconcile:suspect-root:{graph_commit[:12]}",
-            "operation_type": "current_full_reconcile",
+            "operation_id": f"scope-reconcile:suspect-root:{head_commit[:12]}",
+            "operation_type": "scope_reconcile",
             "target_scope": "snapshot",
-            "target_id": graph_commit,
-            "target_label": graph_commit[:12],
+            "target_id": head_commit,
+            "target_label": head_commit[:12],
             "status": "not_queued",
             "progress": {"done": 0, "total": 1},
             "created_at": "",
@@ -18672,12 +18723,12 @@ def _graph_stale_scope_operation(
             "lease_expires_at": "",
             "last_error": "",
             "last_result": "active graph snapshot has materialization provenance warnings",
-            "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
+            "supported_actions": ["run_full_reconcile", "view_trace", "file_backlog"],
             "active_graph_commit": graph_commit,
             "head_commit": head_commit,
             "changed_files": [],
             "warnings": active_warnings,
-            "recommended_action": "run_current_full_reconcile",
+            "recommended_action": "run_full_reconcile",
             "next_action": _direct_update_graph_activation_guidance(
                 project_id,
                 target_commit_sha=head_commit,
@@ -18710,7 +18761,7 @@ def _graph_stale_scope_operation(
     if pending_for_head:
         return None, stale_summary
     changed_hint = f"; {len(all_changed_files)} changed files since snapshot" if all_changed_files else ""
-    next_action = _direct_update_graph_activation_guidance(
+    next_action = _pending_scope_reconcile_activation_guidance(
         project_id,
         target_commit_sha=head_commit,
         parent_commit_sha=graph_commit,
@@ -18721,8 +18772,8 @@ def _graph_stale_scope_operation(
         "next_action": next_action,
     })
     operation = {
-        "operation_id": f"current-full-reconcile:stale:{head_commit[:12]}",
-        "operation_type": "current_full_reconcile",
+        "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
+        "operation_type": "scope_reconcile",
         "target_scope": "snapshot",
         "target_id": head_commit,
         "target_label": head_commit[:12],
@@ -18735,7 +18786,7 @@ def _graph_stale_scope_operation(
         "lease_expires_at": "",
         "last_error": "",
         "last_result": f"active graph at {graph_commit[:12]}, HEAD at {head_commit[:12]}{changed_hint}",
-        "supported_actions": ["run_current_full_reconcile", "view_trace", "file_backlog"],
+        "supported_actions": ["materialize_pending_scope", "view_trace", "file_backlog"],
         "active_graph_commit": graph_commit,
         "head_commit": head_commit,
         "changed_files": changed_files,
@@ -34694,7 +34745,7 @@ def _onboard_runtime_resume_from_current_projection(
     status = readiness_state
     if readiness_state == "parent_resume_required_after_direct_fix_qa":
         status = "returned"
-    return {
+    resume = {
         "schema_version": "onboard_route_guide.runtime_resume.v1",
         "status": status,
         "readiness_state": readiness_state,
@@ -34722,6 +34773,14 @@ def _onboard_runtime_resume_from_current_projection(
         ),
         "projection_hash": str(current_projection.get("projection_hash") or ""),
     }
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        resume["branch_service_takeover"] = (
+            _direct_fix_branch_service_takeover_guidance()
+        )
+        resume["next_runtime_service_action"] = (
+            "run_direct_fix_branch_service_on_canonical_port_then_reenter_parent"
+        )
+    return resume
 
 
 def _source_backed_contract_chain_is_complete(
@@ -37074,6 +37133,42 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
     }
 
 
+def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.branch_service_takeover.v1",
+        "id": "direct_fix_branch_service_takeover",
+        "purpose": "run QA-passed direct-fix branch code before returning to parent",
+        "canonical_port_required": True,
+        "canonical_port": 40000,
+        "state_sharing": "reuse_existing_shared_volume",
+        "steps": [
+            "confirm direct-fix implementation and independent QA have passed",
+            "stop the current governance process bound to canonical port 40000",
+            "start governance from the direct-fix worktree on canonical port 40000",
+            "reuse the existing shared-volume state so contract/runtime lineage remains visible",
+            "re-enter the parent backlog row through onboard_route_guide",
+        ],
+        "forbidden_shortcuts": [
+            "do_not_use_governance_redeploy_until_worktree_isolated_redeploy_exists",
+            "do_not_checkout_the_shared_operator_worktree_to_the_direct_fix_commit",
+            "do_not_treat_a_side_port_branch_service_as_parent_resume_unless_clients_are_rebound",
+            "do_not_merge_direct_fix_before_merge_queue_unless_operator_explicitly_approves",
+        ],
+        "safe_when": [
+            "direct_fix_branch_clean",
+            "main_worktree_clean_or_dirty_scope_recorded",
+            "operator_approval_recorded",
+            "qa_pass_evidence_recorded",
+            "mcp_and_onboard_clients_continue_to_target_canonical_port",
+        ],
+        "verification": [
+            "GET /api/health reports the direct-fix commit version",
+            "runtime_status reports governance.version at the direct-fix commit",
+            "onboard_route_guide for the parent row returns the expected runtime_resume",
+        ],
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -37664,6 +37759,18 @@ def _onboard_contract_route_guide(
                     "kind": "mcp",
                     "mcp_tool": "governance_redeploy",
                     "gated": True,
+                    "worktree_isolated": False,
+                    "warning": (
+                        "Do not use governance_redeploy for QA-passed direct-fix "
+                        "branch service takeover until worktree-isolated redeploy "
+                        "exists; current manager redeploy may checkout the shared "
+                        "operator worktree."
+                    ),
+                },
+                "direct_fix_branch_service_takeover": {
+                    "kind": "operator_cli",
+                    "gated": True,
+                    **_direct_fix_branch_service_takeover_guidance(),
                 },
                 "reconcile": {
                     "kind": "mcp_or_http",
@@ -38482,6 +38589,16 @@ def _onboard_route_guide_service_response(
     role: str = "",
     work_type: str = "",
 ) -> dict[str, Any]:
+    preexisting_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+        route_token_ref=route_token_ref,
+    )
+    preexisting_projection_complete = _source_backed_contract_chain_is_complete(
+        preexisting_projection
+    )
     record = _onboard_service_materialize_parent_record(
         conn,
         project_id=project_id,
@@ -38558,26 +38675,41 @@ def _onboard_route_guide_service_response(
                 route_token_ref=route_token_ref,
             )
             if blocked_resume:
-                runtime_resume["projection_conflict"] = {
-                    "schema_version": "onboard_route_guide.projection_conflict.v1",
-                    "status": "suppressed_stale_resume",
-                    "authoritative_source": "backlog_contract_chain_current",
-                    "authoritative_readiness_state": str(
-                        current_projection.get("readiness_state") or ""
-                    ),
-                    "shadowed_source": str(blocked_resume.get("source") or ""),
-                    "shadowed_mode": str(blocked_resume.get("mode") or ""),
-                    "shadowed_next_legal_action": dict(
-                        blocked_resume.get("next_legal_action")
-                        if isinstance(blocked_resume.get("next_legal_action"), Mapping)
-                        else {}
-                    ),
-                    "safe_next_step": (
-                        "do_not_enter_duplicate_successor; continue from "
-                        "backlog_contract_chain_current"
-                    ),
-                }
-                runtime_resume["stale_compact_ledger_suppressed"] = True
+                if preexisting_projection_complete:
+                    runtime_resume["projection_conflict"] = {
+                        "schema_version": "onboard_route_guide.projection_conflict.v1",
+                        "status": "suppressed_stale_resume",
+                        "authoritative_source": "backlog_contract_chain_current",
+                        "authoritative_readiness_state": str(
+                            current_projection.get("readiness_state") or ""
+                        ),
+                        "shadowed_source": str(blocked_resume.get("source") or ""),
+                        "shadowed_mode": str(blocked_resume.get("mode") or ""),
+                        "shadowed_next_legal_action": dict(
+                            blocked_resume.get("next_legal_action")
+                            if isinstance(blocked_resume.get("next_legal_action"), Mapping)
+                            else {}
+                        ),
+                        "safe_next_step": (
+                            "do_not_enter_duplicate_successor; continue from "
+                            "backlog_contract_chain_current"
+                        ),
+                    }
+                    runtime_resume["stale_compact_ledger_suppressed"] = True
+                else:
+                    blocked_resume["shadowed_current_projection"] = {
+                        "source": "backlog_contract_chain_current",
+                        "readiness_state": str(
+                            current_projection.get("readiness_state") or ""
+                        ),
+                        "current_contract_execution_id": str(
+                            current_projection.get("current_contract_execution_id") or ""
+                        ),
+                        "projection_hash": str(
+                            current_projection.get("projection_hash") or ""
+                        ),
+                    }
+                    runtime_resume = blocked_resume
     else:
         runtime_resume = _onboard_blocked_contract_resume_projection(
             conn,
@@ -42030,6 +42162,7 @@ def _mf_parallel_successor_runtime_enter(
     if not isinstance(route_token_ref_binding, Mapping) or not route_token_ref_binding:
         route_token_ref_binding = child_route_binding
     successor_route_ref = str(successor.get("route_token_ref") or "")
+    response_route_ref = successor_route_ref or route_token_ref
     route_token_ref_guidance: dict[str, Any] = {
         "schema_version": "mf_parallel.child_route_token_ref_guidance.v1",
         "status": str(route_token_ref_binding.get("status") or ""),
@@ -42083,7 +42216,7 @@ def _mf_parallel_successor_runtime_enter(
         "execution_state_revision": current_state["execution_state_revision"],
         "execution_state_hash": current_state["execution_state_hash"],
         "contract_chain_current": current_projection,
-        "route_token_ref": successor_route_ref,
+        "route_token_ref": response_route_ref,
         "route_token_ref_guidance": route_token_ref_guidance,
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {

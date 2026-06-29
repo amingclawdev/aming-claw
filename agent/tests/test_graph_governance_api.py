@@ -24396,9 +24396,25 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert route_guide["system_operation_index"]["operations"]["redeploy"][
         "mcp_tool"
     ] == "governance_redeploy"
-    assert route_guide["system_operation_index"]["operations"]["reconcile"][
-        "queue_path"
-    ] == "/api/graph-governance/{project_id}/pending-scope"
+    redeploy_op = route_guide["system_operation_index"]["operations"]["redeploy"]
+    assert redeploy_op["worktree_isolated"] is False
+    assert "shared operator worktree" in redeploy_op["warning"]
+    takeover_op = route_guide["system_operation_index"]["operations"][
+        "direct_fix_branch_service_takeover"
+    ]
+    assert takeover_op["canonical_port_required"] is True
+    assert takeover_op["canonical_port"] == 40000
+    assert (
+        "do_not_use_governance_redeploy_until_worktree_isolated_redeploy_exists"
+        in takeover_op["forbidden_shortcuts"]
+    )
+    reconcile_op = route_guide["system_operation_index"]["operations"]["reconcile"]
+    assert reconcile_op["status_path"] == (
+        "/api/graph-governance/{project_id}/operations/queue"
+    )
+    assert reconcile_op["legacy_recovery"]["pending_scope_queue_path"] == (
+        "/api/graph-governance/{project_id}/pending-scope"
+    )
     assert route_guide["interface_index"]["hotfix_enter"]["path"] == (
         "/api/projects/{project_id}/hotfix/enter"
     )
@@ -26162,6 +26178,16 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     )
     assert onboard["ok"] is True
     assert onboard["runtime_resume"]["status"] == "returned"
+    assert onboard["runtime_resume"]["next_runtime_service_action"] == (
+        "run_direct_fix_branch_service_on_canonical_port_then_reenter_parent"
+    )
+    takeover = onboard["runtime_resume"]["branch_service_takeover"]
+    assert takeover["canonical_port_required"] is True
+    assert takeover["state_sharing"] == "reuse_existing_shared_volume"
+    assert (
+        "do_not_treat_a_side_port_branch_service_as_parent_resume_unless_clients_are_rebound"
+        in takeover["forbidden_shortcuts"]
+    )
     assert onboard["next_legal_action"]["id"] == "resume_parent_after_successor_return"
     assert (
         onboard["next_legal_action"]["successor_contract_execution_id"]

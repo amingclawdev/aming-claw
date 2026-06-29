@@ -2334,6 +2334,10 @@ TOOLS: list[dict] = [
             "properties": {
                 "project_id": {"type": "string"},
                 "chain_version": {"type": "string", "description": "Short commit hash. Defaults to current git short HEAD."},
+                "branch_ref": {
+                    "type": "string",
+                    "description": "Optional intended branch ref/name to preserve when chain_version is that branch HEAD.",
+                },
                 "sync_version": {"type": "boolean", "description": "Sync full git HEAD to governance after a successful redeploy.", "default": True},
             },
             "required": ["project_id"],
@@ -2593,6 +2597,10 @@ def _runtime_status_classification(
     version_ok = bool(version.get("ok"))
     runtime_match = bool(version.get("runtime_match"))
     dirty = _runtime_status_target_dirty(version)
+    manager_detached = bool(
+        manager.get("runtime_detached")
+        or manager.get("runtime_checkout_warning") == "shared_worktree_detached"
+    )
     target_clean = _runtime_status_target_clean(version)
     legacy_runtime_waivers = (
         _runtime_status_legacy_runtime_waivers(manager, version)
@@ -2601,7 +2609,7 @@ def _runtime_status_classification(
     )
     core_version_ok = bool(version_ok or (target_clean and legacy_runtime_waivers))
     core_ok = bool(gov_ok and core_version_ok and not dirty)
-    advanced_chain_ops_ok = bool(manager_ok and runtime_match and not dirty)
+    advanced_chain_ops_ok = bool(manager_ok and runtime_match and not dirty and not manager_detached)
     strict_ok = core_ok
 
     if not gov_ok:
@@ -2610,6 +2618,12 @@ def _runtime_status_classification(
     elif dirty:
         severity = "warning"
         summary = "Governance is usable, but the worktree has uncommitted files."
+    elif manager_detached:
+        severity = "warning"
+        summary = (
+            "Governance is usable, but the ServiceManager shared runtime worktree "
+            "is detached; follow-up merge work is blocked until a branch checkout is restored."
+        )
     elif not core_version_ok:
         severity = "warning"
         summary = "Governance is usable, but version metadata needs attention."
@@ -2643,6 +2657,15 @@ def _runtime_status_classification(
             "executor": advanced_chain_ops_ok,
         },
         "legacy_runtime_waivers": legacy_runtime_waivers,
+        "runtime_branch_state": {
+            "runtime_worktree": manager.get("runtime_worktree", ""),
+            "runtime_branch": manager.get("runtime_branch", ""),
+            "runtime_branch_ref": manager.get("runtime_branch_ref", ""),
+            "runtime_detached": manager_detached,
+            "runtime_head": manager.get("runtime_head", ""),
+            "runtime_checkout_warning": manager.get("runtime_checkout_warning", ""),
+            "follow_up_merge_blocked": manager_detached,
+        },
     }
 
 
@@ -3679,10 +3702,14 @@ class ToolDispatcher:
             chain_version = args.get("chain_version") or self._git_head(short=True)
             if not chain_version:
                 return {"ok": False, "error": "missing_chain_version"}
+            branch_ref = args.get("branch_ref") or self._git_branch()
+            body = {"chain_version": chain_version}
+            if branch_ref:
+                body["branch_ref"] = branch_ref
             result = self._manager_api(
                 "POST",
                 "/api/manager/redeploy/governance",
-                {"chain_version": chain_version},
+                body,
             )
             if result.get("ok") and args.get("sync_version", True):
                 head = self._git_head(short=False)
@@ -3751,6 +3778,9 @@ class ToolDispatcher:
                 status["recommended_actions"].append("commit_or_stash_dirty_files")
             if not version.get("runtime_match"):
                 status["recommended_actions"].append("advanced_chain_ops_redeploy_or_restart")
+            runtime_branch_state = status.get("runtime_branch_state")
+            if isinstance(runtime_branch_state, dict) and runtime_branch_state.get("follow_up_merge_blocked"):
+                status["recommended_actions"].append("restore_runtime_branch_checkout_before_merge")
             return status
 
         # --- Contract Templates ---
@@ -4074,6 +4104,16 @@ class ToolDispatcher:
         args.append("HEAD")
         try:
             return subprocess.check_output(args, cwd=self._workspace, timeout=5).decode().strip()
+        except Exception:
+            return ""
+
+    def _git_branch(self) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", "branch", "--show-current"],
+                cwd=self._workspace,
+                timeout=5,
+            ).decode().strip()
         except Exception:
             return ""
 

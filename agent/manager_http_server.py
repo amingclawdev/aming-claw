@@ -111,6 +111,46 @@ def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _git_stdout(args: list[str], cwd: Path) -> str:
+    result = _run_git(args, cwd)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _refs_match(left: str, right: str) -> bool:
+    left_s = str(left or "").strip().lower()
+    right_s = str(right or "").strip().lower()
+    if not left_s or not right_s:
+        return False
+    if left_s == right_s:
+        return True
+    min_prefix = 7
+    return (
+        (len(left_s) >= min_prefix and right_s.startswith(left_s))
+        or (len(right_s) >= min_prefix and left_s.startswith(right_s))
+    )
+
+
+def _normalize_branch_name(branch_ref: str) -> str:
+    branch = str(branch_ref or "").strip()
+    if branch.startswith("refs/heads/"):
+        return branch.removeprefix("refs/heads/")
+    return branch
+
+
+def _runtime_checkout_branch_state() -> dict:
+    root = _project_root()
+    branch = _git_stdout(["branch", "--show-current"], root)
+    head = _git_stdout(["rev-parse", "HEAD"], root)
+    return {
+        "runtime_worktree": str(root),
+        "runtime_branch": branch,
+        "runtime_branch_ref": f"refs/heads/{branch}" if branch else "",
+        "runtime_detached": not bool(branch),
+        "runtime_head": head,
+        "runtime_checkout_warning": "shared_worktree_detached" if not branch else "",
+    }
+
+
 def _running_under_test_harness() -> bool:
     """Return True when executing under a recognized test runner.
 
@@ -162,7 +202,7 @@ def _running_under_test_harness() -> bool:
     return False
 
 
-def _ensure_plugin_clone_checkout(chain_version: str) -> str:
+def _ensure_plugin_clone_checkout(chain_version: str, branch_ref: str = "") -> str:
     """Advance the plugin-clone runtime checkout to *chain_version*.
 
     Runs inside _project_root() (the plugin-clone root). Raises RuntimeError on
@@ -173,7 +213,8 @@ def _ensure_plugin_clone_checkout(chain_version: str) -> str:
       1. Refuse a dirty tree (uncommitted changes) — never check out over them.
       2. Ensure the target commit is present (best-effort `git fetch origin`,
          then verify presence with `git cat-file -t`).
-      3. `git checkout <chain_version>`.
+      3. `git checkout <branch>` when the requested commit is the current or
+         explicitly supplied branch HEAD; otherwise `git checkout <chain_version>`.
       4. Verify `git rev-parse HEAD` resolves to the requested commit
          (accommodating short vs full hashes).
 
@@ -232,14 +273,37 @@ def _ensure_plugin_clone_checkout(chain_version: str) -> str:
         chain_version,
     )
 
-    # Step 3: advance the checkout.
-    checkout = _run_git(["checkout", chain_version], root)
+    requested = _run_git(["rev-parse", chain_version], root)
+    requested_full = requested.stdout.strip() if requested.returncode == 0 else ""
+
+    # Step 3: advance the checkout without detaching the shared operator
+    # worktree when the requested commit is the head of an intended branch.
+    checkout_target = chain_version
+    branch_candidates = [
+        _normalize_branch_name(branch_ref),
+        _git_stdout(["branch", "--show-current"], root),
+    ]
+    seen: set[str] = set()
+    for candidate in branch_candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        candidate_head = _git_stdout(["rev-parse", candidate], root)
+        if requested_full and _refs_match(candidate_head, requested_full):
+            checkout_target = candidate
+            break
+
+    checkout = _run_git(["checkout", checkout_target], root)
     if checkout.returncode != 0:
         raise RuntimeError(
-            f"runtime_checkout: `git checkout {chain_version}` failed in {root}: "
+            f"runtime_checkout: `git checkout {checkout_target}` failed in {root}: "
             f"{(checkout.stderr or checkout.stdout).strip()}"
         )
-    log.info("manager_http_server: runtime_checkout — checked out %s", chain_version)
+    log.info(
+        "manager_http_server: runtime_checkout — checked out %s for requested %s",
+        checkout_target,
+        chain_version,
+    )
 
     # Step 4: verify HEAD == requested commit (handle short vs full hashes).
     head = _run_git(["rev-parse", "HEAD"], root)
@@ -252,8 +316,6 @@ def _ensure_plugin_clone_checkout(chain_version: str) -> str:
 
     # Resolve the requested ref to a full hash for an exact comparison; fall
     # back to a prefix match so a short hash request still validates.
-    requested = _run_git(["rev-parse", chain_version], root)
-    requested_full = requested.stdout.strip() if requested.returncode == 0 else ""
     matches = bool(requested_full) and resolved == requested_full
     if not matches:
         # Prefix tolerance for short vs full hashes when rev-parse of the ref
@@ -573,8 +635,12 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 runtime_version = get_runtime_version()
             except Exception:
                 pass
-            self._send_json({"ok": True, "service": "manager_http_server",
-                             "runtime_version": runtime_version})
+            self._send_json({
+                "ok": True,
+                "service": "manager_http_server",
+                "runtime_version": runtime_version,
+                **_runtime_checkout_branch_state(),
+            })
             return
         self._send_json({"ok": False, "detail": "Not found"}, 404)
 
@@ -636,6 +702,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         # --- target == "governance" ---
         body = self._read_json_body()
         chain_version = body.get("chain_version", "")
+        branch_ref = body.get("branch_ref", "") or body.get("branch", "")
         if not chain_version:
             self._send_json(
                 {"ok": False, "detail": "Missing required field: chain_version"},
@@ -653,11 +720,17 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         # not live — return a loud non-ok response and do NOT stop/spawn so the
         # current governance keeps running unchanged.
         try:
-            runtime_head = _ensure_plugin_clone_checkout(chain_version)
+            runtime_head = (
+                _ensure_plugin_clone_checkout(chain_version, branch_ref=branch_ref)
+                if branch_ref
+                else _ensure_plugin_clone_checkout(chain_version)
+            )
+            runtime_branch_state = _runtime_checkout_branch_state()
         except Exception as exc:
             log.error(
                 "manager_http_server: runtime checkout did not advance: %s", exc
             )
+            runtime_branch_state = _runtime_checkout_branch_state()
             self._send_json(
                 {
                     "ok": False,
@@ -666,6 +739,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "runtime_checkout_advanced": False,
                     "detail": f"Runtime checkout failed: {exc}",
                     "pid": None,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
                     "runtime_deployment_verification": (
                         derive_runtime_deployment_verification_status(
                             http_status=500,
@@ -697,6 +772,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "detail": f"Failed to spawn governance: {exc}",
                     "pid": None,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
                     "runtime_deployment_verification": (
                         derive_runtime_deployment_verification_status(
                             http_status=500,
@@ -720,6 +797,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "detail": "Governance spawned but health check failed",
                     "pid": proc.pid,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
                     "runtime_deployment_verification": (
                         derive_runtime_deployment_verification_status(
                             http_status=500,
@@ -743,6 +822,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "detail": "Governance running but failed to write chain_version",
                     "pid": proc.pid,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
                     "runtime_deployment_verification": (
                         derive_runtime_deployment_verification_status(
                             http_status=500,
@@ -765,6 +846,8 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "chain_version": chain_version,
                 "runtime_checkout_advanced": True,
                 "runtime_head": runtime_head,
+                "requested_branch_ref": branch_ref,
+                **runtime_branch_state,
                 "runtime_deployment_verification": (
                     derive_runtime_deployment_verification_status(
                         http_status=200,
