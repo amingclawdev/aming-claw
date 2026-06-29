@@ -1221,7 +1221,12 @@ TOOLS: list[dict] = [
     },
     {
         "name": "graph_current_full_reconcile",
-        "description": "Run the canonical current-commit full graph reconcile path. Defaults to current clean HEAD and activate=true.",
+        "description": (
+            "Run the canonical current-commit full graph reconcile path. "
+            "Defaults to current clean HEAD and activate=true; route-proof "
+            "calls use observer_session_id with observer_route_token_ref or "
+            "route_token_ref."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {

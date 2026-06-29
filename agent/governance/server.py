@@ -18498,6 +18498,7 @@ def _direct_update_graph_activation_guidance(
     return {
         "schema_version": "graph_reconcile_next_action.v1",
         "action": "run_current_full_reconcile",
+        "mcp_tool": "graph_current_full_reconcile",
         "description": (
             "To make the active graph reflect the current clean HEAD, call the "
             "canonical current-full reconcile endpoint. It rebuilds a full "
@@ -18506,10 +18507,40 @@ def _direct_update_graph_activation_guidance(
         ),
         "endpoint": f"/api/graph-governance/{project_id}/reconcile/current-full",
         "method": "POST",
+        "http_fallback": {
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/reconcile/current-full",
+        },
+        "route_proof": {
+            "accepted_refs": ["observer_route_token_ref", "route_token_ref"],
+            "required_fields": [
+                "observer_session_id",
+                "observer_route_token_ref or route_token_ref",
+                "backlog_id",
+                "task_id or contract_execution_id",
+            ],
+            "raw_route_token_required": False,
+        },
+        "body_fields": [
+            "project_id",
+            "target_commit_sha or current clean HEAD",
+            "activate",
+            "require_clean",
+            "semantic_use_ai",
+            "semantic_enrich",
+            "enqueue_stale",
+            "backlog_id",
+            "task_id or contract_execution_id",
+            "observer_session_id",
+            "observer_route_token_ref or route_token_ref",
+        ],
         "request": {"body": body},
         "defaults": {
             "target_commit_sha": "current_clean_head",
             "activate": True,
+            "require_clean": True,
+            "semantic_use_ai": False,
+            "enqueue_stale": False,
         },
     }
 
@@ -37380,6 +37411,23 @@ def _onboard_contract_route_guide(
             "method": "POST",
             "path": "/api/graph-governance/{project_id}/query",
         },
+        "graph_current_full_reconcile": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "graph_current_full_reconcile",
+            "method": "POST",
+            "path": "/api/graph-governance/{project_id}/reconcile/current-full",
+            "http_fallback": {
+                "method": "POST",
+                "path": "/api/graph-governance/{project_id}/reconcile/current-full",
+            },
+            "required_route_proof_fields": [
+                "observer_session_id",
+                "observer_route_token_ref or route_token_ref",
+                "backlog_id",
+                "task_id or contract_execution_id",
+            ],
+            "raw_route_token_required": False,
+        },
         "backlog_get": {
             "kind": "mcp",
             "mcp_tool": "backlog_get",
@@ -37656,6 +37704,7 @@ def _onboard_contract_route_guide(
                 "contract_runtime_current",
                 "contract_runtime_submit_line",
                 "task_timeline_append",
+                "graph_current_full_reconcile",
                 "observer_direct_mutation_exception",
                 "direct_fix_enter",
                 "mf_parallel_enter",
@@ -37731,8 +37780,37 @@ def _onboard_contract_route_guide(
                     ],
                     "status_path": "/api/graph-governance/{project_id}/operations/queue",
                     "run_path": "/api/graph-governance/{project_id}/reconcile/current-full",
-                    "queue_path": "/api/graph-governance/{project_id}/pending-scope",
-                    "materialize_path": "/api/graph-governance/{project_id}/reconcile/pending-scope",
+                    "http_fallback": {
+                        "method": "POST",
+                        "path": "/api/graph-governance/{project_id}/reconcile/current-full",
+                    },
+                    "request_fields": [
+                        "project_id",
+                        "target_commit_sha or current clean HEAD",
+                        "activate",
+                        "require_clean",
+                        "semantic_use_ai",
+                        "semantic_enrich",
+                        "enqueue_stale",
+                        "backlog_id",
+                        "task_id or contract_execution_id",
+                        "observer_session_id",
+                        "observer_route_token_ref or route_token_ref",
+                    ],
+                    "required_route_proof_fields": [
+                        "observer_session_id",
+                        "observer_route_token_ref or route_token_ref",
+                        "backlog_id",
+                        "task_id or contract_execution_id",
+                    ],
+                    "defaults": {
+                        "target_commit_sha": "current_clean_head",
+                        "activate": True,
+                        "require_clean": True,
+                        "semantic_use_ai": False,
+                        "enqueue_stale": False,
+                    },
+                    "raw_route_token_required": False,
                     "gated": True,
                     "legacy_recovery": {
                         "pending_scope_queue_path": "/api/graph-governance/{project_id}/pending-scope",
