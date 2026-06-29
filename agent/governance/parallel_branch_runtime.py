@@ -13157,6 +13157,48 @@ def _merge_gate_blockers_for_queue(decision: MergeQueueDecision) -> tuple[dict[s
     },)
 
 
+def _merge_gate_sibling_warnings(
+    items: list[MergeQueueItem],
+    selected: MergeQueueItem,
+    queue_plan: MergeQueuePlan,
+) -> tuple[dict[str, Any], ...]:
+    decisions_by_item = {
+        decision.queue_item_id: decision
+        for decision in queue_plan.decisions
+    }
+    siblings: list[dict[str, Any]] = []
+    for item in sorted(items, key=lambda candidate: (candidate.queue_index, candidate.queue_item_id)):
+        if item.queue_item_id == selected.queue_item_id:
+            continue
+        decision = decisions_by_item.get(item.queue_item_id)
+        queue_state = str(decision.queue_state if decision else item.status or "").strip()
+        status = str(item.status or "").strip()
+        if status in TERMINAL_NON_BLOCKING_STATES or queue_state in TERMINAL_NON_BLOCKING_STATES:
+            continue
+        siblings.append({
+            "queue_item_id": item.queue_item_id,
+            "task_id": item.task_id,
+            "backlog_id": item.backlog_id,
+            "branch_ref": item.branch_ref,
+            "queue_index": item.queue_index,
+            "status": status,
+            "queue_state": queue_state,
+            "action": str(decision.action if decision else "").strip(),
+        })
+    if not siblings:
+        return ()
+    return ({
+        "code": "active_queue_siblings_unmerged",
+        "source": "merge_queue",
+        "message": "active merge queue has sibling rows that are incomplete or unmerged",
+        "merge_queue_id": selected.merge_queue_id,
+        "queue_item_id": selected.queue_item_id,
+        "task_id": selected.task_id,
+        "sibling_count": len(siblings),
+        "siblings": siblings,
+    },)
+
+
 def _merge_gate_next_actions(
     *,
     blockers: tuple[dict[str, Any], ...],
@@ -13203,6 +13245,7 @@ def decide_merge_gate(
     decision = _select_merge_gate_decision(queue_plan, selected)
     evidence_rows, evidence_blockers, evidence_warnings = _merge_gate_evidence_rows(evidence or {})
     queue_blockers = _merge_gate_blockers_for_queue(decision)
+    sibling_warnings = _merge_gate_sibling_warnings(items, selected, queue_plan)
 
     batch = str(batch_status or "").strip()
     batch_blockers: tuple[dict[str, Any], ...] = ()
@@ -13248,7 +13291,7 @@ def decide_merge_gate(
         target_semantic_activation_allowed=mutation_allowed and bool(selected.projection_id),
         blockers=blockers,
         blocker_codes=blocker_codes,
-        warnings=evidence_warnings,
+        warnings=evidence_warnings + sibling_warnings,
         evidence=evidence_rows,
         next_actions=_merge_gate_next_actions(blockers=blockers, dry_run=dry_run),
         merge_steps=merge_steps,

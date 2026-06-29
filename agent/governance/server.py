@@ -16691,6 +16691,41 @@ def _parallel_branch_contract_evidence_item(
     return item
 
 
+def _parallel_branch_merge_qa_evidence(
+    *,
+    body: Mapping[str, Any],
+    gate_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    request_evidence = body.get("evidence") if isinstance(body.get("evidence"), Mapping) else {}
+    qa_request_keys = {
+        "qa_evidence",
+        "qa_verification",
+        "independent_verification",
+        "test_evidence",
+    }
+    request_payload = {
+        key: request_evidence[key]
+        for key in sorted(qa_request_keys)
+        if key in request_evidence
+    }
+    gate_rows: list[dict[str, Any]] = []
+    raw_rows = gate_plan.get("evidence") if isinstance(gate_plan, Mapping) else []
+    if isinstance(raw_rows, list):
+        for row in raw_rows:
+            if not isinstance(row, Mapping):
+                continue
+            key = str(row.get("key") or "").strip()
+            if key in {"qa_evidence", "test_evidence"} or key.startswith("qa_"):
+                gate_rows.append(dict(row))
+
+    payload: dict[str, Any] = {}
+    if request_payload:
+        payload["request_evidence"] = request_payload
+    if gate_rows:
+        payload["gate_evidence"] = gate_rows
+    return payload
+
+
 def _record_parallel_branch_merge_contract_timeline_events(
     conn,
     *,
@@ -16718,6 +16753,7 @@ def _record_parallel_branch_merge_contract_timeline_events(
     queue_item = (
         recorded.get("queue_item") if isinstance(recorded.get("queue_item"), Mapping) else {}
     )
+    branch_ref = str(queue_item.get("branch_ref") or body.get("branch_ref") or "").strip()
     merge_commit = str(
         result.get("merge_commit")
         or queue_item.get("merge_commit")
@@ -16725,16 +16761,20 @@ def _record_parallel_branch_merge_contract_timeline_events(
         or ""
     ).strip()
     route_gate_payload = dict(route_gate or {})
+    qa_evidence = _parallel_branch_merge_qa_evidence(body=body, gate_plan=gate_plan)
     common_payload = {
         "schema_version": "mf_parallel_merge_contract_evidence.v1",
         "parent_task_id": scope["parent_task_id"],
         "child_task_id": scope["task_id"],
+        "backlog_id": scope["backlog_id"],
         "runtime_context_id": scope["runtime_context_id"],
         "merge_queue_id": scope["merge_queue_id"],
         "queue_item_id": scope["queue_item_id"],
+        "branch_ref": branch_ref,
         "merge_commit": merge_commit,
         "target_head_before_merge": str(queue_item.get("target_head_before_merge") or "").strip(),
         "target_head_after_merge": str(queue_item.get("target_head_after_merge") or "").strip(),
+        "qa_evidence": qa_evidence,
         "route_token_gate": route_gate_payload,
     }
     actor = str(body.get("contract_actor") or "codex-observer").strip()
@@ -16785,8 +16825,11 @@ def _record_parallel_branch_merge_contract_timeline_events(
         evidence_refs=[live_ref] if live_ref else [],
         extra={
             "merge_commit": merge_commit,
+            "branch_ref": branch_ref,
+            "backlog_id": scope["backlog_id"],
             "target_head_after_merge": queue_item.get("target_head_after_merge"),
             "queue_status": queue_item.get("status"),
+            "qa_evidence": qa_evidence,
         },
     )
     events.append(
