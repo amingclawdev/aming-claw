@@ -23431,6 +23431,100 @@ def _complete_source_backed_mf_parallel_successor(
     return record
 
 
+def _start_completed_source_backed_mf_parallel_close_authority_chain(
+    conn,
+    *,
+    backlog_id: str,
+    close_commit: str,
+    worker_commit: str,
+    route_label: str,
+) -> dict:
+    route_identity = {
+        "route_id": f"route-{route_label}",
+        "route_context_hash": _fake_sha(f"route-{route_label}"),
+        "prompt_contract_id": f"rprompt-{route_label}",
+        "prompt_contract_hash": _fake_sha(f"prompt-{route_label}"),
+        "visible_injection_manifest_hash": _fake_sha(f"visible-{route_label}"),
+        "route_token_ref": f"rtok-{route_label}",
+    }
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    parent_record = _complete_source_backed_onboarding(
+        conn,
+        started["contract_execution_id"],
+    )
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": f"{route_label}-parent",
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": f"fence-{backlog_id.lower()}",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    completed = _complete_source_backed_mf_parallel_successor(
+        conn,
+        successor["contract_execution_id"],
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_identity=route_identity,
+    )
+    return {
+        "parent_record": parent_record,
+        "successor": successor,
+        "completed": completed,
+        "route_identity": route_identity,
+    }
+
+
+def _rewrite_completed_line_actor_roles(
+    conn,
+    *,
+    contract_execution_id: str,
+    line_ids: set[str],
+    actor_role: str,
+) -> dict:
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+
+    def rewrite(lines: list[dict]) -> None:
+        for line in lines:
+            if isinstance(line, dict) and line.get("line_id") in line_ids:
+                line["actor_role"] = actor_role
+
+    if isinstance(record.get("completed_lines"), list):
+        rewrite(record["completed_lines"])
+    guide = record.get("runtime_guide")
+    if isinstance(guide, dict) and isinstance(guide.get("completed_lines"), list):
+        rewrite(guide["completed_lines"])
+    return runtime.store.update(
+        contract_execution_id,
+        record,
+        expected_revision=int(record.get("execution_state_revision") or 0),
+    )
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -23484,6 +23578,136 @@ def test_timeline_gate_non_applicable_open_row_never_reports_can_close_true(conn
         "timeline_gate_not_applicable"
     )
     assert repair["repair_summary"]["next_legal_actions"]
+
+
+def test_timeline_gate_authoritatively_accepts_completed_mf_parallel_runtime_chain(conn):
+    backlog_id = "AC-TIMELINE-GATE-MF-PARALLEL-AUTHORITY-PASS"
+    close_commit = "b149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "a05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-authority-pass",
+    )
+
+    full = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+
+    projection = full["timeline_gate"]["contract_runtime_close_authority_projection"]
+    projection_gate = projection["mf_parallel_close_authority_gate"]
+    assert projection_gate["passed"] is True
+    assert projection_gate["missing_requirement_ids"] == []
+    assert projection_gate["contract_execution_id"] == (
+        fixture["successor"]["contract_execution_id"]
+    )
+    authoritative_gate = full["timeline_gate"][
+        "contract_runtime_mf_parallel_close_authority_gate"
+    ]
+    assert authoritative_gate["passed"] is True
+    assert full["can_close"] is True
+    assert full["timeline_gate"]["checks"][
+        "contract_runtime_mf_parallel_close_authority"
+    ] is True
+
+
+def test_timeline_gate_mf_parallel_authority_rejects_observer_replacing_worker_or_qa(
+    conn,
+):
+    backlog_id = "AC-TIMELINE-GATE-MF-PARALLEL-AUTHORITY-ROLE-FAIL"
+    close_commit = "c149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "d05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-authority-role-fail",
+    )
+    _rewrite_completed_line_actor_roles(
+        conn,
+        contract_execution_id=fixture["successor"]["contract_execution_id"],
+        line_ids={
+            "worker_implementation",
+            "worker_finish_gate",
+            "qa_independent_verification",
+        },
+        actor_role="observer",
+    )
+
+    full = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+
+    projection = full["timeline_gate"]["contract_runtime_close_authority_projection"]
+    projection_gate = projection["mf_parallel_close_authority_gate"]
+    assert projection_gate["passed"] is False
+    assert "contract_runtime.worker_implementation" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    assert "contract_runtime.worker_finish_gate" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    assert "contract_runtime.qa_independent_verification" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    rejected = projection_gate["rejected_evidence_by_requirement"]
+    assert rejected["worker_implementation"][0]["reason"] == "actor_role_mismatch"
+    assert rejected["qa_independent_verification"][0]["actor_role"] == "observer"
+    assert full["can_close"] is False
+    assert full["timeline_gate"]["contract_runtime_mf_parallel_close_authority_gate"][
+        "passed"
+    ] is False
+
+
+def test_timeline_gate_mf_parallel_authority_rejects_close_commit_mismatch(conn):
+    backlog_id = "AC-TIMELINE-GATE-MF-PARALLEL-AUTHORITY-COMMIT-FAIL"
+    close_commit = "e149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    requested_close_commit = "f149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "f05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-authority-commit-fail",
+    )
+
+    full = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": requested_close_commit},
+        )
+    )
+
+    projection = full["timeline_gate"]["contract_runtime_close_authority_projection"]
+    projection_gate = projection["mf_parallel_close_authority_gate"]
+    assert projection_gate["passed"] is False
+    assert "contract_runtime.observer_merge_close_commit" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    assert "contract_runtime.observer_reconcile_close_commit" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    assert "contract_runtime.observer_close_ready_close_commit" in projection_gate[
+        "missing_requirement_ids"
+    ]
+    assert {
+        item["requirement_id"] for item in projection_gate["commit_mismatches"]
+    } == {"observer_merge", "observer_reconcile", "observer_close_ready"}
+    assert full["can_close"] is False
+    close_commit_gate = full["timeline_gate"]["close_commit_evidence_gate"]
+    assert close_commit_gate["missing_requirement_ids"] == [
+        "matching_close_commit_timeline_evidence"
+    ]
 
 
 def test_timeline_gate_auto_projects_completed_contract_runtime_chain(conn):
