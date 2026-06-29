@@ -45902,43 +45902,11 @@ def _contract_runtime_close_authority_projection(
         if isinstance(record.get("runtime_guide"), Mapping)
         else {}
     )
-    completed_lines = guide.get("completed_lines")
-    if not isinstance(completed_lines, list):
-        completed_lines = record.get("completed_lines")
-    if not isinstance(completed_lines, list) or not completed_lines:
-        return {
-            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
-            "accepted": False,
-            "status": "missing_completed_lines",
-            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
-                source="contract_runtime_close_authority_projection",
-                contract_execution_id=contract_execution_id,
-            ),
-            "legacy_advisory": True,
-            "authoritative": False,
-            "contract_execution_id": contract_execution_id,
-            "projected_events": [],
-        }
-
     identity = _contract_runtime_close_authority_record_identity(
         conn,
         record,
         seed_identity=_contract_runtime_close_authority_identity(body, route_gate),
     )
-    if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
-        return {
-            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
-            "accepted": False,
-            "status": "missing_route_identity",
-            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
-                source="contract_runtime_close_authority_projection",
-                contract_execution_id=contract_execution_id,
-            ),
-            "legacy_advisory": True,
-            "authoritative": False,
-            "contract_execution_id": contract_execution_id,
-            "projected_events": [],
-        }
 
     try:
         server_chain_projection = _contract_chain_current_projection(
@@ -45958,6 +45926,37 @@ def _contract_runtime_close_authority_projection(
         project_id=project_id,
         bug_id=bug_id,
     )
+    if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
+        merged_identity = dict(identity)
+        for chain_record in chain_records:
+            candidate = _contract_runtime_close_authority_record_identity(
+                conn,
+                chain_record,
+                seed_identity=merged_identity,
+            )
+            for field in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS:
+                if not merged_identity.get(field) and candidate.get(field):
+                    merged_identity[field] = candidate[field]
+            if (
+                merged_identity.get("route_context_hash")
+                and merged_identity.get("prompt_contract_id")
+            ):
+                break
+        identity = merged_identity
+    if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "missing_route_identity",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
+            "contract_execution_id": contract_execution_id,
+            "projected_events": [],
+        }
     direct_fix_gate = _contract_runtime_direct_fix_close_authority_gate(
         chain_records,
         chain_projection=server_chain_projection,
@@ -45968,26 +45967,52 @@ def _contract_runtime_close_authority_projection(
         record=record,
         identity=identity,
     )
-    completed_line_mappings = [
-        line for line in completed_lines if isinstance(line, Mapping)
-    ]
-    line_contexts = _contract_runtime_close_authority_line_contexts(
-        completed_line_mappings,
-        conn=conn,
-        project_id=project_id,
-        backlog_id=bug_id,
-    )
-    projected_events.extend(
-        _contract_runtime_close_authority_event(
-            record=record,
-            line=line,
-            event_id=index + 10,
-            identity=identity,
-            close_commit=close_commit,
-            line_context=line_contexts[index] if index < len(line_contexts) else {},
+    projection_records = chain_records or [dict(record)]
+    projected_line_event_count = 0
+    next_event_id = 10
+    for projection_record in projection_records:
+        completed_line_mappings = [
+            line
+            for line in _contract_runtime_completed_line_items(projection_record)
+            if isinstance(line, Mapping)
+        ]
+        if not completed_line_mappings:
+            continue
+        line_contexts = _contract_runtime_close_authority_line_contexts(
+            completed_line_mappings,
+            conn=conn,
+            project_id=project_id,
+            backlog_id=bug_id,
         )
-        for index, line in enumerate(completed_line_mappings)
-    )
+        for index, line in enumerate(completed_line_mappings):
+            projected_events.append(
+                _contract_runtime_close_authority_event(
+                    record=projection_record,
+                    line=line,
+                    event_id=next_event_id,
+                    identity=identity,
+                    close_commit=close_commit,
+                    line_context=(
+                        line_contexts[index] if index < len(line_contexts) else {}
+                    ),
+                )
+            )
+            projected_line_event_count += 1
+            next_event_id += 1
+    if not projected_line_event_count:
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "missing_completed_lines",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="contract_runtime_close_authority_projection",
+                contract_execution_id=contract_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
+            "contract_execution_id": contract_execution_id,
+            "projected_events": [],
+        }
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": True,
@@ -46012,6 +46037,12 @@ def _contract_runtime_close_authority_projection(
             for key, value in server_chain_projection.items()
             if key not in {"next_legal_action"}
         },
+        "source_contract_execution_ids": [
+            str(item.get("contract_execution_id") or "").strip()
+            for item in projection_records
+            if str(item.get("contract_execution_id") or "").strip()
+        ],
+        "projected_completed_line_event_count": projected_line_event_count,
         "projected_event_count": len(projected_events),
         "projected_events": projected_events,
     }
