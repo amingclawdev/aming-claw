@@ -24633,6 +24633,108 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     ] == "onboard_route_guide"
 
 
+def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(conn):
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "role": "observer",
+                "work_type": "capability_query",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["backlog_id"] == ""
+    assert result["backlog_required"] is False
+    assert result["onboard_contract_required"] is False
+    assert result["onboard_service_waiver"] == {}
+    guide = result["onboard_route_guide"]
+    assert guide["backlog_chain_binding"]["status"] == "backlog_not_bound"
+    assert guide["backlog_chain_binding"]["next_required_action"] == (
+        "create_or_select_backlog_before_implementation"
+    )
+    assert "backlog_start_guidance" in guide["capability_index"]["query_returns"]
+    assert guide["capability_index"]["index_paths"]["backlog_start_guidance"] == (
+        "agent_onboard_guidance.onboard_route_guide.backlog_start_guidance"
+    )
+    start = guide["backlog_start_guidance"]
+    assert start["create_backlog"]["mcp_tool"] == "backlog_upsert"
+    assert start["select_backlog"]["list_tool"] == "backlog_list"
+    assert start["demo_creation"]["id"] == "daily_planner_demo"
+    assert "observer_hotfix" in start["backlog_required_for_work_types"]
+    assert result["agent_onboard_guidance"]["route_token_issue"]["status"] == (
+        "not_required_for_no_backlog_discovery"
+    )
+    assert result["next_legal_action"]["action"] == "select_or_create_backlog"
+
+
+def test_onboard_route_guide_no_backlog_system_operation_returns_policy(conn):
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="GET",
+            query={
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+
+    guide = result["onboard_route_guide"]
+    policy = guide["system_operation_index"]["no_backlog_policy"]
+    assert "runtime_status" in policy["no_backlog_allowed"]
+    assert "mcp_reload_or_restart" in policy["operator_proof_required"]
+    assert "code_mutation" in policy["backlog_required"]
+    assert guide["system_operation_index"]["operations"]["backlog_start"][
+        "mcp_tools"
+    ] == ["backlog_upsert", "backlog_list", "backlog_get"]
+
+
+@pytest.mark.parametrize(
+    "work_type",
+    [
+        "continue_contract_chain",
+        "observer_hotfix",
+        "operator_supervised_direct_main",
+        "direct_fix",
+        "multi_backlog_parallel",
+        "parallel_worker",
+        "qa_verification",
+        "rollback_or_recover_contract",
+    ],
+)
+def test_onboard_route_guide_missing_backlog_for_implementation_is_actionable(
+    conn, work_type
+):
+    with pytest.raises(ValidationError) as excinfo:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "role": "observer",
+                    "work_type": work_type,
+                },
+            )
+        )
+
+    assert "requires backlog_id or bug_id" in excinfo.value.message
+    details = excinfo.value.details
+    assert details["allowed_without_backlog"] == [
+        "capability_query",
+        "system_operation",
+    ]
+    assert details["backlog_start_guidance"]["create_backlog"]["mcp_tool"] == (
+        "backlog_upsert"
+    )
+    assert "direct_fix" in details["backlog_start_guidance"][
+        "backlog_required_for_work_types"
+    ]
+    assert "create/select a backlog row" in details["next_step"]
+
+
 def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     backlog_id = "AC-ONBOARD-COMPLETE-PROJECTION-SUPPRESSES-STALE-LEDGER"
     _insert_simple_mf_close_backlog(conn, backlog_id)

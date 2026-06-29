@@ -37196,6 +37196,276 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
     }
 
 
+_ONBOARD_NO_BACKLOG_WORK_TYPES = {"", "capability_query", "system_operation"}
+
+
+def _onboard_backlog_start_guidance(project_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.backlog_start_guidance.v1",
+        "project_id": project_id,
+        "status": "backlog_not_bound",
+        "purpose": (
+            "Use this guide to discover capabilities or choose/create a backlog "
+            "row before starting governed implementation."
+        ),
+        "create_backlog": {
+            "mcp_tool": "backlog_upsert",
+            "required_fields": [
+                "project_id",
+                "bug_id",
+                "title",
+                "priority",
+                "status",
+                "target_files",
+                "test_files",
+                "acceptance_criteria",
+            ],
+            "recommended_status": "OPEN",
+            "recommended_mf_type": "chain_rescue",
+        },
+        "select_backlog": {
+            "list_tool": "backlog_list",
+            "get_tool": "backlog_get",
+            "recommended_filters": ["q", "status", "priority"],
+        },
+        "demo_creation": {
+            "id": "daily_planner_demo",
+            "recommended_bug_id_prefix": "AC-DEMO-DAILY-PLANNER",
+            "recommended_title": "Create daily planner demo backlog row",
+            "next_step": (
+                "Create or select a backlog row, then call onboard_route_guide "
+                "again with backlog_id and the desired implementation work_type."
+            ),
+        },
+        "backlog_required_for_work_types": [
+            "continue_contract_chain",
+            "observer_hotfix",
+            "operator_supervised_direct_main",
+            "direct_fix",
+            "multi_backlog_parallel",
+            "parallel_worker",
+            "qa_verification",
+            "rollback_or_recover_contract",
+        ],
+    }
+
+
+def _onboard_no_backlog_system_operation_policy() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.no_backlog_system_policy.v1",
+        "no_backlog_allowed": [
+            "capability_query",
+            "system_operation",
+            "runtime_status",
+            "graph_status",
+            "graph_operations_queue",
+            "tool_discovery",
+            "read_only_interface_index",
+        ],
+        "operator_proof_required": [
+            "install",
+            "start_governance",
+            "bootstrap_project",
+            "redeploy",
+            "reconcile",
+            "mcp_reload_or_restart",
+        ],
+        "backlog_required": [
+            "code_mutation",
+            "docs_mutation",
+            "config_mutation",
+            "contract_mutation",
+            "dashboard_mutation",
+            "hotfix",
+            "parallel_worker",
+            "multi_backlog_parallel",
+            "qa_verification",
+            "direct_fix",
+            "backlog_close",
+        ],
+    }
+
+
+def _onboard_no_backlog_service_response(
+    *,
+    project_id: str,
+    role: str = "",
+    work_type: str = "",
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    selected_role = str(role or "").strip()
+    selected_work_type = str(work_type or "").strip()
+    record = {
+        "project_id": project_id,
+        "backlog_id": "",
+        "contract_id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        "contract_execution_id": "",
+        "root_contract_execution_id": "",
+        "parent_contract_execution_id": "",
+        "contract_chain_id": "",
+        "route_token_ref": route_token_ref,
+        "metadata": {
+            "service_source": "onboard_route_guide_service",
+            "legacy_onboard_contract_waived": True,
+        },
+    }
+    next_action = {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "select_or_create_backlog_for_implementation",
+        "action": "select_or_create_backlog",
+        "source": "onboard_route_guide_service",
+        "precedence": "no_backlog_discovery",
+        "role": selected_role,
+        "work_type": selected_work_type or "capability_query",
+        "next_step": (
+            "Use capability/system-operation indexes now, or create/select a "
+            "backlog row before starting implementation, QA, hotfix, parallel, "
+            "multi-row, direct-fix, reconcile, close, or contract-chain work."
+        ),
+        "backlog_required_for_implementation": True,
+        "legacy_onboard_contract_waived": True,
+        "meta_contract_gate_decision_source": False,
+    }
+    route_guide = _onboard_contract_route_guide(
+        record,
+        next_legal_action=next_action,
+    )
+    backlog_start_guidance = _onboard_backlog_start_guidance(project_id)
+    system_policy = _onboard_no_backlog_system_operation_policy()
+    route_guide["backlog_chain_binding"]["status"] = "backlog_not_bound"
+    route_guide["backlog_chain_binding"]["next_required_action"] = (
+        "create_or_select_backlog_before_implementation"
+    )
+    route_guide["backlog_chain_binding"]["backlog_start_guidance"] = (
+        backlog_start_guidance
+    )
+    route_guide["backlog_start_guidance"] = backlog_start_guidance
+    route_guide["system_operation_index"]["no_backlog_policy"] = system_policy
+    route_guide["system_operation_index"]["operations"]["backlog_start"] = {
+        "kind": "mcp",
+        "mcp_tools": ["backlog_upsert", "backlog_list", "backlog_get"],
+        "gated": False,
+        "guide_path": "agent_onboard_guidance.onboard_route_guide.backlog_start_guidance",
+    }
+    capability_index = route_guide["capability_index"]
+    if "backlog_start_guidance" not in capability_index["query_returns"]:
+        capability_index["query_returns"].append("backlog_start_guidance")
+    capability_index["no_backlog_allowed_work_types"] = sorted(
+        _ONBOARD_NO_BACKLOG_WORK_TYPES - {""}
+    )
+    capability_index["backlog_required_work_types"] = list(
+        backlog_start_guidance["backlog_required_for_work_types"]
+    )
+    capability_index["index_paths"]["backlog_start_guidance"] = (
+        "agent_onboard_guidance.onboard_route_guide.backlog_start_guidance"
+    )
+    return {
+        "schema_version": "onboard_route_guide.service_response.v1",
+        "ok": True,
+        "project_id": project_id,
+        "backlog_id": "",
+        "backlog_required": False,
+        "service": {
+            "id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            "kind": "guide_service",
+            "source": "onboard_route_guide_service",
+        },
+        "selected_role": selected_role,
+        "selected_work_type": selected_work_type,
+        "legacy_onboard_contract_waived": True,
+        "onboard_contract_required": False,
+        "onboard_service_waiver": {},
+        "agent_onboard_guidance": {
+            "schema_version": "onboard_contract.agent_onboard_guidance.v1",
+            "role": selected_role,
+            "actor_role": selected_role,
+            "required_identity": {
+                "schema_version": "onboard_contract.required_identity.v1",
+                "required_fields": [],
+                "route_token_ref": {
+                    "required": False,
+                    "source": "not required for no-backlog discovery",
+                },
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "route_token_ref_guidance": {
+                "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+                "current_route_token_ref": route_token_ref,
+                "current_ref_present": bool(route_token_ref),
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "route_token_issue": {
+                "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+                "status": "not_required_for_no_backlog_discovery",
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "next_legal_action": dict(next_action),
+            "contract_chain": {
+                "schema_version": "onboard_contract.contract_chain_guidance.v1",
+                "project_id": project_id,
+                "backlog_id": "",
+                "status": "backlog_not_bound",
+                "backlog_start_guidance": backlog_start_guidance,
+            },
+            "onboard_route_guide": route_guide,
+            "entrypoints": {
+                "onboard_route_guide": {
+                    "method": "POST",
+                    "path": "/api/projects/{project_id}/onboard-route-guide",
+                    "default": True,
+                },
+                "backlog_upsert": {
+                    "kind": "mcp",
+                    "mcp_tool": "backlog_upsert",
+                },
+                "backlog_list": {
+                    "kind": "mcp",
+                    "mcp_tool": "backlog_list",
+                },
+                "backlog_get": {
+                    "kind": "mcp",
+                    "mcp_tool": "backlog_get",
+                },
+            },
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "onboard_route_guide": route_guide,
+        "contract_chain_current": {},
+        "projection_degraded": False,
+        "projection_degraded_reason": {},
+        "runtime_resume": {},
+        "next_legal_action": next_action,
+        "backlog_start_guidance": backlog_start_guidance,
+        "system_operation_policy": system_policy,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _onboard_missing_backlog_error_details(
+    *,
+    project_id: str,
+    role: str,
+    work_type: str,
+) -> dict[str, Any]:
+    return {
+        "project_id": project_id,
+        "role": role,
+        "work_type": work_type,
+        "allowed_without_backlog": sorted(_ONBOARD_NO_BACKLOG_WORK_TYPES - {""}),
+        "backlog_start_guidance": _onboard_backlog_start_guidance(project_id),
+        "next_step": (
+            "Call onboard_route_guide with work_type=capability_query or "
+            "system_operation for no-backlog discovery, or create/select a "
+            "backlog row and retry this implementation route with backlog_id."
+        ),
+    }
+
+
 def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
     return {
         "schema_version": "onboard_route_guide.branch_service_takeover.v1",
@@ -53085,6 +53355,20 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     """Return the role/work-type onboard guide service without starting legacy root contract."""
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    role = str(
+        body.get("role")
+        or body.get("actor_role")
+        or _first_query_value(ctx.query, "role")
+        or _first_query_value(ctx.query, "actor_role")
+        or ""
+    ).strip()
+    work_type = str(
+        body.get("work_type")
+        or body.get("requested_work_type")
+        or _first_query_value(ctx.query, "work_type")
+        or _first_query_value(ctx.query, "requested_work_type")
+        or ""
+    ).strip()
     backlog_id = str(
         body.get("backlog_id")
         or body.get("bug_id")
@@ -53092,13 +53376,25 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         or _first_query_value(ctx.query, "bug_id")
         or ""
     ).strip()
-    if not backlog_id:
-        raise ValidationError("onboard route guide requires backlog_id or bug_id")
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
-    role = str(body.get("role") or body.get("actor_role") or "").strip()
-    work_type = str(body.get("work_type") or body.get("requested_work_type") or "").strip()
+    if not backlog_id:
+        if work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
+            return _onboard_no_backlog_service_response(
+                project_id=project_id,
+                role=role,
+                work_type=work_type,
+                route_token_ref=route_token_ref,
+            )
+        raise ValidationError(
+            "onboard route guide requires backlog_id or bug_id for implementation work",
+            _onboard_missing_backlog_error_details(
+                project_id=project_id,
+                role=role,
+                work_type=work_type,
+            ),
+        )
     with DBContext(project_id) as conn:
         response = _onboard_route_guide_service_response(
             conn,

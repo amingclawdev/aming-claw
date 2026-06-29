@@ -797,6 +797,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
                 },
+                "onboard_service_waiver": {
+                    "type": "object",
+                    "description": "Use the onboard_route_guide service parent instead of legacy onboard_contract.",
+                },
             },
             "required": ["project_id", "reason"],
             "anyOf": [

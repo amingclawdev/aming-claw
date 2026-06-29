@@ -1514,6 +1514,11 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "merge_mode",
         "merge_queue_id",
     }
+    assert _tool_properties("observer_hotfix_enter").keys() >= {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "onboard_service_waiver",
+    }
     onboard_start = next(
         tool for tool in TOOLS if tool.get("name") == "onboard_contract_start"
     )
