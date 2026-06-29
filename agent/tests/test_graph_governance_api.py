@@ -4870,6 +4870,73 @@ def test_observer_runtime_text_prepare_rejects_persisted_runtime_context_mismatc
     )
 
 
+def test_observer_runtime_text_prepare_exposes_repair_path_for_missing_launch_metadata(
+    conn,
+    tmp_path,
+):
+    worktree = tmp_path / "worker"
+    worktree.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="runtime-text-task",
+            runtime_context_id="mfrctx-runtime-text-missing-launch",
+            backlog_id="AC-RUNTIME-TEXT",
+            root_task_id="AC-RUNTIME-TEXT",
+            stage_task_id="runtime-text-task",
+            fence_token="fence-runtime-text-api",
+            branch_ref="refs/heads/codex/runtime-text-task",
+            worktree_path=str(worktree),
+            status=STATE_WORKTREE_READY,
+        ),
+    )
+    main = tmp_path / "main"
+    main.mkdir()
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT",
+                "observer_command_id": "cmd-runtime-text-api",
+                "task_id": "runtime-text-task",
+                "parent_task_id": "AC-RUNTIME-TEXT",
+                "runtime_context_id": "mfrctx-runtime-text-missing-launch",
+                "fence_token": "fence-runtime-text-api",
+                "worktree_path": str(worktree),
+                "base_commit": "base-api",
+                "target_head_commit": "target-api",
+                "merge_queue_id": "mq-runtime-text-api",
+                "route_context_hash": "sha256:route-api",
+                "route_id": "route-api",
+                "prompt_contract_id": "rprompt-api",
+                "route_token_ref": "rtok-api",
+                "visible_injection_manifest_hash": "sha256:visible-api",
+                "main_worktree": str(main),
+                "owned_files": ["agent/observer_runtime.py"],
+                "graph_trace_ids": ["gqt-runtime-api"],
+            },
+        )
+    )
+
+    evidence = prepared["branch_runtime_evidence"]
+    assert prepared["ok"] is False
+    assert prepared["status"] == "allocation_required"
+    assert evidence["registered"] is False
+    assert set(evidence["missing_fields"]) == {
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+    }
+    assert evidence["next_legal_actions"] == [evidence["next_legal_action"]]
+    action = evidence["next_legal_action"]
+    assert action["action"] == "repair_or_supersede_runtime_allocation"
+    assert action["runtime_context_id"] == "mfrctx-runtime-text-missing-launch"
+    assert action["missing_fields"] == evidence["missing_fields"]
+
+
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):
     raw_fence = "synthetic-raw-fence-runtime-contract-secret"
     raw_session = "synthetic-raw-session-runtime-contract-secret"
@@ -26303,7 +26370,13 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     assert runtime_context.stage_type == "direct_fix"
     assert runtime_context.target_project_root == target_root
     assert runtime_context.worktree_path == worktree_path
+    assert runtime_context.base_commit == "base-direct-fix-dispatch-context"
+    assert runtime_context.target_head_commit == "target-direct-fix-dispatch-context"
+    assert runtime_context.merge_queue_id == f"direct-fix:{direct_execution_id}"
     assert runtime_context_session_token_ref(runtime_context) == session_token_ref
+    assert dispatch_payload["base_commit"] == runtime_context.base_commit
+    assert dispatch_payload["target_head_commit"] == runtime_context.target_head_commit
+    assert dispatch_payload["merge_queue_id"] == runtime_context.merge_queue_id
     recorded_dispatch = task_timeline.list_events(
         conn,
         PID,
@@ -26317,6 +26390,9 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     ]
     assert dispatch_marker["runtime_context_id"] == runtime_context_id
     assert dispatch_marker["source"] == "direct_fix_dispatch_context"
+    assert dispatch_marker["base_commit"] == runtime_context.base_commit
+    assert dispatch_marker["target_head_commit"] == runtime_context.target_head_commit
+    assert dispatch_marker["merge_queue_id"] == runtime_context.merge_queue_id
     next_action = dispatched["contract_runtime_current_state"]["next_legal_action"]
     assert next_action["stage_id"] == "candidate_repair"
     assert next_action["line_id"] == "direct_fix_candidate_repair"
