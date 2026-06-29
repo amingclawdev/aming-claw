@@ -1442,6 +1442,36 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         action["id"] for action in progress_handoff["recovery_actions"]
     }
 
+    with_changed_files = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "changed_files": ["agent/governance/parallel_branch_runtime.py"],
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    changed_values = with_changed_files["views"]["current"]["current_values"]
+    changed_handoff = with_changed_files["views"]["action_plan"][
+        "worker_handoff_projection"
+    ]
+    assert changed_values["changed_files"] == [
+        "agent/governance/parallel_branch_runtime.py"
+    ]
+    assert changed_handoff["status"] == "worker_lineage_missing_progress_observed"
+    assert changed_handoff["progress_status"] == "observed"
+    assert changed_handoff["no_progress_reissue_policy"]["allowed"] is False
+    assert "reissue_mf_sub_worker_with_same_scope" not in {
+        action["id"] for action in changed_handoff["recovery_actions"]
+    }
+
     with_lineage = build_runtime_context_projection(
         context,
         route_identity={

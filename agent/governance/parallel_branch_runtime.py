@@ -3209,6 +3209,15 @@ def _runtime_context_timeline_refs(
             or source.get("no_progress_timeout_event_id")
             or source.get("no_progress_event_ref")
         ),
+        "changed_files": _runtime_context_dedupe(
+            _runtime_context_string_list(source.get("changed_files"))
+        ),
+        "owned_changed_files": _runtime_context_dedupe(
+            _runtime_context_string_list(source.get("owned_changed_files"))
+        ),
+        "worker_changed_files": _runtime_context_dedupe(
+            _runtime_context_string_list(source.get("worker_changed_files"))
+        ),
         "implementation_event_refs": _runtime_context_dedupe(
             _runtime_context_string_list(
                 source.get("implementation_event_refs")
@@ -4194,6 +4203,9 @@ def _runtime_context_current_values(
         "implementation_event_refs": list(
             timeline_refs.get("implementation_event_refs") or []
         ),
+        "changed_files": list(timeline_refs.get("changed_files") or []),
+        "owned_changed_files": list(timeline_refs.get("owned_changed_files") or []),
+        "worker_changed_files": list(timeline_refs.get("worker_changed_files") or []),
         "verification_event_refs": verification_event_refs,
         "startup_gate_ref": _runtime_context_text(
             startup_gate.get("event_id")
