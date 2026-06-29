@@ -23613,6 +23613,198 @@ def test_backlog_close_uses_same_completed_contract_runtime_projection_as_preche
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projection_lacks_manifest(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TIMELINE-ROUTE-CONTEXT-LATER-MANIFEST"
+    close_commit = "7ec825ae14a9dde6db6e50ce12814f779410e201"
+    worker_commit = "830b60aac39d3d059541388c45e75f3ccb1e1bbd"
+    route_identity = {
+        "route_id": "route-later-manifest",
+        "route_context_hash": _fake_sha("route-later-manifest"),
+        "prompt_contract_id": "rprompt-later-manifest",
+        "prompt_contract_hash": _fake_sha("prompt-later-manifest"),
+        "visible_injection_manifest_hash": _fake_sha("visible-later-manifest"),
+        "route_token_ref": "rtok-later-manifest-parent",
+    }
+    timeline_route_token_ref = "rtok-later-manifest-timeline"
+    close_route_token_ref = "rtok-later-manifest-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_identity["route_token_ref"],
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": backlog_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:later-manifest-route-context"],
+        },
+    )
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": "timeline-later-manifest-parent",
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": f"fence-{backlog_id.lower()}",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    _complete_source_backed_mf_parallel_successor(
+        conn,
+        successor["contract_execution_id"],
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_identity=route_identity,
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=timeline_route_token_ref,
+        token={
+            **route_identity,
+            "route_token_ref": timeline_route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": successor["contract_execution_id"],
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:later-manifest-route-context"],
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=close_route_token_ref,
+        token={
+            **route_identity,
+            "route_token_ref": close_route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": backlog_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:later-manifest-close"],
+        },
+    )
+
+    real_seed_events = server._contract_runtime_close_authority_seed_events
+
+    def projected_seed_without_visible_manifest(*args, **kwargs):
+        events = real_seed_events(*args, **kwargs)
+        for event in events:
+            if event.get("event_kind") != "route_context":
+                continue
+            event.pop("visible_injection_manifest_hash", None)
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                payload.pop("visible_injection_manifest_hash", None)
+                route_context = payload.get("route_context")
+                if isinstance(route_context, dict):
+                    route_context.pop("visible_injection_manifest_hash", None)
+            verification = event.get("verification")
+            if isinstance(verification, dict):
+                verification.pop("visible_injection_manifest_hash", None)
+        return events
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_seed_events",
+        projected_seed_without_visible_manifest,
+    )
+
+    route_event = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": successor["contract_execution_id"],
+                "event_type": "route_context",
+                "event_kind": "route_context",
+                "phase": "dispatch",
+                "actor": "observer",
+                "status": "passed",
+                "route_token_ref": timeline_route_token_ref,
+                "payload": {
+                    "route_context": {
+                        **route_identity,
+                        "route_token_ref": timeline_route_token_ref,
+                        "caller_role": "observer",
+                        "allowed_actions": ["contract_runtime_close_authority"],
+                    },
+                    "visible_injection_manifest_hash": route_identity[
+                        "visible_injection_manifest_hash"
+                    ],
+                },
+            },
+        )
+    )
+    assert route_event["route_token_gate"]["decision"] == "route_token_ref_resolved"
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
 def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current(
     conn,
     monkeypatch,

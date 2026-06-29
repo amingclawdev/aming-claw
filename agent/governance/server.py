@@ -45172,6 +45172,134 @@ def _contract_runtime_close_authority_seed_events(
     ]
 
 
+def _contract_runtime_close_authority_first_deep_mapping(
+    value: Any,
+    key: str,
+) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        child = value.get(key)
+        if isinstance(child, Mapping):
+            return dict(child)
+        for nested in value.values():
+            found = _contract_runtime_close_authority_first_deep_mapping(nested, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _contract_runtime_close_authority_first_deep_mapping(item, key)
+            if found:
+                return found
+    return {}
+
+
+def _contract_runtime_close_authority_route_token_backed_event(
+    event: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> bool:
+    from . import task_timeline
+
+    route_gate = _contract_runtime_close_authority_first_deep_mapping(
+        event,
+        "route_token_gate",
+    )
+    if task_timeline._source_backed_route_gate_accepted(route_gate):
+        return True
+
+    authority = _contract_runtime_close_authority_first_deep_mapping(
+        event,
+        "source_backed_contract_gate_authority",
+    )
+    authority_gate = (
+        authority.get("route_token_gate") if isinstance(authority, Mapping) else {}
+    )
+    if (
+        isinstance(authority_gate, Mapping)
+        and task_timeline._source_backed_route_gate_accepted(authority_gate)
+    ):
+        return True
+
+    expected_ref = str(identity.get("route_token_ref") or "").strip()
+    event_ref = _observer_root_route_identity_from_event(event).get(
+        "route_token_ref",
+        "",
+    )
+    return bool(expected_ref and event_ref and event_ref == expected_ref)
+
+
+def _contract_runtime_close_authority_timeline_route_context_events(
+    events: list[dict[str, Any]] | None,
+    *,
+    identity: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    from . import task_timeline
+
+    expected_route_hash = str(identity.get("route_context_hash") or "").strip()
+    expected_prompt_id = str(identity.get("prompt_contract_id") or "").strip()
+    if not expected_route_hash or not expected_prompt_id:
+        return []
+
+    expected_prompt_hash = str(identity.get("prompt_contract_hash") or "").strip()
+    expected_visible_manifest = str(
+        identity.get("visible_injection_manifest_hash") or ""
+    ).strip()
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events or []:
+        if not isinstance(event, Mapping):
+            continue
+        summary = task_timeline.route_context_consumption_event_summary(dict(event))
+        if "route_context" not in set(summary.get("categories") or []):
+            continue
+        if not bool(summary.get("passed")):
+            continue
+        event_identity = _observer_root_route_identity_from_event(event)
+        if str(event_identity.get("route_context_hash") or "").strip() != expected_route_hash:
+            continue
+        if str(event_identity.get("prompt_contract_id") or "").strip() != expected_prompt_id:
+            continue
+        event_prompt_hash = str(event_identity.get("prompt_contract_hash") or "").strip()
+        if expected_prompt_hash and event_prompt_hash and event_prompt_hash != expected_prompt_hash:
+            continue
+        event_visible_manifest = str(
+            event_identity.get("visible_injection_manifest_hash") or ""
+        ).strip()
+        if not event_visible_manifest:
+            continue
+        if (
+            expected_visible_manifest
+            and event_visible_manifest != expected_visible_manifest
+        ):
+            continue
+        if not _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            identity,
+        ):
+            continue
+        event_key = str(event.get("id") or event.get("event_id") or id(event))
+        if event_key in seen:
+            continue
+        seen.add(event_key)
+        selected.append(dict(event))
+    return selected
+
+
+def _contract_runtime_close_authority_projected_events_for_gate(
+    runtime_projection: Mapping[str, Any],
+    timeline_events: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    projected_events = list(runtime_projection.get("projected_events") or [])
+    identity = (
+        runtime_projection.get("route_identity")
+        if isinstance(runtime_projection.get("route_identity"), Mapping)
+        else {}
+    )
+    route_context_events = _contract_runtime_close_authority_timeline_route_context_events(
+        timeline_events,
+        identity=identity,
+    )
+    return [*route_context_events, *projected_events]
+
+
 def _contract_runtime_close_authority_projection(
     conn,
     *,
@@ -45346,6 +45474,7 @@ def _contract_runtime_close_authority_projection(
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
         "direct_fix_close_authority_gate": direct_fix_gate,
+        "route_identity": _route_identity_public_summary(identity),
         "server_contract_chain_current_projection": {
             key: value
             for key, value in server_chain_projection.items()
@@ -50759,8 +50888,14 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 close_commit=_audit_recovery_close_commit(row, projection_body),
             )
             if runtime_projection.get("accepted"):
+                projected_events = (
+                    _contract_runtime_close_authority_projected_events_for_gate(
+                        runtime_projection,
+                        events,
+                    )
+                )
                 verification = _mf_close_gate_verification(
-                    list(runtime_projection.get("projected_events") or []),
+                    projected_events,
                     contract=contract,
                     conn=conn,
                     project_id=pid,
@@ -54787,8 +54922,12 @@ def _verify_mf_close_timeline_gate(
         close_commit=_audit_recovery_close_commit(row, gate_body),
     )
     if runtime_projection.get("accepted"):
+        projected_events = _contract_runtime_close_authority_projected_events_for_gate(
+            runtime_projection,
+            events,
+        )
         verification = _mf_close_gate_verification(
-            list(runtime_projection.get("projected_events") or []),
+            projected_events,
             contract=contract,
             conn=conn,
             project_id=project_id,
