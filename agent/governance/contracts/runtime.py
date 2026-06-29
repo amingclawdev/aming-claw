@@ -1101,11 +1101,7 @@ def _project_direct_fix_state(
     generation = int(child.get("execution_state_revision") or 0)
     if not child_id:
         return {}
-    repair_line = _find_completed_line(
-        child,
-        line_ids={"direct_fix_candidate_repair"},
-        evidence_kinds={"direct_fix_repair_evidence"},
-    )
+    repair_line = _find_direct_fix_repair_line(child)
     return_line = _find_completed_line(
         child,
         line_ids={"direct_fix_return_to_parent"},
@@ -1267,6 +1263,7 @@ def _find_completed_line(
     *,
     line_ids: set[str],
     evidence_kinds: set[str],
+    after_index: int = -1,
 ) -> dict[str, Any]:
     lines = (
         record.get("completed_lines")
@@ -1274,6 +1271,8 @@ def _find_completed_line(
         else []
     )
     for index, line in reversed(list(enumerate(lines))):
+        if index <= after_index:
+            continue
         if not isinstance(line, Mapping):
             continue
         line_id = str(line.get("line_id") or "")
@@ -1283,6 +1282,20 @@ def _find_completed_line(
             enriched["_completed_line_index"] = index
             return enriched
     return {}
+
+
+def _find_direct_fix_repair_line(record: Mapping[str, Any]) -> dict[str, Any]:
+    lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    return _find_completed_line(
+        record,
+        line_ids={"direct_fix_candidate_repair"},
+        evidence_kinds={"direct_fix_repair_evidence"},
+        after_index=_last_failed_qa_line_index(lines),
+    )
 
 
 def _find_direct_fix_qa_line(
@@ -1400,20 +1413,136 @@ def _find_parent_resume_ack_line(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
-    candidates = [line]
-    for key in ("payload", "verification", "artifact_refs"):
-        value = line.get(key)
-        if isinstance(value, Mapping):
-            candidates.append(value)
-    for candidate in candidates:
-        status = (
-            str(candidate.get("status") or candidate.get("verdict") or "")
-            .strip()
-            .lower()
-        )
-        if status in {"fail", "failed", "failure", "rejected", "blocked"}:
-            return False
+    return _line_status_allows_contract_completion(line)
+
+
+_CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
+    {"fail", "failed", "failure", "rejected", "blocked"}
+)
+_CONTRACT_COMPLETION_STATUS_FIELDS = frozenset(
+    {"status", "verdict", "outcome", "decision", "result"}
+)
+_CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
+    {"failed", "failures", "failed_count", "failure_count", "error_count"}
+)
+
+
+def _contract_completion_satisfying_lines(
+    lines: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    last_failed_qa_index = _last_failed_qa_line_index(lines)
+    satisfying: list[Mapping[str, Any]] = []
+    for index, line in enumerate(lines):
+        if isinstance(line, Mapping) and not _line_shape_allows_contract_completion(
+            line
+        ):
+            continue
+        if last_failed_qa_index >= 0 and index <= last_failed_qa_index:
+            if not _line_survives_failed_qa_retry_reset(line):
+                continue
+        if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
+            line
+        ):
+            continue
+        satisfying.append(line)
+    return satisfying
+
+
+def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
+    failed_index = -1
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "qa_independent_verification":
+            continue
+        if not _line_status_allows_contract_completion(line):
+            failed_index = index
+    return failed_index
+
+
+_FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
+    {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+)
+
+
+def _line_survives_failed_qa_retry_reset(line: Mapping[str, Any]) -> bool:
+    actor_role = str(line.get("actor_role") or "").strip().lower().replace("-", "_")
+    line_id = str(line.get("line_id") or "").strip()
+    if actor_role in {"mf_sub", "qa"}:
+        return False
+    if line_id in _FAILED_QA_RETRY_RESET_LINE_IDS:
+        return False
     return True
+
+
+_LINE_PAYLOAD_SCHEMA_BLOCKLIST = {
+    "worker_implementation": frozenset(
+        {
+            "worker_runtime_guide_read_after_failed_qa_revision.v1",
+            "contract_context_read_receipt.v1",
+            "mf_subagent_read_receipt.v1",
+            "mf_subagent_startup.v1",
+            "worker_graph_context.v1",
+        }
+    ),
+}
+
+
+def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
+    line_id = str(line.get("line_id") or "").strip()
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    schema_version = str(payload.get("schema_version") or "").strip()
+    blocked_schemas = _LINE_PAYLOAD_SCHEMA_BLOCKLIST.get(line_id)
+    return not (blocked_schemas and schema_version in blocked_schemas)
+
+
+def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
+    return not _contains_contract_completion_blocker(line)
+
+
+def _contains_contract_completion_blocker(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if (
+                key in _CONTRACT_COMPLETION_STATUS_FIELDS
+                and str(item or "").strip().lower()
+                in _CONTRACT_COMPLETION_BLOCKING_STATUSES
+            ):
+                return True
+            if key in _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS and _truthy_failure_count(
+                item
+            ):
+                return True
+            if _contains_contract_completion_blocker(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_contract_completion_blocker(item) for item in value)
+    return False
+
+
+def _truthy_failure_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value > 0
+    try:
+        return int(str(value or "").strip()) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _line_scope_matches_direct_fix_child(
@@ -1890,6 +2019,7 @@ class ContractRuntime:
             definition=definition,
         )
         line_items = list(completed_lines or [])
+        completion_satisfying_lines = _contract_completion_satisfying_lines(line_items)
         effective_actor_role = actor_role or str(
             record["execution_state"].get("actor_role") or ""
         )
@@ -1899,7 +2029,7 @@ class ContractRuntime:
             backlog_id=str(record["backlog_id"]),
             contract_execution_id=str(record["contract_execution_id"]),
             actor_role=effective_actor_role,
-            completed_lines=line_items,
+            completed_lines=completion_satisfying_lines,
             route_token_ref=str(record.get("route_token_ref") or ""),
             instruction_bundle_hash=str(record.get("instruction_bundle_hash") or ""),
             execution_state_revision=int(record.get("execution_state_revision") or 1),
@@ -2259,6 +2389,8 @@ def _effective_actor_role(write: Mapping[str, Any], *, actor_role: str | None) -
 
 _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "line_instance_id",
+    "status",
+    "verdict",
     "runtime_context_id",
     "task_id",
     "parent_task_id",

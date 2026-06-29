@@ -36800,6 +36800,95 @@ def _contract_runtime_mapping_matches_context(
     return False
 
 
+def _contract_runtime_mapping_values(
+    value: Mapping[str, Any],
+    *keys: str,
+) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        text = str(value.get(key) or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _contract_runtime_context_worker_identity_values(context) -> set[str]:
+    values = {
+        str(getattr(context, key, "") or "").strip()
+        for key in (
+            "worker_id",
+            "worker_slot_id",
+            "actual_host_worker_id",
+            "agent_id",
+            "allocation_owner",
+        )
+    }
+    return {value for value in values if value}
+
+
+def _contract_runtime_source_backed_dispatch_mapping_matches_context(
+    value: Mapping[str, Any],
+    *,
+    context,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    contract_execution_id: str,
+    task_id_keys: tuple[str, ...] = ("task_id",),
+) -> bool:
+    expected_worker_ids = _contract_runtime_context_worker_identity_values(context)
+    if not expected_worker_ids:
+        return False
+
+    for payload in _contract_runtime_mapping_candidates(value):
+        if (
+            _contract_runtime_mapping_value(payload, "runtime_context_id")
+            != runtime_context_id
+        ):
+            continue
+        if _contract_runtime_mapping_worker_role(payload) != "mf_sub":
+            continue
+
+        task_values = _contract_runtime_mapping_values(payload, *task_id_keys)
+        if task_values and any(candidate != task_id for candidate in task_values):
+            continue
+        parent_values = _contract_runtime_mapping_values(payload, "parent_task_id")
+        if parent_values and any(
+            candidate != parent_task_id for candidate in parent_values
+        ):
+            continue
+
+        contract_values = _contract_runtime_mapping_values(
+            payload,
+            "contract_execution_id",
+            "successor_contract_execution_id",
+            "parent_contract_execution_id",
+        )
+        if contract_values and not all(
+            candidate in {contract_execution_id, parent_task_id}
+            for candidate in contract_values
+        ):
+            continue
+        if not parent_values and parent_task_id != contract_execution_id:
+            continue
+
+        worker_values = set(
+            _contract_runtime_mapping_values(
+                payload,
+                "worker_id",
+                "worker_slot_id",
+                "actual_host_worker_id",
+                "agent_id",
+                "allocation_owner",
+                "lane_id",
+            )
+        )
+        if not worker_values.intersection(expected_worker_ids):
+            continue
+        return True
+    return False
+
+
 def _contract_runtime_context_identity(context) -> tuple[str, str, str]:
     runtime_context_id = str(getattr(context, "runtime_context_id", "") or "").strip()
     if not runtime_context_id and context is not None:
@@ -36864,6 +36953,21 @@ def _contract_runtime_dispatch_line_match(
             task_id_keys=task_id_keys,
         )
 
+    def _matches_source_backed_dispatch_context(
+        value: Mapping[str, Any],
+        *,
+        task_id_keys: tuple[str, ...] = ("task_id",),
+    ) -> bool:
+        return _contract_runtime_source_backed_dispatch_mapping_matches_context(
+            value,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            contract_execution_id=contract_execution_id,
+            task_id_keys=task_id_keys,
+        )
+
     for index, line in _contract_runtime_completed_lines(record):
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         is_legacy_dispatch_line = (
@@ -36888,6 +36992,14 @@ def _contract_runtime_dispatch_line_match(
         if not (
             _matches_context(line, task_id_keys=dispatch_task_id_keys)
             or _matches_context(payload, task_id_keys=dispatch_task_id_keys)
+            or _matches_source_backed_dispatch_context(
+                line,
+                task_id_keys=dispatch_task_id_keys,
+            )
+            or _matches_source_backed_dispatch_context(
+                payload,
+                task_id_keys=dispatch_task_id_keys,
+            )
         ):
             continue
         return {
@@ -37558,7 +37670,7 @@ def _contract_runtime_effective_actor_role(
 ) -> str:
     session = ctx.require_auth(conn)
     role = str(session.get("role") or "").strip()
-    if role == "observer":
+    if role in {"observer", "qa"}:
         return role
     project_id = ctx.get_project_id()
     mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(
@@ -45864,6 +45976,11 @@ def _contract_runtime_line_status_passes(line: Mapping[str, Any]) -> bool:
         line.get("payload") if isinstance(line.get("payload"), Mapping) else {},
         line.get("verification") if isinstance(line.get("verification"), Mapping) else {},
         line.get("artifact_refs") if isinstance(line.get("artifact_refs"), Mapping) else {},
+        (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        ),
     ]
     for container in containers:
         status = str(

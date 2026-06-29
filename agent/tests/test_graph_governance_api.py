@@ -32322,6 +32322,123 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn
     assert worker_read["actor_role"] == "mf_sub"
 
 
+def test_mf_parallel_worker_read_accepts_source_backed_dispatch_without_task_parent(conn):
+    backlog_id = "AC-MF-PARALLEL-SOURCE-BACKED-DISPATCH"
+    task_id = "parallel-source-backed-dispatch-task"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-source-backed-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-mf-parallel-source-backed-root",
+                "worker_fence": {
+                    "fence_token": "fence-source-backed-dispatch",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    assert result["ok"] is True
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-source-backed-dispatch-worker",
+        parent_task_id=result["contract_execution_id"],
+        fence_token="fence-source-backed-dispatch",
+        token="parallel-source-backed-dispatch-token",
+    )
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "contract_execution_id": result["contract_execution_id"],
+                "worker_role": "mf_sub",
+                "worker_id": worker_identity,
+                "worker_slot_id": worker_identity,
+                "line_instance_id": (
+                    f"runtime_context:{runtime_context.runtime_context_id}"
+                ),
+                "payload": {
+                    "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+                    "source_backed": True,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "contract_execution_id": result["contract_execution_id"],
+                    "worker_role": "mf_sub",
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": result["contract_execution_id"],
+                "worker_role": "mf_sub",
+                "fence_token": "fence-source-backed-dispatch",
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": "/tmp/parallel-source-backed-dispatch-worker",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                },
+            },
+        )
+    )
+
+    assert worker_read["ok"] is True
+    assert worker_read["actor_role"] == "mf_sub"
+
+
 def test_runtime_context_worker_task_alias_is_dispatch_only():
     context = SimpleNamespace(
         runtime_context_id="mfrctx-contract-update-alias",
@@ -32520,6 +32637,7 @@ def test_mf_parallel_worker_read_rejects_dispatch_parent_task_mismatch(conn):
         fence_token="fence-dispatch-parent",
         token="parallel-dispatch-parent-worker-token",
     )
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": result["contract_execution_id"]},
@@ -32532,7 +32650,10 @@ def test_mf_parallel_worker_read_rejects_dispatch_parent_task_mismatch(conn):
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
                 "parent_task_id": "AC-WRONG-PARENT",
+                "contract_execution_id": result["contract_execution_id"],
                 "worker_role": "mf_sub",
+                "worker_id": worker_identity,
+                "worker_slot_id": worker_identity,
             },
         )
     )
