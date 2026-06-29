@@ -840,6 +840,120 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
     assert record["runtime_guide"]["next_legal_action"] is None
 
 
+@pytest.mark.parametrize("qa_status", ["failed", "blocked", "rejected"])
+def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merge(
+    qa_status,
+):
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    record = _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-CLAUDE-PARALLEL-QA-FAILED-BLOCKS-MERGE-20260629",
+        contract_execution_id=f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        route_token_ref="rtok-test",
+    )
+
+    for stage_id, line_id, actor_role in [
+        ("orchestration", "observer_prefill_child_contracts", "observer"),
+        ("dispatch", "observer_dispatch_bounded_workers", "observer"),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub"),
+        ("worker_startup", "worker_startup", "mf_sub"),
+        ("worker_context", "worker_graph_context", "mf_sub"),
+        ("worker_implementation", "worker_implementation", "mf_sub"),
+        ("worker_attestation", "worker_finish_time_attestation", "mf_sub"),
+        ("worker_finish", "worker_finish_gate", "mf_sub"),
+        ("qa_handoff", "worker_review_ready_handoff", "mf_sub"),
+    ]:
+        runtime.current_guide(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+            actor_role=actor_role,
+        )
+        record = runtime.store.get(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test"
+        )
+        accepted = runtime.submit_line_write(
+            f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+            _runtime_write_from(
+                record,
+                actor_role=actor_role,
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    runtime.current_guide(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        actor_role="qa",
+    )
+    record = runtime.store.get(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test"
+    )
+    failed_qa_write = _runtime_write_from(
+        record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+    )
+    failed_qa_write["status"] = qa_status
+    failed_qa_write["payload"] = {"status": qa_status}
+    accepted_failed_qa = runtime.submit_line_write(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        failed_qa_write,
+    )
+    assert accepted_failed_qa["ok"] is True
+    record = accepted_failed_qa["record"]
+    next_action = record["runtime_guide"]["next_legal_action"]
+    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["owner_role"] == "qa"
+    assert next_action["line_id"] != "observer_merge"
+
+    runtime.current_guide(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        actor_role="observer",
+    )
+    record = runtime.store.get(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test"
+    )
+    rejected_merge = runtime.submit_line_write(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="observer_integration",
+            line_id="observer_merge",
+        ),
+    )
+    assert rejected_merge["ok"] is False
+    assert any(
+        "write does not match next legal action" in error
+        or "cannot write line" in error
+        for error in rejected_merge["decision"]["errors"]
+    )
+
+    runtime.current_guide(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        actor_role="qa",
+    )
+    record = runtime.store.get(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test"
+    )
+    accepted_passed_qa = runtime.submit_line_write(
+        f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
+        _runtime_write_from(
+            record,
+            actor_role="qa",
+            stage_id="qa",
+            line_id="qa_independent_verification",
+        ),
+    )
+    assert accepted_passed_qa["ok"] is True
+    record = accepted_passed_qa["record"]
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == "observer_merge"
+
+
 def test_mf_parallel_gate_precheck_requires_onboard_parent():
     service = ContractCrudService()
     definition = service.read("mf_parallel.v1")["data"]["definition"]

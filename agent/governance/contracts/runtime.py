@@ -1400,8 +1400,35 @@ def _find_parent_resume_ack_line(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
+    return _line_status_allows_contract_completion(line)
+
+
+_CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
+    {"fail", "failed", "failure", "rejected", "blocked"}
+)
+
+
+def _contract_completion_satisfying_lines(
+    lines: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    satisfying: list[Mapping[str, Any]] = []
+    for line in lines:
+        if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
+            line
+        ):
+            continue
+        satisfying.append(line)
+    return satisfying
+
+
+def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
     candidates = [line]
-    for key in ("payload", "verification", "artifact_refs"):
+    for key in (
+        "payload",
+        "verification",
+        "artifact_refs",
+        "qa_evidence_provenance",
+    ):
         value = line.get(key)
         if isinstance(value, Mapping):
             candidates.append(value)
@@ -1411,7 +1438,7 @@ def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
             .strip()
             .lower()
         )
-        if status in {"fail", "failed", "failure", "rejected", "blocked"}:
+        if status in _CONTRACT_COMPLETION_BLOCKING_STATUSES:
             return False
     return True
 
@@ -1890,6 +1917,7 @@ class ContractRuntime:
             definition=definition,
         )
         line_items = list(completed_lines or [])
+        completion_satisfying_lines = _contract_completion_satisfying_lines(line_items)
         effective_actor_role = actor_role or str(
             record["execution_state"].get("actor_role") or ""
         )
@@ -1899,7 +1927,7 @@ class ContractRuntime:
             backlog_id=str(record["backlog_id"]),
             contract_execution_id=str(record["contract_execution_id"]),
             actor_role=effective_actor_role,
-            completed_lines=line_items,
+            completed_lines=completion_satisfying_lines,
             route_token_ref=str(record.get("route_token_ref") or ""),
             instruction_bundle_hash=str(record.get("instruction_bundle_hash") or ""),
             execution_state_revision=int(record.get("execution_state_revision") or 1),
@@ -2259,6 +2287,8 @@ def _effective_actor_role(write: Mapping[str, Any], *, actor_role: str | None) -
 
 _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "line_instance_id",
+    "status",
+    "verdict",
     "runtime_context_id",
     "task_id",
     "parent_task_id",
