@@ -45923,6 +45923,267 @@ def _contract_runtime_direct_fix_parent_ack_matches(
     return True
 
 
+def _contract_runtime_authority_evaluable_commit(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{7,40}", text):
+        return text
+    return ""
+
+
+def _contract_runtime_authority_commit_matches(left: str, right: str) -> bool:
+    left_commit = _contract_runtime_authority_evaluable_commit(left)
+    right_commit = _contract_runtime_authority_evaluable_commit(right)
+    if not left_commit or not right_commit:
+        return False
+    if left_commit == right_commit:
+        return True
+    short_len = min(len(left_commit), len(right_commit))
+    return short_len >= 7 and left_commit[:short_len] == right_commit[:short_len]
+
+
+def _contract_runtime_close_authority_explicit_commit(
+    line: Mapping[str, Any],
+) -> str:
+    payload = _contract_runtime_close_authority_line_payload(line)
+    containers: list[Mapping[str, Any]] = [line, payload]
+    for key in (
+        "close_evidence",
+        "close_readiness",
+        "merge_evidence",
+        "reconcile_evidence",
+        "verification",
+        "artifact_refs",
+    ):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+    for container in containers:
+        for key in (
+            "commit_sha",
+            "commit",
+            "merge_commit",
+            "close_commit",
+            "close_commit_sha",
+            "head_commit",
+            "target_head_commit",
+            "verified_commit",
+        ):
+            value = str(container.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _contract_runtime_mf_parallel_close_authority_gate(
+    records: list[dict[str, Any]],
+    *,
+    chain_projection: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    if not _contract_runtime_server_derived_close_authority(chain_projection):
+        return {}
+    mf_parallel_records = [
+        record
+        for record in records
+        if str(record.get("contract_id") or "").strip() == MF_PARALLEL_RECORD_CONTRACT_ID
+    ]
+    if not mf_parallel_records:
+        return {}
+
+    record = mf_parallel_records[-1]
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    required_specs = {
+        "worker_implementation": {
+            "line_ids": {"worker_implementation"},
+            "evidence_kinds": {"implementation"},
+            "actor_roles": {"mf_sub"},
+            "missing_id": "contract_runtime.worker_implementation",
+        },
+        "worker_finish_gate": {
+            "line_ids": {"worker_finish_gate"},
+            "evidence_kinds": {"mf_subagent_finish_gate"},
+            "actor_roles": {"mf_sub"},
+            "missing_id": "contract_runtime.worker_finish_gate",
+        },
+        "qa_independent_verification": {
+            "line_ids": {"qa_independent_verification"},
+            "evidence_kinds": {"independent_verification"},
+            "actor_roles": {"qa"},
+            "missing_id": "contract_runtime.qa_independent_verification",
+        },
+        "observer_merge": {
+            "line_ids": {"observer_merge"},
+            "evidence_kinds": {"merge"},
+            "actor_roles": {"observer"},
+            "missing_id": "contract_runtime.observer_merge",
+            "close_commit_id": "contract_runtime.observer_merge_close_commit",
+        },
+        "observer_reconcile": {
+            "line_ids": {"observer_reconcile"},
+            "evidence_kinds": {"reconcile"},
+            "actor_roles": {"observer"},
+            "missing_id": "contract_runtime.observer_reconcile",
+            "close_commit_id": "contract_runtime.observer_reconcile_close_commit",
+        },
+        "observer_close_ready": {
+            "line_ids": {"observer_close_ready"},
+            "evidence_kinds": {"close_ready"},
+            "actor_roles": {"observer"},
+            "missing_id": "contract_runtime.observer_close_ready",
+            "close_commit_id": "contract_runtime.observer_close_ready_close_commit",
+        },
+    }
+    found: dict[str, dict[str, Any]] = {}
+    rejected_by_requirement: dict[str, list[dict[str, Any]]] = {
+        key: [] for key in required_specs
+    }
+    for line in _contract_runtime_completed_line_items(record):
+        line_id = str(line.get("line_id") or "").strip()
+        evidence_kind = str(line.get("evidence_kind") or "").strip()
+        actor_role = str(line.get("actor_role") or "").strip()
+        for requirement_id, spec in required_specs.items():
+            if (
+                line_id not in spec["line_ids"]
+                and evidence_kind not in spec["evidence_kinds"]
+            ):
+                continue
+            expected_roles = set(spec["actor_roles"])
+            if actor_role not in expected_roles:
+                rejected_by_requirement[requirement_id].append({
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "actor_role": actor_role,
+                    "reason": "actor_role_mismatch",
+                    "expected_actor_roles": sorted(expected_roles),
+                    "source_ref": str(line.get("_source_ref") or ""),
+                })
+                continue
+            if not _contract_runtime_line_status_passes(line):
+                rejected_by_requirement[requirement_id].append({
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "actor_role": actor_role,
+                    "reason": "line_status_not_passing",
+                    "source_ref": str(line.get("_source_ref") or ""),
+                })
+                continue
+            found[requirement_id] = line
+
+    missing: list[str] = []
+    for requirement_id, spec in required_specs.items():
+        if requirement_id not in found:
+            missing.append(str(spec["missing_id"]))
+
+    ordering_pairs = [
+        (
+            "worker_implementation",
+            "worker_finish_gate",
+            "contract_runtime.worker_finish_after_implementation",
+        ),
+        (
+            "worker_finish_gate",
+            "qa_independent_verification",
+            "contract_runtime.qa_after_worker_finish",
+        ),
+        (
+            "qa_independent_verification",
+            "observer_merge",
+            "contract_runtime.merge_after_qa",
+        ),
+        (
+            "observer_merge",
+            "observer_reconcile",
+            "contract_runtime.reconcile_after_merge",
+        ),
+        (
+            "observer_reconcile",
+            "observer_close_ready",
+            "contract_runtime.close_ready_after_reconcile",
+        ),
+    ]
+    for before, after, missing_id in ordering_pairs:
+        before_line = found.get(before)
+        after_line = found.get(after)
+        if not before_line or not after_line:
+            continue
+        before_index = int(before_line.get("_completed_line_index", -1) or -1)
+        after_index = int(after_line.get("_completed_line_index", -1) or -1)
+        if after_index <= before_index:
+            missing.append(missing_id)
+
+    commit_mismatches: list[dict[str, Any]] = []
+    if close_commit:
+        for requirement_id in (
+            "observer_merge",
+            "observer_reconcile",
+            "observer_close_ready",
+        ):
+            line = found.get(requirement_id)
+            if not line:
+                continue
+            actual_commit = _contract_runtime_close_authority_explicit_commit(line)
+            close_commit_id = str(required_specs[requirement_id]["close_commit_id"])
+            if not actual_commit:
+                missing.append(close_commit_id)
+                commit_mismatches.append({
+                    "requirement_id": requirement_id,
+                    "line_id": str(line.get("line_id") or ""),
+                    "expected_close_commit": close_commit,
+                    "actual_commit": "",
+                    "reason": "missing_close_commit",
+                    "source_ref": str(line.get("_source_ref") or ""),
+                })
+                continue
+            if not _contract_runtime_authority_commit_matches(close_commit, actual_commit):
+                missing.append(close_commit_id)
+                commit_mismatches.append({
+                    "requirement_id": requirement_id,
+                    "line_id": str(line.get("line_id") or ""),
+                    "expected_close_commit": close_commit,
+                    "actual_commit": actual_commit,
+                    "reason": "close_commit_mismatch",
+                    "source_ref": str(line.get("_source_ref") or ""),
+                })
+
+    missing = list(dict.fromkeys(item for item in missing if item))
+    passed = not missing
+    source_refs = [
+        str(line.get("_source_ref") or "")
+        for line in found.values()
+        if str(line.get("_source_ref") or "")
+    ]
+    return {
+        "schema_version": "contract_runtime_mf_parallel_close_authority_gate.v1",
+        "accepted": passed,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "source": "server_derived_contract_runtime_completed_mf_parallel_chain",
+        "primary_decision_source": passed,
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": contract_execution_id,
+        "close_commit": close_commit,
+        "missing_requirement_ids": missing,
+        "source_refs": source_refs,
+        "line_sources": {
+            requirement_id: str(line.get("_source_ref") or "")
+            for requirement_id, line in found.items()
+        },
+        "rejected_evidence_by_requirement": {
+            key: value for key, value in rejected_by_requirement.items() if value
+        },
+        "commit_mismatches": commit_mismatches,
+        "checks": {
+            "has_worker_implementation": "worker_implementation" in found,
+            "has_worker_finish_gate": "worker_finish_gate" in found,
+            "has_independent_qa": "qa_independent_verification" in found,
+            "has_observer_merge": "observer_merge" in found,
+            "has_observer_reconcile": "observer_reconcile" in found,
+            "has_observer_close_ready": "observer_close_ready" in found,
+            "observer_close_commit_matches": not commit_mismatches,
+        },
+    }
+
+
 def _contract_runtime_direct_fix_close_authority_gate(
     records: list[dict[str, Any]],
     *,
@@ -46037,8 +46298,67 @@ def _contract_runtime_authoritative_close_verification(
         if isinstance(runtime_projection.get("direct_fix_close_authority_gate"), Mapping)
         else {}
     )
-    if not bool(direct_fix_gate.get("passed")):
+    mf_parallel_gate = (
+        runtime_projection.get("mf_parallel_close_authority_gate")
+        if isinstance(runtime_projection.get("mf_parallel_close_authority_gate"), Mapping)
+        else {}
+    )
+    authority_gate = direct_fix_gate if bool(direct_fix_gate.get("passed")) else mf_parallel_gate
+    if not bool(authority_gate.get("passed")):
+        if mf_parallel_gate:
+            result = dict(verification)
+            result["passed"] = False
+            result["can_close"] = False
+            result["status"] = "failed"
+            result["contract_runtime_mf_parallel_close_authority_gate"] = dict(
+                mf_parallel_gate
+            )
+            result["runtime_projection_authority_failed"] = True
+            checks = dict(result.get("checks") or {})
+            checks["contract_runtime_mf_parallel_close_authority"] = False
+            result["checks"] = checks
+            missing_ids = list(mf_parallel_gate.get("missing_requirement_ids") or [])
+            groups_root = dict(result.get("missing_evidence_groups") or {})
+            groups = dict(groups_root.get("groups") or {})
+            groups["contract_runtime_mf_parallel_close_authority"] = {
+                "label": "ContractRuntime mf_parallel close authority",
+                "missing": missing_ids,
+                "next_action": (
+                    "complete source-backed mf_parallel worker, QA, observer "
+                    "merge/reconcile/close-ready evidence in ContractRuntime"
+                ),
+            }
+            groups_root["groups"] = groups
+            result["missing_evidence_groups"] = groups_root
+            failed_gates = list(result.get("failed_gates") or [])
+            failed_gates.append({
+                "gate": "contract_runtime_mf_parallel_close_authority_gate",
+                "status": str(mf_parallel_gate.get("status") or "failed"),
+                "missing_requirement_ids": missing_ids,
+            })
+            result["failed_gates"] = failed_gates
+            return result
         return dict(verification)
+    authority_kind = (
+        "direct_fix"
+        if authority_gate is direct_fix_gate
+        else "mf_parallel"
+    )
+    source = (
+        "contract_runtime_completed_direct_fix_chain"
+        if authority_kind == "direct_fix"
+        else "contract_runtime_completed_mf_parallel_chain"
+    )
+    message = (
+        "backlog_close accepted server-derived completed ContractRuntime "
+        "direct-fix evidence with independent QA."
+        if authority_kind == "direct_fix"
+        else (
+            "backlog_close accepted server-derived completed source-backed "
+            "mf_parallel ContractRuntime evidence with independent QA and "
+            "observer merge/reconcile/close-ready for the close commit."
+        )
+    )
 
     result = dict(verification)
     result["passed"] = True
@@ -46046,21 +46366,21 @@ def _contract_runtime_authoritative_close_verification(
     result["status"] = "passed"
     result["missing_event_kinds"] = []
     result["ignored_required_events"] = []
-    result["contract_runtime_direct_fix_close_authority_gate"] = dict(direct_fix_gate)
+    if authority_kind == "direct_fix":
+        result["contract_runtime_direct_fix_close_authority_gate"] = dict(authority_gate)
+    else:
+        result["contract_runtime_mf_parallel_close_authority_gate"] = dict(authority_gate)
     result["close_authority"] = {
         "schema_version": "contract_runtime_close_authority.v1",
-        "source": "contract_runtime_completed_direct_fix_chain",
+        "source": source,
         "legacy": False,
         "advisory": False,
         "authoritative": True,
         "close_authoritative": True,
         "can_close_authoritative": True,
-        "contract_execution_id": str(direct_fix_gate.get("contract_execution_id") or ""),
-        "source_refs": list(direct_fix_gate.get("source_refs") or []),
-        "message": (
-            "backlog_close accepted server-derived completed ContractRuntime "
-            "direct-fix evidence with independent QA."
-        ),
+        "contract_execution_id": str(authority_gate.get("contract_execution_id") or ""),
+        "source_refs": list(authority_gate.get("source_refs") or []),
+        "message": message,
     }
     result["legacy_advisory"] = False
     result["authoritative"] = True
@@ -46091,13 +46411,16 @@ def _contract_runtime_authoritative_close_verification(
         replaced["passed"] = True
         replaced["status"] = "passed"
         replaced["missing_requirement_ids"] = []
-        replaced["replaced_by_contract_runtime_direct_fix_close_authority"] = True
+        replaced["replaced_by_contract_runtime_close_authority"] = True
+        replaced[
+            f"replaced_by_contract_runtime_{authority_kind}_close_authority"
+        ] = True
         replaced["authority_gate"] = {
-            "schema_version": str(direct_fix_gate.get("schema_version") or ""),
+            "schema_version": str(authority_gate.get("schema_version") or ""),
             "contract_execution_id": str(
-                direct_fix_gate.get("contract_execution_id") or ""
+                authority_gate.get("contract_execution_id") or ""
             ),
-            "source": str(direct_fix_gate.get("source") or ""),
+            "source": str(authority_gate.get("source") or ""),
         }
         result[key] = replaced
 
@@ -46107,7 +46430,8 @@ def _contract_runtime_authoritative_close_verification(
         "has_verification": True,
         "has_close_ready": True,
         "has_independent_qa": True,
-        "contract_runtime_direct_fix_close_authority": True,
+        "contract_runtime_direct_fix_close_authority": authority_kind == "direct_fix",
+        "contract_runtime_mf_parallel_close_authority": authority_kind == "mf_parallel",
         "close_commit_has_timeline_evidence": True,
     })
     result["checks"] = checks
@@ -46453,6 +46777,11 @@ def _contract_runtime_close_authority_projection(
         chain_projection=server_chain_projection,
         close_commit=close_commit,
     )
+    mf_parallel_gate = _contract_runtime_mf_parallel_close_authority_gate(
+        chain_records,
+        chain_projection=server_chain_projection,
+        close_commit=close_commit,
+    )
 
     projected_events = _contract_runtime_close_authority_seed_events(
         record=record,
@@ -46522,6 +46851,7 @@ def _contract_runtime_close_authority_projection(
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
         "direct_fix_close_authority_gate": direct_fix_gate,
+        "mf_parallel_close_authority_gate": mf_parallel_gate,
         "route_identity": _route_identity_public_summary(identity),
         "server_contract_chain_current_projection": {
             key: value
@@ -56095,12 +56425,24 @@ def _verify_mf_close_timeline_gate(
             else {}
         )
         missing_close_commit = close_commit_gate.get("missing_requirement_ids") or []
+        runtime_mf_parallel_authority_gate = (
+            verification.get("contract_runtime_mf_parallel_close_authority_gate")
+            if isinstance(
+                verification.get("contract_runtime_mf_parallel_close_authority_gate"),
+                dict,
+            )
+            else {}
+        )
+        missing_runtime_mf_parallel_authority = (
+            runtime_mf_parallel_authority_gate.get("missing_requirement_ids") or []
+        )
         missing = ", ".join([
             *missing_event_kinds,
             *missing_contract,
             *missing_route_context,
             *missing_lane_ownership,
             *missing_close_commit,
+            *missing_runtime_mf_parallel_authority,
         ])
         if not missing:
             missing = "timeline gate failed"
@@ -56116,6 +56458,9 @@ def _verify_mf_close_timeline_gate(
                 "missing_route_context_requirement_ids": missing_route_context,
                 "missing_lane_ownership_ids": missing_lane_ownership,
                 "missing_close_commit_requirement_ids": missing_close_commit,
+                "missing_contract_runtime_mf_parallel_authority_requirement_ids": (
+                    missing_runtime_mf_parallel_authority
+                ),
             },
         )
     return verification

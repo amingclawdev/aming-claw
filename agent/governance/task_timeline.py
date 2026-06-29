@@ -10383,6 +10383,7 @@ def compact_gate_summary(
         "command_disposition_gate",
         "close_commit_evidence_gate",
         "close_timeline_startup_gate",
+        "contract_runtime_mf_parallel_close_authority_gate",
     ]
     failed_gates = []
     for key in gate_keys:
