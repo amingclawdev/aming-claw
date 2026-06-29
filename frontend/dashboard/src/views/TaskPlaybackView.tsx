@@ -11,6 +11,9 @@ import {
   fallbackTaskPlaybackSampleTrace,
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
+  projectRecentTimelineEvents,
+  mergeRecentTimelineEvents,
+  recentTimelineEventKey,
   projectEventToCard,
   sliceEventPage,
   buildPlaybackUrl,
@@ -107,7 +110,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
   // These are plain TaskTimelineEvents; each carries its own backlog_id/task_id.
   const [recentEvents, setRecentEvents] = useState<TaskTimelineEvent[]>([]);
   const [recentEventsLoaded, setRecentEventsLoaded] = useState(false);
-  const recentEventIdsRef = useRef<Set<number>>(new Set());
+  const recentEventIdsRef = useRef<Set<string>>(new Set());
   // Frontend-local override: when multiple candidates compete and the user
   // clicks a competing-candidates selector entry, we rebind the activity view
   // to that bug_id locally (no server mutation).
@@ -442,26 +445,16 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
     return api.recentTimelineFor(projectId, RECENT_EVENTS_LIMIT, signal)
       .then((response) => {
         if (signal.aborted || activeProjectIdRef.current !== projectId) return;
-        const incoming = response.events ?? [];
+        const incoming = projectRecentTimelineEvents(response);
         setRecentEvents((prev) => {
-          // Merge: keep existing items, prepend any new ones (by id) at the front.
-          // The /recent endpoint returns newest-first; we maintain that order.
-          const knownIds = recentEventIdsRef.current;
-          const newItems: TaskTimelineEvent[] = [];
-          for (const ev of incoming) {
-            const evId = typeof ev.id === "number" ? ev.id : 0;
-            if (!knownIds.has(evId)) {
-              knownIds.add(evId);
-              newItems.push(ev);
-            }
-          }
-          if (newItems.length === 0) return prev;
-          // Prepend new items (they are newest-first from endpoint) then existing.
-          // Then re-sort by id descending to ensure stable newest-first order.
-          const merged = [...newItems, ...prev];
-          merged.sort((a, b) => (typeof b.id === "number" ? b.id : 0) - (typeof a.id === "number" ? a.id : 0));
-          // Cap at RECENT_EVENTS_LIMIT * 2 to avoid unbounded growth.
-          return merged.slice(0, RECENT_EVENTS_LIMIT * 2);
+          const merged = mergeRecentTimelineEvents(
+            [...incoming, ...prev],
+            RECENT_EVENTS_LIMIT * 2,
+          );
+          recentEventIdsRef.current = new Set(
+            merged.map((event, index) => recentTimelineEventKey(event, index)),
+          );
+          return merged;
         });
         setRecentEventsLoaded(true);
       })
