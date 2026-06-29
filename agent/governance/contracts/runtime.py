@@ -9,7 +9,7 @@ below so execution state has durable rows and compare-and-swap updates.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -1839,6 +1839,43 @@ class ContractRuntime:
         actor_role: str | None = None,
     ) -> dict[str, Any]:
         record = self.store.get(contract_execution_id)
+        view = self._record_view(
+            record,
+            actor_role=actor_role,
+            completed_lines=record.get("completed_lines") or [],
+        )
+        record["execution_state"] = view["execution_state"]
+        record["runtime_guide"] = view["runtime_guide"]
+        record["precheck_decision"] = view["precheck_decision"]
+        self.store.update(contract_execution_id, record)
+        return dict(view["runtime_guide"])
+
+    def projected_record(
+        self,
+        contract_execution_id: str,
+        *,
+        actor_role: str | None = None,
+        completed_lines: Sequence[Mapping[str, Any]],
+        projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a non-mutating read model using source-backed projected lines."""
+
+        record = self.store.get(contract_execution_id)
+        return self._record_view(
+            record,
+            actor_role=actor_role,
+            completed_lines=completed_lines,
+            projection=projection,
+        )
+
+    def _record_view(
+        self,
+        record: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+        completed_lines: Sequence[Mapping[str, Any]] | None = None,
+        projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         definition = self._load_pinned_definition(record)
         instruction_bundle = resolve_instruction_bundle(
             definition,
@@ -1852,13 +1889,17 @@ class ContractRuntime:
             record=record,
             definition=definition,
         )
+        line_items = list(completed_lines or [])
+        effective_actor_role = actor_role or str(
+            record["execution_state"].get("actor_role") or ""
+        )
         state = build_execution_state(
             definition,
             project_id=str(record["project_id"]),
             backlog_id=str(record["backlog_id"]),
-            contract_execution_id=contract_execution_id,
-            actor_role=actor_role or str(record["execution_state"].get("actor_role") or ""),
-            completed_lines=record.get("completed_lines") or [],
+            contract_execution_id=str(record["contract_execution_id"]),
+            actor_role=effective_actor_role,
+            completed_lines=line_items,
             route_token_ref=str(record.get("route_token_ref") or ""),
             instruction_bundle_hash=str(record.get("instruction_bundle_hash") or ""),
             execution_state_revision=int(record.get("execution_state_revision") or 1),
@@ -1868,17 +1909,30 @@ class ContractRuntime:
             state,
             instruction_bundle=instruction_bundle,
         )
-        _attach_completed_line_evidence(guide, record.get("completed_lines") or [])
+        _attach_completed_line_evidence(guide, line_items)
+        sanitized_projection: dict[str, Any] = {}
+        if projection:
+            sanitized = _sanitize_line_evidence_value(projection)
+            if isinstance(sanitized, Mapping):
+                sanitized_projection = dict(sanitized)
+                guide["completed_lines_projection"] = sanitized_projection
+                guide["runtime_guide_hash"] = stable_sha256(
+                    {
+                        key: value
+                        for key, value in guide.items()
+                        if key != "runtime_guide_hash"
+                    }
+                )
         current_precheck = self.gate_kernel.precheck(
             definition,
             action="current_state",
-            actor_role=actor_role or str(record["execution_state"].get("actor_role") or ""),
+            actor_role=effective_actor_role,
             execution_state=state,
             runtime_guide=guide,
             subject={
                 "project_id": record.get("project_id"),
                 "backlog_id": record.get("backlog_id"),
-                "contract_execution_id": contract_execution_id,
+                "contract_execution_id": record.get("contract_execution_id"),
                 "parent_contract_execution_id": record.get("parent_contract_execution_id"),
                 "root_contract_execution_id": record.get("root_contract_execution_id"),
                 "contract_chain_id": record.get("contract_chain_id"),
@@ -1886,11 +1940,14 @@ class ContractRuntime:
             },
         )
         _attach_precheck_decision(guide, current_precheck.to_dict())
-        record["execution_state"] = state
-        record["runtime_guide"] = guide
-        record["precheck_decision"] = current_precheck.to_dict()
-        self.store.update(contract_execution_id, record)
-        return guide
+        view = deepcopy(dict(record))
+        view["execution_state"] = state
+        view["runtime_guide"] = guide
+        view["precheck_decision"] = current_precheck.to_dict()
+        if sanitized_projection:
+            view["completed_lines_projection"] = sanitized_projection
+            view["projected_completed_lines_count"] = len(line_items)
+        return view
 
     def submit_line_write(
         self,
@@ -1898,6 +1955,8 @@ class ContractRuntime:
         write: Mapping[str, Any],
         *,
         actor_role: str | None = None,
+        projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
+        projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         record = self.store.get(contract_execution_id)
         definition = self._load_pinned_definition(record)
@@ -1915,11 +1974,20 @@ class ContractRuntime:
             actor_role=effective_actor_role,
         )
         refreshed = self.store.get(contract_execution_id)
+        gate_record = refreshed
+        if projected_completed_lines is not None:
+            gate_record = self.projected_record(
+                contract_execution_id,
+                actor_role=effective_actor_role,
+                completed_lines=projected_completed_lines,
+                projection=projection,
+            )
+            guide = gate_record["runtime_guide"]
         gate_decision = self.gate_kernel.precheck(
             definition,
             action="submit_line",
             actor_role=effective_actor_role,
-            execution_state=refreshed["execution_state"],
+            execution_state=gate_record["execution_state"],
             runtime_guide=guide,
             write=effective_write,
         )
@@ -1932,18 +2000,19 @@ class ContractRuntime:
                     errors=("line_write_declares_no_mutation_expected",),
                 ).to_dict(),
                 "precheck_decision": gate_decision.to_dict(),
-                "record": refreshed,
+                "record": gate_record,
             }
         if not gate_decision.ok:
             return {
                 "schema_version": "contract_runtime_write_result.v1",
                 "ok": False,
                 "decision": gate_decision.to_dict(),
-                "record": refreshed,
+                "record": gate_record,
             }
 
         completed_lines = list(refreshed.get("completed_lines") or [])
-        completed_lines.append(_line_evidence_from_write(effective_write, effective_actor_role))
+        written_line = _line_evidence_from_write(effective_write, effective_actor_role)
+        completed_lines.append(written_line)
         expected_revision = int(refreshed.get("execution_state_revision") or 1)
         refreshed["completed_lines"] = completed_lines
         refreshed["execution_state_revision"] = expected_revision + 1
@@ -1967,11 +2036,21 @@ class ContractRuntime:
         updated = self.store.get(contract_execution_id)
         updated["runtime_guide"] = next_guide
         self.store.update(contract_execution_id, updated)
+        result_record = self.store.get(contract_execution_id)
+        if projected_completed_lines is not None:
+            projected_after_write = list(projected_completed_lines)
+            projected_after_write.append(written_line)
+            result_record = self.projected_record(
+                contract_execution_id,
+                actor_role=effective_actor_role,
+                completed_lines=projected_after_write,
+                projection=projection,
+            )
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,
             "decision": gate_decision.to_dict(),
-            "record": self.store.get(contract_execution_id),
+            "record": result_record,
         }
 
     def precheck_line_write(
@@ -1980,6 +2059,8 @@ class ContractRuntime:
         write: Mapping[str, Any],
         *,
         actor_role: str | None = None,
+        projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
+        projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Validate a proposed line write without appending completed evidence."""
 
@@ -1998,11 +2079,20 @@ class ContractRuntime:
             actor_role=effective_actor_role,
         )
         refreshed = self.store.get(contract_execution_id)
+        gate_record = refreshed
+        if projected_completed_lines is not None:
+            gate_record = self.projected_record(
+                contract_execution_id,
+                actor_role=effective_actor_role,
+                completed_lines=projected_completed_lines,
+                projection=projection,
+            )
+            guide = gate_record["runtime_guide"]
         gate_decision = self.gate_kernel.precheck(
             definition,
             action="submit_line",
             actor_role=effective_actor_role,
-            execution_state=refreshed["execution_state"],
+            execution_state=gate_record["execution_state"],
             runtime_guide=guide,
             write=effective_write,
         )
@@ -2010,10 +2100,11 @@ class ContractRuntime:
             "schema_version": "contract_runtime_line_write_precheck_result.v1",
             "ok": gate_decision.ok,
             "decision": gate_decision.to_dict(),
-            "record": refreshed,
+            "record": gate_record,
             "write": effective_write,
             "would_mutate_completed_lines": False,
             "completed_lines_count": len(refreshed.get("completed_lines") or []),
+            "projected_completed_lines_count": len(projected_completed_lines or []),
             "execution_state_revision": int(
                 refreshed.get("execution_state_revision") or 0
             ),
