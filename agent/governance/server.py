@@ -17201,6 +17201,13 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 ),
                 message=str(ctx.body.get("message") or ""),
                 bug_id=str(ctx.body.get("bug_id") or ""),
+                source_contract_id=str(
+                    ctx.body.get("source_contract_execution_id")
+                    or ctx.body.get("source_contract_id")
+                    or ctx.body.get("contract_execution_id")
+                    or ctx.body.get("active_contract_execution_id")
+                    or ""
+                ),
                 fence_token=str(ctx.body.get("fence_token") or ""),
                 now_iso=str(ctx.body.get("now_iso") or ""),
                 timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
