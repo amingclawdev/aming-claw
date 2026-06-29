@@ -3195,6 +3195,20 @@ def _runtime_context_timeline_refs(
         "close_ready_event_ref": _runtime_context_text(
             source.get("close_ready_event_ref") or source.get("close_ready_event_id")
         ),
+        "heartbeat_event_ref": _runtime_context_text(
+            source.get("heartbeat_event_ref")
+            or source.get("heartbeat_event_id")
+            or source.get("last_heartbeat_event_ref")
+            or source.get("last_heartbeat_event_id")
+        ),
+        "progress_event_ref": _runtime_context_text(
+            source.get("progress_event_ref") or source.get("progress_event_id")
+        ),
+        "no_progress_timeout_event_ref": _runtime_context_text(
+            source.get("no_progress_timeout_event_ref")
+            or source.get("no_progress_timeout_event_id")
+            or source.get("no_progress_event_ref")
+        ),
         "implementation_event_refs": _runtime_context_dedupe(
             _runtime_context_string_list(
                 source.get("implementation_event_refs")
@@ -3665,6 +3679,24 @@ def _runtime_context_timeline_derived_evidence(
             timeline_refs.setdefault("route_action_precheck_event_ref", event_ref)
         if _runtime_context_is_implementation_event_kind(event_kind) and event_ref:
             implementation_refs.append(event_ref)
+        if event_kind in {
+            "mf_subagent_heartbeat",
+            "worker_heartbeat",
+            "heartbeat",
+        }:
+            timeline_refs.setdefault("heartbeat_event_ref", event_ref)
+        if event_kind in {
+            "mf_subagent_progress",
+            "worker_progress",
+            "progress",
+        }:
+            timeline_refs.setdefault("progress_event_ref", event_ref)
+        if event_kind in {
+            "no_progress_timeout",
+            "observer_command_no_progress_timeout",
+            "dispatch_no_progress",
+        }:
+            timeline_refs.setdefault("no_progress_timeout_event_ref", event_ref)
         if (
             event_kind in {"verification", "qa_verification", "independent_verification"}
             and event_ref
@@ -4145,6 +4177,12 @@ def _runtime_context_current_values(
         "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
         "route_action_precheck_event_ref": timeline_refs.get(
             "route_action_precheck_event_ref",
+            "",
+        ),
+        "heartbeat_event_ref": timeline_refs.get("heartbeat_event_ref", ""),
+        "progress_event_ref": timeline_refs.get("progress_event_ref", ""),
+        "no_progress_timeout_event_ref": timeline_refs.get(
+            "no_progress_timeout_event_ref",
             "",
         ),
         "finish_event_ref": timeline_refs.get("finish_event_ref", ""),
@@ -5792,6 +5830,35 @@ def _runtime_context_worker_handoff_projection(
         or values.get("last_heartbeat_event_ref")
         or values.get("progress_event_ref")
     )
+    progress_event_ref = _runtime_context_text(values.get("progress_event_ref"))
+    no_progress_timeout_event_ref = _runtime_context_text(
+        values.get("no_progress_timeout_event_ref")
+    )
+    implementation_event_refs = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("implementation_event_refs"))
+    )
+    graph_trace_ids = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("graph_trace_ids"))
+    )
+    changed_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("changed_files"))
+        + _runtime_context_string_list(values.get("owned_changed_files"))
+        + _runtime_context_string_list(values.get("worker_changed_files"))
+    )
+    progress_evidence_refs = _runtime_context_dedupe(
+        [
+            item
+            for item in (
+                heartbeat_event_ref,
+                progress_event_ref,
+                *implementation_event_refs,
+                *graph_trace_ids,
+                *changed_files,
+            )
+            if item
+        ]
+    )
+    progress_observed = bool(progress_evidence_refs)
     dispatch_present = bool(
         dispatch_event_ref
         or (
@@ -5813,6 +5880,9 @@ def _runtime_context_worker_handoff_projection(
     if not dispatch_present:
         status = "not_dispatched"
         observer_next_action = "refresh_branch_runtime_context"
+    elif missing_lineage and progress_observed:
+        status = "worker_lineage_missing_progress_observed"
+        observer_next_action = "inspect_progress_and_repair_worker_lineage"
     elif missing_lineage:
         status = (
             "no_worker_startup_evidence"
@@ -5831,6 +5901,11 @@ def _runtime_context_worker_handoff_projection(
         worker_next_action = "record_mf_subagent_startup"
 
     recovery_actions: list[dict[str, Any]] = []
+    no_progress_reissue_allowed = bool(
+        dispatch_present
+        and missing_lineage
+        and not progress_observed
+    )
     if status == "not_dispatched":
         recovery_actions.append(
             {
@@ -5853,12 +5928,32 @@ def _runtime_context_worker_handoff_projection(
                         "fence token, target worktree, and runtime_context_id"
                     ),
                 },
+            ]
+        )
+    if missing_lineage and progress_observed:
+        recovery_actions.append(
+            {
+                "id": "inspect_progress_and_repair_worker_lineage",
+                "role": "observer",
+                "allowed_when": (
+                    "worker progress evidence exists but startup/read-receipt "
+                    "lineage is incomplete"
+                ),
+                "blocked_actions": [
+                    "cancel_or_mark_stale_no_progress_worker",
+                    "reissue_mf_sub_worker_with_same_scope",
+                ],
+            }
+        )
+    if no_progress_reissue_allowed:
+        recovery_actions.extend(
+            [
                 {
                     "id": "cancel_or_mark_stale_no_progress_worker",
                     "role": "observer",
                     "allowed_when": (
                         "a spawned worker has no read receipt, startup, heartbeat, "
-                        "or worktree mutation evidence"
+                        "progress, graph trace, implementation, or changed-file evidence"
                     ),
                 },
                 {
@@ -5891,19 +5986,31 @@ def _runtime_context_worker_handoff_projection(
             "read_receipt_event_ref": read_receipt_event_ref,
             "startup_event_ref": startup_event_ref,
             "heartbeat_event_ref": heartbeat_event_ref,
+            "progress_event_ref": progress_event_ref,
+            "no_progress_timeout_event_ref": no_progress_timeout_event_ref,
+            "implementation_event_refs": implementation_event_refs,
+            "graph_trace_ids": graph_trace_ids,
+            "changed_files": changed_files,
             "worktree_path": _runtime_context_text(values.get("worktree_path")),
             "branch_ref": _runtime_context_text(values.get("branch_ref")),
         },
         "missing_worker_lineage": missing_lineage,
         "heartbeat_status": "present" if heartbeat_event_ref else "missing",
+        "progress_status": "observed" if progress_observed else "not_observed",
+        "progress_evidence_refs": progress_evidence_refs,
         "worker_next_action": worker_next_action,
         "observer_next_action": observer_next_action,
         "recovery_actions": recovery_actions,
         "no_progress_reissue_policy": {
+            "allowed": no_progress_reissue_allowed,
             "legal_when": (
                 "dispatch is present and no worker read receipt, startup, "
-                "heartbeat, or worktree mutation evidence exists"
+                "heartbeat, progress, graph trace, implementation, or "
+                "changed-file evidence exists"
             ),
+            "blocked_by_progress_evidence": progress_observed,
+            "progress_evidence_refs": progress_evidence_refs,
+            "no_progress_timeout_event_ref": no_progress_timeout_event_ref,
             "must_record_before_reissue": "cancel_or_mark_stale_no_progress_worker",
             "duplicate_worker_evidence_close_satisfying": False,
             "observer_must_not_backfill_worker_evidence": True,
@@ -6990,13 +7097,14 @@ def build_runtime_context_action_plan_view(
     if worker_handoff_projection.get("status") in {
         "no_worker_startup_evidence",
         "read_receipt_missing",
+        "worker_lineage_missing_progress_observed",
     }:
         blocking_reasons.append(
             {
                 "code": "worker_handoff_no_startup_progress",
                 "message": (
-                    "worker dispatch has no startup lineage; observer must "
-                    "request the initial-join envelope or reissue the worker "
+                    "worker dispatch has incomplete startup lineage; observer "
+                    "must follow the worker_handoff_projection recovery action "
                     "instead of backfilling worker evidence"
                 ),
                 "next_action": worker_handoff_projection.get(

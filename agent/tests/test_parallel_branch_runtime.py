@@ -1368,6 +1368,10 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert handoff["no_progress_reissue_policy"][
         "observer_must_not_backfill_worker_evidence"
     ] is True
+    assert handoff["no_progress_reissue_policy"]["allowed"] is True
+    assert "reissue_mf_sub_worker_with_same_scope" in {
+        action["id"] for action in handoff["recovery_actions"]
+    }
     assert handoff["direct_fix_return_contract"][
         "requires_independent_qa_after_repair"
     ] is True
@@ -1401,6 +1405,66 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert present_handoff["status"] == "no_worker_startup_evidence"
     assert present_handoff["missing_worker_lineage"] == ["mf_subagent_startup"]
     assert present_handoff["worker_next_action"] == "record_mf_subagent_startup"
+
+    with_progress = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "heartbeat_event_ref": "timeline:heartbeat-runtime-context",
+            "implementation_event_refs": ["timeline:implementation-runtime-context"],
+        },
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    progress_values = with_progress["views"]["current"]["current_values"]
+    progress_handoff = with_progress["views"]["action_plan"][
+        "worker_handoff_projection"
+    ]
+    assert progress_values["heartbeat_event_ref"] == "timeline:heartbeat-runtime-context"
+    assert progress_handoff["status"] == "worker_lineage_missing_progress_observed"
+    assert progress_handoff["observer_next_action"] == (
+        "inspect_progress_and_repair_worker_lineage"
+    )
+    assert progress_handoff["progress_status"] == "observed"
+    assert progress_handoff["no_progress_reissue_policy"]["allowed"] is False
+    assert progress_handoff["no_progress_reissue_policy"][
+        "blocked_by_progress_evidence"
+    ] is True
+    assert "reissue_mf_sub_worker_with_same_scope" not in {
+        action["id"] for action in progress_handoff["recovery_actions"]
+    }
+
+    with_lineage = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={
+            "read_receipt_event_ref": "timeline:read-runtime-context",
+            "startup_event_ref": "timeline:startup-runtime-context",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        generated_at=NOW,
+    ).to_dict()
+
+    lineage_handoff = with_lineage["views"]["action_plan"][
+        "worker_handoff_projection"
+    ]
+    assert lineage_handoff["status"] == "worker_lineage_present"
+    assert lineage_handoff["missing_worker_lineage"] == []
+    assert lineage_handoff["observer_next_action"] == "none"
 
 
 def test_runtime_context_worker_guide_carries_nested_dispatch_owned_files() -> None:
