@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 
 import pytest
@@ -19,8 +20,11 @@ from agent.governance.contracts import (
 )
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
+    SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    read_backlog_contract_chain_current,
 )
+from agent.governance.server import _contract_runtime_direct_fix_close_authority_gate
 
 
 _SYSTEM_LAYER_POLICY_NAMES = [
@@ -116,6 +120,30 @@ def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str)
     }
 
 
+def _runtime_next_write(record, *, actor_role: str):
+    next_action = record["runtime_guide"].get("next_legal_action") or {}
+    return _runtime_write_from(
+        record,
+        actor_role=actor_role,
+        stage_id=next_action["stage_id"],
+        line_id=next_action["line_id"],
+    )
+
+
+def _submit_next_runtime_line(
+    runtime: ContractRuntime,
+    contract_execution_id: str,
+    *,
+    actor_role: str,
+    **overrides,
+):
+    runtime.current_guide(contract_execution_id, actor_role=actor_role)
+    record = runtime.store.get(contract_execution_id)
+    write = _runtime_next_write(record, actor_role=actor_role)
+    write.update(overrides)
+    return runtime.submit_line_write(contract_execution_id, write)
+
+
 def _start_mf_parallel_successor(
     runtime: ContractRuntime,
     *,
@@ -137,6 +165,38 @@ def _start_mf_parallel_successor(
     )
     return runtime.start_execution(
         "mf_parallel.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+        parent_contract_execution_id=parent_execution_id,
+        root_contract_execution_id=parent_execution_id,
+        contract_chain_id=chain_id,
+        route_token_ref=route_token_ref,
+    )
+
+
+def _start_direct_fix_successor(
+    runtime: ContractRuntime,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict:
+    parent_execution_id = f"cex-onboard-parent-for-{contract_execution_id}"
+    chain_id = f"cchain-for-{contract_execution_id}"
+    runtime.start_execution(
+        "onboard_contract",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=parent_execution_id,
+        actor_role="observer",
+        route_token_ref=route_token_ref,
+        contract_chain_id=chain_id,
+    )
+    return runtime.start_execution(
+        "direct_fix.v1",
         project_id=project_id,
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
@@ -952,6 +1012,183 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
     assert accepted_passed_qa["ok"] is True
     record = accepted_passed_qa["record"]
     assert record["runtime_guide"]["next_legal_action"]["line_id"] == "observer_merge"
+
+
+def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
+    service = ContractCrudService()
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        service.registry,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    backlog_id = "AC-DIRECT-FIX-QA-FAILED-BLOCKS-PROGRESSION-20260629"
+    child_id = "cex-direct-fix-qa-failed-blocks-progression-test"
+    _start_direct_fix_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        contract_execution_id=child_id,
+        route_token_ref="rtok-test",
+    )
+
+    for _stage in range(3):
+        accepted = _submit_next_runtime_line(
+            runtime,
+            child_id,
+            actor_role="observer",
+        )
+        assert accepted["ok"] is True
+
+    repair = _submit_next_runtime_line(runtime, child_id, actor_role="mf_sub")
+    assert repair["ok"] is True
+
+    failed_qa = _submit_next_runtime_line(
+        runtime,
+        child_id,
+        actor_role="qa",
+        qa_evidence_provenance={
+            "status": "failed",
+            "verdict": "failed",
+            "reviewer_role": "qa",
+        },
+    )
+    assert failed_qa["ok"] is True
+
+    projection = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert projection["readiness_state"] == (
+        "direct_fix_complete_awaiting_independent_qa"
+    )
+    assert projection["next_legal_action"]["line_id"] == "qa_independent_verification"
+
+    runtime.current_guide(child_id, actor_role="observer")
+    record = runtime.store.get(child_id)
+    rejected_return = runtime.submit_line_write(
+        child_id,
+        {
+            **_runtime_write_from(
+                record,
+                actor_role="observer",
+                stage_id="return_to_parent",
+                line_id="direct_fix_return_to_parent",
+            ),
+            "evidence_kind": "direct_fix_return_to_parent",
+        },
+    )
+    assert rejected_return["ok"] is False
+    assert any(
+        "write does not match next legal action" in error
+        or "cannot write line" in error
+        for error in rejected_return["decision"]["errors"]
+    )
+
+    passed_qa = _submit_next_runtime_line(
+        runtime,
+        child_id,
+        actor_role="qa",
+        qa_evidence_provenance={
+            "status": "passed",
+            "verdict": "passed",
+            "reviewer_role": "qa",
+        },
+    )
+    assert passed_qa["ok"] is True
+
+    projection = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert projection["readiness_state"] == "return_to_parent_after_direct_fix_qa"
+    assert projection["next_legal_action"]["line_id"] == "direct_fix_return_to_parent"
+
+    returned = _submit_next_runtime_line(runtime, child_id, actor_role="observer")
+    assert returned["ok"] is True
+
+    projection = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert projection["readiness_state"] == "parent_resume_required_after_direct_fix_qa"
+    assert (
+        projection["next_legal_action"]["line_id"]
+        == "resume_parent_after_successor_return"
+    )
+
+
+def test_direct_fix_close_authority_gate_rejects_failed_qa_provenance():
+    projection = {
+        "projection_source": "backlog_contract_chain_current",
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+        "active_chain": {"execution_ids": ["cex-parent", "cex-child"]},
+    }
+    child_record = {
+        "contract_id": "direct_fix",
+        "contract_execution_id": "cex-child",
+        "parent_contract_execution_id": "cex-parent",
+        "completed_lines": [
+            {
+                "stage_id": "candidate_repair",
+                "line_id": "direct_fix_candidate_repair",
+                "actor_role": "mf_sub",
+                "evidence_kind": "direct_fix_repair_evidence",
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "qa_evidence_provenance": {"status": "failed"},
+            },
+            {
+                "stage_id": "return_to_parent",
+                "line_id": "direct_fix_return_to_parent",
+                "actor_role": "observer",
+                "evidence_kind": "direct_fix_return_to_parent",
+            },
+        ],
+    }
+    parent_record = {
+        "contract_id": "onboard_contract",
+        "contract_execution_id": "cex-parent",
+        "completed_lines": [
+            {
+                "stage_id": "successor_return",
+                "line_id": "resume_parent_after_successor_return",
+                "actor_role": "observer",
+                "evidence_kind": "successor_return_acknowledgement",
+                "payload": {
+                    "parent_contract_execution_id": "cex-parent",
+                    "successor_contract_execution_id": "cex-child",
+                },
+            }
+        ],
+    }
+
+    rejected = _contract_runtime_direct_fix_close_authority_gate(
+        [parent_record, child_record],
+        chain_projection=projection,
+        close_commit="",
+    )
+    assert rejected["passed"] is False
+    assert "independent_qa" in rejected["missing_requirement_ids"]
+    assert rejected["checks"]["has_independent_qa"] is False
+
+    child_record["completed_lines"][1]["qa_evidence_provenance"] = {
+        "status": "passed"
+    }
+    accepted = _contract_runtime_direct_fix_close_authority_gate(
+        [parent_record, child_record],
+        chain_projection=projection,
+        close_commit="",
+    )
+    assert accepted["passed"] is True
+    assert accepted["checks"]["has_independent_qa"] is True
 
 
 def test_mf_parallel_gate_precheck_requires_onboard_parent():

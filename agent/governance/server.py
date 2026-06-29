@@ -45976,6 +45976,11 @@ def _contract_runtime_line_status_passes(line: Mapping[str, Any]) -> bool:
         line.get("payload") if isinstance(line.get("payload"), Mapping) else {},
         line.get("verification") if isinstance(line.get("verification"), Mapping) else {},
         line.get("artifact_refs") if isinstance(line.get("artifact_refs"), Mapping) else {},
+        (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        ),
     ]
     for container in containers:
         status = str(
