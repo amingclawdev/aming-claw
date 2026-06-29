@@ -1014,6 +1014,86 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
     assert record["runtime_guide"]["next_legal_action"]["line_id"] == "observer_merge"
 
 
+def test_mf_parallel_repeated_failed_qa_payload_outcome_does_not_unlock_observer_merge():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    execution_id = "cex-mf-parallel-qa-outcome-failed-blocks-merge-test"
+    record = _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-CLAUDE-PARALLEL-QA-OUTCOME-FAILED-BLOCKS-MERGE-20260629",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-test",
+    )
+
+    for stage_id, line_id, actor_role in [
+        ("orchestration", "observer_prefill_child_contracts", "observer"),
+        ("dispatch", "observer_dispatch_bounded_workers", "observer"),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub"),
+        ("worker_startup", "worker_startup", "mf_sub"),
+        ("worker_context", "worker_graph_context", "mf_sub"),
+        ("worker_implementation", "worker_implementation", "mf_sub"),
+        ("worker_attestation", "worker_finish_time_attestation", "mf_sub"),
+        ("worker_finish", "worker_finish_gate", "mf_sub"),
+        ("qa_handoff", "worker_review_ready_handoff", "mf_sub"),
+    ]:
+        runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.store.get(execution_id)
+        accepted = runtime.submit_line_write(
+            execution_id,
+            _runtime_write_from(
+                record,
+                actor_role=actor_role,
+                stage_id=stage_id,
+                line_id=line_id,
+            ),
+        )
+        assert accepted["ok"] is True
+        record = accepted["record"]
+
+    runtime.current_guide(execution_id, actor_role="qa")
+    record = runtime.store.get(execution_id)
+    failed_verdict_write = _runtime_write_from(
+        record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+    )
+    failed_verdict_write["payload"] = {"verdict": "failed"}
+    accepted_failed_verdict = runtime.submit_line_write(
+        execution_id,
+        failed_verdict_write,
+    )
+    assert accepted_failed_verdict["ok"] is True
+    assert (
+        accepted_failed_verdict["record"]["runtime_guide"]["next_legal_action"][
+            "line_id"
+        ]
+        == "qa_independent_verification"
+    )
+
+    runtime.current_guide(execution_id, actor_role="qa")
+    record = runtime.store.get(execution_id)
+    failed_outcome_write = _runtime_write_from(
+        record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+    )
+    failed_outcome_write["payload"] = {"outcome": "failed"}
+    accepted_failed_outcome = runtime.submit_line_write(
+        execution_id,
+        failed_outcome_write,
+    )
+    assert accepted_failed_outcome["ok"] is True
+    next_action = accepted_failed_outcome["record"]["runtime_guide"][
+        "next_legal_action"
+    ]
+    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["owner_role"] == "qa"
+    assert next_action["line_id"] != "observer_merge"
+
+
 def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
     service = ContractCrudService()
     conn = sqlite3.connect(":memory:")

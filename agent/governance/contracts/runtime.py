@@ -1406,6 +1406,12 @@ def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
 _CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
     {"fail", "failed", "failure", "rejected", "blocked"}
 )
+_CONTRACT_COMPLETION_STATUS_FIELDS = frozenset(
+    {"status", "verdict", "outcome", "decision", "result"}
+)
+_CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
+    {"failed", "failures", "failed_count", "failure_count", "error_count"}
+)
 
 
 def _contract_completion_satisfying_lines(
@@ -1422,25 +1428,40 @@ def _contract_completion_satisfying_lines(
 
 
 def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
-    candidates = [line]
-    for key in (
-        "payload",
-        "verification",
-        "artifact_refs",
-        "qa_evidence_provenance",
-    ):
-        value = line.get(key)
-        if isinstance(value, Mapping):
-            candidates.append(value)
-    for candidate in candidates:
-        status = (
-            str(candidate.get("status") or candidate.get("verdict") or "")
-            .strip()
-            .lower()
-        )
-        if status in _CONTRACT_COMPLETION_BLOCKING_STATUSES:
-            return False
-    return True
+    return not _contains_contract_completion_blocker(line)
+
+
+def _contains_contract_completion_blocker(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if (
+                key in _CONTRACT_COMPLETION_STATUS_FIELDS
+                and str(item or "").strip().lower()
+                in _CONTRACT_COMPLETION_BLOCKING_STATUSES
+            ):
+                return True
+            if key in _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS and _truthy_failure_count(
+                item
+            ):
+                return True
+            if _contains_contract_completion_blocker(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_contract_completion_blocker(item) for item in value)
+    return False
+
+
+def _truthy_failure_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value > 0
+    try:
+        return int(str(value or "").strip()) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _line_scope_matches_direct_fix_child(
