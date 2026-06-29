@@ -30457,6 +30457,200 @@ def test_backlog_close_rejects_runtime_gate_projection_as_close_evidence(conn):
     assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
+def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_complete_current(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-BLOCKED-PROJECTS-DIRECT-FIX"
+    close_commit = "8b567b087c2e48f33a0f1aa7c76fc92752e0bd25"
+    close_ref = "rtok-blocked-close-direct-fix"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    first = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-blocked-close-parent",
+            },
+        )
+    )
+    parent_execution_id = first["contract_chain_current"][
+        "current_contract_execution_id"
+    ]
+
+    before = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert before["readiness_state"] == "contract_complete"
+    assert before["next_legal_action"] == {}
+
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=backlog_id,
+        route_token_ref=close_ref,
+        evidence_refs=[f"contract_runtime:{parent_execution_id}"],
+    )
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "route_token_ref": close_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_gate_failed"
+    prechecks = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="route_action_precheck",
+    )
+    assert len(prechecks) == 1
+    assert prechecks[0]["status"] == "accepted"
+    assert prechecks[0]["payload"]["route_token_ref"] == close_ref
+    assert prechecks[0]["payload"]["route_token_gate"]["decision"] == (
+        "route_token_ref_resolved"
+    )
+
+    blocked = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="backlog_close_blocked",
+    )
+    assert len(blocked) == 1
+    blocked_payload = blocked[0]["payload"]
+    assert blocked_payload["status"] == "blocked"
+    assert blocked_payload["source"] == "authoritative_backlog_close"
+    assert blocked_payload["candidate_runtime_target_truth_activated"] is False
+    assert blocked_payload["route_action_precheck_event_ref"] == (
+        f"timeline:{prechecks[0]['id']}"
+    )
+    assert blocked_payload["next_legal_action"]["action"] == (
+        "enter_direct_fix_successor"
+    )
+    assert blocked_payload["next_legal_action"]["successor_contract_id"] == "direct_fix"
+
+    current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert current["readiness_state"] == "blocked"
+    assert current["source_of_proof"] == "task_timeline.backlog_close_blocked"
+    assert current["blocked_parent_state"]["event_ref"] == f"timeline:{blocked[0]['id']}"
+    assert current["next_legal_action"]["action"] == "enter_direct_fix_successor"
+    assert current["next_legal_action"]["parent_contract_execution_id"] == (
+        parent_execution_id
+    )
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": close_ref,
+            },
+        )
+    )
+    assert guide["contract_chain_current"]["readiness_state"] == "blocked"
+    assert guide["runtime_resume"]["status"] == "blocked"
+    assert guide["next_legal_action"]["action"] == "enter_direct_fix_successor"
+
+
+def test_backlog_close_blocker_projection_requires_source_backed_route_token_ref(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-BLOCKED-REQUIRES-SOURCE-REF"
+    close_commit = "a2d266f0507af80f272c87e9f7051d72edc5956c"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-blocked-close-waiver-parent",
+            },
+        )
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx_with_role(
+                {"project_id": PID, "bug_id": backlog_id},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "route_waiver": _route_waiver(
+                        "backlog_close",
+                        backlog_id=backlog_id,
+                    ),
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_gate_failed"
+    assert (
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="route_action_precheck",
+        )
+        == []
+    )
+    assert (
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="backlog_close_blocked",
+        )
+        == []
+    )
+    current = server.handle_project_contract_chain_current(
+        _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
+    )["contract_chain_current"]
+    assert current["readiness_state"] == "contract_complete"
+    assert current["next_legal_action"] == {}
+
+
 def test_hotfix_enter_requires_backlog_scope_before_timeline_write(conn):
     with pytest.raises(ValidationError, match="backlog_id or bug_id"):
         server.handle_project_hotfix_enter(
