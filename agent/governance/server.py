@@ -35583,6 +35583,12 @@ def _contract_runtime_read(
         )
     runtime.current_guide(contract_execution_id, actor_role=actor_role)
     record = runtime.store.get(contract_execution_id)
+    record, _projection = _contract_runtime_apply_mf_parallel_context_projection(
+        conn,
+        project_id=str(record.get("project_id") or ""),
+        record=record,
+        actor_role=actor_role,
+    )
     return _contract_runtime_apply_blocked_projection(
         conn,
         project_id=str(record.get("project_id") or ""),
@@ -35590,6 +35596,505 @@ def _contract_runtime_read(
         record=record,
         actor_role=actor_role,
     )
+
+
+_MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES = (
+    (
+        "worker_read",
+        "worker_read_runtime_guide",
+        "read_receipt",
+        "read_receipt",
+    ),
+    ("worker_startup", "worker_startup", "mf_subagent_startup", "startup"),
+    ("worker_context", "worker_graph_context", "graph_trace", "graph_trace"),
+    (
+        "worker_implementation",
+        "worker_implementation",
+        "implementation",
+        "implementation",
+    ),
+    (
+        "worker_attestation",
+        "worker_finish_time_attestation",
+        "record_finish_time_worker_attestation",
+        "finish_time_worker_attestation",
+    ),
+    ("worker_finish", "worker_finish_gate", "mf_subagent_finish_gate", "finish_gate"),
+    ("qa_handoff", "worker_review_ready_handoff", "review_ready", "review_ready"),
+)
+
+
+def _contract_runtime_apply_mf_parallel_context_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    actor_role: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    projection = _contract_runtime_mf_parallel_context_projection(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not projection:
+        return dict(record), {}
+    runtime = _contract_runtime(conn)
+    projected = runtime.projected_record(
+        str(record.get("contract_execution_id") or ""),
+        actor_role=actor_role,
+        completed_lines=projection["projected_completed_lines"],
+        projection=projection,
+    )
+    return projected, projection
+
+
+def _contract_runtime_mf_parallel_context_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
+        return {}
+    completed_lines = [
+        dict(line)
+        for line in (record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+    ]
+    dispatch_lines = [
+        line
+        for line in completed_lines
+        if str(line.get("stage_id") or "").strip() == "dispatch"
+        and str(line.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+        and str(line.get("evidence_kind") or "").strip()
+        == "dispatch_bounded_worker"
+    ]
+    if not dispatch_lines:
+        return {}
+
+    projected_lines: list[dict[str, Any]] = []
+    projected_refs: list[dict[str, Any]] = []
+    source_refs: list[str] = []
+    existing_keys = _contract_runtime_projection_line_keys(completed_lines)
+    for dispatch_line in dispatch_lines:
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            context_projection = _contract_runtime_projection_for_context(
+                conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                existing_keys=existing_keys,
+            )
+            for line in context_projection.get("projected_lines", []):
+                if not isinstance(line, Mapping):
+                    continue
+                line_dict = dict(line)
+                key = _contract_runtime_projection_line_key(line_dict)
+                existing_keys.add(key)
+                projected_lines.append(line_dict)
+            for ref in context_projection.get("projected_line_refs", []):
+                if isinstance(ref, Mapping):
+                    projected_refs.append(dict(ref))
+            for ref in context_projection.get("source_refs", []):
+                text = str(ref or "").strip()
+                if text and text not in source_refs:
+                    source_refs.append(text)
+
+    if not projected_lines:
+        return {}
+    return {
+        "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
+        "source": "runtime_context_worker_evidence",
+        "source_of_authority": "branch_runtime_context+task_timeline+graph_query_traces",
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "project_id": project_id,
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "stored_completed_lines_count": len(completed_lines),
+        "projected_line_count": len(projected_lines),
+        "projected_line_refs": projected_refs,
+        "source_refs": source_refs,
+        "projected_completed_lines": completed_lines + projected_lines,
+        "persistence": {
+            "mutates_contract_runtime_completed_lines": False,
+            "observer_authored_worker_backfill": False,
+        },
+    }
+
+
+def _contract_runtime_contexts_for_dispatch_line(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    line: Mapping[str, Any],
+) -> list[Any]:
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        get_branch_context_by_runtime_context_id,
+    )
+
+    contexts: list[Any] = []
+    seen: set[str] = set()
+    for candidate in _contract_runtime_mapping_candidates(line):
+        if _contract_runtime_mapping_worker_role(candidate) != "mf_sub":
+            continue
+        runtime_context_id = _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+        )
+        task_id = _contract_runtime_mapping_value(
+            candidate,
+            "task_id",
+            "worker_task_id",
+        )
+        context = (
+            get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if runtime_context_id
+            else None
+        )
+        if context is None and task_id:
+            context = get_branch_context(conn, project_id, task_id)
+        if context is None:
+            continue
+        context_id, _, _ = _contract_runtime_context_identity(context)
+        if not context_id or context_id in seen:
+            continue
+        if not _contract_runtime_dispatch_line_match(record, context):
+            continue
+        seen.add(context_id)
+        contexts.append(context)
+    return contexts
+
+
+def _contract_runtime_projection_for_context(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    existing_keys: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    backlog_id = str(getattr(context, "backlog_id", "") or record.get("backlog_id") or "")
+    fence_token = str(getattr(context, "fence_token", "") or "")
+    if not all((runtime_context_id, task_id, parent_task_id, backlog_id)):
+        return {}
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    timeline_refs, startup_payload, finish_payload, _close_payload = (
+        _runtime_context_service_timeline_refs(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            timeline_events=timeline_events,
+        )
+    )
+    graph_refs = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        explicit_trace_ids=list(timeline_refs.get("graph_trace_ids") or []),
+    )
+    source_map = _contract_runtime_projection_source_map(
+        timeline_events=timeline_events,
+        timeline_refs=timeline_refs,
+        graph_refs=graph_refs,
+        finish_payload=finish_payload,
+    )
+
+    projected_lines: list[dict[str, Any]] = []
+    projected_line_refs: list[dict[str, Any]] = []
+    source_refs: list[str] = []
+    local_keys = set(existing_keys)
+    for stage_id, line_id, evidence_kind, source_key in (
+        _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES
+    ):
+        source = source_map.get(source_key)
+        if not isinstance(source, Mapping) or not source.get("source_ref"):
+            break
+        line = _contract_runtime_projected_worker_line(
+            record=record,
+            context=context,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+            source_key=source_key,
+            source=source,
+            timeline_refs=timeline_refs,
+            startup_payload=startup_payload,
+            graph_refs=graph_refs,
+        )
+        key = _contract_runtime_projection_line_key(line)
+        if _contract_runtime_projection_key_completed(key, local_keys):
+            continue
+        local_keys.add(key)
+        projected_lines.append(line)
+        source_ref = str(source.get("source_ref") or "")
+        projected_line_refs.append(
+            {
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "evidence_kind": evidence_kind,
+                "line_instance_id": line["line_instance_id"],
+                "source_ref": source_ref,
+            }
+        )
+        if source_ref and source_ref not in source_refs:
+            source_refs.append(source_ref)
+    return {
+        "projected_lines": projected_lines,
+        "projected_line_refs": projected_line_refs,
+        "source_refs": source_refs,
+    }
+
+
+def _contract_runtime_projection_source_map(
+    *,
+    timeline_events: list[dict[str, Any]],
+    timeline_refs: Mapping[str, Any],
+    graph_refs: Mapping[str, Any],
+    finish_payload: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
+    implementation_refs = list(timeline_refs.get("implementation_event_refs") or [])
+    attestation_ref = str(
+        finish_payload.get("attestation_event_ref")
+        if isinstance(finish_payload, Mapping)
+        else ""
+    ).strip()
+    if not attestation_ref:
+        attestation_ref = _contract_runtime_timeline_ref_for_token(
+            timeline_events,
+            "finish_time_worker_attestation",
+        )
+    review_ready_ref = _contract_runtime_timeline_ref_for_token(
+        timeline_events,
+        "review_ready",
+    )
+    finish_ref = str(timeline_refs.get("finish_event_ref") or "").strip()
+    return {
+        "read_receipt": {
+            "source_ref": str(timeline_refs.get("read_receipt_event_ref") or ""),
+            "read_receipt_hash": str(timeline_refs.get("read_receipt_hash") or ""),
+        },
+        "startup": {
+            "source_ref": str(timeline_refs.get("startup_event_ref") or ""),
+            "payload": dict(timeline_refs.get("startup_hint") or {}),
+        },
+        "graph_trace": {
+            "source_ref": f"graph_trace:{graph_trace_ids[0]}"
+            if graph_refs.get("db_verified") and graph_trace_ids
+            else "",
+            "graph_trace_ids": graph_trace_ids,
+        },
+        "implementation": {
+            "source_ref": str(
+                timeline_refs.get("latest_implementation_event_ref")
+                or (implementation_refs[-1] if implementation_refs else "")
+            ),
+            "implementation_event_refs": implementation_refs,
+            "changed_files": list(timeline_refs.get("changed_files") or []),
+            "test_results": dict(timeline_refs.get("test_results") or {}),
+            "head_commit": str(
+                timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""
+            ),
+        },
+        "finish_time_worker_attestation": {
+            "source_ref": attestation_ref,
+            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+        },
+        "finish_gate": {
+            "source_ref": finish_ref,
+            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+        },
+        "review_ready": {
+            "source_ref": review_ready_ref or finish_ref,
+            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+        },
+    }
+
+
+def _contract_runtime_timeline_ref_for_token(
+    timeline_events: list[dict[str, Any]],
+    token: str,
+) -> str:
+    wanted = str(token or "").strip().lower().replace("-", "_")
+    for event in timeline_events:
+        if str(event.get("status") or "").strip().lower() in {
+            "failed",
+            "rejected",
+            "blocked",
+        }:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        fields = (
+            str(event.get("event_type") or ""),
+            str(event.get("event_kind") or ""),
+            str(event.get("phase") or ""),
+            str(payload.get("action") or ""),
+            str(payload.get("schema_version") or ""),
+        )
+        haystack = " ".join(field.lower().replace("-", "_") for field in fields)
+        if wanted in haystack:
+            return _runtime_context_event_ref(event)
+    return ""
+
+
+def _contract_runtime_projected_worker_line(
+    *,
+    record: Mapping[str, Any],
+    context: Any,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    source_key: str,
+    source: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+    startup_payload: Mapping[str, Any],
+    graph_refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    worker_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    source_ref = str(source.get("source_ref") or "").strip()
+    line_instance_id = f"runtime_context:{runtime_context_id}"
+    changed_files = _runtime_context_public_file_values(
+        list(timeline_refs.get("changed_files") or [])
+    )
+    graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
+    payload = {
+        "schema_version": "mf_parallel.runtime_context_worker_line_projection.v1",
+        "source": "runtime_context_worker_evidence",
+        "source_key": source_key,
+        "source_ref": source_ref,
+        "source_backed": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "read_receipt_hash": str(timeline_refs.get("read_receipt_hash") or ""),
+        "graph_trace_ids": graph_trace_ids,
+        "changed_files": changed_files,
+        "head_commit": str(timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""),
+        "projection_contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "projection_persists_completed_line": False,
+        "observer_authored_worker_backfill": False,
+    }
+    if isinstance(startup_payload, Mapping) and startup_payload:
+        payload["startup_event_id"] = str(startup_payload.get("event_id") or "")
+    line = {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": "mf_sub",
+        "evidence_kind": evidence_kind,
+        "line_instance_id": line_instance_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "payload": payload,
+        "artifact_refs": {
+            "source": "runtime_context_worker_evidence",
+            "source_ref": source_ref,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "timeline_event_ref": source_ref
+            if source_ref.startswith("timeline:")
+            else "",
+            "graph_trace_ids": graph_trace_ids,
+            "graph_trace_evidence": _runtime_context_service_redact_graph_trace_refs(
+                graph_refs
+            ),
+        },
+    }
+    head_commit = str(
+        timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""
+    ).strip()
+    if head_commit:
+        line["commit_sha"] = head_commit
+    if graph_trace_ids:
+        line["trace_id"] = graph_trace_ids[0]
+    return line
+
+
+def _contract_runtime_projection_line_keys(
+    completed_lines: Sequence[Mapping[str, Any]],
+) -> set[tuple[str, str, str]]:
+    return {
+        _contract_runtime_projection_line_key(line)
+        for line in completed_lines
+        if isinstance(line, Mapping)
+    }
+
+
+def _contract_runtime_projection_line_key(
+    line: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    return (
+        str(line.get("stage_id") or "").strip(),
+        str(line.get("line_id") or "").strip(),
+        str(line.get("line_instance_id") or "").strip(),
+    )
+
+
+def _contract_runtime_projection_key_completed(
+    key: tuple[str, str, str],
+    completed: set[tuple[str, str, str]],
+) -> bool:
+    if key in completed:
+        return True
+    stage_id, line_id, instance_id = key
+    if not stage_id or not line_id:
+        return True
+    if (stage_id, line_id, "") in completed:
+        return True
+    if not instance_id:
+        return any(
+            existing_stage == stage_id and existing_line == line_id
+            for existing_stage, existing_line, _existing_instance in completed
+        )
+    return False
+
+
+def _contract_runtime_projection_completed_lines(
+    projection: Mapping[str, Any],
+) -> list[Mapping[str, Any]] | None:
+    completed_lines = projection.get("projected_completed_lines")
+    if not isinstance(completed_lines, list):
+        return None
+    return [line for line in completed_lines if isinstance(line, Mapping)]
 
 
 def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
@@ -44012,9 +44517,16 @@ def _contract_runtime_close_gate(
             },
         )
     runtime = _contract_runtime(conn)
+    projection: dict[str, Any] = {}
     try:
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
+        record, projection = _contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+            actor_role=actor_role,
+        )
     except ContractRuntimeError as exc:
         raise GovernanceError(
             "contract_runtime_close_evidence_rejected",
@@ -44061,6 +44573,10 @@ def _contract_runtime_close_gate(
         contract_execution_id,
         write,
         actor_role=actor_role,
+        projected_completed_lines=_contract_runtime_projection_completed_lines(
+            projection
+        ),
+        projection=projection,
     )
     if not result.get("ok"):
         raise GovernanceError(
@@ -54272,6 +54788,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             else:
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
+                record, projection = (
+                    _contract_runtime_apply_mf_parallel_context_projection(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        actor_role=actor_role,
+                    )
+                )
                 write = _contract_runtime_line_write_body(
                     record,
                     actor_role=actor_role,
@@ -54288,6 +54812,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     contract_execution_id,
                     write,
                     actor_role=actor_role,
+                    projected_completed_lines=(
+                        _contract_runtime_projection_completed_lines(projection)
+                    ),
+                    projection=projection,
                 )
                 dispatch_timeline_event = (
                     _record_contract_runtime_mf_parallel_dispatch_event(
@@ -54374,6 +54902,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
             else:
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
+                record, projection = (
+                    _contract_runtime_apply_mf_parallel_context_projection(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        actor_role=actor_role,
+                    )
+                )
                 write = _contract_runtime_line_write_body(
                     record,
                     actor_role=actor_role,
@@ -54383,6 +54919,10 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     contract_execution_id,
                     write,
                     actor_role=actor_role,
+                    projected_completed_lines=(
+                        _contract_runtime_projection_completed_lines(projection)
+                    ),
+                    projection=projection,
                 )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
