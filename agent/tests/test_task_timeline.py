@@ -5684,6 +5684,11 @@ class TestTaskTimeline(unittest.TestCase):
         bug_id = "BUG-SERVICE-ROUTER-TOKEN"
         task_id = "task-router-token"
         self._insert_router_backlog(bug_id=bug_id)
+        issued = self._issue_route_token(
+            bug_id,
+            task_id=task_id,
+            allowed_actions=["task_timeline_append"],
+        )
 
         result = server.handle_task_timeline_append(
             _ctx(
@@ -5695,11 +5700,7 @@ class TestTaskTimeline(unittest.TestCase):
                     "actor": "worker",
                     "status": "succeeded",
                     "payload": {"task_type": "dev"},
-                    "route_token": _route_token(
-                        "service_route",
-                        bug_id=bug_id,
-                        task_id=task_id,
-                    ),
+                    "route_token": issued["route_token"],
                 },
             )
         )
@@ -5715,13 +5716,14 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertNotIn("route_token", source["payload"])
         self.assertIn("route_token_gate", source["payload"])
         gate = source["payload"]["route_token_gate"]
-        self.assertEqual(gate["decision"], "route_token_input_redacted")
+        self.assertEqual(gate["decision"], "route_token")
+        self.assertTrue(gate["server_issued_binding"])
+        self.assertEqual(gate["route_token_ref"], issued["route_token_ref"])
         self.assertEqual(
             gate["route_context_hash"],
-            _fake_sha("test-route-context-service_route"),
+            issued["route_token"]["route_context_hash"],
         )
         self.assertTrue(gate["route_token_hash"].startswith("sha256:"))
-        self.assertNotIn("expires_at", source["payload"].get("route_token_gate", {}))
 
     def test_project_bootstrap_with_route_handoff_requires_bound_route_token(self):
         from agent.governance import server

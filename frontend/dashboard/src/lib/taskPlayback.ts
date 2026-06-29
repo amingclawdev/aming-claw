@@ -210,6 +210,7 @@ export interface TaskPlaybackCompactLedgerRow {
   projection_generation: number | null;
   projection_watermark: number | null;
   projection_hash: string;
+  projection_updated_at: string;
   projection_degraded: boolean;
   projection_degraded_flags: Record<string, unknown>;
   contract_chain_current: Record<string, unknown>;
@@ -263,6 +264,15 @@ export interface NormalizeTaskPlaybackInput {
   compactLedger?: unknown;
   source?: TaskPlaybackSource;
   generatedAt?: string;
+}
+
+export interface RecentTimelineProjectionInput {
+  project_id?: string;
+  events?: TaskTimelineEvent[];
+  compact_ledger?: unknown;
+  compactLedger?: unknown;
+  contract_runtime_projection_events?: TaskTimelineEvent[];
+  generated_at?: string;
 }
 
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
@@ -452,6 +462,53 @@ export function taskPlaybackLedgerRowsToTimelineEvents(
   return ledger.rows.map((row, index) => compactLedgerEventFromRow(row, ledger, index, at));
 }
 
+export function recentTimelineEventKey(event: TaskTimelineEvent, index = 0): string {
+  return eventIdentity(event, index);
+}
+
+export function compareRecentTimelineEvents(a: TaskTimelineEvent, b: TaskTimelineEvent): number {
+  return -compareTimelineEvents(a, b);
+}
+
+export function mergeRecentTimelineEvents(
+  events: TaskTimelineEvent[],
+  limit?: number,
+): TaskTimelineEvent[] {
+  const seen = new Set<string>();
+  const merged: TaskTimelineEvent[] = [];
+  events.forEach((event, index) => {
+    const key = recentTimelineEventKey(event, index);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(event);
+  });
+  merged.sort(compareRecentTimelineEvents);
+  return typeof limit === "number" && limit > 0 ? merged.slice(0, limit) : merged;
+}
+
+export function projectRecentTimelineEvents(
+  response: RecentTimelineProjectionInput | null | undefined,
+): TaskTimelineEvent[] {
+  const record = response ?? {};
+  const sourceEvents = Array.isArray(record.events) ? record.events : [];
+  const projectionEvents = Array.isArray(record.contract_runtime_projection_events)
+    ? record.contract_runtime_projection_events
+    : [];
+  const compactLedger = normalizeTaskPlaybackCompactLedger(
+    firstCompactLedgerSource(record.compact_ledger, record.compactLedger, record),
+    record.project_id ?? "",
+  );
+  const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(
+    compactLedger,
+    record.generated_at,
+  );
+  return mergeRecentTimelineEvents([
+    ...sourceEvents,
+    ...projectionEvents,
+    ...ledgerEvents,
+  ]);
+}
+
 export function taskPlaybackLedgerRowRefs(row: TaskPlaybackCompactLedgerRow): TaskPlaybackEvidenceRef[] {
   const payload = row.latest_payload_ref;
   const refs: TaskPlaybackEvidenceRef[] = [];
@@ -561,6 +618,7 @@ function normalizeCompactLedgerRow(value: unknown): TaskPlaybackCompactLedgerRow
     projection_generation: numberFrom(record.projection_generation) ?? numberFrom(contractChainCurrent.projection_generation),
     projection_watermark: numberFrom(record.projection_watermark) ?? numberFrom(contractChainCurrent.projection_watermark),
     projection_hash: firstStringField(record, ["projection_hash"]) || firstStringField(contractChainCurrent, ["projection_hash"]),
+    projection_updated_at: firstStringField(record, ["projection_updated_at", "updated_at"]) || firstStringField(contractChainCurrent, ["updated_at", "projection_updated_at"]),
     projection_degraded: booleanFrom(record.projection_degraded) || booleanFrom(contractChainCurrent.projection_degraded) || booleanFrom(contractChainCurrent.degraded),
     projection_degraded_flags: projectionDegradedFlags,
     contract_chain_current: contractChainCurrent,
@@ -694,7 +752,7 @@ function compactLedgerEventFromRow(
       source_event_id: row.latest_event_id,
       source_event_refs: refs.filter((ref) => ref.kind === "source_event").map((ref) => ref.value),
     },
-    created_at: generatedAt,
+    created_at: row.projection_updated_at || generatedAt,
   };
 }
 
@@ -709,6 +767,7 @@ function compactLedgerProjectionFields(row: TaskPlaybackCompactLedgerRow): Recor
     projection_generation: row.projection_generation,
     projection_watermark: row.projection_watermark,
     projection_hash: row.projection_hash,
+    projection_updated_at: row.projection_updated_at,
     projection_degraded: row.projection_degraded,
     projection_degraded_flags: row.projection_degraded_flags,
     contract_chain_current: row.contract_chain_current,
@@ -3640,8 +3699,10 @@ function eventIdentity(event: TaskTimelineEvent, index: number): string {
 }
 
 function eventDisplayId(event: TaskTimelineEvent): string {
+  const rawId = (event as { id?: unknown }).id;
   if (event.event_id && !isSensitiveEvidenceText(event.event_id, "event_id")) return safeText(event.event_id);
-  if (event.id != null) return `#${event.id}`;
+  if (typeof rawId === "number") return `#${rawId}`;
+  if (rawId != null) return safeText(String(rawId));
   if (event.trace_id && !isSensitiveEvidenceText(event.trace_id, "trace_id")) return safeText(event.trace_id);
   return "recorded";
 }
@@ -3650,7 +3711,17 @@ function compareTimelineEvents(a: TaskTimelineEvent, b: TaskTimelineEvent): numb
   const at = Date.parse(a.created_at || "") || 0;
   const bt = Date.parse(b.created_at || "") || 0;
   if (at !== bt) return at - bt;
-  return Number(a.id ?? 0) - Number(b.id ?? 0);
+  const an = eventNumericSortValue(a);
+  const bn = eventNumericSortValue(b);
+  if (an != null && bn != null && an !== bn) return an - bn;
+  return eventIdentity(a, 0).localeCompare(eventIdentity(b, 0));
+}
+
+function eventNumericSortValue(event: TaskTimelineEvent): number | null {
+  const rawId = (event as { id?: unknown }).id;
+  if (typeof rawId === "number" && Number.isFinite(rawId)) return rawId;
+  if (typeof rawId === "string" && /^\d+$/.test(rawId.trim())) return Number(rawId);
+  return null;
 }
 
 function titleize(value: string): string {
@@ -3800,7 +3871,16 @@ export interface ActivityEventCard {
  */
 export function projectEventToCard(event: TaskTimelineEvent): ActivityEventCard {
   const publicEvent = hydrateTimelineEventJson(event);
-  const id = typeof publicEvent.id === "number" ? publicEvent.id : String(publicEvent.id ?? "");
+  const rawId = (publicEvent as { id?: unknown }).id;
+  const id = publicEvent.event_id && !isSensitiveEvidenceText(publicEvent.event_id, "event_id")
+    ? publicEvent.event_id
+    : typeof rawId === "number" && Number.isFinite(rawId)
+      ? rawId
+      : typeof rawId === "string"
+        ? rawId
+        : rawId != null
+          ? String(rawId)
+      : eventIdentity(publicEvent, 0);
   const at = (publicEvent.created_at ?? "").trim();
   const event_kind = (publicEvent.event_kind ?? publicEvent.event_type ?? "event").trim();
   const event_type = (publicEvent.event_type ?? "").trim();

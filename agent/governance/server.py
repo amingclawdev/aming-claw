@@ -32040,6 +32040,7 @@ def _record_backlog_close_blocked_event(
         "close_commit": commit_sha,
         "next_legal_action": next_action,
         "candidate_runtime_target_truth_activated": False,
+        "requested_actor": str(body.get("actor") or ""),
     }
     event = task_timeline.record_event(
         conn,
@@ -32049,7 +32050,7 @@ def _record_backlog_close_blocked_event(
         event_type="backlog.close.blocked",
         phase="close_gate",
         event_kind="backlog_close_blocked",
-        actor=str(body.get("actor") or "observer"),
+        actor="observer",
         status="blocked",
         decision="blocked",
         payload=payload,
@@ -47365,11 +47366,29 @@ def handle_task_timeline_recent(ctx: RequestContext):
             (project_id, limit),
         ).fetchall()
         events = [task_timeline._row_to_dict(row) for row in rows]
+        event_ledger = task_timeline.build_compact_ledger(conn, project_id, events)
+        current_ledger = task_timeline.build_contract_runtime_current_ledger(
+            conn,
+            project_id,
+            limit=limit,
+        )
+        compact_ledger = task_timeline.merge_compact_ledgers(
+            project_id,
+            current_ledger,
+            event_ledger,
+            source_event_count=len(events),
+        )
+        contract_runtime_projection_events = (
+            task_timeline.compact_ledger_to_timeline_events(compact_ledger)
+        )
     return {
         "ok": True,
         "project_id": project_id,
         "events": events,
         "count": len(events),
+        "compact_ledger": compact_ledger,
+        "contract_runtime_projection_events": contract_runtime_projection_events,
+        "contract_runtime_projection_event_count": len(contract_runtime_projection_events),
         "order": "newest_first",
         "cross_row": True,
     }

@@ -1361,6 +1361,9 @@ export interface RecentTimelineResponse {
   project_id: string;
   events: import("../types").TaskTimelineEvent[];
   count: number;
+  compact_ledger?: unknown;
+  contract_runtime_projection_events?: import("../types").TaskTimelineEvent[];
+  contract_runtime_projection_event_count?: number;
   order?: string;
   cross_row?: boolean;
 }
