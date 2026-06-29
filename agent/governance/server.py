@@ -37133,6 +37133,9 @@ def _contract_runtime_line_write_body(
         "lane_id",
         "worker_slot_id",
         "worker_id",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
         "payload",
         "artifact_refs",
         "trace_id",
@@ -41280,6 +41283,11 @@ def _direct_fix_materialize_dispatch_runtime_context(
         or _direct_fix_dispatch_text(write, "target_head_commit")
         or base_commit
     )
+    merge_queue_id = (
+        _direct_fix_dispatch_text(payload, "merge_queue_id")
+        or _direct_fix_dispatch_text(write, "merge_queue_id")
+        or f"direct-fix:{contract_execution_id}"
+    )
     fence_token = (
         _direct_fix_dispatch_text(write, "fence_token", "worker_fence_token")
         or _direct_fix_dispatch_text(payload, "fence_token", "worker_fence_token")
@@ -41328,7 +41336,7 @@ def _direct_fix_materialize_dispatch_runtime_context(
         ref_name=str(payload.get("ref_name") or payload.get("target_branch") or "main"),
         base_commit=base_commit,
         target_head_commit=target_head_commit,
-        merge_queue_id=_direct_fix_dispatch_text(payload, "merge_queue_id"),
+        merge_queue_id=merge_queue_id,
         fence_token=fence_token,
         status=STATE_WORKTREE_READY if worktree_path else STATE_ALLOCATED,
     )
@@ -41391,6 +41399,11 @@ def _direct_fix_materialize_dispatch_runtime_context(
                         **dict(route_identity),
                         "observer_command_id": contract_execution_id,
                         "owned_files": owned_files,
+                        "base_commit": saved_context.get("base_commit") or base_commit,
+                        "target_head_commit": saved_context.get("target_head_commit")
+                        or target_head_commit,
+                        "merge_queue_id": saved_context.get("merge_queue_id")
+                        or merge_queue_id,
                     },
                     saved_context,
                     route_identity,
@@ -41443,9 +41456,7 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "base_commit": saved_context.get("base_commit") or base_commit,
         "target_head_commit": saved_context.get("target_head_commit")
         or target_head_commit,
-        "merge_queue_id": saved_context.get("merge_queue_id")
-        or _direct_fix_dispatch_text(payload, "merge_queue_id")
-        or f"direct-fix:{contract_execution_id}",
+        "merge_queue_id": saved_context.get("merge_queue_id") or merge_queue_id,
         "owned_files": owned_files,
         "target_files": owned_files,
         "route_token_ref": route_token_ref,
@@ -41475,6 +41486,7 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "base_commit": saved_context.get("base_commit") or base_commit,
         "target_head_commit": saved_context.get("target_head_commit")
         or target_head_commit,
+        "merge_queue_id": saved_context.get("merge_queue_id") or merge_queue_id,
         "owned_files": owned_files,
         "target_files": owned_files,
         "fence_token_present": bool(saved.fence_token),
@@ -41497,6 +41509,10 @@ def _direct_fix_materialize_dispatch_runtime_context(
             "worker_role": "mf_sub",
             "worker_id": saved_context.get("worker_id") or worker_slot_id,
             "worker_slot_id": saved_context.get("worker_slot_id") or worker_slot_id,
+            "base_commit": saved_context.get("base_commit") or base_commit,
+            "target_head_commit": saved_context.get("target_head_commit")
+            or target_head_commit,
+            "merge_queue_id": saved_context.get("merge_queue_id") or merge_queue_id,
             "fence_token": saved.fence_token,
             "session_token_ref": session_token_ref,
             "worker_session_token_ref": session_token_ref,
@@ -46611,6 +46627,19 @@ def _runtime_text_prepare_allocation_required_evidence(
     missing_fields: list[str] | None = None,
     mismatches: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    repair_action = {
+        "id": "repair_or_supersede_runtime_allocation",
+        "action": "repair_or_supersede_runtime_allocation",
+        "owner_role": "observer",
+        "endpoint": "/api/projects/{project_id}/observer/runtime-text/prepare",
+        "runtime_context_id": runtime_context_id,
+        "missing_fields": missing_fields or [],
+        "mismatches": mismatches or [],
+        "requirements": [
+            "persist base_commit, target_head_commit, and durable merge_queue_id",
+            "or supersede the worker with a freshly allocated runtime context",
+        ],
+    }
     return {
         "schema_version": "mf_subagent_branch_runtime.v1",
         "status": "allocation_required",
@@ -46623,6 +46652,8 @@ def _runtime_text_prepare_allocation_required_evidence(
         "message": message,
         "missing_fields": missing_fields or [],
         "mismatches": mismatches or [],
+        "next_legal_action": repair_action,
+        "next_legal_actions": [repair_action],
     }
 
 
