@@ -466,6 +466,11 @@ def test_direct_fix_successor_projection_exposes_return_to_parent(monkeypatch) -
         store = FakeStore()
 
     monkeypatch.setattr(server_module, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server_module,
+        "_direct_fix_projection_for_successor",
+        lambda *_args, **_kwargs: {},
+    )
 
     next_action = server_module._contract_runtime_blocked_successor_next_action(
         object(),
@@ -486,6 +491,97 @@ def test_direct_fix_successor_projection_exposes_return_to_parent(monkeypatch) -
     assert next_action["body"]["parent_contract_execution_id"] == (
         "cex-contract-update-parent"
     )
+
+
+def test_backlog_close_blocker_overlay_requires_source_ref_and_preserves_current(
+    monkeypatch,
+) -> None:
+    from agent.governance import server as server_module
+
+    assert server_module._backlog_close_route_gate_is_source_backed(
+        {
+            "action": "backlog_close",
+            "decision": "route_token_ref_resolved",
+            "route_token_ref": "rtok-source-backed-close",
+            "resolved_from_ref": True,
+            "binding_source": "observer_route_token_refs",
+        }
+    )
+    assert not server_module._backlog_close_route_gate_is_source_backed(
+        {
+            "action": "backlog_close",
+            "decision": "accepted",
+            "binding_source": "route_waiver",
+        }
+    )
+    assert not server_module._backlog_close_route_gate_is_source_backed(
+        {
+            "action": "backlog_close",
+            "decision": "accepted",
+            "route_token_ref": "rtok-unverified-close",
+        }
+    )
+
+    current_with_next_action = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PRESERVE-CURRENT",
+        "readiness_state": "contract_complete",
+        "current_contract_execution_id": "cex-current",
+        "active_child_contract_execution_id": "",
+        "next_legal_action": {"id": "already-current", "action": "continue"},
+        "projection_hash": "sha256:current",
+    }
+    calls: list[dict] = []
+
+    def fail_if_queried(*_args, **kwargs):
+        calls.append(kwargs)
+        return {
+            "id": 99,
+            "event_kind": "backlog_close_blocked",
+            "payload": {
+                "source": "authoritative_backlog_close",
+                "route_token_gate": {
+                    "action": "backlog_close",
+                    "decision": "route_token_ref_resolved",
+                    "route_token_ref": "rtok-source-backed-close",
+                    "resolved_from_ref": True,
+                },
+            },
+        }
+
+    monkeypatch.setattr(
+        server_module,
+        "_latest_source_backed_backlog_close_blocker_event",
+        fail_if_queried,
+    )
+
+    projected = server_module._contract_chain_current_with_backlog_close_blocker(
+        object(),
+        project_id="aming-claw",
+        backlog_id="AC-PRESERVE-CURRENT",
+        current_projection=current_with_next_action,
+    )
+
+    assert projected == current_with_next_action
+    assert calls == []
+
+    monkeypatch.setattr(
+        server_module,
+        "_latest_source_backed_backlog_close_blocker_event",
+        lambda *_args, **_kwargs: {},
+    )
+    complete_without_blocker = {
+        **current_with_next_action,
+        "next_legal_action": {},
+        "projection_hash": "sha256:complete",
+    }
+
+    assert server_module._contract_chain_current_with_backlog_close_blocker(
+        object(),
+        project_id="aming-claw",
+        backlog_id="AC-PRESERVE-CURRENT",
+        current_projection=complete_without_blocker,
+    ) == complete_without_blocker
 
 
 def test_runtime_contract_view_reports_revision_polling_state() -> None:

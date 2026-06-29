@@ -31847,6 +31847,200 @@ def _record_route_token_gate_event(
         log.debug("route_token_gate: failed to record timeline evidence", exc_info=True)
 
 
+def _record_backlog_close_route_action_precheck_event(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+    commit_sha: str = "",
+) -> dict[str, Any]:
+    if not _backlog_close_route_gate_is_source_backed(route_gate):
+        return {}
+    from . import task_timeline
+
+    gate_summary = _route_gate_public_summary(route_gate)
+    verification = {
+        "schema_version": "backlog_close.route_action_precheck.v1",
+        "passed": True,
+        "status": "accepted",
+        "action": "backlog_close",
+        "route_token_gate": gate_summary,
+        "source_backed_contract_gate_authority": (
+            task_timeline.source_backed_route_gate_authority(gate_summary)
+        ),
+    }
+    return task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=str(body.get("task_id") or backlog_id),
+        event_type="contract_runtime.route_action_precheck",
+        phase="route_gate",
+        event_kind="route_action_precheck",
+        actor=str(body.get("actor") or "observer"),
+        status="accepted",
+        decision="accepted",
+        payload={
+            "schema_version": "backlog_close.route_action_precheck.v1",
+            "source": "authoritative_backlog_close",
+            "action": "backlog_close",
+            "route_token_ref": str(route_gate.get("route_token_ref") or ""),
+            "route_token_gate": gate_summary,
+            "contract_execution_id": str(
+                body.get("contract_execution_id")
+                or _onboard_service_execution_id(project_id, backlog_id)
+            ),
+            "close_commit": commit_sha,
+        },
+        verification=verification,
+        commit_sha=commit_sha,
+    )
+
+
+def _record_backlog_close_blocked_event(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    row: Any,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+    gate_error: GovernanceError,
+    route_action_precheck_event: Mapping[str, Any] | None = None,
+    commit_sha: str = "",
+) -> dict[str, Any]:
+    if (
+        gate_error.code != "mf_timeline_gate_failed"
+        or not _backlog_close_route_gate_is_source_backed(route_gate)
+    ):
+        return {}
+    from . import task_timeline
+
+    gate_summary = _route_gate_public_summary(route_gate)
+    details = gate_error.details if isinstance(gate_error.details, Mapping) else {}
+    timeline_gate = (
+        details.get("timeline_gate")
+        if isinstance(details.get("timeline_gate"), Mapping)
+        else {}
+    )
+    failed_gates = list(
+        details.get("failed_gates") if isinstance(details.get("failed_gates"), list) else []
+    )
+    missing_requirement_ids: list[str] = []
+    for key in (
+        "missing_event_kinds",
+        "missing_contract_requirement_ids",
+        "missing_route_context_requirement_ids",
+        "missing_lane_ownership_ids",
+        "missing_close_commit_requirement_ids",
+    ):
+        values = details.get(key)
+        if isinstance(values, list):
+            missing_requirement_ids.extend(
+                str(value) for value in values if str(value)
+            )
+    if isinstance(timeline_gate.get("missing_requirement_ids"), list):
+        missing_requirement_ids.extend(
+            str(value) for value in timeline_gate["missing_requirement_ids"] if str(value)
+        )
+    missing_requirement_ids = list(dict.fromkeys(missing_requirement_ids))
+    parent_execution_id = str(
+        body.get("contract_execution_id")
+        or _onboard_service_execution_id(project_id, backlog_id)
+    ).strip()
+    next_action = _backlog_close_direct_fix_next_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_execution_id,
+        route_token_ref=str(route_gate.get("route_token_ref") or ""),
+    )
+    payload = {
+        "schema_version": "backlog_close.blocked_projection.v1",
+        "source": "authoritative_backlog_close",
+        "status": "blocked",
+        "backlog_id": backlog_id,
+        "row_status": str(_row_get(row, "status", "") or ""),
+        "contract_execution_id": parent_execution_id,
+        "blocked_gate": gate_error.code,
+        "failed_gates": failed_gates,
+        "missing_requirement_ids": missing_requirement_ids,
+        "missing_event_kinds": list(
+            details.get("missing_event_kinds")
+            if isinstance(details.get("missing_event_kinds"), list)
+            else []
+        ),
+        "missing_contract_requirement_ids": list(
+            details.get("missing_contract_requirement_ids")
+            if isinstance(details.get("missing_contract_requirement_ids"), list)
+            else []
+        ),
+        "missing_route_context_requirement_ids": list(
+            details.get("missing_route_context_requirement_ids")
+            if isinstance(details.get("missing_route_context_requirement_ids"), list)
+            else []
+        ),
+        "missing_close_commit_requirement_ids": list(
+            details.get("missing_close_commit_requirement_ids")
+            if isinstance(details.get("missing_close_commit_requirement_ids"), list)
+            else []
+        ),
+        "route_token_ref": str(route_gate.get("route_token_ref") or ""),
+        "route_token_gate": gate_summary,
+        "route_action_precheck_event_ref": (
+            f"timeline:{route_action_precheck_event.get('id')}"
+            if isinstance(route_action_precheck_event, Mapping)
+            and route_action_precheck_event.get("id")
+            else ""
+        ),
+        "close_commit": commit_sha,
+        "next_legal_action": next_action,
+        "candidate_runtime_target_truth_activated": False,
+    }
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=str(body.get("task_id") or backlog_id),
+        event_type="backlog.close.blocked",
+        phase="close_gate",
+        event_kind="backlog_close_blocked",
+        actor=str(body.get("actor") or "observer"),
+        status="blocked",
+        decision="blocked",
+        payload=payload,
+        verification={
+            "schema_version": "backlog_close.blocked_projection.v1",
+            "passed": False,
+            "status": "blocked",
+            "blocked_gate": gate_error.code,
+            "route_token_gate": gate_summary,
+            "timeline_gate": timeline_gate,
+        },
+        commit_sha=commit_sha,
+    )
+    payload["next_legal_action"] = _backlog_close_direct_fix_next_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_execution_id,
+        blocked_event_id=int(event.get("id") or 0),
+        route_token_ref=str(route_gate.get("route_token_ref") or ""),
+    )
+    event["payload"] = payload
+    try:
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                int(event.get("id") or 0),
+            ),
+        )
+    except Exception:
+        log.debug("backlog_close_blocked: failed to refresh payload", exc_info=True)
+    return event
+
+
 @route("POST", "/api/task/{project_id}/create")
 def handle_task_create(ctx: RequestContext):
     """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'.
@@ -34709,6 +34903,246 @@ def _contract_chain_current_projection(
         }
 
 
+def _backlog_close_route_gate_is_source_backed(route_gate: Mapping[str, Any]) -> bool:
+    if not isinstance(route_gate, Mapping) or not route_gate:
+        return False
+    if str(route_gate.get("action") or "").strip() != "backlog_close":
+        return False
+    if not str(route_gate.get("route_token_ref") or "").strip():
+        return False
+    decision = str(route_gate.get("decision") or route_gate.get("status") or "").strip()
+    if decision not in {"route_token_ref_resolved", "accepted", "passed", "ok"}:
+        return False
+    return bool(
+        route_gate.get("resolved_from_ref")
+        or route_gate.get("server_issued_binding")
+        or route_gate.get("registry_verified")
+        or str(route_gate.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+    )
+
+
+def _backlog_close_direct_fix_next_action(
+    *,
+    project_id: str,
+    backlog_id: str,
+    parent_contract_execution_id: str,
+    blocked_event_id: int = 0,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    parent_execution_id = str(parent_contract_execution_id or "").strip()
+    if not parent_execution_id:
+        return {}
+    successor_execution_id = _direct_fix_successor_execution_id(
+        project_id,
+        backlog_id,
+        parent_execution_id,
+    )
+    return_to_parent = {
+        "schema_version": "direct_fix.return_to_parent_projection.v1",
+        "parent_contract_execution_id": parent_execution_id,
+        "return_to_stage_id": "backlog_close",
+        "return_to_line_id": "backlog_close",
+        "blocked_gate": "mf_timeline_gate_failed",
+        "latest_timeline_event_id": blocked_event_id,
+        "parent_close_gate_recheck_required": True,
+        "child_must_not_write_parent_close_evidence": True,
+    }
+    body = {
+        "backlog_id": backlog_id,
+        "parent_contract_execution_id": parent_execution_id,
+        "contract_execution_id": successor_execution_id,
+        "reason": (
+            "Repair authoritative backlog_close close-gate blockers and "
+            "return to parent."
+        ),
+        "blocked_successor_entry": {
+            "status": "blocked",
+            "blocked_successor_contract_id": "backlog_close",
+            "blocker_id": "mf_timeline_gate_failed",
+            "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+            "recommended_next_action": "enter_direct_fix_successor",
+            "latest_timeline_event_id": blocked_event_id,
+        },
+        "return_to_parent": return_to_parent,
+    }
+    if route_token_ref:
+        body["route_token_ref"] = route_token_ref
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "direct_fix_successor",
+        "action": "enter_direct_fix_successor",
+        "mode": "resume_blocked_contract",
+        "source": "task_timeline.backlog_close_blocked",
+        "precedence": "authoritative_backlog_close_blocker",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "stage_id": "blocked",
+        "line_id": "direct_fix_successor",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "evidence_kind": "blocked_backlog_close_gate",
+        "status": "blocked",
+        "required": True,
+        "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+        "recommended_successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
+        "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
+        "successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
+        "parent_contract_execution_id": parent_execution_id,
+        "successor_contract_execution_id": successor_execution_id,
+        "requires_route_token_ref": True,
+        "child_route_token_required": True,
+        "endpoint": f"/api/projects/{project_id}/direct-fix/enter",
+        "body": body,
+        "return_to_parent": return_to_parent,
+        "latest_timeline_event_id": blocked_event_id,
+        "next_operator_action": "enter_direct_fix_successor",
+        "block_reason": (
+            "authoritative backlog_close reported close-gate blockers after a "
+            "source-backed close attempt"
+        ),
+        "meta_contract_gate_decision_source": False,
+    }
+
+
+def _latest_source_backed_backlog_close_blocker_event(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    try:
+        row = conn.execute(
+            "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row and str(_row_get(row, "status", "") or "") not in {"OPEN", "MF_IN_PROGRESS"}:
+        return {}
+
+    from . import task_timeline
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        event_kind="backlog_close_blocked",
+        limit=1000,
+    )
+    for event in sorted(events, key=lambda item: int(item.get("id") or 0), reverse=True):
+        if str(event.get("status") or "").strip().lower() not in {"blocked", "failed"}:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if str(payload.get("source") or "") != "authoritative_backlog_close":
+            continue
+        route_gate = (
+            payload.get("route_token_gate")
+            if isinstance(payload.get("route_token_gate"), Mapping)
+            else {}
+        )
+        if not _backlog_close_route_gate_is_source_backed(route_gate):
+            continue
+        return dict(event)
+    return {}
+
+
+def _contract_chain_current_with_backlog_close_blocker(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    current_projection: Mapping[str, Any],
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    current = dict(current_projection or {})
+    if not current:
+        return current
+    next_action = (
+        current.get("next_legal_action")
+        if isinstance(current.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if next_action or str(current.get("active_child_contract_execution_id") or "").strip():
+        return current
+    if str(current.get("readiness_state") or "") != "contract_complete":
+        return current
+    event = _latest_source_backed_backlog_close_blocker_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if not event:
+        return current
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    parent_execution_id = (
+        str(payload.get("contract_execution_id") or "").strip()
+        or str(current.get("current_contract_execution_id") or "").strip()
+        or _onboard_service_execution_id(project_id, backlog_id)
+    )
+    action = (
+        payload.get("next_legal_action")
+        if isinstance(payload.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if not action:
+        action = _backlog_close_direct_fix_next_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=parent_execution_id,
+            blocked_event_id=int(event.get("id") or 0),
+            route_token_ref=route_token_ref
+            or str(payload.get("route_token_ref") or "").strip(),
+        )
+    if not action:
+        return current
+    overlay = dict(current)
+    overlay.update(
+        {
+            "current_contract_execution_id": parent_execution_id,
+            "parent_to_resume_contract_execution_id": "",
+            "active_child_contract_execution_id": "",
+            "readiness_state": "blocked",
+            "next_legal_action": dict(action),
+            "source_of_proof": "task_timeline.backlog_close_blocked",
+            "blocked_parent_state": {
+                "schema_version": "backlog_contract_chain.blocked_parent_state.v1",
+                "status": "blocked",
+                "source": "authoritative_backlog_close",
+                "event_ref": f"timeline:{event.get('id')}",
+                "event_kind": str(event.get("event_kind") or ""),
+                "missing_requirement_ids": list(
+                    payload.get("missing_requirement_ids")
+                    if isinstance(payload.get("missing_requirement_ids"), list)
+                    else []
+                ),
+                "failed_gates": list(
+                    payload.get("failed_gates")
+                    if isinstance(payload.get("failed_gates"), list)
+                    else []
+                ),
+                "route_action_precheck_event_ref": str(
+                    payload.get("route_action_precheck_event_ref") or ""
+                ),
+                "close_commit": str(payload.get("close_commit") or ""),
+                "route_token_ref": str(payload.get("route_token_ref") or ""),
+            },
+            "shadowed_current_projection": {
+                "readiness_state": str(current.get("readiness_state") or ""),
+                "current_contract_execution_id": str(
+                    current.get("current_contract_execution_id") or ""
+                ),
+                "projection_hash": str(current.get("projection_hash") or ""),
+                "source_of_proof": str(current.get("source_of_proof") or ""),
+            },
+        }
+    )
+    overlay["projection_hash"] = stable_sha256(
+        {key: value for key, value in overlay.items() if key != "projection_hash"}
+    )
+    return overlay
+
+
 def _contract_chain_current_response(
     conn,
     *,
@@ -34722,6 +35156,13 @@ def _contract_chain_current_response(
         project_id=project_id,
         backlog_id=backlog_id,
         rebuild_if_missing=rebuild_if_missing,
+        route_token_ref=route_token_ref,
+    )
+    current_projection = _contract_chain_current_with_backlog_close_blocker(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        current_projection=current_projection,
         route_token_ref=route_token_ref,
     )
     return {
@@ -39457,6 +39898,13 @@ def _onboard_route_guide_service_response(
         project_id=project_id,
         backlog_id=backlog_id,
         rebuild_if_missing=True,
+        route_token_ref=route_token_ref,
+    )
+    current_projection = _contract_chain_current_with_backlog_close_blocker(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        current_projection=current_projection,
         route_token_ref=route_token_ref,
     )
     projection_degraded = bool(current_projection.get("degraded"))
@@ -55144,14 +55592,38 @@ def handle_backlog_close(ctx: RequestContext):
             body=body,
             commit_sha=commit_sha,
         )
-        timeline_gate = _verify_mf_close_timeline_gate(
+        route_action_precheck_event = _record_backlog_close_route_action_precheck_event(
             conn,
-            pid,
-            bug_id,
-            row,
-            body,
+            project_id=pid,
+            backlog_id=bug_id,
+            body=body,
             route_gate=route_gate,
+            commit_sha=commit_sha,
         )
+        try:
+            timeline_gate = _verify_mf_close_timeline_gate(
+                conn,
+                pid,
+                bug_id,
+                row,
+                body,
+                route_gate=route_gate,
+            )
+        except GovernanceError as exc:
+            blocked_event = _record_backlog_close_blocked_event(
+                conn,
+                project_id=pid,
+                backlog_id=bug_id,
+                row=row,
+                body=body,
+                route_gate=route_gate,
+                gate_error=exc,
+                route_action_precheck_event=route_action_precheck_event,
+                commit_sha=commit_sha,
+            )
+            if blocked_event:
+                conn.commit()
+            raise
         identity_block = _backlog_close_route_waiver_identity_block(
             route_gate,
             timeline_gate,
