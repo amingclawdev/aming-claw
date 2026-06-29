@@ -34663,7 +34663,7 @@ def _onboard_runtime_resume_from_current_projection(
     status = readiness_state
     if readiness_state == "parent_resume_required_after_direct_fix_qa":
         status = "returned"
-    return {
+    resume = {
         "schema_version": "onboard_route_guide.runtime_resume.v1",
         "status": status,
         "readiness_state": readiness_state,
@@ -34691,6 +34691,14 @@ def _onboard_runtime_resume_from_current_projection(
         ),
         "projection_hash": str(current_projection.get("projection_hash") or ""),
     }
+    if readiness_state == "parent_resume_required_after_direct_fix_qa":
+        resume["branch_service_takeover"] = (
+            _direct_fix_branch_service_takeover_guidance()
+        )
+        resume["next_runtime_service_action"] = (
+            "run_direct_fix_branch_service_on_canonical_port_then_reenter_parent"
+        )
+    return resume
 
 
 def _source_backed_contract_chain_is_complete(
@@ -37043,6 +37051,42 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
     }
 
 
+def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.branch_service_takeover.v1",
+        "id": "direct_fix_branch_service_takeover",
+        "purpose": "run QA-passed direct-fix branch code before returning to parent",
+        "canonical_port_required": True,
+        "canonical_port": 40000,
+        "state_sharing": "reuse_existing_shared_volume",
+        "steps": [
+            "confirm direct-fix implementation and independent QA have passed",
+            "stop the current governance process bound to canonical port 40000",
+            "start governance from the direct-fix worktree on canonical port 40000",
+            "reuse the existing shared-volume state so contract/runtime lineage remains visible",
+            "re-enter the parent backlog row through onboard_route_guide",
+        ],
+        "forbidden_shortcuts": [
+            "do_not_use_governance_redeploy_until_worktree_isolated_redeploy_exists",
+            "do_not_checkout_the_shared_operator_worktree_to_the_direct_fix_commit",
+            "do_not_treat_a_side_port_branch_service_as_parent_resume_unless_clients_are_rebound",
+            "do_not_merge_direct_fix_before_merge_queue_unless_operator_explicitly_approves",
+        ],
+        "safe_when": [
+            "direct_fix_branch_clean",
+            "main_worktree_clean_or_dirty_scope_recorded",
+            "operator_approval_recorded",
+            "qa_pass_evidence_recorded",
+            "mcp_and_onboard_clients_continue_to_target_canonical_port",
+        ],
+        "verification": [
+            "GET /api/health reports the direct-fix commit version",
+            "runtime_status reports governance.version at the direct-fix commit",
+            "onboard_route_guide for the parent row returns the expected runtime_resume",
+        ],
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -37615,6 +37659,18 @@ def _onboard_contract_route_guide(
                     "kind": "mcp",
                     "mcp_tool": "governance_redeploy",
                     "gated": True,
+                    "worktree_isolated": False,
+                    "warning": (
+                        "Do not use governance_redeploy for QA-passed direct-fix "
+                        "branch service takeover until worktree-isolated redeploy "
+                        "exists; current manager redeploy may checkout the shared "
+                        "operator worktree."
+                    ),
+                },
+                "direct_fix_branch_service_takeover": {
+                    "kind": "operator_cli",
+                    "gated": True,
+                    **_direct_fix_branch_service_takeover_guidance(),
                 },
                 "reconcile": {
                     "kind": "mcp_or_http",
