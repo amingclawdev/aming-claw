@@ -32006,6 +32006,7 @@ def _record_backlog_close_blocked_event(
         backlog_id=backlog_id,
         parent_contract_execution_id=parent_execution_id,
         route_token_ref=str(route_gate.get("route_token_ref") or ""),
+        blocked_gate=gate_error.code,
     )
     payload = {
         "schema_version": "backlog_close.blocked_projection.v1",
@@ -32078,6 +32079,7 @@ def _record_backlog_close_blocked_event(
         parent_contract_execution_id=parent_execution_id,
         blocked_event_id=int(event.get("id") or 0),
         route_token_ref=str(route_gate.get("route_token_ref") or ""),
+        blocked_gate=gate_error.code,
     )
     event["payload"] = payload
     try:
@@ -34981,10 +34983,12 @@ def _backlog_close_direct_fix_next_action(
     parent_contract_execution_id: str,
     blocked_event_id: int = 0,
     route_token_ref: str = "",
+    blocked_gate: str = "mf_timeline_gate_failed",
 ) -> dict[str, Any]:
     parent_execution_id = str(parent_contract_execution_id or "").strip()
     if not parent_execution_id:
         return {}
+    blocker_id = str(blocked_gate or "").strip() or "mf_timeline_gate_failed"
     successor_execution_id = _direct_fix_successor_execution_id(
         project_id,
         backlog_id,
@@ -34995,7 +34999,7 @@ def _backlog_close_direct_fix_next_action(
         "parent_contract_execution_id": parent_execution_id,
         "return_to_stage_id": "backlog_close",
         "return_to_line_id": "backlog_close",
-        "blocked_gate": "mf_timeline_gate_failed",
+        "blocked_gate": blocker_id,
         "latest_timeline_event_id": blocked_event_id,
         "parent_close_gate_recheck_required": True,
         "child_must_not_write_parent_close_evidence": True,
@@ -35011,7 +35015,7 @@ def _backlog_close_direct_fix_next_action(
         "blocked_successor_entry": {
             "status": "blocked",
             "blocked_successor_contract_id": "backlog_close",
-            "blocker_id": "mf_timeline_gate_failed",
+            "blocker_id": blocker_id,
             "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
             "recommended_next_action": "enter_direct_fix_successor",
             "latest_timeline_event_id": blocked_event_id,
@@ -35132,20 +35136,16 @@ def _contract_chain_current_with_backlog_close_blocker(
         or str(current.get("current_contract_execution_id") or "").strip()
         or _onboard_service_execution_id(project_id, backlog_id)
     )
-    action = (
-        payload.get("next_legal_action")
-        if isinstance(payload.get("next_legal_action"), Mapping)
-        else {}
+    blocked_gate = str(payload.get("blocked_gate") or "").strip()
+    action = _backlog_close_direct_fix_next_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        parent_contract_execution_id=parent_execution_id,
+        blocked_event_id=int(event.get("id") or 0),
+        route_token_ref=route_token_ref
+        or str(payload.get("route_token_ref") or "").strip(),
+        blocked_gate=blocked_gate,
     )
-    if not action:
-        action = _backlog_close_direct_fix_next_action(
-            project_id=project_id,
-            backlog_id=backlog_id,
-            parent_contract_execution_id=parent_execution_id,
-            blocked_event_id=int(event.get("id") or 0),
-            route_token_ref=route_token_ref
-            or str(payload.get("route_token_ref") or "").strip(),
-        )
     if not action:
         return current
     overlay = dict(current)

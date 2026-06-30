@@ -31287,6 +31287,33 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
         "enter_direct_fix_successor"
     )
     assert blocked_payload["next_legal_action"]["successor_contract_id"] == "direct_fix"
+    assert blocked_payload["next_legal_action"]["body"][
+        "blocked_successor_entry"
+    ]["blocker_id"] == "missing_contract_runtime_close_authority"
+    assert blocked_payload["next_legal_action"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
+    assert blocked_payload["next_legal_action"]["body"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
+
+    stale_payload = json.loads(json.dumps(blocked_payload))
+    stale_action = stale_payload["next_legal_action"]
+    stale_action["body"]["blocked_successor_entry"][
+        "blocker_id"
+    ] = "mf_timeline_gate_failed"
+    stale_action["return_to_parent"]["blocked_gate"] = "mf_timeline_gate_failed"
+    stale_action["body"]["return_to_parent"][
+        "blocked_gate"
+    ] = "mf_timeline_gate_failed"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(stale_payload, sort_keys=True, separators=(",", ":")),
+            blocked[0]["id"],
+        ),
+    )
+    conn.commit()
 
     current = server.handle_project_contract_chain_current(
         _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
@@ -31298,6 +31325,18 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
     assert current["next_legal_action"]["parent_contract_execution_id"] == (
         parent_execution_id
     )
+    assert current["next_legal_action"]["body"]["blocked_successor_entry"][
+        "blocker_id"
+    ] == "missing_contract_runtime_close_authority"
+    assert current["next_legal_action"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
+    assert current["next_legal_action"]["body"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
+    assert current["authority_projection"]["next_legal_action"][
+        "return_to_parent"
+    ]["blocked_gate"] == "missing_contract_runtime_close_authority"
 
     guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
@@ -31315,6 +31354,18 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
     assert guide["contract_chain_current"]["readiness_state"] == "blocked"
     assert guide["runtime_resume"]["status"] == "blocked"
     assert guide["next_legal_action"]["action"] == "enter_direct_fix_successor"
+    assert guide["next_legal_action"]["body"]["blocked_successor_entry"][
+        "blocker_id"
+    ] == "missing_contract_runtime_close_authority"
+    assert guide["next_legal_action"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
+    assert guide["runtime_resume"]["next_legal_action"]["body"][
+        "blocked_successor_entry"
+    ]["blocker_id"] == "missing_contract_runtime_close_authority"
+    assert guide["runtime_resume"]["next_legal_action"]["return_to_parent"][
+        "blocked_gate"
+    ] == "missing_contract_runtime_close_authority"
 
 
 def test_backlog_close_blocker_projection_requires_source_backed_route_token_ref(
