@@ -14395,6 +14395,174 @@ def test_cross_ref_repair_projects_parent_row_child_tasks_and_merge_queue():
     assert compact_cross_ref["append_payload_hint"]["merge_queue_id"] == "mq-sibling"
 
 
+def test_gate_summaries_treat_legacy_timeline_missing_as_advisory_under_contract_runtime():
+    from agent.governance import task_timeline
+
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "status": "failed",
+        "missing_event_kinds": ["close_ready"],
+        "event_count": 3,
+        "close_authority": {
+            "schema_version": "contract_runtime_close_authority.v1",
+            "source": "contract_runtime_close_authority_projection",
+            "legacy": False,
+            "advisory": False,
+            "authoritative": True,
+            "close_authoritative": True,
+            "can_close_authoritative": True,
+            "replacement_authority": [
+                "mf_timeline_precheck",
+                "legacy_mf_timeline_gate",
+            ],
+        },
+        "close_timeline_startup_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": ["finish_time_worker_attestation"],
+        },
+        "contract_projection_gate": {
+            "schema_version": "mf_contract_projection_close_gate.v1",
+            "required": True,
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": ["mf_subagent_read_receipt_gate"],
+        },
+    }
+
+    compact = task_timeline.compact_gate_summary(full_gate)
+
+    assert compact["can_close"] is False
+    assert compact["missing_event_kinds"] == []
+    assert compact["legacy_mf_timeline_precheck_advisory"] is True
+    assert compact["legacy_mf_timeline_missing_event_kinds"] == ["close_ready"]
+    compact_failed = {item["gate"]: item for item in compact["failed_gates"]}
+    assert "contract_projection_gate" in compact_failed
+    assert "close_timeline_startup_gate" not in compact_failed
+    compact_legacy = {
+        item["gate"]: item
+        for item in compact["legacy_mf_timeline_failed_gates"]
+    }
+    assert compact_legacy["close_timeline_startup_gate"]["historical"] is True
+    assert compact_legacy["close_timeline_startup_gate"][
+        "suppressed_by_contract_runtime_close_authority"
+    ] is True
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+
+    assert repair["can_close"] is False
+    assert repair["missing_event_kinds"] == []
+    assert repair["missing_event_repairs"] == []
+    assert repair["legacy_mf_timeline_precheck_advisory"] is True
+    assert repair["legacy_mf_timeline_missing_event_repairs"] == [
+        {
+            "event_kind": "close_ready",
+            "advisory_only": True,
+            "historical": True,
+            "suppressed_by_contract_runtime_close_authority": True,
+        }
+    ]
+    repair_failed = {item["gate"]: item for item in repair["failed_gate_repairs"]}
+    assert "contract_projection_gate" in repair_failed
+    assert "close_timeline_startup_gate" not in repair_failed
+    repair_legacy = {
+        item["gate"]: item
+        for item in repair["legacy_mf_timeline_failed_gate_repairs"]
+    }
+    assert repair_legacy["close_timeline_startup_gate"]["historical"] is True
+
+
+def test_gate_summaries_do_not_suppress_for_bare_contract_execution_id():
+    from agent.governance import task_timeline
+
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "status": "failed",
+        "missing_event_kinds": ["close_ready"],
+        "event_count": 3,
+        "contract_runtime": {
+            "accepted": True,
+            "contract_execution_id": "cex-unrelated",
+            "source": "contract_runtime",
+        },
+        "close_timeline_startup_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": ["finish_time_worker_attestation"],
+        },
+    }
+
+    compact = task_timeline.compact_gate_summary(full_gate)
+
+    assert compact["missing_event_kinds"] == ["close_ready"]
+    assert "legacy_mf_timeline_precheck_advisory" not in compact
+    assert "close_timeline_startup_gate" in {
+        item["gate"] for item in compact["failed_gates"]
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+
+    assert repair["missing_event_kinds"] == ["close_ready"]
+    assert repair["missing_event_repairs"][0]["event_kind"] == "close_ready"
+    assert "legacy_mf_timeline_precheck_advisory" not in repair
+    assert "close_timeline_startup_gate" in {
+        item["gate"] for item in repair["failed_gate_repairs"]
+    }
+
+
+def test_gate_summaries_do_not_suppress_for_blocked_contract_chain_current():
+    from agent.governance import task_timeline
+
+    full_gate = {
+        "passed": False,
+        "can_close": False,
+        "status": "failed",
+        "missing_event_kinds": ["close_ready"],
+        "event_count": 3,
+        "contract_chain_current": {
+            "schema_version": "contract_chain_current_projection.v1",
+            "source": "backlog_contract_chain_current_projection",
+            "status": "blocked",
+            "close_authority": {
+                "schema_version": "mf_timeline_precheck_close_authority.v1",
+                "source": "backlog_contract_chain_current_projection",
+                "legacy": True,
+                "advisory": True,
+                "authoritative": False,
+                "replacement_authority": [
+                    "contract_runtime",
+                    "contract_gate_kernel",
+                    "backlog_close",
+                ],
+            },
+        },
+        "close_timeline_startup_gate": {
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": ["finish_time_worker_attestation"],
+        },
+    }
+
+    compact = task_timeline.compact_gate_summary(full_gate)
+
+    assert compact["missing_event_kinds"] == ["close_ready"]
+    assert "legacy_mf_timeline_precheck_advisory" not in compact
+    assert "close_timeline_startup_gate" in {
+        item["gate"] for item in compact["failed_gates"]
+    }
+
+    repair = task_timeline.repair_gate_summary(full_gate)
+
+    assert repair["missing_event_kinds"] == ["close_ready"]
+    assert repair["missing_event_repairs"][0]["event_kind"] == "close_ready"
+    assert "legacy_mf_timeline_precheck_advisory" not in repair
+    assert "close_timeline_startup_gate" in {
+        item["gate"] for item in repair["failed_gate_repairs"]
+    }
+
+
 def test_repair_summary_blocks_parent_contract_history_reconstruction():
     from agent.governance import task_timeline
 

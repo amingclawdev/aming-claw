@@ -10348,6 +10348,111 @@ def mf_close_gate_verification(
     }
 
 
+_LEGACY_TIMELINE_ADVISORY_GATE_KEYS = {
+    "close_timeline_startup_gate",
+}
+
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_KEYS = (
+    "close_authority",
+    "authority",
+    "contract_runtime",
+    "contract_chain_current",
+    "contract_chain_current_authority",
+    "contract_runtime_close_authority",
+    "contract_runtime_close_authority_projection",
+)
+
+
+def _explicit_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return _text(value).lower() in {"1", "true", "yes", "authoritative"}
+
+
+def _explicit_false(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    return _text(value).lower() in {"0", "false", "no", "blocked", "failed"}
+
+
+def _explicit_contract_runtime_close_authority(source: Mapping[str, Any]) -> bool:
+    schema = _text(source.get("schema_version")).lower()
+    source_name = _text(
+        source.get("source")
+        or source.get("authority_source")
+        or source.get("projection_source")
+    ).lower()
+    if _explicit_true(source.get("legacy")) or _explicit_true(source.get("advisory")):
+        return False
+    if _explicit_false(source.get("status")) or _explicit_false(source.get("decision")):
+        return False
+    for field_name in ("passed", "accepted", "ok"):
+        if field_name in source and _explicit_false(source.get(field_name)):
+            return False
+    if (
+        _explicit_false(source.get("authoritative"))
+        or _explicit_false(source.get("close_authoritative"))
+        or _explicit_false(source.get("can_close_authoritative"))
+    ):
+        return False
+    if not any(
+        _explicit_true(source.get(key))
+        for key in ("authoritative", "close_authoritative", "can_close_authoritative")
+    ):
+        return False
+    return bool(
+        schema.startswith("contract_runtime_close_authority")
+        or "contract_runtime_close_authority" in schema
+        or "contract_runtime_close_authority" in source_name
+        or _text(source.get("authority_kind")).lower()
+        == "contract_runtime_close_authority"
+        or _text(source.get("kind")).lower() == "contract_runtime_close_authority"
+    )
+
+
+def _contract_runtime_close_authority_present(
+    value: Any,
+    *,
+    _depth: int = 0,
+) -> bool:
+    if _depth > 4:
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contract_runtime_close_authority_present(item, _depth=_depth + 1)
+            for item in value
+        )
+    source = _mapping(value)
+    if not source:
+        return False
+    if _explicit_contract_runtime_close_authority(source):
+        return True
+    for key in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_KEYS:
+        nested = source.get(key)
+        if nested is not value and _contract_runtime_close_authority_present(
+            nested,
+            _depth=_depth + 1,
+        ):
+            return True
+    return False
+
+
+def _legacy_timeline_advisory_gate(
+    key: str,
+    failed_gate: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **failed_gate,
+        "advisory_only": True,
+        "historical": True,
+        "suppressed_by_contract_runtime_close_authority": True,
+    }
+
+
 def compact_gate_summary(
     full_result: dict[str, Any],
     request_id: str = "",
@@ -10368,7 +10473,9 @@ def compact_gate_summary(
         passed = False
     can_close = passed
 
-    missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    raw_missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    legacy_timeline_advisory = _contract_runtime_close_authority_present(full_result)
+    missing_event_kinds = [] if legacy_timeline_advisory else raw_missing_event_kinds
     parent_successor_gap = _parent_successor_close_model_gap(full_result)
 
     gate_keys = [
@@ -10389,6 +10496,7 @@ def compact_gate_summary(
         "contract_runtime_mf_parallel_close_authority_gate",
     ]
     failed_gates = []
+    legacy_failed_gates = []
     for key in gate_keys:
         gate = _mapping(full_result.get(key))
         if not gate:
@@ -10431,6 +10539,11 @@ def compact_gate_summary(
                     value = compact_repair.get(field)
                     if value not in ("", [], {}, None):
                         failed_gate[field] = value
+            if legacy_timeline_advisory and key in _LEGACY_TIMELINE_ADVISORY_GATE_KEYS:
+                legacy_failed_gates.append(
+                    _legacy_timeline_advisory_gate(key, failed_gate)
+                )
+                continue
             failed_gates.append(failed_gate)
 
     # Route identity from route_context_gate
@@ -10459,6 +10572,11 @@ def compact_gate_summary(
                 close_authority.get("replacement_authority") or []
             ),
         }
+    if legacy_timeline_advisory:
+        summary["legacy_mf_timeline_precheck_advisory"] = True
+        summary["legacy_mf_timeline_missing_event_kinds"] = raw_missing_event_kinds
+        if legacy_failed_gates:
+            summary["legacy_mf_timeline_failed_gates"] = legacy_failed_gates
     observer_direct_gate = _mapping(full_result.get("observer_direct_close_exception_gate"))
     if observer_direct_gate.get("required") or observer_direct_gate.get("passed"):
         accepted_exception = _mapping(observer_direct_gate.get("accepted_exception"))
@@ -12017,21 +12135,33 @@ def repair_gate_summary(
     passed = bool(full_result.get("passed") or full_result.get("can_close"))
     if not_applicable:
         passed = False
-    missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    raw_missing_event_kinds = list(full_result.get("missing_event_kinds") or [])
+    legacy_timeline_advisory = _contract_runtime_close_authority_present(full_result)
+    missing_event_kinds = [] if legacy_timeline_advisory else raw_missing_event_kinds
     parent_successor_gap = _parent_successor_close_model_gap(full_result)
     failed_gate_repairs = []
+    legacy_failed_gate_repairs = []
     for key in MF_REPAIR_GATE_KEYS:
         gate = _mapping(full_result.get(key))
         if not gate or bool(gate.get("passed")):
             continue
         repair = _gate_repair_summary(key, gate)
         repair = _gate_repair_with_cross_ref_context(key, repair, full_result)
-        failed_gate_repairs.append(
-            _repair_with_parent_successor_close_model_context(
-                repair,
-                parent_successor_gap,
-            )
+        repair = _repair_with_parent_successor_close_model_context(
+            repair,
+            parent_successor_gap,
         )
+        if legacy_timeline_advisory and key in _LEGACY_TIMELINE_ADVISORY_GATE_KEYS:
+            legacy_failed_gate_repairs.append(
+                {
+                    **repair,
+                    "advisory_only": True,
+                    "historical": True,
+                    "suppressed_by_contract_runtime_close_authority": True,
+                }
+            )
+            continue
+        failed_gate_repairs.append(repair)
 
     missing_event_repairs = [
         {
@@ -12090,6 +12220,21 @@ def repair_gate_summary(
                 close_authority.get("replacement_authority") or []
             ),
         }
+    if legacy_timeline_advisory:
+        summary["legacy_mf_timeline_precheck_advisory"] = True
+        summary["legacy_mf_timeline_missing_event_kinds"] = raw_missing_event_kinds
+        summary["legacy_mf_timeline_missing_event_repairs"] = [
+            {
+                "event_kind": kind,
+                "advisory_only": True,
+                "historical": True,
+                "suppressed_by_contract_runtime_close_authority": True,
+            }
+            for kind in raw_missing_event_kinds
+        ]
+        if legacy_failed_gate_repairs:
+            summary["legacy_mf_timeline_failed_gate_repairs"] = legacy_failed_gate_repairs
+        summary["normal_repair_actions"]["legacy_mf_timeline_precheck_advisory"] = True
     repair_reasons = list(full_result.get("repair_reasons") or [])
     next_legal_actions = list(full_result.get("next_legal_actions") or [])
     if parent_successor_gap:

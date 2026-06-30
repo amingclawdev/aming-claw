@@ -50,6 +50,37 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
+def _contract_runtime_close_authority() -> dict[str, object]:
+    return {
+        "schema_version": "contract_runtime_close_authority.v1",
+        "source": "contract_runtime_close_authority_projection",
+        "legacy": False,
+        "advisory": False,
+        "authoritative": True,
+        "close_authoritative": True,
+        "can_close_authoritative": True,
+        "replacement_authority": [
+            "mf_timeline_precheck",
+            "legacy_mf_timeline_gate",
+        ],
+    }
+
+
+def _legacy_mf_timeline_close_authority() -> dict[str, object]:
+    return {
+        "schema_version": "mf_timeline_precheck_close_authority.v1",
+        "source": "backlog_contract_chain_current_projection",
+        "legacy": True,
+        "advisory": True,
+        "authoritative": False,
+        "replacement_authority": [
+            "contract_runtime",
+            "contract_gate_kernel",
+            "backlog_close",
+        ],
+    }
+
+
 def route_context_consumption_events() -> list[dict[str, object]]:
     return [
         {
@@ -1205,6 +1236,159 @@ def test_scn_mf_wf_006_close_gate_requires_close_ready_merge_commit_and_evidence
     )
     assert missing_result["decision"] == "block"
     assert "missing_close_ready_timeline" in missing_result["evidence"]["errors"]
+
+
+def test_close_gate_treats_legacy_mf_timeline_missing_as_advisory_under_contract_runtime(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["timeline_evidence"] = subject["timeline_evidence"][:-1]
+    subject["contract_runtime"] = {
+        "contract_execution_id": "cex-unit-close",
+        "source": "contract_runtime",
+        "close_authority": _contract_runtime_close_authority(),
+    }
+
+    result = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    evidence = result["evidence"]
+    assert result["decision"] == "allow", evidence["errors"]
+    assert "missing_close_ready_timeline" not in evidence["errors"]
+    assert "mf_timeline_precheck_incomplete" not in evidence["errors"]
+    assert evidence["close_ready_present"] is False
+    assert evidence["mf_timeline_precheck_compatible"] is True
+    assert evidence["mf_timeline_precheck_blocking"] is False
+    assert evidence["legacy_mf_timeline_precheck_advisory"] is True
+    assert evidence["legacy_mf_timeline_missing_event_kinds"] == ["close_ready"]
+    accounting = evidence["close_timeline_accounting"]
+    assert accounting["advisory_only"] is True
+    assert accounting["legacy_mf_timeline_missing_event_kinds"] == ["close_ready"]
+
+
+def test_close_gate_does_not_treat_bare_contract_execution_as_close_authority(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["timeline_evidence"] = subject["timeline_evidence"][:-1]
+    subject["contract_runtime"] = {
+        "accepted": True,
+        "contract_execution_id": "cex-unrelated",
+        "source": "contract_runtime",
+    }
+
+    result = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    evidence = result["evidence"]
+    assert result["decision"] == "block"
+    assert "missing_close_ready_timeline" in evidence["errors"]
+    assert "mf_timeline_precheck_incomplete" in evidence["errors"]
+    assert evidence["legacy_mf_timeline_precheck_advisory"] is False
+    assert evidence["mf_timeline_precheck_blocking"] is True
+
+
+def test_close_gate_does_not_suppress_for_blocked_contract_chain_current(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["timeline_evidence"] = subject["timeline_evidence"][:-1]
+    subject["contract_chain_current"] = {
+        "schema_version": "contract_chain_current_projection.v1",
+        "source": "backlog_contract_chain_current_projection",
+        "status": "blocked",
+        "close_authority": _legacy_mf_timeline_close_authority(),
+    }
+
+    result = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    evidence = result["evidence"]
+    assert result["decision"] == "block"
+    assert "missing_close_ready_timeline" in evidence["errors"]
+    assert "mf_timeline_precheck_incomplete" in evidence["errors"]
+    assert evidence["legacy_mf_timeline_precheck_advisory"] is False
+    assert evidence["mf_timeline_precheck_blocking"] is True
+
+
+def test_close_gate_preserves_contract_runtime_projection_blocker(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["timeline_evidence"] = subject["timeline_evidence"][:-1]
+    subject["contract_runtime"] = {
+        "contract_execution_id": "cex-unit-close",
+        "source": "contract_runtime",
+        "close_authority": _contract_runtime_close_authority(),
+    }
+    subject["contract_projection_gate"] = {
+        "schema_version": "mf_contract_projection_close_gate.v1",
+        "required": True,
+        "passed": False,
+        "status": "failed",
+        "missing_requirement_ids": ["mf_subagent_read_receipt_gate"],
+    }
+
+    result = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    errors = result["evidence"]["errors"]
+    assert result["decision"] == "block"
+    assert "contract_runtime_projection_incomplete" in errors
+    assert "missing_close_ready_timeline" not in errors
+    assert "mf_timeline_precheck_incomplete" not in errors
 
 
 def test_close_gate_counts_child_lane_finish_projection_but_keeps_qa_separate(
