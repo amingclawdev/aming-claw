@@ -36364,6 +36364,10 @@ def _contract_runtime_mf_parallel_context_projection(
 
     if not projected_lines:
         return {}
+    projected_completed_lines = _contract_runtime_merge_projected_completed_lines(
+        completed_lines,
+        projected_lines,
+    )
     return {
         "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
         "source": "runtime_context_worker_evidence",
@@ -36375,12 +36379,64 @@ def _contract_runtime_mf_parallel_context_projection(
         "projected_line_count": len(projected_lines),
         "projected_line_refs": projected_refs,
         "source_refs": source_refs,
-        "projected_completed_lines": completed_lines + projected_lines,
+        "projected_completed_lines": projected_completed_lines,
         "persistence": {
             "mutates_contract_runtime_completed_lines": False,
             "observer_authored_worker_backfill": False,
         },
     }
+
+
+def _contract_runtime_merge_projected_completed_lines(
+    completed_lines: Sequence[Mapping[str, Any]],
+    projected_lines: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    completed = [line for line in completed_lines if isinstance(line, Mapping)]
+    projected = [line for line in projected_lines if isinstance(line, Mapping)]
+    if not projected:
+        return completed
+    projected_by_context: dict[tuple[str, str], list[int]] = {}
+    for index, line in enumerate(projected):
+        for context_key in _contract_runtime_line_context_keys(line):
+            projected_by_context.setdefault(context_key, []).append(index)
+
+    merged: list[Mapping[str, Any]] = []
+    inserted: set[int] = set()
+    for line in completed:
+        merged.append(line)
+        if str(line.get("line_id") or "").strip() != (
+            "observer_dispatch_bounded_workers"
+        ):
+            continue
+        for context_key in _contract_runtime_line_context_keys(line):
+            for projected_index in projected_by_context.get(context_key, []):
+                if projected_index in inserted:
+                    continue
+                merged.append(projected[projected_index])
+                inserted.add(projected_index)
+    for index, line in enumerate(projected):
+        if index not in inserted:
+            merged.append(line)
+    return merged
+
+
+def _contract_runtime_line_context_keys(line: Mapping[str, Any]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for candidate in _contract_runtime_mapping_candidates(line):
+        runtime_context_id = _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+        )
+        task_id = _contract_runtime_mapping_value(
+            candidate,
+            "task_id",
+            "worker_task_id",
+        )
+        if runtime_context_id:
+            keys.add(("runtime_context_id", runtime_context_id))
+        if task_id:
+            keys.add(("task_id", task_id))
+    return keys
 
 
 def _contract_runtime_contexts_for_dispatch_line(
@@ -48094,6 +48150,14 @@ def _contract_runtime_close_authority_projection(
     try:
         runtime.current_guide(contract_execution_id, actor_role="observer")
         record = runtime.store.get(contract_execution_id)
+        record, _runtime_context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                actor_role="observer",
+            )
+        )
     except ContractRuntimeError as exc:
         raise GovernanceError(
             "contract_runtime_close_authority_rejected",

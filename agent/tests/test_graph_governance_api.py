@@ -23904,6 +23904,276 @@ def test_backlog_close_uses_same_completed_contract_runtime_projection_as_preche
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_applies_runtime_context_projection_before_current_state(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-RUNTIME-CONTEXT-PROJECTION"
+    close_commit = "aa6275118745006c8324dfcbeecea62c39e91936"
+    worker_commit = "bb5d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    task_id = "timeline-gate-runtime-context-projection-parent"
+    worker_task_id = "timeline-gate-runtime-context-projection-worker"
+    worker_token = "timeline-gate-runtime-context-projection-token"
+    fence_token = "fence-runtime-context-close-projection"
+    route_identity = {
+        "route_id": "route-runtime-context-close-projection",
+        "route_context_hash": _fake_sha("route-runtime-context-close-projection"),
+        "prompt_contract_id": "rprompt-runtime-context-close-projection",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-context-close-projection"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-runtime-context-close-projection"
+        ),
+        "route_token_ref": "rtok-runtime-context-close-parent",
+    }
+    close_route_token_ref = "rtok-runtime-context-close-projection"
+    worktree = tmp_path / "runtime-context-close-projection"
+    worktree.mkdir()
+
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": fence_token,
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+                "payload": {
+                    **route_identity,
+                    "owned_files": ["agent/governance/server.py"],
+                },
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        parent_task_id=contract_execution_id,
+        fence_token=fence_token,
+        token=worker_token,
+        worktree_path=str(worktree),
+        base_commit="base-runtime-context-close-projection",
+        target_head_commit=worker_commit,
+        merge_queue_id="mq-runtime-context-close-projection",
+        owned_files=("agent/governance/server.py",),
+    )
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": contract_execution_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": contract_execution_id,
+                    "worker_role": "mf_sub",
+                    "owned_files": ["agent/governance/server.py"],
+                    "target_head_commit": worker_commit,
+                    "merge_queue_id": "mq-runtime-context-close-projection",
+                    **route_identity,
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        graph_trace_id="gqt-runtime-context-close-projection",
+        head_commit=worker_commit,
+    )
+
+    qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "commit_sha": worker_commit,
+                "payload": {
+                    **route_identity,
+                    "principal_id": "qa:runtime-context-close-projection",
+                    "verdict": "passed",
+                    "verified_commit": worker_commit,
+                    "changed_files": ["agent/governance/server.py"],
+                },
+            },
+        )
+    )
+    assert qa["ok"] is True
+    assert qa["next_legal_action"]["line_id"] == "observer_merge"
+
+    for stage_id, line_id, evidence_kind, payload in [
+        (
+            "observer_integration",
+            "observer_merge",
+            "merge",
+            {**route_identity, "merge_commit": close_commit},
+        ),
+        (
+            "observer_integration",
+            "observer_reconcile",
+            "reconcile",
+            {**route_identity, "graph_reconciled": True, "scope_reconciled": True},
+        ),
+        (
+            "observer_integration",
+            "observer_close_ready",
+            "close_ready",
+            {
+                **route_identity,
+                "merge_commit": close_commit,
+                "close_readiness": {
+                    "qa_independent_verification": True,
+                    "governance_redeploy": True,
+                    "graph_reconcile": True,
+                },
+            },
+        ),
+    ]:
+        line = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": contract_execution_id},
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "commit_sha": close_commit,
+                    "payload": payload,
+                },
+            )
+        )
+        assert line["ok"] is True, line
+
+    stored = server._contract_runtime_store(conn).get(contract_execution_id)
+    stored_line_ids = {line["line_id"] for line in stored["completed_lines"]}
+    assert "observer_close_ready" in stored_line_ids
+    assert "worker_read_runtime_guide" not in stored_line_ids
+    assert "worker_implementation" not in stored_line_ids
+    assert stored["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[f"contract_runtime:{contract_execution_id}"],
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={
+                "close_commit": close_commit,
+                "contract_execution_id": contract_execution_id,
+            },
+        )
+    )
+    projection = precheck["timeline_gate"].get(
+        "contract_runtime_close_authority_projection"
+    ) or {}
+    projection_gate = projection.get("mf_parallel_close_authority_gate") or {}
+    assert projection_gate.get("missing_requirement_ids") == [], (
+        projection_gate.get("missing_requirement_ids"),
+        projection_gate.get("rejected_evidence_by_requirement"),
+        projection_gate.get("commit_mismatches"),
+    )
+    assert precheck["can_close"] is True, {
+        "failed_gates": precheck["timeline_gate"].get("failed_gates"),
+        "checks": precheck["timeline_gate"].get("checks"),
+        "projection_accepted": projection.get("accepted"),
+        "projection_status": projection.get("status"),
+        "projection_next_legal_action": projection.get("next_legal_action"),
+        "projection_gate_passed": projection_gate.get("passed"),
+        "projection_gate_missing": projection_gate.get("missing_requirement_ids"),
+        "authority_gate": precheck["timeline_gate"].get(
+            "contract_runtime_mf_parallel_close_authority_gate"
+        ),
+    }
+    assert projection["accepted"] is True, projection
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": contract_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
 def test_backlog_close_projects_successor_runtime_lines_when_close_scoped_to_parent(
     conn,
     monkeypatch,
