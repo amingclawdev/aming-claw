@@ -46839,6 +46839,250 @@ def _contract_runtime_close_authority_chain_records(
     return records
 
 
+def _contract_runtime_close_authority_overlap_component_memberships(
+    conn,
+    *,
+    project_id: str,
+    bug_id: str,
+) -> list[dict[str, Any]]:
+    """Find source-backed batch overlap components that include this child row."""
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, backlog_id, task_id, payload_json
+            FROM task_timeline_events
+            WHERE project_id = ? AND event_type = 'mf_batch_parallel.entered'
+            ORDER BY id DESC
+            LIMIT 200
+            """,
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+    memberships: list[dict[str, Any]] = []
+    seen_component_ids: set[str] = set()
+    for row in rows:
+        raw_payload = row["payload_json"] if isinstance(row, sqlite3.Row) else row[3]
+        try:
+            payload = json.loads(raw_payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        batch_id = str(payload.get("batch_id") or "").strip()
+        if not batch_id:
+            continue
+        preflight_gate = (
+            payload.get("preflight_gate")
+            if isinstance(payload.get("preflight_gate"), Mapping)
+            else {}
+        )
+        merge_queue_id = str(
+            payload.get("merge_queue_id")
+            or preflight_gate.get("merge_queue_id")
+            or ""
+        ).strip()
+        for group in preflight_gate.get("dispatch_groups") or []:
+            if not isinstance(group, Mapping):
+                continue
+            if not bool(group.get("overlap_component")):
+                continue
+            backlog_ids = [
+                str(item or "").strip()
+                for item in group.get("backlog_ids") or []
+                if str(item or "").strip()
+            ]
+            if bug_id not in backlog_ids:
+                continue
+            group_index = int(group.get("group_index") or 0)
+            if group_index <= 0:
+                continue
+            component_task_id = str(
+                group.get("task_id")
+                or group.get("component_task_id")
+                or f"{batch_id}:overlap-component:{group_index}"
+            ).strip()
+            if not component_task_id or component_task_id in seen_component_ids:
+                continue
+            seen_component_ids.add(component_task_id)
+            memberships.append(
+                {
+                    "schema_version": (
+                        "contract_runtime.close_authority_overlap_component_membership.v1"
+                    ),
+                    "source": "task_timeline_events.mf_batch_parallel.entered",
+                    "source_event_id": int(
+                        row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                    ),
+                    "batch_backlog_id": str(
+                        row["backlog_id"] if isinstance(row, sqlite3.Row) else row[1]
+                    ),
+                    "batch_task_id": str(
+                        row["task_id"] if isinstance(row, sqlite3.Row) else row[2]
+                    ),
+                    "batch_id": batch_id,
+                    "component_task_id": component_task_id,
+                    "group_index": group_index,
+                    "backlog_ids": backlog_ids,
+                    "child_backlog_id": bug_id,
+                    "merge_queue_id": merge_queue_id,
+                }
+            )
+    return memberships
+
+
+def _contract_runtime_close_authority_timeline_actor_role(
+    event: Mapping[str, Any],
+) -> str:
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    verification = (
+        event.get("verification")
+        if isinstance(event.get("verification"), Mapping)
+        else {}
+    )
+    for value in (
+        event.get("actor_role"),
+        payload.get("actor_role"),
+        payload.get("worker_role"),
+        verification.get("actor_role"),
+        verification.get("worker_role"),
+    ):
+        role = str(value or "").strip().lower()
+        if role in {"observer", "qa", "mf_sub"}:
+            return role
+    actor = str(event.get("actor") or "").strip().lower()
+    if "mf_sub" in actor or "worker" in actor:
+        return "mf_sub"
+    if "qa" in actor:
+        return "qa"
+    if "observer" in actor or "operator" in actor:
+        return "observer"
+    return ""
+
+
+def _contract_runtime_close_authority_timeline_line(
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    event_kind = str(event.get("event_kind") or "").strip()
+    event_type = str(event.get("event_type") or "").strip()
+    normalized = (event_kind or event_type).strip().lower().replace("-", "_")
+    mapping = {
+        "implementation": ("worker_implementation", "implementation"),
+        "worker_implementation": ("worker_implementation", "implementation"),
+        "mf_subagent_finish_gate": ("worker_finish_gate", "mf_subagent_finish_gate"),
+        "worker_finish_gate": ("worker_finish_gate", "mf_subagent_finish_gate"),
+        "independent_verification": (
+            "qa_independent_verification",
+            "independent_verification",
+        ),
+        "qa_independent_verification": (
+            "qa_independent_verification",
+            "independent_verification",
+        ),
+        "merge": ("observer_merge", "merge"),
+        "observer_merge": ("observer_merge", "merge"),
+        "reconcile": ("observer_reconcile", "reconcile"),
+        "observer_reconcile": ("observer_reconcile", "reconcile"),
+        "close_ready": ("observer_close_ready", "close_ready"),
+        "observer_close_ready": ("observer_close_ready", "close_ready"),
+    }
+    if normalized not in mapping:
+        return {}
+    actor_role = _contract_runtime_close_authority_timeline_actor_role(event)
+    if not actor_role:
+        return {}
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    line_id, evidence_kind = mapping[normalized]
+    line = {
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "actor_role": actor_role,
+        "status": str(event.get("status") or event.get("decision") or "passed"),
+        "payload": dict(payload),
+        "verification": (
+            dict(event.get("verification"))
+            if isinstance(event.get("verification"), Mapping)
+            else {}
+        ),
+        "artifact_refs": (
+            dict(event.get("artifact_refs"))
+            if isinstance(event.get("artifact_refs"), Mapping)
+            else {}
+        ),
+        "commit_sha": str(event.get("commit_sha") or payload.get("commit_sha") or ""),
+        "_completed_line_index": int(event.get("_component_line_index") or 0),
+        "_source_ref": f"timeline:{int(event.get('id') or 0)}",
+    }
+    if event.get("task_id"):
+        line.setdefault("task_id", str(event.get("task_id") or ""))
+    return line
+
+
+def _contract_runtime_close_authority_overlap_component_records(
+    conn,
+    *,
+    project_id: str,
+    bug_id: str,
+    memberships: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not memberships:
+        return []
+    from . import task_timeline
+
+    records: list[dict[str, Any]] = []
+    for membership in memberships:
+        component_task_id = str(membership.get("component_task_id") or "").strip()
+        if not component_task_id:
+            continue
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            task_id=component_task_id,
+            limit=1000,
+        )
+        completed_lines: list[dict[str, Any]] = []
+        for index, event in enumerate(events):
+            event = dict(event)
+            event["_component_line_index"] = index
+            line = _contract_runtime_close_authority_timeline_line(event)
+            if line:
+                completed_lines.append(line)
+        if not completed_lines:
+            continue
+        record = {
+            "schema_version": "contract_runtime_close_authority_projected_record.v1",
+            "projection_source": "task_timeline_overlap_component_membership",
+            "project_id": project_id,
+            "backlog_id": bug_id,
+            "contract_execution_id": component_task_id,
+            "contract_id": MF_PARALLEL_RECORD_CONTRACT_ID,
+            "parent_contract_execution_id": str(membership.get("batch_task_id") or ""),
+            "root_contract_execution_id": str(membership.get("batch_task_id") or ""),
+            "contract_chain_id": str(membership.get("batch_id") or ""),
+            "completed_lines": completed_lines,
+            "runtime_guide": {
+                "completed_lines": completed_lines,
+                "next_legal_action": None,
+            },
+            "backlog_lineage": {
+                "project_id": project_id,
+                "backlog_id": bug_id,
+                "task_id": component_task_id,
+                "overlap_component_membership": dict(membership),
+            },
+            "metadata": {
+                "source_backed_projection_bridge": True,
+                "overlap_component_membership": dict(membership),
+            },
+        }
+        records.append(record)
+    return records
+
+
 def _contract_runtime_completed_line_items(
     record: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -47910,6 +48154,33 @@ def _contract_runtime_close_authority_projection(
         project_id=project_id,
         bug_id=bug_id,
     )
+    overlap_component_memberships = (
+        _contract_runtime_close_authority_overlap_component_memberships(
+            conn,
+            project_id=project_id,
+            bug_id=bug_id,
+        )
+    )
+    overlap_component_records = (
+        _contract_runtime_close_authority_overlap_component_records(
+            conn,
+            project_id=project_id,
+            bug_id=bug_id,
+            memberships=overlap_component_memberships,
+        )
+    )
+    if overlap_component_records:
+        seen_projection_ids = {
+            str(item.get("contract_execution_id") or "").strip()
+            for item in chain_records
+        }
+        for component_record in overlap_component_records:
+            component_id = str(
+                component_record.get("contract_execution_id") or ""
+            ).strip()
+            if component_id and component_id not in seen_projection_ids:
+                chain_records.append(component_record)
+                seen_projection_ids.add(component_id)
     if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
         merged_identity = dict(identity)
         for chain_record in chain_records:
@@ -48030,6 +48301,12 @@ def _contract_runtime_close_authority_projection(
         "source_contract_execution_ids": [
             str(item.get("contract_execution_id") or "").strip()
             for item in projection_records
+            if str(item.get("contract_execution_id") or "").strip()
+        ],
+        "overlap_component_memberships": overlap_component_memberships,
+        "projected_overlap_component_task_ids": [
+            str(item.get("contract_execution_id") or "").strip()
+            for item in overlap_component_records
             if str(item.get("contract_execution_id") or "").strip()
         ],
         "projected_completed_line_event_count": projected_line_event_count,
