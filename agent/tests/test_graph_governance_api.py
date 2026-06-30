@@ -27488,6 +27488,265 @@ def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
     assert entered["next_legal_action"]["owner_role"] == "observer"
 
 
+def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
+    backlog_id = "AC-MF-PARALLEL-FAILED-QA-DIRECT-FIX"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-failed-qa-direct-fix",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(
+        conn,
+        onboard["contract_execution_id"],
+    )
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Start mf_parallel lane for failed QA direct-fix test.",
+                "backlog_id": backlog_id,
+                "task_id": "mf-parallel-failed-qa-parent",
+                "route_token_ref": "rtok-mf-parallel-failed-qa-direct-fix",
+                "worker_fence": {
+                    "fence_token": "fence-mf-parallel-failed-qa-direct-fix",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    runtime = server._contract_runtime(conn)
+    execution_id = successor["contract_execution_id"]
+
+    def submit_line(actor_role, stage_id, line_id, evidence_kind, payload=None):
+        runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.store.get(execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if payload is not None:
+            write["payload"] = payload
+        result = runtime.submit_line_write(execution_id, write, actor_role=actor_role)
+        assert result["ok"] is True
+        return result["record"]
+
+    for actor_role, stage_id, line_id, evidence_kind in [
+        (
+            "observer",
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "contract_binding",
+        ),
+        (
+            "observer",
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "dispatch_bounded_worker",
+        ),
+        ("mf_sub", "worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("mf_sub", "worker_startup", "worker_startup", "mf_subagent_startup"),
+        ("mf_sub", "worker_context", "worker_graph_context", "graph_trace"),
+        ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
+        (
+            "mf_sub",
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+        ),
+        ("mf_sub", "worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
+        ("mf_sub", "qa_handoff", "worker_review_ready_handoff", "review_ready"),
+    ]:
+        submit_line(actor_role, stage_id, line_id, evidence_kind)
+
+    submit_line(
+        "qa",
+        "qa",
+        "qa_independent_verification",
+        "independent_verification",
+        payload={
+            "summary": (
+                "Independent QA failed the worker commit because route-token "
+                "refs minted before scope persistence cannot renew."
+            )
+        },
+    )
+
+    current = runtime.current_guide(execution_id, actor_role="observer")
+    assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair failed QA blocker in mf_parallel parent.",
+                "backlog_id": backlog_id,
+                "task_id": "mf-parallel-failed-qa-direct-fix",
+                "parent_contract_execution_id": execution_id,
+                "route_token_ref": "rtok-mf-parallel-failed-qa-direct-fix",
+            },
+        )
+    )
+
+    assert entered["contract_id"] == server.DIRECT_FIX_CONTRACT_ID
+    assert entered["parent_contract_execution_id"] == execution_id
+    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
+    assert entered["return_to_parent"]["return_to_line_id"] == (
+        "qa_independent_verification"
+    )
+    assert entered["return_to_parent"]["blocked_gate"] == "independent_verification"
+
+
+def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
+    backlog_id = "AC-MF-PARALLEL-LATEST-QA-PASS-DIRECT-FIX"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-mf-parallel-latest-qa-pass",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(
+        conn,
+        onboard["contract_execution_id"],
+    )
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Start mf_parallel lane for latest QA direct-fix test.",
+                "backlog_id": backlog_id,
+                "task_id": "mf-parallel-latest-qa-pass-parent",
+                "route_token_ref": "rtok-mf-parallel-latest-qa-pass",
+                "worker_fence": {
+                    "fence_token": "fence-mf-parallel-latest-qa-pass",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    runtime = server._contract_runtime(conn)
+    execution_id = successor["contract_execution_id"]
+
+    def submit_line(actor_role, stage_id, line_id, evidence_kind, payload=None):
+        runtime.current_guide(execution_id, actor_role=actor_role)
+        record = runtime.store.get(execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if payload is not None:
+            write["payload"] = payload
+        result = runtime.submit_line_write(execution_id, write, actor_role=actor_role)
+        assert result["ok"] is True
+        return result["record"]
+
+    for actor_role, stage_id, line_id, evidence_kind in [
+        (
+            "observer",
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "contract_binding",
+        ),
+        (
+            "observer",
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "dispatch_bounded_worker",
+        ),
+        ("mf_sub", "worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("mf_sub", "worker_startup", "worker_startup", "mf_subagent_startup"),
+        ("mf_sub", "worker_context", "worker_graph_context", "graph_trace"),
+        ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
+        (
+            "mf_sub",
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+        ),
+        ("mf_sub", "worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
+        ("mf_sub", "qa_handoff", "worker_review_ready_handoff", "review_ready"),
+    ]:
+        submit_line(actor_role, stage_id, line_id, evidence_kind)
+
+    failed_record = submit_line(
+        "qa",
+        "qa",
+        "qa_independent_verification",
+        "independent_verification",
+        payload={
+            "summary": (
+                "Independent QA failed the worker commit because route-token "
+                "refs minted before scope persistence cannot renew."
+            )
+        },
+    )
+
+    passed_qa = dict(failed_record["completed_lines"][-1])
+    passed_qa["status"] = "passed"
+    passed_qa["payload"] = {
+        "status": "passed",
+        "summary": "Independent QA passed the retry.",
+    }
+    mutated = dict(failed_record)
+    mutated["completed_lines"] = list(failed_record["completed_lines"]) + [passed_qa]
+    mutated["execution_state_revision"] = int(
+        failed_record.get("execution_state_revision") or 1
+    ) + 1
+    runtime.store.update(execution_id, mutated)
+
+    assert server._contract_runtime_latest_failed_qa_line(
+        runtime.store.get(execution_id)
+    ) == {}
+    with pytest.raises(
+        ValidationError,
+        match="parent contract does not allow requested successor",
+    ):
+        server.handle_project_direct_fix_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "actor": "operator",
+                    "reason": "Do not repair when latest QA passed.",
+                    "backlog_id": backlog_id,
+                    "task_id": "mf-parallel-latest-qa-pass-direct-fix",
+                    "parent_contract_execution_id": execution_id,
+                    "route_token_ref": "rtok-mf-parallel-latest-qa-pass",
+                },
+            )
+        )
+
+
 def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     backlog_id = "AC-DIRECT-FIX-BLOCKED-ONBOARD-SERVICE-PARENT"
     _insert_simple_mf_close_backlog(conn, backlog_id)

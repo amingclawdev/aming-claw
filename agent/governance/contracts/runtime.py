@@ -1420,7 +1420,17 @@ _CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
     {"fail", "failed", "failure", "rejected", "blocked"}
 )
 _CONTRACT_COMPLETION_STATUS_FIELDS = frozenset(
-    {"status", "verdict", "outcome", "decision", "result"}
+    {
+        "status",
+        "verdict",
+        "outcome",
+        "decision",
+        "result",
+        "qa_status",
+        "qa_decision",
+        "verification_status",
+        "verification_decision",
+    }
 )
 _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
     {"failed", "failures", "failed_count", "failure_count", "error_count"}
@@ -1518,7 +1528,66 @@ def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         if _contains_contract_completion_blocker(payload):
             return False
+        if _qa_independent_verification_summary_reports_failure(payload):
+            return False
     return True
+
+
+_QA_FAILURE_SUMMARY_FIELDS = frozenset(
+    {
+        "summary",
+        "reason",
+        "decision_summary",
+        "qa_summary",
+        "qa_result_summary",
+        "verification_summary",
+        "failure_summary",
+        "block_reason",
+    }
+)
+_QA_FAILURE_TEXT_MARKERS = (
+    "independent qa failed",
+    "qa failed",
+    "qa rejected",
+    "qa blocked",
+    "verification failed",
+    "verification rejected",
+    "failed worker commit",
+    "failed the worker commit",
+)
+_QA_PASSING_TEXT_MARKERS = (
+    "independent qa passed",
+    "qa passed",
+    "verification passed",
+    "passed qa",
+)
+
+
+def _qa_independent_verification_summary_reports_failure(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if key in _QA_FAILURE_SUMMARY_FIELDS and _qa_failure_text_signal(item):
+                return True
+            if _qa_independent_verification_summary_reports_failure(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_qa_independent_verification_summary_reports_failure(item) for item in value)
+    return False
+
+
+def _qa_failure_text_signal(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = " ".join(
+        value.strip().lower().replace("-", " ").replace("_", " ").split()
+    )
+    if not text:
+        return False
+    if any(marker in text for marker in _QA_PASSING_TEXT_MARKERS):
+        return False
+    return any(marker in text for marker in _QA_FAILURE_TEXT_MARKERS)
 
 
 def _mapping_own_fields_contain_contract_completion_blocker(

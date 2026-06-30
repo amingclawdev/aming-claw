@@ -42676,6 +42676,107 @@ def _direct_fix_blocker_signal(value: Any) -> bool:
     )
 
 
+_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS = frozenset(
+    {
+        "status",
+        "verdict",
+        "outcome",
+        "decision",
+        "result",
+        "qa_status",
+        "qa_decision",
+        "verification_status",
+        "verification_decision",
+    }
+)
+_CONTRACT_RUNTIME_QA_FAILURE_STATUSES = frozenset(
+    {"fail", "failed", "failure", "rejected", "blocked"}
+)
+_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS = frozenset(
+    {
+        "summary",
+        "reason",
+        "decision_summary",
+        "qa_summary",
+        "qa_result_summary",
+        "verification_summary",
+        "failure_summary",
+        "block_reason",
+    }
+)
+_CONTRACT_RUNTIME_QA_FAILURE_TEXT_MARKERS = (
+    "independent qa failed",
+    "qa failed",
+    "qa rejected",
+    "qa blocked",
+    "verification failed",
+    "verification rejected",
+    "failed worker commit",
+    "failed the worker commit",
+)
+_CONTRACT_RUNTIME_QA_PASSING_TEXT_MARKERS = (
+    "independent qa passed",
+    "qa passed",
+    "verification passed",
+    "passed qa",
+)
+
+
+def _contract_runtime_qa_failure_text_signal(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = " ".join(
+        value.strip().lower().replace("-", " ").replace("_", " ").split()
+    )
+    if not text:
+        return False
+    if any(marker in text for marker in _CONTRACT_RUNTIME_QA_PASSING_TEXT_MARKERS):
+        return False
+    return any(marker in text for marker in _CONTRACT_RUNTIME_QA_FAILURE_TEXT_MARKERS)
+
+
+def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if (
+                key in _CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS
+                and str(item or "").strip().lower()
+                in _CONTRACT_RUNTIME_QA_FAILURE_STATUSES
+            ):
+                return True
+            if (
+                key in _CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS
+                and _contract_runtime_qa_failure_text_signal(item)
+            ):
+                return True
+            if _contract_runtime_value_reports_failed_qa(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contract_runtime_value_reports_failed_qa(item) for item in value)
+    return False
+
+
+def _contract_runtime_latest_failed_qa_line(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return {}
+    for index, line in reversed(list(enumerate(completed_lines))):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "qa_independent_verification":
+            continue
+        if not _contract_runtime_value_reports_failed_qa(line):
+            return {}
+        enriched = dict(line)
+        enriched["_completed_line_index"] = index
+        return enriched
+    return {}
+
+
 def _contract_runtime_last_blocked_line(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -43311,25 +43412,40 @@ def _contract_runtime_parent_for_successor(
     )
     blocked_line = _contract_runtime_last_blocked_line(parent_record)
     blocked_successor_id = _contract_runtime_block_successor_id(blocked_line)
-    if (
-        successor_contract_id == DIRECT_FIX_CONTRACT_ID
-        and blocked_successor_id == DIRECT_FIX_CONTRACT_ID
-    ):
+    if successor_contract_id == DIRECT_FIX_CONTRACT_ID:
         direct_fix_definition = runtime.registry.get(
             DIRECT_FIX_CONTRACT_ID,
             version="v1",
             include_deprecated=True,
         )
-        if _direct_fix_definition_allows_parent(direct_fix_definition, parent_record):
-            return parent_record
-        raise ValidationError(
-            "direct_fix contract does not allow this blocked parent contract",
-            {
-                "parent_contract_execution_id": parent_contract_execution_id,
-                "parent_contract_id": str(parent_record.get("contract_id") or ""),
-                "successor_contract_id": successor_contract_id,
-            },
+        direct_fix_parent_allowed = _direct_fix_definition_allows_parent(
+            direct_fix_definition,
+            parent_record,
         )
+        if blocked_successor_id == DIRECT_FIX_CONTRACT_ID:
+            if direct_fix_parent_allowed:
+                return parent_record
+            raise ValidationError(
+                "direct_fix contract does not allow this blocked parent contract",
+                {
+                    "parent_contract_execution_id": parent_contract_execution_id,
+                    "parent_contract_id": str(parent_record.get("contract_id") or ""),
+                    "successor_contract_id": successor_contract_id,
+                },
+            )
+        failed_qa_line = _contract_runtime_latest_failed_qa_line(parent_record)
+        if failed_qa_line and not _runtime_record_is_complete(parent_record):
+            if direct_fix_parent_allowed:
+                return parent_record
+            raise ValidationError(
+                "direct_fix contract does not allow this failed-QA parent contract",
+                {
+                    "parent_contract_execution_id": parent_contract_execution_id,
+                    "parent_contract_id": str(parent_record.get("contract_id") or ""),
+                    "successor_contract_id": successor_contract_id,
+                    "failed_qa_line_id": str(failed_qa_line.get("line_id") or ""),
+                },
+            )
     if not _contract_definition_allows_successor(parent_definition, successor_contract_id):
         raise ValidationError(
             "parent contract does not allow requested successor",
@@ -43896,6 +44012,8 @@ def _direct_fix_successor_runtime_enter(
     )
     chain_id = str(parent_record.get("contract_chain_id") or "")
     blocked_line = _contract_runtime_last_blocked_line(parent_record)
+    if not blocked_line:
+        blocked_line = _contract_runtime_latest_failed_qa_line(parent_record)
     successor_execution_id = contract_execution_id or _direct_fix_successor_execution_id(
         project_id, backlog_id, parent_execution_id
     )

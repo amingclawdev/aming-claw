@@ -744,6 +744,103 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     assert current["readiness_state"] == "contract_active"
 
 
+def test_mf_parallel_failed_qa_summary_resets_completion_path(tmp_path):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel.v1",
+        stages=[
+            {
+                "stage_id": "worker_implementation",
+                "lines": [
+                    {
+                        "line_id": "worker_implementation",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "implementation",
+                    }
+                ],
+            },
+            {
+                "stage_id": "qa",
+                "lines": [
+                    {
+                        "line_id": "qa_independent_verification",
+                        "owner_role": "qa",
+                        "allowed_writer_roles": ["qa"],
+                        "evidence_kind": "independent_verification",
+                        "requires": ["worker_implementation"],
+                    }
+                ],
+            },
+            {
+                "stage_id": "observer_integration",
+                "lines": [
+                    {
+                        "line_id": "observer_merge",
+                        "owner_role": "observer",
+                        "allowed_writer_roles": ["observer"],
+                        "evidence_kind": "merge",
+                        "requires": ["qa_independent_verification"],
+                    }
+                ],
+            },
+        ],
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    record = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-FAILED-QA-SUMMARY",
+        contract_execution_id="cex-mf-parallel-failed-qa-summary",
+        actor_role="observer",
+        route_token_ref="rtok-mf-parallel-failed-qa-summary",
+    )
+
+    runtime.current_guide(record["contract_execution_id"], actor_role="mf_sub")
+    worker_record = runtime.store.get(record["contract_execution_id"])
+    worker = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _write_from(
+            worker_record,
+            actor_role="mf_sub",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        ),
+        actor_role="mf_sub",
+    )
+    assert worker["ok"] is True
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+    qa_write = _write_from(
+        qa_record,
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+        evidence_kind="independent_verification",
+    )
+    qa_write["payload"] = {
+        "summary": (
+            "Independent QA failed the worker commit because legacy route-token "
+            "refs cannot renew."
+        )
+    }
+
+    qa = runtime.submit_line_write(
+        record["contract_execution_id"],
+        qa_write,
+        actor_role="qa",
+    )
+    assert qa["ok"] is True
+
+    guide = runtime.current_guide(record["contract_execution_id"], actor_role="observer")
+    assert guide["next_legal_action"]["line_id"] == "worker_implementation"
+    assert guide["next_legal_action"]["owner_role"] == "mf_sub"
+
+
 def test_direct_fix_qa_evidence_preserves_owner_submitter_provenance(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
