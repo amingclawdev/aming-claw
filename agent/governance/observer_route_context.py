@@ -1269,6 +1269,135 @@ def _row_owned_files(row_dict: Mapping[str, Any]) -> list[str]:
     return owned_files or _row_target_files(row_dict)
 
 
+def _backlog_target_files(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> list[str]:
+    if not backlog_id:
+        return []
+    try:
+        row = conn.execute(
+            """
+            SELECT target_files
+            FROM backlog_bugs
+            WHERE project_id=? AND bug_id=?
+            """,
+            (project_id, backlog_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return []
+    if row is None:
+        return []
+    try:
+        raw = row["target_files"]
+    except (KeyError, TypeError, IndexError):
+        raw = row[0]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = raw
+        return _dedupe(_string_list(parsed))
+    return _json_loads_string_list(raw)
+
+
+def _legacy_row_identity_matches_target_files(
+    row_dict: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    allowed_actions: Sequence[str],
+    target_files: Sequence[str],
+    project_root: Path | str | None,
+) -> bool:
+    issued_at = _parse_utc_datetime(row_dict.get("issued_at")) or _parse_utc_datetime(
+        row_dict.get("created_at")
+    )
+    if issued_at is None:
+        return False
+    try:
+        token = build_observer_write_route_token(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            target_files=target_files,
+            allowed_actions=allowed_actions,
+            ttl_hours=1.0,
+            now=issued_at,
+            project_root=project_root,
+        )
+    except (TypeError, ValueError):
+        return False
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        stored = _string(row_dict.get(field))
+        if stored and stored != _string(token.get(field)):
+            return False
+    return bool(
+        _string(row_dict.get("route_context_hash"))
+        and _string(row_dict.get("prompt_contract_id"))
+    )
+
+
+def _recover_legacy_row_target_files(
+    conn: sqlite3.Connection,
+    row_dict: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    allowed_actions: Sequence[str],
+    requested_target_files: Sequence[str] | None,
+    project_root: Path | str | None,
+    route_token_ref: str,
+) -> list[str]:
+    """Recover old ref rows that predate persisted file-scope columns.
+
+    Recovery only accepts candidate target files that reproduce the stored
+    public route identity. This lets legacy refs renew without trusting caller
+    supplied files or persisting/exposing raw tokens.
+    """
+
+    existing = _row_target_files(row_dict)
+    if existing:
+        return existing
+    candidates: list[list[str]] = []
+    for candidate in (
+        _dedupe(_string_list(requested_target_files or [])),
+        _backlog_target_files(conn, project_id=project_id, backlog_id=backlog_id),
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if _legacy_row_identity_matches_target_files(
+            row_dict,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_actions=allowed_actions,
+            target_files=candidate,
+            project_root=project_root,
+        ):
+            return candidate
+    raise RouteTokenRefError(
+        f"route_token_ref {route_token_ref!r} cannot renew without verified stored target_files",
+        code="route_token_ref_target_files_missing",
+        details={
+            "field": "target_files",
+            "route_token_ref": route_token_ref,
+            "legacy_scope_recovery_attempted": bool(candidates),
+        },
+    )
+
+
 def _registry_public_payload(
     row_dict: Mapping[str, Any],
     *,
@@ -2203,15 +2332,27 @@ def renew_route_token_ref(
             _row_allowed_actions(row_dict),
             route_token_ref=old_ref,
         )
+        stored_target_files = _recover_legacy_row_target_files(
+            conn,
+            row_dict,
+            project_id=project_id,
+            backlog_id=stored_backlog,
+            task_id=stored_task,
+            allowed_actions=renewed_actions,
+            requested_target_files=target_files,
+            project_root=project_root,
+            route_token_ref=old_ref,
+        )
+        stored_owned_files = _row_owned_files(row_dict) or list(stored_target_files)
         renewed_target_files = _subset_or_same(
             target_files or [],
-            _row_target_files(row_dict),
+            stored_target_files,
             field="target_files",
             route_token_ref=old_ref,
         )
         renewed_owned_files = _subset_or_same(
             owned_files or [],
-            _row_owned_files(row_dict),
+            stored_owned_files,
             field="owned_files",
             route_token_ref=old_ref,
         )
