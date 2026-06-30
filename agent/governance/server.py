@@ -35188,6 +35188,144 @@ def _contract_chain_current_with_backlog_close_blocker(
     return overlay
 
 
+def _contract_chain_current_runtime_authority_projection(
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not current_projection:
+        return {}
+    if str(current_projection.get("projection_source") or "") != (
+        "backlog_contract_chain_current"
+    ):
+        return {}
+    if bool(current_projection.get("degraded")):
+        return {}
+
+    next_action = (
+        dict(current_projection.get("next_legal_action"))
+        if isinstance(current_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    current_execution_id = str(
+        current_projection.get("current_contract_execution_id") or ""
+    ).strip()
+    active_child_execution_id = str(
+        current_projection.get("active_child_contract_execution_id") or ""
+    ).strip()
+    root_execution_id = str(
+        current_projection.get("root_contract_execution_id") or ""
+    ).strip()
+    if not (current_execution_id or active_child_execution_id or root_execution_id):
+        return {}
+
+    next_action_id = str(
+        next_action.get("id") or next_action.get("line_id") or ""
+    ).strip()
+    if next_action_id:
+        semantic_blocker_reason = str(
+            next_action.get("semantic_blocker_reason")
+            or next_action.get("block_reason")
+            or next_action.get("detail")
+            or ""
+        ).strip()
+        if not semantic_blocker_reason:
+            evidence_kind = str(next_action.get("evidence_kind") or "").strip()
+            semantic_blocker_reason = (
+                "ContractRuntime current projection is waiting for "
+                f"{next_action_id}"
+                + (f" ({evidence_kind})" if evidence_kind else "")
+            )
+    else:
+        semantic_blocker_reason = (
+            "ContractRuntime current projection has no missing runtime line; "
+            "legacy route_action_precheck remains historical/advisory only."
+        )
+
+    legacy_advisory = {
+        "schema_version": "legacy_route_action_precheck_authority.v1",
+        "id": "route_action_precheck",
+        "legacy": True,
+        "historical": True,
+        "advisory_only": True,
+        "required": False,
+        "authorization_blocker": False,
+        "ignored_as_next_legal_action": True,
+        "source": "legacy_route_action_precheck",
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "backlog_contract_chain_current",
+        "replacement_authority": [
+            "contract_runtime",
+            "backlog_contract_chain_current",
+        ],
+        "semantic_blocker_reason": semantic_blocker_reason,
+        "message": (
+            "route_action_precheck is retained as legacy route diagnostics only; "
+            "ContractRuntime/backlog_contract_chain_current supplies the next "
+            "legal action for this row."
+        ),
+    }
+    authority = {
+        "schema_version": "contract_chain_current.authority_projection.v1",
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "backlog_contract_chain_current",
+        "projection_source": "backlog_contract_chain_current",
+        "readiness_state": str(current_projection.get("readiness_state") or ""),
+        "contract_chain_id": str(current_projection.get("contract_chain_id") or ""),
+        "root_contract_execution_id": root_execution_id,
+        "current_contract_execution_id": current_execution_id,
+        "active_child_contract_execution_id": active_child_execution_id,
+        "current_contract_id": str(current_projection.get("current_contract_id") or ""),
+        "next_legal_action_source": str(
+            next_action.get("source")
+            or current_projection.get("source_of_proof")
+            or "backlog_contract_chain_current"
+        ),
+        "required_next_action_id": next_action_id,
+        "semantic_blocker_reason": semantic_blocker_reason,
+        "legacy_route_action_precheck": legacy_advisory,
+    }
+    if next_action:
+        authority["next_legal_action"] = next_action
+    source_refs = current_projection.get("source_refs")
+    if isinstance(source_refs, list):
+        authority["source_refs"] = list(source_refs)
+    return authority
+
+
+def _contract_chain_current_with_runtime_authority_overlay(
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    current = dict(current_projection or {})
+    authority = _contract_chain_current_runtime_authority_projection(current)
+    if not authority:
+        return current
+
+    legacy_advisory = dict(authority.get("legacy_route_action_precheck") or {})
+    current["source_of_authority"] = "contract_runtime"
+    current["authority_decision_source"] = "backlog_contract_chain_current"
+    current["authority_projection"] = authority
+    current["legacy_route_action_precheck_advisory"] = legacy_advisory
+    next_action = (
+        dict(current.get("next_legal_action"))
+        if isinstance(current.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if next_action:
+        next_action.setdefault("source_of_authority", "contract_runtime")
+        next_action.setdefault(
+            "authority_decision_source", "backlog_contract_chain_current"
+        )
+        next_action.setdefault(
+            "semantic_blocker_reason",
+            str(authority.get("semantic_blocker_reason") or ""),
+        )
+        next_action.setdefault(
+            "legacy_route_action_precheck_advisory", legacy_advisory
+        )
+        current["next_legal_action"] = next_action
+        authority["next_legal_action"] = dict(next_action)
+    return current
+
+
 def _contract_chain_current_response(
     conn,
     *,
@@ -35210,6 +35348,9 @@ def _contract_chain_current_response(
         current_projection=current_projection,
         route_token_ref=route_token_ref,
     )
+    current_projection = _contract_chain_current_with_runtime_authority_overlay(
+        current_projection
+    )
     return {
         "ok": True,
         "project_id": project_id,
@@ -35225,6 +35366,9 @@ def _onboard_runtime_resume_from_current_projection(
 ) -> dict[str, Any]:
     if not current_projection:
         return {}
+    current_projection = _contract_chain_current_with_runtime_authority_overlay(
+        current_projection
+    )
     next_action = (
         current_projection.get("next_legal_action")
         if isinstance(current_projection.get("next_legal_action"), Mapping)
@@ -35257,6 +35401,25 @@ def _onboard_runtime_resume_from_current_projection(
             current_projection.get("active_child_contract_execution_id") or ""
         ),
         "next_legal_action": dict(next_action),
+        "authority_projection": dict(
+            current_projection.get("authority_projection")
+            if isinstance(current_projection.get("authority_projection"), Mapping)
+            else {}
+        ),
+        "legacy_route_action_precheck_advisory": dict(
+            current_projection.get("legacy_route_action_precheck_advisory")
+            if isinstance(
+                current_projection.get("legacy_route_action_precheck_advisory"),
+                Mapping,
+            )
+            else {}
+        ),
+        "source_of_authority": str(
+            current_projection.get("source_of_authority") or ""
+        ),
+        "authority_decision_source": str(
+            current_projection.get("authority_decision_source") or ""
+        ),
         "projection_watermark": int(
             current_projection.get("projection_watermark") or 0
         ),
@@ -40064,6 +40227,9 @@ def _onboard_route_guide_service_response(
         current_projection=current_projection,
         route_token_ref=route_token_ref,
     )
+    current_projection = _contract_chain_current_with_runtime_authority_overlay(
+        current_projection
+    )
     projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
@@ -44014,6 +44180,23 @@ def _observer_root_route_context_state(
         actor_role="observer",
         route_token_ref=token_ref,
     )
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+        route_token_ref=token_ref,
+    )
+    current_projection = _contract_chain_current_with_backlog_close_blocker(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        current_projection=current_projection,
+        route_token_ref=token_ref,
+    )
+    current_projection = _contract_chain_current_with_runtime_authority_overlay(
+        current_projection
+    )
 
     transition_gate = observer_session.work_mode_transition_gate(
         events,
@@ -44401,6 +44584,99 @@ def _observer_root_route_context_state(
         context["next_legal_action"] = dict(
             runtime_projection.get("next_legal_action") or {}
         )
+    if current_projection:
+        context["contract_chain_current"] = current_projection
+        authority_projection = (
+            current_projection.get("authority_projection")
+            if isinstance(current_projection.get("authority_projection"), Mapping)
+            else {}
+        )
+        if authority_projection:
+            legacy_advisory = dict(
+                authority_projection.get("legacy_route_action_precheck") or {}
+            )
+            context["contract_runtime_authority_projection"] = dict(
+                authority_projection
+            )
+            context["legacy_route_action_precheck_advisory"] = legacy_advisory
+        current_next_action = (
+            dict(current_projection.get("next_legal_action"))
+            if isinstance(current_projection.get("next_legal_action"), Mapping)
+            else {}
+        )
+        if authority_projection and current_next_action:
+            prior_next_action = dict(context.get("next_legal_action") or {})
+            legacy_advisory = (
+                dict(authority_projection.get("legacy_route_action_precheck") or {})
+                if authority_projection
+                else dict(
+                    current_projection.get("legacy_route_action_precheck_advisory")
+                    or {}
+                )
+            )
+            same_runtime_execution = bool(
+                runtime_projection.get("active")
+                and str(current_projection.get("current_contract_execution_id") or "")
+                == str(runtime_projection.get("contract_execution_id") or "")
+            )
+            if (
+                prior_next_action
+                and prior_next_action != current_next_action
+                and not same_runtime_execution
+            ):
+                context[
+                    "next_legal_action_deferred_by_contract_runtime_current"
+                ] = prior_next_action
+            projected_next_action = current_next_action
+            if same_runtime_execution:
+                projected_next_action = {
+                    **current_next_action,
+                    **prior_next_action,
+                    "source_of_authority": "contract_runtime",
+                    "authority_decision_source": "backlog_contract_chain_current",
+                    "semantic_blocker_reason": (
+                        prior_next_action.get("semantic_blocker_reason")
+                        or current_next_action.get("semantic_blocker_reason")
+                        or str(authority_projection.get("semantic_blocker_reason") or "")
+                    ),
+                    "legacy_route_action_precheck_advisory": legacy_advisory,
+                }
+                runtime_current_state = dict(
+                    context.get("contract_runtime_current_state") or {}
+                )
+                runtime_current_state.update(
+                    {
+                        "next_legal_action": projected_next_action,
+                        "source_of_authority": "contract_runtime",
+                        "authority_decision_source": (
+                            "backlog_contract_chain_current"
+                        ),
+                    }
+                )
+                context["contract_runtime_current_state"] = runtime_current_state
+            else:
+                context["contract_runtime_current_state"] = {
+                    "schema_version": "contract_runtime_current_state.v1",
+                    "contract_execution_id": str(
+                        current_projection.get("current_contract_execution_id") or ""
+                    ),
+                    "root_contract_execution_id": str(
+                        current_projection.get("root_contract_execution_id") or ""
+                    ),
+                    "contract_chain_id": str(
+                        current_projection.get("contract_chain_id") or ""
+                    ),
+                    "contract_id": str(
+                        current_projection.get("current_contract_id") or ""
+                    ),
+                    "route_token_ref": str(
+                        current_next_action.get("route_token_ref") or ""
+                    ),
+                    "next_legal_action": projected_next_action,
+                    "source_of_authority": "contract_runtime",
+                    "authority_decision_source": "backlog_contract_chain_current",
+                }
+            context["next_legal_action"] = projected_next_action
     context["route_context_gate"] = {
         "required": bool(route_context_gate.get("required")),
         "passed": bool(route_context_gate.get("passed")),
