@@ -24868,6 +24868,304 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_projects_child_authority_from_completed_overlap_component(
+    conn,
+    monkeypatch,
+):
+    child_id = "AC-OVERLAP-COMPONENT-CHILD-CLOSE"
+    sibling_id = "AC-OVERLAP-COMPONENT-SIBLING-CLOSE"
+    batch_backlog_id = "AC-OVERLAP-COMPONENT-BATCH"
+    close_commit = "3ee991b4e21942f36500ce4f6b791652bde0c101"
+    worker_commit = "4ee991b4e21942f36500ce4f6b791652bde0c101"
+    direct_execution_id = "cex-overlap-component-child-direct-fix"
+    parent_execution_id = server._onboard_service_execution_id(PID, child_id)
+    route_token_ref = "rtok-overlap-component-child-direct"
+    close_route_token_ref = "rtok-overlap-component-child-close"
+    route_identity = {
+        "route_id": "route-overlap-component-child",
+        "route_context_hash": _fake_sha("route-overlap-component-child"),
+        "prompt_contract_id": "rprompt-overlap-component-child",
+        "prompt_contract_hash": _fake_sha("prompt-overlap-component-child"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-overlap-component-child"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    for row_id in (child_id, sibling_id, batch_backlog_id):
+        _insert_simple_mf_close_backlog(conn, row_id)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair child close authority from overlap component.",
+                "backlog_id": child_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": route_token_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "backlog_close",
+                    "blocker_id": "missing_contract_runtime_close_authority",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == direct_execution_id
+
+    runtime = server._contract_runtime(conn)
+
+    def write_direct_line(
+        *,
+        actor_role: str,
+        stage_id: str,
+        line_id: str,
+        evidence_kind: str,
+        payload: dict,
+        commit_sha: str = "",
+    ) -> None:
+        runtime.current_guide(direct_execution_id, actor_role=actor_role)
+        record = runtime.store.get(direct_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            direct_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+
+    write_direct_line(
+        actor_role="observer",
+        stage_id="operator_approval",
+        line_id="direct_fix_operator_approval",
+        evidence_kind="operator_approval",
+        payload=route_identity,
+    )
+    write_direct_line(
+        actor_role="observer",
+        stage_id="dispatch_context",
+        line_id="direct_fix_dispatch_context",
+        evidence_kind="dispatch_bounded_worker",
+        payload={**route_identity, "owned_files": ["agent/governance/server.py"]},
+    )
+    write_direct_line(
+        actor_role="mf_sub",
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        evidence_kind="direct_fix_repair_evidence",
+        payload={
+            **route_identity,
+            "status": "implemented",
+            "changed_files": ["agent/governance/server.py"],
+            "commit_sha": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_direct_line(
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+        evidence_kind="independent_verification",
+        payload={
+            **route_identity,
+            "status": "pass",
+            "verdict": "PASS",
+            "verified_commit": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_direct_line(
+        actor_role="observer",
+        stage_id="return_to_parent",
+        line_id="direct_fix_return_to_parent",
+        evidence_kind="direct_fix_return_to_parent",
+        payload={
+            **route_identity,
+            "parent_contract_execution_id": parent_execution_id,
+            "successor_contract_execution_id": direct_execution_id,
+            "successor_contract_id": "direct_fix",
+        },
+    )
+    record = runtime.store.get(direct_execution_id)
+    assert record["runtime_guide"]["next_legal_action"] is None
+
+    batch_id = "mf-batch-parallel-overlap-projection"
+    component_task_id = f"{batch_id}:overlap-component:2"
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=batch_backlog_id,
+        task_id=batch_id,
+        event_type="mf_batch_parallel.entered",
+        event_kind="contract_binding",
+        phase="orchestration",
+        actor="observer",
+        status="accepted",
+        payload={
+            "batch_id": batch_id,
+            "merge_queue_id": "mq-overlap-component-projection",
+            "preflight_gate": {
+                "dispatch_groups": [
+                    {
+                        "group_index": 1,
+                        "backlog_ids": [batch_backlog_id],
+                        "reason": "no_overlap",
+                        "overlap_component": False,
+                    },
+                    {
+                        "group_index": 2,
+                        "backlog_ids": [child_id, sibling_id],
+                        "reason": "connected_overlap_component",
+                        "overlap_component": True,
+                    },
+                ]
+            },
+        },
+    )
+    component_lines = [
+        (
+            "mf_sub:component-worker",
+            "implementation",
+            "implementation",
+            {"head_commit": worker_commit, "changed_files": ["agent/governance/server.py"]},
+            worker_commit,
+        ),
+        (
+            "mf_sub:component-worker",
+            "mf_subagent_finish_gate",
+            "finish_gate",
+            {"head_commit": worker_commit, "close_ready": True},
+            worker_commit,
+        ),
+        (
+            "qa:component",
+            "independent_verification",
+            "verification",
+            {"verdict": "passed", "verified_commit": worker_commit},
+            worker_commit,
+        ),
+        (
+            "observer",
+            "merge",
+            "merge",
+            {"merge_commit": close_commit},
+            close_commit,
+        ),
+        (
+            "observer",
+            "reconcile",
+            "reconcile",
+            {"graph_reconciled": True, "scope_reconciled": True},
+            close_commit,
+        ),
+        (
+            "observer",
+            "close_ready",
+            "close",
+            {
+                "merge_commit": close_commit,
+                "close_readiness": {
+                    "qa_independent_verification": True,
+                    "graph_reconcile": True,
+                },
+            },
+            close_commit,
+        ),
+    ]
+    for actor, event_kind, phase, payload, commit_sha in component_lines:
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=batch_backlog_id,
+            task_id=component_task_id,
+            event_type=f"mf_parallel.{event_kind}",
+            event_kind=event_kind,
+            phase=phase,
+            actor=actor,
+            status="passed",
+            payload={
+                **route_identity,
+                **payload,
+                "task_id": component_task_id,
+                "parent_task_id": batch_id,
+                "backlog_ids": [child_id, sibling_id],
+                "merge_queue_id": "mq-overlap-component-projection",
+            },
+            commit_sha=commit_sha,
+        )
+
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=child_id,
+        task_id=direct_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[
+            f"contract_runtime:{direct_execution_id}",
+            f"timeline:{component_task_id}",
+        ],
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": child_id},
+            query={"close_commit": close_commit},
+            body={"contract_execution_id": direct_execution_id},
+        )
+    )
+    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["direct_fix_close_authority_gate"]["passed"] is False
+    assert projection["direct_fix_close_authority_gate"]["missing_requirement_ids"] == [
+        "parent_return_acknowledgement"
+    ]
+    assert projection["mf_parallel_close_authority_gate"]["passed"] is True
+    assert projection["mf_parallel_close_authority_gate"]["contract_execution_id"] == (
+        component_task_id
+    )
+    assert projection["overlap_component_memberships"][0]["child_backlog_id"] == child_id
+    assert component_task_id in projection["projected_overlap_component_task_ids"]
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": child_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
 def test_timeline_repair_summary_names_missing_startup_identity_fields():
     summary = task_timeline.repair_gate_summary(
         {
