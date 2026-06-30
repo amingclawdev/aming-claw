@@ -46765,6 +46765,51 @@ def _contract_runtime_authoritative_close_verification(
     return result
 
 
+def _contract_runtime_legacy_close_diagnostics(
+    legacy_verification: Mapping[str, Any],
+    *,
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    diagnostics = _annotate_legacy_mf_timeline_precheck_authority(
+        legacy_verification,
+        source="legacy_mf_timeline_gate_verification",
+        contract_execution_id=contract_execution_id,
+    )
+    diagnostics["schema_version"] = "legacy_mf_close_gate_diagnostics.v1"
+    diagnostics["advisory_only"] = True
+    diagnostics["authorization_blocker"] = False
+    diagnostics["ignored_for_contract_runtime_close_authority"] = True
+    diagnostics["message"] = (
+        "Legacy MF timeline gate output is retained for diagnostics only; "
+        "passing ContractRuntime close authority is the close authorization source."
+    )
+    return diagnostics
+
+
+def _contract_runtime_authoritative_close_with_legacy_diagnostics(
+    legacy_verification: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    verification = _contract_runtime_authoritative_close_verification(
+        legacy_verification,
+        runtime_projection,
+    )
+    authority = verification.get("close_authority")
+    contract_execution_id = ""
+    if isinstance(authority, Mapping):
+        contract_execution_id = str(authority.get("contract_execution_id") or "")
+    if not contract_execution_id:
+        contract_execution_id = str(
+            runtime_projection.get("contract_execution_id") or ""
+        )
+    verification["legacy_diagnostics"] = _contract_runtime_legacy_close_diagnostics(
+        legacy_verification,
+        contract_execution_id=contract_execution_id,
+    )
+    verification["legacy_mf_close_gate_authorization_blocker"] = False
+    return verification
+
+
 def _contract_runtime_close_authority_seed_events(
     *,
     record: Mapping[str, Any],
@@ -56730,26 +56775,21 @@ def _verify_mf_close_timeline_gate(
         close_commit=_audit_recovery_close_commit(row, gate_body),
     )
     if runtime_projection.get("accepted"):
-        projected_events = _contract_runtime_close_authority_projected_events_for_gate(
-            runtime_projection,
+        legacy_verification = _mf_close_gate_verification(
             events,
-        )
-        verification = _mf_close_gate_verification(
-            projected_events,
             contract=contract,
             conn=conn,
             project_id=project_id,
         )
-        verification = dict(verification)
+        verification = _contract_runtime_authoritative_close_with_legacy_diagnostics(
+            legacy_verification,
+            runtime_projection,
+        )
         verification["contract_runtime_close_authority_projection"] = {
             key: value
             for key, value in runtime_projection.items()
             if key != "projected_events"
         }
-        verification = _contract_runtime_authoritative_close_verification(
-            verification,
-            runtime_projection,
-        )
     else:
         verification = _mf_close_gate_verification(
             events,

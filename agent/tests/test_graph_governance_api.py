@@ -24055,6 +24055,61 @@ def test_backlog_close_projects_successor_runtime_lines_when_close_scoped_to_par
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_contract_runtime_authority_keeps_legacy_gate_advisory(conn):
+    backlog_id = "AC-TIMELINE-GATE-CONTRACT-RUNTIME-LEGACY-ADVISORY"
+    close_commit = "f16275118745006c8324dfcbeecea62c39e91936"
+    worker_commit = "c15d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-legacy-advisory",
+    )
+    parent_execution_id = fixture["parent_record"]["contract_execution_id"]
+    row = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+
+    assert (
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="route_action_precheck",
+        )
+        == []
+    )
+
+    verification = server._verify_mf_close_timeline_gate(
+        conn,
+        PID,
+        backlog_id,
+        row,
+        {
+            "actor": "observer",
+            "commit": close_commit,
+            "contract_execution_id": parent_execution_id,
+            **fixture["route_identity"],
+        },
+        route_gate=fixture["route_identity"],
+    )
+
+    assert verification["passed"] is True
+    assert verification["source_of_authority"] == "contract_runtime"
+    assert verification["legacy_mf_close_gate_authorization_blocker"] is False
+    legacy = verification["legacy_diagnostics"]
+    assert legacy["advisory_only"] is True
+    assert legacy["authorization_blocker"] is False
+    assert legacy["passed"] is False
+    route_service_group = legacy["missing_evidence_groups"]["groups"]["route_service"]
+    assert "route.action_precheck" in route_service_group["next_actions"]
+    assert verification["contract_runtime_mf_parallel_close_authority_gate"][
+        "passed"
+    ] is True
+
+
 def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projection_lacks_manifest(
     conn,
     monkeypatch,
