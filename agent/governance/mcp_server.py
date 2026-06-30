@@ -1734,6 +1734,44 @@ TOOLS: list[dict] = [
             "required": ["project_id", "backlog_id", "task_id", "target_files"],
         },
     },
+    {
+        "name": "observer_route_context_renew",
+        "description": (
+            "Renew an expired or near-expired server-registered route_token_ref "
+            "for the same project/backlog/task/action/file scope. Requires an "
+            "active observer_session_id and never returns a raw route token."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "caller_role": {
+                    "type": "string",
+                    "description": "Must be observer; defaults to observer in this MCP wrapper.",
+                },
+                "observer_session_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "allowed_actions": {"type": "array", "items": {"type": "string"}},
+                "target_files": {"type": "array", "items": {"type": "string"}},
+                "owned_files": {"type": "array", "items": {"type": "string"}},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "ttl_hours": {"type": "number"},
+                "renew_within_seconds": {"type": "integer"},
+            },
+            "required": [
+                "project_id",
+                "observer_session_id",
+                "route_token_ref",
+                "backlog_id",
+                "task_id",
+            ],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -2219,6 +2257,16 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         # (unless an explicit caller_role was already supplied by the caller).
         body.setdefault("caller_role", "observer")
         return _http("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
+
+    if name == "observer_route_context_renew":
+        pid = args["project_id"]
+        body = {
+            key: value
+            for key, value in args.items()
+            if key != "project_id" and value is not None
+        }
+        body.setdefault("caller_role", "observer")
+        return _http("POST", f"/api/projects/{pid}/observer/route-context/renew", body)
 
     raise ValueError(f"Unknown tool: {name!r}")
 

@@ -976,8 +976,12 @@ def issue_observer_write_route_context(
 # brute-force the token body with a rainbow table over a fixed salt.
 
 REF_REGISTRY_SCHEMA_VERSION = "route_token_ref_registry.v1"
+REF_RENEWAL_SCHEMA_VERSION = "route_token_ref_renewal.v1"
+REF_EXPIRY_STATUS_SCHEMA_VERSION = "route_token_ref_expiry_status.v1"
+REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_renewal_next_action.v1"
 _REF_SALT_LEN = 16  # bytes of per-entry entropy, hex-encoded in DB
 _REF_REGISTRY_LOCK = threading.RLock()
+ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS = 15 * 60
 
 # Status values
 REF_STATUS_ACTIVE = "active"
@@ -987,6 +991,10 @@ _REF_LINEAGE_COLUMNS = {
     "parent_route_lineage": "parent_route_lineage_json",
     "child_route_lineage": "child_route_lineage_json",
     "route_lineage": "route_lineage_json",
+}
+_REF_SCOPE_LIST_COLUMNS = {
+    "target_files": "target_files_json",
+    "owned_files": "owned_files_json",
 }
 
 
@@ -1007,6 +1015,135 @@ def _json_loads_public_mapping(value: Any) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         parsed = {}
     return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _json_dumps_string_list(value: Any) -> str:
+    return json.dumps(_dedupe(_string_list(value)), sort_keys=True)
+
+
+def _json_loads_string_list(value: Any) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (json.JSONDecodeError, TypeError):
+        parsed = []
+    return _dedupe(_string_list(parsed))
+
+
+def _json_loads_mapping(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _utc_datetime(value: datetime | None = None) -> datetime:
+    dt = value or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    text = _string(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return _utc_datetime(parsed)
+
+
+def route_token_ref_renewal_next_action(
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Return the public-safe semantic action for renewing a route-token ref."""
+
+    return {
+        "schema_version": REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION,
+        "action": "renew_route_token_ref",
+        "semantic_next_action": "observer_route_context_renew",
+        "mcp_tool": "observer_route_context_renew",
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/renew",
+            "path_params": {"project_id": _string(project_id) or "{project_id}"},
+        },
+        "required_fields": [
+            "project_id",
+            "observer_session_id",
+            "route_token_ref",
+            "backlog_id",
+            "task_id",
+        ],
+        "project_id": _string(project_id),
+        "observer_session_id": _string(observer_session_id),
+        "route_token_ref": _string(route_token_ref),
+        "scope": {
+            "project_id": _string(project_id),
+            "backlog_id": _string(backlog_id),
+            "task_id": _string(task_id),
+        },
+        "reason": _string(reason),
+        "observer_session_must_be_active": True,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def route_token_ref_expiry_status(
+    expires_at: Any,
+    *,
+    now: datetime | None = None,
+    renew_within_seconds: int = ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+) -> dict[str, Any]:
+    """Classify expiry and attach renewal guidance when a ref should rotate."""
+
+    now_dt = _utc_datetime(now)
+    expires_text = _string(expires_at)
+    renew_window = max(0, int(renew_within_seconds or 0))
+    parsed = _parse_utc_datetime(expires_text)
+    status = "missing_expiry" if not expires_text else "invalid_expiry"
+    seconds_remaining: int | None = None
+    expired = False
+    near_expiry = False
+    if parsed is not None:
+        seconds_remaining = int((parsed - now_dt).total_seconds())
+        expired = seconds_remaining <= 0
+        near_expiry = not expired and seconds_remaining <= renew_window
+        status = "expired" if expired else "near_expiry" if near_expiry else "valid"
+    payload: dict[str, Any] = {
+        "schema_version": REF_EXPIRY_STATUS_SCHEMA_VERSION,
+        "status": status,
+        "expires_at": expires_text,
+        "seconds_remaining": seconds_remaining,
+        "expired": expired,
+        "near_expiry": near_expiry,
+        "renewal_recommended": expired or near_expiry,
+        "renew_within_seconds": renew_window,
+    }
+    if expired or near_expiry:
+        payload["next_action"] = route_token_ref_renewal_next_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            observer_session_id=observer_session_id,
+            reason=status,
+        )
+    return payload
 
 
 def _lineage_conflicting_fields(
@@ -1103,6 +1240,197 @@ def _with_registry_lineages(
     return result
 
 
+def _row_scope(row_dict: Mapping[str, Any]) -> dict[str, Any]:
+    return _json_loads_mapping(row_dict.get("scope_json"))
+
+
+def _row_allowed_actions(row_dict: Mapping[str, Any]) -> list[str]:
+    return _normalized_action_list(_json_loads_string_list(row_dict.get("allowed_actions_json")))
+
+
+def _row_evidence_refs(row_dict: Mapping[str, Any]) -> list[str]:
+    return _json_loads_string_list(row_dict.get("evidence_refs_json"))
+
+
+def _row_target_files(row_dict: Mapping[str, Any]) -> list[str]:
+    target_files = _json_loads_string_list(row_dict.get("target_files_json"))
+    if target_files:
+        return target_files
+    scope = _row_scope(row_dict)
+    return _dedupe(_string_list(scope.get("target_files")))
+
+
+def _row_owned_files(row_dict: Mapping[str, Any]) -> list[str]:
+    owned_files = _json_loads_string_list(row_dict.get("owned_files_json"))
+    if owned_files:
+        return owned_files
+    scope = _row_scope(row_dict)
+    owned_files = _dedupe(_string_list(scope.get("owned_files")))
+    return owned_files or _row_target_files(row_dict)
+
+
+def _backlog_target_files(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> list[str]:
+    if not backlog_id:
+        return []
+    try:
+        row = conn.execute(
+            """
+            SELECT target_files
+            FROM backlog_bugs
+            WHERE project_id=? AND bug_id=?
+            """,
+            (project_id, backlog_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return []
+    if row is None:
+        return []
+    try:
+        raw = row["target_files"]
+    except (KeyError, TypeError, IndexError):
+        raw = row[0]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = raw
+        return _dedupe(_string_list(parsed))
+    return _json_loads_string_list(raw)
+
+
+def _legacy_row_identity_matches_target_files(
+    row_dict: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    allowed_actions: Sequence[str],
+    target_files: Sequence[str],
+    project_root: Path | str | None,
+) -> bool:
+    issued_at = _parse_utc_datetime(row_dict.get("issued_at")) or _parse_utc_datetime(
+        row_dict.get("created_at")
+    )
+    if issued_at is None:
+        return False
+    try:
+        token = build_observer_write_route_token(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            target_files=target_files,
+            allowed_actions=allowed_actions,
+            ttl_hours=1.0,
+            now=issued_at,
+            project_root=project_root,
+        )
+    except (TypeError, ValueError):
+        return False
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        stored = _string(row_dict.get(field))
+        if stored and stored != _string(token.get(field)):
+            return False
+    return bool(
+        _string(row_dict.get("route_context_hash"))
+        and _string(row_dict.get("prompt_contract_id"))
+    )
+
+
+def _recover_legacy_row_target_files(
+    conn: sqlite3.Connection,
+    row_dict: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    allowed_actions: Sequence[str],
+    requested_target_files: Sequence[str] | None,
+    project_root: Path | str | None,
+    route_token_ref: str,
+) -> list[str]:
+    """Recover old ref rows that predate persisted file-scope columns.
+
+    Recovery only accepts candidate target files that reproduce the stored
+    public route identity. This lets legacy refs renew without trusting caller
+    supplied files or persisting/exposing raw tokens.
+    """
+
+    existing = _row_target_files(row_dict)
+    if existing:
+        return existing
+    candidates: list[list[str]] = []
+    for candidate in (
+        _dedupe(_string_list(requested_target_files or [])),
+        _backlog_target_files(conn, project_id=project_id, backlog_id=backlog_id),
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if _legacy_row_identity_matches_target_files(
+            row_dict,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            allowed_actions=allowed_actions,
+            target_files=candidate,
+            project_root=project_root,
+        ):
+            return candidate
+    raise RouteTokenRefError(
+        f"route_token_ref {route_token_ref!r} cannot renew without verified stored target_files",
+        code="route_token_ref_target_files_missing",
+        details={
+            "field": "target_files",
+            "route_token_ref": route_token_ref,
+            "legacy_scope_recovery_attempted": bool(candidates),
+        },
+    )
+
+
+def _registry_public_payload(
+    row_dict: Mapping[str, Any],
+    *,
+    route_token_ref: str = "",
+    expiry_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    ref = _string(route_token_ref or row_dict.get("route_token_ref"))
+    scope = _row_scope(row_dict)
+    payload: dict[str, Any] = {
+        "schema_version": REF_REGISTRY_SCHEMA_VERSION,
+        "route_token_ref": ref,
+        "route_id": _string(row_dict.get("route_id")),
+        "route_context_hash": _string(row_dict.get("route_context_hash")),
+        "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
+        "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
+        "visible_injection_manifest_hash": _string(
+            row_dict.get("visible_injection_manifest_hash")
+        ),
+        "caller_role": _string(row_dict.get("caller_role")),
+        "allowed_actions": _row_allowed_actions(row_dict),
+        "evidence_refs": _row_evidence_refs(row_dict),
+        "expires_at": _string(row_dict.get("expires_at")),
+        "scope": scope,
+        "target_files": _row_target_files(row_dict),
+        "owned_files": _row_owned_files(row_dict),
+        "status": _string(row_dict.get("status")),
+        "resolved_from_ref": True,
+    }
+    if expiry_status:
+        payload["expiry_status"] = dict(expiry_status)
+    return _with_registry_lineages(payload, row_dict)
+
+
 def _token_digest(token: Mapping[str, Any], salt: str) -> str:
     """Return a salted SHA-256 hex digest of the canonical token body.
 
@@ -1138,6 +1466,8 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             expires_at          TEXT NOT NULL DEFAULT '',
             evidence_refs_json  TEXT NOT NULL DEFAULT '[]',
             scope_json          TEXT NOT NULL DEFAULT '{}',
+            target_files_json   TEXT NOT NULL DEFAULT '[]',
+            owned_files_json    TEXT NOT NULL DEFAULT '[]',
             parent_route_lineage_json TEXT NOT NULL DEFAULT '{}',
             child_route_lineage_json TEXT NOT NULL DEFAULT '{}',
             route_lineage_json TEXT NOT NULL DEFAULT '{}',
@@ -1163,6 +1493,12 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE observer_route_token_refs "
                 f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'"
+            )
+    for column in _REF_SCOPE_LIST_COLUMNS.values():
+        if column not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE observer_route_token_refs "
+                f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
             )
 
 
@@ -1195,6 +1531,8 @@ def persist_route_token_ref(
     scope = dict(token.get("scope") or {})
     allowed_actions = list(token.get("allowed_actions") or [])
     evidence_refs = list(token.get("evidence_refs") or [])
+    target_files = _dedupe(_string_list(token.get("target_files")))
+    owned_files = _dedupe(_string_list(token.get("owned_files"))) or target_files
     lineage_payloads = _ref_lineage_payloads(token, route_token_ref=route_token_ref)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1219,13 +1557,24 @@ def persist_route_token_ref(
                 if lineage_payloads[public_key]
                 and not _json_loads_public_mapping(dict(row).get(column))
             ]
-            if missing_lineage_columns:
+            row_dict = dict(row)
+            missing_scope_columns = [
+                column
+                for value, column in (
+                    (target_files, "target_files_json"),
+                    (owned_files, "owned_files_json"),
+                )
+                if value and not _json_loads_string_list(row_dict.get(column))
+            ]
+            if missing_lineage_columns or missing_scope_columns:
                 conn.execute(
                     """
                     UPDATE observer_route_token_refs
                     SET parent_route_lineage_json=?,
                         child_route_lineage_json=?,
-                        route_lineage_json=?
+                        route_lineage_json=?,
+                        target_files_json=?,
+                        owned_files_json=?
                     WHERE project_id=? AND route_token_ref=?
                     """,
                     (
@@ -1236,6 +1585,8 @@ def persist_route_token_ref(
                             lineage_payloads["child_route_lineage"]
                         ),
                         _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
+                        _json_dumps_string_list(target_files),
+                        _json_dumps_string_list(owned_files),
                         project_id,
                         route_token_ref,
                     ),
@@ -1252,9 +1603,10 @@ def persist_route_token_ref(
                  prompt_contract_hash, visible_injection_manifest_hash,
                  backlog_id, task_id, caller_role,
                  allowed_actions_json, expires_at, evidence_refs_json,
-                 scope_json, parent_route_lineage_json, child_route_lineage_json,
+                 scope_json, target_files_json, owned_files_json,
+                 parent_route_lineage_json, child_route_lineage_json,
                  route_lineage_json, status, issued_at, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 project_id,
@@ -1273,6 +1625,8 @@ def persist_route_token_ref(
                 _string(token.get("expires_at")),
                 json.dumps(evidence_refs),
                 json.dumps(scope),
+                _json_dumps_string_list(target_files),
+                _json_dumps_string_list(owned_files),
                 _json_dumps_public_mapping(lineage_payloads["parent_route_lineage"]),
                 _json_dumps_public_mapping(lineage_payloads["child_route_lineage"]),
                 _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
@@ -1395,40 +1749,7 @@ def persist_route_token_ref_lineage(
             ).fetchone()
             row_dict = dict(row) if row is not None else row_dict
 
-    try:
-        allowed_actions = json.loads(row_dict.get("allowed_actions_json") or "[]")
-    except (json.JSONDecodeError, TypeError):
-        allowed_actions = []
-    try:
-        evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
-    except (json.JSONDecodeError, TypeError):
-        evidence_refs = []
-    try:
-        scope = json.loads(row_dict.get("scope_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        scope = {}
-
-    return _with_registry_lineages(
-        {
-            "schema_version": REF_REGISTRY_SCHEMA_VERSION,
-            "route_token_ref": route_token_ref,
-            "route_id": _string(row_dict.get("route_id")),
-            "route_context_hash": _string(row_dict.get("route_context_hash")),
-            "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
-            "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
-            "visible_injection_manifest_hash": _string(
-                row_dict.get("visible_injection_manifest_hash")
-            ),
-            "caller_role": _string(row_dict.get("caller_role")),
-            "allowed_actions": allowed_actions,
-            "evidence_refs": evidence_refs,
-            "expires_at": _string(row_dict.get("expires_at")),
-            "scope": scope,
-            "status": _string(row_dict.get("status")),
-            "resolved_from_ref": True,
-        },
-        row_dict,
-    )
+    return _registry_public_payload(row_dict, route_token_ref=route_token_ref)
 
 
 def resolve_route_token_ref(
@@ -1442,6 +1763,7 @@ def resolve_route_token_ref(
     task_id: str = "",
     backlog_id: str = "",
     now: datetime | None = None,
+    renew_within_seconds: int = 0,
 ) -> dict[str, Any] | None:
     """Resolve a route_token_ref to its stored public identity.
 
@@ -1480,7 +1802,18 @@ def resolve_route_token_ref(
     if status != REF_STATUS_ACTIVE:
         raise RouteTokenRefError(
             f"route_token_ref {route_token_ref!r} is not active (status={status!r}); "
-            "ref resolution refused"
+            "ref resolution refused",
+            code="route_token_ref_not_active",
+            details={
+                "status": status,
+                "next_action": route_token_ref_renewal_next_action(
+                    project_id=project_id,
+                    backlog_id=backlog_id or _string(row_dict.get("backlog_id")),
+                    task_id=task_id or _string(row_dict.get("task_id")),
+                    route_token_ref=route_token_ref,
+                    reason=status or "not_active",
+                ),
+            },
         )
 
     # Identity binding checks — only when the caller supplies non-empty values.
@@ -1539,51 +1872,39 @@ def resolve_route_token_ref(
 
     # Expiry check
     expires_at = _string(row_dict.get("expires_at"))
-    if expires_at:
-        now_dt = now or datetime.now(timezone.utc)
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
-        try:
-            expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            if now_dt >= expires_dt:
-                raise RouteTokenRefError(
-                    f"route_token_ref {route_token_ref!r} has expired (expires_at={expires_at!r})"
-                )
-        except (ValueError, TypeError):
-            pass  # Unparseable expiry: do not block resolution
+    expiry_status = route_token_ref_expiry_status(
+        expires_at,
+        now=now,
+        renew_within_seconds=renew_within_seconds,
+        project_id=project_id,
+        backlog_id=backlog_id or _string(row_dict.get("backlog_id")),
+        task_id=task_id or _string(row_dict.get("task_id")),
+        route_token_ref=route_token_ref,
+    )
+    if expiry_status.get("expired"):
+        raise RouteTokenRefError(
+            f"route_token_ref {route_token_ref!r} has expired (expires_at={expires_at!r})",
+            code="route_token_ref_expired",
+            details={
+                "expiry_status": expiry_status,
+                "next_action": expiry_status.get("next_action"),
+            },
+        )
+    if renew_within_seconds and expiry_status.get("near_expiry"):
+        raise RouteTokenRefError(
+            f"route_token_ref {route_token_ref!r} is near expiry (expires_at={expires_at!r})",
+            code="route_token_ref_near_expiry",
+            details={
+                "expiry_status": expiry_status,
+                "next_action": expiry_status.get("next_action"),
+            },
+        )
 
-    # Reconstruct a public-only token surface (sufficient for the gate)
-    try:
-        allowed_actions = json.loads(row_dict.get("allowed_actions_json") or "[]")
-    except (json.JSONDecodeError, TypeError):
-        allowed_actions = []
-    try:
-        evidence_refs = json.loads(row_dict.get("evidence_refs_json") or "[]")
-    except (json.JSONDecodeError, TypeError):
-        evidence_refs = []
-    try:
-        scope = json.loads(row_dict.get("scope_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        scope = {}
-
-    return _with_registry_lineages({
-        "schema_version": REF_REGISTRY_SCHEMA_VERSION,
-        "route_token_ref": route_token_ref,
-        "route_id": _string(row_dict.get("route_id")),
-        "route_context_hash": _string(row_dict.get("route_context_hash")),
-        "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
-        "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
-        "visible_injection_manifest_hash": _string(
-            row_dict.get("visible_injection_manifest_hash")
-        ),
-        "caller_role": _string(row_dict.get("caller_role")),
-        "allowed_actions": allowed_actions,
-        "evidence_refs": evidence_refs,
-        "expires_at": expires_at,
-        "scope": scope,
-        "status": status,
-        "resolved_from_ref": True,
-    }, row_dict)
+    return _registry_public_payload(
+        row_dict,
+        route_token_ref=route_token_ref,
+        expiry_status=expiry_status,
+    )
 
 
 def verify_route_token_binding(
@@ -1830,6 +2151,328 @@ def verify_route_token_binding(
     )
 
 
+def _scope_value(source: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        value = _string(source.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _subset_or_same(
+    requested: Sequence[str],
+    existing: Sequence[str],
+    *,
+    field: str,
+    route_token_ref: str,
+) -> list[str]:
+    existing_list = _dedupe(_string_list(existing))
+    requested_list = _dedupe(_string_list(requested))
+    if not requested_list:
+        if existing_list:
+            return existing_list
+        raise RouteTokenRefError(
+            f"route_token_ref {route_token_ref!r} cannot renew without stored {field}",
+            code=f"route_token_ref_{field}_missing",
+            details={"field": field, "route_token_ref": route_token_ref},
+        )
+    missing = sorted(set(requested_list) - set(existing_list))
+    if missing:
+        raise RouteTokenRefError(
+            f"route_token_ref renewal cannot widen {field}: {', '.join(missing)}",
+            code=f"route_token_ref_{field}_widening_refused",
+            details={
+                "field": field,
+                "route_token_ref": route_token_ref,
+                "requested": requested_list,
+                "existing": existing_list,
+                "widening_values": missing,
+            },
+        )
+    return requested_list
+
+
+def _actions_subset_or_same(
+    requested: Sequence[str] | None,
+    existing: Sequence[str],
+    *,
+    route_token_ref: str,
+) -> list[str]:
+    existing_actions = _normalized_action_list(existing)
+    if not requested:
+        if existing_actions:
+            return existing_actions
+        raise RouteTokenRefError(
+            f"route_token_ref {route_token_ref!r} cannot renew without stored allowed_actions",
+            code="route_token_ref_allowed_actions_missing",
+            details={"route_token_ref": route_token_ref},
+        )
+    requested_actions = _normalized_action_list(requested)
+    missing = sorted(set(requested_actions) - set(existing_actions))
+    if missing:
+        raise RouteTokenRefError(
+            "route_token_ref renewal cannot widen allowed_actions: "
+            + ", ".join(missing),
+            code="route_token_ref_allowed_actions_widening_refused",
+            details={
+                "route_token_ref": route_token_ref,
+                "requested": requested_actions,
+                "existing": existing_actions,
+                "widening_values": missing,
+            },
+        )
+    return requested_actions
+
+
+def renew_route_token_ref(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    backlog_id: str = "",
+    task_id: str = "",
+    caller_role: str = "",
+    allowed_actions: Sequence[str] | None = None,
+    target_files: Sequence[str] | None = None,
+    owned_files: Sequence[str] | None = None,
+    ttl_hours: float = 24.0,
+    renew_within_seconds: int = ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+    now: datetime | None = None,
+    evidence_refs: Sequence[str] | None = None,
+    project_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Renew a same-scope route_token_ref and supersede the previous ref."""
+
+    project_id = _string(project_id)
+    old_ref = _string(route_token_ref)
+    if not project_id or not old_ref:
+        raise ValueError("project_id and route_token_ref are required")
+
+    _ensure_ref_registry_schema(conn)
+    with _REF_REGISTRY_LOCK:
+        row = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (project_id, old_ref),
+        ).fetchone()
+        if row is None:
+            raise RouteTokenRefError(
+                f"route_token_ref {old_ref!r} is unknown; renewal refused",
+                code="route_token_ref_unknown",
+                details={"route_token_ref": old_ref},
+            )
+        row_dict = dict(row)
+        status = _string(row_dict.get("status"))
+        if status == REF_STATUS_SUPERSEDED:
+            raise RouteTokenRefError(
+                f"route_token_ref {old_ref!r} is superseded; renewal refused",
+                code="route_token_ref_superseded",
+                details={"route_token_ref": old_ref, "status": status},
+            )
+        if status not in {REF_STATUS_ACTIVE, REF_STATUS_EXPIRED}:
+            raise RouteTokenRefError(
+                f"route_token_ref {old_ref!r} status {status!r} cannot be renewed",
+                code="route_token_ref_status_not_renewable",
+                details={"route_token_ref": old_ref, "status": status},
+            )
+
+        scope = _row_scope(row_dict)
+        stored_project = _scope_value(scope, "project_id") or project_id
+        stored_backlog = _string(row_dict.get("backlog_id")) or _scope_value(
+            scope, "backlog_id", "bug_id"
+        )
+        stored_task = _string(row_dict.get("task_id")) or _scope_value(scope, "task_id")
+        if stored_project != project_id:
+            raise RouteTokenRefError(
+                "route_token_ref renewal project scope mismatch",
+                code="route_token_ref_project_scope_mismatch",
+                details={
+                    "route_token_ref": old_ref,
+                    "stored_project_id": stored_project,
+                    "project_id": project_id,
+                },
+            )
+        requested_backlog = _string(backlog_id) or stored_backlog
+        requested_task = _string(task_id) or stored_task
+        if not stored_backlog or requested_backlog != stored_backlog:
+            raise RouteTokenRefError(
+                "route_token_ref renewal backlog scope mismatch",
+                code="route_token_ref_backlog_scope_mismatch",
+                details={
+                    "route_token_ref": old_ref,
+                    "stored_backlog_id": stored_backlog,
+                    "backlog_id": requested_backlog,
+                },
+            )
+        if not stored_task or requested_task != stored_task:
+            raise RouteTokenRefError(
+                "route_token_ref renewal task scope mismatch",
+                code="route_token_ref_task_scope_mismatch",
+                details={
+                    "route_token_ref": old_ref,
+                    "stored_task_id": stored_task,
+                    "task_id": requested_task,
+                },
+            )
+
+        stored_role = _string(row_dict.get("caller_role"))
+        requested_role = _string(caller_role) or stored_role
+        if stored_role and requested_role and requested_role != stored_role:
+            raise RouteTokenRefError(
+                "route_token_ref renewal caller_role mismatch",
+                code="route_token_ref_caller_role_mismatch",
+                details={
+                    "route_token_ref": old_ref,
+                    "stored_caller_role": stored_role,
+                    "caller_role": requested_role,
+                },
+            )
+
+        renewed_actions = _actions_subset_or_same(
+            allowed_actions,
+            _row_allowed_actions(row_dict),
+            route_token_ref=old_ref,
+        )
+        stored_target_files = _recover_legacy_row_target_files(
+            conn,
+            row_dict,
+            project_id=project_id,
+            backlog_id=stored_backlog,
+            task_id=stored_task,
+            allowed_actions=renewed_actions,
+            requested_target_files=target_files,
+            project_root=project_root,
+            route_token_ref=old_ref,
+        )
+        stored_owned_files = _row_owned_files(row_dict) or list(stored_target_files)
+        renewed_target_files = _subset_or_same(
+            target_files or [],
+            stored_target_files,
+            field="target_files",
+            route_token_ref=old_ref,
+        )
+        renewed_owned_files = _subset_or_same(
+            owned_files or [],
+            stored_owned_files,
+            field="owned_files",
+            route_token_ref=old_ref,
+        )
+
+        parent_lineage = _json_loads_public_mapping(
+            row_dict.get(_REF_LINEAGE_COLUMNS["parent_route_lineage"])
+        )
+        evidence = _dedupe(
+            [
+                *_row_evidence_refs(row_dict),
+                *(_string_list(evidence_refs) if evidence_refs is not None else []),
+                f"renewed_from:{old_ref}",
+            ]
+        )
+        issued = issue_observer_write_route_context(
+            project_id=project_id,
+            backlog_id=stored_backlog,
+            task_id=stored_task,
+            target_files=renewed_target_files,
+            allowed_actions=renewed_actions,
+            ttl_hours=ttl_hours,
+            now=now,
+            evidence_refs=evidence,
+            project_root=project_root,
+            parent_route_identity=parent_lineage or None,
+            parent_route_token_ref=_string(parent_lineage.get("route_token_ref")),
+        )
+        new_ref = _string(issued.get("route_token_ref"))
+        if not new_ref or new_ref == old_ref:
+            raise RouteTokenRefError(
+                "route_token_ref renewal did not produce a fresh ref",
+                code="route_token_ref_renewal_not_fresh",
+                details={"route_token_ref": old_ref, "new_route_token_ref": new_ref},
+            )
+        token = issued.get("route_token")
+        if not isinstance(token, dict):
+            raise RouteTokenRefError(
+                "route_token_ref renewal failed to mint a token",
+                code="route_token_ref_renewal_mint_failed",
+                details={"route_token_ref": old_ref},
+            )
+        token["owned_files"] = list(renewed_owned_files)
+        persist_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=new_ref,
+            token=token,
+        )
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=? AND status IN (?, ?)",
+            (
+                REF_STATUS_SUPERSEDED,
+                project_id,
+                old_ref,
+                REF_STATUS_ACTIVE,
+                REF_STATUS_EXPIRED,
+            ),
+        )
+        conn.commit()
+        new_row = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (project_id, new_ref),
+        ).fetchone()
+        new_row_dict = dict(new_row) if new_row is not None else {}
+
+    expiry_status = route_token_ref_expiry_status(
+        new_row_dict.get("expires_at"),
+        now=now,
+        renew_within_seconds=renew_within_seconds,
+        project_id=project_id,
+        backlog_id=stored_backlog,
+        task_id=stored_task,
+        route_token_ref=new_ref,
+    )
+    renewed_public = _registry_public_payload(
+        new_row_dict,
+        route_token_ref=new_ref,
+        expiry_status=expiry_status,
+    )
+    return {
+        "schema_version": REF_RENEWAL_SCHEMA_VERSION,
+        "ok": True,
+        "project_id": project_id,
+        "previous_route_token_ref": old_ref,
+        "route_token_ref": new_ref,
+        "previous_status": status,
+        "status": "renewed",
+        "renewed": True,
+        "superseded_previous_ref": True,
+        "previous_expires_at": _string(row_dict.get("expires_at")),
+        "expires_at": _string(new_row_dict.get("expires_at")),
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": stored_backlog,
+            "task_id": stored_task,
+        },
+        "allowed_actions": list(renewed_actions),
+        "target_files": list(renewed_target_files),
+        "owned_files": list(renewed_owned_files),
+        "route_identity": {
+            "route_id": renewed_public.get("route_id", ""),
+            "route_context_hash": renewed_public.get("route_context_hash", ""),
+            "prompt_contract_id": renewed_public.get("prompt_contract_id", ""),
+            "prompt_contract_hash": renewed_public.get("prompt_contract_hash", ""),
+            "visible_injection_manifest_hash": renewed_public.get(
+                "visible_injection_manifest_hash", ""
+            ),
+            "route_token_ref": new_ref,
+        },
+        "renewed_route_token_ref": renewed_public,
+        "merge_queue_id": issued.get("merge_queue_id", ""),
+        "execute_backlog_row_payload": issued.get("execute_backlog_row_payload", {}),
+        "expiry_status": expiry_status,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "raw_route_token_persisted": False,
+    }
+
+
 def supersede_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -1857,8 +2500,14 @@ def supersede_route_token_ref(
         _ensure_ref_registry_schema(conn)
         cursor = conn.execute(
             "UPDATE observer_route_token_refs SET status=? "
-            "WHERE project_id=? AND route_token_ref=? AND status=?",
-            (REF_STATUS_SUPERSEDED, project_id, route_token_ref, REF_STATUS_ACTIVE),
+            "WHERE project_id=? AND route_token_ref=? AND status IN (?, ?)",
+            (
+                REF_STATUS_SUPERSEDED,
+                project_id,
+                route_token_ref,
+                REF_STATUS_ACTIVE,
+                REF_STATUS_EXPIRED,
+            ),
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -1867,4 +2516,15 @@ def supersede_route_token_ref(
 
 
 class RouteTokenRefError(Exception):
-    """Raised by resolve_route_token_ref for non-active / mismatched refs."""
+    """Raised for route_token_ref resolution, renewal, and binding failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.code = _string(code) or "route_token_ref_error"
+        self.details = dict(details or {})
+        super().__init__(message)

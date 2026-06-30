@@ -2931,6 +2931,96 @@ def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     return expanded
 
 
+def _observer_route_context_renewal_guidance(
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    from . import observer_route_context
+
+    return observer_route_context.route_token_ref_renewal_next_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        observer_session_id=observer_session_id,
+        reason=reason,
+    )
+
+
+def _observer_session_renewal_gate_guidance(
+    *,
+    project_id: str = "",
+    observer_session_id: str = "",
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    return {
+        "schema_version": "observer_session.route_token_ref_renewal_gate.v1",
+        "action": "observer_session_heartbeat_or_register",
+        "semantic_next_action": "observer_session_heartbeat_or_register",
+        "required_before": "observer_route_context_renew",
+        "observer_session_id": str(observer_session_id or "").strip(),
+        "route_token_ref": str(route_token_ref or "").strip(),
+        "project_id": str(project_id or "").strip(),
+        "mcp_tools": ["observer_session_heartbeat", "observer_session_register"],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _route_token_ref_error_details(
+    exc: BaseException,
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+) -> dict[str, Any]:
+    code = str(getattr(exc, "code", "") or "").strip()
+    raw_details = getattr(exc, "details", {})
+    exc_details = dict(raw_details) if isinstance(raw_details, Mapping) else {}
+    next_action = exc_details.get("next_action")
+    if not isinstance(next_action, Mapping):
+        expiry_status = exc_details.get("expiry_status")
+        if isinstance(expiry_status, Mapping):
+            next_action = expiry_status.get("next_action")
+    if not isinstance(next_action, Mapping) and (
+        code in {"route_token_ref_expired", "route_token_ref_near_expiry"}
+        or "expired" in str(exc).lower()
+        or "near expiry" in str(exc).lower()
+    ):
+        next_action = _observer_route_context_renewal_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            observer_session_id=observer_session_id,
+            reason=code or "route_token_ref_expiry",
+        )
+    payload: dict[str, Any] = {
+        "schema_version": "route_token_ref.semantic_error.v1",
+        "route_token_ref": str(route_token_ref or "").strip(),
+        "route_token_ref_error_code": code,
+        "route_token_ref_error_details": exc_details,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    if isinstance(next_action, Mapping):
+        payload["next_action"] = dict(next_action)
+        payload["next_legal_action"] = dict(next_action)
+        payload["semantic_next_action"] = str(
+            next_action.get("semantic_next_action")
+            or next_action.get("action")
+            or "observer_route_context_renew"
+        )
+    return payload
+
+
 def _iter_nested_mappings(value: Any, *, _depth: int = 0) -> Iterable[Mapping[str, Any]]:
     if _depth > 8:
         return
@@ -3192,6 +3282,13 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             parent_route_identity=parent_route_identity,
             **parent_identity_args,
         )
+        issued_token = issued.get("route_token")
+        if isinstance(issued_token, dict):
+            owned_scope = body.get("owned_files") if isinstance(body.get("owned_files"), list) else target_files
+            issued_token.setdefault(
+                "owned_files",
+                [str(path).strip() for path in owned_scope if str(path or "").strip()],
+            )
     except ValueError as exc:
         return 400, {"ok": False, "error": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
@@ -3251,6 +3348,148 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     if ref_persist_warning:
         response["ref_persist_warning"] = ref_persist_warning
     return response
+
+
+@route("POST", "/api/projects/{project_id}/observer/route-context/renew")
+def handle_observer_route_context_renew(ctx: RequestContext):
+    """Renew an expired/near-expired same-scope route_token_ref."""
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    try:
+        header_role = str(ctx.handler.headers.get("X-Caller-Role", "") or "").strip()
+    except Exception:
+        header_role = ""
+    caller_role = str(body.get("caller_role") or header_role or "").strip().lower()
+    if caller_role != "observer":
+        return 403, {
+            "ok": False,
+            "error": "caller_role must be 'observer' to renew a route_token_ref",
+        }
+
+    observer_session_id = str(
+        body.get("observer_session_id") or body.get("observer_session_ref") or ""
+    ).strip()
+    route_token_ref = str(
+        body.get("route_token_ref") or body.get("observer_route_token_ref") or ""
+    ).strip()
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    task_id = str(body.get("task_id") or body.get("contract_execution_id") or "").strip()
+    missing = [
+        field
+        for field, value in (
+            ("observer_session_id", observer_session_id),
+            ("route_token_ref", route_token_ref),
+            ("backlog_id", backlog_id),
+            ("task_id", task_id),
+        )
+        if not value
+    ]
+    if missing:
+        return 400, {
+            "ok": False,
+            "error": "route_token_ref renewal is missing required fields",
+            "missing_fields": missing,
+            "next_action": _observer_route_context_renewal_guidance(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+                observer_session_id=observer_session_id,
+                reason="missing_required_fields",
+            ),
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+
+    allowed_actions = body.get("allowed_actions")
+    if allowed_actions is not None and not isinstance(allowed_actions, list):
+        return 400, {"ok": False, "error": "allowed_actions must be a list"}
+    allowed_actions = _observer_route_context_issue_allowed_actions(allowed_actions)
+    target_files = body.get("target_files")
+    if target_files is not None and not isinstance(target_files, list):
+        return 400, {"ok": False, "error": "target_files must be a list"}
+    owned_files = body.get("owned_files")
+    if owned_files is not None and not isinstance(owned_files, list):
+        return 400, {"ok": False, "error": "owned_files must be a list"}
+    evidence_refs = body.get("evidence_refs")
+    if evidence_refs is not None and not isinstance(evidence_refs, list):
+        return 400, {"ok": False, "error": "evidence_refs must be a list"}
+    try:
+        ttl_hours = float(body.get("ttl_hours", 24))
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "error": "ttl_hours must be a number"}
+
+    from . import observer_route_context
+
+    try:
+        renew_within_seconds = int(
+            body.get(
+                "renew_within_seconds",
+                observer_route_context.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+            )
+        )
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "error": "renew_within_seconds must be an integer"}
+
+    conn = get_connection(project_id)
+    try:
+        session = observer_session.get_session(
+            conn,
+            project_id=project_id,
+            session_id=observer_session_id,
+        )
+        if not session or str(session.get("computed_status") or "") != "active":
+            return 403, {
+                "ok": False,
+                "error": "active observer_session_id is required to renew route_token_ref",
+                "observer_session_id": observer_session_id,
+                "next_action": _observer_session_renewal_gate_guidance(
+                    project_id=project_id,
+                    observer_session_id=observer_session_id,
+                    route_token_ref=route_token_ref,
+                ),
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            }
+        project_root = None
+        try:
+            project_root = _graph_governance_project_root(project_id, body)
+        except Exception:
+            project_root = None
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            caller_role=caller_role,
+            allowed_actions=allowed_actions,
+            target_files=target_files,
+            owned_files=owned_files,
+            ttl_hours=ttl_hours,
+            renew_within_seconds=renew_within_seconds,
+            evidence_refs=evidence_refs,
+            project_root=project_root,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        return 422, {
+            "ok": False,
+            "error": str(exc),
+            **_route_token_ref_error_details(
+                exc,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+                observer_session_id=observer_session_id,
+            ),
+        }
+    except ValueError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+    return renewed
 
 
 @route("GET", "/api/projects/{project_id}/project-inbox")
@@ -5821,6 +6060,11 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             "observer_session_not_active",
             "current-full reconcile observer route proof requires an active observer session",
             observer_session_id=observer_session_id,
+            next_action=_observer_session_renewal_gate_guidance(
+                project_id=project_id,
+                observer_session_id=observer_session_id,
+                route_token_ref=route_token_ref,
+            ),
         )
 
     from . import observer_route_context as _orc
@@ -5832,14 +6076,24 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
+            renew_within_seconds=_orc.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
         )
     except _orc.RouteTokenRefError as exc:
+        renewal_details = _route_token_ref_error_details(
+            exc,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            observer_session_id=observer_session_id,
+        )
         _raise_current_full_route_proof(
             "route_token_ref_invalid",
             str(exc),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
+            **renewal_details,
         )
 
     if not resolved:
@@ -30404,6 +30658,7 @@ def _resolve_route_token_ref_server_side(
     route_id: str = "",
     route_context_hash: str = "",
     prompt_contract_id: str = "",
+    renew_within_seconds: int | None = None,
 ) -> dict | None:
     """Attempt server-side resolution of a route_token_ref in the request body.
 
@@ -30450,6 +30705,11 @@ def _resolve_route_token_ref_server_side(
             route_id=route_id,
             route_context_hash=route_context_hash,
             prompt_contract_id=prompt_contract_id,
+            renew_within_seconds=(
+                _orc.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS
+                if renew_within_seconds is None
+                else renew_within_seconds
+            ),
         )
     finally:
         try:
@@ -30602,11 +30862,21 @@ def _require_route_token_mutation_gate(
                 body = dict(body)
                 body["route_token"] = resolved
     except _orc.RouteTokenRefError as exc:
+        details = route_token_required_failure_details(action=action, reason=str(exc))
+        details.update(
+            _route_token_ref_error_details(
+                exc,
+                project_id=pid,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=str(body.get("route_token_ref") or "").strip(),
+            )
+        )
         raise GovernanceError(
             "route_token_required",
             str(exc),
             422,
-            route_token_required_failure_details(action=action, reason=str(exc)),
+            details,
         ) from exc
 
     try:
@@ -36868,6 +37138,11 @@ def _resolve_contract_runtime_observer_proof(
                 "required_role": "observer",
                 "proof_error": "observer_session_not_active",
                 "observer_session_id": observer_session_id,
+                "next_action": _observer_session_renewal_gate_guidance(
+                    project_id=project_id,
+                    observer_session_id=observer_session_id,
+                    route_token_ref=route_token_ref,
+                ),
             },
         )
 
@@ -36880,17 +37155,29 @@ def _resolve_contract_runtime_observer_proof(
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=contract_execution_id,
+            renew_within_seconds=_orc.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
         )
     except _orc.RouteTokenRefError as exc:
+        details = {
+            "required_role": "observer",
+            "proof_error": "route_token_ref_invalid",
+            "route_token_ref": route_token_ref,
+            "message": str(exc),
+        }
+        details.update(
+            _route_token_ref_error_details(
+                exc,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                route_token_ref=route_token_ref,
+                observer_session_id=observer_session_id,
+            )
+        )
         raise PermissionDeniedError(
             "coordinator",
             action,
-            {
-                "required_role": "observer",
-                "proof_error": "route_token_ref_invalid",
-                "route_token_ref": route_token_ref,
-                "message": str(exc),
-            },
+            details,
         ) from exc
     if not resolved:
         raise PermissionDeniedError(
@@ -39595,6 +39882,13 @@ def _onboard_contract_agent_guidance(
         "backlog_id": backlog_id,
         "task_id": contract_execution_id,
     }
+    renewal_guidance = _observer_route_context_renewal_guidance(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        reason="long_running_agent_route_token_ref_refresh",
+    )
     route_guide = _onboard_contract_route_guide(
         record,
         next_legal_action=next_legal_action,
@@ -39798,6 +40092,9 @@ def _onboard_contract_agent_guidance(
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
         }
+    route_token_ref_guidance.setdefault("renewal", renewal_guidance)
+    route_token_ref_guidance.setdefault("route_token_ref_renewal", renewal_guidance)
+    route_token_issue.setdefault("renewal", renewal_guidance)
     return {
         "schema_version": "onboard_contract.agent_onboard_guidance.v1",
         "role": requested_role,
@@ -40035,6 +40332,14 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     status = "current_contract_scope_verified"
     pass_aliases = ["observer_route_token_ref", "route_token_ref"]
     current_ref = verified_ref
+    renewal_ref = verified_ref or fallback_ref
+    renewal_guidance = _observer_route_context_renewal_guidance(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=target_execution_id,
+        route_token_ref=renewal_ref,
+        reason="long_running_contract_runtime_route_token_ref_refresh",
+    )
     if verified_ref:
         patched_next_action["route_token_ref"] = verified_ref
         patched_next_action["route_token_ref_status"] = status
@@ -40053,6 +40358,14 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         if fallback_ref:
             patched_next_action["enter_only_route_token_ref"] = fallback_ref
             patched_next_action["enter_only_route_token_ref_binding"] = fallback_binding
+            fallback_next = fallback_binding.get("next_action")
+            if isinstance(fallback_next, Mapping):
+                patched_next_action["route_token_ref_renewal"] = dict(fallback_next)
+                patched_next_action["semantic_next_action"] = str(
+                    fallback_next.get("semantic_next_action")
+                    or fallback_next.get("action")
+                    or ""
+                )
 
     guidance["route_token_ref_guidance"] = {
         "schema_version": "onboard_contract.route_token_ref_guidance.v1",
@@ -40063,6 +40376,8 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         "target_contract_id": target_contract_id,
         "pass_to_next_runtime_writes_as": pass_aliases,
         "observer_route_context_issue_payload": issue_payload,
+        "renewal": renewal_guidance,
+        "route_token_ref_renewal": renewal_guidance,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -40088,6 +40403,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
             "path_params": {"project_id": project_id},
         },
         "observer_route_context_issue_payload": issue_payload,
+        "renewal": renewal_guidance,
         "scope": {
             "project_id": project_id,
             "backlog_id": backlog_id,
@@ -41344,6 +41660,10 @@ def _contract_runtime_route_token_ref_binding(
             project_id=project_id,
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            renew_within_seconds=(
+                observer_route_context.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS
+            ),
         )
     except observer_route_context.RouteTokenRefError as exc:
         proof.update(
@@ -41352,6 +41672,15 @@ def _contract_runtime_route_token_ref_binding(
                 "reason": "route_token_ref_invalid",
                 "resolution_error": str(exc),
             }
+        )
+        proof.update(
+            _route_token_ref_error_details(
+                exc,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                route_token_ref=route_token_ref,
+            )
         )
         return proof
     if not resolved:
