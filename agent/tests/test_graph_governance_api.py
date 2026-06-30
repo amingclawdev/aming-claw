@@ -24110,6 +24110,115 @@ def test_backlog_close_contract_runtime_authority_keeps_legacy_gate_advisory(con
     ] is True
 
 
+def test_backlog_close_authority_projection_prefers_route_gate_cex_for_onboard_service_current(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-AUTHORITY-ROUTE-GATE-CEX-WINS"
+    close_commit = "fe6275118745006c8324dfcbeecea62c39e91936"
+    worker_commit = "e15d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-route-gate-cex-wins",
+    )
+    authority_execution_id = fixture["parent_record"]["contract_execution_id"]
+    successor_execution_id = fixture["successor"]["contract_execution_id"]
+    service_execution_id = "onboard-service-route-gate-cex-wins"
+    real_backlog_contract_chain_current = server.read_backlog_contract_chain_current
+
+    def fake_backlog_contract_chain_current(
+        read_conn,
+        *,
+        project_id,
+        backlog_id,
+        rebuild_if_missing=False,
+        **_kwargs,
+    ):
+        if rebuild_if_missing:
+            return real_backlog_contract_chain_current(
+                read_conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                rebuild_if_missing=rebuild_if_missing,
+                **_kwargs,
+            )
+        return {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "current_contract_execution_id": service_execution_id,
+            "root_contract_execution_id": service_execution_id,
+            "active_child_contract_execution_id": "",
+            "active_chain": {"execution_ids": [service_execution_id]},
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "backlog_contract_chain_current",
+            "readiness_state": "contract_active",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "read_backlog_contract_chain_current",
+        fake_backlog_contract_chain_current,
+    )
+    route_gate = {
+        **fixture["route_identity"],
+        "schema_version": "route_token_mutation_gate.v1",
+        "allowed": True,
+        "accepted": True,
+        "status": "passed",
+        "scope": {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": service_execution_id,
+        },
+        "evidence_refs": [
+            f"contract_runtime:{authority_execution_id}",
+            f"contract_runtime:{successor_execution_id}",
+        ],
+        "contract_chain_current": {
+            "current_contract_execution_id": service_execution_id,
+            "root_contract_execution_id": service_execution_id,
+        },
+    }
+    close_body = {
+        "actor": "observer",
+        "commit": close_commit,
+        "route_token_ref": fixture["route_identity"]["route_token_ref"],
+    }
+    gate_body = server._timeline_gate_contract_runtime_projection_body(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        query=close_body,
+        route_gate=route_gate,
+    )
+    assert gate_body["contract_execution_id"] == authority_execution_id
+    assert gate_body["contract_runtime"]["current_contract_execution_id"] == (
+        service_execution_id
+    )
+
+    monkeypatch.setattr(
+        server,
+        "read_backlog_contract_chain_current",
+        real_backlog_contract_chain_current,
+    )
+    projection = server._contract_runtime_close_authority_projection(
+        conn,
+        project_id=PID,
+        bug_id=backlog_id,
+        body=gate_body,
+        route_gate=route_gate,
+        close_commit=close_commit,
+    )
+
+    assert projection["accepted"] is True, projection
+    assert projection["contract_execution_id"] == authority_execution_id
+    assert successor_execution_id in projection["source_contract_execution_ids"]
+
+
 def test_backlog_close_contract_runtime_authority_ignores_legacy_advisory_gaps(
     conn,
     monkeypatch,

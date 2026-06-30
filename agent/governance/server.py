@@ -45421,6 +45421,7 @@ def _contract_runtime_close_requested_execution_ref(body: Mapping[str, Any]) -> 
 
 def _contract_runtime_close_authority_ref_execution_id(value: Any) -> str:
     refs: list[str] = []
+    candidates: list[str] = []
     queue: list[Any] = [value]
     seen: set[int] = set()
     while queue and len(seen) < 200:
@@ -45430,6 +45431,17 @@ def _contract_runtime_close_authority_ref_execution_id(value: Any) -> str:
             if marker in seen:
                 continue
             seen.add(marker)
+            for key in (
+                *_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS,
+                "current_contract_execution_id",
+                "root_contract_execution_id",
+                "parent_contract_execution_id",
+                "active_child_contract_execution_id",
+                "task_id",
+            ):
+                token = str(item.get(key) or "").strip()
+                if token.startswith(("cex-", "onboard-service-")):
+                    candidates.append(token.split(":", 1)[0].strip())
             for key in ("evidence_refs", "source_refs", "references"):
                 child = item.get(key)
                 if isinstance(child, str):
@@ -45455,9 +45467,15 @@ def _contract_runtime_close_authority_ref_execution_id(value: Any) -> str:
         if token.startswith("contract_runtime:"):
             parts = token.split(":")
             if len(parts) > 1 and parts[1].strip():
-                return parts[1].strip()
+                candidates.append(parts[1].strip())
         if token.startswith(("cex-", "onboard-service-")):
-            return token.split(":", 1)[0].strip()
+            candidates.append(token.split(":", 1)[0].strip())
+    for candidate in candidates:
+        if candidate.startswith("cex-"):
+            return candidate
+    for candidate in candidates:
+        if candidate.startswith("onboard-service-"):
+            return candidate
     return ""
 
 
@@ -53664,7 +53682,23 @@ def _timeline_gate_contract_runtime_projection_body(
     current_execution_id = str(
         current.get("current_contract_execution_id") or ""
     ).strip()
+    root_execution_id = str(current.get("root_contract_execution_id") or "").strip()
+    route_gate_execution_id = _contract_runtime_close_authority_ref_execution_id(
+        route_gate or {}
+    )
+    route_gate_cex_execution_id = (
+        route_gate_execution_id if route_gate_execution_id.startswith("cex-") else ""
+    )
     execution_id = current_execution_id
+    if (
+        not execution_id.startswith("cex-")
+        and route_gate_cex_execution_id
+        and (
+            current_execution_id.startswith("onboard-service-")
+            or root_execution_id.startswith("onboard-service-")
+        )
+    ):
+        execution_id = route_gate_cex_execution_id
     if not execution_id.startswith("cex-"):
         execution_id = str(
             current.get("active_child_contract_execution_id") or ""
@@ -53680,12 +53714,11 @@ def _timeline_gate_contract_runtime_projection_body(
             if candidate_id.startswith("cex-"):
                 execution_id = candidate_id
                 break
-    route_gate_execution_id = _contract_runtime_close_authority_ref_execution_id(
-        route_gate or {}
-    )
+    if not execution_id.startswith("cex-") and route_gate_cex_execution_id:
+        execution_id = route_gate_cex_execution_id
     requested_execution_id = (
         current_execution_id
-        or str(current.get("root_contract_execution_id") or "").strip()
+        or root_execution_id
         or route_gate_execution_id
     )
     has_contract_runtime_signal = (

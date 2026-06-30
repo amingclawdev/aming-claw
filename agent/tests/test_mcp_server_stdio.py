@@ -576,10 +576,18 @@ def test_mcp_stdio_backlog_close_schema_exposes_route_gate_fields():
     tools = responses[0]["result"]["tools"]
     backlog_close = next(tool for tool in tools if tool["name"] == "backlog_close")
     properties = backlog_close["inputSchema"]["properties"]
+    assert "contract_execution_id" in properties
     assert "route_token" in properties
     assert "route_token_ref" in properties
     assert "route_waiver" in properties
     assert "route_token_waiver" in properties
+    runtime_backlog_close = next(
+        tool for tool in runtime_mcp_tools if tool["name"] == "backlog_close"
+    )
+    assert (
+        "contract_execution_id"
+        in runtime_backlog_close["inputSchema"]["properties"]
+    )
 
 
 def test_mcp_stdio_mf_timeline_precheck_schema_exposes_close_commit_aliases():
@@ -1114,6 +1122,7 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
             "bug_id": "BUG-ROUTE",
             "commit": "abc123",
             "actor": "observer",
+            "contract_execution_id": "cex-close-authority-test",
             "route_token": route_token,
             "route_token_ref": "rtok-close-test",
             "route_waiver": route_waiver,
@@ -1128,6 +1137,7 @@ def test_mcp_backlog_close_forwards_route_gate_payloads():
             {
                 "commit": "abc123",
                 "actor": "observer",
+                "contract_execution_id": "cex-close-authority-test",
                 "route_token": route_token,
                 "route_token_ref": "rtok-close-test",
                 "route_waiver": route_waiver,

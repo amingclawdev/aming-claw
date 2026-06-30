@@ -1140,6 +1140,7 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string"},
                 "commit": {"type": "string"},
                 "actor": {"type": "string"},
+                "contract_execution_id": {"type": "string", "description": "Optional ContractRuntime execution id to use for backlog close authority projection."},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog close."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
@@ -3317,7 +3318,15 @@ class ToolDispatcher:
             bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
             body = {
                 key: args[key]
-                for key in ("commit", "actor", "route_token", "route_token_ref", "route_waiver", "route_token_waiver")
+                for key in (
+                    "commit",
+                    "actor",
+                    "contract_execution_id",
+                    "route_token",
+                    "route_token_ref",
+                    "route_waiver",
+                    "route_token_waiver",
+                )
                 if args.get(key)
             }
             return self._api("POST", f"/api/backlog/{pid}/{bug_id}/close", body)
