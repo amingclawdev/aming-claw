@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -32923,6 +32924,221 @@ def _record_mf_parallel_runtime_context_worker_evidence(
         "attestation": attestation["id"],
         "finish_gate": finish_gate["id"],
     }
+
+
+def _setup_mf_parallel_contract_runtime_worker_dispatch(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    worker_task_id: str,
+    fence_token: str,
+    token: str,
+    worktree_path: str | None = None,
+) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": f"rtok-{backlog_id.lower()}-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved parallel worker repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": f"rtok-{backlog_id.lower()}-root",
+                "worker_fence": {
+                    "fence_token": fence_token,
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        fence_token=fence_token,
+        token=token,
+        worktree_path=worktree_path,
+    )
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "worker_id": worker_identity,
+                "worker_slot_id": worker_identity,
+                "payload": {
+                    "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                },
+            },
+        )
+    )
+    assert dispatch["ok"] is True
+    return successor, runtime_context
+
+
+def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-COPY-SAFE-WORKER-READ"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="copy-safe-worker-read-parent",
+        worker_task_id="copy-safe-worker-read-worker",
+        fence_token="fence-copy-safe-worker-read",
+        token="copy-safe-worker-read-token",
+    )
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            query={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "parent_task_id": backlog_id,
+                "target_project_root": runtime_context.target_project_root,
+                "worker_role": "mf_sub",
+            },
+        )
+    )
+
+    assert current["actor_role"] == "mf_sub"
+    assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+
+
+def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-MISSING-WORKER-PROOF"
+    successor, _runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="missing-worker-proof-parent",
+        worker_task_id="missing-worker-proof-worker",
+        fence_token="fence-missing-worker-proof",
+        token="missing-worker-proof-token",
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc:
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "mf_sub",
+            )
+        )
+
+    details = exc.value.details
+    assert details["proof_error"] == "missing_worker_proof_fields"
+    assert set(details["missing_required_fields"]) == {
+        "runtime_context_id",
+        "session_token_ref",
+        "parent_task_id",
+        "target_project_root",
+    }
+    assert details["required_role"] == "mf_sub"
+
+
+def test_contract_runtime_worker_line_attaches_verified_mf_sub_provenance(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-WORKER-LINE-PROVENANCE"
+    fence_token = "fence-worker-line-provenance"
+    worker_token = "worker-line-provenance-token"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="worker-line-provenance-parent",
+        worker_task_id="worker-line-provenance-worker",
+        fence_token=fence_token,
+        token=worker_token,
+    )
+    session_ref = runtime_context_session_token_ref(runtime_context)
+
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token_ref": session_ref,
+                "target_project_root": runtime_context.target_project_root,
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                },
+            },
+        )
+    )
+
+    assert worker_read["ok"] is True
+    assert worker_read["actor_role"] == "mf_sub"
+    stored = server._contract_runtime_store(conn).get(successor["contract_execution_id"])
+    worker_line = stored["completed_lines"][-1]
+    assert worker_line["actor_role"] == "mf_sub"
+    assert worker_line["observer_impersonation"] is False
+    assert worker_line["authorization_source"] == (
+        "runtime_context_copy_safe_worker_proof"
+    )
+    assert worker_line["evidence_owner_role"] == "mf_sub"
+    provenance = worker_line["payload"]["worker_evidence_provenance"]
+    assert provenance["source"] == "runtime_context_copy_safe_worker_proof"
+    assert provenance["runtime_context_id"] == runtime_context.runtime_context_id
+    assert provenance["session_token_ref"] == session_ref
+    assert provenance["worker_owned"] is True
+    assert provenance["observer_impersonation"] is False
+    stored_json = json.dumps(worker_line, sort_keys=True)
+    assert fence_token not in stored_json
+    assert worker_token not in stored_json
 
 
 def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):

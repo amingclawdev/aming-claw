@@ -10823,27 +10823,9 @@ def _runtime_context_worker_guide_response(
 
 
 def _runtime_context_mf_sub_parent_task_id(context) -> str:
-    parent_task_id = str(getattr(context, "parent_task_id", "") or "").strip()
-    if parent_task_id:
-        return parent_task_id
-    root_task_id = str(getattr(context, "root_task_id", "") or "").strip()
-    chain_id = str(getattr(context, "chain_id", "") or "").strip()
-    task_id = str(getattr(context, "task_id", "") or "").strip()
-    if (
-        chain_id
-        and chain_id not in {root_task_id, task_id}
-        and not chain_id.startswith(("chain-", "cchain-"))
-    ):
-        return chain_id
-    stage_task_id = str(getattr(context, "stage_task_id", "") or "").strip()
-    return str(
-        root_task_id
-        or stage_task_id
-        or chain_id
-        or getattr(context, "backlog_id", "")
-        or task_id
-        or ""
-    ).strip()
+    from .runtime_context import mf_sub_parent_task_id
+
+    return mf_sub_parent_task_id(context)
 
 
 def _runtime_context_request_value(ctx: RequestContext, key: str) -> str:
@@ -37318,8 +37300,10 @@ def _contract_runtime_projection_completed_lines(
 
 
 def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
-    body = ctx.body if isinstance(ctx.body, Mapping) else {}
-    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    body_value = getattr(ctx, "body", {})
+    query_value = getattr(ctx, "query", {})
+    body = body_value if isinstance(body_value, Mapping) else {}
+    query = query_value if isinstance(query_value, Mapping) else {}
     for key in keys:
         value = body.get(key)
         if value is None:
@@ -37334,6 +37318,39 @@ def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
 
 def _normalized_contract_runtime_action(value: str) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _contract_runtime_normalized_ref_value(ctx: RequestContext, *keys: str) -> str:
+    return _normalized_contract_runtime_action(_contract_runtime_ref_value(ctx, *keys))
+
+
+def _contract_runtime_mf_sub_proof_requested(ctx: RequestContext) -> bool:
+    if _contract_runtime_normalized_ref_value(ctx, "worker_role", "role") == "mf_sub":
+        return True
+    return any(
+        _contract_runtime_ref_value(ctx, key)
+        for key in (
+            "runtime_context_id",
+            "session_token_ref",
+            "worker_session_token_ref",
+            "session_token",
+            "fence_token",
+            "target_project_root",
+            "target_graph_root",
+            "parent_task_id",
+        )
+    )
+
+
+def _contract_runtime_next_line_allows_mf_sub(
+    record: Mapping[str, Any] | None,
+) -> bool:
+    next_line = _contract_runtime_next_line(record or {})
+    allowed_roles = {
+        str(role or "").strip().lower().replace("-", "_")
+        for role in (next_line.get("allowed_writer_roles") or [])
+    }
+    return "mf_sub" in allowed_roles
 
 
 def _resolve_contract_runtime_observer_proof(
@@ -38266,95 +38283,71 @@ def _resolve_contract_runtime_mf_sub_proof(
     action: str,
     contract_execution_id: str,
     record: Mapping[str, Any] | None = None,
+    require_proof: bool = False,
 ) -> dict[str, Any] | None:
+    proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
+    mf_sub_allowed = _contract_runtime_next_line_allows_mf_sub(record)
+    if not (mf_sub_allowed or require_proof or proof_requested):
+        return None
+
+    if proof_requested and not mf_sub_allowed and not require_proof:
+        return None
+
     runtime_context_id = _contract_runtime_ref_value(ctx, "runtime_context_id")
-    if not runtime_context_id:
-        return None
+    session_token_ref = (
+        _contract_runtime_ref_value(ctx, "session_token_ref", "worker_session_token_ref")
+    )
+    session_token = _contract_runtime_ref_value(ctx, "session_token")
+    parent_task_id = _contract_runtime_ref_value(ctx, "parent_task_id")
+    target_project_root = _contract_runtime_ref_value(
+        ctx,
+        "target_project_root",
+        "target_graph_root",
+    )
+    task_id = _contract_runtime_ref_value(ctx, "task_id")
+    worker_role = _contract_runtime_ref_value(ctx, "worker_role", "role") or "mf_sub"
+    fence_token = _contract_runtime_ref_value(ctx, "fence_token")
+    require_fence_token = not action.endswith("_current")
 
-    next_line = _contract_runtime_next_line(record or {})
-    allowed_roles = {
-        str(role or "").strip().lower().replace("-", "_")
-        for role in (next_line.get("allowed_writer_roles") or [])
-    }
-    if "mf_sub" not in allowed_roles:
-        return None
-
-    expected_runtime_context_id = str(next_line.get("runtime_context_id") or "").strip()
-    if expected_runtime_context_id and runtime_context_id != expected_runtime_context_id:
-        raise PermissionDeniedError(
-            "coordinator",
-            action,
-            {
-                "required_role": "mf_sub",
-                "proof_error": "runtime_context_next_action_mismatch",
-                "runtime_context_id": runtime_context_id,
-                "expected_runtime_context_id": expected_runtime_context_id,
-            },
-        )
-
-    worker_role = _contract_runtime_ref_value(ctx, "worker_role", "role")
-    if worker_role and worker_role.strip().lower().replace("-", "_") != "mf_sub":
-        raise PermissionDeniedError(
-            "coordinator",
-            action,
-            {
-                "required_role": "mf_sub",
-                "proof_error": "worker_role_mismatch",
-                "runtime_context_id": runtime_context_id,
-            },
-        )
+    from .runtime_context import (
+        RuntimeContextWorkerProofError,
+        validate_contract_runtime_worker_proof,
+    )
 
     try:
-        context = _runtime_context_validate_mf_sub_lookup(
-            ctx,
+        proof = validate_contract_runtime_worker_proof(
             conn,
             project_id=project_id,
             runtime_context_id=runtime_context_id,
-            require_session_token=True,
-            require_target_project_root=True,
-            allow_validated=True,
+            session_token_ref=session_token_ref,
+            parent_task_id=parent_task_id,
+            target_project_root=target_project_root,
+            task_id=task_id,
+            worker_role=worker_role,
+            fence_token=fence_token,
+            session_token=session_token,
+            governance_project_id=(
+                _contract_runtime_ref_value(ctx, "governance_project_id", "backlog_project_id")
+                or project_id
+            ),
+            target_project_id=(
+                _contract_runtime_ref_value(ctx, "target_project_id", "graph_project_id")
+                or project_id
+            ),
+            require_fence_token=require_fence_token,
             allow_worktree_target_root_alias=True,
         )
-    except GovernanceError as exc:
+    except RuntimeContextWorkerProofError as exc:
+        details = dict(exc.details or {})
+        details.setdefault("required_role", "mf_sub")
+        details.setdefault("proof_error", exc.code)
+        details.setdefault("action", action)
+        details.setdefault("contract_execution_id", contract_execution_id)
         raise PermissionDeniedError(
-            "coordinator",
+            "mf_sub",
             action,
-            {
-                "required_role": "mf_sub",
-                "proof_error": exc.code,
-                "runtime_context_id": runtime_context_id,
-                "details": dict(exc.details or {}),
-            },
+            details,
         ) from exc
-
-    task_id = _contract_runtime_ref_value(ctx, "task_id")
-    if task_id and task_id != str(getattr(context, "task_id", "") or ""):
-        raise PermissionDeniedError(
-            "coordinator",
-            action,
-            {
-                "required_role": "mf_sub",
-                "proof_error": "runtime_context_task_mismatch",
-                "runtime_context_id": runtime_context_id,
-                "task_id": task_id,
-                "expected_task_id": str(getattr(context, "task_id", "") or ""),
-            },
-        )
-
-    parent_task_id = _contract_runtime_ref_value(ctx, "parent_task_id")
-    expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
-    if parent_task_id and parent_task_id != expected_parent_task_id:
-        raise PermissionDeniedError(
-            "coordinator",
-            action,
-            {
-                "required_role": "mf_sub",
-                "proof_error": "runtime_context_parent_task_mismatch",
-                "runtime_context_id": runtime_context_id,
-                "parent_task_id": parent_task_id,
-                "expected_parent_task_id": expected_parent_task_id,
-            },
-        )
 
     parent_contract_execution_id = _contract_runtime_ref_value(
         ctx,
@@ -38370,7 +38363,7 @@ def _resolve_contract_runtime_mf_sub_proof(
         and parent_contract_execution_id != expected_parent_contract_execution_id
     ):
         raise PermissionDeniedError(
-            "coordinator",
+            "mf_sub",
             action,
             {
                 "required_role": "mf_sub",
@@ -38383,6 +38376,21 @@ def _resolve_contract_runtime_mf_sub_proof(
             },
         )
 
+    next_line = _contract_runtime_next_line(record or {})
+    expected_runtime_context_id = str(next_line.get("runtime_context_id") or "").strip()
+    if expected_runtime_context_id and runtime_context_id != expected_runtime_context_id:
+        raise PermissionDeniedError(
+            "mf_sub",
+            action,
+            {
+                "required_role": "mf_sub",
+                "proof_error": "runtime_context_next_action_mismatch",
+                "runtime_context_id": runtime_context_id,
+                "expected_runtime_context_id": expected_runtime_context_id,
+            },
+        )
+
+    context = proof.get("context")
     if not _contract_runtime_record_references_runtime_context(
         record,
         context,
@@ -38394,7 +38402,7 @@ def _resolve_contract_runtime_mf_sub_proof(
         context=context,
     ):
         raise PermissionDeniedError(
-            "coordinator",
+            "mf_sub",
             action,
             {
                 "required_role": "mf_sub",
@@ -38404,12 +38412,7 @@ def _resolve_contract_runtime_mf_sub_proof(
             },
         )
 
-    return {
-        "role": "mf_sub",
-        "role_source": "runtime_context_session_token_or_ref",
-        "runtime_context_id": runtime_context_id,
-        "task_id": str(getattr(context, "task_id", "") or ""),
-    }
+    return proof
 
 
 def _contract_runtime_effective_actor_role(
@@ -38423,19 +38426,27 @@ def _contract_runtime_effective_actor_role(
 ) -> str:
     session = ctx.require_auth(conn)
     role = str(session.get("role") or "").strip()
-    if role in {"observer", "qa"}:
-        return role
     project_id = ctx.get_project_id()
-    mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(
-        ctx,
-        conn,
-        project_id=project_id,
-        action=action,
-        contract_execution_id=contract_execution_id,
-        record=record,
-    )
-    if mf_sub_proof:
-        return "mf_sub"
+    role_normalized = _normalized_contract_runtime_action(role)
+    if role_normalized == "qa":
+        return "qa"
+    proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
+    mf_sub_allowed = _contract_runtime_next_line_allows_mf_sub(record)
+    if role_normalized == "mf_sub" or (proof_requested and mf_sub_allowed):
+        mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(
+            ctx,
+            conn,
+            project_id=project_id,
+            action=action,
+            contract_execution_id=contract_execution_id,
+            record=record,
+            require_proof=role_normalized == "mf_sub",
+        )
+        if mf_sub_proof:
+            ctx._contract_runtime_mf_sub_proof = mf_sub_proof
+            return "mf_sub"
+    if role == "observer":
+        return role
     proof = _resolve_contract_runtime_observer_proof(
         ctx,
         conn,
@@ -38454,6 +38465,7 @@ def _contract_runtime_line_write_body(
     body: Mapping[str, Any],
     *,
     actor_role: str,
+    worker_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     next_line = (
         record.get("runtime_guide", {}).get("next_legal_action")
@@ -38524,6 +38536,10 @@ def _contract_runtime_line_write_body(
                 payload,
                 worker_role,
             )
+    if actor_role == "mf_sub" and worker_proof:
+        from .runtime_context import attach_contract_runtime_worker_provenance
+
+        write = attach_contract_runtime_worker_provenance(write, worker_proof)
     return write
 
 
@@ -57401,6 +57417,7 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
                 record,
                 actor_role=actor_role,
                 body=body,
+                worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
             )
             result = runtime.submit_line_write(
                 contract_execution_id,
@@ -57567,6 +57584,7 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
                 record,
                 actor_role=actor_role,
                 body=body,
+                worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
             )
             result = runtime.submit_line_write(
                 contract_execution_id,
@@ -57867,6 +57885,7 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
                 write_record,
                 actor_role=actor_role,
                 body=body,
+                worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
             )
             result = runtime.submit_line_write(
                 contract_execution_id,
@@ -57923,6 +57942,7 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             action="contract_runtime_current",
             backlog_id=str(record.get("backlog_id") or ""),
             contract_execution_id=contract_execution_id,
+            record=record,
         )
         try:
             record = _contract_runtime_read(
@@ -57975,6 +57995,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     record,
                     actor_role=actor_role,
                     body=body,
+                    worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
                 result = _onboard_service_submit_line_write(
                     conn,
@@ -57997,6 +58018,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     record,
                     actor_role=actor_role,
                     body=body,
+                    worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
                 write = _direct_fix_materialize_dispatch_runtime_context(
                     conn,
@@ -58088,6 +58110,7 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     record,
                     actor_role=actor_role,
                     body=body,
+                    worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
                 result = _onboard_service_submit_line_write(
                     conn,
@@ -58111,6 +58134,7 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     record,
                     actor_role=actor_role,
                     body=body,
+                    worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
                 )
                 result = runtime.precheck_line_write(
                     contract_execution_id,
