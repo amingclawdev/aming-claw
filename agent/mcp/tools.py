@@ -761,6 +761,41 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_route_context_renew",
+        "description": (
+            "Renew an expired or near-expired server-registered route_token_ref "
+            "for the same project/backlog/task/action/file scope. Requires an "
+            "active observer_session_id and never returns a raw route token."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "caller_role": {"type": "string", "description": "Must be observer."},
+                "observer_session_id": {"type": "string"},
+                "route_token_ref": {"type": "string"},
+                "observer_route_token_ref": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
+                "allowed_actions": {"type": "array", "items": {"type": "string"}},
+                "target_files": {"type": "array", "items": {"type": "string"}},
+                "owned_files": {"type": "array", "items": {"type": "string"}},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "ttl_hours": {"type": "number"},
+                "renew_within_seconds": {"type": "integer"},
+            },
+            "required": [
+                "project_id",
+                "observer_session_id",
+                "route_token_ref",
+                "backlog_id",
+                "task_id",
+            ],
+        },
+    },
+    {
         "name": "observer_command_list",
         "description": "List durable observer command queue rows for a project, including observer-consumer recovery diagnostics for notified execute_backlog_row commands.",
         "inputSchema": {
@@ -3188,6 +3223,16 @@ class ToolDispatcher:
                 if key != "project_id" and value is not None
             }
             return self._api("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
+
+        if name == "observer_route_context_renew":
+            pid = args["project_id"]
+            body = {
+                key: value
+                for key, value in args.items()
+                if key != "project_id" and value is not None
+            }
+            body.setdefault("caller_role", "observer")
+            return self._api("POST", f"/api/projects/{pid}/observer/route-context/renew", body)
 
         if name == "observer_command_list":
             pid = args["project_id"]

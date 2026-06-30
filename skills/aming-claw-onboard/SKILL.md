@@ -38,6 +38,12 @@ instructions.
    contract/timeline payload. Use source-only evidence only when the graph misses,
    is unavailable, or source-hint status says docs/config/tests are not
    materialized.
+8. For long-running observer/worker chains, if a protected facade reports an
+   expired or near-expired `route_token_ref`, renew the same-scope ref through
+   `observer_route_context_renew` (or
+   `POST /api/projects/{project_id}/observer/route-context/renew`) with an
+   active `observer_session_id`. Pass only refs; raw route tokens are not
+   required or exposed.
 
 ## Guardrails
 
@@ -51,6 +57,10 @@ instructions.
 - For QA evidence that is materialized by a parent observer, keep the QA owner,
   submitter, materialized-from, and authorization provenance fields returned by
   the runtime guide; do not collapse it into observer-authored QA.
+- Route-token-ref renewal must preserve or narrow the existing project,
+  backlog/task, allowed-actions, target-files, and owned-files scope. If the
+  observer session is stale, heartbeat or register an observer session before
+  renewal; never request or paste a raw route token.
 
 ## Archive
 

@@ -1569,6 +1569,44 @@ def _backlog_target_files(row: Mapping[str, Any]) -> list[str]:
     return _string_list(value)
 
 
+def _route_token_ref_renewal_hint(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "contract_state.route_token_ref_renewal_hint.v1",
+        "action": "renew_route_token_ref",
+        "semantic_next_action": "observer_route_context_renew",
+        "mcp_tool": "observer_route_context_renew",
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/renew",
+            "path_params": {"project_id": project_id},
+        },
+        "required_fields": [
+            "project_id",
+            "observer_session_id",
+            "route_token_ref",
+            "backlog_id",
+            "task_id",
+        ],
+        "project_id": project_id,
+        "current_route_token_ref": route_token_ref,
+        "route_token_ref": route_token_ref,
+        "scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        },
+        "use_when": ["expired", "near_expiry", "long_running_agent_refresh"],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _backlog_close_route_token_request_hint(
     *,
     row: Mapping[str, Any],
@@ -1613,6 +1651,12 @@ def _backlog_close_route_token_request_hint(
         "current_route_token_ref": route_token_ref,
         "route_identity": route_identity,
         "issue_route_token_request": issue_request,
+        "route_token_ref_renewal": _route_token_ref_renewal_hint(
+            project_id=str(row.get("project_id") or ""),
+            backlog_id=backlog_id,
+            task_id=task_id or backlog_id,
+            route_token_ref=route_token_ref,
+        ),
         "protected_entrypoint": {
             "mcp_tool": "backlog_close",
             "allowed_action": "backlog_close",
