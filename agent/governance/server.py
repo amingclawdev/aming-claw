@@ -35142,6 +35142,25 @@ def _runtime_next_action_from_guide(
         "successor_contract_template_id",
         "next_operator_action",
         "block_reason",
+        "target_project_root",
+        "project_root",
+        "repo_root",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_identity",
+        "session_token_ref",
+        "graph_trace_id",
+        "graph_trace_ids",
+        "graph_query_trace_id",
+        "graph_query_trace_ids",
+        "caller_graph_query_schema_trace_id",
+        "owned_files",
+        "target_files",
+        "worker_session_lifecycle_policy",
+        "write_authorization_policy",
     ):
         if key in next_line:
             result[key] = next_line[key]
@@ -35172,6 +35191,213 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     }
 
 
+_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS = (
+    "id",
+    "line_id",
+    "stage_id",
+    "action",
+    "evidence_kind",
+    "contract_execution_id",
+    "execution_state_revision",
+)
+
+_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "lane_id",
+    "worker_slot_id",
+    "worker_id",
+    "worker_index",
+    "target_project_root",
+    "project_root",
+    "repo_root",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "route_identity",
+    "session_token_ref",
+    "graph_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_id",
+    "graph_query_trace_ids",
+    "caller_graph_query_schema_trace_id",
+    "read_receipt_hash",
+    "startup_event_id",
+    "startup_event_ref",
+    "implementation_event_refs",
+    "changed_files",
+    "test_results",
+    "head_commit",
+    "commit_sha",
+    "trace_id",
+    "artifact_refs",
+    "verification",
+    "owned_files",
+    "target_files",
+    "worker_session_lifecycle_policy",
+    "write_authorization_policy",
+)
+
+
+def _contract_chain_next_action_freshness_key(
+    next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: next_action.get(key)
+        for key in _CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS
+        if key in next_action
+    }
+
+
+def _merge_contract_chain_next_action_context(
+    next_action: Mapping[str, Any],
+    previous_next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(next_action)
+    for key in _CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS:
+        if key in merged:
+            continue
+        value = previous_next_action.get(key)
+        if value not in ("", None, [], {}):
+            merged[key] = value
+    return merged
+
+
+def _contract_chain_current_with_runtime_freshness(
+    conn,
+    current_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    current = dict(current_projection or {})
+    if not current or bool(current.get("degraded")):
+        return current
+
+    current_execution_id = str(
+        current.get("current_contract_execution_id") or ""
+    ).strip()
+    if not current_execution_id:
+        return current
+
+    try:
+        runtime = _contract_runtime(conn)
+        record = runtime.store.get(current_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return current
+    if (
+        str(record.get("contract_id") or "") == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+        or str(record.get("version") or "") == "service"
+    ):
+        return current
+
+    if str(record.get("project_id") or "") != str(current.get("project_id") or ""):
+        return current
+    if str(record.get("backlog_id") or "") != str(current.get("backlog_id") or ""):
+        return current
+
+    previous_next_action = (
+        dict(current.get("next_legal_action"))
+        if isinstance(current.get("next_legal_action"), Mapping)
+        else {}
+    )
+    actor_role = str(
+        previous_next_action.get("owner_role")
+        or previous_next_action.get("worker_role")
+        or ""
+    ).strip()
+    try:
+        projected_record, runtime_context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=str(current.get("project_id") or ""),
+                record=record,
+                actor_role=actor_role or None,
+            )
+        )
+        if not runtime_context_projection:
+            return current
+    except (ContractRuntimeError, StalePinnedContractExecutionError, sqlite3.Error):
+        return current
+
+    guide = (
+        projected_record.get("runtime_guide")
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    fresh_next_action = _runtime_next_action_from_guide(
+        guide,
+        source="backlog_contract_chain_current",
+    )
+    if _contract_chain_next_action_freshness_key(
+        previous_next_action
+    ) == _contract_chain_next_action_freshness_key(fresh_next_action):
+        return current
+
+    if fresh_next_action:
+        fresh_next_action = _merge_contract_chain_next_action_context(
+            fresh_next_action,
+            previous_next_action,
+        )
+    if fresh_next_action:
+        fresh_next_action.setdefault("source_of_authority", "contract_runtime")
+        fresh_next_action.setdefault(
+            "authority_decision_source", "contract_runtime_current_state"
+        )
+
+    projected_record = dict(projected_record)
+    projected_record["runtime_guide"] = guide
+    current_state = _runtime_current_state_from_record(projected_record)
+    current_state["next_legal_action"] = dict(fresh_next_action)
+
+    overlay = dict(current)
+    durable_projection_hash = str(current.get("projection_hash") or "")
+    if durable_projection_hash:
+        overlay["durable_projection_hash"] = durable_projection_hash
+    overlay["next_legal_action"] = dict(fresh_next_action)
+    overlay["generation"] = int(
+        current_state.get("execution_state_revision") or current.get("generation") or 0
+    )
+    overlay["projection_freshness"] = {
+        "schema_version": "backlog_contract_chain_current.runtime_freshness.v1",
+        "status": "refreshed_from_contract_runtime_current",
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_current_state",
+        "current_contract_execution_id": current_execution_id,
+        "current_contract_id": str(record.get("contract_id") or ""),
+        "execution_state_revision": int(
+            current_state.get("execution_state_revision") or 0
+        ),
+        "runtime_guide_hash": str(current_state.get("runtime_guide_hash") or ""),
+        "runtime_context_projection_applied": bool(runtime_context_projection),
+        "stale_next_legal_action": previous_next_action,
+        "refreshed_next_legal_action": dict(fresh_next_action),
+        "preserved_context_keys": [
+            key
+            for key in _CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS
+            if key in fresh_next_action and key in previous_next_action
+        ],
+    }
+    if runtime_context_projection:
+        overlay["projection_freshness"][
+            "runtime_context_projection"
+        ] = runtime_context_projection
+    overlay["contract_runtime_current_state"] = current_state
+    source_ref = (
+        f"contract_runtime:{current_execution_id}:revision:"
+        f"{int(current_state.get('execution_state_revision') or 0)}"
+    )
+    source_refs = list(overlay.get("source_refs") or [])
+    if source_ref not in source_refs:
+        source_refs.append(source_ref)
+    overlay["source_refs"] = source_refs
+    overlay["projection_hash"] = stable_sha256(
+        {key: value for key, value in overlay.items() if key != "projection_hash"}
+    )
+    return overlay
+
+
 def _contract_chain_current_projection(
     conn,
     *,
@@ -35188,7 +35414,10 @@ def _contract_chain_current_projection(
             rebuild_if_missing=False,
         )
         if current_projection or not rebuild_if_missing:
-            return current_projection
+            return _contract_chain_current_with_runtime_freshness(
+                conn,
+                current_projection,
+            )
         try:
             rebuilt_projection = rebuild_backlog_contract_chain_projection(
                 conn,
@@ -35198,7 +35427,10 @@ def _contract_chain_current_projection(
         except sqlite3.Error:
             rebuilt_projection = {}
         if rebuilt_projection:
-            return rebuilt_projection
+            return _contract_chain_current_with_runtime_freshness(
+                conn,
+                rebuilt_projection,
+            )
         record = _onboard_service_materialize_parent_record(
             conn,
             project_id=project_id,
@@ -35207,12 +35439,18 @@ def _contract_chain_current_projection(
         )
         projected = record.get("contract_chain_current")
         if isinstance(projected, Mapping) and projected:
-            return dict(projected)
-        return read_backlog_contract_chain_current(
+            return _contract_chain_current_with_runtime_freshness(
+                conn,
+                projected,
+            )
+        return _contract_chain_current_with_runtime_freshness(
             conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            rebuild_if_missing=True,
+            read_backlog_contract_chain_current(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                rebuild_if_missing=True,
+            ),
         )
     except sqlite3.Error as exc:
         return {
