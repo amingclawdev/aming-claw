@@ -127,6 +127,7 @@ def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
             "owned_files",
             "target_files",
             "contract_execution_id",
+            "onboard_service_waiver",
         }.issubset(schema["properties"])
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
@@ -301,6 +302,7 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
             "reason": "Human approved parallel repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-parallel",
+            "onboard_service_waiver": True,
             "worker_fence": {"fence_token": "fence-parallel"},
             "owned_files": ["agent/governance/server.py"],
         },
@@ -317,6 +319,7 @@ def test_governance_mcp_mf_parallel_enter_dispatches_to_runtime_facade(monkeypat
                 "reason": "Human approved parallel repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-parallel",
+                "onboard_service_waiver": True,
                 "worker_fence": {"fence_token": "fence-parallel"},
                 "owned_files": ["agent/governance/server.py"],
             },
@@ -480,6 +483,7 @@ def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
             "reason": "Human approved parallel repair.",
             "actor_role": "observer",
             "route_token_ref": "rtok-parallel",
+            "onboard_service_waiver": True,
             "worker_fence": {"fence_token": "fence-parallel"},
             "owned_files": ["agent/governance/server.py"],
         },
@@ -496,6 +500,7 @@ def test_tool_dispatcher_mf_parallel_enter_posts_runtime_facade():
                 "reason": "Human approved parallel repair.",
                 "actor_role": "observer",
                 "route_token_ref": "rtok-parallel",
+                "onboard_service_waiver": True,
                 "worker_fence": {"fence_token": "fence-parallel"},
                 "owned_files": ["agent/governance/server.py"],
             },

@@ -297,13 +297,15 @@ def test_mf_batch_parallel_preflight_plans_parallel_groups_and_queue_dependencie
     assert plan["dispatch_groups"] == [
         {
             "group_index": 1,
-            "backlog_ids": ["AC-ROW-B", "AC-ROW-A"],
-            "reason": "no_overlap_with_group",
+            "backlog_ids": ["AC-ROW-B"],
+            "reason": "no_overlap",
+            "overlap_component": False,
         },
         {
             "group_index": 2,
-            "backlog_ids": ["AC-ROW-C"],
-            "reason": "no_overlap_with_group",
+            "backlog_ids": ["AC-ROW-A", "AC-ROW-C"],
+            "reason": "connected_overlap_component",
+            "overlap_component": True,
         },
     ]
     planned = plan["merge_queue_plan"]["planned_items"]
@@ -314,6 +316,65 @@ def test_mf_batch_parallel_preflight_plans_parallel_groups_and_queue_dependencie
     ]
     assert plan["merge_queue_plan"]["planner_only"] is True
     assert plan["merge_queue_plan"]["durable_queue_write"] is False
+
+
+def test_mf_batch_parallel_preflight_groups_connected_overlap_component():
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH",
+        batch_id="batch-overlap",
+        merge_queue_id="mq-batch-overlap",
+        target_head_commit="HEAD1",
+        snapshot_id="scope-HEAD1",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-A",
+                "status": "OPEN",
+                "priority": "P0",
+                "target_files": ["agent/governance/server.py"],
+                "test_files": ["agent/tests/test_graph_governance_api.py"],
+            },
+            {
+                "bug_id": "AC-ROW-B",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["agent/governance/server.py"],
+                "test_files": ["agent/tests/test_mcp_server_stdio.py"],
+            },
+            {
+                "bug_id": "AC-ROW-C",
+                "status": "OPEN",
+                "priority": "P2",
+                "target_files": ["agent/governance/mcp_server.py"],
+                "test_files": ["agent/tests/test_mcp_server_stdio.py"],
+            },
+            {
+                "bug_id": "AC-ROW-D",
+                "status": "OPEN",
+                "priority": "P3",
+                "target_files": ["agent/governance/mcp_server.py"],
+                "test_files": ["agent/tests/test_graph_governance_api.py"],
+            },
+        ],
+    )
+
+    assert plan["status"] == "passed"
+    assert plan["dispatch_groups"] == [
+        {
+            "group_index": 1,
+            "backlog_ids": ["AC-ROW-A", "AC-ROW-B", "AC-ROW-C", "AC-ROW-D"],
+            "reason": "connected_overlap_component",
+            "overlap_component": True,
+        }
+    ]
+    planned = plan["merge_queue_plan"]["planned_items"]
+    by_row = {item["backlog_id"]: item for item in planned}
+    assert by_row["AC-ROW-B"]["serializes_after"] == [by_row["AC-ROW-A"]["task_id"]]
+    assert by_row["AC-ROW-C"]["serializes_after"] == [by_row["AC-ROW-B"]["task_id"]]
+    assert by_row["AC-ROW-D"]["serializes_after"] == [
+        by_row["AC-ROW-A"]["task_id"],
+        by_row["AC-ROW-C"]["task_id"],
+    ]
 
 
 def test_mf_batch_parallel_preflight_strict_mode_serializes_every_row():
