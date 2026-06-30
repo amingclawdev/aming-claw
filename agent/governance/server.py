@@ -45140,11 +45140,18 @@ _CONTRACT_RUNTIME_EXECUTION_ID_FIELDS = (
 
 _CONTRACT_RUNTIME_CONTAINER_KEYS = (
     "artifact_refs",
+    "authority_projection",
+    "backlog_contract_chain_current",
+    "close_authority",
+    "contract_chain_current",
     "contract_runtime",
     "contract_runtime_current_state",
     "current_state",
+    "onboard_service_waiver",
     "payload",
+    "route_token_gate",
     "selected_successor_contract",
+    "source_backed_contract_gate_authority",
     "successor_contract",
     "successor_contract_binding",
     "verification",
@@ -45207,15 +45214,148 @@ def _contract_runtime_close_requested_execution_ref(body: Mapping[str, Any]) -> 
     return ""
 
 
+def _contract_runtime_close_authority_ref_execution_id(value: Any) -> str:
+    refs: list[str] = []
+    queue: list[Any] = [value]
+    seen: set[int] = set()
+    while queue and len(seen) < 200:
+        item = queue.pop(0)
+        if isinstance(item, Mapping):
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            for key in ("evidence_refs", "source_refs", "references"):
+                child = item.get(key)
+                if isinstance(child, str):
+                    refs.append(child)
+                elif isinstance(child, Sequence) and not isinstance(
+                    child,
+                    (str, bytes, bytearray),
+                ):
+                    refs.extend(str(ref) for ref in child if str(ref).strip())
+            queue.extend(
+                child
+                for child in item.values()
+                if isinstance(child, (Mapping, list, tuple))
+            )
+        elif isinstance(item, Sequence) and not isinstance(
+            item,
+            (str, bytes, bytearray),
+        ):
+            queue.extend(item)
+
+    for ref in refs:
+        token = str(ref or "").strip()
+        if token.startswith("contract_runtime:"):
+            parts = token.split(":")
+            if len(parts) > 1 and parts[1].strip():
+                return parts[1].strip()
+        if token.startswith(("cex-", "onboard-service-")):
+            return token.split(":", 1)[0].strip()
+    return ""
+
+
+def _contract_runtime_close_authority_current_projection_signal(
+    projection: Mapping[str, Any],
+) -> bool:
+    if not isinstance(projection, Mapping) or not projection:
+        return False
+    if _contract_runtime_close_authority_ref_execution_id(projection):
+        return True
+    for key in (
+        "current_contract_execution_id",
+        "root_contract_execution_id",
+        "active_child_contract_execution_id",
+    ):
+        token = str(projection.get(key) or "").strip()
+        if token.startswith(("cex-", "onboard-service-")):
+            return True
+    active_chain = (
+        projection.get("active_chain")
+        if isinstance(projection.get("active_chain"), Mapping)
+        else {}
+    )
+    for token in active_chain.get("execution_ids") or []:
+        execution_id = str(token or "").strip()
+        if execution_id.startswith(("cex-", "onboard-service-")):
+            return True
+    authority_source = str(
+        projection.get("source_of_authority")
+        or projection.get("authority_decision_source")
+        or projection.get("projection_source")
+        or ""
+    ).strip()
+    if authority_source in {
+        "contract_runtime",
+        "backlog_contract_chain_current",
+    }:
+        return True
+    close_authority = (
+        projection.get("close_authority")
+        if isinstance(projection.get("close_authority"), Mapping)
+        else {}
+    )
+    replacement_authority = {
+        str(item or "").strip()
+        for item in close_authority.get("replacement_authority") or []
+    }
+    if "contract_runtime" in replacement_authority:
+        return True
+    close_source = str(close_authority.get("source") or "").strip()
+    return close_source in {
+        "contract_runtime",
+        "backlog_contract_chain_current_projection",
+    }
+
+
+def _contract_runtime_close_authority_route_gate_signal(
+    route_gate: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(route_gate, Mapping) or not route_gate:
+        return False
+    if _contract_runtime_close_authority_ref_execution_id(route_gate):
+        return True
+    for container in _contract_runtime_close_mapping_containers(route_gate):
+        authority_source = str(
+            container.get("source_of_authority")
+            or container.get("authority_decision_source")
+            or container.get("projection_source")
+            or ""
+        ).strip()
+        if authority_source in {
+            "contract_runtime",
+            "backlog_contract_chain_current",
+        }:
+            return True
+        for key in (
+            "contract_chain_current",
+            "backlog_contract_chain_current",
+            "authority_projection",
+        ):
+            child = container.get(key)
+            if (
+                isinstance(child, Mapping)
+                and _contract_runtime_close_authority_current_projection_signal(child)
+            ):
+                return True
+    return False
+
+
 def _contract_runtime_close_authority_required_signal(
     body: Mapping[str, Any],
     runtime_projection: Mapping[str, Any] | None = None,
+    route_gate: Mapping[str, Any] | None = None,
 ) -> bool:
     if isinstance(runtime_projection, Mapping) and runtime_projection:
+        return True
+    if _contract_runtime_close_authority_route_gate_signal(route_gate):
         return True
     if _contract_runtime_close_requested_execution_ref(body):
         return True
     for container in _contract_runtime_close_mapping_containers(body):
+        if _contract_runtime_close_authority_current_projection_signal(container):
+            return True
         for key in (
             "contract_runtime_close_authority_required",
             "requires_contract_runtime_close_authority",
@@ -53004,23 +53144,49 @@ def _timeline_gate_contract_runtime_projection_body(
     project_id: str,
     backlog_id: str,
     query: Mapping[str, Any],
+    route_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = dict(query or {})
     if _contract_runtime_close_execution_id(body):
         return body
+    current: dict[str, Any] = {}
     try:
-        current = _contract_chain_current_projection(
+        current = read_backlog_contract_chain_current(
             conn,
             project_id=project_id,
             backlog_id=backlog_id,
-            rebuild_if_missing=True,
-            route_token_ref=str(body.get("route_token_ref") or ""),
+            rebuild_if_missing=False,
         )
-    except Exception:
+    except sqlite3.Error:
         return body
-    execution_id = str(current.get("current_contract_execution_id") or "").strip()
+    explicit_runtime_signal = (
+        _contract_runtime_close_requested_execution_ref(body)
+        or _contract_runtime_close_authority_required_signal(
+            body,
+            route_gate=route_gate,
+        )
+    )
+    if not current and explicit_runtime_signal:
+        try:
+            current = _contract_chain_current_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                rebuild_if_missing=True,
+                route_token_ref=str(body.get("route_token_ref") or ""),
+            )
+        except Exception:
+            return body
+    if not current:
+        return body
+    current_execution_id = str(
+        current.get("current_contract_execution_id") or ""
+    ).strip()
+    execution_id = current_execution_id
     if not execution_id.startswith("cex-"):
-        execution_id = str(current.get("active_child_contract_execution_id") or "").strip()
+        execution_id = str(
+            current.get("active_child_contract_execution_id") or ""
+        ).strip()
     if not execution_id.startswith("cex-"):
         active_chain = (
             current.get("active_chain")
@@ -53032,21 +53198,41 @@ def _timeline_gate_contract_runtime_projection_body(
             if candidate_id.startswith("cex-"):
                 execution_id = candidate_id
                 break
-    if not execution_id.startswith("cex-"):
+    route_gate_execution_id = _contract_runtime_close_authority_ref_execution_id(
+        route_gate or {}
+    )
+    requested_execution_id = (
+        current_execution_id
+        or str(current.get("root_contract_execution_id") or "").strip()
+        or route_gate_execution_id
+    )
+    has_contract_runtime_signal = (
+        _contract_runtime_close_authority_current_projection_signal(current)
+        or _contract_runtime_close_authority_route_gate_signal(route_gate)
+    )
+    if not execution_id.startswith("cex-") and not has_contract_runtime_signal:
         return body
     next_action = current.get("next_legal_action")
-    body["contract_execution_id"] = execution_id
+    if execution_id.startswith("cex-"):
+        requested_execution_id = requested_execution_id or execution_id
+        body["contract_execution_id"] = execution_id
+    elif requested_execution_id:
+        body["current_contract_execution_id"] = requested_execution_id
+    body["contract_runtime_close_authority_required"] = True
     body["contract_runtime"] = {
         **(
             dict(body.get("contract_runtime"))
             if isinstance(body.get("contract_runtime"), Mapping)
             else {}
         ),
-        "contract_execution_id": execution_id,
+        "contract_execution_id": (
+            execution_id if execution_id.startswith("cex-") else ""
+        ),
+        "current_contract_execution_id": requested_execution_id,
         "projection_source": "backlog_contract_chain_current_projection",
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="contract_runtime_current_chain_projection",
-            contract_execution_id=execution_id,
+            contract_execution_id=requested_execution_id or execution_id,
         ),
         "legacy_advisory": True,
         "authoritative": False,
@@ -53055,7 +53241,7 @@ def _timeline_gate_contract_runtime_projection_body(
         **dict(current),
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="backlog_contract_chain_current_projection",
-            contract_execution_id=execution_id,
+            contract_execution_id=requested_execution_id or execution_id,
         ),
         "legacy_advisory": True,
         "authoritative": False,
@@ -53066,7 +53252,10 @@ def _timeline_gate_contract_runtime_projection_body(
             "backlog_close",
         ],
     }
-    if str(current.get("readiness_state") or "").strip() != "contract_complete" and next_action:
+    if (
+        str(current.get("readiness_state") or "").strip() != "contract_complete"
+        and next_action
+    ):
         body["contract_runtime"]["close_blocked_by_next_legal_action"] = True
         body["contract_chain_current"]["close_blocked_by_next_legal_action"] = True
     return body
@@ -57217,6 +57406,7 @@ def _verify_mf_close_timeline_gate(
         project_id=project_id,
         backlog_id=bug_id,
         query=body,
+        route_gate=route_gate,
     )
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
     contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
@@ -57232,6 +57422,7 @@ def _verify_mf_close_timeline_gate(
     contract_runtime_required = _contract_runtime_close_authority_required_signal(
         gate_body,
         runtime_projection,
+        route_gate=route_gate,
     )
     if runtime_projection.get("accepted"):
         legacy_verification = _mf_close_gate_verification(

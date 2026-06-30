@@ -24384,6 +24384,86 @@ def test_backlog_close_contract_runtime_required_without_authority_uses_new_bloc
     assert row["status"] == "MF_IN_PROGRESS"
 
 
+def test_backlog_close_missing_contract_runtime_close_authority_for_onboard_service_current_without_cex(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-ONBOARD-SERVICE-NO-CEX"
+    close_commit = "ed6275118745006c8324dfcbeecea62c39e91936"
+    close_route_token_ref = "rtok-onboard-service-no-cex-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "worker",
+                "work_type": "parallel_worker",
+                "route_token_ref": "rtok-onboard-service-no-cex-parent",
+            },
+        )
+    )
+    current = guide["contract_chain_current"]
+    parent_execution_id = current["current_contract_execution_id"]
+    assert parent_execution_id.startswith("onboard-service-")
+    assert not parent_execution_id.startswith("cex-")
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[f"contract_runtime:{parent_execution_id}"],
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "route_token_ref": close_route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "missing_contract_runtime_close_authority"
+    assert "MF backlog close requires task timeline evidence" not in exc.value.message
+    details = exc.value.details
+    projection = details["contract_runtime_close_authority_projection"]
+    assert projection["status"] == "missing"
+    assert projection["contract_execution_id"] == parent_execution_id
+    assert details["failed_gates"] == [
+        {
+            "gate": "contract_runtime_close_authority_projection",
+            "status": "missing",
+            "missing_requirement_ids": ["contract_runtime_close_authority"],
+            "contract_execution_id": parent_execution_id,
+        }
+    ]
+    legacy = details["legacy_diagnostics"]
+    assert legacy["advisory_only"] is True
+    assert legacy["authorization_blocker"] is False
+    assert legacy["legacy_advisory"] is True
+    assert legacy["authoritative"] is False
+    assert legacy["passed"] is False
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+
+
 def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projection_lacks_manifest(
     conn,
     monkeypatch,
@@ -31172,7 +31252,7 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
             )
         )
 
-    assert exc.value.code == "mf_timeline_gate_failed"
+    assert exc.value.code == "missing_contract_runtime_close_authority"
     prechecks = task_timeline.list_events(
         conn,
         PID,
@@ -31196,6 +31276,9 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
     blocked_payload = blocked[0]["payload"]
     assert blocked_payload["status"] == "blocked"
     assert blocked_payload["source"] == "authoritative_backlog_close"
+    assert blocked_payload["blocked_gate"] == (
+        "missing_contract_runtime_close_authority"
+    )
     assert blocked_payload["candidate_runtime_target_truth_activated"] is False
     assert blocked_payload["route_action_precheck_event_ref"] == (
         f"timeline:{prechecks[0]['id']}"
@@ -31280,7 +31363,7 @@ def test_backlog_close_blocker_projection_requires_source_backed_route_token_ref
             )
         )
 
-    assert exc.value.code == "mf_timeline_gate_failed"
+    assert exc.value.code == "missing_contract_runtime_close_authority"
     assert (
         task_timeline.list_events(
             conn,
