@@ -5,6 +5,8 @@ import {
   normalizeTaskPlaybackTrace,
   normalizeTaskPlaybackCompactLedger,
   taskPlaybackLedgerRowsToTimelineEvents,
+  taskPlaybackCompactLedgerBlockingLabel,
+  taskPlaybackCompactLedgerDisplayState,
   displayPlaybackFrames,
   latestPlaybackFrameId,
   pushPlaybackNavStack,
@@ -1312,9 +1314,137 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
   assertFixture(rawSections.includes("contract_chain_current") && rawSections.includes("projection_watermark"), "compact ledger: inspector raw sections should include compact projection fields");
   assertFixture(!rawSections.includes("rtok-private-fixture"), "compact ledger: inspector raw sections should not expose token refs");
 
+  const legacyOnlyBacklog: BacklogBug = {
+    bug_id: "AC-DASHBOARD-LEGACY-ROUTE-PRECHECK-ADVISORY-20260629",
+    title: "Legacy route precheck advisory row",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const legacyOnlyLedger = normalizeTaskPlaybackCompactLedger({
+    schema_version: "task_timeline.compact_multi_backlog_ledger.v1",
+    project_id: "aming-claw",
+    row_count: 1,
+    source_event_count: 1,
+    rows: [{
+      backlog_id: legacyOnlyBacklog.bug_id,
+      title: legacyOnlyBacklog.title,
+      priority: "P1",
+      status: "OPEN",
+      latest_event_id: "8308",
+      latest_event_kind: "contract_runtime_compact_ledger",
+      latest_event_type: "task_timeline.compact_ledger",
+      latest_status: "blocked",
+      readiness_state: "blocked",
+      blocker_summary: {
+        kind: "blockers",
+        count: 2,
+        keys: ["route_action_precheck", "mf_timeline_precheck"],
+        summary: "route_action_precheck, mf_timeline_precheck",
+        reason: "legacy route precheck evidence missing",
+      },
+      next_legal_action: {
+        id: "continue_contract_runtime_authority",
+        action: "continue",
+        description: "ContractRuntime authority controls close evidence.",
+      },
+    }],
+  }, "aming-claw");
+  const legacyOnlyRow = legacyOnlyLedger.rows[0];
+  assertFixture(taskPlaybackCompactLedgerBlockingLabel(legacyOnlyRow) === "", "compact ledger: legacy route/mf prechecks should not produce a blocking label");
+  const legacyOnlyDisplay = taskPlaybackCompactLedgerDisplayState(legacyOnlyRow);
+  assertFixture(!legacyOnlyDisplay.blocked, "compact ledger display: legacy route/mf prechecks should not mark the row blocked");
+  assertFixture(legacyOnlyDisplay.readinessLabel === "advisory/recorded", `compact ledger display: legacy-only readiness should be advisory/recorded, got ${legacyOnlyDisplay.readinessLabel}`);
+  assertFixture(legacyOnlyDisplay.readinessTone !== "status-failed", `compact ledger display: legacy-only readiness should not be failed/red, got ${legacyOnlyDisplay.readinessTone}`);
+  assertFixture(legacyOnlyDisplay.blockerListLabel === "legacy advisory", `compact ledger display: legacy-only values should render under legacy advisory, got ${legacyOnlyDisplay.blockerListLabel}`);
+  assertFixture(
+    legacyOnlyDisplay.blockerValues.includes("route_action_precheck") && legacyOnlyDisplay.blockerValues.includes("mf_timeline_precheck"),
+    `compact ledger display: legacy-only advisory values should preserve historical ids, got ${legacyOnlyDisplay.blockerValues.join(", ")}`,
+  );
+  const legacyOnlyTrace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog: legacyOnlyBacklog,
+    compactLedger: legacyOnlyLedger,
+    taskTimeline: { project_id: "aming-claw", backlog_id: legacyOnlyBacklog.bug_id, events: [], count: 0 },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-29T16:00:00Z",
+  });
+  const legacyOnlyFrame = legacyOnlyTrace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
+  assertFixture(legacyOnlyFrame?.status === "recorded", `compact ledger: legacy-only precheck blockers should be advisory/recorded, got ${legacyOnlyFrame?.status}`);
+  assertFixture(
+    !JSON.stringify(legacyOnlyFrame?.failure_diagnosis ?? []).includes("route_action_precheck"),
+    "compact ledger: legacy route_action_precheck should not appear in failure diagnosis",
+  );
+
+  const authorityLedger = normalizeTaskPlaybackCompactLedger({
+    schema_version: "task_timeline.compact_multi_backlog_ledger.v1",
+    project_id: "aming-claw",
+    row_count: 1,
+    source_event_count: 1,
+    rows: [{
+      backlog_id: legacyOnlyBacklog.bug_id,
+      title: legacyOnlyBacklog.title,
+      priority: "P1",
+      status: "OPEN",
+      latest_event_id: "8309",
+      latest_event_kind: "contract_runtime_compact_ledger",
+      latest_event_type: "task_timeline.compact_ledger",
+      latest_status: "blocked",
+      readiness_state: "blocked",
+      blocker_summary: {
+        kind: "blockers",
+        count: 2,
+        keys: ["route_action_precheck", "mf_timeline_precheck"],
+        summary: "route_action_precheck, mf_timeline_precheck",
+        reason: "legacy route precheck evidence missing",
+      },
+      contract_chain_current: {
+        contract_runtime_mf_parallel_close_authority_gate: {
+          passed: false,
+          missing_requirement_ids: ["contract_runtime.worker_finish_gate"],
+          next_action: "record worker finish evidence",
+        },
+      },
+      next_legal_action: {
+        id: "record_worker_finish",
+        action: "record_worker_finish",
+        description: "Record worker finish evidence.",
+      },
+    }],
+  }, "aming-claw");
+  const authorityRow = authorityLedger.rows[0];
+  assertFixture(
+    taskPlaybackCompactLedgerBlockingLabel(authorityRow).includes("contract_runtime.worker_finish_gate"),
+    `compact ledger: ContractRuntime authority missing evidence should be the blocking label, got ${taskPlaybackCompactLedgerBlockingLabel(authorityRow)}`,
+  );
+  const authorityDisplay = taskPlaybackCompactLedgerDisplayState(authorityRow);
+  assertFixture(authorityDisplay.blocked, "compact ledger display: ContractRuntime authority missing evidence should mark the row blocked");
+  assertFixture(authorityDisplay.readinessLabel === "blocked", `compact ledger display: ContractRuntime authority missing evidence should show blocked readiness, got ${authorityDisplay.readinessLabel}`);
+  assertFixture(authorityDisplay.blockerListLabel === "blockers", `compact ledger display: authority blocker should render under blockers, got ${authorityDisplay.blockerListLabel}`);
+  assertFixture(
+    authorityDisplay.blockerValues.some((value) => value.includes("contract_runtime.worker_finish_gate")),
+    `compact ledger display: authority blocker values should name missing evidence, got ${authorityDisplay.blockerValues.join(", ")}`,
+  );
+  const authorityTrace = normalizeTaskPlaybackTrace({
+    projectId: "aming-claw",
+    backlog: legacyOnlyBacklog,
+    compactLedger: authorityLedger,
+    taskTimeline: { project_id: "aming-claw", backlog_id: legacyOnlyBacklog.bug_id, events: [], count: 0 },
+    gateResponse: null,
+    source: "governed",
+    generatedAt: "2026-06-29T16:01:00Z",
+  });
+  const authorityFrame = authorityTrace.frames.find((item) => item.event_type === "task_timeline.compact_ledger");
+  assertFixture(authorityFrame?.status === "blocked", `compact ledger: ContractRuntime authority blocker should keep frame blocked, got ${authorityFrame?.status}`);
+  assertFixture(
+    JSON.stringify(authorityFrame?.failure_diagnosis ?? []).includes("contract_runtime.worker_finish_gate"),
+    "compact ledger: ContractRuntime authority missing evidence should appear in failure diagnosis",
+  );
+
   return [
     "compact ledger projection fields normalize and project into timeline payload/verification/artifacts",
     "compact ledger generated frame exposes chain/projection facts and safe inspector data",
+    "compact ledger legacy route/mf prechecks are advisory unless ContractRuntime authority reports a blocker",
   ];
 }
 
@@ -2882,6 +3012,51 @@ function projectGateMatrixQuadrantAssertions(): string[] {
     "quadrant(ii): mf_subagent_startup evidenceLabels should be populated for present row",
   );
 
+  const gateWithContractRuntimeAuthority = {
+    passed: false,
+    status: "blocked",
+    source_of_authority: "contract_runtime",
+    required_event_kinds: ["implementation", "verification", "close_ready"],
+    present_event_kinds: ["implementation", "verification"] as string[],
+    missing_event_kinds: ["close_ready"],
+    route_context_gate: {
+      passed: false,
+      required: true,
+      required_requirement_ids: ["route_context", "route_action_precheck", "mf_timeline_precheck"],
+      present_requirement_ids: ["route_context"] as string[],
+      missing_requirement_ids: ["route_action_precheck", "mf_timeline_precheck"],
+      evidence_events: {
+        route_context: [
+          { id: 3792, event_kind: "route_action_precheck", phase: "dispatch", status: "allowed" },
+        ],
+      } as Record<string, unknown>,
+    },
+    contract_runtime_mf_parallel_close_authority_gate: {
+      passed: false,
+      status: "blocked",
+      missing_requirement_ids: ["contract_runtime.worker_finish_gate"],
+      next_action: "record worker finish evidence",
+    },
+  } as Parameters<typeof projectGateMatrix>[0];
+  const matrixAuthority: GateMatrixProjection = projectGateMatrix(gateWithContractRuntimeAuthority, true);
+  const legacyRouteActionRow = matrixAuthority.rows.find((r) => r.id === "route_action_precheck");
+  assertFixture(Boolean(legacyRouteActionRow), "contract runtime authority: route_action_precheck row should still render as historical context");
+  assertFixture(legacyRouteActionRow?.required === false, "contract runtime authority: route_action_precheck should not be required");
+  assertFixture(legacyRouteActionRow?.status === "not_applicable", `contract runtime authority: route_action_precheck should be advisory/not_applicable, got ${legacyRouteActionRow?.status}`);
+  assertFixture(
+    legacyRouteActionRow?.nextAction.includes("ContractRuntime authority") === true,
+    `contract runtime authority: advisory route_action_precheck row should mention ContractRuntime authority, got ${legacyRouteActionRow?.nextAction}`,
+  );
+  const legacyTimelinePrecheckRow = matrixAuthority.rows.find((r) => r.id === "mf_timeline_precheck");
+  assertFixture(legacyTimelinePrecheckRow?.status === "not_applicable", `contract runtime authority: mf_timeline_precheck should be advisory/not_applicable, got ${legacyTimelinePrecheckRow?.status}`);
+  const authorityGateRow = matrixAuthority.rows.find((r) => r.id === "contract_runtime_mf_parallel_close_authority_gate");
+  assertFixture(Boolean(authorityGateRow), "contract runtime authority: authority gate row should render");
+  assertFixture(authorityGateRow?.status === "missing", `contract runtime authority: authority gate row should be missing, got ${authorityGateRow?.status}`);
+  assertFixture(
+    authorityGateRow?.nextAction.includes("contract_runtime.worker_finish_gate") === true,
+    `contract runtime authority: authority row nextAction should name missing evidence, got ${authorityGateRow?.nextAction}`,
+  );
+
   // ── (iii) applicable=false → rows=[] honest ──────────────────────────────
   // When applicable=false the gate is not subject to close: rows must be empty
   // and overallPassed=true (not-applicable rows are honest pass-throughs).
@@ -2942,6 +3117,7 @@ function projectGateMatrixQuadrantAssertions(): string[] {
     `quadrant(i): route_context evidenceEventIds include 3792, label has route_action_precheck·allowed`,
     `quadrant(ii): gate present, missing evidence — verification/IV rows show status=missing`,
     `quadrant(ii): mf_subagent_startup present row has evidenceLabels`,
+    `contract runtime authority: legacy prechecks are advisory and authority missing evidence drives blocker`,
     `quadrant(iii): applicable=false → rows=[], overallPassed=true (not applicable)`,
     `quadrant(iii): no gate + not applicable → rows=[], gatePresent=false`,
     `quadrant(iv): mangled gate JSON → no throw, schema_version present, rows is array`,

@@ -3,7 +3,7 @@ import { api, ApiError } from "../lib/api";
 import {
   buildPlaybackUrl,
   normalizeTaskPlaybackCompactLedger,
-  taskPlaybackCompactLedgerBlockerLabel,
+  taskPlaybackCompactLedgerDisplayState,
   taskPlaybackCompactLedgerNextActionLabel,
   taskPlaybackCompactLedgerRowForBacklog,
   taskPlaybackLedgerRowsToTimelineEvents,
@@ -63,7 +63,8 @@ const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
 const CONTENT_SYS_DEMO_VISUALIZATION_SCHEMA = "content_sys.demo_visualization_evidence.v1";
 const ROUTE_GUIDANCE_TEMPLATE_ID = "mf_workflow_runtime.v1";
 const ROUTE_GUIDANCE_ALLOWED_STAGES = ["dispatch", "startup_gate", "implementation_wait", "handoff_gate"];
-const ROUTE_SERVICE_REQUIREMENTS = ["route_context", "route_action_precheck"];
+const ROUTE_SERVICE_REQUIREMENTS = ["route_context"];
+const ROUTE_LEGACY_ADVISORY_REQUIREMENTS = ["route_action_precheck", "mf_timeline_precheck"];
 const ROUTE_WORKER_REQUIREMENTS = ["bounded_implementation_worker_dispatch", "mf_subagent_startup"];
 const ROUTE_QA_REQUIREMENTS = ["independent_verification_lane"];
 const ROUTE_IDENTITY_REQUIREMENTS = ["route_identity_mismatch", "same_route_identity", "route_identity_cleanup"];
@@ -968,7 +969,7 @@ function BacklogDetailSummary({
   ]);
   const related = relatedIdsFromBug(bug, []);
   const ledgerNextAction = taskPlaybackCompactLedgerNextActionLabel(compactLedgerRow?.next_legal_action);
-  const ledgerBlocked = ledgerRowBlocked(compactLedgerRow);
+  const ledgerDisplay = taskPlaybackCompactLedgerDisplayState(compactLedgerRow);
   const ledgerProjectionStatus = compactLedgerProjectionReadiness(compactLedgerRow);
   return (
     <div className="backlog-modal-summary">
@@ -981,7 +982,7 @@ function BacklogDetailSummary({
           <SummaryItem label="Chain" value={compactLedgerRow.contract_chain_id || "none"} mono />
           <SummaryItem label="Current contract" value={compactLedgerCurrentContractLabel(compactLedgerRow)} mono />
           <SummaryItem label="Ledger projection" value={ledgerProjectionStatus} tone={compactLedgerProjectionTone(compactLedgerRow)} />
-          <SummaryItem label="Readiness" value={compactLedgerRow.readiness_state || "unknown"} tone={ledgerBlocked ? "status-failed" : compactLedgerRow.readiness_state === "close_ready" ? "status-complete" : "status-pending"} />
+          <SummaryItem label="Readiness" value={ledgerDisplay.readinessLabel} tone={ledgerDisplay.readinessTone} />
           <SummaryItem label="Latest event" value={compactLedgerRow.latest_event_id ? `${compactLedgerRow.latest_event_id} ${compactLedgerRow.latest_event_kind || ""}`.trim() : "none"} mono />
         </>
       ) : null}
@@ -1021,7 +1022,7 @@ function CompactLedgerPanel({
 }) {
   const refs = row ? taskPlaybackLedgerRowRefs(row) : [];
   const nextAction = taskPlaybackCompactLedgerNextActionLabel(row?.next_legal_action);
-  const blocker = taskPlaybackCompactLedgerBlockerLabel(row?.blocker_summary);
+  const ledgerDisplay = taskPlaybackCompactLedgerDisplayState(row);
   const payloadRef = row?.latest_payload_ref;
   const projectionStatus = compactLedgerProjectionReadiness(row);
   return (
@@ -1036,10 +1037,10 @@ function CompactLedgerPanel({
         <div className="timeline-empty">No compact ledger row is available for {backlogId}.</div>
       ) : (
         <div className="backlog-gate-grid">
-          <div className={`backlog-gate-card ${ledgerRowBlocked(row) ? "fail" : row.readiness_state === "close_ready" ? "pass" : "neutral"}`}>
+          <div className={`backlog-gate-card ${ledgerDisplay.readinessCardTone}`}>
             <div className="backlog-gate-title">
               <span>Runtime row</span>
-              <span className={`status-badge ${ledgerTone(row)}`}>{row.readiness_state || "unknown"}</span>
+              <span className={`status-badge ${ledgerDisplay.readinessTone}`}>{ledgerDisplay.readinessLabel}</span>
             </div>
             <div className="backlog-gate-facts">
               {row.contract_execution_id ? <span className="mono">{row.contract_execution_id}</span> : null}
@@ -1079,17 +1080,18 @@ function CompactLedgerPanel({
             <TokenList label="action" values={nextAction ? [nextAction] : []} empty="none" />
           </div>
 
-          <div className={`backlog-gate-card ${ledgerRowBlocked(row) ? "fail" : "neutral"}`}>
+          <div className={`backlog-gate-card ${ledgerDisplay.blocked ? "fail" : "neutral"}`}>
             <div className="backlog-gate-title">
               <span>Blocked / close readiness</span>
-              <span className={`status-badge ${ledgerTone(row)}`}>{ledgerRowBlocked(row) ? "blocked" : row.readiness_state || "recorded"}</span>
+              <span className={`status-badge ${ledgerDisplay.readinessTone}`}>{ledgerDisplay.readinessLabel}</span>
             </div>
             <div className="backlog-gate-facts">
-              {row.blocker_summary.kind ? <span>{row.blocker_summary.kind}</span> : null}
-              {row.blocker_summary.count != null ? <span>{row.blocker_summary.count} blockers</span> : null}
+              {ledgerDisplay.blocked && row.blocker_summary.kind ? <span>{row.blocker_summary.kind}</span> : null}
+              {ledgerDisplay.blocked && row.blocker_summary.count != null ? <span>{row.blocker_summary.count} blockers</span> : null}
+              {!ledgerDisplay.blocked && ledgerDisplay.legacyAdvisoryValues.length > 0 ? <span>{ledgerDisplay.legacyAdvisoryValues.length} legacy advisory</span> : null}
               {row.merge_queue_status ? <span>{row.merge_queue_status}</span> : null}
             </div>
-            <TokenList label="blockers" values={blocker ? [blocker] : row.blocker_summary.keys} empty="none" tone={ledgerRowBlocked(row) ? "red" : "green"} />
+            <TokenList label={ledgerDisplay.blockerListLabel} values={ledgerDisplay.blockerValues} empty="none" tone={ledgerDisplay.blockerTone} />
           </div>
 
           <div className="backlog-gate-card neutral">
@@ -1126,19 +1128,6 @@ function CompactLedgerPanel({
       )}
     </div>
   );
-}
-
-function ledgerRowBlocked(row?: TaskPlaybackCompactLedgerRow | null): boolean {
-  if (!row) return false;
-  return [
-    row.readiness_state,
-    row.latest_status,
-    row.projection_degraded ? "projection_degraded" : "",
-    row.blocker_summary.kind,
-    row.blocker_summary.summary,
-    row.blocker_summary.reason,
-    row.blocker_summary.keys.join(" "),
-  ].join(" ").toLowerCase().includes("block");
 }
 
 function compactLedgerCurrentContractLabel(row?: TaskPlaybackCompactLedgerRow | null): string {
@@ -1194,14 +1183,6 @@ function compactLedgerProjectionFlagValues(flags: Record<string, unknown>): stri
     .filter(([, value]) => Boolean(value))
     .slice(0, 6)
     .map(([key, value]) => `${compactProjectionReason(key)}: ${compactUnknown(value)}`);
-}
-
-function ledgerTone(row?: TaskPlaybackCompactLedgerRow | null): string {
-  if (!row) return "status-unknown";
-  if (ledgerRowBlocked(row)) return "status-failed";
-  if (row.readiness_state === "close_ready" || row.readiness_state === "verified") return "status-complete";
-  if (row.readiness_state === "implemented" || row.readiness_state === "planned") return "status-running";
-  return "status-unknown";
 }
 
 function contractProjectionForSummary(bug: BacklogBug, gate?: MfCloseTimelineGate): AgentTaskContractProjection | null {
@@ -2381,6 +2362,9 @@ function GateSummary({
   const contract = gate.contract_gate;
   const present = gate.present_event_kinds ?? [];
   const missing = gate.missing_event_kinds ?? [];
+  const contractRuntimeGoverned = isContractRuntimeGovernedGate(gate);
+  const blockingMissing = contractRuntimeGoverned ? missing.filter((id) => !isLegacyRouteAdvisoryRequirement(id)) : missing;
+  const legacyMissing = contractRuntimeGoverned ? missing.filter(isLegacyRouteAdvisoryRequirement) : [];
   const required = gate.required_event_kinds ?? [];
   const contractRequired = contract?.required_requirement_ids ?? [];
   const contractPresent = contract?.present_requirement_ids ?? [];
@@ -2391,6 +2375,8 @@ function GateSummary({
   const routeRequired = routeGate?.required_requirement_ids ?? [];
   const routePresent = routeGate?.present_requirement_ids ?? [];
   const routeMissing = routeGate?.missing_requirement_ids ?? [];
+  const routeBlockingMissing = contractRuntimeGoverned ? routeMissing.filter((id) => !isLegacyRouteAdvisoryRequirement(id)) : routeMissing;
+  const routeLegacyMissing = contractRuntimeGoverned ? routeMissing.filter(isLegacyRouteAdvisoryRequirement) : [];
   const routeTopology = firstText(asRecord(routeGate?.topology_policy).selected_topology, asRecord(routeGate?.topology_policy).recommended_topology) || "not selected";
   return (
     <div className="backlog-gate-grid">
@@ -2404,10 +2390,11 @@ function GateSummary({
         <div className="backlog-gate-facts">
           <span>required {required.length}</span>
           <span>present {present.length}</span>
-          <span>missing {missing.length}</span>
+          <span>missing {blockingMissing.length}</span>
           {response?.reason ? <span>{response.reason}</span> : null}
         </div>
-        <TokenList label="missing" values={missing} empty="none" tone={missing.length ? "red" : "green"} />
+        <TokenList label="missing" values={blockingMissing} empty="none" tone={blockingMissing.length ? "red" : "green"} />
+        {legacyMissing.length > 0 ? <TokenList label="legacy advisory" values={legacyMissing} empty="none" tone="neutral" /> : null}
       </div>
       <div className={`backlog-gate-card ${hasContract && contract?.passed ? "pass" : hasContract ? "fail" : "neutral"}`}>
         <div className="backlog-gate-title">
@@ -2425,21 +2412,22 @@ function GateSummary({
         <TokenList label="missing" values={contractMissing} empty="none" tone={contractMissing.length ? "red" : "green"} />
       </div>
       {routeGate ? (
-        <div className={`backlog-gate-card ${routeGate.passed ? "pass" : routeGate.required ? "fail" : "neutral"}`}>
+        <div className={`backlog-gate-card ${routeGate.passed ? "pass" : routeGate.required && routeBlockingMissing.length > 0 ? "fail" : "neutral"}`}>
           <div className="backlog-gate-title">
             <span>Route context</span>
-            <span className={`status-badge ${routeGate.passed ? "status-complete" : routeGate.required ? "status-failed" : "status-unknown"}`}>
+            <span className={`status-badge ${routeGate.passed ? "status-complete" : routeGate.required && routeBlockingMissing.length > 0 ? "status-failed" : "status-unknown"}`}>
               {routeGate.status || (routeGate.required ? "required" : "not required")}
             </span>
           </div>
           <div className="backlog-gate-facts">
             <span className="mono">{ROUTE_GUIDANCE_TEMPLATE_ID}</span>
             <span>{routeTopology}</span>
-            <span>missing {routeMissing.length}</span>
+            <span>missing {routeBlockingMissing.length}</span>
           </div>
           <TokenList label="required" values={routeRequired} empty="none" />
           <TokenList label="present" values={routePresent} empty="none" tone="green" />
-          <TokenList label="missing" values={routeMissing} empty="none" tone={routeMissing.length ? "red" : "green"} />
+          <TokenList label="missing" values={routeBlockingMissing} empty="none" tone={routeBlockingMissing.length ? "red" : "green"} />
+          {routeLegacyMissing.length > 0 ? <TokenList label="legacy advisory" values={routeLegacyMissing} empty="none" tone="neutral" /> : null}
         </div>
       ) : null}
     </div>
@@ -2457,6 +2445,7 @@ interface RouteGuidanceGroup {
   id: string;
   label: string;
   values: string[];
+  tone?: "neutral" | "green" | "red";
 }
 
 interface RouteContextGuidance {
@@ -2497,7 +2486,7 @@ function RouteContextGuidancePanel({ gate }: { gate?: MfCloseTimelineGate }) {
       </div>
       <div className="backlog-route-guidance-groups">
         {guidance.groups.map((group) => (
-          <TokenList key={group.id} label={group.label} values={group.values} empty="none" tone={group.values.length ? "red" : "green"} />
+          <TokenList key={group.id} label={group.label} values={group.values} empty="none" tone={group.tone ?? (group.values.length ? "red" : "green")} />
         ))}
       </div>
       {guidance.identityMismatch ? (
@@ -2524,32 +2513,36 @@ function buildRouteContextGuidance(gate?: MfCloseTimelineGate): RouteContextGuid
   const routeMissing = routeGate.missing_requirement_ids ?? [];
   const routePresent = routeGate.present_requirement_ids ?? [];
   const closeMissing = gate?.missing_event_kinds ?? [];
+  const contractRuntimeGoverned = isContractRuntimeGovernedGate(gate);
+  const blockingRouteMissing = contractRuntimeGoverned ? routeMissing.filter((id) => !isLegacyRouteAdvisoryRequirement(id)) : routeMissing;
+  const blockingCloseMissing = contractRuntimeGoverned ? closeMissing.filter((id) => !isLegacyRouteAdvisoryRequirement(id)) : closeMissing;
   const checks = routeGate.checks ?? {};
   const hasRouteConsumption = checks.has_route_context_consumption;
   const sameRouteIdentity = routeGate.same_route_identity !== false && checks.same_route_identity !== false;
-  const identityMissing = missingForRouteGroup(routeMissing, ROUTE_IDENTITY_REQUIREMENTS);
+  const identityMissing = missingForRouteGroup(blockingRouteMissing, ROUTE_IDENTITY_REQUIREMENTS);
   const identityMismatch = !sameRouteIdentity || identityMissing.length > 0;
+  const hasBlockingRouteGap = blockingRouteMissing.length > 0 || blockingCloseMissing.length > 0 || hasRouteConsumption === false || identityMismatch;
   const shouldShow =
     routeGate.required === true &&
-    (routeGate.passed !== true || gate?.passed !== true || routeMissing.length > 0 || closeMissing.length > 0 || hasRouteConsumption === false || identityMismatch);
+    (hasBlockingRouteGap || (!contractRuntimeGoverned && (routeGate.passed !== true || gate?.passed !== true)));
   if (!shouldShow) return null;
   const topology = asRecord(routeGate.topology_policy);
   const allowedStages = reminder?.allowed_stages?.length ? reminder.allowed_stages : ROUTE_GUIDANCE_ALLOWED_STAGES;
-  const groups = routeGuidanceGroupsFromBackend(gate) || routeGuidanceGroups(closeMissing, routeMissing, identityMismatch);
+  const groups = routeGuidanceGroupsFromBackend(gate, contractRuntimeGoverned) || routeGuidanceGroups(blockingCloseMissing, routeMissing, identityMismatch, contractRuntimeGoverned);
   return {
     status: reminder?.status || routeGate.status || "blocked",
     templateId: reminder?.contract_template_id || ROUTE_GUIDANCE_TEMPLATE_ID,
     allowedStages,
     topology: firstText(reminder?.selected_topology, reminder?.recommended_topology, topology.selected_topology, topology.recommended_topology) || "route topology pending",
     priority: firstText(reminder?.priority, topology.priority),
-    actions: routeGuidanceActionsFromBackend(reminder?.next_actions) || routeGuidanceActions(routeMissing, routePresent, closeMissing, allowedStages),
+    actions: routeGuidanceActionsFromBackend(reminder?.next_actions, contractRuntimeGoverned) || routeGuidanceActions(routeMissing, routePresent, blockingCloseMissing, allowedStages, contractRuntimeGoverned),
     groups,
     identityMismatch,
     ignoredRouteEventCount: routeGate.ignored_route_events?.length ?? 0,
   };
 }
 
-function routeGuidanceGroupsFromBackend(gate?: MfCloseTimelineGate): RouteGuidanceGroup[] | null {
+function routeGuidanceGroupsFromBackend(gate?: MfCloseTimelineGate, contractRuntimeGoverned = false): RouteGuidanceGroup[] | null {
   const reminderGroups = asRecord(gate?.route_context_reminder?.missing_evidence_groups);
   const gateGroups = asRecord(gate?.missing_evidence_groups?.groups);
   const source = Object.keys(reminderGroups).length > 0 ? reminderGroups : gateGroups;
@@ -2566,12 +2559,15 @@ function routeGuidanceGroupsFromBackend(gate?: MfCloseTimelineGate): RouteGuidan
   const seen = new Set<string>();
   const ids = [...order, ...Object.keys(source).filter((id) => !order.includes(id))];
   const groups: RouteGuidanceGroup[] = [];
+  const advisoryValues: string[] = [];
   for (const id of ids) {
     if (seen.has(id)) continue;
     seen.add(id);
     const group = asRecord(source[id]);
     if (Object.keys(group).length === 0) continue;
-    const values = stableUnique(listUnknown(group.missing).map(String).filter(Boolean));
+    const rawValues = stableUnique(listUnknown(group.missing).map(String).filter(Boolean));
+    const values = contractRuntimeGoverned ? rawValues.filter((value) => !isLegacyRouteAdvisoryRequirement(value)) : rawValues;
+    if (contractRuntimeGoverned) advisoryValues.push(...rawValues.filter(isLegacyRouteAdvisoryRequirement));
     if (id === "other_route" && values.length === 0) continue;
     groups.push({
       id,
@@ -2579,33 +2575,75 @@ function routeGuidanceGroupsFromBackend(gate?: MfCloseTimelineGate): RouteGuidan
       values,
     });
   }
+  const legacyValues = stableUnique(advisoryValues);
+  if (contractRuntimeGoverned && legacyValues.length > 0) {
+    groups.push({ id: "legacy-advisory", label: "legacy advisory", values: legacyValues, tone: "neutral" });
+  }
   return groups.length ? groups : null;
 }
 
-function routeGuidanceGroups(closeMissing: string[], routeMissing: string[], identityMismatch: boolean): RouteGuidanceGroup[] {
+function routeGuidanceGroups(closeMissing: string[], routeMissing: string[], identityMismatch: boolean, contractRuntimeGoverned = false): RouteGuidanceGroup[] {
+  const blockingRouteMissing = contractRuntimeGoverned ? routeMissing.filter((id) => !isLegacyRouteAdvisoryRequirement(id)) : routeMissing;
+  const legacyRouteMissing = contractRuntimeGoverned ? routeMissing.filter(isLegacyRouteAdvisoryRequirement) : [];
   const knownRouteIds = stableUnique([
     ...ROUTE_SERVICE_REQUIREMENTS,
+    ...ROUTE_LEGACY_ADVISORY_REQUIREMENTS,
     ...ROUTE_WORKER_REQUIREMENTS,
     ...ROUTE_QA_REQUIREMENTS,
     ...ROUTE_IDENTITY_REQUIREMENTS,
   ]);
-  const identityValues = missingForRouteGroup(routeMissing, ROUTE_IDENTITY_REQUIREMENTS);
+  const identityValues = missingForRouteGroup(blockingRouteMissing, ROUTE_IDENTITY_REQUIREMENTS);
   if (identityMismatch && !identityValues.includes("route_identity_mismatch")) identityValues.push("route_identity_mismatch");
-  return [
+  const groups: RouteGuidanceGroup[] = [
     { id: "timeline", label: "timeline", values: stableUnique(closeMissing) },
-    { id: "route-service", label: "route service", values: missingForRouteGroup(routeMissing, ROUTE_SERVICE_REQUIREMENTS) },
-    { id: "worker", label: "worker", values: missingForRouteGroup(routeMissing, ROUTE_WORKER_REQUIREMENTS) },
-    { id: "qa", label: "QA", values: missingForRouteGroup(routeMissing, ROUTE_QA_REQUIREMENTS) },
+    { id: "route-service", label: "route service", values: missingForRouteGroup(blockingRouteMissing, ROUTE_SERVICE_REQUIREMENTS) },
+    { id: "worker", label: "worker", values: missingForRouteGroup(blockingRouteMissing, ROUTE_WORKER_REQUIREMENTS) },
+    { id: "qa", label: "QA", values: missingForRouteGroup(blockingRouteMissing, ROUTE_QA_REQUIREMENTS) },
     { id: "identity", label: "identity", values: stableUnique(identityValues) },
-    { id: "other", label: "other route", values: routeMissing.filter((id) => !knownRouteIds.includes(id)) },
-  ].filter((group) => group.id !== "other" || group.values.length > 0);
+    { id: "other", label: "other route", values: blockingRouteMissing.filter((id) => !knownRouteIds.includes(id)) },
+  ];
+  const legacyValues = stableUnique(legacyRouteMissing);
+  if (contractRuntimeGoverned && legacyValues.length > 0) {
+    groups.push({ id: "legacy-advisory", label: "legacy advisory", values: legacyValues, tone: "neutral" });
+  }
+  return groups.filter((group) => group.id !== "other" || group.values.length > 0);
 }
 
 function missingForRouteGroup(missing: string[], group: string[]): string[] {
   return stableUnique(missing.filter((id) => group.includes(id)));
 }
 
-function routeGuidanceActionsFromBackend(actions: Record<string, unknown>[] | undefined): RouteGuidanceAction[] | null {
+function isLegacyRouteAdvisoryRequirement(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[-\s.]+/g, "_");
+  if (!normalized) return false;
+  return ROUTE_LEGACY_ADVISORY_REQUIREMENTS.includes(normalized)
+    || normalized.includes("route_action_precheck")
+    || normalized.includes("mf_timeline_precheck");
+}
+
+function isContractRuntimeGovernedGate(gate?: MfCloseTimelineGate): boolean {
+  const record = asRecord(gate);
+  const closeAuthority = asRecord(record.close_authority);
+  const sourceOfAuthority = firstText(record.source_of_authority).toLowerCase();
+  const closeAuthoritySource = firstText(closeAuthority.source_of_authority).toLowerCase();
+  return sourceOfAuthority === "contract_runtime"
+    || closeAuthoritySource === "contract_runtime"
+    || truthyRouteFlag(record.runtime_projection_authority_failed)
+    || (truthyRouteFlag(closeAuthority.authoritative) && closeAuthoritySource === "contract_runtime")
+    || Object.keys(asRecord(record.contract_runtime_close_authority_projection)).length > 0
+    || Object.keys(asRecord(record.contract_runtime_mf_parallel_close_authority_gate)).length > 0
+    || Object.keys(asRecord(record.contract_runtime_direct_fix_close_authority_gate)).length > 0;
+}
+
+function truthyRouteFlag(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "degraded";
+}
+
+function routeGuidanceActionsFromBackend(actions: Record<string, unknown>[] | undefined, contractRuntimeGoverned = false): RouteGuidanceAction[] | null {
   if (!actions?.length) return null;
   const normalized = actions
     .map((action, index) => {
@@ -2613,11 +2651,17 @@ function routeGuidanceActionsFromBackend(actions: Record<string, unknown>[] | un
       const command = firstText(record.command);
       const id = firstText(record.id) || command || `route-action-${index + 1}`;
       if (!command && !firstText(record.detail, record.label, record.title)) return null;
+      const rawText = [id, command, firstText(record.label, record.title), firstText(record.detail, record.next_action, record.reason)].join(" ");
+      const legacyAction = contractRuntimeGoverned && isLegacyRouteAdvisoryRequirement(rawText);
       return {
         id,
         command: sanitizeRouteGuidanceDisplayText(command || id),
-        label: sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id)),
-        detail: sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason)),
+        label: legacyAction
+          ? "Legacy route precheck is advisory"
+          : sanitizeRouteGuidanceDisplayText(firstText(record.label, record.title) || titleizeLane(id)),
+        detail: legacyAction
+          ? "ContractRuntime authority controls blocking close evidence; historical route precheck rows remain context."
+          : sanitizeRouteGuidanceDisplayText(firstText(record.detail, record.next_action, record.reason)),
       };
     })
     .filter((action): action is RouteGuidanceAction => Boolean(action));
@@ -2646,9 +2690,9 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function routeGuidanceActions(routeMissing: string[], routePresent: string[], closeMissing: string[], allowedStages = ROUTE_GUIDANCE_ALLOWED_STAGES): RouteGuidanceAction[] {
+function routeGuidanceActions(routeMissing: string[], routePresent: string[], closeMissing: string[], allowedStages = ROUTE_GUIDANCE_ALLOWED_STAGES, contractRuntimeGoverned = false): RouteGuidanceAction[] {
   const needsRouteContext = routeMissing.includes("route_context") || !routePresent.includes("route_context");
-  const needsActionPrecheck = routeMissing.includes("route_action_precheck") || !routePresent.includes("route_action_precheck");
+  const needsActionPrecheck = !contractRuntimeGoverned && (routeMissing.includes("route_action_precheck") || !routePresent.includes("route_action_precheck"));
   const needsWorkerDispatch = routeMissing.includes("bounded_implementation_worker_dispatch");
   const needsWorkerStartup = routeMissing.includes("mf_subagent_startup");
   const needsIndependentVerification = routeMissing.includes("independent_verification_lane");
@@ -2665,8 +2709,12 @@ function routeGuidanceActions(routeMissing: string[], routePresent: string[], cl
     {
       id: "route-action-precheck",
       command: "route.action_precheck",
-      label: needsActionPrecheck ? "Run the route action precheck" : "Route action precheck recorded",
-      detail: `Stage must be one of ${allowedStages.join(", ")}.`,
+      label: contractRuntimeGoverned
+        ? "Legacy route action precheck is advisory"
+        : needsActionPrecheck ? "Run the route action precheck" : "Route action precheck recorded",
+      detail: contractRuntimeGoverned
+        ? "ContractRuntime authority controls blocking close evidence; historical route precheck rows remain context."
+        : `Stage must be one of ${allowedStages.join(", ")}.`,
     },
     {
       id: "bounded-worker-dispatch",

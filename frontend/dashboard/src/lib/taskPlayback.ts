@@ -238,6 +238,18 @@ export interface TaskPlaybackCompactLedger {
   rows: TaskPlaybackCompactLedgerRow[];
 }
 
+export interface TaskPlaybackCompactLedgerDisplayState {
+  blocked: boolean;
+  readinessLabel: string;
+  readinessTone: string;
+  readinessCardTone: "fail" | "pass" | "neutral";
+  blockerLabel: string;
+  blockerListLabel: "blockers" | "legacy advisory";
+  blockerValues: string[];
+  blockerTone: "neutral" | "green" | "red";
+  legacyAdvisoryValues: string[];
+}
+
 export interface TaskPlaybackTrace {
   schema_version: typeof TASK_PLAYBACK_TRACE_SCHEMA;
   project_id: string;
@@ -559,16 +571,205 @@ export function taskPlaybackCompactLedgerNextActionLabel(
 export function taskPlaybackCompactLedgerBlockerLabel(
   blocker: TaskPlaybackCompactLedgerBlockerSummary | null | undefined,
 ): string {
-  if (!blocker) return "";
-  const keys = blocker.keys.length > 0 ? formatCompactList(blocker.keys) : "";
-  const count = blocker.count != null ? `${blocker.count} blocker${blocker.count === 1 ? "" : "s"}` : "";
+  const filtered = contractRuntimeBlockingBlockerSummary(blocker);
+  if (!filtered) return "";
+  const count = filtered.count != null ? `${filtered.count} blocker${filtered.count === 1 ? "" : "s"}` : "";
   return [
-    blocker.kind,
+    filtered.kind,
     count,
-    keys,
-    blocker.summary,
-    blocker.reason,
+    filtered.keys.length > 0 ? formatCompactList(filtered.keys) : "",
+    filtered.summary,
+    filtered.reason,
   ].filter(Boolean).join(" - ");
+}
+
+export function taskPlaybackCompactLedgerBlockingLabel(
+  row: TaskPlaybackCompactLedgerRow | null | undefined,
+): string {
+  if (!row) return "";
+  return compactLedgerAuthorityBlockingLabel(row) || taskPlaybackCompactLedgerBlockerLabel(row.blocker_summary);
+}
+
+export function taskPlaybackCompactLedgerDisplayState(
+  row: TaskPlaybackCompactLedgerRow | null | undefined,
+): TaskPlaybackCompactLedgerDisplayState {
+  if (!row) {
+    return {
+      blocked: false,
+      readinessLabel: "not loaded",
+      readinessTone: "status-unknown",
+      readinessCardTone: "neutral",
+      blockerLabel: "",
+      blockerListLabel: "blockers",
+      blockerValues: [],
+      blockerTone: "green",
+      legacyAdvisoryValues: [],
+    };
+  }
+  const blockerLabel = taskPlaybackCompactLedgerBlockingLabel(row);
+  const projectedStatus = compactLedgerStatus(row);
+  const blocked = projectedStatus === "blocked" || Boolean(blockerLabel);
+  const legacyAdvisoryValues = legacyPrecheckAdvisoryValues(row.blocker_summary.keys);
+  const rawBlockish = [
+    row.readiness_state,
+    row.latest_status,
+    row.blocker_summary.kind,
+    row.blocker_summary.summary,
+    row.blocker_summary.reason,
+  ].join(" ").toLowerCase();
+  const legacyOnlyAdvisory = !blocked && legacyAdvisoryValues.length > 0 && /(block|fail|missing)/.test(rawBlockish);
+  const readinessLabel = blocked
+    ? "blocked"
+    : legacyOnlyAdvisory
+      ? "advisory/recorded"
+      : row.readiness_state || projectedStatus || "recorded";
+  const readinessTone = blocked
+    ? "status-failed"
+    : row.readiness_state === "close_ready" || row.readiness_state === "verified" || projectedStatus === "passed"
+      ? "status-complete"
+      : row.readiness_state === "implemented" || row.readiness_state === "planned" || projectedStatus === "running" || projectedStatus === "waiting"
+        ? "status-running"
+        : legacyOnlyAdvisory ? "status-unknown" : "status-unknown";
+  return {
+    blocked,
+    readinessLabel,
+    readinessTone,
+    readinessCardTone: blocked ? "fail" : row.readiness_state === "close_ready" || row.readiness_state === "verified" || projectedStatus === "passed" ? "pass" : "neutral",
+    blockerLabel,
+    blockerListLabel: blockerLabel ? "blockers" : legacyAdvisoryValues.length > 0 ? "legacy advisory" : "blockers",
+    blockerValues: blockerLabel ? [blockerLabel] : legacyAdvisoryValues,
+    blockerTone: blockerLabel ? "red" : legacyAdvisoryValues.length > 0 ? "neutral" : "green",
+    legacyAdvisoryValues,
+  };
+}
+
+const LEGACY_PRECHECK_ADVISORY_IDS = new Set([
+  "route_action_precheck",
+  "route.action_precheck",
+  "mf_timeline_precheck",
+]);
+
+const GENERIC_BLOCKER_WORDS = new Set(["blocker", "blockers", "blocker_evidence", "missing", "missing_evidence"]);
+
+function isLegacyPrecheckAdvisoryText(value: string): boolean {
+  const normalized = safeText(value).toLowerCase().replace(/[-\s.]+/g, "_");
+  if (!normalized) return false;
+  if (LEGACY_PRECHECK_ADVISORY_IDS.has(normalized)) return true;
+  return normalized.includes("route_action_precheck") || normalized.includes("mf_timeline_precheck");
+}
+
+function isContractRuntimeEvent(event: TaskTimelineEvent): boolean {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  const payloadKeys = Object.keys(payload);
+  const verificationKeys = Object.keys(verification);
+  return event.actor === "ContractRuntime"
+    || event.event_type === TASK_COMPACT_LEDGER_EVENT_TYPE
+    || event.event_kind === "contract_runtime_compact_ledger"
+    || event.event_type.startsWith("contract_runtime.")
+    || booleanFrom(payload.contract_runtime_projection)
+    || booleanFrom(verification.contract_runtime_projection)
+    || payloadKeys.some((key) => key === "contract_chain_current" || key.startsWith("contract_runtime_"))
+    || verificationKeys.some((key) => key === "contract_chain_current" || key.startsWith("contract_runtime_"));
+}
+
+function filterLegacyPrecheckAdvisoryValues(values: PublicFieldValue[]): PublicFieldValue[] {
+  return values.filter((item) => !isLegacyPrecheckAdvisoryText(item.value));
+}
+
+function legacyPrecheckAdvisoryValues(values: string[]): string[] {
+  return stable(values.filter(isLegacyPrecheckAdvisoryText));
+}
+
+function contractRuntimeBlockingBlockerSummary(
+  blocker: TaskPlaybackCompactLedgerBlockerSummary | null | undefined,
+): TaskPlaybackCompactLedgerBlockerSummary | null {
+  if (!blocker) return null;
+  const rawValues = [blocker.kind, blocker.summary, blocker.reason, ...blocker.keys].filter(Boolean);
+  const mentionsLegacyPrecheck = rawValues.some(isLegacyPrecheckAdvisoryText);
+  const keys = blocker.keys.filter((key) => !isLegacyPrecheckAdvisoryText(key));
+  const onlyLegacyPrecheckKeys = blocker.keys.length > 0 && keys.length === 0 && blocker.keys.some(isLegacyPrecheckAdvisoryText);
+  const summary = isLegacyPrecheckAdvisoryText(blocker.summary) || (onlyLegacyPrecheckKeys && /legacy|precheck|route|timeline|missing/i.test(blocker.summary)) ? "" : blocker.summary;
+  const reason = isLegacyPrecheckAdvisoryText(blocker.reason) || (onlyLegacyPrecheckKeys && /legacy|precheck|route|timeline|missing/i.test(blocker.reason)) ? "" : blocker.reason;
+  const kind = isLegacyPrecheckAdvisoryText(blocker.kind) || GENERIC_BLOCKER_WORDS.has(blocker.kind.toLowerCase()) ? "" : blocker.kind;
+  const genericCountOnly = (blocker.count ?? 0) > 0 && !mentionsLegacyPrecheck;
+  const hasBlockingContent = keys.length > 0 || Boolean(summary) || Boolean(reason) || Boolean(kind) || genericCountOnly;
+  if (!hasBlockingContent) return null;
+  return {
+    kind,
+    count: keys.length > 0 ? keys.length : blocker.count,
+    keys,
+    summary,
+    reason,
+  };
+}
+
+const CONTRACT_RUNTIME_AUTHORITY_MISSING_PATHS = [
+  "contract_runtime_mf_parallel_close_authority_gate.missing_requirement_ids",
+  "contract_runtime_direct_fix_close_authority_gate.missing_requirement_ids",
+  "contract_runtime_close_authority_projection.mf_parallel_close_authority_gate.missing_requirement_ids",
+  "contract_runtime_close_authority_projection.direct_fix_close_authority_gate.missing_requirement_ids",
+  "mf_parallel_close_authority_gate.missing_requirement_ids",
+  "direct_fix_close_authority_gate.missing_requirement_ids",
+  "next_required_evidence",
+  "missing_evidence",
+  "contract_chain_current.contract_runtime_mf_parallel_close_authority_gate.missing_requirement_ids",
+  "contract_chain_current.contract_runtime_direct_fix_close_authority_gate.missing_requirement_ids",
+  "contract_chain_current.contract_runtime_close_authority_projection.mf_parallel_close_authority_gate.missing_requirement_ids",
+  "contract_chain_current.contract_runtime_close_authority_projection.direct_fix_close_authority_gate.missing_requirement_ids",
+  "contract_chain_current.next_required_evidence",
+  "contract_chain_current.missing_evidence",
+];
+
+const CONTRACT_RUNTIME_AUTHORITY_PAYLOAD_PATHS = [
+  "contract_runtime_mf_parallel_close_authority_gate",
+  "contract_runtime_direct_fix_close_authority_gate",
+  "contract_runtime_close_authority_projection",
+  "mf_parallel_close_authority_gate",
+  "direct_fix_close_authority_gate",
+  "contract_chain_current.contract_runtime_mf_parallel_close_authority_gate",
+  "contract_chain_current.contract_runtime_direct_fix_close_authority_gate",
+  "contract_chain_current.contract_runtime_close_authority_projection",
+];
+
+const CONTRACT_RUNTIME_AUTHORITY_ACTION_PATHS = [
+  "contract_runtime_mf_parallel_close_authority_gate.next_action",
+  "contract_runtime_direct_fix_close_authority_gate.next_action",
+  "contract_runtime_close_authority_projection.next_action",
+  "next_legal_action.description",
+  "next_legal_action.action",
+  "next_legal_action.id",
+  "contract_chain_current.next_legal_action.description",
+  "contract_chain_current.next_legal_action.action",
+  "contract_chain_current.next_legal_action.id",
+];
+
+function contractRuntimeAuthorityValues(root: Record<string, unknown>, paths: string[]): string[] {
+  return stable(paths.flatMap((path) => stringsFromUnknown(valueAtPath(root, path))).map(safeText).filter(Boolean))
+    .filter((value) => !isLegacyPrecheckAdvisoryText(value));
+}
+
+function hasContractRuntimeAuthorityPayload(root: Record<string, unknown>, paths = CONTRACT_RUNTIME_AUTHORITY_PAYLOAD_PATHS): boolean {
+  return paths.some((path) => Object.keys(asRecord(valueAtPath(root, path))).length > 0);
+}
+
+function compactLedgerAuthorityBlockingLabel(row: TaskPlaybackCompactLedgerRow): string {
+  const root = row as unknown as Record<string, unknown>;
+  const missing = contractRuntimeAuthorityValues(root, CONTRACT_RUNTIME_AUTHORITY_MISSING_PATHS);
+  if (missing.length > 0) return `ContractRuntime authority missing ${formatCompactList(missing)}`;
+  if (!hasContractRuntimeAuthorityPayload(root)) return "";
+  const blockedish = [
+    row.readiness_state,
+    row.latest_status,
+    row.blocker_summary.kind,
+    row.blocker_summary.summary,
+    row.blocker_summary.reason,
+    row.blocker_summary.keys.join(" "),
+  ].join(" ").toLowerCase();
+  if (!/(block|fail|missing)/.test(blockedish)) return "";
+  const actions = contractRuntimeAuthorityValues(root, CONTRACT_RUNTIME_AUTHORITY_ACTION_PATHS);
+  if (actions.length > 0) return `ContractRuntime next legal action ${actions[0]}`;
+  return "";
 }
 
 function firstCompactLedgerSource(...sources: unknown[]): unknown {
@@ -777,14 +978,24 @@ function compactLedgerProjectionFields(row: TaskPlaybackCompactLedgerRow): Recor
 function compactLedgerStatus(row: TaskPlaybackCompactLedgerRow): TaskPlaybackFrameStatus {
   const readiness = row.readiness_state.toLowerCase();
   const latestStatus = row.latest_status.toLowerCase();
-  const blockerText = [
-    row.blocker_summary.kind,
-    row.blocker_summary.summary,
-    row.blocker_summary.reason,
-    row.blocker_summary.keys.join(" "),
-  ].join(" ").toLowerCase();
-  if (readiness.includes("block") || latestStatus.includes("block") || blockerText.includes("block")) return "blocked";
-  if (readiness.includes("fail") || latestStatus.includes("fail")) return "failed";
+  const blockingBlocker = contractRuntimeBlockingBlockerSummary(row.blocker_summary);
+  const blockerText = blockingBlocker
+    ? [
+      blockingBlocker.kind,
+      blockingBlocker.summary,
+      blockingBlocker.reason,
+      blockingBlocker.keys.join(" "),
+    ].join(" ").toLowerCase()
+    : "";
+  const authorityBlocker = compactLedgerAuthorityBlockingLabel(row);
+  if (readiness.includes("block") || latestStatus.includes("block") || blockerText.includes("block")) {
+    if (!blockerText && !authorityBlocker) return "recorded";
+    return "blocked";
+  }
+  if (readiness.includes("fail") || latestStatus.includes("fail")) {
+    if (!blockerText && !authorityBlocker) return "recorded";
+    return "failed";
+  }
   if (readiness.includes("close_ready") || readiness.includes("verified") || readiness.includes("implemented")) return "passed";
   if (readiness.includes("planned") || readiness.includes("pending") || latestStatus.includes("pending")) return "waiting";
   return "recorded";
@@ -1497,6 +1708,8 @@ function firstLedgerNextAction(event: TaskTimelineEvent): PublicFieldValue | nul
 }
 
 function firstLedgerBlockerSummary(event: TaskTimelineEvent): PublicFieldValue | null {
+  const authorityBlocker = firstContractRuntimeAuthorityBlocker(event);
+  if (authorityBlocker) return authorityBlocker;
   const paths = [
     "payload.blocker_summary",
     "verification.blocker_summary",
@@ -1510,6 +1723,37 @@ function firstLedgerBlockerSummary(event: TaskTimelineEvent): PublicFieldValue |
       ? taskPlaybackCompactLedgerBlockerLabel(normalizeLedgerBlockerSummary(record))
       : safeText(stringFrom(value));
     if (label && label !== "[private detail redacted]") return { value: label, path, source: sourceForPath(path) };
+  }
+  return null;
+}
+
+function contractRuntimeAuthorityPublicValues(event: TaskTimelineEvent, paths: string[]): PublicFieldValue[] {
+  if (!isContractRuntimeEvent(event)) return [];
+  const prefixed = ["payload", "verification", "artifact_refs"].flatMap((prefix) => paths.map((path) => `${prefix}.${path}`));
+  return filterLegacyPrecheckAdvisoryValues(publicValuesAtPaths(event, prefixed));
+}
+
+function firstContractRuntimeAuthorityBlocker(event: TaskTimelineEvent): PublicFieldValue | null {
+  if (!isContractRuntimeEvent(event)) return null;
+  const missing = contractRuntimeAuthorityPublicValues(event, CONTRACT_RUNTIME_AUTHORITY_MISSING_PATHS);
+  if (missing.length > 0) {
+    return {
+      value: `ContractRuntime authority missing ${formatCompactList(missing)}`,
+      path: missing[0].path,
+      source: sourceForPath(missing[0].path),
+    };
+  }
+  const blockedish = [event.status, event.event_type, event.event_kind, event.phase].join(" ").toLowerCase();
+  if (!/(block|fail|missing)/.test(blockedish)) return null;
+  const prefixedAuthorityPaths = ["payload", "verification", "artifact_refs"].flatMap((prefix) => CONTRACT_RUNTIME_AUTHORITY_PAYLOAD_PATHS.map((path) => `${prefix}.${path}`));
+  if (!hasContractRuntimeAuthorityPayload(event as unknown as Record<string, unknown>, prefixedAuthorityPaths)) return null;
+  const actions = contractRuntimeAuthorityPublicValues(event, CONTRACT_RUNTIME_AUTHORITY_ACTION_PATHS);
+  if (actions.length > 0) {
+    return {
+      value: `ContractRuntime next legal action ${actions[0].value}`,
+      path: actions[0].path,
+      source: sourceForPath(actions[0].path),
+    };
   }
   return null;
 }
@@ -1745,7 +1989,18 @@ function pushAuditCloseFacts(facts: TaskPlaybackStructuredFact[], event: TaskTim
 
 function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybackFrameStatus): TaskPlaybackStructuredFact[] {
   const diagnosis: TaskPlaybackStructuredFact[] = [];
-  const blockerIds = publicValuesAtPaths(event, [
+  const contractRuntimeEvent = isContractRuntimeEvent(event);
+  const authorityMissingRequirements = contractRuntimeAuthorityPublicValues(event, CONTRACT_RUNTIME_AUTHORITY_MISSING_PATHS);
+  if (authorityMissingRequirements.length > 0) {
+    pushFact(
+      diagnosis,
+      "missing_required_evidence",
+      "missing ContractRuntime authority",
+      formatCompactList(authorityMissingRequirements),
+      sourceForPath(authorityMissingRequirements[0].path),
+    );
+  }
+  const blockerIds = (contractRuntimeEvent ? filterLegacyPrecheckAdvisoryValues : (items: PublicFieldValue[]) => items)(publicValuesAtPaths(event, [
     "payload.blocker_ids",
     "payload.blockers",
     "payload.blocker_summary",
@@ -1759,22 +2014,22 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "verification.blocker_summary.kind",
     "artifact_refs.blocker_ids",
     "artifact_refs.blocker_summary",
-  ]);
+  ]));
   if (blockerIds.length > 0) {
     pushFact(diagnosis, "blocker_ids", "blocker ids", formatCompactList(blockerIds), sourceForPath(blockerIds[0].path));
   }
-  const missingEventKinds = publicValuesAtPaths(event, [
+  const missingEventKinds = (contractRuntimeEvent ? filterLegacyPrecheckAdvisoryValues : (items: PublicFieldValue[]) => items)(publicValuesAtPaths(event, [
     "payload.missing_event_kinds",
     "payload.blocked_event_kinds",
     "payload.blocked_protected_event_kinds",
     "payload.required_before_protected_evidence",
     "verification.missing_event_kinds",
     "verification.blocked_event_kinds",
-  ]);
+  ]));
   if (missingEventKinds.length > 0) {
     pushFact(diagnosis, "missing_event_kinds", "missing event kinds", formatCompactList(missingEventKinds), sourceForPath(missingEventKinds[0].path));
   }
-  const missingRequirements = publicValuesAtPaths(event, [
+  const missingRequirements = (contractRuntimeEvent ? filterLegacyPrecheckAdvisoryValues : (items: PublicFieldValue[]) => items)(publicValuesAtPaths(event, [
     "payload.missing_required_evidence",
     "payload.missing_requirement_ids",
     "payload.missing_protected_lanes",
@@ -1792,7 +2047,7 @@ function failureDiagnosisFromEvent(event: TaskTimelineEvent, status: TaskPlaybac
     "verification.route_context_gate.missing_required_evidence",
     "verification.contract_gate.missing_requirement_ids",
     "verification.contract_gate.missing_required_evidence",
-  ]);
+  ]));
   if (missingRequirements.length > 0) {
     pushFact(diagnosis, "missing_required_evidence", "missing required evidence", formatCompactList(missingRequirements), sourceForPath(missingRequirements[0].path));
   }
@@ -1934,6 +2189,10 @@ function eventChecklistFromEvent(
   const items: TaskPlaybackChecklistItem[] = [];
   const typedPaths = new Set<string>();
   const finalBlockingVerdict = isFinalBlockingChecklistVerdict(event, frameStatus);
+  const contractRuntimeEvent = isContractRuntimeEvent(event);
+  const contractRuntimeMissingFilter = contractRuntimeEvent
+    ? (item: PublicFieldValue) => !isLegacyPrecheckAdvisoryText(item.value)
+    : undefined;
 
   for (const fact of failureDiagnosis) {
     const status = checklistStatusFromFact(fact, frameStatus);
@@ -1947,7 +2206,7 @@ function eventChecklistFromEvent(
     "payload.blocked_protected_event_kinds",
     "verification.missing_event_kinds",
     "verification.blocked_event_kinds",
-  ], typedPaths, unmetStatus);
+  ], typedPaths, unmetStatus, contractRuntimeMissingFilter);
   pushChecklistPathItems(items, event, "missing_requirements", finalBlockingVerdict ? "Missing requirement" : "Pending requirement", unmetStatus, [
     "payload.missing_required_evidence",
     "payload.missing_requirement_ids",
@@ -1964,7 +2223,34 @@ function eventChecklistFromEvent(
     "verification.route_context_gate.missing_required_evidence",
     "verification.contract_gate.missing_requirement_ids",
     "verification.contract_gate.missing_required_evidence",
-  ], typedPaths);
+  ], typedPaths, undefined, contractRuntimeMissingFilter);
+  if (contractRuntimeEvent) {
+    const advisoryValues = legacyPrecheckAdvisoryValues(publicValuesAtPaths(event, [
+      "payload.missing_event_kinds",
+      "payload.blocked_event_kinds",
+      "payload.blocked_protected_event_kinds",
+      "payload.missing_required_evidence",
+      "payload.missing_requirement_ids",
+      "payload.route_context_gate.missing_requirement_ids",
+      "payload.route_context_gate.missing_required_evidence",
+      "verification.missing_event_kinds",
+      "verification.blocked_event_kinds",
+      "verification.missing_required_evidence",
+      "verification.missing_requirement_ids",
+      "verification.route_context_gate.missing_requirement_ids",
+      "verification.route_context_gate.missing_required_evidence",
+    ]).map((item) => item.value));
+    if (advisoryValues.length > 0) {
+      pushChecklistItem(
+        items,
+        "legacy_precheck_advisory",
+        "Legacy advisory",
+        `${formatCompactList(advisoryValues)} is historical; ContractRuntime authority controls the blocking gate.`,
+        "recorded",
+        "semantic",
+      );
+    }
+  }
   pushChecklistPathItems(items, event, "present_event_kinds", "Present event kind", "present", [
     "payload.present_event_kinds",
     "payload.recorded_event_kinds",
@@ -2409,10 +2695,12 @@ function pushChecklistPathItems(
   paths: string[],
   typedPaths?: Set<string>,
   overrideStatus?: TaskPlaybackChecklistItemStatus,
+  includeItem?: (item: PublicFieldValue) => boolean,
 ): void {
   for (const item of publicValuesAtPaths(event, paths)) {
-    pushChecklistItem(items, kind, label, item.value, overrideStatus ?? status, item.source);
     typedPaths?.add(item.path);
+    if (includeItem && !includeItem(item)) continue;
+    pushChecklistItem(items, kind, label, item.value, overrideStatus ?? status, item.source);
   }
 }
 
@@ -3072,9 +3360,19 @@ function closeGateMissingRequirementIds(response: BacklogTimelineGateResponse): 
   const gate = response.timeline_gate;
   const contractGate = asRecord(gate?.contract_gate);
   const routeGate = asRecord(gate?.route_context_gate);
+  const runtimeMfParallelAuthorityGate = asRecord(asRecord(gate as unknown as Record<string, unknown>).contract_runtime_mf_parallel_close_authority_gate);
+  const runtimeDirectFixAuthorityGate = asRecord(asRecord(gate as unknown as Record<string, unknown>).contract_runtime_direct_fix_close_authority_gate);
+  const runtimeAuthorityProjection = asRecord(asRecord(gate as unknown as Record<string, unknown>).contract_runtime_close_authority_projection);
+  const runtimeAuthorityProjectionMfParallelGate = asRecord(runtimeAuthorityProjection.mf_parallel_close_authority_gate);
+  const runtimeAuthorityProjectionDirectFixGate = asRecord(runtimeAuthorityProjection.direct_fix_close_authority_gate);
   const verification = asRecord(asRecord(response as unknown as Record<string, unknown>).verification);
   const gateRecord = asRecord(gate as unknown as Record<string, unknown>);
-  return stable([
+  const hasRuntimeAuthority = hasContractRuntimeCloseAuthority(gateRecord);
+  const values = [
+    ...stringsFromUnknown(runtimeMfParallelAuthorityGate.missing_requirement_ids),
+    ...stringsFromUnknown(runtimeDirectFixAuthorityGate.missing_requirement_ids),
+    ...stringsFromUnknown(runtimeAuthorityProjectionMfParallelGate.missing_requirement_ids),
+    ...stringsFromUnknown(runtimeAuthorityProjectionDirectFixGate.missing_requirement_ids),
     ...stringsFromUnknown(contractGate.missing_requirement_ids),
     ...stringsFromUnknown(routeGate.missing_requirement_ids),
     ...stringsFromUnknown(gateRecord.missing_requirement_ids),
@@ -3084,7 +3382,21 @@ function closeGateMissingRequirementIds(response: BacklogTimelineGateResponse): 
     ...stringsFromUnknown(verification.missing_protected_lanes),
     ...stringsFromUnknown(verification.required_before_protected_evidence),
     ...stringsFromUnknown(verification.next_expected_event_kind),
-  ].map(safeText).filter(Boolean));
+  ].map(safeText).filter(Boolean);
+  return stable(hasRuntimeAuthority ? values.filter((value) => !isLegacyPrecheckAdvisoryText(value)) : values);
+}
+
+function hasContractRuntimeCloseAuthority(gate: Record<string, unknown>): boolean {
+  const closeAuthority = asRecord(gate.close_authority);
+  const sourceOfAuthority = stringFrom(gate.source_of_authority).toLowerCase();
+  const closeAuthoritySource = stringFrom(closeAuthority.source_of_authority).toLowerCase();
+  return sourceOfAuthority === "contract_runtime"
+    || closeAuthoritySource === "contract_runtime"
+    || booleanFrom(gate.runtime_projection_authority_failed)
+    || (booleanFrom(closeAuthority.authoritative) && closeAuthoritySource === "contract_runtime")
+    || Object.keys(asRecord(gate.contract_runtime_close_authority_projection)).length > 0
+    || Object.keys(asRecord(gate.contract_runtime_mf_parallel_close_authority_gate)).length > 0
+    || Object.keys(asRecord(gate.contract_runtime_direct_fix_close_authority_gate)).length > 0;
 }
 
 function closeGateReasonSentence(

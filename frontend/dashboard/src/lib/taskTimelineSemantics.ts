@@ -997,7 +997,8 @@ const GATE_ROW_LABELS: Record<string, string> = {
   close_ready:                             "Close-ready evidence recorded",
   // Route-context gate
   route_context:                           "Route context bundle obtained",
-  route_action_precheck:                   "Route action precheck passed",
+  route_action_precheck:                   "Legacy route action precheck (historical/advisory)",
+  mf_timeline_precheck:                    "Legacy MF timeline precheck (advisory)",
   bounded_implementation_worker_dispatch:  "Bounded worker dispatched",
   mf_subagent_startup:                     "Bounded worker started",
   independent_verification_lane:           "Independent QA verified",
@@ -1034,7 +1035,7 @@ function gateRowLabel(id: string): string {
 function gateFamily(id: string): GateMatrixRow["family"] {
   if (["implementation", "verification", "close_ready"].includes(id)) return "timeline";
   if ([
-    "route_context", "route_action_precheck", "bounded_implementation_worker_dispatch",
+    "route_context", "route_action_precheck", "mf_timeline_precheck", "bounded_implementation_worker_dispatch",
     "mf_subagent_startup", "independent_verification_lane", "architecture_review_lane",
     "route_identity_mismatch", "same_route_identity", "route_identity_cleanup",
   ].includes(id)) return "route_context";
@@ -1043,6 +1044,38 @@ function gateFamily(id: string): GateMatrixRow["family"] {
   if (id.includes("read_receipt") || id === "contract_projection") return "receipt_projection";
   if (id === "contract_gate" || id.includes("contract")) return "contract";
   return "other";
+}
+
+const LEGACY_PRECHECK_ADVISORY_REQUIREMENTS = new Set(["route_action_precheck", "route.action_precheck", "mf_timeline_precheck"]);
+
+function isLegacyPrecheckAdvisoryRequirement(id: string): boolean {
+  const normalized = stringFrom(id).toLowerCase().replace(/[-\s.]+/g, "_");
+  if (!normalized) return false;
+  return LEGACY_PRECHECK_ADVISORY_REQUIREMENTS.has(normalized)
+    || normalized.includes("route_action_precheck")
+    || normalized.includes("mf_timeline_precheck");
+}
+
+function gateHasContractRuntimeAuthority(gate: unknown): boolean {
+  const record = asRecord(gate);
+  const closeAuthority = asRecord(record.close_authority);
+  const sourceOfAuthority = stringFrom(record.source_of_authority).toLowerCase();
+  const closeAuthoritySource = stringFrom(closeAuthority.source_of_authority).toLowerCase();
+  return sourceOfAuthority === "contract_runtime"
+    || closeAuthoritySource === "contract_runtime"
+    || booleanFrom(record.runtime_projection_authority_failed)
+    || (booleanFrom(closeAuthority.authoritative) && closeAuthoritySource === "contract_runtime")
+    || Object.keys(asRecord(record.contract_runtime_close_authority_projection)).length > 0
+    || Object.keys(asRecord(record.contract_runtime_mf_parallel_close_authority_gate)).length > 0
+    || Object.keys(asRecord(record.contract_runtime_direct_fix_close_authority_gate)).length > 0;
+}
+
+function booleanFrom(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "degraded";
 }
 
 const FAMILY_LABELS: Record<GateMatrixRow["family"], string> = {
@@ -1088,6 +1121,8 @@ export function projectGateMatrix(
   gate: {
     passed?: boolean;
     status?: string;
+    source_of_authority?: string;
+    authoritative?: boolean;
     required_event_kinds?: string[];
     present_event_kinds?: string[];
     missing_event_kinds?: string[];
@@ -1115,6 +1150,10 @@ export function projectGateMatrix(
     audit_close_gate?: Record<string, unknown>;
     qa_acceptance?: Record<string, unknown>;
     fixed_close_waiver_alert?: Record<string, unknown>;
+    close_authority?: Record<string, unknown>;
+    contract_runtime_close_authority_projection?: Record<string, unknown>;
+    contract_runtime_mf_parallel_close_authority_gate?: Record<string, unknown>;
+    contract_runtime_direct_fix_close_authority_gate?: Record<string, unknown>;
     contract_projection_gate?: { passed?: boolean; status?: string };
     checks?: Record<string, boolean | number | string>;
   } | undefined,
@@ -1131,6 +1170,7 @@ export function projectGateMatrix(
   }
 
   const rows: GateMatrixRow[] = [];
+  const contractRuntimeAuthority = gateHasContractRuntimeAuthority(gate);
 
   // ── 1. Timeline gate rows (required_event_kinds) ─────────────────────────
   const required = gate.required_event_kinds ?? ["implementation", "verification", "close_ready"];
@@ -1162,14 +1202,17 @@ export function projectGateMatrix(
     for (const id of Array.from(rgRequired)) {
       const eventsForId = (evidenceMap as Record<string, unknown>)[id];
       const { ids: evidenceIds, labels: evidenceLabels } = eventIdsFromGateEvents(eventsForId);
+      const legacyAdvisory = contractRuntimeAuthority && isLegacyPrecheckAdvisoryRequirement(id);
       rows.push({
         id,
         label: gateRowLabel(id),
         family: gateFamily(id),
         familyLabel: FAMILY_LABELS[gateFamily(id)],
-        required: rg.required !== false,
-        status: rgPresent.has(id) ? "passed" : rgMissing.has(id) ? "missing" : "unknown",
-        nextAction: rgMissing.has(id) ? `Record ${gateRowLabel(id).toLowerCase()}` : "",
+        required: legacyAdvisory ? false : rg.required !== false,
+        status: legacyAdvisory ? (rgPresent.has(id) ? "passed" : "not_applicable") : rgPresent.has(id) ? "passed" : rgMissing.has(id) ? "missing" : "unknown",
+        nextAction: legacyAdvisory
+          ? "Historical/advisory; ContractRuntime authority controls blocking close evidence."
+          : rgMissing.has(id) ? `Record ${gateRowLabel(id).toLowerCase()}` : "",
         evidenceEventIds: evidenceIds,
         evidenceLabels,
       });
@@ -1192,6 +1235,8 @@ export function projectGateMatrix(
       }
     }
   }
+
+  rows.push(...contractRuntimeAuthorityRows(gate));
 
   // ── 3. Contract gate rows ─────────────────────────────────────────────────
   const cg = gate.contract_gate;
@@ -1328,6 +1373,90 @@ export function projectGateMatrix(
     gatePresent: true,
     applicable,
   };
+}
+
+const CONTRACT_RUNTIME_AUTHORITY_ROW_SPECS = [
+  {
+    id: "contract_runtime_mf_parallel_close_authority_gate",
+    label: "ContractRuntime MF parallel close authority",
+    paths: [
+      "contract_runtime_mf_parallel_close_authority_gate",
+      "contract_runtime_close_authority_projection.mf_parallel_close_authority_gate",
+      "mf_parallel_close_authority_gate",
+    ],
+  },
+  {
+    id: "contract_runtime_direct_fix_close_authority_gate",
+    label: "ContractRuntime direct-fix close authority",
+    paths: [
+      "contract_runtime_direct_fix_close_authority_gate",
+      "contract_runtime_close_authority_projection.direct_fix_close_authority_gate",
+      "direct_fix_close_authority_gate",
+    ],
+  },
+];
+
+function contractRuntimeAuthorityRows(gate: unknown): GateMatrixRow[] {
+  const root = asRecord(gate);
+  if (!gateHasContractRuntimeAuthority(root)) return [];
+  const rows: GateMatrixRow[] = [];
+  for (const spec of CONTRACT_RUNTIME_AUTHORITY_ROW_SPECS) {
+    const records = spec.paths
+      .map((path) => asRecord(valueAtPath(root, path)))
+      .filter((record) => Object.keys(record).length > 0);
+    if (records.length === 0) continue;
+    const primary = records[0];
+    const missing = authorityMissingValues(records);
+    const statusText = stringFrom(primary.status).toLowerCase();
+    const passed = booleanFrom(primary.passed) || ["passed", "accepted", "ok", "ready"].includes(statusText);
+    const failed = primary.passed === false || ["blocked", "failed", "missing"].includes(statusText);
+    const action = authorityNextAction(records);
+    rows.push({
+      id: spec.id,
+      label: spec.label,
+      family: "contract",
+      familyLabel: FAMILY_LABELS.contract,
+      required: true,
+      status: passed ? "passed" : missing.length > 0 ? "missing" : failed ? "failed" : "unknown",
+      nextAction: missing.length > 0
+        ? `Record ContractRuntime authority evidence for ${missing.join(", ")}`
+        : action,
+      evidenceEventIds: authorityEvidenceEventIds(records),
+      evidenceLabels: authorityEvidenceEventIds(records).map(() => "ContractRuntime authority"),
+    });
+  }
+  return rows;
+}
+
+function authorityMissingValues(records: Record<string, unknown>[]): string[] {
+  return Array.from(new Set(records.flatMap((record) => [
+    ...stringsFromUnknown(record.missing_requirement_ids),
+    ...stringsFromUnknown(record.missing_required_evidence),
+    ...stringsFromUnknown(record.missing_evidence),
+    ...stringsFromUnknown(record.next_required_evidence),
+  ]).map(stringFrom).filter(Boolean).filter((id) => !isLegacyPrecheckAdvisoryRequirement(id))));
+}
+
+function authorityNextAction(records: Record<string, unknown>[]): string {
+  for (const record of records) {
+    const values = [
+      ...stringsFromUnknown(record.next_action),
+      ...stringsFromUnknown(record.required_action),
+      ...stringsFromUnknown(record.action),
+    ].map(stringFrom).filter(Boolean);
+    if (values[0]) return values[0];
+  }
+  return "";
+}
+
+function authorityEvidenceEventIds(records: Record<string, unknown>[]): string[] {
+  const ids = records.flatMap((record) => [
+    ...eventIdsFromGateEvents(record.evidence_events).ids,
+    normalizeEventId(record.event_id),
+    normalizeEventId(record.timeline_event_id),
+    normalizeEventId(record.id),
+  ]).filter(Boolean);
+  return Array.from(new Set(ids)).slice(0, 8);
 }
 
 function auditCloseRows(gate: {

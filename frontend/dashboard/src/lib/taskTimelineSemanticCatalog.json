@@ -210,15 +210,15 @@
         "event_kind": ["route_action", "route_action_precheck"]
       },
       "title": "Route action requested",
-      "detail": "A route action check recorded who requested the governed action, which action was authorized or blocked, what route evidence changed, and what evidence must appear before close.",
+      "detail": "A route action check recorded who requested the governed action, which action was authorized or blocked, what route evidence changed, and what advisory legacy precheck state was observed.",
       "lane": "observer",
       "actor": "Route service",
       "narrative": {
         "actor": "Route service checked a scoped governance action for the requesting actor.",
         "information": "It produced action-precheck evidence for the requested action, allowed action, stage, decision, route hash, and backlog/task scope when present.",
         "context": "The action request carries public route identity and allowed-action metadata; route tokens and private route bodies are not displayed.",
-        "purpose": "This explains whether the next mutation, dispatch, or evidence append is allowed to proceed and which public route evidence supports it.",
-        "outcome": "Allowed actions can continue under the route context; blocked actions need the missing route, worker, implementation, verification, or close-ready evidence before the task can close."
+        "purpose": "This preserves historical route-precheck context without making legacy precheck state the ContractRuntime close authority.",
+        "outcome": "Allowed or blocked actions still explain missing route, worker, implementation, verification, or close-ready evidence as historical context; for ContractRuntime-governed rows, close blocking comes from the ContractRuntime authority payload, missing evidence, or next action."
       },
       "chip_paths": [
         { "label": "service", "path": "payload.service_id" },
@@ -445,7 +445,7 @@
       "id": "observer.work_mode_transition",
       "match": { "event_type": ["observer_work_mode_transition", "observer.work_mode_transition"], "event_kind": ["observer_work_mode_transition"] },
       "title": "Observer work-mode transition",
-      "detail": "The observer recorded a work-mode transition (observer_look_before_act -> observer_execution_supervisor). This transition is legal only with both a recorded transition event and a route_action_precheck bound to the canonical route identity.",
+      "detail": "The observer recorded a work-mode transition (observer_look_before_act -> observer_execution_supervisor). Historical transitions may cite a route_action_precheck, while ContractRuntime-governed close decisions use the ContractRuntime authority payload.",
       "lane": "observer",
       "actor": "Observer",
       "narrative": {
@@ -453,7 +453,7 @@
         "information": "It recorded the from/to work modes and the canonical route identity the transition is bound to.",
         "context": "Default observer posture is observer_look_before_act, which blocks edit-implementation, self-clear-judge-blocker, dispatch, merge, and close; the transition unlocks dispatch/merge/close coordination but never direct implementation or judge self-clear.",
         "purpose": "This proves the observer earned dispatch/merge/close coordination authority through an explicit, route-bound transition rather than acting by fiat.",
-        "outcome": "Once accepted, supervisor coordination actions become legal under the canonical route identity; without the bound precheck the transition stays blocked."
+        "outcome": "Once accepted, supervisor coordination actions become legal under the canonical route identity; without the bound precheck the transition stays blocked, while legacy bound precheck rows remain historical context for ContractRuntime-governed close decisions."
       },
       "chip_paths": [
         { "label": "from work mode", "path": "payload.from_work_mode" },
