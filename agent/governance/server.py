@@ -35298,8 +35298,6 @@ def _contract_chain_current_with_runtime_freshness(
                 actor_role=actor_role or None,
             )
         )
-        if not runtime_context_projection:
-            return current
     except (ContractRuntimeError, StalePinnedContractExecutionError, sqlite3.Error):
         return current
 
@@ -36800,6 +36798,8 @@ def _contract_runtime_mf_parallel_context_projection(
     project_id: str,
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if conn is None:
+        return {}
     if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
         return {}
     completed_lines = [
@@ -37351,6 +37351,31 @@ def _contract_runtime_next_line_allows_mf_sub(
         for role in (next_line.get("allowed_writer_roles") or [])
     }
     return "mf_sub" in allowed_roles
+
+
+def _contract_runtime_next_line_requires_mf_sub_proof(
+    record: Mapping[str, Any] | None,
+) -> bool:
+    if not _contract_runtime_next_line_allows_mf_sub(record):
+        return False
+    if (
+        str((record or {}).get("contract_id") or "").strip()
+        == MF_PARALLEL_RECORD_CONTRACT_ID
+    ):
+        return True
+    next_line = _contract_runtime_next_line(record or {})
+    for candidate in _contract_runtime_mapping_candidates(next_line):
+        if _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+            "parent_task_id",
+            "target_project_root",
+            "target_graph_root",
+            "session_token_ref",
+            "worker_session_token_ref",
+        ):
+            return True
+    return False
 
 
 def _resolve_contract_runtime_observer_proof(
@@ -38430,9 +38455,14 @@ def _contract_runtime_effective_actor_role(
     role_normalized = _normalized_contract_runtime_action(role)
     if role_normalized == "qa":
         return "qa"
+    if role_normalized == "observer":
+        return "observer"
     proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
     mf_sub_allowed = _contract_runtime_next_line_allows_mf_sub(record)
-    if role_normalized == "mf_sub" or (proof_requested and mf_sub_allowed):
+    mf_sub_proof_required = _contract_runtime_next_line_requires_mf_sub_proof(record)
+    if role_normalized == "mf_sub":
+        if not (proof_requested or mf_sub_proof_required):
+            return "mf_sub"
         mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(
             ctx,
             conn,
@@ -38440,13 +38470,24 @@ def _contract_runtime_effective_actor_role(
             action=action,
             contract_execution_id=contract_execution_id,
             record=record,
-            require_proof=role_normalized == "mf_sub",
+            require_proof=True,
         )
         if mf_sub_proof:
             ctx._contract_runtime_mf_sub_proof = mf_sub_proof
             return "mf_sub"
-    if role == "observer":
-        return role
+    if proof_requested and mf_sub_allowed:
+        mf_sub_proof = _resolve_contract_runtime_mf_sub_proof(
+            ctx,
+            conn,
+            project_id=project_id,
+            action=action,
+            contract_execution_id=contract_execution_id,
+            record=record,
+            require_proof=False,
+        )
+        if mf_sub_proof:
+            ctx._contract_runtime_mf_sub_proof = mf_sub_proof
+            return "mf_sub"
     proof = _resolve_contract_runtime_observer_proof(
         ctx,
         conn,

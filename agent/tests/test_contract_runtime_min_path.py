@@ -744,6 +744,100 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     assert current["readiness_state"] == "contract_active"
 
 
+def test_server_chain_current_refreshes_stale_next_action_after_finish(tmp_path):
+    from agent.governance import server
+
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    _, direct_fix, generation, repair_ref = _start_repaired_direct_fix(
+        runtime,
+        backlog_id="AC-DIRECT-FIX-STALE-AFTER-FINISH",
+    )
+
+    qa = runtime.submit_line_write(
+        direct_fix["contract_execution_id"],
+        _direct_fix_qa_write(
+            direct_fix,
+            generation=generation,
+            repair_ref=repair_ref,
+        ),
+        actor_role="qa",
+    )
+    assert qa["ok"] is True
+    stale_after_qa = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX-STALE-AFTER-FINISH",
+    )
+    assert stale_after_qa["next_legal_action"]["line_id"] == (
+        "direct_fix_return_to_parent"
+    )
+
+    runtime.current_guide(direct_fix["contract_execution_id"], actor_role="observer")
+    record = runtime.store.get(direct_fix["contract_execution_id"])
+    returned = runtime.submit_line_write(
+        direct_fix["contract_execution_id"],
+        _write_from(
+            record,
+            actor_role="observer",
+            stage_id="return_to_parent",
+            line_id="direct_fix_return_to_parent",
+            evidence_kind="direct_fix_return_to_parent",
+        ),
+        actor_role="observer",
+    )
+    assert returned["ok"] is True
+    assert returned["record"]["runtime_guide"]["next_legal_action"] is None
+
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+        SET next_legal_action_json = ?
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            json.dumps(
+                stale_after_qa["next_legal_action"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "aming-claw",
+            "AC-DIRECT-FIX-STALE-AFTER-FINISH",
+        ),
+    )
+    stale_read = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX-STALE-AFTER-FINISH",
+    )
+    assert stale_read["next_legal_action"]["line_id"] == "direct_fix_return_to_parent"
+
+    refreshed = server._contract_chain_current_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX-STALE-AFTER-FINISH",
+    )
+
+    assert refreshed["current_contract_execution_id"].startswith("cex-root-")
+    assert refreshed["next_legal_action"]["line_id"] == "read_context"
+    assert refreshed["next_legal_action"]["line_id"] != "direct_fix_return_to_parent"
+    assert refreshed["contract_runtime_current_state"]["next_legal_action"][
+        "line_id"
+    ] == "read_context"
+    freshness = refreshed["projection_freshness"]
+    assert freshness["status"] == "refreshed_from_contract_runtime_current"
+    assert freshness["runtime_context_projection_applied"] is False
+    assert freshness["stale_next_legal_action"]["line_id"] == (
+        "direct_fix_return_to_parent"
+    )
+
+
 def test_mf_parallel_failed_qa_summary_resets_completion_path(tmp_path):
     _write_contract_definition(
         tmp_path,
