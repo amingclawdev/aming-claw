@@ -37300,8 +37300,10 @@ def _contract_runtime_projection_completed_lines(
 
 
 def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
-    body = ctx.body if isinstance(ctx.body, Mapping) else {}
-    query = ctx.query if isinstance(ctx.query, Mapping) else {}
+    body_value = getattr(ctx, "body", {})
+    query_value = getattr(ctx, "query", {})
+    body = body_value if isinstance(body_value, Mapping) else {}
+    query = query_value if isinstance(query_value, Mapping) else {}
     for key in keys:
         value = body.get(key)
         if value is None:
@@ -38426,6 +38428,8 @@ def _contract_runtime_effective_actor_role(
     role = str(session.get("role") or "").strip()
     project_id = ctx.get_project_id()
     role_normalized = _normalized_contract_runtime_action(role)
+    if role_normalized == "qa":
+        return "qa"
     proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
     mf_sub_allowed = _contract_runtime_next_line_allows_mf_sub(record)
     if role_normalized == "mf_sub" or (proof_requested and mf_sub_allowed):
@@ -38441,7 +38445,7 @@ def _contract_runtime_effective_actor_role(
         if mf_sub_proof:
             ctx._contract_runtime_mf_sub_proof = mf_sub_proof
             return "mf_sub"
-    if role in {"observer", "qa"}:
+    if role == "observer":
         return role
     proof = _resolve_contract_runtime_observer_proof(
         ctx,
