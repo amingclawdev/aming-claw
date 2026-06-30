@@ -1274,6 +1274,127 @@ def _route_pre_mutation_error_code(message: str) -> str:
     return "route_action_gate_blocked"
 
 
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_KEYS = (
+    "close_authority",
+    "authority",
+    "contract_runtime",
+    "contract_chain_current",
+    "contract_chain_current_authority",
+    "contract_runtime_close_authority",
+    "contract_runtime_close_authority_projection",
+)
+
+
+def _explicit_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return _text(value).lower() in {"1", "true", "yes", "authoritative"}
+
+
+def _explicit_false(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    return _text(value).lower() in {"0", "false", "no", "blocked", "failed"}
+
+
+def _explicit_contract_runtime_close_authority(source: Mapping[str, Any]) -> bool:
+    schema = _text(source.get("schema_version")).lower()
+    source_name = _text(
+        source.get("source")
+        or source.get("authority_source")
+        or source.get("projection_source")
+    ).lower()
+    if _explicit_true(source.get("legacy")) or _explicit_true(source.get("advisory")):
+        return False
+    if _explicit_false(source.get("status")) or _explicit_false(source.get("decision")):
+        return False
+    for field_name in ("passed", "accepted", "ok"):
+        if field_name in source and _explicit_false(source.get(field_name)):
+            return False
+    if (
+        _explicit_false(source.get("authoritative"))
+        or _explicit_false(source.get("close_authoritative"))
+        or _explicit_false(source.get("can_close_authoritative"))
+    ):
+        return False
+    if not any(
+        _explicit_true(source.get(key))
+        for key in ("authoritative", "close_authoritative", "can_close_authoritative")
+    ):
+        return False
+    return bool(
+        schema.startswith("contract_runtime_close_authority")
+        or "contract_runtime_close_authority" in schema
+        or "contract_runtime_close_authority" in source_name
+        or _text(source.get("authority_kind")).lower()
+        == "contract_runtime_close_authority"
+        or _text(source.get("kind")).lower() == "contract_runtime_close_authority"
+    )
+
+
+def _contract_runtime_close_authority_present(
+    *values: Any,
+    _depth: int = 0,
+) -> bool:
+    if _depth > 4:
+        return False
+    for value in values:
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            if _contract_runtime_close_authority_present(*value, _depth=_depth + 1):
+                return True
+            continue
+        source = _mapping(value)
+        if not source:
+            continue
+        if _explicit_contract_runtime_close_authority(source):
+            return True
+        for key in _CONTRACT_RUNTIME_CLOSE_AUTHORITY_KEYS:
+            nested = source.get(key)
+            if nested is not value and _contract_runtime_close_authority_present(
+                nested,
+                _depth=_depth + 1,
+            ):
+                return True
+    return False
+
+
+def _close_gate_failed(gate: Mapping[str, Any]) -> bool:
+    if not gate:
+        return False
+    if bool(gate.get("passed", True)):
+        return False
+    status = _text(gate.get("status")).lower()
+    return bool(
+        gate.get("required") is True
+        or _string_list(gate.get("missing_requirement_ids"))
+        or _string_list(gate.get("missing_fields"))
+        or status in {"blocked", "failed", "missing", "rejected"}
+    )
+
+
+def _contract_runtime_close_gate_errors(
+    subject: Mapping[str, Any],
+    close_timeline_gate: Mapping[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    for source in (close_timeline_gate, subject):
+        contract_projection_gate = _mapping(source.get("contract_projection_gate"))
+        if _close_gate_failed(contract_projection_gate):
+            errors.append("contract_runtime_projection_incomplete")
+        for gate_key in (
+            "contract_runtime_mf_parallel_close_authority_gate",
+            "contract_runtime_direct_fix_close_authority_gate",
+            "contract_runtime_close_authority_gate",
+        ):
+            if _close_gate_failed(_mapping(source.get(gate_key))):
+                errors.append("contract_runtime_close_authority_incomplete")
+    return errors
+
+
 def _close_gate(
     contract_id: str,
     stage: str,
@@ -1312,8 +1433,27 @@ def _close_gate(
     close_missing_event_kinds = _string_list(
         close_timeline_accounting.get("missing_event_kinds")
     )
+    legacy_timeline_advisory = _contract_runtime_close_authority_present(
+        subject,
+        close_timeline_gate,
+    )
+    timeline_precheck_blocking = bool(
+        close_missing_event_kinds and not legacy_timeline_advisory
+    )
+    blocking_close_missing_event_kinds = (
+        [] if legacy_timeline_advisory else close_missing_event_kinds
+    )
+    if legacy_timeline_advisory:
+        close_timeline_accounting = {
+            **close_timeline_accounting,
+            "advisory_only": True,
+            "blocking": False,
+            "authority": "contract_runtime",
+            "legacy_mf_timeline_precheck_advisory": True,
+            "legacy_mf_timeline_missing_event_kinds": close_missing_event_kinds,
+        }
     missing_evidence_groups = task_timeline.mf_close_missing_evidence_groups(
-        close_missing_event_kinds,
+        blocking_close_missing_event_kinds,
         route_context_gate,
     )
     route_context_reminder = task_timeline.mf_route_context_reminder(
@@ -1326,10 +1466,11 @@ def _close_gate(
     present_event_kinds = set(
         _string_list(close_timeline_accounting.get("present_event_kinds"))
     )
-    if "close_ready" not in present_event_kinds:
+    if "close_ready" not in present_event_kinds and not legacy_timeline_advisory:
         errors.append("missing_close_ready_timeline")
-    if close_missing_event_kinds:
+    if timeline_precheck_blocking:
         errors.append("mf_timeline_precheck_incomplete")
+    errors.extend(_contract_runtime_close_gate_errors(subject, close_timeline_gate))
     if missing_evidence:
         errors.append("required_evidence_ids_missing")
     if independent_verification_required and not independent_verification_present:
@@ -1373,7 +1514,12 @@ def _close_gate(
         "worker_graph_trace_evidence_present": _has_graph_trace_evidence(subject),
         "runtime_context_projection_requirements": projection_requirements,
         "close_ready_present": "close_ready" in present_event_kinds,
-        "mf_timeline_precheck_compatible": not close_missing_event_kinds,
+        "mf_timeline_precheck_compatible": not timeline_precheck_blocking,
+        "mf_timeline_precheck_blocking": timeline_precheck_blocking,
+        "legacy_mf_timeline_precheck_advisory": legacy_timeline_advisory,
+        "legacy_mf_timeline_missing_event_kinds": (
+            close_missing_event_kinds if legacy_timeline_advisory else []
+        ),
     }
 
 
