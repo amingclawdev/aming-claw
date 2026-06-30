@@ -721,6 +721,7 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "bug_id": {"type": "string"},
                 "commit": {"type": "string", "description": "Git commit hash that fixes the bug."},
+                "contract_execution_id": {"type": "string", "description": "Optional ContractRuntime execution id to use for backlog close authority projection."},
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected backlog close."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit manual-fix/same-worktree waiver for protected route-token gates."},
