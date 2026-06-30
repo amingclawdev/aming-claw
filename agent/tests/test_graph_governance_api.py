@@ -24870,6 +24870,80 @@ def test_observer_root_route_context_source_backed_next_action_from_contract_run
     assert row["execution_state_revision"] == 1
 
 
+def test_observer_root_route_context_ignores_degraded_current_projection_next_action(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-ROOT-ROUTE-DEGRADED-CURRENT-NO-AUTHORITY"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    degraded_next_action = {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "route_action_precheck",
+        "action": "record_route_action_precheck",
+        "source": "backlog_contract_chain_current",
+        "precedence": "degraded_projection",
+        "contract_execution_id": "cex-degraded-current",
+        "line_id": "route_action_precheck",
+        "stage_id": "route_binding",
+        "evidence_kind": "route_action_precheck",
+    }
+
+    def degraded_current_projection(_conn, *, project_id, backlog_id, **_kwargs):
+        return {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "projection_source": "backlog_contract_chain_current",
+            "degraded": True,
+            "degraded_flags": {"multi_active_chains": True},
+            "readiness_state": "contract_active",
+            "contract_chain_id": "cchain-degraded-current",
+            "root_contract_execution_id": "cex-degraded-root",
+            "current_contract_execution_id": "cex-degraded-current",
+            "active_child_contract_execution_id": "cex-degraded-current",
+            "current_contract_id": "mf_parallel",
+            "next_legal_action": dict(degraded_next_action),
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        degraded_current_projection,
+    )
+
+    result = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        route_token_ref="rtok-source-backed-degraded-current",
+        caller_graph_query_schema_trace_id="gqt-20260630-degradedcurrent",
+    )
+
+    assert result["contract_runtime"]["active"] is True
+    assert result["contract_chain_current"]["degraded"] is True
+    assert result["contract_chain_current"]["degraded_flags"] == {
+        "multi_active_chains": True
+    }
+    assert "authority_projection" not in result["contract_chain_current"]
+    assert "contract_runtime_authority_projection" not in result
+    assert result["next_legal_action"]["id"] == "graph_query_schema_trace"
+    assert result["next_legal_action"]["source"] == "contract_runtime"
+    assert result["next_legal_action"]["route_token_ref"] == (
+        "rtok-source-backed-degraded-current"
+    )
+    assert result["next_legal_action"].get("authority_decision_source") is None
+    assert result["next_legal_action"].get(
+        "legacy_route_action_precheck_advisory"
+    ) is None
+    assert result["contract_runtime_current_state"]["next_legal_action"]["id"] == (
+        "graph_query_schema_trace"
+    )
+    assert result["contract_runtime_current_state"].get(
+        "authority_decision_source"
+    ) is None
+
+
 def test_observer_root_route_context_uses_existing_source_backed_onboard_runtime_without_chain_trigger(conn):
     backlog_id = "AC-ROOT-ROUTE-SOURCE-BACKED-FACADE-ONLY"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -26629,6 +26703,17 @@ def test_onboard_route_guide_returns_contract_chain_current_projection(conn):
     assert response["runtime_resume"]["projection_hash"] == current["projection_hash"]
     assert response["agent_onboard_guidance"]["contract_chain_current"] == current
     assert response["runtime_resume"].get("source") != "task_timeline_compact_ledger"
+    assert current["source_of_authority"] == "contract_runtime"
+    assert current["authority_decision_source"] == "backlog_contract_chain_current"
+    authority = current["authority_projection"]
+    assert authority["source_of_authority"] == "contract_runtime"
+    assert authority["required_next_action_id"] == ""
+    legacy = current["legacy_route_action_precheck_advisory"]
+    assert legacy["advisory_only"] is True
+    assert legacy["required"] is False
+    assert legacy["authorization_blocker"] is False
+    assert legacy["ignored_as_next_legal_action"] is True
+    assert response["runtime_resume"]["legacy_route_action_precheck_advisory"] == legacy
 
 
 def test_contract_chain_current_endpoint_returns_onboard_service_projection(conn):
@@ -32899,12 +32984,53 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
     assert guide_next["contract_execution_id"] == result["contract_execution_id"]
     assert guide_next["route_token_ref"] == child_ref
     assert guide_next["route_token_ref_status"] == "current_contract_scope_verified"
+    assert guide_next["source_of_authority"] == "contract_runtime"
+    assert guide_next["authority_decision_source"] == "backlog_contract_chain_current"
+    assert guide_next["legacy_route_action_precheck_advisory"]["required"] is False
+    assert guide_next["legacy_route_action_precheck_advisory"][
+        "ignored_as_next_legal_action"
+    ] is True
     assert guide_ref["current_route_token_ref"] == child_ref
     assert guide_ref["target_contract_execution_id"] == result["contract_execution_id"]
     assert guide_ref["pass_to_next_runtime_writes_as"] == [
         "observer_route_token_ref",
         "route_token_ref",
     ]
+    current = guide["contract_chain_current"]
+    assert current["source_of_authority"] == "contract_runtime"
+    assert current["authority_projection"]["required_next_action_id"] == (
+        "observer_prefill_child_contracts"
+    )
+    assert current["legacy_route_action_precheck_advisory"]["advisory_only"] is True
+    assert current["legacy_route_action_precheck_advisory"][
+        "authorization_blocker"
+    ] is False
+
+    root = server._observer_root_route_context_state(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=result["contract_execution_id"],
+        work_mode=observer_session.WORK_MODE_EXECUTION_SUPERVISOR,
+        route_token_ref=child_ref,
+        caller_graph_query_schema_trace_id="gqt-20260630-currentchild",
+    )
+    root_next = root["next_legal_action"]
+    assert root_next["id"] == "observer_prefill_child_contracts"
+    assert root_next["source"] == "backlog_contract_chain_current"
+    assert root_next["source_of_authority"] == "contract_runtime"
+    assert root_next["authority_decision_source"] == "backlog_contract_chain_current"
+    assert root["contract_runtime_authority_projection"][
+        "required_next_action_id"
+    ] == "observer_prefill_child_contracts"
+    legacy = root["legacy_route_action_precheck_advisory"]
+    assert legacy["id"] == "route_action_precheck"
+    assert legacy["advisory_only"] is True
+    assert legacy["required"] is False
+    assert legacy["authorization_blocker"] is False
+    assert root["next_legal_action_deferred_by_contract_runtime_current"]["id"] != (
+        "route_action_precheck"
+    )
 
 
 def test_onboard_route_guide_marks_onboard_service_ref_enter_only_for_mf_parallel_current(
