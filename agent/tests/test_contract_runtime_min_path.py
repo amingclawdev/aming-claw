@@ -841,6 +841,181 @@ def test_mf_parallel_failed_qa_summary_resets_completion_path(tmp_path):
     assert guide["next_legal_action"]["owner_role"] == "mf_sub"
 
 
+def test_mf_parallel_failed_qa_retry_reuses_same_context_setup_lines(tmp_path):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel.v1",
+        stages=[
+            {
+                "stage_id": "worker_read",
+                "lines": [
+                    {
+                        "line_id": "worker_read_runtime_guide",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "read_receipt",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_startup",
+                "lines": [
+                    {
+                        "line_id": "worker_startup",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "mf_subagent_startup",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_context",
+                "lines": [
+                    {
+                        "line_id": "worker_graph_context",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "graph_trace",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_implementation",
+                "lines": [
+                    {
+                        "line_id": "worker_implementation",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "implementation",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_finish",
+                "lines": [
+                    {
+                        "line_id": "worker_finish_gate",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "mf_subagent_finish_gate",
+                    }
+                ],
+            },
+            {
+                "stage_id": "qa",
+                "lines": [
+                    {
+                        "line_id": "qa_independent_verification",
+                        "owner_role": "qa",
+                        "allowed_writer_roles": ["qa"],
+                        "evidence_kind": "independent_verification",
+                    }
+                ],
+            },
+            {
+                "stage_id": "observer_integration",
+                "lines": [
+                    {
+                        "line_id": "observer_close_ready",
+                        "owner_role": "observer",
+                        "allowed_writer_roles": ["observer"],
+                        "evidence_kind": "close_ready",
+                    }
+                ],
+            },
+        ],
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    record = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-FAILED-QA-RETRY-CONTEXT",
+        contract_execution_id="cex-mf-parallel-failed-qa-retry-context",
+        actor_role="observer",
+        route_token_ref="rtok-mf-parallel-failed-qa-retry-context",
+    )
+    context_id = "mfrctx-same-worker"
+    instance_id = f"runtime_context:{context_id}"
+
+    def line(stage, line_id, role, evidence, *, payload=None):
+        payload = dict(payload or {})
+        payload.setdefault("runtime_context_id", context_id)
+        return {
+            "stage_id": stage,
+            "line_id": line_id,
+            "actor_role": role,
+            "evidence_kind": evidence,
+            "line_instance_id": instance_id,
+            "runtime_context_id": context_id,
+            "payload": payload,
+        }
+
+    completed_lines = [
+        line(
+            "worker_read",
+            "worker_read_runtime_guide",
+            "mf_sub",
+            "read_receipt",
+            payload={"schema_version": "contract_context_read_receipt.v1"},
+        ),
+        line("worker_startup", "worker_startup", "mf_sub", "mf_subagent_startup"),
+        line("worker_context", "worker_graph_context", "mf_sub", "graph_trace"),
+        line("worker_implementation", "worker_implementation", "mf_sub", "implementation"),
+        line(
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+            payload={"summary": "Independent QA failed the worker commit."},
+        ),
+        line(
+            "worker_implementation",
+            "worker_implementation",
+            "mf_sub",
+            "implementation",
+            payload={
+                "schema_version": "mf_sub.worker_implementation.v1",
+                "summary": "Retry implementation fixed the QA blocker.",
+            },
+        ),
+        line(
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_sub",
+            "mf_subagent_finish_gate",
+            payload={"schema_version": "mf_sub.finish_gate.v1"},
+        ),
+        line(
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+            payload={
+                "schema_version": "qa_independent_verification.retry.v1",
+                "qa_result": "pass",
+                "pass": True,
+            },
+        ),
+        {
+            "stage_id": "observer_integration",
+            "line_id": "observer_close_ready",
+            "actor_role": "observer",
+            "evidence_kind": "close_ready",
+            "payload": {"schema_version": "observer_close_ready.retry.v1"},
+        },
+    ]
+
+    projected = runtime.projected_record(
+        record["contract_execution_id"],
+        actor_role="observer",
+        completed_lines=completed_lines,
+    )
+    assert projected["runtime_guide"]["next_legal_action"] is None
+
+
 def test_direct_fix_qa_evidence_preserves_owner_submitter_provenance(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")

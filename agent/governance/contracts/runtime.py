@@ -18,7 +18,11 @@ import sqlite3
 from typing import Any
 from uuid import uuid4
 
-from .execution_state import build_execution_state
+from .execution_state import (
+    _first_mapping_text,
+    _line_instance_id_from_mapping,
+    build_execution_state,
+)
 from .gate_kernel import ContractGateKernel
 from .guide_compiler import compile_runtime_guide
 from .hash import stable_sha256
@@ -1441,6 +1445,10 @@ def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
     last_failed_qa_index = _last_failed_qa_line_index(lines)
+    post_failed_retry_contexts = _post_failed_qa_retry_context_keys(
+        lines,
+        failed_qa_index=last_failed_qa_index,
+    )
     satisfying: list[Mapping[str, Any]] = []
     for index, line in enumerate(lines):
         if isinstance(line, Mapping) and not _line_shape_allows_contract_completion(
@@ -1448,7 +1456,10 @@ def _contract_completion_satisfying_lines(
         ):
             continue
         if last_failed_qa_index >= 0 and index <= last_failed_qa_index:
-            if not _line_survives_failed_qa_retry_reset(line):
+            if not _line_survives_failed_qa_retry_reset(
+                line,
+                post_failed_retry_contexts=post_failed_retry_contexts,
+            ):
                 continue
         if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
             line
@@ -1486,10 +1497,85 @@ _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
     }
 )
 
+_FAILED_QA_RETRY_SETUP_LINE_IDS = frozenset(
+    {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+    }
+)
 
-def _line_survives_failed_qa_retry_reset(line: Mapping[str, Any]) -> bool:
+_FAILED_QA_RETRY_PROOF_LINE_IDS = frozenset(
+    {
+        "worker_implementation",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }
+)
+
+
+def _post_failed_qa_retry_context_keys(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    failed_qa_index: int,
+) -> set[tuple[str, str]]:
+    if failed_qa_index < 0:
+        return set()
+    contexts: set[tuple[str, str]] = set()
+    for line in lines[failed_qa_index + 1 :]:
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() not in _FAILED_QA_RETRY_PROOF_LINE_IDS:
+            continue
+        if not _line_status_allows_contract_completion(line):
+            continue
+        contexts.update(_line_retry_context_keys(line))
+    return contexts
+
+
+def _line_retry_context_keys(line: Mapping[str, Any]) -> set[tuple[str, str]]:
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    keys: set[tuple[str, str]] = set()
+    line_instance_id = _line_instance_id_from_mapping(line)
+    if line_instance_id:
+        keys.add(("line_instance_id", line_instance_id))
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        value = _first_mapping_text(line, field) or _first_mapping_text(payload, field)
+        if not value:
+            continue
+        keys.add((field, value))
+        if field == "runtime_context_id":
+            keys.add(("line_instance_id", f"runtime_context:{value}"))
+        elif field == "task_id":
+            keys.add(("line_instance_id", f"task:{value}"))
+    lane_id = (
+        _first_mapping_text(line, "lane_id", "worker_slot_id", "worker_id")
+        or _first_mapping_text(payload, "lane_id", "worker_slot_id", "worker_id")
+    )
+    if lane_id:
+        keys.add(("lane_id", lane_id))
+        keys.add(("line_instance_id", f"lane:{lane_id}"))
+    return keys
+
+
+def _line_survives_failed_qa_retry_reset(
+    line: Mapping[str, Any],
+    *,
+    post_failed_retry_contexts: set[tuple[str, str]] | None = None,
+) -> bool:
     actor_role = str(line.get("actor_role") or "").strip().lower().replace("-", "_")
     line_id = str(line.get("line_id") or "").strip()
+    if (
+        line_id in _FAILED_QA_RETRY_SETUP_LINE_IDS
+        and post_failed_retry_contexts
+        and _line_retry_context_keys(line).intersection(post_failed_retry_contexts)
+    ):
+        return True
     if actor_role in {"mf_sub", "qa"}:
         return False
     if line_id in _FAILED_QA_RETRY_RESET_LINE_IDS:
