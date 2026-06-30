@@ -24110,6 +24110,200 @@ def test_backlog_close_contract_runtime_authority_keeps_legacy_gate_advisory(con
     ] is True
 
 
+def test_backlog_close_contract_runtime_authority_ignores_legacy_advisory_gaps(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-CONTRACT-RUNTIME-LEGACY-GAPS"
+    close_commit = "ad6275118745006c8324dfcbeecea62c39e91936"
+    worker_commit = "bd5d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    close_route_token_ref = "rtok-runtime-close-legacy-gaps"
+    fixture = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        route_label="mf-parallel-legacy-gaps",
+    )
+    parent_execution_id = fixture["parent_record"]["contract_execution_id"]
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[
+            f"contract_runtime:{parent_execution_id}",
+            f"contract_runtime:{fixture['successor']['contract_execution_id']}",
+        ],
+    )
+
+    def legacy_advisory_failure(_events, contract=None, *, conn=None, project_id=""):
+        return {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": False,
+            "can_close": False,
+            "status": "failed",
+            "applicable": True,
+            "missing_event_kinds": ["close_ready"],
+            "failed_gates": [
+                {
+                    "gate": "route_context_gate",
+                    "status": "failed",
+                    "missing_requirement_ids": ["route_identity_mismatch"],
+                },
+                {
+                    "gate": "close_commit_evidence_gate",
+                    "status": "failed",
+                    "missing_requirement_ids": [
+                        "matching_close_commit_timeline_evidence"
+                    ],
+                },
+            ],
+            "route_context_gate": {
+                "passed": False,
+                "status": "failed",
+                "missing_requirement_ids": ["route_identity_mismatch"],
+                "route_identity": fixture["route_identity"],
+            },
+            "close_commit_evidence_gate": {
+                "passed": False,
+                "status": "failed",
+                "missing_requirement_ids": [
+                    "matching_close_commit_timeline_evidence"
+                ],
+            },
+            "checks": {
+                "has_close_ready": False,
+                "close_commit_has_timeline_evidence": False,
+            },
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_mf_close_gate_verification",
+        legacy_advisory_failure,
+    )
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+
+
+def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-CONTRACT-RUNTIME-INCOMPLETE"
+    close_commit = "cd6275118745006c8324dfcbeecea62c39e91936"
+    parent_route_ref = "rtok-runtime-incomplete-parent"
+    close_route_token_ref = "rtok-runtime-incomplete-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": parent_route_ref,
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Human approved source-backed parallel repair.",
+                "backlog_id": backlog_id,
+                "task_id": "runtime-incomplete-parent",
+                "route_token_ref": parent_route_ref,
+                "worker_fence": {
+                    "fence_token": f"fence-{backlog_id.lower()}",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=successor["contract_execution_id"],
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[f"contract_runtime:{successor['contract_execution_id']}"],
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "route_token_ref": close_route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "mf_timeline_gate_failed"
+    details = exc.value.details
+    assert details["runtime_projection_authority_failed"] is True
+    projection = details["contract_runtime_close_authority_projection"]
+    assert projection["status"] == "incomplete"
+    assert projection["contract_execution_id"] == successor["contract_execution_id"]
+    assert projection["next_legal_action"]
+    assert details["failed_gates"] == [
+        {
+            "gate": "contract_runtime_close_authority_projection",
+            "status": "incomplete",
+            "missing_requirement_ids": [
+                projection["next_legal_action"]["id"]
+            ],
+            "contract_execution_id": successor["contract_execution_id"],
+        }
+    ]
+    assert details["legacy_diagnostics"]["advisory_only"] is True
+    assert details["legacy_diagnostics"]["authorization_blocker"] is False
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+
+
 def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projection_lacks_manifest(
     conn,
     monkeypatch,

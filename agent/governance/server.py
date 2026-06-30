@@ -47086,6 +47086,72 @@ def _contract_runtime_authoritative_close_with_legacy_diagnostics(
     return verification
 
 
+def _contract_runtime_close_authority_failure_details(
+    verification: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(runtime_projection, Mapping) or not runtime_projection:
+        return {}
+
+    contract_execution_id = str(runtime_projection.get("contract_execution_id") or "")
+    projection_summary = {
+        key: value
+        for key, value in runtime_projection.items()
+        if key != "projected_events"
+    }
+    status = str(runtime_projection.get("status") or "failed")
+    missing_ids: list[str] = []
+    next_action = (
+        runtime_projection.get("next_legal_action")
+        if isinstance(runtime_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    for key in ("id", "line_id", "action"):
+        value = str(next_action.get(key) or "").strip()
+        if value:
+            missing_ids.append(value)
+            break
+    if status == "missing_route_identity":
+        missing_ids.append("contract_runtime_route_identity")
+    elif status == "missing_completed_lines":
+        missing_ids.append("contract_runtime_completed_lines")
+
+    for gate_key in (
+        "direct_fix_close_authority_gate",
+        "mf_parallel_close_authority_gate",
+    ):
+        gate = (
+            runtime_projection.get(gate_key)
+            if isinstance(runtime_projection.get(gate_key), Mapping)
+            else {}
+        )
+        if gate and not bool(gate.get("passed")):
+            missing_ids.extend(
+                str(item) for item in gate.get("missing_requirement_ids") or []
+            )
+
+    missing_ids = [item for item in dict.fromkeys(missing_ids) if item]
+    failed_gates = [
+        {
+            "gate": "contract_runtime_close_authority_projection",
+            "status": status,
+            "missing_requirement_ids": missing_ids,
+            "contract_execution_id": contract_execution_id,
+        }
+    ]
+    return {
+        "timeline_gate": dict(verification or {}),
+        "failed_gates": failed_gates,
+        "runtime_projection_authority_failed": True,
+        "contract_runtime_close_authority_projection": projection_summary,
+        "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
+        "legacy_diagnostics": _contract_runtime_legacy_close_diagnostics(
+            verification,
+            contract_execution_id=contract_execution_id,
+        ),
+    }
+
+
 def _contract_runtime_close_authority_seed_events(
     *,
     record: Mapping[str, Any],
@@ -52844,6 +52910,8 @@ def _timeline_gate_contract_runtime_projection_body(
         return body
     execution_id = str(current.get("current_contract_execution_id") or "").strip()
     if not execution_id.startswith("cex-"):
+        execution_id = str(current.get("active_child_contract_execution_id") or "").strip()
+    if not execution_id.startswith("cex-"):
         active_chain = (
             current.get("active_chain")
             if isinstance(current.get("active_chain"), Mapping)
@@ -52857,8 +52925,6 @@ def _timeline_gate_contract_runtime_projection_body(
     if not execution_id.startswith("cex-"):
         return body
     next_action = current.get("next_legal_action")
-    if str(current.get("readiness_state") or "").strip() != "contract_complete" and next_action:
-        return body
     body["contract_execution_id"] = execution_id
     body["contract_runtime"] = {
         **(
@@ -52890,6 +52956,9 @@ def _timeline_gate_contract_runtime_projection_body(
             "backlog_close",
         ],
     }
+    if str(current.get("readiness_state") or "").strip() != "contract_complete" and next_action:
+        body["contract_runtime"]["close_blocked_by_next_legal_action"] = True
+        body["contract_chain_current"]["close_blocked_by_next_legal_action"] = True
     return body
 
 
@@ -57081,6 +57150,33 @@ def _verify_mf_close_timeline_gate(
                 if key != "projected_events"
             }
     if not verification.get("passed"):
+        runtime_authority_failed = (
+            isinstance(runtime_projection, Mapping)
+            and bool(runtime_projection)
+            and (
+                not bool(runtime_projection.get("accepted"))
+                or bool(verification.get("runtime_projection_authority_failed"))
+            )
+        )
+        if runtime_authority_failed:
+            runtime_failure_details = _contract_runtime_close_authority_failure_details(
+                verification,
+                runtime_projection,
+            )
+            missing_runtime = runtime_failure_details.get(
+                "missing_contract_runtime_close_authority_requirement_ids"
+            ) or []
+            status = str(runtime_projection.get("status") or "failed")
+            missing_text = ", ".join(missing_runtime) if missing_runtime else status
+            raise GovernanceError(
+                "mf_timeline_gate_failed",
+                (
+                    "ContractRuntime close authority blocked backlog_close; "
+                    f"missing: {missing_text}"
+                ),
+                422,
+                runtime_failure_details,
+            )
         missing_event_kinds = verification.get("missing_event_kinds") or []
         contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
         missing_contract = contract_gate.get("missing_requirement_ids") or []
