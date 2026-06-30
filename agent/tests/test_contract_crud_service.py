@@ -1365,6 +1365,47 @@ def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
     )
 
 
+def test_direct_fix_repair_diagnostic_blocked_status_still_advances_to_qa():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    child_id = "cex-direct-fix-repair-diagnostic-blocked-status-test"
+    _start_direct_fix_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-FIX-DIAGNOSTIC-BLOCKED-STATUS-20260630",
+        contract_execution_id=child_id,
+        route_token_ref="rtok-test",
+    )
+
+    for _stage in range(3):
+        accepted = _submit_next_runtime_line(
+            runtime,
+            child_id,
+            actor_role="observer",
+        )
+        assert accepted["ok"] is True
+
+    repair = _submit_next_runtime_line(
+        runtime,
+        child_id,
+        actor_role="mf_sub",
+        payload={
+            "schema_version": "direct_fix_repair_evidence.worker_audit.v1",
+            "graph_evidence": {
+                "graph_query": {
+                    "status": "blocked",
+                    "reason": "runtime_context_sequence_incomplete",
+                }
+            },
+        },
+    )
+
+    assert repair["ok"] is True
+    next_action = repair["record"]["runtime_guide"]["next_legal_action"]
+    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["owner_role"] == "qa"
+
+
 def test_direct_fix_close_authority_gate_rejects_failed_qa_provenance():
     projection = {
         "projection_source": "backlog_contract_chain_current",

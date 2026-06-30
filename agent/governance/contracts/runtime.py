@@ -1509,7 +1509,34 @@ def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
 
 
 def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
-    return not _contains_contract_completion_blocker(line)
+    if _mapping_own_fields_contain_contract_completion_blocker(line):
+        return False
+    for field in ("qa_evidence_provenance", "verification"):
+        if _contains_contract_completion_blocker(line.get(field)):
+            return False
+    if str(line.get("line_id") or "").strip() == "qa_independent_verification":
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        if _contains_contract_completion_blocker(payload):
+            return False
+    return True
+
+
+def _mapping_own_fields_contain_contract_completion_blocker(
+    value: Mapping[str, Any],
+) -> bool:
+    for raw_key, item in value.items():
+        key = str(raw_key or "").strip().lower()
+        if (
+            key in _CONTRACT_COMPLETION_STATUS_FIELDS
+            and str(item or "").strip().lower()
+            in _CONTRACT_COMPLETION_BLOCKING_STATUSES
+        ):
+            return True
+        if key in _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS and _truthy_failure_count(
+            item
+        ):
+            return True
+    return False
 
 
 def _contains_contract_completion_blocker(value: Any) -> bool:
