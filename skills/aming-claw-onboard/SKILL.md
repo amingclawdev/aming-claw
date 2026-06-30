@@ -30,10 +30,14 @@ instructions.
    `interface_index`, `capability_index`, `system_operation_index`,
    `backlog_chain_binding`, `graph_first_policy`, source-hint status paths,
    and archive/resource paths.
-7. Before source search fallback, use the returned `graph_first_policy` to pick
-   the correct `graph_query` `query_purpose`, preserve graph trace ids in the
-   contract/timeline payload, and only then use source search when the graph has
-   no match or the source-hint status says docs/config/tests are not materialized.
+7. Before source-only fallback, use source search, IDE symbols, language tooling,
+   or project-native navigation to discover exact source symbol names. Then use
+   the returned `graph_first_policy` to call `graph_query` with the correct
+   `query_purpose`, starting with `function_index` and exact symbols, followed
+   by callers/callees for matched symbols. Preserve graph trace ids in the
+   contract/timeline payload. Use source-only evidence only when the graph misses,
+   is unavailable, or source-hint status says docs/config/tests are not
+   materialized.
 
 ## Guardrails
 

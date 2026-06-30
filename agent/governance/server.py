@@ -38419,11 +38419,28 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
     return {
         "schema_version": "onboard_route_guide.graph_first_policy.v1",
         "default_sequence": [
-            "call_graph_query_with_query_purpose",
+            "discover_exact_source_symbol_names",
+            "call_graph_query_function_index_with_exact_symbols",
+            "call_graph_query_callers_callees_for_matched_symbols",
             "preserve_graph_query_trace_ids_in_evidence",
             "fallback_to_source_search_only_when_graph_has_no_match_or_is_unavailable",
             "record_source_search_fallback_in_timeline_or_contract_payload",
         ],
+        "source_symbol_discovery": {
+            "required_before_graph_symbol_queries": True,
+            "tool_agnostic": True,
+            "allowed_methods": [
+                "source_search",
+                "ide_symbol_search",
+                "language_server_or_static_index",
+                "project_native_code_navigation",
+            ],
+            "instruction": (
+                "Use any available source/IDE/language tooling to find exact "
+                "symbol names first; do not rely on a single hard-coded source "
+                "search command. Then query the graph with those exact symbols."
+            ),
+        },
         "intent_query_purpose_map": {
             "observer_implementation_context": "global_architecture_review",
             "worker_context": "subagent_context_build",
@@ -38437,8 +38454,27 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
         "graph_query_tools": [
             "query_schema",
             "function_index",
+            "function_callers",
+            "function_callees",
             "search_structure",
             "get_file_excerpt",
+        ],
+        "exact_symbol_graph_sequence": [
+            {
+                "tool": "function_index",
+                "args": {"query": "<exact_symbol_name>"},
+                "purpose": "resolve graph node/function identity",
+            },
+            {
+                "tool": "function_callers",
+                "args": {"query": "<exact_symbol_name>"},
+                "purpose": "inspect inbound impact for exact symbol",
+            },
+            {
+                "tool": "function_callees",
+                "args": {"query": "<exact_symbol_name>"},
+                "purpose": "inspect outbound dependencies for exact symbol",
+            },
         ],
         "trace_evidence": {
             "preserve_fields": [
@@ -38467,6 +38503,12 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
                 "If graph_query misses source-controlled docs/config/tests, inspect "
                 "source_hints status, add or update a governance hint, then update "
                 "the graph before relying on the source fact as graph-backed."
+            ),
+            "source_only_fallback": (
+                "Use source-only evidence only when graph_query misses, graph is "
+                "unavailable, or source-hint status shows the docs/config/tests are "
+                "not materialized; include the graph trace id or unavailability "
+                "reason with the fallback evidence."
             ),
         },
     }
@@ -39458,11 +39500,19 @@ def _onboard_contract_agent_guidance(
     record: Mapping[str, Any],
     *,
     next_legal_action: Mapping[str, Any],
+    selected_role: str = "",
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
+    requested_role = str(
+        selected_role or next_legal_action.get("role") or "observer"
+    ).strip()
+    if requested_role in {"mf_sub", "sub_worker"}:
+        requested_role = "worker"
+    if requested_role not in {"observer", "worker", "qa"}:
+        requested_role = "observer"
     allowed_actions = _observer_route_context_issue_allowed_actions(
         list(_ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS)
     )
@@ -39489,11 +39539,160 @@ def _onboard_contract_agent_guidance(
         "backlog_id": backlog_id,
         "task_id": contract_execution_id,
     }
-    return {
-        "schema_version": "onboard_contract.agent_onboard_guidance.v1",
-        "role": "observer",
-        "actor_role": "observer",
-        "required_identity": {
+    route_guide = _onboard_contract_route_guide(
+        record,
+        next_legal_action=next_legal_action,
+    )
+    role_entries = (
+        route_guide.get("role_entries")
+        if isinstance(route_guide.get("role_entries"), Mapping)
+        else {}
+    )
+    selected_role_guidance = (
+        dict(role_entries.get(requested_role))
+        if isinstance(role_entries.get(requested_role), Mapping)
+        else {}
+    )
+    route_guide["selected_role"] = requested_role
+    route_guide["selected_actor_role"] = requested_role
+    route_guide["selected_role_guidance"] = selected_role_guidance
+    if requested_role == "worker":
+        required_identity = {
+            "schema_version": "onboard_contract.required_identity.v1",
+            "required_fields": [
+                "runtime_context_id",
+                "parent_task_id",
+                "task_id",
+                "fence_token",
+                "target_project_root",
+                "session_token_ref",
+            ],
+            "runtime_context_id": {
+                "required": True,
+                "source": "runtime_context_worker_guide/current-state",
+            },
+            "parent_task_id": {
+                "required": True,
+                "source": "runtime_context_worker_guide/current-state",
+            },
+            "task_id": {
+                "required": True,
+                "source": "runtime_context_worker_guide/current-state",
+            },
+            "fence_token": {
+                "required": True,
+                "source": "runtime_context_worker_guide/current-state",
+            },
+            "target_project_root": {
+                "required": True,
+                "source": "runtime_context_worker_guide/current-state",
+            },
+            "session_token_ref": {
+                "required": True,
+                "source": "worker allocation envelope",
+            },
+            "route_token_ref": {
+                "required": False,
+                "source": "copy-safe route identity when provided",
+            },
+            "raw_session_token_required": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+        route_token_issue = {
+            "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+            "status": "runtime_context_worker_guide_required",
+            "mcp_entrypoint": {"tool": "runtime_context_worker_guide"},
+            "scope": scope,
+            "required_identity": list(required_identity["required_fields"]),
+            "raw_session_token_required": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+        route_token_ref_guidance = {
+            "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+            "current_route_token_ref": route_token_ref,
+            "current_ref_present": bool(route_token_ref),
+            "pass_to_next_runtime_writes_as": ["route_token_ref"],
+            "required_token_refs": ["session_token_ref", "route_token_ref"],
+            "raw_session_token_required": False,
+            "raw_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+    elif requested_role == "qa":
+        required_identity = {
+            "schema_version": "onboard_contract.required_identity.v1",
+            "required_fields": [
+                "project_id",
+                "parent_task_id",
+                "task_id or contract_execution_id",
+                "qa_session_token_ref or route_token_ref",
+            ],
+            "project_id": {
+                "required": True,
+                "source": "qa session registration scope",
+            },
+            "parent_task_id": {
+                "required": True,
+                "source": "parent runtime or verification handoff",
+            },
+            "task_id": {
+                "required": True,
+                "alias": "contract_execution_id",
+                "source": "qa target runtime",
+            },
+            "qa_session_token_ref": {
+                "required": False,
+                "source": "qa_session_register when available",
+            },
+            "route_token_ref": {
+                "required": False,
+                "source": "copy-safe route identity when provided",
+            },
+            "raw_qa_session_token_required": False,
+            "raw_qa_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+        route_token_issue = {
+            "schema_version": "onboard_contract.route_token_issue_guidance.v1",
+            "status": (
+                "current_ref_present"
+                if route_token_ref
+                else "qa_session_register_or_route_ref_required"
+            ),
+            "mcp_entrypoint": {"tool": "qa_session_register"},
+            "scope": scope,
+            "required_identity": list(required_identity["required_fields"]),
+            "raw_qa_session_token_required": False,
+            "raw_qa_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+        route_token_ref_guidance = {
+            "schema_version": "onboard_contract.route_token_ref_guidance.v1",
+            "current_route_token_ref": route_token_ref,
+            "current_ref_present": bool(route_token_ref),
+            "pass_to_next_runtime_writes_as": [
+                "qa_session_token_ref",
+                "qa_child_route_token_ref",
+                "route_token_ref",
+            ],
+            "required_token_refs": [
+                "qa_session_token_ref",
+                "qa_child_route_token_ref",
+                "route_token_ref",
+            ],
+            "raw_qa_session_token_required": False,
+            "raw_qa_session_token_exposed": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+    else:
+        required_identity = {
             "schema_version": "onboard_contract.required_identity.v1",
             "required_fields": [
                 "observer_session_id",
@@ -39514,8 +39713,8 @@ def _onboard_contract_agent_guidance(
             },
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
-        },
-        "route_token_ref_guidance": {
+        }
+        route_token_ref_guidance = {
             "schema_version": "onboard_contract.route_token_ref_guidance.v1",
             "current_route_token_ref": route_token_ref,
             "current_ref_present": bool(route_token_ref),
@@ -39525,8 +39724,8 @@ def _onboard_contract_agent_guidance(
             ],
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
-        },
-        "route_token_issue": {
+        }
+        route_token_issue = {
             "schema_version": "onboard_contract.route_token_issue_guidance.v1",
             "status": "current_ref_present" if route_token_ref else "issue_required",
             "mcp_entrypoint": {
@@ -39542,7 +39741,15 @@ def _onboard_contract_agent_guidance(
             "allowed_actions": allowed_actions,
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
-        },
+        }
+    return {
+        "schema_version": "onboard_contract.agent_onboard_guidance.v1",
+        "role": requested_role,
+        "actor_role": requested_role,
+        "required_identity": required_identity,
+        "selected_role_guidance": selected_role_guidance,
+        "route_token_ref_guidance": route_token_ref_guidance,
+        "route_token_issue": route_token_issue,
         "next_legal_action": dict(next_legal_action),
         "contract_chain": {
             "schema_version": "onboard_contract.contract_chain_guidance.v1",
@@ -39558,10 +39765,7 @@ def _onboard_contract_agent_guidance(
             ),
             "contract_chain_id": str(record.get("contract_chain_id") or ""),
         },
-        "onboard_route_guide": _onboard_contract_route_guide(
-            record,
-            next_legal_action=next_legal_action,
-        ),
+        "onboard_route_guide": route_guide,
         "entrypoints": {
             "onboard_route_guide": {
                 "method": "POST",
@@ -40353,6 +40557,7 @@ def _onboard_route_guide_service_response(
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
+        selected_role=str(role or "").strip() or "observer",
     )
     if current_projection:
         guidance["contract_chain_current"] = current_projection

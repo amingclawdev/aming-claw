@@ -25714,12 +25714,29 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
         "/api/projects/{project_id}/mf-batch-parallel/enter"
     )
     graph_first = guide["graph_first_policy"]
+    assert graph_first["source_symbol_discovery"]["tool_agnostic"] is True
+    assert graph_first["default_sequence"][:3] == [
+        "discover_exact_source_symbol_names",
+        "call_graph_query_function_index_with_exact_symbols",
+        "call_graph_query_callers_callees_for_matched_symbols",
+    ]
     assert graph_first["intent_query_purpose_map"]["worker_context"] == (
         "subagent_context_build"
     )
     assert graph_first["intent_query_purpose_map"]["qa_independent_verification"] == (
         "independent_verification"
     )
+    assert {"function_index", "function_callers", "function_callees"}.issubset(
+        set(graph_first["graph_query_tools"])
+    )
+    assert [step["tool"] for step in graph_first["exact_symbol_graph_sequence"]] == [
+        "function_index",
+        "function_callers",
+        "function_callees",
+    ]
+    assert "source-only evidence only when graph_query misses" in graph_first[
+        "source_hint_policy"
+    ]["source_only_fallback"]
     assert "source_hints" in guide["capability_index"]["query_returns"]
     assert guide["capability_index"]["index_paths"]["graph_first_policy"] == (
         "agent_onboard_guidance.onboard_route_guide.graph_first_policy"
@@ -25748,6 +25765,77 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert result["agent_onboard_guidance"]["entrypoints"]["onboard_start"][
         "entrypoint"
     ] == "onboard_route_guide"
+
+
+def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_roles(conn):
+    worker_backlog_id = "AC-ONBOARD-SELECTED-WORKER-GUIDANCE"
+    qa_backlog_id = "AC-ONBOARD-SELECTED-QA-GUIDANCE"
+    _insert_simple_mf_close_backlog(conn, worker_backlog_id)
+    _insert_simple_mf_close_backlog(conn, qa_backlog_id)
+
+    worker = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": worker_backlog_id,
+                "role": "worker",
+                "work_type": "parallel_worker",
+                "route_token_ref": "rtok-onboard-worker",
+            },
+        )
+    )
+    worker_guidance = worker["agent_onboard_guidance"]
+    assert worker["selected_role"] == "worker"
+    assert worker_guidance["role"] == "worker"
+    assert worker_guidance["actor_role"] == "worker"
+    assert worker_guidance["required_identity"]["required_fields"] == [
+        "runtime_context_id",
+        "parent_task_id",
+        "task_id",
+        "fence_token",
+        "target_project_root",
+        "session_token_ref",
+    ]
+    assert worker_guidance["selected_role_guidance"]["role"] == "worker"
+    assert worker_guidance["onboard_route_guide"]["selected_role"] == "worker"
+    assert worker_guidance["onboard_route_guide"]["selected_role_guidance"][
+        "entrypoint"
+    ] == "runtime_context_worker_guide"
+    assert worker_guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
+        "runtime_context_worker_guide"
+    )
+
+    qa = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": qa_backlog_id,
+                "role": "qa",
+                "work_type": "qa_verification",
+                "route_token_ref": "rtok-onboard-qa",
+            },
+        )
+    )
+    qa_guidance = qa["agent_onboard_guidance"]
+    assert qa["selected_role"] == "qa"
+    assert qa_guidance["role"] == "qa"
+    assert qa_guidance["actor_role"] == "qa"
+    assert qa_guidance["required_identity"]["required_fields"] == [
+        "project_id",
+        "parent_task_id",
+        "task_id or contract_execution_id",
+        "qa_session_token_ref or route_token_ref",
+    ]
+    assert qa_guidance["selected_role_guidance"]["role"] == "qa"
+    assert qa_guidance["onboard_route_guide"]["selected_role"] == "qa"
+    assert qa_guidance["onboard_route_guide"]["selected_role_guidance"][
+        "entrypoint"
+    ] == "qa_session_register"
+    assert qa_guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
+        "qa_session_register"
+    )
 
 
 def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(conn):

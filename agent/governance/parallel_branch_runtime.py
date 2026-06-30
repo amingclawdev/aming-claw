@@ -1124,6 +1124,7 @@ def plan_mf_batch_parallel_preflight(
                 overlap_by_row[right["backlog_id"]].add(left["backlog_id"])
 
     dispatch_groups: list[dict[str, Any]] = []
+    row_order = {row["backlog_id"]: index for index, row in enumerate(ordered_rows)}
     if normalized_mode == "strict_ordered":
         for index, row in enumerate(ordered_rows):
             dispatch_groups.append(
@@ -1134,22 +1135,39 @@ def plan_mf_batch_parallel_preflight(
                 }
             )
     else:
+        visited: set[str] = set()
         for row in ordered_rows:
-            placed = False
-            for group in dispatch_groups:
-                group_ids = set(group["backlog_ids"])
-                if not overlap_by_row[row["backlog_id"]] & group_ids:
-                    group["backlog_ids"].append(row["backlog_id"])
-                    placed = True
-                    break
-            if not placed:
-                dispatch_groups.append(
-                    {
-                        "group_index": len(dispatch_groups) + 1,
-                        "backlog_ids": [row["backlog_id"]],
-                        "reason": "no_overlap_with_group",
-                    }
-                )
+            row_id = row["backlog_id"]
+            if row_id in visited:
+                continue
+            component: list[str] = []
+            stack = [row_id]
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                component.append(current)
+                for neighbor in sorted(
+                    overlap_by_row.get(current, set()),
+                    key=lambda value: row_order.get(value, len(row_order)),
+                    reverse=True,
+                ):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+            component.sort(key=lambda value: row_order.get(value, len(row_order)))
+            dispatch_groups.append(
+                {
+                    "group_index": len(dispatch_groups) + 1,
+                    "backlog_ids": component,
+                    "reason": (
+                        "connected_overlap_component"
+                        if len(component) > 1
+                        else "no_overlap"
+                    ),
+                    "overlap_component": len(component) > 1,
+                }
+            )
 
     planned_items: list[dict[str, Any]] = []
     previous_task_id = ""
