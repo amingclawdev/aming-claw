@@ -1273,13 +1273,15 @@ def test_close_gate_treats_legacy_mf_timeline_missing_as_advisory_under_contract
     assert evidence["mf_timeline_precheck_compatible"] is True
     assert evidence["mf_timeline_precheck_blocking"] is False
     assert evidence["legacy_mf_timeline_precheck_advisory"] is True
+    assert evidence["contract_runtime_close_authority_required"] is True
+    assert evidence["contract_runtime_close_authority_present"] is True
     assert evidence["legacy_mf_timeline_missing_event_kinds"] == ["close_ready"]
     accounting = evidence["close_timeline_accounting"]
     assert accounting["advisory_only"] is True
     assert accounting["legacy_mf_timeline_missing_event_kinds"] == ["close_ready"]
 
 
-def test_close_gate_does_not_treat_bare_contract_execution_as_close_authority(
+def test_close_gate_reports_missing_contract_runtime_close_authority_for_bare_runtime(
     tmp_path: Path,
 ) -> None:
     contract = load_workflow_contract()
@@ -1308,13 +1310,16 @@ def test_close_gate_does_not_treat_bare_contract_execution_as_close_authority(
 
     evidence = result["evidence"]
     assert result["decision"] == "block"
-    assert "missing_close_ready_timeline" in evidence["errors"]
-    assert "mf_timeline_precheck_incomplete" in evidence["errors"]
-    assert evidence["legacy_mf_timeline_precheck_advisory"] is False
-    assert evidence["mf_timeline_precheck_blocking"] is True
+    assert "missing_contract_runtime_close_authority" in evidence["errors"]
+    assert "missing_close_ready_timeline" not in evidence["errors"]
+    assert "mf_timeline_precheck_incomplete" not in evidence["errors"]
+    assert evidence["legacy_mf_timeline_precheck_advisory"] is True
+    assert evidence["contract_runtime_close_authority_required"] is True
+    assert evidence["contract_runtime_close_authority_present"] is False
+    assert evidence["mf_timeline_precheck_blocking"] is False
 
 
-def test_close_gate_does_not_suppress_for_blocked_contract_chain_current(
+def test_close_gate_preserves_incomplete_contract_chain_current_blocker(
     tmp_path: Path,
 ) -> None:
     contract = load_workflow_contract()
@@ -1344,10 +1349,13 @@ def test_close_gate_does_not_suppress_for_blocked_contract_chain_current(
 
     evidence = result["evidence"]
     assert result["decision"] == "block"
-    assert "missing_close_ready_timeline" in evidence["errors"]
-    assert "mf_timeline_precheck_incomplete" in evidence["errors"]
-    assert evidence["legacy_mf_timeline_precheck_advisory"] is False
-    assert evidence["mf_timeline_precheck_blocking"] is True
+    assert "contract_runtime_close_authority_incomplete" in evidence["errors"]
+    assert "missing_close_ready_timeline" not in evidence["errors"]
+    assert "mf_timeline_precheck_incomplete" not in evidence["errors"]
+    assert evidence["legacy_mf_timeline_precheck_advisory"] is True
+    assert evidence["contract_runtime_close_authority_required"] is True
+    assert evidence["contract_runtime_close_authority_present"] is False
+    assert evidence["mf_timeline_precheck_blocking"] is False
 
 
 def test_close_gate_preserves_contract_runtime_projection_blocker(

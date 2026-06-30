@@ -31956,7 +31956,12 @@ def _record_backlog_close_blocked_event(
     commit_sha: str = "",
 ) -> dict[str, Any]:
     if (
-        gate_error.code != "mf_timeline_gate_failed"
+        gate_error.code
+        not in {
+            "mf_timeline_gate_failed",
+            "missing_contract_runtime_close_authority",
+            "contract_runtime_close_authority_incomplete",
+        }
         or not _backlog_close_route_gate_is_source_backed(route_gate)
     ):
         return {}
@@ -31979,6 +31984,8 @@ def _record_backlog_close_blocked_event(
         "missing_route_context_requirement_ids",
         "missing_lane_ownership_ids",
         "missing_close_commit_requirement_ids",
+        "missing_contract_runtime_close_authority_requirement_ids",
+        "missing_contract_runtime_mf_parallel_authority_requirement_ids",
     ):
         values = details.get(key)
         if isinstance(values, list):
@@ -45185,6 +45192,66 @@ def _contract_runtime_close_execution_id(body: Mapping[str, Any]) -> str:
     return ""
 
 
+def _contract_runtime_close_requested_execution_ref(body: Mapping[str, Any]) -> str:
+    execution_fields = (
+        *_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS,
+        "current_contract_execution_id",
+        "root_contract_execution_id",
+        "parent_contract_execution_id",
+    )
+    for container in _contract_runtime_close_mapping_containers(body):
+        for key in execution_fields:
+            token = str(container.get(key) or "").strip()
+            if token:
+                return token
+    return ""
+
+
+def _contract_runtime_close_authority_required_signal(
+    body: Mapping[str, Any],
+    runtime_projection: Mapping[str, Any] | None = None,
+) -> bool:
+    if isinstance(runtime_projection, Mapping) and runtime_projection:
+        return True
+    if _contract_runtime_close_requested_execution_ref(body):
+        return True
+    for container in _contract_runtime_close_mapping_containers(body):
+        for key in (
+            "contract_runtime_close_authority_required",
+            "requires_contract_runtime_close_authority",
+            "contract_runtime_required",
+            "contract_runtime_governed",
+        ):
+            value = container.get(key)
+            if value is True or str(value or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "required",
+                "contract_runtime",
+            }:
+                return True
+        authority_source = str(
+            container.get("source_of_authority")
+            or container.get("authority_decision_source")
+            or ""
+        ).strip()
+        if authority_source in {
+            "contract_runtime",
+            "backlog_contract_chain_current",
+        }:
+            return True
+        for key in (
+            "contract_runtime_close_authority",
+            "contract_runtime_close_authority_projection",
+            "contract_chain_current_authority",
+        ):
+            value = container.get(key)
+            if isinstance(value, Mapping) and value:
+                return True
+    return False
+
+
 def _contract_runtime_close_event_kind_supported(event_kind: str) -> bool:
     return (
         _contract_runtime_close_normalized(event_kind)
@@ -47139,16 +47206,59 @@ def _contract_runtime_close_authority_failure_details(
             "contract_execution_id": contract_execution_id,
         }
     ]
+    legacy_diagnostics = _contract_runtime_legacy_close_diagnostics(
+        verification,
+        contract_execution_id=contract_execution_id,
+    )
     return {
-        "timeline_gate": dict(verification or {}),
+        "timeline_gate": legacy_diagnostics,
         "failed_gates": failed_gates,
         "runtime_projection_authority_failed": True,
         "contract_runtime_close_authority_projection": projection_summary,
         "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
-        "legacy_diagnostics": _contract_runtime_legacy_close_diagnostics(
-            verification,
-            contract_execution_id=contract_execution_id,
+        "legacy_diagnostics": legacy_diagnostics,
+    }
+
+
+def _missing_contract_runtime_close_authority_details(
+    verification: Mapping[str, Any],
+    *,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
+    missing_ids = ["contract_runtime_close_authority"]
+    projection = {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": False,
+        "status": "missing",
+        "contract_execution_id": requested_execution_id,
+        "requested_contract_execution_id": requested_execution_id,
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=requested_execution_id,
         ),
+        "legacy_advisory": True,
+        "authoritative": False,
+        "missing_requirement_ids": missing_ids,
+    }
+    legacy_diagnostics = _contract_runtime_legacy_close_diagnostics(
+        verification,
+        contract_execution_id=requested_execution_id,
+    )
+    return {
+        "timeline_gate": legacy_diagnostics,
+        "failed_gates": [
+            {
+                "gate": "contract_runtime_close_authority_projection",
+                "status": "missing",
+                "missing_requirement_ids": missing_ids,
+                "contract_execution_id": requested_execution_id,
+            }
+        ],
+        "runtime_projection_authority_failed": True,
+        "contract_runtime_close_authority_projection": projection,
+        "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
+        "legacy_diagnostics": legacy_diagnostics,
     }
 
 
@@ -57119,6 +57229,10 @@ def _verify_mf_close_timeline_gate(
         route_gate=route_gate,
         close_commit=_audit_recovery_close_commit(row, gate_body),
     )
+    contract_runtime_required = _contract_runtime_close_authority_required_signal(
+        gate_body,
+        runtime_projection,
+    )
     if runtime_projection.get("accepted"):
         legacy_verification = _mf_close_gate_verification(
             events,
@@ -57149,9 +57263,43 @@ def _verify_mf_close_timeline_gate(
                 for key, value in runtime_projection.items()
                 if key != "projected_events"
             }
+        if contract_runtime_required:
+            if runtime_projection:
+                runtime_failure_details = _contract_runtime_close_authority_failure_details(
+                    verification,
+                    runtime_projection,
+                )
+                missing_runtime = runtime_failure_details.get(
+                    "missing_contract_runtime_close_authority_requirement_ids"
+                ) or []
+                status = str(runtime_projection.get("status") or "failed")
+                missing_text = ", ".join(missing_runtime) if missing_runtime else status
+                raise GovernanceError(
+                    "contract_runtime_close_authority_incomplete",
+                    (
+                        "ContractRuntime close authority blocked backlog_close; "
+                        f"missing: {missing_text}"
+                    ),
+                    422,
+                    runtime_failure_details,
+                )
+            runtime_failure_details = _missing_contract_runtime_close_authority_details(
+                verification,
+                body=gate_body,
+            )
+            raise GovernanceError(
+                "missing_contract_runtime_close_authority",
+                (
+                    "ContractRuntime close authority is required before backlog_close; "
+                    "missing: contract_runtime_close_authority"
+                ),
+                422,
+                runtime_failure_details,
+            )
     if not verification.get("passed"):
         runtime_authority_failed = (
-            isinstance(runtime_projection, Mapping)
+            contract_runtime_required
+            and isinstance(runtime_projection, Mapping)
             and bool(runtime_projection)
             and (
                 not bool(runtime_projection.get("accepted"))
@@ -57169,7 +57317,7 @@ def _verify_mf_close_timeline_gate(
             status = str(runtime_projection.get("status") or "failed")
             missing_text = ", ".join(missing_runtime) if missing_runtime else status
             raise GovernanceError(
-                "mf_timeline_gate_failed",
+                "contract_runtime_close_authority_incomplete",
                 (
                     "ContractRuntime close authority blocked backlog_close; "
                     f"missing: {missing_text}"

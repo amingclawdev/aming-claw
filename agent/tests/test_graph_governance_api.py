@@ -24279,7 +24279,7 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
             )
         )
 
-    assert exc.value.code == "mf_timeline_gate_failed"
+    assert exc.value.code == "contract_runtime_close_authority_incomplete"
     details = exc.value.details
     assert details["runtime_projection_authority_failed"] is True
     projection = details["contract_runtime_close_authority_projection"]
@@ -24298,6 +24298,86 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
     ]
     assert details["legacy_diagnostics"]["advisory_only"] is True
     assert details["legacy_diagnostics"]["authorization_blocker"] is False
+    row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
+    ).fetchone()
+    assert row["status"] == "MF_IN_PROGRESS"
+
+
+def test_backlog_close_contract_runtime_required_without_authority_uses_new_blocker(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-CONTRACT-RUNTIME-NO-AUTHORITY"
+    close_commit = "dd6275118745006c8324dfcbeecea62c39e91936"
+    close_route_token_ref = "rtok-runtime-missing-authority-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "worker",
+                "work_type": "parallel_worker",
+                "route_token_ref": "rtok-runtime-missing-authority-parent",
+            },
+        )
+    )
+    parent_execution_id = guide["contract_chain_current"][
+        "current_contract_execution_id"
+    ]
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[f"contract_runtime:{parent_execution_id}"],
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "contract_execution_id": parent_execution_id,
+                    "route_token_ref": close_route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "missing_contract_runtime_close_authority"
+    assert "MF backlog close requires task timeline evidence" not in exc.value.message
+    details = exc.value.details
+    projection = details["contract_runtime_close_authority_projection"]
+    assert projection["status"] == "missing"
+    assert projection["contract_execution_id"] == parent_execution_id
+    assert details["failed_gates"] == [
+        {
+            "gate": "contract_runtime_close_authority_projection",
+            "status": "missing",
+            "missing_requirement_ids": ["contract_runtime_close_authority"],
+            "contract_execution_id": parent_execution_id,
+        }
+    ]
+    legacy = details["legacy_diagnostics"]
+    assert legacy["advisory_only"] is True
+    assert legacy["authorization_blocker"] is False
+    assert legacy["legacy_advisory"] is True
+    assert legacy["authoritative"] is False
+    assert legacy["passed"] is False
     row = conn.execute(
         "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
     ).fetchone()
