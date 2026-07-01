@@ -16486,6 +16486,131 @@ def test_backlog_close_contract_runtime_completed_lines_project_to_close_gate():
     assert gate["checks"]["close_commit_has_timeline_evidence"] is True
 
 
+def test_onboard_service_runtime_context_child_lane_projection_bridges_batch_row():
+    from agent.governance import server
+
+    project_id = "aming-claw"
+    backlog_id = "AC-BATCH-CHILD-CLOSE"
+    child_task_id = "mf-batch-parallel-unit:row:2"
+    close_commit = "a11667cb3a0c11acc95930c121e73fd0b757e009"
+    route_identity = {
+        **ROUTE_IDENTITY,
+        "route_id": "route-batch-child",
+        "route_token_ref": "rtok-batch-child",
+        "visible_injection_manifest_hash": _fake_sha("visible-batch-child"),
+    }
+
+    def scoped(event, *, task_id=backlog_id, event_id=None):
+        event = copy.deepcopy(event)
+        event["project_id"] = project_id
+        event["backlog_id"] = backlog_id
+        event["task_id"] = task_id
+        if event_id is not None:
+            event["id"] = event_id
+        return event
+
+    route_context, route_action, dispatch, startup = _route_context_consumption_events(
+        identity=route_identity
+    )
+    child_common = {
+        **route_identity,
+        "parent_task_id": "mf-batch-parallel-unit",
+        "runtime_context_id": "mfrctx-batch-child",
+        "worker_slot_id": "codex-row2",
+        "worker_id": "codex-row2",
+        "fence_token_hash": _fake_sha("fence-batch-child"),
+        "fence_token_redacted": True,
+        "observer_command_id": "cex-direct-fix-parent",
+        "merge_queue_id": "mq-batch-child",
+        "merge_queue_item_id": "mqitem-batch-child-row2",
+    }
+    startup = scoped(startup, task_id=child_task_id, event_id=13)
+    startup["payload"]["mf_subagent_startup_gate"].update(child_common)
+    implementation = scoped(
+        {
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "passed",
+            "commit_sha": "13a639c7c8bd022ba4b4ab1ca5a81284836a5c5d",
+            "payload": {**child_common, "changed_files": ["agent/governance/server.py"]},
+        },
+        task_id=child_task_id,
+        event_id=14,
+    )
+    finish = scoped(
+        _route_context_worker_finish_gate_event(
+            identity=route_identity,
+            parent_task_id="mf-batch-parallel-unit",
+        ),
+        task_id=child_task_id,
+        event_id=15,
+    )
+    finish["payload"]["mf_subagent_finish_gate"].update(child_common)
+    qa = scoped(
+        {
+            "event_kind": "verification",
+            "phase": "independent_qa",
+            "status": "passed",
+            "actor": "qa",
+            "verification": {
+                **child_common,
+                "role": "qa",
+                "lane_id": "independent_verification_lane",
+                "test_results": {"status": "passed"},
+            },
+        },
+        task_id=child_task_id,
+        event_id=16,
+    )
+    close_ready = scoped(
+        {
+            "event_kind": "close_ready",
+            "phase": "close_gate",
+            "status": "passed",
+            "commit_sha": close_commit,
+            "payload": {
+                **route_identity,
+                "observer_command_id": "cex-direct-fix-parent",
+                "merge_commit": close_commit,
+                "merge_queue_id": "mq-batch-child",
+                "merge_queue_item_id": "mqitem-batch-child-row2",
+            },
+        },
+        task_id=backlog_id,
+        event_id=17,
+    )
+
+    projection = server._runtime_context_child_lane_close_authority_projection(
+        project_id=project_id,
+        bug_id=backlog_id,
+        requested_execution_id="onboard-service-unit",
+        close_commit=close_commit,
+        timeline_events=[
+            scoped(route_context, event_id=10),
+            scoped(route_action, event_id=11),
+            scoped(dispatch, task_id=child_task_id, event_id=12),
+            startup,
+            implementation,
+            finish,
+            qa,
+            close_ready,
+        ],
+    )
+
+    assert projection["accepted"] is True, projection
+    gate = projection["runtime_context_child_lane_close_authority_gate"]
+    assert gate["passed"] is True
+    assert gate["child_task_ids"] == [child_task_id]
+    assert gate["merge_queue_ids"] == ["mq-batch-child"]
+    bridge = projection["projected_events"][0]
+    assert bridge["event_kind"] == "cross_ref_lineage_bridge"
+    assert {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": child_task_id,
+    } in bridge["payload"]["bridged_identities"]
+
+
 def test_backlog_close_contract_runtime_projection_rejects_cross_backlog_record():
     from agent.governance import server
 

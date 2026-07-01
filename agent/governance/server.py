@@ -48667,6 +48667,27 @@ def _missing_contract_runtime_close_authority_details(
     }
 
 
+def _runtime_context_child_lane_close_authority_projection(
+    *,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    from .contract_runtime_close_authority import (
+        runtime_context_child_lane_close_authority_projection,
+    )
+
+    return runtime_context_child_lane_close_authority_projection(
+        project_id=project_id,
+        backlog_id=bug_id,
+        requested_execution_id=requested_execution_id,
+        close_commit=close_commit,
+        timeline_events=timeline_events,
+    )
+
+
 def _contract_runtime_close_authority_seed_events(
     *,
     record: Mapping[str, Any],
@@ -48884,22 +48905,24 @@ def _contract_runtime_close_authority_projection(
     body: Mapping[str, Any],
     route_gate: Mapping[str, Any] | None,
     close_commit: str,
+    timeline_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body)
     if not contract_execution_id:
+        requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
+        if requested_execution_id.startswith("onboard-service-"):
+            return _runtime_context_child_lane_close_authority_projection(
+                project_id=project_id,
+                bug_id=bug_id,
+                requested_execution_id=requested_execution_id,
+                close_commit=close_commit,
+                timeline_events=timeline_events,
+            )
         return {}
     runtime = _contract_runtime(conn)
     try:
         runtime.current_guide(contract_execution_id, actor_role="observer")
         record = runtime.store.get(contract_execution_id)
-        record, _runtime_context_projection = (
-            _contract_runtime_apply_mf_parallel_context_projection(
-                conn,
-                project_id=project_id,
-                record=record,
-                actor_role="observer",
-            )
-        )
     except ContractRuntimeError as exc:
         raise GovernanceError(
             "contract_runtime_close_authority_rejected",
@@ -48931,6 +48954,28 @@ def _contract_runtime_close_authority_projection(
                 "error": "contract_execution_scope_mismatch",
             },
         )
+
+    try:
+        record, _runtime_context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                actor_role="observer",
+            )
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_close_authority_rejected",
+            str(exc),
+            422,
+            {
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+                "accepted": False,
+                "contract_execution_id": contract_execution_id,
+                "error": str(exc),
+            },
+        ) from exc
 
     current_state = _runtime_current_state_from_record(record)
     if current_state.get("next_legal_action"):
@@ -54640,6 +54685,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 body=projection_body,
                 route_gate=route_context_gate,
                 close_commit=_audit_recovery_close_commit(row, projection_body),
+                timeline_events=events,
             )
             if runtime_projection.get("accepted"):
                 projected_events = (
@@ -58747,6 +58793,7 @@ def _verify_mf_close_timeline_gate(
         body=gate_body,
         route_gate=route_gate,
         close_commit=_audit_recovery_close_commit(row, gate_body),
+        timeline_events=events,
     )
     contract_runtime_required = _contract_runtime_close_authority_required_signal(
         gate_body,
