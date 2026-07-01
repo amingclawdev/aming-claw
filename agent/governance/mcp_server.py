@@ -1736,7 +1736,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_finish_time_worker_attestation",
-        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade.",
+        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Must run before the worker git commit; runtime-context lanes block if the assigned row head already moved and no committed-branch evidence lane exists.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
@@ -1745,7 +1745,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_finish_gate",
-        "description": "Canonical Runtime Context finish-gate facade that records mf_subagent_finish_gate evidence.",
+        "description": "Canonical Runtime Context finish-gate facade that records mf_subagent_finish_gate evidence before the worker git commit.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),

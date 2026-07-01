@@ -10330,6 +10330,11 @@ def _runtime_context_worker_guide_response(
                 "for this row. current_branch_head_commit is informational when "
                 "successor repairs continue on the same branch."
             ),
+            "precommit_finish_order": (
+                "Leave worker changes uncommitted until finish-time worker "
+                "attestation and finish gate pass; only then create the worker "
+                "git commit."
+            ),
             "observer_must_not_author": True,
             "raw_tokens_exposed": False,
             "test_results_source": (
@@ -10425,6 +10430,10 @@ def _runtime_context_worker_guide_response(
                 "Do not replace head_commit with current_branch_head_commit when "
                 "row_scoped_finish_head_projection.status is "
                 "branch_head_scope_mismatch."
+            ),
+            "precommit_finish_order": (
+                "This finish gate must pass before the worker creates its git "
+                "commit. If the runtime blocks, stop and report the blocker."
             ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
@@ -11291,15 +11300,17 @@ def _runtime_context_row_scoped_finish_head_projection(
         "next_legal_action": next_legal_action,
         "guide": (
             "Do not submit finish-time or finish-gate evidence for the row using "
-            "the current branch HEAD. Use the row-scoped implementation head from "
-            "the implementation event, or stop and request a row-scope recovery "
-            "decision before close."
+            "the current branch HEAD after it moved past the row-scoped head. "
+            "Finish-time worker attestation and finish gate must happen before "
+            "the worker commit unless an explicit committed-branch evidence lane "
+            "is implemented. Stop and request a row-scope recovery decision "
+            "before close."
             if mismatch
             else (
                 "Use the row-scoped worker implementation head for finish-time "
-                "and finish-gate evidence. The current branch head is only a "
-                "service/deployment head when successor repairs continue on the "
-                "same branch."
+                "and finish-gate evidence before creating the worker git commit. "
+                "The current branch head is only a service/deployment head when "
+                "successor repairs continue on the same branch."
             )
         ),
         "merge_queue_policy": (
@@ -13780,6 +13791,7 @@ def _runtime_context_finish_gate_submission_payload(
     observer_command_id: str = "",
     worker_session_id: str = "",
     filer_principal: str = "",
+    finish_order_projection: Mapping[str, Any] | None = None,
     request_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = request_body if isinstance(request_body, Mapping) else {}
@@ -13858,6 +13870,8 @@ def _runtime_context_finish_gate_submission_payload(
             finish_time_worker_self_attestation
         ),
     }
+    if isinstance(finish_order_projection, Mapping):
+        submission_body["finish_order_projection"] = dict(finish_order_projection)
     if observer_command_id:
         submission_body["observer_command_id"] = observer_command_id
     if worker_session_id:
@@ -13898,6 +13912,11 @@ def _runtime_context_finish_gate_submission_payload(
         "finish_time_worker_self_attestation": dict(
             finish_time_worker_self_attestation
         ),
+        **(
+            {"finish_order_projection": dict(finish_order_projection)}
+            if isinstance(finish_order_projection, Mapping)
+            else {}
+        ),
         **({"observer_command_id": observer_command_id} if observer_command_id else {}),
         "body": submission_body,
         "reminders": {
@@ -13908,6 +13927,10 @@ def _runtime_context_finish_gate_submission_payload(
                 "Keep head_commit equal to the row-scoped implementation head. "
                 "current_branch_head_commit is informational when successor "
                 "repairs continue on the same branch."
+            ),
+            "precommit_finish_order": (
+                "Record finish-time worker attestation and finish gate before "
+                "creating the worker git commit."
             ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
@@ -15044,6 +15067,96 @@ def handle_graph_governance_runtime_context_checkpoint(ctx: RequestContext):
     )
 
 
+def _runtime_context_finish_commit_order_projection(
+    *,
+    context: Any,
+    actual_head: str,
+    source: str,
+) -> dict[str, Any]:
+    assigned_head = str(getattr(context, "head_commit", "") or "").strip()
+    runtime_context_id = (
+        str(getattr(context, "runtime_context_id", "") or "").strip()
+        or str(getattr(context, "task_id", "") or "").strip()
+    )
+    replay_source = str(getattr(context, "replay_source", "") or "").strip()
+    status = "in_sync"
+    blocked = False
+    reason = ""
+    if (
+        actual_head
+        and assigned_head
+        and actual_head != assigned_head
+        and replay_source != "mf_sub_finish_gate"
+    ):
+        status = "blocked_pre_finish_commit_detected"
+        blocked = True
+        reason = (
+            "finish-time worker attestation and finish gate must be recorded "
+            "before the worker creates a git commit; explicit committed-branch "
+            "evidence lane is not implemented for runtime-context workers"
+        )
+    return {
+        "schema_version": "runtime_context.precommit_finish_order.v1",
+        "status": status,
+        "blocked": blocked,
+        "reason": reason,
+        "source": source,
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "assigned_head_commit": assigned_head,
+        "actual_worktree_head_commit": actual_head,
+        "replay_source": replay_source,
+        "required_order": [
+            "implementation_evidence",
+            "finish_time_worker_attestation",
+            "finish_gate",
+            "git_commit",
+        ],
+        "explicit_committed_branch_evidence_lane": {
+            "implemented": False,
+            "accepted": False,
+        },
+    }
+
+
+def _runtime_context_require_precommit_finish_order(
+    *,
+    context: Any,
+    actual_head: str,
+    source: str,
+) -> dict[str, Any]:
+    projection = _runtime_context_finish_commit_order_projection(
+        context=context,
+        actual_head=actual_head,
+        source=source,
+    )
+    if projection.get("blocked"):
+        raise GovernanceError(
+            "worker_finish_gate_before_commit_required",
+            str(projection.get("reason") or "finish gate must precede commit"),
+            422,
+            {
+                "runtime_context_id": projection.get("runtime_context_id", ""),
+                "task_id": projection.get("task_id", ""),
+                "backlog_id": projection.get("backlog_id", ""),
+                "assigned_head_commit": projection.get("assigned_head_commit", ""),
+                "actual_worktree_head_commit": projection.get(
+                    "actual_worktree_head_commit",
+                    "",
+                ),
+                "required_order": projection.get("required_order", []),
+                "explicit_committed_branch_evidence_lane": projection.get(
+                    "explicit_committed_branch_evidence_lane",
+                    {},
+                ),
+                "next_legal_action": "stop_and_report_pre_finish_commit_blocker",
+                "finish_order_projection": projection,
+            },
+        )
+    return projection
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
 def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: RequestContext):
@@ -15123,6 +15236,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 actual_head = batch_jobs.git_commit(worktree_path)
             except batch_jobs.BatchJobError:
                 actual_head = ""
+        finish_order_projection = _runtime_context_finish_commit_order_projection(
+            context=context,
+            actual_head=actual_head,
+            source="runtime_context.finish_time_worker_attestation",
+        )
         head_commit = actual_head or str(body.get("head_commit") or context.head_commit or "")
         changed_files: list[str] = []
         if worktree_path and os.path.exists(worktree_path) and context.base_commit:
@@ -15197,6 +15315,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 "finish-time worker attestation requires read_receipt_hash and "
                 "read_receipt_event_id lineage"
             )
+        finish_order_projection = _runtime_context_require_precommit_finish_order(
+            context=context,
+            actual_head=actual_head,
+            source="runtime_context.finish_time_worker_attestation",
+        )
 
         graph_trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -15285,6 +15408,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "base_commit": context.base_commit,
             "target_head_commit": context.target_head_commit,
             "head_commit": head_commit,
+            "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
             "owned_files": list(body.get("owned_files") or changed_files),
             "observer_command_id": observer_command_id,
@@ -15330,6 +15454,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             or "",
             "observer_command_id": observer_command_id,
             "head_commit": head_commit,
+            "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
             "graph_trace_ids": verified_graph_trace_ids,
             "read_receipt_hash": read_receipt_hash,
@@ -15368,6 +15493,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         gate=event.get("meta_contract_gate") if isinstance(event, Mapping) else None,
     )
     response["finish_time_worker_self_attestation"] = public_attestation
+    response["finish_order_projection"] = finish_order_projection
     response["next_legal_action"] = "record_finish_gate"
     response["next_action"] = {
         "action": "record_finish_gate",
@@ -15396,6 +15522,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             observer_command_id=observer_command_id,
             worker_session_id=worker_session_id,
             filer_principal=filer_principal,
+            finish_order_projection=finish_order_projection,
             request_body=body,
         )
     )
@@ -15424,11 +15551,19 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
 
         worktree_path = str(context.worktree_path or "")
         expected_head_commit = str(body.get("head_commit") or context.head_commit or "").strip()
+        actual_head_commit = ""
         if worktree_path and os.path.exists(worktree_path):
             try:
-                expected_head_commit = batch_jobs.git_commit(worktree_path)
+                actual_head_commit = batch_jobs.git_commit(worktree_path)
             except batch_jobs.BatchJobError:
                 pass
+        if actual_head_commit:
+            expected_head_commit = actual_head_commit
+        finish_order_projection = _runtime_context_require_precommit_finish_order(
+            context=context,
+            actual_head=actual_head_commit,
+            source="runtime_context.finish_gate",
+        )
         expected_changed_files = _runtime_context_service_query_values(
             body,
             "changed_files",
@@ -15561,6 +15696,7 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
+        "finish_order_projection": finish_order_projection,
     }
     evidence = finish_body.get("evidence") if isinstance(finish_body.get("evidence"), Mapping) else {}
     if (
@@ -16801,6 +16937,9 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 gate["caller_supplied_real_startup_events_ignored"] = True
             if _caller_supplied_startup_evidence:
                 gate["caller_supplied_startup_evidence_ignored"] = True
+            runtime_context_lane = bool(
+                str(ctx.body.get("runtime_context_id") or "").strip()
+            )
             claimed_head = str(gate.get("head_commit") or "").strip()
             actual_head = ""
             worktree_path = str(context.worktree_path or "")
@@ -16809,17 +16948,32 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     actual_head = batch_jobs.git_commit(worktree_path)
                 except batch_jobs.BatchJobError:
                     actual_head = ""
+            finish_order_projection: dict[str, Any] = {}
+            if runtime_context_lane:
+                finish_order_projection = _runtime_context_require_precommit_finish_order(
+                    context=context,
+                    actual_head=actual_head,
+                    source="parallel_branch.finish_gate.runtime_context_lane",
+                )
+                gate["finish_order_projection"] = finish_order_projection
             if actual_head and claimed_head and actual_head != claimed_head:
                 raise ValidationError("head_commit does not match assigned worktree HEAD")
             validated_head = actual_head or claimed_head or context.head_commit
             actual_changed_files: list[str] = []
             if worktree_path and os.path.exists(worktree_path) and context.base_commit:
                 try:
-                    actual_changed_files = batch_jobs.git_changed_files(
-                        worktree_path,
-                        base_ref=context.base_commit,
-                        head_ref=validated_head or "HEAD",
-                    )
+                    if runtime_context_lane:
+                        actual_changed_files = batch_jobs.git_changed_files_with_worktree(
+                            worktree_path,
+                            base_ref=context.base_commit,
+                            head_ref=validated_head or "HEAD",
+                        )
+                    else:
+                        actual_changed_files = batch_jobs.git_changed_files(
+                            worktree_path,
+                            base_ref=context.base_commit,
+                            head_ref=validated_head or "HEAD",
+                        )
                 except batch_jobs.BatchJobError:
                     actual_changed_files = []
             if actual_changed_files:

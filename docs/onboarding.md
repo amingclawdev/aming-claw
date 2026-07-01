@@ -356,13 +356,17 @@ The normal worker order is:
    `query_purpose=subagent_context_build` or `subagent_gate_validation`,
    carrying `task_id`, `parent_task_id`, `worker_role=mf_sub`, fence, and
    session identity.
-5. Implement only inside the file/worktree fence, then write implementation
-   evidence through the runtime-context `implementation-evidence` facade with
-   changed files, tests, and graph trace ids.
-6. Record finish-time worker attestation and the finish gate, then stop. The
-   worker does not merge, mutate the merge queue, or write QA evidence. After
-   the finish gate, the observer resumes the parent contract with independent
-   QA, then materializes the durable merge queue item with
+5. Implement only inside the file/worktree fence and run focused tests, but do
+   not create the worker git commit yet. Write implementation evidence through
+   the runtime-context `implementation-evidence` facade with changed files,
+   tests, and graph trace ids.
+6. Record finish-time worker attestation and the finish gate while the worker
+   diff is still uncommitted. If the finish gate blocks, stop and report the
+   blocker; do not backfill or fabricate evidence. Only after the finish gate
+   passes may the worker commit its branch. The worker does not merge, mutate
+   the merge queue, or write QA evidence. After the finish gate, the observer
+   resumes the parent contract with independent QA, then materializes the
+   durable merge queue item with
    `parallel_branch_merge_queue_materialize` (or HTTP
    `parallel-branches/merge-queue/materialize`) using the worker finish
    checkpoint before any ordered merge apply.

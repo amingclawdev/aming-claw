@@ -5738,6 +5738,7 @@ def _runtime_context_read_receipt_hash_action(
                 "owned file diff",
                 "focused tests",
                 "git diff --check",
+                "uncommitted worker diff until finish-time attestation and finish gate pass",
             ],
             "evidence_to_file": [
                 "implementation_evidence",
@@ -5805,7 +5806,26 @@ def _runtime_context_read_receipt_hash_action(
                 "raw_token_exfiltration",
                 "author_worker_evidence_as_observer",
                 "bypass_timeline_gate",
+                "git_commit_before_finish_gate",
             ],
+            "precommit_finish_order": {
+                "required": True,
+                "sequence": [
+                    "implementation_evidence",
+                    "finish_time_worker_attestation",
+                    "finish_gate",
+                    "git_commit",
+                ],
+                "blocker": (
+                    "runtime-context workers must leave the row-scoped branch "
+                    "head unchanged until finish-time attestation and finish "
+                    "gate pass"
+                ),
+                "committed_branch_evidence_lane": {
+                    "implemented": False,
+                    "accepted": False,
+                },
+            },
             "scope": {
                 "owned_files": owned_files,
                 "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
