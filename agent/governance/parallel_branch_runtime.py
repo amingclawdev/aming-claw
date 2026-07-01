@@ -12010,6 +12010,16 @@ def record_mf_subagent_startup(
         runtime_context_id=runtime_context_id,
         fence_token=fence_token,
     )
+    session_token_evidence_type = str(
+        token_evidence["session_token_evidence_type"] or ""
+    )
+    service_dispatch_verified_startup = bool(
+        agent_id_match_mode == "observer_subagent_service_dispatch"
+        and session_token_evidence_type in {"server_verified", "server_verified_ref"}
+    )
+    host_adapter_surrogate_startup = bool(
+        host_adapter_startup and not service_dispatch_verified_startup
+    )
     worker_self_attestation_payload = {
         **dict(payload),
         "worker_session_id": worker_session_id,
@@ -12037,9 +12047,9 @@ def record_mf_subagent_startup(
         "filed_on_behalf_by": filed_on_behalf_by,
         "actor": filer_principal,
         "agent_id_match_mode": agent_id_match_mode,
-        "session_token_evidence_type": token_evidence["session_token_evidence_type"],
+        "session_token_evidence_type": session_token_evidence_type,
         "session_token_present": token_evidence["session_token_present"],
-        "host_adapter_startup_token_accepted": host_adapter_startup,
+        "host_adapter_startup_token_accepted": host_adapter_surrogate_startup,
         "graph_trace_db_evidence": graph_trace_db_evidence,
         "attestation_phase": "startup",
         "service_dispatch_worker_binding": service_dispatch_worker_binding,
@@ -12048,9 +12058,8 @@ def record_mf_subagent_startup(
         verify_worker_transcript(worker_self_attestation_payload)
     )
     surrogate_startup_not_close_satisfying = bool(
-        host_adapter_startup
-        or token_evidence["session_token_evidence_type"]
-        in {"surrogate", "claimed_unverified_ref"}
+        host_adapter_surrogate_startup
+        or session_token_evidence_type in {"surrogate", "claimed_unverified_ref"}
     )
     if surrogate_startup_not_close_satisfying:
         blockers = _runtime_context_dedupe(

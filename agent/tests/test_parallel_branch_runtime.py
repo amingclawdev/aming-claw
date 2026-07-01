@@ -88,6 +88,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_audit_nodes_for_views,
     runtime_context_content_hash,
     runtime_context_filter_content_address,
+    runtime_context_session_token_ref,
     runtime_context_session_token_lease_view,
     runtime_context_secret_hash,
     runtime_tasks_from_contexts,
@@ -5506,10 +5507,144 @@ def test_mf_sub_startup_accepts_host_adapter_agent_id_mismatch_with_surrogate(tm
     assert gate["same_as_expected_worker"] is False
     assert gate["worker_self_attesting"] is False
     assert gate["close_satisfying"] is False
+    assert gate["host_adapter_startup_surrogate_not_close_satisfying"] is True
     assert gate["worker_self_attestation"]["status"] == "blocked"
     assert "host_adapter_startup_surrogate_not_close_satisfying" in gate[
         "worker_self_attestation"
     ]["blockers"]
+
+
+def test_mf_sub_startup_service_dispatch_host_metadata_is_not_surrogate(
+    tmp_path,
+) -> None:
+    from agent.governance import task_timeline
+
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-service-dispatch-host"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+        session_token_hash=mf_subagent_session_token_hash(
+            "secret-worker-session-token"
+        ),
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    runtime_context_id = branch_runtime_context_id(PROJECT_ID, "mf-sub-startup")
+    route_identity = {
+        "route_id": "route-startup",
+        "route_context_hash": "sha256:route-startup",
+        "prompt_contract_id": "rprompt-startup",
+        "prompt_contract_hash": "sha256:prompt-startup",
+        "route_token_ref": "rtok-startup",
+        "visible_injection_manifest_hash": "sha256:visible-startup",
+    }
+    service_agent_id = "service-dispatch-host-worker"
+    host_startup_id = "multi_agent_v1.spawn_agent:service-dispatch-host-worker"
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_adapter_spawn",
+                "runtime_context_id": runtime_context_id,
+                "task_id": "mf-sub-startup",
+                "worker_slot_id": "worker-startup",
+                "agent_id": service_agent_id,
+                "actual_host_worker_id": service_agent_id,
+                "host_startup_id": host_startup_id,
+                "host_session_id": host_startup_id,
+            }
+        },
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+    _insert_startup_graph_trace(conn)
+    task_timeline.ensure_schema(conn)
+    dispatch_event = task_timeline.record_event(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="parent-startup",
+        backlog_id="BUG-STARTUP",
+        event_type="observer.subagent.service_dispatch",
+        event_kind="observer_subagent_service_dispatch",
+        phase="dispatch",
+        status="accepted",
+        actor="observer",
+        payload={
+            "schema_version": "observer_subagent_service_dispatch.v1",
+            "observer_command_id": "cmd-startup",
+            **route_identity,
+            "workers": [
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": "mf-sub-startup",
+                    "worker_id": "worker-startup",
+                    "worker_slot_id": "worker-startup",
+                    "agent_id": service_agent_id,
+                    "actual_host_worker_id": service_agent_id,
+                    "worker_session_id": service_agent_id,
+                    "transcript_ref": f"multi_agent:{service_agent_id}",
+                    "session_token_ref": runtime_context_session_token_ref(
+                        context
+                    ),
+                }
+            ],
+        },
+    )
+    conn.commit()
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            agent_id=service_agent_id,
+            actual_host_worker_id=service_agent_id,
+            worker_session_id=service_agent_id,
+            worker_transcript_ref=f"multi_agent:{service_agent_id}",
+            session_token="",
+            session_token_ref=runtime_context_session_token_ref(context),
+            startup_source="codex_host_spawn_agent",
+            host_startup_id=host_startup_id,
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    assert gate["agent_id_match_mode"] == "observer_subagent_service_dispatch"
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["session_token_evidence_type"] == "server_verified_ref"
+    assert gate["server_issued_session_token_verified"] is True
+    assert gate["service_dispatch_worker_binding_present"] is True
+    assert gate["service_dispatch_worker_binding"]["event_ref"] == (
+        f"timeline:{dispatch_event['id']}"
+    )
+    assert gate["host_adapter_startup_surrogate_not_close_satisfying"] is False
+    assert "host_adapter_startup_surrogate_not_close_satisfying" not in gate[
+        "worker_self_attestation"
+    ]["blockers"]
+    assert gate["worker_self_attesting"] is True
+    assert gate["close_satisfying"] is True
 
 
 def test_mf_sub_startup_accepts_host_startup_id_matching_registered_host_session(
