@@ -464,6 +464,10 @@ def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
         "queue_item_id": {"type": "string"},
         "task_id": {"type": "string"},
         "backlog_id": {"type": "string"},
+        "branch_ref": {
+            "type": "string",
+            "description": "Optional explicit branch ref; server derives it from the branch lane when omitted.",
+        },
         "repo_root_path": {"type": "string"},
         "workspace_root": {"type": "string"},
         "target_ref": {"type": "string"},
@@ -526,6 +530,7 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "queue_item_id",
         "task_id",
         "backlog_id",
+        "branch_ref",
         "repo_root_path",
         "workspace_root",
         "target_ref",

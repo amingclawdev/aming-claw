@@ -74,6 +74,17 @@ def test_mcp_stdio_initialize_and_health_survive_missing_governance():
     assert "error" in payload
 
 
+def test_parallel_branch_merge_queue_apply_schemas_expose_branch_ref():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        tool = next(
+            candidate
+            for candidate in tools
+            if candidate["name"] == "parallel_branch_merge_queue_apply"
+        )
+        properties = tool["inputSchema"]["properties"]
+        assert "branch_ref" in properties
+
+
 def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
