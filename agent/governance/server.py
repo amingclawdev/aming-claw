@@ -47023,6 +47023,10 @@ def _contract_runtime_close_gate(
 _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION = (
     "contract_runtime_close_authority_projection.v1"
 )
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE = "contract_runtime"
+_CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE = (
+    "contract_runtime_close_authority_projection"
+)
 
 _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS = (
     "route_id",
@@ -48591,8 +48595,15 @@ def _contract_runtime_legacy_close_diagnostics(
     )
     diagnostics["schema_version"] = "legacy_mf_close_gate_diagnostics.v1"
     diagnostics["advisory_only"] = True
+    diagnostics["required"] = False
     diagnostics["authorization_blocker"] = False
     diagnostics["ignored_for_contract_runtime_close_authority"] = True
+    diagnostics["source_of_authority"] = _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE
+    diagnostics["authority_decision_source"] = (
+        _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE
+    )
+    diagnostics["legacy_mf_timeline_close_gate_advisory_only"] = True
+    diagnostics["legacy_mf_close_gate_authorization_blocker"] = False
     diagnostics["message"] = (
         "Legacy MF timeline gate output is retained for diagnostics only; "
         "passing ContractRuntime close authority is the close authorization source."
@@ -48621,7 +48632,25 @@ def _contract_runtime_authoritative_close_with_legacy_diagnostics(
         contract_execution_id=contract_execution_id,
     )
     verification["legacy_mf_close_gate_authorization_blocker"] = False
+    verification["source_of_authority"] = _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE
+    verification["authority_decision_source"] = (
+        _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE
+    )
     return verification
+
+
+def _contract_runtime_close_authority_payload_fields(
+    runtime_projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
+        "contract_runtime_close_authority_required": True,
+        "legacy_mf_timeline_close_gate_advisory_only": True,
+        "legacy_mf_close_gate_authorization_blocker": False,
+        "timeline_gate_advisory_only": True,
+        "timeline_gate_authorization_blocker": False,
+    }
 
 
 def _contract_runtime_close_authority_failure_details(
@@ -48684,9 +48713,9 @@ def _contract_runtime_close_authority_failure_details(
         contract_execution_id=contract_execution_id,
     )
     return {
-        "source_of_authority": "contract_runtime",
-        "authority_decision_source": "contract_runtime_close_authority_projection",
+        **_contract_runtime_close_authority_payload_fields(runtime_projection),
         "timeline_gate": legacy_diagnostics,
+        "legacy_mf_timeline_gate_diagnostics": legacy_diagnostics,
         "failed_gates": failed_gates,
         "runtime_projection_authority_failed": True,
         "contract_runtime_close_authority_projection": projection_summary,
@@ -48703,6 +48732,7 @@ def _missing_contract_runtime_close_authority_details(
     requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
     missing_ids = ["contract_runtime_close_authority"]
     projection = {
+        **_contract_runtime_close_authority_payload_fields(),
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": False,
         "status": "missing",
@@ -48723,7 +48753,9 @@ def _missing_contract_runtime_close_authority_details(
         contract_execution_id=requested_execution_id,
     )
     return {
+        **_contract_runtime_close_authority_payload_fields(projection),
         "timeline_gate": legacy_diagnostics,
+        "legacy_mf_timeline_gate_diagnostics": legacy_diagnostics,
         "failed_gates": [
             {
                 "gate": "contract_runtime_close_authority_projection",
@@ -49075,11 +49107,10 @@ def _contract_runtime_close_authority_projection(
     current_state = _runtime_current_state_from_record(record)
     if current_state.get("next_legal_action"):
         return {
+            **_contract_runtime_close_authority_payload_fields(),
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "incomplete",
-            "source_of_authority": "contract_runtime",
-            "authority_decision_source": "contract_runtime_current_state",
             "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
                 source="contract_runtime_close_authority_projection",
                 contract_execution_id=contract_execution_id,
@@ -49166,6 +49197,7 @@ def _contract_runtime_close_authority_projection(
         identity = merged_identity
     if not identity.get("route_context_hash") or not identity.get("prompt_contract_id"):
         return {
+            **_contract_runtime_close_authority_payload_fields(),
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_route_identity",
@@ -49229,6 +49261,7 @@ def _contract_runtime_close_authority_projection(
             next_event_id += 1
     if not projected_line_event_count:
         return {
+            **_contract_runtime_close_authority_payload_fields(),
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_completed_lines",
@@ -49247,8 +49280,8 @@ def _contract_runtime_close_authority_projection(
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": True,
         "status": "projected",
-        "source_of_authority": "contract_runtime",
-        "authority_decision_source": "contract_runtime_close_authority_projection",
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="contract_runtime_close_authority_projection",
             contract_execution_id=contract_execution_id,

@@ -24677,6 +24677,15 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
 
     assert exc.value.code == "contract_runtime_close_authority_incomplete"
     details = exc.value.details
+    assert details["source_of_authority"] == "contract_runtime"
+    assert (
+        details["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
+    assert details["contract_runtime_close_authority_required"] is True
+    assert details["timeline_gate_advisory_only"] is True
+    assert details["timeline_gate_authorization_blocker"] is False
+    assert details["legacy_mf_close_gate_authorization_blocker"] is False
     assert details["runtime_projection_authority_failed"] is True
     assert details["source_of_authority"] == "contract_runtime"
     assert (
@@ -24684,11 +24693,13 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
         == "contract_runtime_close_authority_projection"
     )
     projection = details["contract_runtime_close_authority_projection"]
-    assert projection["status"] == "incomplete"
     assert projection["source_of_authority"] == "contract_runtime"
     assert (
-        projection["authority_decision_source"] == "contract_runtime_current_state"
+        projection["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
     )
+    assert projection["legacy_mf_timeline_close_gate_advisory_only"] is True
+    assert projection["status"] == "incomplete"
     assert projection["contract_execution_id"] == successor["contract_execution_id"]
     assert projection["next_legal_action"]
     assert details["failed_gates"] == [
@@ -24705,8 +24716,23 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
             "contract_execution_id": successor["contract_execution_id"],
         }
     ]
+    assert (
+        details["legacy_mf_timeline_gate_diagnostics"]
+        == details["legacy_diagnostics"]
+    )
+    assert details["timeline_gate"] == details["legacy_diagnostics"]
+    assert details["timeline_gate"]["source_of_authority"] == "contract_runtime"
+    assert (
+        details["timeline_gate"]["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert details["legacy_diagnostics"]["advisory_only"] is True
+    assert details["legacy_diagnostics"]["required"] is False
     assert details["legacy_diagnostics"]["authorization_blocker"] is False
+    assert (
+        details["legacy_diagnostics"]["legacy_mf_timeline_close_gate_advisory_only"]
+        is True
+    )
     row = conn.execute(
         "SELECT status FROM backlog_bugs WHERE bug_id = ?", (backlog_id,)
     ).fetchone()
@@ -24775,7 +24801,13 @@ def test_backlog_close_contract_runtime_required_without_authority_uses_new_bloc
         details["authority_decision_source"]
         == "contract_runtime_close_authority_projection"
     )
+    assert details["timeline_gate_advisory_only"] is True
     projection = details["contract_runtime_close_authority_projection"]
+    assert projection["source_of_authority"] == "contract_runtime"
+    assert (
+        projection["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert projection["status"] == "missing"
     assert projection["source_of_authority"] == "contract_runtime"
     assert (
@@ -24795,9 +24827,20 @@ def test_backlog_close_contract_runtime_required_without_authority_uses_new_bloc
             "contract_execution_id": parent_execution_id,
         }
     ]
+    assert details["timeline_gate"] == details["legacy_diagnostics"]
+    assert (
+        details["legacy_mf_timeline_gate_diagnostics"]
+        == details["legacy_diagnostics"]
+    )
     legacy = details["legacy_diagnostics"]
     assert legacy["advisory_only"] is True
+    assert legacy["required"] is False
     assert legacy["authorization_blocker"] is False
+    assert legacy["source_of_authority"] == "contract_runtime"
+    assert (
+        legacy["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert legacy["legacy_advisory"] is True
     assert legacy["authoritative"] is False
     assert legacy["passed"] is False
