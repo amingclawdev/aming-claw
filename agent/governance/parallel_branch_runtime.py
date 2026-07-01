@@ -9198,6 +9198,74 @@ def list_merge_queue_items(
     return [_merge_queue_item_from_row(row) for row in rows]
 
 
+def _list_merge_queue_items_with_target_fallback(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merge_queue_id: str,
+    *,
+    target_ref: str = "",
+) -> list[MergeQueueItem]:
+    items = list_merge_queue_items(
+        conn,
+        project_id,
+        merge_queue_id,
+        target_ref=target_ref,
+    )
+    if not items and str(target_ref or "").strip():
+        items = list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref="",
+        )
+    return items
+
+
+def _context_enriched_merge_queue_item(
+    conn: sqlite3.Connection,
+    item: MergeQueueItem,
+    *,
+    explicit_branch_ref: str = "",
+    target_ref: str = "",
+) -> MergeQueueItem:
+    context = get_branch_context(conn, item.project_id, item.task_id)
+    if context is None and not explicit_branch_ref and not target_ref:
+        return item
+    branch_ref = str(explicit_branch_ref or item.branch_ref or "").strip()
+    if context is not None:
+        branch_ref = branch_ref or context.branch_ref
+    if context is None:
+        return replace(
+            item,
+            branch_ref=branch_ref,
+            target_ref=str(target_ref or item.target_ref or "").strip(),
+        )
+    return replace(
+        item,
+        backlog_id=item.backlog_id or context.backlog_id,
+        branch_ref=branch_ref,
+        target_ref=str(target_ref or item.target_ref or context.ref_name or "").strip(),
+        base_commit=item.base_commit or context.base_commit,
+        branch_head=item.branch_head or context.head_commit,
+        current_target_head=item.current_target_head or context.target_head_commit,
+        snapshot_id=item.snapshot_id or context.snapshot_id,
+        projection_id=item.projection_id or context.projection_id,
+        merge_preview_id=item.merge_preview_id or context.merge_preview_id,
+    )
+
+
+def _context_enriched_merge_queue_items(
+    conn: sqlite3.Connection,
+    items: list[MergeQueueItem],
+    *,
+    target_ref: str = "",
+) -> list[MergeQueueItem]:
+    return [
+        _context_enriched_merge_queue_item(conn, item, target_ref=target_ref)
+        for item in items
+    ]
+
+
 def decide_persisted_merge_queue(
     conn: sqlite3.Connection,
     project_id: str,
@@ -9208,10 +9276,14 @@ def decide_persisted_merge_queue(
     scenario_id: str = "PB-002",
 ) -> MergeQueuePlan:
     """Replay merge queue decisions from durable queue rows."""
-    items = list_merge_queue_items(
+    items = _context_enriched_merge_queue_items(
         conn,
-        project_id,
-        merge_queue_id,
+        _list_merge_queue_items_with_target_fallback(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
         target_ref=target_ref,
     )
     latest_target = str(current_target_head or "").strip()
@@ -9249,10 +9321,14 @@ def decide_persisted_merge_gate(
         if runtime is not None:
             runtime_status = runtime.batch_status
     return decide_merge_gate(
-        list_merge_queue_items(
+        _context_enriched_merge_queue_items(
             conn,
-            project_id,
-            merge_queue_id,
+            _list_merge_queue_items_with_target_fallback(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=target_ref,
+            ),
             target_ref=target_ref,
         ),
         queue_item_id=queue_item_id,
@@ -9293,13 +9369,18 @@ def record_merge_queue_result(
     if result_status == STATE_MERGE_FAILED and not str(failure_reason or "").strip():
         raise ValueError("failure_reason is required when recording merge_failed")
 
-    selected = _select_merge_gate_item(
-        list_merge_queue_items(
+    items = _context_enriched_merge_queue_items(
+        conn,
+        _list_merge_queue_items_with_target_fallback(
             conn,
             project_id,
             merge_queue_id,
             target_ref=target_ref,
         ),
+        target_ref=target_ref,
+    )
+    selected = _select_merge_gate_item(
+        items,
         queue_item_id=queue_item_id,
         task_id=task_id,
     )
@@ -13442,6 +13523,25 @@ def git_merge_preview_evidence(
     }
 
 
+def _git_preview_branch_is_ancestor(
+    repo_root: Path,
+    *,
+    branch_commit: str,
+    target_commit: str,
+    timeout_seconds: int,
+) -> bool:
+    branch = str(branch_commit or "").strip()
+    target = str(target_commit or "").strip()
+    if not branch or not target:
+        return False
+    proc = _git_preview_command(
+        repo_root,
+        ["merge-base", "--is-ancestor", branch, target],
+        timeout_seconds=timeout_seconds,
+    )
+    return proc.returncode == 0
+
+
 def _git_worktree_dirty_files(repo_root: Path, *, timeout_seconds: int) -> list[str]:
     proc = _git_preview_command(
         repo_root,
@@ -13461,11 +13561,13 @@ def execute_merge_queue_item(
     repo_root_path: str | Path,
     queue_item_id: str = "",
     task_id: str = "",
+    branch_ref: str = "",
     target_ref: str = "",
     evidence: dict[str, Any] | None = None,
     batch_status: str = "",
     dry_run: bool = True,
     allow_target_ref_mutation: bool = False,
+    allow_route_gated_reclaimed_fence_without_token: bool = False,
     message: str = "",
     bug_id: str = "",
     source_contract_id: str = "",
@@ -13480,21 +13582,123 @@ def execute_merge_queue_item(
     allow_target_ref_mutation=true, and the merge gate must pass first.
     """
     ensure_branch_runtime_schema(conn)
-    items = list_merge_queue_items(
+    items = _context_enriched_merge_queue_items(
         conn,
-        project_id,
-        merge_queue_id,
+        _list_merge_queue_items_with_target_fallback(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
         target_ref=target_ref,
     )
     item = select_merge_queue_item(items, queue_item_id=queue_item_id, task_id=task_id)
+    explicit_branch = str(branch_ref or "").strip()
+    if explicit_branch:
+        item = replace(item, branch_ref=explicit_branch)
+        items = [
+            item if candidate.queue_item_id == item.queue_item_id else candidate
+            for candidate in items
+        ]
     repo_root = Path(repo_root_path).resolve()
+    selected_target_ref = target_ref or item.target_ref or "refs/heads/main"
+    if not item.branch_ref:
+        return {
+            "ok": False,
+            "dry_run": dry_run,
+            "executed": False,
+            "error": "merge_queue_branch_ref_unresolved",
+            "message": (
+                "merge queue item has no branch_ref and no branch runtime "
+                "context supplied one"
+            ),
+            "queue_item": merge_queue_item_to_dict(item),
+            "recorded": None,
+        }
     preview = git_merge_preview_evidence(
         repo_root_path=repo_root,
-        target_ref=target_ref or item.target_ref,
+        target_ref=selected_target_ref,
         branch_ref=item.branch_ref,
         expected_target_head=item.current_target_head or item.validated_target_head,
         timeout_seconds=timeout_seconds,
     )
+    target_commit = str(preview.get("target_commit") or "").strip()
+    branch_commit = str(preview.get("branch_commit") or item.branch_head or "").strip()
+    already_integrated = _git_preview_branch_is_ancestor(
+        repo_root,
+        branch_commit=branch_commit,
+        target_commit=target_commit,
+        timeout_seconds=timeout_seconds,
+    )
+    if already_integrated:
+        integrated_item = replace(
+            item,
+            status=STATE_MERGED,
+            merge_commit=target_commit or item.merge_commit,
+            target_head_before_merge=(
+                item.target_head_before_merge
+                or item.current_target_head
+                or item.validated_target_head
+                or target_commit
+            ),
+            target_head_after_merge=target_commit or item.target_head_after_merge,
+            current_target_head=target_commit or item.current_target_head,
+        )
+        integrated_items = [
+            integrated_item if candidate.queue_item_id == item.queue_item_id else candidate
+            for candidate in items
+        ]
+        gate_plan = decide_merge_gate(
+            integrated_items,
+            queue_item_id=integrated_item.queue_item_id,
+            evidence={**(evidence or {}), "git_conflict_check": preview},
+            batch_status=batch_status,
+            dry_run=True,
+            scenario_id=scenario_id,
+        )
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "executed": False,
+                "already_integrated": True,
+                "target_ref_mutated": False,
+                "preview": preview,
+                "gate_plan": merge_gate_plan_to_dict(gate_plan),
+                "queue_item": merge_queue_item_to_dict(integrated_item),
+                "next_actions": ["record_merge_result_without_target_ref_mutation"],
+                "recorded": None,
+            }
+        recorded = record_merge_queue_result(
+            conn,
+            project_id=project_id,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=integrated_item.queue_item_id,
+            task_id=integrated_item.task_id,
+            target_ref=target_ref or item.target_ref,
+            status=STATE_MERGED,
+            merge_commit=target_commit or branch_commit,
+            target_head_before_merge=integrated_item.target_head_before_merge,
+            target_head_after_merge=target_commit or branch_commit,
+            snapshot_id=integrated_item.snapshot_id,
+            projection_id=integrated_item.projection_id,
+            fence_token=fence_token,
+            allow_route_gated_reclaimed_fence_without_token=(
+                allow_route_gated_reclaimed_fence_without_token
+            ),
+            now_iso=now_iso,
+        )
+        return {
+            "ok": True,
+            "dry_run": False,
+            "executed": False,
+            "already_integrated": True,
+            "target_ref_mutated": False,
+            "merge_commit": target_commit or branch_commit,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": recorded,
+        }
     gate_evidence = dict(evidence or {})
     gate_evidence["git_conflict_check"] = preview
     gate_plan = decide_merge_gate(
@@ -14213,10 +14417,14 @@ def build_parallel_branch_read_model_from_db(
         queue_ids = sorted({ctx.merge_queue_id for ctx in contexts if ctx.merge_queue_id})
         queue_id = queue_ids[0] if len(queue_ids) == 1 else ""
     if queue_id:
-        queue_items = list_merge_queue_items(
+        queue_items = _context_enriched_merge_queue_items(
             conn,
-            project_id,
-            queue_id,
+            _list_merge_queue_items_with_target_fallback(
+                conn,
+                project_id,
+                queue_id,
+                target_ref=target_ref,
+            ),
             target_ref=target_ref,
         )
         latest_target = str(current_target_head or "").strip()

@@ -20,6 +20,35 @@ def test_mf_timeline_precheck_schema_exposes_repair_view():
     assert "repair" in view["enum"]
 
 
+def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
+    properties = _tool_properties("parallel_branch_merge_queue_apply")
+    assert "branch_ref" in properties
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "parallel_branch_merge_queue_apply",
+        {
+            "project_id": "aming-claw",
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "branch_ref": "refs/heads/codex/task-1",
+            "dry_run": True,
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/parallel-branches/merge-execute",
+        {
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "branch_ref": "refs/heads/codex/task-1",
+            "dry_run": True,
+        },
+    )
+
+
 class _Recorder:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []

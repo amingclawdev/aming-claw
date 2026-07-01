@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from agent.governance import parallel_branch_runtime as pbr
 from agent.tests.fixtures.parallel_project import (
     PB001RestartFixtureProject,
     create_pb001_restart_fixture_project,
@@ -765,3 +766,129 @@ def test_pb010_read_model_marks_queue_stale_against_latest_target_head() -> None
         "verify_semantic_projection",
         "refresh_merge_preview",
     ]
+
+
+def test_pb010_read_model_derives_queue_branch_ref_from_lane_when_target_filter_empty() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=BATCH_ID,
+            task_id="T-context-ref",
+            backlog_id="OPT-PB010-CONTEXT-REF",
+            branch_ref="refs/heads/codex/PB010-context-ref",
+            ref_name="main",
+            status="running",
+            base_commit="B0",
+            head_commit="H-context",
+            target_head_commit="M0",
+            merge_queue_id="mergeq-PB010-context-ref",
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB010-context-ref",
+                queue_item_id="item-context-ref",
+                task_id="T-context-ref",
+                branch_ref="",
+                queue_index=1,
+                status="planned",
+                target_ref="",
+            ),
+        ],
+        now_iso=NOW,
+    )
+
+    model = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-PB010-context-ref",
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    )
+    payload = model.to_dict()
+    row = payload["merge_queue"]["rows"][0]
+
+    assert row["task_id"] == "T-context-ref"
+    assert row["branch_ref"] == "refs/heads/codex/PB010-context-ref"
+    assert row["queue_state"] == "planned"
+
+
+def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=BATCH_ID,
+            task_id="T-integrated",
+            backlog_id="OPT-PB010-INTEGRATED",
+            branch_ref="refs/heads/codex/PB010-integrated",
+            ref_name="main",
+            status="running",
+            base_commit="B0",
+            head_commit="branch-commit",
+            target_head_commit="target-before",
+            merge_queue_id="mergeq-PB010-integrated",
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB010-integrated",
+                queue_item_id="item-integrated",
+                task_id="T-integrated",
+                branch_ref="",
+                queue_index=1,
+                status="planned",
+                target_ref="",
+            ),
+        ],
+        now_iso=NOW,
+    )
+    preview_call: dict[str, object] = {}
+
+    def fake_preview(**kwargs):
+        preview_call.update(kwargs)
+        return {
+            "status": "pass",
+            "passed": True,
+            "target_commit": "target-after",
+            "branch_commit": "branch-commit",
+        }
+
+    monkeypatch.setattr(pbr, "git_merge_preview_evidence", fake_preview)
+    monkeypatch.setattr(pbr, "_git_preview_branch_is_ancestor", lambda *args, **kwargs: True)
+
+    result = pbr.execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-PB010-integrated",
+        repo_root_path=tmp_path,
+        task_id="T-integrated",
+        target_ref=TARGET_REF,
+        dry_run=False,
+        allow_target_ref_mutation=False,
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    assert result["already_integrated"] is True
+    assert result["target_ref_mutated"] is False
+    assert preview_call["branch_ref"] == "refs/heads/codex/PB010-integrated"
+    saved = pbr.list_merge_queue_items(conn, PROJECT_ID, "mergeq-PB010-integrated")[0]
+    assert saved.status == "merged"
+    assert saved.branch_ref == "refs/heads/codex/PB010-integrated"
+    assert saved.merge_commit == "target-after"

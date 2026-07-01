@@ -17473,6 +17473,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 repo_root_path=repo_root,
                 queue_item_id=str(ctx.body.get("queue_item_id") or ""),
                 task_id=str(ctx.body.get("task_id") or ""),
+                branch_ref=str(ctx.body.get("branch_ref") or ""),
                 target_ref=target_ref,
                 evidence=evidence,
                 batch_status=str(ctx.body.get("batch_status") or ""),
@@ -17482,6 +17483,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                     "allow_target_ref_mutation",
                     False,
                 ),
+                allow_route_gated_reclaimed_fence_without_token=bool(route_gate),
                 message=str(ctx.body.get("message") or ""),
                 bug_id=str(ctx.body.get("bug_id") or ""),
                 source_contract_id=str(
