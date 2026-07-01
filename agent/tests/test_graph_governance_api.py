@@ -26684,6 +26684,121 @@ def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     assert result["next_legal_action"]["id"] != "resume_blocked_contract_chain"
 
 
+def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continue(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-ONBOARD-FIXED-COMPLETE-SUPPRESSES-CONTINUE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (backlog_id,),
+    )
+    conn.commit()
+
+    projection_reads = {"count": 0}
+
+    def fake_contract_chain_current_projection(
+        _conn,
+        *,
+        project_id,
+        backlog_id,
+        rebuild_if_missing=False,
+        route_token_ref="",
+    ):
+        projection_reads["count"] += 1
+        base = {
+            "schema_version": "backlog_contract_chain_current.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_chain_id": "cchain-fixed-complete",
+            "root_contract_execution_id": "cex-fixed-complete-root",
+            "current_contract_execution_id": "cex-fixed-complete-root",
+            "current_contract_id": "mf_parallel.v1",
+            "parent_to_resume_contract_execution_id": "",
+            "active_child_contract_execution_id": "",
+            "projection_source": "backlog_contract_chain_current",
+            "source_of_proof": "contract_runtime_executions.completed_lines",
+            "route_token_ref": route_token_ref,
+            "generation": 7,
+            "projection_watermark": 123,
+            "projection_hash": f"sha256:fixed-complete-{projection_reads['count']}",
+        }
+        if projection_reads["count"] == 1:
+            return {
+                **base,
+                "readiness_state": "contract_active",
+                "next_legal_action": {
+                    "id": "continue_contract_chain",
+                    "action": "continue_contract_chain",
+                    "source": "stale_test_projection",
+                },
+            }
+        return {
+            **base,
+            "readiness_state": "contract_complete",
+            "next_legal_action": {},
+        }
+
+    def stale_normal_continue_resume(
+        _conn,
+        *,
+        project_id,
+        backlog_id,
+        actor_role,
+        route_token_ref="",
+    ):
+        return {
+            "schema_version": "onboard_route_guide.runtime_resume.v1",
+            "status": "blocked",
+            "mode": "resume_blocked_contract",
+            "source": "task_timeline_compact_ledger",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "actor_role": actor_role,
+            "next_legal_action": {
+                "id": "continue_contract_chain",
+                "action": "continue_contract_chain",
+                "route_token_ref": route_token_ref,
+            },
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        fake_contract_chain_current_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_blocked_contract_resume_projection",
+        stale_normal_continue_resume,
+    )
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-fixed-complete",
+            },
+        )
+    )
+
+    resume = result["runtime_resume"]
+    assert resume["readiness_state"] == "contract_complete"
+    assert resume["next_legal_action"] == {}
+    conflict = resume["projection_conflict"]
+    assert conflict["status"] == "suppressed_terminal_fixed_continue"
+    assert conflict["backlog_row_status"] == "FIXED"
+    assert conflict["shadowed_next_legal_action"]["id"] == "continue_contract_chain"
+    assert resume["fixed_row_terminal"] is True
+    assert result["next_legal_action"]["id"] != "continue_contract_chain"
+    assert result["next_legal_action"]["action"] != "continue_contract_chain"
+
+
 def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-RESUME-DIRECT-FIX"
     _insert_simple_mf_close_backlog(conn, backlog_id)

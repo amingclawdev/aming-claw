@@ -838,6 +838,125 @@ def test_server_chain_current_refreshes_stale_next_action_after_finish(tmp_path)
     )
 
 
+def test_server_chain_current_projects_mf_parallel_runtime_context_completion_read_only(
+    tmp_path,
+    monkeypatch,
+):
+    from agent.governance import server
+
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    record = runtime.start_execution(
+        "mf_parallel.v1",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-RUNTIME-CONTEXT-PROJECTED-COMPLETE",
+        contract_execution_id="cex-mf-parallel-runtime-context-projected-complete",
+        actor_role="observer",
+        route_token_ref="rtok-mf-parallel-runtime-context-projected-complete",
+    )
+    stored_before = runtime.store.get(record["contract_execution_id"])
+    assert stored_before.get("completed_lines") == []
+    durable = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-RUNTIME-CONTEXT-PROJECTED-COMPLETE",
+    )
+    assert durable["readiness_state"] == "contract_active"
+    assert durable["next_legal_action"]["line_id"] == "observer_prefill_child_contracts"
+
+    projected_line = {
+        "stage_id": "observer_prefill",
+        "line_id": "observer_prefill_child_contracts",
+        "actor_role": "observer",
+        "evidence_kind": "mf_parallel_prefill",
+        "line_instance_id": "runtime_context:mfrctx-projected-complete",
+        "payload": {
+            "source": "runtime_context_worker_evidence",
+            "projection_persists_completed_line": False,
+            "observer_authored_worker_backfill": False,
+        },
+    }
+    projection = {
+        "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
+        "source": "runtime_context_worker_evidence",
+        "projected_completed_lines": [projected_line],
+        "projected_line_count": 1,
+        "persistence": {
+            "mutates_contract_runtime_completed_lines": False,
+            "observer_authored_worker_backfill": False,
+        },
+    }
+
+    def projected_runtime_current(_conn, *, project_id, record, actor_role):
+        assert project_id == "aming-claw"
+        assert actor_role == "observer"
+        projected = dict(record)
+        projected["execution_state_revision"] = 2
+        projected["execution_state"] = {
+            "schema_version": "contract_execution_state.v1",
+            "contract_execution_id": record["contract_execution_id"],
+            "execution_state_revision": 2,
+            "execution_state_hash": "sha256:projected-runtime-context-state",
+            "completed_lines": [projected_line],
+        }
+        projected["runtime_guide"] = {
+            "schema_version": "contract_runtime_guide.v1",
+            "next_legal_action": None,
+            "runtime_guide_hash": "sha256:projected-runtime-context-guide",
+            "execution": {
+                "project_id": "aming-claw",
+                "backlog_id": (
+                    "AC-MF-PARALLEL-RUNTIME-CONTEXT-PROJECTED-COMPLETE"
+                ),
+                "contract_execution_id": record["contract_execution_id"],
+                "execution_state_revision": 2,
+                "execution_state_hash": "sha256:projected-runtime-context-state",
+                "route_token_ref": (
+                    "rtok-mf-parallel-runtime-context-projected-complete"
+                ),
+            },
+        }
+        return projected, projection
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        projected_runtime_current,
+    )
+
+    refreshed = server._contract_chain_current_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-RUNTIME-CONTEXT-PROJECTED-COMPLETE",
+    )
+
+    assert refreshed["readiness_state"] == "contract_complete"
+    assert refreshed["next_legal_action"] == {}
+    assert refreshed["contract_runtime_current_state"]["readiness_state"] == (
+        "contract_complete"
+    )
+    assert refreshed["contract_runtime_current_state"]["next_legal_action"] == {}
+    freshness = refreshed["projection_freshness"]
+    assert freshness["status"] == "refreshed_from_contract_runtime_current"
+    assert freshness["runtime_context_projection_applied"] is True
+    assert freshness["readiness_state_changed"] is True
+    assert freshness["stale_readiness_state"] == "contract_active"
+    assert freshness["refreshed_readiness_state"] == "contract_complete"
+    assert freshness["runtime_context_projection"]["persistence"] == {
+        "mutates_contract_runtime_completed_lines": False,
+        "observer_authored_worker_backfill": False,
+    }
+
+    stored_after = runtime.store.get(record["contract_execution_id"])
+    assert stored_after.get("completed_lines") == []
+
+
 def test_mf_parallel_failed_qa_summary_resets_completion_path(tmp_path):
     _write_contract_definition(
         tmp_path,

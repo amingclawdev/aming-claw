@@ -35149,10 +35149,18 @@ def _runtime_next_action_from_guide(
     return result
 
 
+def _runtime_readiness_state_from_guide(guide: Mapping[str, Any]) -> str:
+    if "next_legal_action" not in guide:
+        return ""
+    if guide.get("next_legal_action") is None:
+        return "contract_complete"
+    return "contract_active"
+
+
 def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
-    return {
+    current_state = {
         "schema_version": "contract_runtime_current_state.v1",
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
         "parent_contract_execution_id": str(
@@ -35171,6 +35179,10 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
         "next_legal_action": _runtime_next_action_from_guide(guide),
     }
+    readiness_state = _runtime_readiness_state_from_guide(guide)
+    if readiness_state:
+        current_state["readiness_state"] = readiness_state
+    return current_state
 
 
 _CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS = (
@@ -35310,9 +35322,16 @@ def _contract_chain_current_with_runtime_freshness(
         guide,
         source="backlog_contract_chain_current",
     )
-    if _contract_chain_next_action_freshness_key(
+    fresh_readiness_state = _runtime_readiness_state_from_guide(guide)
+    stale_readiness_state = str(current.get("readiness_state") or "")
+    readiness_changed = bool(
+        fresh_readiness_state
+        and fresh_readiness_state != stale_readiness_state
+    )
+    next_action_changed = _contract_chain_next_action_freshness_key(
         previous_next_action
-    ) == _contract_chain_next_action_freshness_key(fresh_next_action):
+    ) != _contract_chain_next_action_freshness_key(fresh_next_action)
+    if not next_action_changed and not readiness_changed:
         return current
 
     if fresh_next_action:
@@ -35330,12 +35349,16 @@ def _contract_chain_current_with_runtime_freshness(
     projected_record["runtime_guide"] = guide
     current_state = _runtime_current_state_from_record(projected_record)
     current_state["next_legal_action"] = dict(fresh_next_action)
+    if fresh_readiness_state:
+        current_state["readiness_state"] = fresh_readiness_state
 
     overlay = dict(current)
     durable_projection_hash = str(current.get("projection_hash") or "")
     if durable_projection_hash:
         overlay["durable_projection_hash"] = durable_projection_hash
     overlay["next_legal_action"] = dict(fresh_next_action)
+    if fresh_readiness_state:
+        overlay["readiness_state"] = fresh_readiness_state
     overlay["generation"] = int(
         current_state.get("execution_state_revision") or current.get("generation") or 0
     )
@@ -35351,8 +35374,12 @@ def _contract_chain_current_with_runtime_freshness(
         ),
         "runtime_guide_hash": str(current_state.get("runtime_guide_hash") or ""),
         "runtime_context_projection_applied": bool(runtime_context_projection),
+        "stale_readiness_state": stale_readiness_state,
+        "refreshed_readiness_state": fresh_readiness_state or stale_readiness_state,
+        "readiness_state_changed": readiness_changed,
         "stale_next_legal_action": previous_next_action,
         "refreshed_next_legal_action": dict(fresh_next_action),
+        "next_legal_action_changed": next_action_changed,
         "preserved_context_keys": [
             key
             for key in _CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS
@@ -35949,6 +35976,19 @@ def _source_backed_contract_chain_is_complete(
     return not next_action and not str(
         current_projection.get("active_child_contract_execution_id") or ""
     ).strip()
+
+
+def _backlog_row_status_for_onboard_route(conn, backlog_id: str) -> str:
+    try:
+        row = conn.execute(
+            "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return ""
+    return str(_row_get(row, "status", "") or "").strip().upper()
 
 
 def _backlog_has_source_backed_onboarding(
@@ -40532,7 +40572,7 @@ def _onboard_route_guide_patch_next_action(
     if not isinstance(container, dict):
         return
     next_action = container.get("next_legal_action")
-    if isinstance(next_action, Mapping):
+    if isinstance(next_action, Mapping) and next_action:
         action_execution_id = str(next_action.get("contract_execution_id") or "")
         if not action_execution_id or action_execution_id == target_contract_execution_id:
             container["next_legal_action"] = dict(patched_next_action)
@@ -41079,6 +41119,7 @@ def _onboard_route_guide_service_response(
     preexisting_projection_complete = _source_backed_contract_chain_is_complete(
         preexisting_projection
     )
+    backlog_row_status = _backlog_row_status_for_onboard_route(conn, backlog_id)
     record = _onboard_service_materialize_parent_record(
         conn,
         project_id=project_id,
@@ -41165,14 +41206,28 @@ def _onboard_route_guide_service_response(
                 route_token_ref=route_token_ref,
             )
             if blocked_resume:
-                if preexisting_projection_complete:
+                suppress_stale_resume = preexisting_projection_complete or (
+                    backlog_row_status == "FIXED"
+                    and selected_work_type == "continue_contract_chain"
+                )
+                if suppress_stale_resume:
+                    conflict_status = (
+                        "suppressed_terminal_fixed_continue"
+                        if (
+                            backlog_row_status == "FIXED"
+                            and selected_work_type == "continue_contract_chain"
+                            and not preexisting_projection_complete
+                        )
+                        else "suppressed_stale_resume"
+                    )
                     runtime_resume["projection_conflict"] = {
                         "schema_version": "onboard_route_guide.projection_conflict.v1",
-                        "status": "suppressed_stale_resume",
+                        "status": conflict_status,
                         "authoritative_source": "backlog_contract_chain_current",
                         "authoritative_readiness_state": str(
                             current_projection.get("readiness_state") or ""
                         ),
+                        "backlog_row_status": backlog_row_status,
                         "shadowed_source": str(blocked_resume.get("source") or ""),
                         "shadowed_mode": str(blocked_resume.get("mode") or ""),
                         "shadowed_next_legal_action": dict(
@@ -41185,6 +41240,12 @@ def _onboard_route_guide_service_response(
                             "backlog_contract_chain_current"
                         ),
                     }
+                    if backlog_row_status == "FIXED":
+                        runtime_resume["projection_conflict"]["safe_next_step"] = (
+                            "row_is_fixed; use explicit audit/reopen recovery "
+                            "instead of normal continue_contract_chain"
+                        )
+                        runtime_resume["fixed_row_terminal"] = True
                     runtime_resume["stale_compact_ledger_suppressed"] = True
                 else:
                     blocked_resume["shadowed_current_projection"] = {
