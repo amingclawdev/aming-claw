@@ -48511,6 +48511,8 @@ def _contract_runtime_authoritative_close_verification(
     result["close_authority"] = {
         "schema_version": "contract_runtime_close_authority.v1",
         "source": source,
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_close_authority_projection",
         "legacy": False,
         "advisory": False,
         "authoritative": True,
@@ -48523,6 +48525,7 @@ def _contract_runtime_authoritative_close_verification(
     result["legacy_advisory"] = False
     result["authoritative"] = True
     result["source_of_authority"] = "contract_runtime"
+    result["authority_decision_source"] = "contract_runtime_close_authority_projection"
     result["failed_gates"] = []
 
     gate_keys = [
@@ -48670,6 +48673,8 @@ def _contract_runtime_close_authority_failure_details(
         {
             "gate": "contract_runtime_close_authority_projection",
             "status": status,
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
             "missing_requirement_ids": missing_ids,
             "contract_execution_id": contract_execution_id,
         }
@@ -48679,6 +48684,8 @@ def _contract_runtime_close_authority_failure_details(
         contract_execution_id=contract_execution_id,
     )
     return {
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_close_authority_projection",
         "timeline_gate": legacy_diagnostics,
         "failed_gates": failed_gates,
         "runtime_projection_authority_failed": True,
@@ -48699,6 +48706,8 @@ def _missing_contract_runtime_close_authority_details(
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": False,
         "status": "missing",
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_close_authority_projection",
         "contract_execution_id": requested_execution_id,
         "requested_contract_execution_id": requested_execution_id,
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
@@ -48719,10 +48728,14 @@ def _missing_contract_runtime_close_authority_details(
             {
                 "gate": "contract_runtime_close_authority_projection",
                 "status": "missing",
+                "source_of_authority": "contract_runtime",
+                "authority_decision_source": "contract_runtime_close_authority_projection",
                 "missing_requirement_ids": missing_ids,
                 "contract_execution_id": requested_execution_id,
             }
         ],
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_close_authority_projection",
         "runtime_projection_authority_failed": True,
         "contract_runtime_close_authority_projection": projection,
         "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
@@ -48742,13 +48755,20 @@ def _runtime_context_child_lane_close_authority_projection(
         runtime_context_child_lane_close_authority_projection,
     )
 
-    return runtime_context_child_lane_close_authority_projection(
+    projection = runtime_context_child_lane_close_authority_projection(
         project_id=project_id,
         backlog_id=bug_id,
         requested_execution_id=requested_execution_id,
         close_commit=close_commit,
         timeline_events=timeline_events,
     )
+    if projection:
+        projection.setdefault("source_of_authority", "contract_runtime")
+        projection.setdefault(
+            "authority_decision_source",
+            "contract_runtime_close_authority_projection",
+        )
+    return projection
 
 
 def _contract_runtime_close_authority_seed_events(
@@ -48994,6 +49014,10 @@ def _contract_runtime_close_authority_projection(
             {
                 "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
                 "accepted": False,
+                "source_of_authority": "contract_runtime",
+                "authority_decision_source": (
+                    "contract_runtime_close_authority_projection"
+                ),
                 "contract_execution_id": contract_execution_id,
                 "error": str(exc),
             },
@@ -49009,6 +49033,10 @@ def _contract_runtime_close_authority_projection(
             {
                 "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
                 "accepted": False,
+                "source_of_authority": "contract_runtime",
+                "authority_decision_source": (
+                    "contract_runtime_close_authority_projection"
+                ),
                 "contract_execution_id": contract_execution_id,
                 "project_id": project_id,
                 "backlog_id": bug_id,
@@ -49035,6 +49063,10 @@ def _contract_runtime_close_authority_projection(
             {
                 "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
                 "accepted": False,
+                "source_of_authority": "contract_runtime",
+                "authority_decision_source": (
+                    "contract_runtime_close_authority_projection"
+                ),
                 "contract_execution_id": contract_execution_id,
                 "error": str(exc),
             },
@@ -49046,6 +49078,8 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "incomplete",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_current_state",
             "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
                 source="contract_runtime_close_authority_projection",
                 contract_execution_id=contract_execution_id,
@@ -49135,6 +49169,8 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_route_identity",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
             "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
                 source="contract_runtime_close_authority_projection",
                 contract_execution_id=contract_execution_id,
@@ -49196,6 +49232,8 @@ def _contract_runtime_close_authority_projection(
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
             "accepted": False,
             "status": "missing_completed_lines",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
             "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
                 source="contract_runtime_close_authority_projection",
                 contract_execution_id=contract_execution_id,
@@ -49209,6 +49247,8 @@ def _contract_runtime_close_authority_projection(
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
         "accepted": True,
         "status": "projected",
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_close_authority_projection",
         "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
             source="contract_runtime_close_authority_projection",
             contract_execution_id=contract_execution_id,
