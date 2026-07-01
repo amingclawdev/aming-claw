@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import tools as mcp_tools
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
@@ -201,6 +202,43 @@ class _OfflineGovRecorder(_Recorder):
         return {"ok": False, "error": "<urlopen error timed out>"}
 
 
+class _TimeoutAwareGovRecorder:
+    gov_url = "http://governance.test"
+
+    def __init__(self, *, timeout_current_full: bool = False):
+        self.timeout_current_full = timeout_current_full
+        self.calls: list[tuple[str, str, dict | None, int]] = []
+
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        raise AssertionError("generic governance API should not handle current-full reconcile")
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        data: dict | None = None,
+        timeout: int = 15,
+    ) -> dict:
+        self.calls.append((method, url, data, timeout))
+        if url.endswith("/reconcile/current-full") and self.timeout_current_full:
+            return {"ok": False, "error": "timed out"}
+        if "/operations/queue" in url:
+            return {
+                "ok": True,
+                "operations": [
+                    {
+                        "operation_id": "current-full-run-1",
+                        "operation_type": "current_full_reconcile",
+                        "status": "running",
+                        "progress": {"done": 3, "total": 10},
+                        "last_result": "run current-full-run-1 still running",
+                    }
+                ],
+                "count": 1,
+            }
+        return {"ok": True, "method": method, "url": url, "data": data}
+
+
 def _dispatcher(recorder: _Recorder, manager: _Recorder | None = None) -> ToolDispatcher:
     return ToolDispatcher(
         api_fn=recorder.api,
@@ -277,6 +315,8 @@ def test_mcp_graph_current_full_reconcile_schema_exposes_route_proof_fields():
         assert key in props
 
     assert props["observer_session_id"]["type"] == "string"
+    assert props["timeout_seconds"]["type"] == "integer"
+    assert "900 seconds" in props["timeout_seconds"]["description"]
     assert "raw route tokens are not accepted" in props["observer_route_token_ref"][
         "description"
     ]
@@ -314,6 +354,133 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
                 "observer_session_id": "obs-current-full",
                 "observer_route_token_ref": "rtok-current-full",
             },
+        )
+    ]
+
+
+def test_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
+    monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    recorder = _TimeoutAwareGovRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        service_mgr=None,
+        workspace=".",
+    )
+
+    result = dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-run-1",
+            "timeout_seconds": 1200,
+        },
+    )
+
+    assert result["ok"] is True
+    assert recorder.calls == [
+        (
+            "POST",
+            "http://governance.test/api/graph-governance/aming-claw/reconcile/current-full",
+            {"run_id": "current-full-run-1"},
+            1200,
+        )
+    ]
+
+
+def test_mcp_graph_current_full_reconcile_default_timeout_is_long(monkeypatch):
+    monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    recorder = _TimeoutAwareGovRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        service_mgr=None,
+        workspace=".",
+    )
+
+    dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-run-1",
+        },
+    )
+
+    assert recorder.calls[0][3] == 900
+
+
+def test_mcp_graph_current_full_reconcile_timeout_returns_poll_guidance(monkeypatch):
+    monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    recorder = _TimeoutAwareGovRecorder(timeout_current_full=True)
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        service_mgr=None,
+        workspace=".",
+    )
+
+    result = dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-run-1",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "reconcile_timeout"
+    assert result["run_id"] == "current-full-run-1"
+    assert result["status"] == "running"
+    assert result["progress"] == {"done": 3, "total": 10}
+    assert result["next_legal_action"]["poll_tool"] == "graph_operations_queue"
+    assert result["next_legal_action"]["retry_tool"] == "graph_current_full_reconcile"
+    assert recorder.calls[0][3] == 900
+    assert recorder.calls[1] == (
+        "GET",
+        "http://governance.test/api/graph-governance/aming-claw/operations/queue"
+        "?include_status_observations=true&include_resolved=false",
+        None,
+        10,
+    )
+
+
+def test_governance_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
+    monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
+    calls = []
+
+    def fake_http(
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        gov_token: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict:
+        calls.append((method, path, body, gov_token, timeout_seconds))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    governance_mcp_server._dispatch_tool(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-run-1",
+            "timeout_seconds": 1200,
+        },
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/reconcile/current-full",
+            {"run_id": "current-full-run-1"},
+            None,
+            1200,
         )
     ]
 
@@ -2087,9 +2254,13 @@ def test_mcp_host_ops_tools_route_to_manager_sidecar():
         },
     )
 
+    expected_redeploy_body = {"chain_version": "abc1234"}
+    branch_ref = dispatcher._git_branch()
+    if branch_ref:
+        expected_redeploy_body["branch_ref"] = branch_ref
     assert manager.calls == [
         ("GET", "/api/manager/health", None),
-        ("POST", "/api/manager/redeploy/governance", {"chain_version": "abc1234"}),
+        ("POST", "/api/manager/redeploy/governance", expected_redeploy_body),
         ("POST", "/api/manager/respawn-executor", {"chain_version": "abc1234"}),
     ]
     assert governance.calls == []
