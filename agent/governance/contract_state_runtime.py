@@ -229,6 +229,8 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "merge",
     "merge_preview",
     "merge_queue_entry",
+    "merge_queue_item_materialize",
+    "merge_queue_item_materialized",
     "mf_subagent_finish_gate",
     "mf_subagent_read_receipt",
     "mf_subagent_startup",
@@ -292,6 +294,8 @@ _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
         "dispatch_bounded_worker",
         "merge_preview",
         "merge_queue_entry",
+        "merge_queue_item_materialize",
+        "merge_queue_item_materialized",
         "live_merge",
         "merge",
         "reconcile",
@@ -525,7 +529,10 @@ _MF_PARALLEL_DEFAULT_REQUIREMENTS = [
     {
         "id": "worker_finish_gate",
         "action": "record_mf_subagent_finish_gate",
-        "detail": "mf_sub worker records the close-satisfying finish gate and stops at review_ready or waiting_merge",
+        "detail": (
+            "mf_sub worker records the close-satisfying finish gate, then stops; "
+            "observer resumes with independent QA and durable merge queue materialization"
+        ),
         "accepted_event_kinds": ["mf_subagent_finish_gate", "finish_gate", "review_ready"],
         "owner_role": "mf_sub",
         "allowed_writer_roles": ["mf_sub"],
@@ -543,13 +550,33 @@ _MF_PARALLEL_DEFAULT_REQUIREMENTS = [
         "order": 700,
     },
     {
-        "id": "observer_merge",
-        "action": "record_merge",
-        "detail": "observer records merge evidence for QA-accepted worker candidates",
-        "accepted_event_kinds": ["merge", "live_merge", "merge_preview"],
+        "id": "observer_merge_queue_item_materialize",
+        "action": "materialize_merge_queue_item",
+        "detail": (
+            "observer materializes a durable merge queue item after independent QA; "
+            "use the merge_queue_item_materialize path with the worker finish checkpoint"
+        ),
+        "accepted_event_kinds": [
+            "merge_queue_item_materialize",
+            "merge_queue_item_materialized",
+            "merge_queue_entry",
+        ],
         "owner_role": "observer",
         "allowed_writer_roles": ["observer"],
         "requires": ["qa_independent_verification"],
+        "order": 760,
+    },
+    {
+        "id": "observer_merge",
+        "action": "record_merge",
+        "detail": (
+            "observer records merge evidence only after the QA-accepted worker candidate "
+            "has a durable merge queue item"
+        ),
+        "accepted_event_kinds": ["merge", "live_merge", "merge_preview"],
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "requires": ["observer_merge_queue_item_materialize"],
         "order": 800,
     },
     {

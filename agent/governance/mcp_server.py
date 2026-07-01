@@ -663,6 +663,59 @@ def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
     }
 
 
+def _parallel_branch_merge_queue_materialize_schema_properties() -> dict[str, Any]:
+    return {
+        "project_id": {"type": "string"},
+        "flow": {
+            "type": "string",
+            "enum": _MERGE_QUEUE_FLOW_VALUES,
+            "description": "Client hint for direct-fix, hotfix, mf_parallel, or mf_batch_parallel callers.",
+        },
+        "merge_queue_id": {"type": "string"},
+        "queue_item_id": {"type": "string"},
+        "queue_index": {"type": "integer"},
+        "task_id": {"type": "string"},
+        "backlog_id": {"type": "string"},
+        "target_ref": {"type": "string"},
+        "current_target_head": {"type": "string"},
+        "latest_target_head": {"type": "string"},
+        "validated_target_head": {"type": "string"},
+        "validation_attempt": {"type": "integer"},
+        "merge_preview_id": {"type": "string"},
+        "checkpoint_id": {
+            "type": "string",
+            "description": "Worker finish-gate checkpoint id; required when require_finish_gate is true.",
+        },
+        "require_finish_gate": {
+            "type": "boolean",
+            "description": "Defaults to true when checkpoint_id is provided.",
+        },
+        "worker_role": {"type": "string"},
+        "status": {"type": "string"},
+        "fence_token": {"type": "string"},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "hard_depends_on": {"type": "array", "items": {"type": "string"}},
+        "serializes_after": {"type": "array", "items": {"type": "string"}},
+        "conflicts_with": {"type": "array", "items": {"type": "string"}},
+        "same_node_or_file_conflicts": {"type": "array", "items": {"type": "string"}},
+        "requires_graph_epoch": {"type": "array", "items": {"type": "string"}},
+        "route_token": {
+            "type": "object",
+            "description": "Route-token evidence required when governance protects this mutation.",
+        },
+        "route_token_ref": {
+            "type": "string",
+            "description": "Opaque server-registered route token reference.",
+        },
+        "route_waiver": {"type": "object"},
+        "route_token_waiver": {"type": "object"},
+        "scenario_id": {"type": "string"},
+        "now_iso": {"type": "string"},
+        "actor": {"type": "string"},
+        "contract_actor": {"type": "string"},
+    }
+
+
 def _parallel_branch_merge_queue_status_query(args: dict) -> dict[str, str]:
     query: dict[str, str] = {}
     for key in (
@@ -726,6 +779,53 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         evidence = dict(evidence)
         evidence.setdefault("qa_evidence", args["qa_evidence"])
         body["evidence"] = evidence
+    return body
+
+
+def _parallel_branch_merge_queue_materialize_body(args: dict) -> dict:
+    allowed_keys = {
+        "merge_queue_id",
+        "queue_item_id",
+        "queue_index",
+        "task_id",
+        "backlog_id",
+        "target_ref",
+        "current_target_head",
+        "validated_target_head",
+        "validation_attempt",
+        "merge_preview_id",
+        "checkpoint_id",
+        "require_finish_gate",
+        "worker_role",
+        "status",
+        "fence_token",
+        "depends_on",
+        "hard_depends_on",
+        "serializes_after",
+        "conflicts_with",
+        "same_node_or_file_conflicts",
+        "requires_graph_epoch",
+        "route_token",
+        "route_token_ref",
+        "route_waiver",
+        "route_token_waiver",
+        "scenario_id",
+        "now_iso",
+        "actor",
+        "contract_actor",
+    }
+    body = {
+        key: value
+        for key, value in args.items()
+        if key in allowed_keys and value is not None
+    }
+    latest_target_head = str(args.get("latest_target_head") or "").strip()
+    if latest_target_head and not body.get("current_target_head"):
+        body["current_target_head"] = latest_target_head
+    if body.get("backlog_id") and not body.get("bug_id"):
+        body["bug_id"] = body["backlog_id"]
+    if body.get("checkpoint_id") and "require_finish_gate" not in body:
+        body["require_finish_gate"] = True
     return body
 
 
@@ -1693,6 +1793,19 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_merge_queue_materialize",
+        "description": (
+            "Materialize a durable merge queue item after mf_sub finish gate and "
+            "independent QA. This is the explicit mf_parallel handoff before "
+            "ordered merge apply."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _parallel_branch_merge_queue_materialize_schema_properties(),
+            "required": ["project_id", "merge_queue_id", "task_id"],
+        },
+    },
+    {
         "name": "parallel_branch_merge_queue_apply",
         "description": (
             "Copy-safe ordered merge queue apply path. Defaults to dry_run; "
@@ -2423,6 +2536,15 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http(
             "GET",
             f"/api/graph-governance/{pid}/parallel-branches{qs}",
+        )
+
+    if name == "parallel_branch_merge_queue_materialize":
+        pid = args["project_id"]
+        body = _parallel_branch_merge_queue_materialize_body(args)
+        return _http(
+            "POST",
+            f"/api/graph-governance/{pid}/parallel-branches/merge-queue/materialize",
+            body,
         )
 
     if name == "parallel_branch_merge_queue_apply":

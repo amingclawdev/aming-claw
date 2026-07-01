@@ -359,8 +359,13 @@ The normal worker order is:
 5. Implement only inside the file/worktree fence, then write implementation
    evidence through the runtime-context `implementation-evidence` facade with
    changed files, tests, and graph trace ids.
-6. Record finish-time worker attestation and the finish gate, then stop at
-   `review_ready` or `waiting_merge`.
+6. Record finish-time worker attestation and the finish gate, then stop. The
+   worker does not merge, mutate the merge queue, or write QA evidence. After
+   the finish gate, the observer resumes the parent contract with independent
+   QA, then materializes the durable merge queue item with
+   `parallel_branch_merge_queue_materialize` (or HTTP
+   `parallel-branches/merge-queue/materialize`) using the worker finish
+   checkpoint before any ordered merge apply.
 
 Startup and implementation belong to the same live worker session for the
 happy path. If a startup-only probe exits, do not reuse that completed

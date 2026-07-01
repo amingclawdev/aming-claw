@@ -10184,6 +10184,83 @@ def test_parallel_branch_merge_queue_accepts_root_route_token_ref_for_child_lane
     assert gate["route_token_ref"] == issued["route_token_ref"]
 
 
+def test_parallel_branch_merge_queue_materialize_records_contract_event_after_finish_gate(conn):
+    root_task_id = "root-route-materialize-task"
+    child_task_id = f"{root_task_id}-focus-ui"
+    queue_id = "mergeq-api-materialize-route-ref"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=root_task_id,
+        task_id=root_task_id,
+        target_files=["src/app.js"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:qa-independent-verification"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-materialize-root-route-ref",
+            backlog_id=root_task_id,
+            root_task_id=root_task_id,
+            task_id=child_task_id,
+            branch_ref="refs/heads/codex/root-route-materialize-child",
+            status=STATE_VALIDATED,
+            fence_token="fence-root-route-materialize-child",
+            base_commit="base-root-route",
+            head_commit="head-root-route",
+            target_head_commit="target-root-route",
+            checkpoint_id="ckpt-root-route-materialize-child",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-06-21T20:10:00Z",
+    )
+    conn.commit()
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": child_task_id,
+                "merge_queue_id": queue_id,
+                "queue_index": 1,
+                "checkpoint_id": "ckpt-root-route-materialize-child",
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "now_iso": "2026-06-21T20:11:00Z",
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["task_id"] == child_task_id
+    assert queued["timeline_event_recorded"]["event_kind"] == (
+        "merge_queue_item_materialize"
+    )
+    assert queued["timeline_event_recorded"]["requirement_ids"] == [
+        "observer_merge_queue_item_materialize"
+    ]
+    stored_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=root_task_id,
+        event_kind="merge_queue_item_materialize",
+        limit=5,
+    )
+    assert len(stored_events) == 1
+    payload = stored_events[0]["payload"]
+    assert payload["child_task_id"] == child_task_id
+    assert payload["checkpoint_id"] == "ckpt-root-route-materialize-child"
+
+
 def test_parallel_branch_checkpoint_refreshes_worktree_head_before_merge_queue(conn, tmp_path):
     repo = _git_repo(tmp_path)
     base = subprocess.run(

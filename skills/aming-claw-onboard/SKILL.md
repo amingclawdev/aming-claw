@@ -68,6 +68,11 @@ instructions.
 - For QA evidence that is materialized by a parent observer, keep the QA owner,
   submitter, materialized-from, and authorization provenance fields returned by
   the runtime guide; do not collapse it into observer-authored QA.
+- For `mf_parallel` workers, finish gate is the worker's last write. After
+  `mf_subagent_finish_gate`, resume the parent contract with independent QA,
+  then call `parallel_branch_merge_queue_materialize` (or HTTP
+  `parallel-branches/merge-queue/materialize`) with the finish checkpoint before
+  `parallel_branch_merge_queue_apply`.
 - Route-token-ref renewal must preserve or narrow the existing project,
   backlog/task, allowed-actions, target-files, and owned-files scope. If the
   observer session is stale, heartbeat or register an observer session before

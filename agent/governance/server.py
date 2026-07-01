@@ -17333,6 +17333,95 @@ def _record_parallel_branch_merge_contract_timeline_events(
     return events
 
 
+def _record_parallel_branch_merge_queue_materialize_event(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    queued: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Record the contract line that makes a durable queue item visible."""
+    from . import task_timeline
+
+    context = queued.get("context") if isinstance(queued.get("context"), Mapping) else {}
+    queue_item = (
+        queued.get("queue_item") if isinstance(queued.get("queue_item"), Mapping) else {}
+    )
+    child_task_id = str(
+        queue_item.get("task_id") or context.get("task_id") or body.get("task_id") or ""
+    ).strip()
+    backlog_id = str(
+        body.get("backlog_id")
+        or body.get("bug_id")
+        or context.get("backlog_id")
+        or queue_item.get("backlog_id")
+        or ""
+    ).strip()
+    parent_task_id = str(
+        body.get("parent_task_id")
+        or context.get("root_task_id")
+        or context.get("chain_id")
+        or context.get("parent_task_id")
+        or backlog_id
+        or child_task_id
+        or ""
+    ).strip()
+    actor = str(body.get("contract_actor") or body.get("actor") or "codex-observer").strip()
+    queue_item_id = str(queue_item.get("queue_item_id") or body.get("queue_item_id") or "").strip()
+    merge_queue_id = str(
+        queue_item.get("merge_queue_id") or body.get("merge_queue_id") or ""
+    ).strip()
+    checkpoint_id = str(
+        body.get("checkpoint_id") or context.get("checkpoint_id") or ""
+    ).strip()
+    evidence_ref = f"merge_queue_item:{queue_item_id}" if queue_item_id else ""
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        event_type="parallel.merge_queue_item_materialize",
+        event_kind="merge_queue_item_materialize",
+        phase="merge_queue",
+        actor=actor,
+        status="accepted",
+        payload={
+            "schema_version": "mf_parallel_merge_queue_item_materialize.v1",
+            "requirement_id": "observer_merge_queue_item_materialize",
+            "requirement_ids": ["observer_merge_queue_item_materialize"],
+            "contract_evidence": [
+                {
+                    "requirement_id": "observer_merge_queue_item_materialize",
+                    "status": "passed",
+                    "evidence_refs": [evidence_ref] if evidence_ref else [],
+                }
+            ],
+            "merge_queue_id": merge_queue_id,
+            "queue_item_id": queue_item_id,
+            "child_task_id": child_task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": backlog_id,
+            "checkpoint_id": checkpoint_id,
+            "route_token_gate": dict(route_gate or {}),
+            "queue_item": dict(queue_item),
+            "context": dict(context),
+            "source_of_authority": "parallel_branch_merge_queue_materialize",
+        },
+        artifact_refs={
+            "backlog_id": backlog_id,
+            "task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "merge_queue_id": merge_queue_id,
+            "queue_item_id": queue_item_id,
+            "checkpoint_id": checkpoint_id,
+        },
+        commit_sha=str(queue_item.get("branch_head") or context.get("head_commit") or ""),
+    )
+    return event
+
+
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue/materialize")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     """Enter one branch runtime context into the durable merge queue."""
@@ -17414,12 +17503,30 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 route_gate,
                 task_id=task_id,
             )
+            materialize_event = _record_parallel_branch_merge_queue_materialize_event(
+                conn,
+                project_id=project_id,
+                body=ctx.body,
+                queued=queued,
+                route_gate=route_gate,
+            )
             conn.commit()
         return {
             "ok": True,
             "project_id": project_id,
             "route_token_gate": route_gate,
             **queued,
+            "timeline_event_recorded": {
+                "id": materialize_event.get("id"),
+                "ref": f"timeline:{materialize_event.get('id')}",
+                "event_kind": materialize_event.get("event_kind"),
+                "phase": materialize_event.get("phase"),
+                "status": materialize_event.get("status"),
+                "requirement_ids": (
+                    materialize_event.get("payload", {}).get("requirement_ids")
+                    or materialize_event.get("payload", {}).get("requirement_id")
+                ),
+            },
             "decision": {
                 "scenario_id": decision.scenario_id,
                 "mergeable_task_ids": list(decision.mergeable_task_ids),

@@ -50,6 +50,37 @@ def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     )
 
 
+def test_parallel_branch_merge_queue_materialize_forwards_checkpoint():
+    properties = _tool_properties("parallel_branch_merge_queue_materialize")
+    assert "checkpoint_id" in properties
+    assert "require_finish_gate" in properties
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "parallel_branch_merge_queue_materialize",
+        {
+            "project_id": "aming-claw",
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "checkpoint_id": "ckpt-worker-finish",
+            "route_token_ref": "rtok-1",
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/parallel-branches/merge-queue/materialize",
+        {
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "checkpoint_id": "ckpt-worker-finish",
+            "route_token_ref": "rtok-1",
+            "require_finish_gate": True,
+        },
+    )
+
+
 class _Recorder:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []

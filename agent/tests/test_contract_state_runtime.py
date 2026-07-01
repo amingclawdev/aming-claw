@@ -1351,6 +1351,7 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
         "worker_finish_time_attestation",
         "worker_finish_gate",
         "qa_independent_verification",
+        "observer_merge_queue_item_materialize",
         "observer_merge",
         "observer_reconcile",
         "observer_close_ready",
@@ -1405,6 +1406,32 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
     )
     assert qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
 
+    materialize = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+            _event(9, "independent_verification"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert materialize["next_legal_action"]["id"] == (
+        "observer_merge_queue_item_materialize"
+    )
+    assert materialize["next_legal_action"]["timeline_append_hint"]["event_kind"] == (
+        "merge_queue_item_materialize"
+    )
+    assert materialize["next_legal_action"]["timeline_append_hint"]["actor_role"] == (
+        "observer"
+    )
+
     merge = build_contract_state_projection(
         [
             _event(1, "contract_binding"),
@@ -1416,6 +1443,7 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
             _event(7, "record_finish_time_worker_attestation"),
             _event(8, "mf_subagent_finish_gate"),
             _event(9, "independent_verification"),
+            _event(10, "merge_queue_item_materialize"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
