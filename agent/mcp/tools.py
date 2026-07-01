@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import posixpath
+import socket
 import subprocess
 import sys
 import urllib.parse
@@ -18,6 +19,14 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+_RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS = 900
+_RECONCILE_MCP_TIMEOUT_MAX_SECONDS = 8 * 60 * 60
+_RECONCILE_MCP_TIMEOUT_ENV_KEYS = (
+    "AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS",
+    "AMING_RECONCILE_MCP_TIMEOUT_SECONDS",
+)
+_RECONCILE_PROGRESS_POLL_TIMEOUT_SECONDS = 10
+
 
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
@@ -25,6 +34,156 @@ def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) 
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(value, maximum))
+
+
+def _positive_timeout_seconds(value: Any, default: int) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, _RECONCILE_MCP_TIMEOUT_MAX_SECONDS)
+
+
+def _reconcile_mcp_timeout_seconds(args: dict) -> int:
+    if args.get("timeout_seconds") is not None:
+        return _positive_timeout_seconds(
+            args.get("timeout_seconds"),
+            _RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS,
+        )
+    for key in _RECONCILE_MCP_TIMEOUT_ENV_KEYS:
+        if os.environ.get(key):
+            return _positive_timeout_seconds(
+                os.environ.get(key),
+                _RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS,
+            )
+    return _RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS
+
+
+def _is_timeout_result(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    text = " ".join(
+        str(result.get(key) or "")
+        for key in ("error", "message", "reason")
+    ).lower()
+    return (
+        str(result.get("error") or "") in {"request_timeout", "timeout", "timed_out"}
+        or "timed out" in text
+        or "timeout" in text
+    )
+
+
+def _summarize_reconcile_progress(queue: Any, run_id: str) -> dict:
+    if not isinstance(queue, dict) or queue.get("error"):
+        return {
+            "available": False,
+            "status": "unknown",
+            "progress": {},
+            "error": str(queue.get("error") if isinstance(queue, dict) else queue),
+        }
+
+    operations = queue.get("operations") if isinstance(queue.get("operations"), list) else []
+    matched_operation = None
+    if run_id:
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            haystack = " ".join(
+                str(operation.get(key) or "")
+                for key in ("operation_id", "target_id", "last_result", "run_id")
+            )
+            if run_id in haystack:
+                matched_operation = operation
+                break
+    if matched_operation is None and len(operations) == 1:
+        matched_operation = operations[0] if isinstance(operations[0], dict) else None
+
+    if matched_operation:
+        return {
+            "available": True,
+            "status": str(matched_operation.get("status") or "unknown"),
+            "progress": matched_operation.get("progress") or {},
+            "operation_id": matched_operation.get("operation_id") or "",
+            "operation_type": matched_operation.get("operation_type") or "",
+            "last_result": matched_operation.get("last_result") or "",
+        }
+
+    summary = queue.get("summary") if isinstance(queue.get("summary"), dict) else {}
+    graph_stale = summary.get("graph_stale") if isinstance(summary.get("graph_stale"), dict) else {}
+    metrics = summary.get("reconcile_metrics") if isinstance(summary.get("reconcile_metrics"), dict) else {}
+    latest = (
+        metrics.get("latest_full_rebuild_fallback")
+        if isinstance(metrics.get("latest_full_rebuild_fallback"), dict)
+        else {}
+    )
+    status = "unknown"
+    progress: dict[str, Any] = {}
+    if latest and (not run_id or latest.get("run_id") == run_id):
+        status = str(latest.get("status") or "observed")
+        progress = {"elapsed_ms": latest.get("elapsed_ms")}
+    elif graph_stale:
+        status = "graph_current" if graph_stale.get("is_stale") is False else "graph_stale"
+
+    return {
+        "available": bool(summary or graph_stale or latest),
+        "status": status,
+        "progress": progress,
+        "operation_count": queue.get("count", 0),
+        "active_snapshot_id": queue.get("active_snapshot_id") or queue.get("snapshot_id") or "",
+        "graph_stale": graph_stale,
+    }
+
+
+def _current_full_reconcile_run_id(body: dict) -> str:
+    explicit = str(body.get("run_id") or "").strip()
+    if explicit:
+        return explicit
+    target = str(body.get("target_commit_sha") or body.get("commit_sha") or "").strip()
+    if target:
+        return f"current-full-{target[:7]}"
+    return ""
+
+
+def _current_full_reconcile_timeout_response(
+    project_id: str,
+    body: dict,
+    *,
+    timeout_seconds: int,
+    timeout_result: dict,
+    progress: dict,
+) -> dict:
+    run_id = _current_full_reconcile_run_id(body)
+    return {
+        "ok": False,
+        "error": "reconcile_timeout",
+        "project_id": project_id,
+        "run_id": run_id,
+        "run_id_available": bool(run_id),
+        "timeout_seconds": timeout_seconds,
+        "status": progress.get("status") or "unknown",
+        "progress": progress.get("progress") or {},
+        "reconcile_progress": progress,
+        "timeout_error": timeout_result.get("error") or timeout_result.get("message") or "",
+        "message": (
+            "graph_current_full_reconcile exceeded its bounded MCP reconcile "
+            "timeout. The reconcile may still be running; poll "
+            "graph_operations_queue or graph_status before deciding whether to retry."
+        ),
+        "next_legal_action": {
+            "action": "poll_graph_operations_queue_or_retry_safely",
+            "poll_tool": "graph_operations_queue",
+            "status_tool": "graph_status",
+            "retry_tool": "graph_current_full_reconcile",
+            "safe_retry": True,
+            "retry_guidance": (
+                "Poll graph_operations_queue for the run/progress first. Retry only "
+                "after no running reconcile is reported, preferably with the same "
+                "run_id when one was supplied."
+            ),
+        },
+    }
 
 
 def _backlog_list_query(args: dict) -> dict:
@@ -2087,6 +2246,13 @@ TOOLS: list[dict] = [
                 "semantic_enrich": {"type": "boolean"},
                 "enqueue_stale": {"type": "boolean", "default": False},
                 "notes_extra": {"type": "object"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": (
+                        "Client-side MCP reconcile request timeout. Defaults to "
+                        "AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS or 900 seconds."
+                    ),
+                },
             },
             "required": ["project_id"],
         },
@@ -3120,6 +3286,39 @@ class ToolDispatcher:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _governance_api_with_timeout(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        timeout_seconds: int,
+    ) -> dict:
+        """Call governance with an endpoint-specific timeout when the host exposes it."""
+        bound_owner = getattr(self._api, "__self__", None)
+        request_json = getattr(bound_owner, "_request_json", None) if bound_owner is not None else None
+        if callable(request_json):
+            url = f"{self._governance_url()}{path}"
+            try:
+                return request_json(method, url, data, timeout=timeout_seconds)
+            except (TimeoutError, socket.timeout) as exc:
+                return {
+                    "ok": False,
+                    "error": "request_timeout",
+                    "message": str(exc),
+                    "timeout_seconds": timeout_seconds,
+                }
+            except Exception as exc:
+                if _is_timeout_result({"error": str(exc)}):
+                    return {
+                        "ok": False,
+                        "error": "request_timeout",
+                        "message": str(exc),
+                        "timeout_seconds": timeout_seconds,
+                    }
+                return {"ok": False, "error": str(exc)}
+        return self._api(method, path, data)
+
     def dispatch(self, name: str, args: dict) -> Any:
         args = dict(args or {})
         # --- Task tools ---
@@ -3744,16 +3943,36 @@ class ToolDispatcher:
 
         if name == "graph_current_full_reconcile":
             pid = args["project_id"]
+            timeout_seconds = _reconcile_mcp_timeout_seconds(args)
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if key not in {"project_id", "timeout_seconds"} and value is not None
             }
-            return self._api(
+            result = self._governance_api_with_timeout(
                 "POST",
                 f"/api/graph-governance/{pid}/reconcile/current-full",
                 body,
+                timeout_seconds=timeout_seconds,
             )
+            if _is_timeout_result(result):
+                queue = self._governance_api_with_timeout(
+                    "GET",
+                    f"/api/graph-governance/{pid}/operations/queue"
+                    "?include_status_observations=true&include_resolved=false",
+                    timeout_seconds=_RECONCILE_PROGRESS_POLL_TIMEOUT_SECONDS,
+                )
+                return _current_full_reconcile_timeout_response(
+                    pid,
+                    body,
+                    timeout_seconds=timeout_seconds,
+                    timeout_result=result,
+                    progress=_summarize_reconcile_progress(
+                        queue,
+                        _current_full_reconcile_run_id(body),
+                    ),
+                )
+            return result
 
         if name == "stale_artifact_cleanup":
             pid = args["project_id"]
