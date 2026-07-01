@@ -26191,8 +26191,6 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "onboard_contract_start",
         "onboard_contract_current",
         "onboard_contract_submit_line",
-        "observer_hotfix_enter",
-        "hotfix_enter",
         "contract_runtime_current",
         "contract_runtime_submit_line",
         "task_timeline_append",
@@ -26216,9 +26214,27 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert [step["id"] for step in route_guide["guide_steps"]] == [
         "confirm_role",
         "confirm_work_type",
+        "establish_observer_session_route_ref",
         "bind_backlog_contract_chain",
         "return_execution_guidance",
     ]
+    session_checklist = route_guide["observer_session_route_token_checklist"]
+    assert [step["id"] for step in session_checklist["ordered_steps"]] == [
+        "observer_session_register",
+        "observer_session_keepalive",
+        "observer_route_context_issue_or_renew",
+    ]
+    assert session_checklist["ordered_steps"][1]["heartbeat_interval_sec"] == 300
+    assert "direct_fix_enter" in session_checklist["required_before"]
+    assert "mf_parallel_enter" in session_checklist["required_before"]
+    assert "backlog_close" in session_checklist["required_before"]
+    assert session_checklist["identity_boundaries"]["not_interchangeable"] is True
+    assert (
+        session_checklist["missing_observer_session_id_recovery"][
+            "cannot_recover_from_route_token_ref_alone"
+        ]
+        is True
+    )
     assert {option["id"] for option in route_guide["role_options"]} == {
         "observer",
         "worker",
@@ -26228,11 +26244,13 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "capability_query",
         "system_operation",
         "continue_contract_chain",
-        "observer_hotfix",
         "operator_supervised_direct_main",
         "multi_backlog_parallel",
         "parallel_worker",
         "qa_verification",
+    }
+    assert "observer_hotfix" not in {
+        option["id"] for option in route_guide["work_type_options"]
     }
     assert route_guide["backlog_chain_binding"]["backlog_id"] == backlog_id
     assert route_guide["backlog_chain_binding"]["contract_execution_id"] == (
@@ -26248,7 +26266,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         item["contract_id"]: item
         for item in route_guide["role_entries"]["observer"]["next_contracts"]
     }
-    assert observer_next["observer_hotfix"]["interface"] == "hotfix_enter"
+    assert "observer_hotfix" not in observer_next
     assert observer_next["mf_parallel"]["interface"] == "mf_parallel_enter"
     assert observer_next["mf_parallel"]["single_backlog_scoped"] is True
     assert observer_next["mf_batch_parallel"]["interface"] == "mf_batch_parallel_enter"
@@ -26256,6 +26274,31 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert observer_next["contract_add"]["interface"] == "contract_add_start"
     assert observer_next["contract_update"]["interface"] == "contract_update_start"
     assert observer_next["qa_session"]["interface"] == "qa_session_register"
+    direct_fix_guide = observer_next["direct_fix"]["guide"]
+    assert {
+        item["id"] for item in direct_fix_guide["classifications"]
+    } == {
+        "parentless_single_branch_direct_merge",
+        "blocked_parent_successor_return_to_parent",
+        "multi_parallel_merge_queue",
+    }
+    assert (
+        direct_fix_guide["progress_audit_before_stopping_or_replacing_worker"][
+            "required"
+        ]
+        is True
+    )
+    assert "independent QA evidence from a distinct verifier lane" in direct_fix_guide[
+        "completion_sequence"
+    ]
+    assert direct_fix_guide["branch_service_validation"]["canonical_port"] == 40000
+    assert route_guide["runtime_authority_preference"]["preferred_sources"] == [
+        "backlog_contract_chain_current",
+        "ContractRuntime current_state",
+    ]
+    recovery = route_guide["legacy_operator_recovery"]
+    assert recovery["default_visible"] is False
+    assert recovery["interfaces"]["observer_hotfix"]["interface"] == "hotfix_enter"
     direct_main = route_guide["role_entries"]["observer"]["direct_main"]
     assert direct_main["id"] == "operator_supervised_direct_main"
     assert direct_main["entrypoint"] == "observer_direct_mutation_exception"
@@ -26282,6 +26325,13 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert "runtime_context_worker_guide" in route_guide["capability_index"][
         "interfaces"
     ]
+    assert "observer_session_register" in route_guide["capability_index"][
+        "interfaces"
+    ]
+    assert "observer_route_context_renew" in route_guide["capability_index"][
+        "interfaces"
+    ]
+    assert "hotfix_enter" not in route_guide["capability_index"]["interfaces"]
     assert "observer_direct_mutation_exception" in route_guide["capability_index"][
         "interfaces"
     ]
@@ -26310,7 +26360,10 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert reconcile_op["legacy_recovery"]["pending_scope_queue_path"] == (
         "/api/graph-governance/{project_id}/pending-scope"
     )
-    assert route_guide["interface_index"]["hotfix_enter"]["path"] == (
+    assert "hotfix_enter" not in route_guide["interface_index"]
+    assert route_guide["legacy_operator_recovery"]["interfaces"]["hotfix_enter"][
+        "path"
+    ] == (
         "/api/projects/{project_id}/hotfix/enter"
     )
     assert route_guide["interface_index"]["mf_parallel_enter"]["path"] == (
@@ -26332,6 +26385,14 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert direct_exception_interface["event_kind"] == (
         "observer_direct_implementation_exception"
     )
+    assert route_guide["backlog_chain_binding"]["create_successor"][
+        "direct_fix"
+    ]["guide"]["completion_sequence"][-1] == (
+        "close backlog only through the protected backlog_close route after close authority is current"
+    )
+    assert "observer_hotfix" not in route_guide["backlog_chain_binding"][
+        "create_successor"
+    ]
     assert route_guide["backlog_chain_binding"]["create_successor"][
         "operator_supervised_direct_main"
     ] == {
@@ -26646,7 +26707,7 @@ def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(con
     assert start["create_backlog"]["mcp_tool"] == "backlog_upsert"
     assert start["select_backlog"]["list_tool"] == "backlog_list"
     assert start["demo_creation"]["id"] == "daily_planner_demo"
-    assert "observer_hotfix" in start["backlog_required_for_work_types"]
+    assert "legacy_operator_recovery" in start["backlog_required_for_work_types"]
     assert result["agent_onboard_guidance"]["route_token_issue"]["status"] == (
         "not_required_for_no_backlog_discovery"
     )
@@ -26679,7 +26740,7 @@ def test_onboard_route_guide_no_backlog_system_operation_returns_policy(conn):
     "work_type",
     [
         "continue_contract_chain",
-        "observer_hotfix",
+        "legacy_operator_recovery",
         "operator_supervised_direct_main",
         "direct_fix",
         "multi_backlog_parallel",
@@ -26956,7 +27017,20 @@ def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
     assert route_guide["backlog_chain_binding"]["runtime_resume"][
         "next_legal_action"
     ] == next_action
-    assert route_guide["backlog_chain_binding"]["create_successor"]["direct_fix"] == {
+    direct_fix_successor = route_guide["backlog_chain_binding"]["create_successor"][
+        "direct_fix"
+    ]
+    assert {
+        key: direct_fix_successor[key]
+        for key in (
+            "interface",
+            "requires_role",
+            "requires_route_token_ref",
+            "requires_parent_contract_execution_id",
+            "blocked_parent_only",
+            "contract_template_id",
+        )
+    } == {
         "interface": "direct_fix_enter",
         "requires_role": "observer",
         "requires_route_token_ref": True,
@@ -26964,6 +27038,9 @@ def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
         "blocked_parent_only": True,
         "contract_template_id": "direct_fix.v1",
     }
+    assert direct_fix_successor["guide"]["classifications"][1]["id"] == (
+        "blocked_parent_successor_return_to_parent"
+    )
 
 
 def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
@@ -34859,6 +34936,17 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
         "observer_route_token_ref",
         "route_token_ref",
     ]
+    assert guide_ref["observer_session_route_token_checklist"]["ordered_steps"][1][
+        "heartbeat_interval_sec"
+    ] == 300
+    assert (
+        guide_ref["observer_session_route_token_checklist"]["identity_boundaries"][
+            "route_token_ref"
+        ]
+        != guide_ref["observer_session_route_token_checklist"]["identity_boundaries"][
+            "observer_session_id"
+        ]
+    )
     current = guide["contract_chain_current"]
     assert current["source_of_authority"] == "contract_runtime"
     assert current["authority_projection"]["required_next_action_id"] == (
@@ -34894,6 +34982,7 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
     assert root["next_legal_action_deferred_by_contract_runtime_current"]["id"] != (
         "route_action_precheck"
     )
+    assert guide["runtime_resume"]["authority_preference"]["stale_compact_ledger_authoritative"] is False
 
 
 def test_onboard_route_guide_marks_onboard_service_ref_enter_only_for_mf_parallel_current(

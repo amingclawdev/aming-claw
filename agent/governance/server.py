@@ -2972,6 +2972,246 @@ def _observer_session_renewal_gate_guidance(
     }
 
 
+_OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS = (
+    "direct_fix_enter",
+    "mf_parallel_enter",
+    "mf_batch_parallel_enter",
+    "backlog_close",
+    "contract_runtime_submit_line",
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+)
+
+
+def _observer_session_route_token_checklist(
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+) -> dict[str, Any]:
+    """Public-safe observer session and route-token prerequisite checklist."""
+
+    heartbeat_interval = observer_session.HEARTBEAT_INTERVAL_SEC
+    return {
+        "schema_version": "onboard_route_guide.observer_session_route_token_checklist.v1",
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "required_before": list(_OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS),
+        "protected_write_actions": list(_OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS),
+        "ordered_steps": [
+            {
+                "id": "observer_session_register",
+                "order": 1,
+                "mcp_tool": "observer_session_register",
+                "http_entrypoint": {
+                    "method": "POST",
+                    "path": "/api/projects/{project_id}/observer-sessions/register",
+                },
+                "produces": ["observer_session_id", "observer_session_token"],
+                "raw_session_token_persisted": False,
+            },
+            {
+                "id": "observer_session_keepalive",
+                "order": 2,
+                "mcp_tool": "observer_session_heartbeat",
+                "http_entrypoint": {
+                    "method": "POST",
+                    "path": (
+                        "/api/projects/{project_id}/observer-sessions/"
+                        "{observer_session_id}/heartbeat"
+                    ),
+                },
+                "heartbeat_interval_sec": heartbeat_interval,
+                "keepalive_every_sec": heartbeat_interval,
+                "requires": ["observer_session_id", "observer_session_token"],
+            },
+            {
+                "id": "observer_route_context_issue_or_renew",
+                "order": 3,
+                "mcp_tools": [
+                    "observer_route_context_issue",
+                    "observer_route_context_renew",
+                ],
+                "http_entrypoints": [
+                    {
+                        "method": "POST",
+                        "path": (
+                            "/api/projects/{project_id}/observer/"
+                            "route-context/issue"
+                        ),
+                    },
+                    {
+                        "method": "POST",
+                        "path": (
+                            "/api/projects/{project_id}/observer/"
+                            "route-context/renew"
+                        ),
+                    },
+                ],
+                "produces_or_refreshes": [
+                    "observer_route_token_ref",
+                    "route_token_ref",
+                ],
+                "requires": ["active observer_session_id"],
+                "route_token_ref": str(route_token_ref or "").strip(),
+                "observer_session_id": str(observer_session_id or "").strip(),
+            },
+        ],
+        "identity_boundaries": {
+            "observer_session_id": (
+                "Observer liveness principal used with the observer session token "
+                "for heartbeat/keepalive and protected observer facades."
+            ),
+            "observer_session_token": (
+                "Secret session credential used to authenticate/sign observer "
+                "session operations; do not persist it in timeline, code, docs, or "
+                "backlog rows."
+            ),
+            "observer_route_token_ref": (
+                "Opaque route-token reference authorizing a scoped observer route "
+                "write. It is the same public-safe value accepted as route_token_ref."
+            ),
+            "route_token_ref": (
+                "Alias for observer_route_token_ref on protected route facades; it "
+                "is not an observer_session_id and cannot prove session liveness."
+            ),
+            "not_interchangeable": True,
+        },
+        "missing_observer_session_id_recovery": {
+            "status": "recoverable_with_active_or_new_observer_session",
+            "sequence": [
+                "If a session id is known, authenticate/sign with its session token and heartbeat it.",
+                "If heartbeat reports stale, revoked, closed, or missing, register a new observer session.",
+                "After a session is active, issue or renew the same-scope observer route token ref.",
+            ],
+            "cannot_recover_from_route_token_ref_alone": True,
+            "mcp_tools": [
+                "observer_session_heartbeat",
+                "observer_session_register",
+                "observer_route_context_issue",
+                "observer_route_context_renew",
+            ],
+        },
+        "raw_session_token_required_for_register_response": True,
+        "raw_session_token_persisted": False,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _direct_fix_topology_guidance() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.direct_fix_topology_guidance.v1",
+        "default_entrypoint": "direct_fix_enter",
+        "classifications": [
+            {
+                "id": "parentless_single_branch_direct_merge",
+                "applies_when": (
+                    "the operator explicitly approves a tiny parentless direct "
+                    "main/worktree repair"
+                ),
+                "entrypoint": "observer_direct_mutation_exception",
+                "direct_fix_successor": False,
+                "merge_policy": "single_branch_direct_merge_after_evidence",
+            },
+            {
+                "id": "blocked_parent_successor_return_to_parent",
+                "applies_when": (
+                    "a source-backed parent contract is blocked or failed QA and "
+                    "must be repaired by a child successor"
+                ),
+                "entrypoint": "direct_fix_enter",
+                "requires_parent_contract_execution_id": True,
+                "return_to_parent_required": True,
+            },
+            {
+                "id": "multi_parallel_merge_queue",
+                "applies_when": (
+                    "one or more row-scoped parallel workers are coordinated by "
+                    "mf_parallel or mf_batch_parallel"
+                ),
+                "entrypoints": ["mf_parallel_enter", "mf_batch_parallel_enter"],
+                "merge_queue_required": True,
+                "direct_fix_role": "repair blocked parent/child lane only",
+            },
+        ],
+        "progress_audit_before_stopping_or_replacing_worker": {
+            "required": True,
+            "checks": [
+                "read current runtime_context_worker_guide/current state",
+                "inspect latest task timeline for startup, graph trace, implementation, tests, finish gate, and blockers",
+                "compare branch head, changed files, and owned-file fence before cancelling or replacing the worker",
+                "record the audit decision before dispatching a replacement worker",
+            ],
+        },
+        "completion_sequence": [
+            "direct-fix implementation evidence",
+            "independent QA evidence from a distinct verifier lane",
+            "branch-service validation on canonical governance port when runtime code changed",
+            "merge or redeploy only after QA and route/branch-service checks pass",
+            "run full graph reconcile after merge/redeploy when governed source changed",
+            "close backlog only through the protected backlog_close route after close authority is current",
+        ],
+        "branch_service_validation": _direct_fix_branch_service_takeover_guidance(),
+    }
+
+
+def _runtime_authority_preference_guidance() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.runtime_authority_preference.v1",
+        "preferred_sources": [
+            "backlog_contract_chain_current",
+            "ContractRuntime current_state",
+        ],
+        "fallback_sources": ["task_timeline_compact_ledger"],
+        "rule": (
+            "Prefer live backlog_contract_chain_current / ContractRuntime "
+            "projection for resume and next legal action decisions; use compact "
+            "ledger only as a recovery fallback when the live projection is "
+            "missing or cannot be rebuilt."
+        ),
+        "stale_compact_ledger_authoritative": False,
+    }
+
+
+def _legacy_operator_recovery_guidance() -> dict[str, Any]:
+    return {
+        "schema_version": "onboard_route_guide.legacy_operator_recovery.v1",
+        "default_visible": False,
+        "ordinary_observer_path": False,
+        "use_only_when": [
+            "explicit operator recovery request",
+            "legacy hotfix audit or repair is returned by live ContractRuntime guidance",
+            "governance service recovery where normal successor routing is blocked",
+        ],
+        "interfaces": {
+            "observer_hotfix": {
+                "interface": "hotfix_enter",
+                "path": "/api/projects/{project_id}/hotfix/enter",
+                "requires_role": "observer",
+                "requires_route_token_ref": True,
+                "requires_operator_recovery_context": True,
+            },
+            "hotfix_enter": {
+                "kind": "http",
+                "method": "POST",
+                "path": "/api/projects/{project_id}/hotfix/enter",
+                "legacy_operator_recovery_only": True,
+            },
+        },
+        "route_token_allowed_actions": [
+            "observer_hotfix_enter",
+            "hotfix_enter",
+            "task_timeline_append",
+        ],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _route_token_ref_error_details(
     exc: BaseException,
     *,
@@ -35944,6 +36184,7 @@ def _onboard_runtime_resume_from_current_projection(
         "authority_decision_source": str(
             current_projection.get("authority_decision_source") or ""
         ),
+        "authority_preference": _runtime_authority_preference_guidance(),
         "projection_watermark": int(
             current_projection.get("projection_watermark") or 0
         ),
@@ -38704,7 +38945,6 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "onboard_contract_start",
     "onboard_contract_current",
     "onboard_contract_submit_line",
-    "observer_hotfix_enter",
     "direct_fix_enter",
     "observer_direct_mutation_exception",
     "contract_add_start",
@@ -39237,9 +39477,9 @@ def _onboard_backlog_start_guidance(project_id: str) -> dict[str, Any]:
         },
         "backlog_required_for_work_types": [
             "continue_contract_chain",
-            "observer_hotfix",
             "operator_supervised_direct_main",
             "direct_fix",
+            "legacy_operator_recovery",
             "multi_backlog_parallel",
             "parallel_worker",
             "qa_verification",
@@ -39274,7 +39514,7 @@ def _onboard_no_backlog_system_operation_policy() -> dict[str, Any]:
             "config_mutation",
             "contract_mutation",
             "dashboard_mutation",
-            "hotfix",
+            "legacy_operator_recovery",
             "parallel_worker",
             "multi_backlog_parallel",
             "qa_verification",
@@ -39391,6 +39631,12 @@ def _onboard_no_backlog_service_response(
                 "schema_version": "onboard_contract.route_token_ref_guidance.v1",
                 "current_route_token_ref": route_token_ref,
                 "current_ref_present": bool(route_token_ref),
+                "observer_session_route_token_checklist": (
+                    _observer_session_route_token_checklist(
+                        project_id=project_id,
+                        route_token_ref=route_token_ref,
+                    )
+                ),
                 "raw_route_token_required": False,
                 "raw_route_token_exposed": False,
             },
@@ -39565,10 +39811,6 @@ def _onboard_contract_route_guide(
             "entry": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
         },
         {
-            "id": "observer_hotfix",
-            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.observer.next_contracts",
-        },
-        {
             "id": "operator_supervised_direct_main",
             "entry": (
                 "agent_onboard_guidance.onboard_route_guide.role_entries."
@@ -39647,10 +39889,27 @@ def _onboard_contract_route_guide(
             "method": "POST",
             "path": "/api/projects/{project_id}/observer/route-context/issue",
         },
-        "hotfix_enter": {
-            "kind": "http",
+        "observer_route_context_renew": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "observer_route_context_renew",
             "method": "POST",
-            "path": "/api/projects/{project_id}/hotfix/enter",
+            "path": "/api/projects/{project_id}/observer/route-context/renew",
+        },
+        "observer_session_register": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "observer_session_register",
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer-sessions/register",
+        },
+        "observer_session_heartbeat": {
+            "kind": "mcp_or_http",
+            "mcp_tool": "observer_session_heartbeat",
+            "method": "POST",
+            "path": (
+                "/api/projects/{project_id}/observer-sessions/"
+                "{observer_session_id}/heartbeat"
+            ),
+            "heartbeat_interval_sec": observer_session.HEARTBEAT_INTERVAL_SEC,
         },
         "direct_fix_enter": {
             "kind": "http",
@@ -39857,6 +40116,15 @@ def _onboard_contract_route_guide(
         "raw_route_token_exposed": False,
     }
     graph_first_policy = _onboard_graph_first_policy()
+    observer_route_checklist = _observer_session_route_token_checklist(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+    direct_fix_guidance = _direct_fix_topology_guidance()
+    runtime_authority_preference = _runtime_authority_preference_guidance()
+    legacy_operator_recovery = _legacy_operator_recovery_guidance()
     return {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
@@ -39880,13 +40148,22 @@ def _onboard_contract_route_guide(
                 "selection_required": True,
             },
             {
-                "id": "bind_backlog_contract_chain",
+                "id": "establish_observer_session_route_ref",
                 "order": 3,
+                "binding": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "observer_session_route_token_checklist"
+                ),
+                "required_before": list(_OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS),
+            },
+            {
+                "id": "bind_backlog_contract_chain",
+                "order": 4,
                 "binding": "agent_onboard_guidance.onboard_route_guide.backlog_chain_binding",
             },
             {
                 "id": "return_execution_guidance",
-                "order": 4,
+                "order": 5,
                 "binding": "agent_onboard_guidance.onboard_route_guide.role_entries",
             },
         ],
@@ -39900,11 +40177,6 @@ def _onboard_contract_route_guide(
                 "next_legal_action": dict(next_legal_action),
             },
             "create_successor": {
-                "observer_hotfix": {
-                    "interface": "hotfix_enter",
-                    "requires_role": "observer",
-                    "requires_route_token_ref": True,
-                },
                 "direct_fix": {
                     "interface": "direct_fix_enter",
                     "requires_role": "observer",
@@ -39912,6 +40184,7 @@ def _onboard_contract_route_guide(
                     "requires_parent_contract_execution_id": True,
                     "blocked_parent_only": True,
                     "contract_template_id": DIRECT_FIX_TEMPLATE_ID,
+                    "guide": direct_fix_guidance,
                 },
                 "mf_parallel": {
                     "interface": "mf_parallel_enter",
@@ -39963,16 +40236,14 @@ def _onboard_contract_route_guide(
                 "required_token_refs": ["observer_route_token_ref", "route_token_ref"],
                 "current_route_token_ref_present": bool(route_token_ref),
                 "next_action": "follow next_legal_action or create a successor contract/runtime",
+                "observer_session_route_token_checklist": observer_route_checklist,
                 "next_contracts": [
-                    {
-                        "contract_id": "observer_hotfix",
-                        "interface": "hotfix_enter",
-                    },
                     {
                         "contract_id": DIRECT_FIX_CONTRACT_ID,
                         "interface": "direct_fix_enter",
                         "contract_template_id": DIRECT_FIX_TEMPLATE_ID,
                         "blocked_parent_only": True,
+                        "guide": direct_fix_guidance,
                     },
                     {
                         "contract_id": "mf_parallel",
@@ -40020,13 +40291,20 @@ def _onboard_contract_route_guide(
                 "backlog_chain_binding",
                 "graph_first_policy",
                 "source_hints",
+                "observer_session_route_token_checklist",
+                "direct_fix_topology_guidance",
+                "runtime_authority_preference",
+                "legacy_operator_recovery",
             ],
             "interfaces": [
                 "graph_query",
                 "backlog_get",
                 "backlog_list",
                 "contract_chain_current",
+                "observer_session_register",
+                "observer_session_heartbeat",
                 "observer_route_context_issue",
+                "observer_route_context_renew",
                 "contract_add_start",
                 "contract_update_start",
                 "runtime_context_worker_guide",
@@ -40056,6 +40334,22 @@ def _onboard_contract_route_guide(
                 "source_hints": (
                     "agent_onboard_guidance.onboard_route_guide.graph_first_policy."
                     "source_hint_policy"
+                ),
+                "observer_session_route_token_checklist": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "observer_session_route_token_checklist"
+                ),
+                "direct_fix_topology_guidance": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "direct_fix_topology_guidance"
+                ),
+                "runtime_authority_preference": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "runtime_authority_preference"
+                ),
+                "legacy_operator_recovery": (
+                    "agent_onboard_guidance.onboard_route_guide."
+                    "legacy_operator_recovery"
                 ),
             },
         },
@@ -40168,6 +40462,10 @@ def _onboard_contract_route_guide(
         },
         "graph_first_policy": graph_first_policy,
         "interface_index": interface_index,
+        "observer_session_route_token_checklist": observer_route_checklist,
+        "direct_fix_topology_guidance": direct_fix_guidance,
+        "runtime_authority_preference": runtime_authority_preference,
+        "legacy_operator_recovery": legacy_operator_recovery,
         "next_legal_action": dict(next_legal_action),
         "route_token_ref": route_token_ref,
         "route_token_ref_present": bool(route_token_ref),
@@ -40225,6 +40523,12 @@ def _onboard_contract_agent_guidance(
         task_id=contract_execution_id,
         route_token_ref=route_token_ref,
         reason="long_running_agent_route_token_ref_refresh",
+    )
+    observer_route_checklist = _observer_session_route_token_checklist(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        route_token_ref=route_token_ref,
     )
     route_guide = _onboard_contract_route_guide(
         record,
@@ -40304,6 +40608,7 @@ def _onboard_contract_agent_guidance(
             "current_ref_present": bool(route_token_ref),
             "pass_to_next_runtime_writes_as": ["route_token_ref"],
             "required_token_refs": ["session_token_ref", "route_token_ref"],
+            "observer_session_route_token_checklist": observer_route_checklist,
             "raw_session_token_required": False,
             "raw_session_token_exposed": False,
             "raw_route_token_required": False,
@@ -40373,6 +40678,7 @@ def _onboard_contract_agent_guidance(
                 "qa_child_route_token_ref",
                 "route_token_ref",
             ],
+            "observer_session_route_token_checklist": observer_route_checklist,
             "raw_qa_session_token_required": False,
             "raw_qa_session_token_exposed": False,
             "raw_route_token_required": False,
@@ -40388,6 +40694,12 @@ def _onboard_contract_agent_guidance(
             "observer_session_id": {
                 "required": True,
                 "source": "active observer session",
+            },
+            "observer_session_token": {
+                "required": True,
+                "source": "observer_session_register response or active session secret",
+                "purpose": "authenticate/sign heartbeat and protected observer session operations",
+                "raw_session_token_persisted": False,
             },
             "observer_route_token_ref": {
                 "required": True,
@@ -40409,6 +40721,7 @@ def _onboard_contract_agent_guidance(
                 "observer_route_token_ref",
                 "route_token_ref",
             ],
+            "observer_session_route_token_checklist": observer_route_checklist,
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
         }
@@ -40424,6 +40737,7 @@ def _onboard_contract_agent_guidance(
                 "path_params": {"project_id": project_id},
             },
             "observer_route_context_issue_payload": issue_payload,
+            "observer_session_route_token_checklist": observer_route_checklist,
             "scope": scope,
             "allowed_actions": allowed_actions,
             "raw_route_token_required": False,
@@ -40440,6 +40754,7 @@ def _onboard_contract_agent_guidance(
         "selected_role_guidance": selected_role_guidance,
         "route_token_ref_guidance": route_token_ref_guidance,
         "route_token_issue": route_token_issue,
+        "observer_session_route_token_checklist": observer_route_checklist,
         "next_legal_action": dict(next_legal_action),
         "contract_chain": {
             "schema_version": "onboard_contract.contract_chain_guidance.v1",
@@ -40677,6 +40992,12 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         route_token_ref=renewal_ref,
         reason="long_running_contract_runtime_route_token_ref_refresh",
     )
+    observer_route_checklist = _observer_session_route_token_checklist(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=target_execution_id,
+        route_token_ref=renewal_ref,
+    )
     if verified_ref:
         patched_next_action["route_token_ref"] = verified_ref
         patched_next_action["route_token_ref_status"] = status
@@ -40715,6 +41036,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         "observer_route_context_issue_payload": issue_payload,
         "renewal": renewal_guidance,
         "route_token_ref_renewal": renewal_guidance,
+        "observer_session_route_token_checklist": observer_route_checklist,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -40741,6 +41063,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         },
         "observer_route_context_issue_payload": issue_payload,
         "renewal": renewal_guidance,
+        "observer_session_route_token_checklist": observer_route_checklist,
         "scope": {
             "project_id": project_id,
             "backlog_id": backlog_id,
