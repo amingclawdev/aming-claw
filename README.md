@@ -11,7 +11,7 @@ That is the core move from the public article:
 Search, grep, RAG, and repo maps still matter, but they are fact-layer tools.
 They should not be the control loop for an agent that is already drifting.
 
-![Aming Claw dashboard and AI session sharing the same project evidence](docs/assets/hero.png)
+![The Guided Runtime push-not-pull diagram](docs/assets/guided-runtime-hero.png)
 
 ## Status
 
