@@ -79,11 +79,24 @@ can answer HTTP. They do not prove the AI host loaded `.mcp.json`, exposed the
 Aming Claw MCP server, or has route/current-context visibility.
 
 Every source-controlled mutation must be contract-bound before it happens. This
-applies to hotfix, parallel MF, Docker dogfood, fixture, docs, dashboard,
-runtime, config, and test changes alike: update or create the backlog row,
-bind the route/contract identity, record timeline evidence for the intended
-action, then mutate only the allowed files. A hotfix changes the allowed route,
-not the requirement to leave contract and timeline evidence.
+applies to parallel MF, direct fix, legacy/operator recovery, Docker dogfood,
+fixture, docs, dashboard, runtime, config, and test changes alike: update or
+create the backlog row, bind the route/contract identity, record timeline
+evidence for the intended action, then mutate only the allowed files. A legacy
+recovery hotfix changes the allowed route, not the requirement to leave
+contract and timeline evidence.
+
+Observer-owned protected writes have a fixed identity order. First call
+`observer_session_register`. Keep that session alive with
+`observer_session_heartbeat` every 300 seconds. Then call
+`observer_route_context_issue` or `observer_route_context_renew` before
+`direct_fix_enter`, `mf_parallel_enter`, backlog close, graph reconcile, or any
+other protected write. The `observer_session_id` and its session token prove
+observer liveness; `observer_route_token_ref` / `route_token_ref` proves scoped
+route authority. They are not interchangeable. If `observer_session_id` is
+missing, recover by authenticating/signing with the known session token and
+heartbeating that session, or register a fresh observer session before issuing
+or renewing the route-token ref.
 
 During governed execution, the live runtime is the authority for what is legal
 next. Use `observer-root-route-context`, `runtime_context_worker_guide`,
@@ -92,7 +105,10 @@ acting. Historical docs, `docs/dev/` drafts, previous timeline examples, and
 source-code searches are orientation only; they do not authorize a step. If the
 runtime guidance is missing, stale, contradictory, or too vague to act on, file
 that as blocker evidence and stop instead of reconstructing the flow from old
-context prose.
+context prose. Runtime resume should prefer live
+`backlog_contract_chain_current` / ContractRuntime current state; compact-ledger
+resume is a recovery fallback only when the live projection is missing or cannot
+be rebuilt.
 
 When a parent observer materializes QA evidence from a QA-owned packet or role
 session, preserve evidence-owner, submitter, materialized-from, and
@@ -298,6 +314,31 @@ Route context is not satisfied by reading this onboarding document or by
 searching source files. Workers and observers must consume the runtime-projected
 route context and record the required evidence through the current facade for
 their role.
+
+Default onboard guidance does not expose `observer_hotfix` / `hotfix_enter` as
+ordinary observer paths. Those interfaces are legacy/operator recovery only and
+should appear through the live guide's explicit `legacy_operator_recovery`
+surface or a concrete operator recovery instruction. Ordinary repairs use the
+current ContractRuntime `next_legal_action`, `direct_fix_enter`,
+`mf_parallel_enter`, or `mf_batch_parallel_enter`.
+
+Classify direct-fix topology before action:
+
+1. Parentless single-branch direct merge: only for explicit operator-approved,
+   tiny direct-main repairs with pre-mutation exception evidence.
+2. Blocked-parent successor: use `direct_fix_enter`, repair in the child
+   contract, run independent QA, and record return-to-parent evidence before
+   parent close authority resumes.
+3. Multi/parallel merge queue: use `mf_parallel_enter` or
+   `mf_batch_parallel_enter`; row-scoped workers finish into the merge queue
+   rather than direct parent mutation.
+
+Before stopping or replacing a worker, audit progress from the latest runtime
+current state, worker guide, task timeline, graph traces, branch head, changed
+files, tests, finish gate, and blockers. Complete direct-fix work with
+independent QA, branch-service validation on canonical governance port when
+runtime code changed, merge or redeploy, full graph reconcile, and protected
+backlog close.
 
 The normal worker order is:
 

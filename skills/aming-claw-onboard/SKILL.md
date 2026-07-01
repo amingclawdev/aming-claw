@@ -22,9 +22,9 @@ instructions.
    `POST /api/projects/{project_id}/onboard-route-guide` with the same fields.
 4. Confirm role: `observer`, `worker`, `mf_sub`, or `qa`.
 5. Confirm work type, such as `capability_query`, `system_operation`,
-   `continue_contract_chain`, `observer_hotfix`,
-   `operator_supervised_direct_main`, `multi_backlog_parallel`,
-   `parallel_worker`, or `qa_verification`.
+   `continue_contract_chain`, `operator_supervised_direct_main`,
+   `multi_backlog_parallel`, `parallel_worker`, `qa_verification`, or explicit
+   `legacy_operator_recovery`.
 6. Follow only the returned role/token guidance, `next_legal_action`, and index
    paths under `agent_onboard_guidance.onboard_route_guide`, including
    `interface_index`, `capability_index`, `system_operation_index`,
@@ -38,7 +38,18 @@ instructions.
    contract/timeline payload. Use source-only evidence only when the graph misses,
    is unavailable, or source-hint status says docs/config/tests are not
    materialized.
-8. For long-running observer/worker chains, if a protected facade reports an
+8. For observer-owned protected writes, establish the observer identity in this
+   order before `direct_fix_enter`, `mf_parallel_enter`, backlog close, route
+   renewals, or other protected writes: call `observer_session_register`, keep
+   the session alive with `observer_session_heartbeat` every 300 seconds, then
+   call `observer_route_context_issue` or `observer_route_context_renew`.
+   `observer_session_id` plus its session token proves observer liveness;
+   `observer_route_token_ref`/`route_token_ref` proves scoped route authority.
+   They are not interchangeable. If `observer_session_id` is missing, recover
+   by authenticating/signing with the session token and heartbeating the known
+   session, or registering a fresh observer session before issuing/renewing the
+   route ref.
+9. For long-running observer/worker chains, if a protected facade reports an
    expired or near-expired `route_token_ref`, renew the same-scope ref through
    `observer_route_context_renew` (or
    `POST /api/projects/{project_id}/observer/route-context/renew`) with an
@@ -61,6 +72,20 @@ instructions.
   backlog/task, allowed-actions, target-files, and owned-files scope. If the
   observer session is stale, heartbeat or register an observer session before
   renewal; never request or paste a raw route token.
+- `observer_hotfix` / `hotfix_enter` are not ordinary observer paths. Use them
+  only when the live guide returns `legacy_operator_recovery` or an operator has
+  explicitly requested legacy recovery. Normal repairs should use
+  `direct_fix_enter`, `mf_parallel_enter`, or the current ContractRuntime
+  `next_legal_action`.
+- Direct-fix topology must be classified before action: parentless
+  single-branch direct merge, blocked-parent successor that returns to parent,
+  or multi/parallel merge queue. Before stopping or replacing a worker, audit
+  progress from runtime current state and timeline evidence; complete direct
+  fix with independent QA, branch-service validation when runtime code changed,
+  merge or redeploy, full reconcile, and protected backlog close.
+- Runtime resume guidance prefers live `backlog_contract_chain_current` /
+  ContractRuntime current state. Treat compact-ledger resume as recovery
+  fallback only when the live projection is missing or unrebuildable.
 
 ## Archive
 
