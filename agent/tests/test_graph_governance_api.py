@@ -24369,6 +24369,22 @@ def test_backlog_close_contract_runtime_authority_keeps_legacy_gate_advisory(con
 
     assert verification["passed"] is True
     assert verification["source_of_authority"] == "contract_runtime"
+    assert (
+        verification["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
+    assert verification["close_authority"]["source_of_authority"] == (
+        "contract_runtime"
+    )
+    assert verification["close_authority"]["authority_decision_source"] == (
+        "contract_runtime_close_authority_projection"
+    )
+    projection = verification["contract_runtime_close_authority_projection"]
+    assert projection["source_of_authority"] == "contract_runtime"
+    assert (
+        projection["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert verification["legacy_mf_close_gate_authorization_blocker"] is False
     legacy = verification["legacy_diagnostics"]
     assert legacy["advisory_only"] is True
@@ -24662,14 +24678,27 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
     assert exc.value.code == "contract_runtime_close_authority_incomplete"
     details = exc.value.details
     assert details["runtime_projection_authority_failed"] is True
+    assert details["source_of_authority"] == "contract_runtime"
+    assert (
+        details["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     projection = details["contract_runtime_close_authority_projection"]
     assert projection["status"] == "incomplete"
+    assert projection["source_of_authority"] == "contract_runtime"
+    assert (
+        projection["authority_decision_source"] == "contract_runtime_current_state"
+    )
     assert projection["contract_execution_id"] == successor["contract_execution_id"]
     assert projection["next_legal_action"]
     assert details["failed_gates"] == [
         {
             "gate": "contract_runtime_close_authority_projection",
             "status": "incomplete",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": (
+                "contract_runtime_close_authority_projection"
+            ),
             "missing_requirement_ids": [
                 projection["next_legal_action"]["id"]
             ],
@@ -24741,13 +24770,27 @@ def test_backlog_close_contract_runtime_required_without_authority_uses_new_bloc
     assert exc.value.code == "missing_contract_runtime_close_authority"
     assert "MF backlog close requires task timeline evidence" not in exc.value.message
     details = exc.value.details
+    assert details["source_of_authority"] == "contract_runtime"
+    assert (
+        details["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     projection = details["contract_runtime_close_authority_projection"]
     assert projection["status"] == "missing"
+    assert projection["source_of_authority"] == "contract_runtime"
+    assert (
+        projection["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert projection["contract_execution_id"] == parent_execution_id
     assert details["failed_gates"] == [
         {
             "gate": "contract_runtime_close_authority_projection",
             "status": "missing",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": (
+                "contract_runtime_close_authority_projection"
+            ),
             "missing_requirement_ids": ["contract_runtime_close_authority"],
             "contract_execution_id": parent_execution_id,
         }
@@ -24821,13 +24864,27 @@ def test_backlog_close_missing_contract_runtime_close_authority_for_onboard_serv
     assert exc.value.code == "missing_contract_runtime_close_authority"
     assert "MF backlog close requires task timeline evidence" not in exc.value.message
     details = exc.value.details
+    assert details["source_of_authority"] == "contract_runtime"
+    assert (
+        details["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     projection = details["contract_runtime_close_authority_projection"]
     assert projection["status"] == "missing"
+    assert projection["source_of_authority"] == "contract_runtime"
+    assert (
+        projection["authority_decision_source"]
+        == "contract_runtime_close_authority_projection"
+    )
     assert projection["contract_execution_id"] == parent_execution_id
     assert details["failed_gates"] == [
         {
             "gate": "contract_runtime_close_authority_projection",
             "status": "missing",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": (
+                "contract_runtime_close_authority_projection"
+            ),
             "missing_requirement_ids": ["contract_runtime_close_authority"],
             "contract_execution_id": parent_execution_id,
         }
