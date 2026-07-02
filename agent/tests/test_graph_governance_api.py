@@ -28727,6 +28727,30 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert accepted["actor_role"] == "observer"
     assert accepted["next_legal_action"]["id"] == "worker_previous_source_proof"
     assert accepted["next_legal_action"]["allowed_writer_roles"] == ["mf_sub"]
+    bridge_guidance = accepted["next_legal_action"]["mf_sub_host_bridge_guidance"]
+    assert bridge_guidance["status"] == "mf_sub_runtime_identity_required"
+    assert set(bridge_guidance["required_worker_runtime_fields"]) == {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "target_project_root",
+        "session_token_ref",
+    }
+    assert "observer_body_actor_role_mf_sub" in bridge_guidance["forbidden_shortcuts"]
+    assert (
+        bridge_guidance["host_subagent_identity_policy"]["codex_subagent_id_sufficient"]
+        is False
+    )
+    assert bridge_guidance["copy_safe_bridge_payload"][
+        "runtime_context_worker_guide"
+    ]["view"] == "worker_view"
+    assert bridge_guidance["copy_safe_bridge_payload"][
+        "contract_runtime_submit_line_body_after_bridge"
+    ]["session_token_ref"] == "<copy-safe worker session_token_ref>"
+    assert accepted["contract_runtime_current_state"][
+        "mf_sub_host_bridge_guidance"
+    ] == bridge_guidance
 
     current = server.handle_project_contract_update_current_state(
         _ctx(
@@ -34687,6 +34711,19 @@ def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(co
         "target_project_root",
     }
     assert details["required_role"] == "mf_sub"
+    bridge_guidance = details["mf_sub_host_bridge_guidance"]
+    assert bridge_guidance["blocked_action"] == "contract_runtime_current"
+    assert bridge_guidance["next_action"]["action"] == (
+        "allocate_or_read_worker_runtime_context_before_submit_line"
+    )
+    assert "parallel_branch_allocate" in bridge_guidance["next_action"]["tools"]
+    assert "runtime_context_worker_guide" in bridge_guidance["next_action"]["tools"]
+    assert bridge_guidance["observer_body_actor_role_policy"][
+        "body_actor_role_is_authorization"
+    ] is False
+    assert bridge_guidance["host_subagent_identity_policy"][
+        "requires_runtime_context_bridge"
+    ] is True
 
 
 def test_contract_runtime_worker_line_attaches_verified_mf_sub_provenance(conn):
@@ -34894,6 +34931,21 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     )
     assert dispatch["ok"] is True
     assert dispatch["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    bridge_guidance = dispatch["next_legal_action"]["mf_sub_host_bridge_guidance"]
+    assert bridge_guidance["status"] == "mf_sub_runtime_identity_required"
+    assert bridge_guidance["next_line"]["line_id"] == "worker_read_runtime_guide"
+    assert set(bridge_guidance["required_worker_runtime_fields"]) == {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "target_project_root",
+        "session_token_ref",
+    }
+    assert "observer_written_worker_evidence" in bridge_guidance["forbidden_shortcuts"]
+    assert bridge_guidance["copy_safe_bridge_payload"][
+        "contract_runtime_submit_line_body_after_bridge"
+    ]["fence_token"] == "<worker fence_token from allocation envelope>"
 
     forged_worker_read = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
