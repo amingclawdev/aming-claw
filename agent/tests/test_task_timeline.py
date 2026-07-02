@@ -10030,6 +10030,112 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(ready["route_context_gate"]["missing_requirement_ids"], [])
         self.assertTrue(ready["independent_qa_gate"]["passed"])
 
+    def test_finish_gate_projection_accepts_precommit_row_scoped_head(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        route_context, route_action, dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        finish_gate = json.loads(json.dumps(_daily_planner_finish_gate_event()))
+        gate_payload = finish_gate["payload"]["finish_gate"]
+        gate_payload.pop("commit_sha")
+        row_head = "cad660cde0d56d32d146c5c3640b6ee9a0aa1a1f"
+        gate_payload["row_scoped_finish_head_projection"] = {
+            "schema_version": "runtime_context.row_scoped_finish_head_projection.v1",
+            "status": "pending_row_scoped_implementation_head",
+            "row_scoped_implementation_head_commit": row_head,
+            "current_branch_head_commit": row_head,
+            "base_commit": row_head,
+            "target_head_commit": row_head,
+            "finish_gate_allowed_against_current_branch_head": True,
+            "worker_finish_scope_requires_row_head": True,
+            "later_branch_commits_must_not_widen_row_scope": True,
+            "next_legal_action": "record_finish_time_worker_attestation",
+        }
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                route_context,
+                route_action,
+                dispatch,
+                finish_gate,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        projection = ready["finish_gate_projection"]
+        self.assertTrue(projection["passed"], ready)
+        self.assertNotIn(
+            "finish_gate_implementation_commit",
+            projection["missing_fields"],
+        )
+        projected_payloads = [
+            item["payload"] for item in projection["projected_events"]
+        ]
+        self.assertTrue(
+            any(
+                item.get("post_finish_commit_bridge_required")
+                for item in projected_payloads
+            ),
+            projection,
+        )
+
+    def test_finish_gate_projection_still_requires_commit_without_precommit_head(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-DPL-DEMO-LAUNCH-20260616",
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        route_context, route_action, dispatch, _startup = (
+            _route_context_consumption_events()
+        )
+        finish_gate = json.loads(json.dumps(_daily_planner_finish_gate_event()))
+        finish_gate["payload"]["finish_gate"].pop("commit_sha")
+
+        blocked = task_timeline.mf_close_gate_verification(
+            [
+                route_context,
+                route_action,
+                dispatch,
+                finish_gate,
+                _route_context_qa_verification_event(),
+            ],
+            contract=contract,
+        )
+
+        projection = blocked["finish_gate_projection"]
+        self.assertFalse(projection["passed"], blocked)
+        self.assertIn(
+            "finish_gate_implementation_commit",
+            projection["missing_fields"],
+        )
+
     def test_finish_gate_projection_accepts_fence_match_without_persisted_token(self):
         from agent.governance import task_timeline
 
