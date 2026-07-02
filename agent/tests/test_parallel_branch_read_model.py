@@ -974,6 +974,20 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         "worker_graph_query",
         "implementation_and_tests",
     ]
+    worktree_guard = reminders["worker_rules"]["pre_edit_worktree_guard"]
+    assert worktree_guard["required"] is True
+    assert worktree_guard["required_startup_fields"] == [
+        "actual_cwd",
+        "actual_git_root",
+        "worktree_path",
+    ]
+    assert worktree_guard["must_match"] == {
+        "actual_cwd": "runtime_context.current_values.worktree_path",
+        "actual_git_root": "runtime_context.current_values.worktree_path",
+    }
+    assert "actual_cwd_not_assigned_worktree" in worktree_guard["blockers"]
+    assert "actual_git_root_not_assigned_worktree" in worktree_guard["blockers"]
+    assert "target/main worktree" in worktree_guard["message"]
     recovery = reminders["worker_rules"]["finish_time_attestation_recovery"]
     assert recovery["required_before"] == "finish_gate"
     assert recovery["sequence"] == [
