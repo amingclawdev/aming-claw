@@ -941,6 +941,18 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
             "If route issue returns another queue id, keep the runtime "
             "context merge_queue_id for this lane."
         ),
+        "merge_materialization_prompt_merge_queue_id_source": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "merge_apply_prompt_merge_queue_id_source": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "newly_minted_route_token_merge_queue_id_allowed": False,
+        "message": (
+            "Durable merge materialization/apply prompts must use the "
+            "runtime-context merge_queue_id, not a merge_queue_id returned "
+            "by freshly issued route-token payloads."
+        ),
     }
     assert reminders["worker_rules"]["no_historical_evidence_backfill"][
         "allowed"
@@ -978,6 +990,23 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         "prompt_contract_id",
         "observer_command_id",
     ]
+    route_scope = reminders["merge_route_scope_guidance"]
+    assert route_scope["root_contract_execution_id_role"] == (
+        "root-scope route authorization for close_or_merge_after_evidence"
+    )
+    assert route_scope["close_or_merge_after_evidence_route_issue_shape"] == {
+        "task_id": "<root_contract_execution_id>",
+        "allowed_actions": ["close_or_merge_after_evidence"],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    fence_guidance = reminders["live_merge_fence_guidance"]
+    assert fence_guidance[
+        "route_authorization_and_fence_freshness_are_separate"
+    ] is True
+    assert fence_guidance[
+        "branch_context_reclaimed_or_fence_mismatch_next_action"
+    ] == "re_read_runtime_context_current_and_pass_current_fence_token"
 
     read_action = action_plan["read_receipt_hash_action"]
     assert read_action["mf_parallel_happy_path_reminders"] == reminders
@@ -1047,3 +1076,10 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
     assert any("observer_session_id" in item for item in prompt_reminders)
     assert any("observer_command_id" in item for item in prompt_reminders)
     assert any("merge_queue_id is authoritative" in item for item in prompt_reminders)
+    assert any("root_contract_execution_id" in item for item in prompt_reminders)
+    assert any("runtime_context_current" in item for item in prompt_reminders)
+    assert any(
+        "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash" in item
+        for item in prompt_reminders
+    )
+    assert any("hash may change" in item for item in prompt_reminders)

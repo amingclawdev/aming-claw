@@ -72,6 +72,44 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
+    superseded = observer_route_context.route_token_ref_renewal_next_action(
+        project_id=PID,
+        backlog_id="AC-ROUTE-TOKEN-SUPERSEDED",
+        task_id="cex-root-scope",
+        route_token_ref="rtok-superseded",
+        observer_session_id="obs-session",
+        reason=observer_route_context.REF_STATUS_SUPERSEDED,
+    )
+    assert superseded["schema_version"] == (
+        observer_route_context.REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION
+    )
+    assert superseded["action"] == "issue_fresh_same_scope_route_token_ref"
+    assert superseded["semantic_next_action"] == "observer_route_context_issue"
+    assert superseded["preferred_over"] == "renew_route_token_ref"
+    assert superseded["renew_loop_allowed"] is False
+    assert superseded["same_scope_required"] is True
+    assert superseded["scope"] == {
+        "project_id": PID,
+        "backlog_id": "AC-ROUTE-TOKEN-SUPERSEDED",
+        "task_id": "cex-root-scope",
+    }
+
+    expired = observer_route_context.route_token_ref_renewal_next_action(
+        project_id=PID,
+        backlog_id="AC-ROUTE-TOKEN-SUPERSEDED",
+        task_id="cex-root-scope",
+        route_token_ref="rtok-expired",
+        observer_session_id="obs-session",
+        reason=observer_route_context.REF_STATUS_EXPIRED,
+    )
+    assert expired["schema_version"] == (
+        observer_route_context.REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION
+    )
+    assert expired["action"] == "renew_route_token_ref"
+    assert expired["semantic_next_action"] == "observer_route_context_renew"
+
+
 def _fake_sha(label: str) -> str:
     return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
 
@@ -2673,13 +2711,25 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     assert next_action["observer_command_id"] == "cmd-allocate-incomplete"
     assert next_action["worker_id"] == "contract-worker"
     assert next_action["merge_queue_id"] == "mq-allocate-incomplete"
+    assert next_action["merge_queue_id_source"] == (
+        "runtime_context.current_values.merge_queue_id"
+    )
     assert next_action["route_identity"] == dispatch_event["route_identity"]
     assert next_action["missing_fields"] == ["owned_files"]
+    merge_queue_guidance = dispatch_event["recovery"]["merge_queue_guidance"]
+    assert merge_queue_guidance["runtime_context_merge_queue_id_authoritative"] is True
+    assert merge_queue_guidance[
+        "merge_materialization_prompt_merge_queue_id_source"
+    ] == "runtime_context.current_values.merge_queue_id"
+    assert merge_queue_guidance["newly_minted_route_token_merge_queue_id_allowed"] is False
     payload_shape = dispatch_event["recovery"]["payload_shape"]
     assert payload_shape["runtime_context_id"] == context["runtime_context_id"]
     assert payload_shape["task_id"] == "allocate-incomplete-task"
     assert payload_shape["observer_command_id"] == "cmd-allocate-incomplete"
     assert payload_shape["merge_queue_id"] == "mq-allocate-incomplete"
+    assert payload_shape["merge_queue_id_source"] == (
+        "runtime_context.current_values.merge_queue_id"
+    )
     assert payload_shape["route_id"] == "route-allocate-incomplete"
     assert payload_shape["route_context_hash"] == "sha256:route-allocate-incomplete"
     assert payload_shape["prompt_contract_id"] == "rprompt-allocate-incomplete"
@@ -34255,6 +34305,13 @@ def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
 
     assert current["actor_role"] == "mf_sub"
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    submit_guidance = current["submit_line_guidance"]
+    assert submit_guidance["required_runtime_guide_hash_source"] == (
+        "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+    )
+    assert submit_guidance["every_line_must_copy_current_writer_hash"] is True
+    assert submit_guidance["hash_may_change_after_each_accepted_line"] is True
+    assert current["next_legal_action"]["submit_line_guidance"] == submit_guidance
 
 
 def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(conn):
@@ -34400,6 +34457,27 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert result["contract_runtime_current_state"]["contract_id"] == "mf_parallel"
     assert result["execution_state_revision"] == 1
     assert result["route_token_ref"] == "rtok-mf-parallel-root"
+    merge_route_scope = result["merge_route_scope_guidance"]
+    assert merge_route_scope["successor_contract_execution_id"] == (
+        result["successor_contract_execution_id"]
+    )
+    assert merge_route_scope["root_contract_execution_id"] == (
+        result["root_contract_execution_id"]
+    )
+    root_issue_shape = merge_route_scope[
+        "close_or_merge_after_evidence_route_issue_shape"
+    ]
+    assert root_issue_shape["task_id"] == result["root_contract_execution_id"]
+    assert root_issue_shape["allowed_actions"] == ["close_or_merge_after_evidence"]
+    assert root_issue_shape["raw_route_token_required"] is False
+    assert root_issue_shape["raw_route_token_exposed"] is False
+    assert merge_route_scope["copy_safe_route_token_ref_only"] is True
+    assert result["event"]["payload"]["successor_contract"][
+        "merge_route_scope_guidance"
+    ] == merge_route_scope
+    assert result["route_token_ref_guidance"]["merge_route_scope_guidance"] == (
+        merge_route_scope
+    )
     assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
     assert result["next_legal_action"]["source"] == "contract_runtime"
     assert result["next_legal_action"]["evidence_kind"] == "contract_binding"
