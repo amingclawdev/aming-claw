@@ -2648,6 +2648,90 @@ def test_parallel_branch_allocate_persists_merge_queue_id_from_child_route_linea
     ] == "mq-allocate-lineage"
 
 
+def test_parallel_branch_finish_gate_graph_trace_gap_is_non_closeable_recovery(
+    conn,
+    tmp_path,
+):
+    workspace = tmp_path / "workers"
+    worktree = workspace / "graph-trace-gap-worker" / "graph-trace-gap-task"
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "graph-trace-gap-task",
+                "parent_task_id": "AC-GRAPH-TRACE-GAP",
+                "backlog_id": "AC-GRAPH-TRACE-GAP",
+                "observer_command_id": "cmd-graph-trace-gap",
+                "workspace_root": str(workspace),
+                "worktree_path": str(worktree),
+                "worker_id": "graph-trace-gap-worker",
+                "fence_token": "fence-graph-trace-gap",
+                "base_commit": "base-graph-trace-gap",
+                "target_head_commit": "target-graph-trace-gap",
+                "merge_queue_id": "mq-graph-trace-gap",
+                "route_id": "route-graph-trace-gap",
+                "route_context_hash": "sha256:route-graph-trace-gap",
+                "prompt_contract_id": "rprompt-graph-trace-gap",
+                "prompt_contract_hash": "sha256:prompt-graph-trace-gap",
+                "route_token_ref": "rtok-graph-trace-gap",
+                "visible_injection_manifest_hash": "sha256:visible-graph-trace-gap",
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": False,
+            },
+        )
+    )
+    assert status == 201
+    runtime_context_id = created["context"]["runtime_context_id"]
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id="AC-GRAPH-TRACE-GAP",
+        task_id="graph-trace-gap-task",
+        event_type="implementation",
+        event_kind="implementation",
+        phase="implementation",
+        status="passed",
+        payload={
+            "implementation": {
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [],
+            }
+        },
+    )
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "AC-GRAPH-TRACE-GAP",
+                "fence_token": "fence-graph-trace-gap",
+                "target_project_root": str(worktree),
+            },
+        )
+    )
+
+    worker_view = current_state["runtime_context_service"]["views"]["worker_view"]
+    gap = worker_view["action_plan"]["worker_handoff_projection"][
+        "graph_trace_recovery_gap"
+    ]
+    assert gap["status"] == "non_closeable_recovery_required"
+    assert gap["historical_implementation_without_verified_graph_trace"] is True
+    assert gap["closeable"] is False
+    assert gap["recommended_action"] == (
+        "keep_open_and_redispatch_with_graph_first_trace"
+    )
+    assert "post_hoc_graph_trace_evidence" in gap["blocked_actions"]
+    assert gap["scope_mismatch_rule"][
+        "out_of_fence_file_requirement_keeps_old_branch_open"
+    ] is True
+
+
 def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     conn,
     tmp_path,

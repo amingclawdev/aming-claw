@@ -965,6 +965,31 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         "finish_gate",
         "git_commit",
     ]
+    graph_first = reminders["worker_rules"]["graph_trace_before_implementation"]
+    assert graph_first["required"] is True
+    assert graph_first["blocker"] == "pre_implementation_graph_trace_missing"
+    assert graph_first["sequence"] == [
+        "runtime_context_read_receipt",
+        "mf_subagent_startup",
+        "worker_graph_query",
+        "implementation_and_tests",
+    ]
+    recovery = reminders["worker_rules"]["finish_time_attestation_recovery"]
+    assert recovery["required_before"] == "finish_gate"
+    assert recovery["sequence"] == [
+        "implementation_evidence",
+        "finish_time_worker_attestation",
+        "refresh_runtime_context_current",
+        "finish_gate",
+    ]
+    graph_gap = reminders["graph_trace_recovery_gap"]
+    assert graph_gap[
+        "historical_implementation_without_verified_graph_trace_closeable"
+    ] is False
+    assert graph_gap["worker_next_action"] == (
+        "keep_open_and_redispatch_graph_first_worker"
+    )
+    assert "post_hoc_graph_trace_evidence" in graph_gap["forbidden_actions"]
     durable_gate = reminders["worker_rules"][
         "independent_qa_before_durable_merge_queue"
     ]
@@ -1068,11 +1093,20 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
     ] == reminders
     assert prompt_reminders == list(mf_contract.MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS)
     assert any("Do not backfill historical" in item for item in prompt_reminders)
+    assert any("Graph-first trace evidence" in item for item in prompt_reminders)
     assert any("Finish gate evidence" in item for item in prompt_reminders)
+    assert any(
+        "finish-time worker self-attestation" in item for item in prompt_reminders
+    )
     assert any("Independent QA" in item for item in prompt_reminders)
     assert any("Chain-Source-Stage" in item for item in prompt_reminders)
     assert any("graph_current_full_reconcile" in item for item in prompt_reminders)
     assert any("leave the row open" in item for item in prompt_reminders)
+    assert any(
+        "Historical implementation without verified graph trace" in item
+        for item in prompt_reminders
+    )
+    assert any("Out-of-fence file requirements" in item for item in prompt_reminders)
     assert any("observer_session_id" in item for item in prompt_reminders)
     assert any("observer_command_id" in item for item in prompt_reminders)
     assert any("merge_queue_id is authoritative" in item for item in prompt_reminders)
@@ -1083,3 +1117,83 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         for item in prompt_reminders
     )
     assert any("hash may change" in item for item in prompt_reminders)
+
+
+def test_worker_execution_safety_blocks_pre_edit_without_verified_graph_trace() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="T-safety",
+        parent_task_id="cex-parent-safety",
+        backlog_id="AC-SAFETY",
+        branch_ref="refs/heads/codex/safety",
+        status=pbr.STATE_WORKTREE_READY,
+        runtime_context_id="mfrctx-safety",
+        worker_id="worker-safety",
+        worker_slot_id="worker-safety",
+        fence_token="fence-safety",
+        worktree_path="/tmp/safety",
+        base_commit="base-safety",
+        head_commit="head-safety",
+        target_head_commit="target-safety",
+        merge_queue_id="mq-safety",
+        target_files=("agent/governance/parallel_branch_runtime.py",),
+        owned_files=("agent/governance/parallel_branch_runtime.py",),
+    )
+    startup_gate = {
+        "runtime_context_id": "mfrctx-safety",
+        "worker_session_id": "worker-session-safety",
+        "worker_transcript_ref": "codex:safety",
+        "harness_type": "codex",
+        "actual_cwd": "/tmp/safety",
+        "actual_git_root": "/tmp/safety",
+        "read_receipt_hash": "sha256:read-safety",
+        "read_receipt_event_id": "8896",
+    }
+    route_identity = {
+        "route_id": "route-safety",
+        "route_context_hash": "sha256:route-safety",
+        "prompt_contract_id": "rprompt-safety",
+        "prompt_contract_hash": "sha256:prompt-safety",
+        "route_token_ref": "rtok-safety",
+        "visible_injection_manifest_hash": "sha256:visible-safety",
+    }
+
+    current_without_graph = pbr.build_runtime_context_current_view(
+        context,
+        route_identity=route_identity,
+        timeline_refs={
+            "read_receipt_event_ref": "timeline:8896",
+            "startup_event_ref": "timeline:8898",
+        },
+        startup_gate=startup_gate,
+    )
+    blocked = pbr.build_runtime_context_capability_boundary_view(
+        current_without_graph
+    )["worker_execution_safety"]
+
+    assert blocked["status"] == "pre_edit_blocked"
+    assert blocked["relative_patch_safe"] is False
+    assert blocked["graph_trace_verified"] is False
+    assert "graph_query_trace.trace_ids" in blocked["pre_edit_required_evidence"]
+    assert {
+        blocker["code"] for blocker in blocked["pre_edit_blockers"]
+    } == {"pre_implementation_graph_trace_missing"}
+
+    current_with_graph = pbr.build_runtime_context_current_view(
+        context,
+        route_identity=route_identity,
+        timeline_refs={
+            "read_receipt_event_ref": "timeline:8896",
+            "startup_event_ref": "timeline:8898",
+        },
+        startup_gate=startup_gate,
+        graph_trace_refs=["gqt-safety"],
+    )
+    verified = pbr.build_runtime_context_capability_boundary_view(
+        current_with_graph
+    )["worker_execution_safety"]
+
+    assert verified["status"] == "verified"
+    assert verified["relative_patch_safe"] is True
+    assert verified["graph_trace_verified"] is True
+    assert verified["graph_trace_ids"] == ["gqt-safety"]

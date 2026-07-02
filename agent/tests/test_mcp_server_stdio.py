@@ -740,6 +740,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
         "route_identity",
         "canonical_route_identity",
         "parent_route_identity",
+        "parent_route_lineage",
+        "child_route_lineage",
+        "route_lineage",
         "route_token_ref",
     }.issubset(properties)
     for key in (
