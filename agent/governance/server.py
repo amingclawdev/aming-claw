@@ -35779,6 +35779,136 @@ def _contract_runtime_submit_line_guidance(guide: Mapping[str, Any]) -> dict[str
     return guidance
 
 
+_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "fence_token",
+    "target_project_root",
+    "session_token_ref",
+)
+
+
+def _contract_runtime_next_action_requires_mf_sub(
+    next_action: Mapping[str, Any],
+) -> bool:
+    roles = {
+        str(role or "").strip().lower().replace("-", "_")
+        for role in (next_action.get("allowed_writer_roles") or [])
+    }
+    owner_role = str(next_action.get("owner_role") or "").strip().lower().replace(
+        "-",
+        "_",
+    )
+    worker_role = str(next_action.get("worker_role") or "").strip().lower().replace(
+        "-",
+        "_",
+    )
+    return "mf_sub" in roles or owner_role == "mf_sub" or worker_role == "mf_sub"
+
+
+def _contract_runtime_mf_sub_host_bridge_guidance(
+    guide: Mapping[str, Any],
+    *,
+    blocked_action: str = "",
+) -> dict[str, Any]:
+    next_action = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if not isinstance(next_action, Mapping) or not _contract_runtime_next_action_requires_mf_sub(
+        next_action
+    ):
+        return {}
+    execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
+    contract = guide.get("contract") if isinstance(guide.get("contract"), Mapping) else {}
+    safe_copy = (
+        guide.get("writer_role_safe_copy_payload")
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        dict(safe_copy.get("copy_payload"))
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    submit_line_body = dict(copy_payload)
+    submit_line_body.update(
+        {
+            "runtime_context_id": "<from parallel_branch_allocate/runtime_context>",
+            "task_id": "<worker task_id from runtime_context>",
+            "parent_task_id": "<parent MF task_id from runtime_context>",
+            "worker_role": "mf_sub",
+            "fence_token": "<worker fence_token from allocation envelope>",
+            "target_project_root": "<assigned worker worktree path>",
+            "session_token_ref": "<copy-safe worker session_token_ref>",
+        }
+    )
+    return {
+        "schema_version": "contract_runtime.mf_sub_host_bridge_guidance.v1",
+        "status": "mf_sub_runtime_identity_required",
+        "blocked_action": blocked_action,
+        "reason": (
+            "The next legal ContractRuntime line is owned by mf_sub; a host-created "
+            "Codex subagent id is not enough to authorize the write."
+        ),
+        "contract_execution_id": str(execution.get("contract_execution_id") or ""),
+        "contract_id": str(contract.get("contract_id") or ""),
+        "next_line": {
+            "stage_id": str(next_action.get("stage_id") or ""),
+            "line_id": str(next_action.get("line_id") or ""),
+            "evidence_kind": str(next_action.get("evidence_kind") or ""),
+            "owner_role": str(next_action.get("owner_role") or ""),
+            "allowed_writer_roles": list(next_action.get("allowed_writer_roles") or []),
+        },
+        "required_worker_runtime_fields": list(_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS),
+        "next_action": {
+            "id": "obtain_mf_sub_runtime_identity",
+            "action": "allocate_or_read_worker_runtime_context_before_submit_line",
+            "tools": [
+                "parallel_branch_allocate",
+                "runtime_context_worker_guide",
+                "runtime_context_current",
+            ],
+            "produces": list(_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS),
+        },
+        "copy_safe_bridge_payload": {
+            "runtime_context_worker_guide": {
+                "project_id": str(execution.get("project_id") or ""),
+                "runtime_context_id": "<worker runtime_context_id>",
+                "parent_task_id": "<parent MF task_id>",
+                "fence_token": "<worker fence_token>",
+                "session_token_ref": "<copy-safe worker session_token_ref>",
+                "target_project_root": "<assigned worker worktree path>",
+                "view": "worker_view",
+            },
+            "contract_runtime_submit_line_body_after_bridge": submit_line_body,
+        },
+        "forbidden_shortcuts": [
+            "observer_body_actor_role_mf_sub",
+            "observer_written_worker_evidence",
+            "codex_subagent_id_without_runtime_context",
+            "post_hoc_worker_identity_backfill",
+        ],
+        "observer_body_actor_role_policy": {
+            "body_actor_role_is_authorization": False,
+            "effective_writer_role_source": "authenticated_runtime_context_worker_proof",
+            "message": (
+                "Do not rely on body.actor_role='mf_sub' from an observer/host request; "
+                "the worker write must carry runtime_context_id, fence_token, "
+                "session_token_ref, parent_task_id, task_id, and target_project_root."
+            ),
+        },
+        "host_subagent_identity_policy": {
+            "codex_subagent_id_sufficient": False,
+            "requires_runtime_context_bridge": True,
+            "raw_session_token_required": False,
+            "raw_route_token_required": False,
+        },
+    }
+
+
 def _runtime_next_action_from_guide(
     guide: Mapping[str, Any],
     *,
@@ -35864,6 +35994,9 @@ def _runtime_next_action_from_guide(
     ):
         if key in next_line:
             result[key] = next_line[key]
+    bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
+    if bridge_guidance:
+        result["mf_sub_host_bridge_guidance"] = bridge_guidance
     return result
 
 
@@ -35900,6 +36033,9 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     readiness_state = _runtime_readiness_state_from_guide(guide)
     if readiness_state:
         current_state["readiness_state"] = readiness_state
+    bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
+    if bridge_guidance:
+        current_state["mf_sub_host_bridge_guidance"] = bridge_guidance
     return current_state
 
 
@@ -39427,6 +39563,14 @@ def _resolve_contract_runtime_mf_sub_proof(
         details.setdefault("proof_error", exc.code)
         details.setdefault("action", action)
         details.setdefault("contract_execution_id", contract_execution_id)
+        bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(
+            (record or {}).get("runtime_guide")
+            if isinstance((record or {}).get("runtime_guide"), Mapping)
+            else {},
+            blocked_action=action,
+        )
+        if bridge_guidance:
+            details.setdefault("mf_sub_host_bridge_guidance", bridge_guidance)
         raise PermissionDeniedError(
             "mf_sub",
             action,
