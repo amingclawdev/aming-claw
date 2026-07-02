@@ -44110,6 +44110,18 @@ def _direct_fix_dispatch_task_id(
     return f"{contract_execution_id}-worker" if contract_execution_id else ""
 
 
+def _direct_fix_dispatch_default_worker_identity(
+    *,
+    task_id: str,
+    contract_execution_id: str,
+) -> str:
+    for value in (task_id, contract_execution_id, "direct_fix_worker"):
+        slug = _parallel_branch_allocate_slug(value)
+        if slug:
+            return slug
+    return "direct-fix-worker"
+
+
 def _direct_fix_dispatch_route_identity(
     conn,
     *,
@@ -44195,13 +44207,18 @@ def _direct_fix_materialize_dispatch_runtime_context(
         "worker_agent_id",
         "agent_id",
     )
+    if not worker_slot_id:
+        worker_slot_id = _direct_fix_dispatch_default_worker_identity(
+            task_id=task_id,
+            contract_execution_id=contract_execution_id,
+        )
     allocation_owner = _direct_fix_dispatch_text(
         payload,
         "allocation_owner",
         "observer_allocation_owner",
         "worker_agent_id",
         "agent_id",
-    ) or worker_slot_id or "direct_fix_worker"
+    ) or worker_slot_id
     branch_ref = _direct_fix_dispatch_branch_ref(
         payload.get("branch_ref"),
         payload.get("branch"),
@@ -44246,11 +44263,21 @@ def _direct_fix_materialize_dispatch_runtime_context(
         )
     if not owned_files:
         owned_files = _direct_fix_child_route_token_target_files(conn, backlog_id=backlog_id)
-    base_commit = _direct_fix_dispatch_text(payload, "base_commit") or _direct_fix_dispatch_text(write, "base_commit")
+    current_head_commit = _runtime_context_git_head_commit(
+        worktree_path,
+        target_project_root,
+        workspace_root,
+    )
+    base_commit = (
+        _direct_fix_dispatch_text(payload, "base_commit")
+        or _direct_fix_dispatch_text(write, "base_commit")
+        or current_head_commit
+    )
     target_head_commit = (
         _direct_fix_dispatch_text(payload, "target_head_commit")
         or _direct_fix_dispatch_text(write, "target_head_commit")
         or base_commit
+        or current_head_commit
     )
     merge_queue_id = (
         _direct_fix_dispatch_text(payload, "merge_queue_id")
