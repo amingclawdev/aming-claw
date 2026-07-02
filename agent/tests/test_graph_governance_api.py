@@ -13359,6 +13359,128 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     ).stdout.find("Chain-Source-Stage: merge") != -1
 
 
+def test_parallel_branch_merge_execute_preflights_fence_before_live_writer(
+    conn, tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature-stale-fence"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "stale-fence.txt").write_text("stale fence\n", encoding="utf-8")
+    subprocess.run(["git", "add", "stale-fence.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "stale fence branch"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    queue_id = "mergeq-api-execute-stale-fence"
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-execute-stale-fence",
+            task_id="execute-stale-fence-task",
+            branch_ref="feature-stale-fence",
+            status="merge_ready",
+            fence_token="fence-api-current",
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T08:32:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-execute-stale-fence-task",
+                task_id="execute-stale-fence-task",
+                branch_ref="feature-stale-fence",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="feature-stale-fence",
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-execute-stale-fence",
+                projection_id="semproj-execute-stale-fence",
+            )
+        ],
+        now_iso="2026-05-17T08:32:00Z",
+    )
+    writer_calls: list[dict[str, str]] = []
+
+    def fake_write_merge_with_trailer(*args, **kwargs):
+        writer_calls.append({"message": str(args[0]) if args else ""})
+        return True, "merge-should-not-happen", ""
+
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        fake_write_merge_with_trailer,
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_execute(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "repo_root_path": str(repo),
+                    "merge_queue_id": queue_id,
+                    "target_ref": "main",
+                    "task_id": "execute-stale-fence-task",
+                    "evidence": evidence,
+                    "dry_run": False,
+                    "allow_target_ref_mutation": True,
+                    "fence_token": "fence-api-stale",
+                    "route_waiver": _route_waiver(
+                        "merge_execute",
+                        task_id="execute-stale-fence-task",
+                    ),
+                    "message": "merge feature-stale-fence",
+                    "now_iso": "2026-05-17T08:33:00Z",
+                },
+            )
+        )
+
+    assert writer_calls == []
+    assert subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_head
+
+
 def test_parallel_branch_merge_result_route_records_with_fence(conn):
     queue_id = "mergeq-api-result"
     upsert_branch_context(
