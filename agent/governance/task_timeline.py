@@ -5502,6 +5502,52 @@ def _finish_gate_commit(event: dict[str, Any]) -> str:
     )
 
 
+def _finish_gate_precommit_head_projection(event: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "row_scoped_finish_head_projection",
+        "row_scoped_precommit_finish_projection",
+        "precommit_finish_order",
+    ):
+        projection = _first_deep_mapping(event, key)
+        if projection:
+            return projection
+    return {}
+
+
+def _finish_gate_precommit_head_declared(event: dict[str, Any]) -> bool:
+    projection = _finish_gate_precommit_head_projection(event)
+    if not projection:
+        return False
+    head = _first_event_string(
+        event,
+        {
+            "row_scoped_implementation_head_commit",
+            "runtime_context_head_commit",
+            "current_branch_head_commit",
+            "submission_head_commit",
+            "base_commit",
+            "target_head_commit",
+        },
+    )
+    if not head:
+        return False
+    if _truthy(projection.get("finish_gate_allowed_against_current_branch_head")):
+        return True
+    if _truthy(projection.get("worker_finish_scope_requires_row_head")):
+        return True
+    if _truthy(projection.get("later_branch_commits_must_not_widen_row_scope")):
+        return True
+    status = _normalize_token(projection.get("status"))
+    return status in {
+        "pending_row_scoped_implementation_head",
+        "row_scoped_implementation_head",
+        "precommit_finish_head",
+        "precommit_finish_order",
+        "passed",
+        "accepted",
+    }
+
+
 def _evaluable_commit(value: Any) -> str:
     text = str(value or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{7,40}", text):
@@ -5859,7 +5905,10 @@ def _finish_gate_missing_fields(
             missing.append(f"finish_gate_{field}")
     if not _finish_gate_observer_command_id(event):
         missing.append("finish_gate_observer_command_id")
-    if not _finish_gate_commit(event):
+    if (
+        not _finish_gate_commit(event)
+        and not _finish_gate_precommit_head_declared(event)
+    ):
         missing.append("finish_gate_implementation_commit")
     if not _finish_gate_changed_files_declared(event):
         missing.append("finish_gate_changed_files")
@@ -5911,6 +5960,11 @@ def _finish_gate_projection_event(
         **identity,
         **lineage,
     }
+    precommit_projection = _finish_gate_precommit_head_projection(source)
+    if precommit_projection and not commit:
+        payload["row_scoped_finish_head_projection"] = precommit_projection
+        payload["post_finish_commit_bridge_required"] = True
+        payload["commit_sha"] = ""
     if graph_trace_ids:
         payload["graph_trace_ids"] = graph_trace_ids
         payload["query_source"] = _first_deep_text(source, "query_source") or "mf_subagent"
