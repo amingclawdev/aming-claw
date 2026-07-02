@@ -5671,6 +5671,50 @@ def runtime_context_mf_parallel_happy_path_reminders(
                 "If route issue returns another queue id, keep the runtime "
                 "context merge_queue_id for this lane."
             ),
+            "merge_materialization_prompt_merge_queue_id_source": (
+                "runtime_context.current_values.merge_queue_id"
+            ),
+            "merge_apply_prompt_merge_queue_id_source": (
+                "runtime_context.current_values.merge_queue_id"
+            ),
+            "newly_minted_route_token_merge_queue_id_allowed": False,
+            "message": (
+                "Durable merge materialization/apply prompts must use the "
+                "runtime-context merge_queue_id, not a merge_queue_id returned "
+                "by freshly issued route-token payloads."
+            ),
+        },
+        "merge_route_scope_guidance": {
+            "successor_contract_execution_id_role": (
+                "current child mf_parallel contract runtime writes"
+            ),
+            "root_contract_execution_id_role": (
+                "root-scope route authorization for close_or_merge_after_evidence"
+            ),
+            "close_or_merge_after_evidence_route_issue_shape": {
+                "task_id": "<root_contract_execution_id>",
+                "allowed_actions": ["close_or_merge_after_evidence"],
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "message": (
+                "Do not use the successor contract_execution_id as the root "
+                "route scope. Issue close_or_merge_after_evidence authority at "
+                "root_contract_execution_id scope and pass only route_token_ref."
+            ),
+        },
+        "live_merge_fence_guidance": {
+            "route_authorization_and_fence_freshness_are_separate": True,
+            "route_authorization_action": "close_or_merge_after_evidence",
+            "fence_freshness_source": "runtime_context_current",
+            "branch_context_reclaimed_or_fence_mismatch_next_action": (
+                "re_read_runtime_context_current_and_pass_current_fence_token"
+            ),
+            "message": (
+                "A route token authorizes the merge action; it does not refresh "
+                "a reclaimed branch-context fence. On fence mismatch, re-read "
+                "runtime_context_current and pass the current fence_token."
+            ),
         },
     }
 

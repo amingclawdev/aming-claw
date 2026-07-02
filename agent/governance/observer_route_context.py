@@ -979,6 +979,7 @@ REF_REGISTRY_SCHEMA_VERSION = "route_token_ref_registry.v1"
 REF_RENEWAL_SCHEMA_VERSION = "route_token_ref_renewal.v1"
 REF_EXPIRY_STATUS_SCHEMA_VERSION = "route_token_ref_expiry_status.v1"
 REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_renewal_next_action.v1"
+REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_same_scope_issue_next_action.v1"
 _REF_SALT_LEN = 16  # bytes of per-entry entropy, hex-encoded in DB
 _REF_REGISTRY_LOCK = threading.RLock()
 ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS = 15 * 60
@@ -1066,6 +1067,17 @@ def route_token_ref_renewal_next_action(
 ) -> dict[str, Any]:
     """Return the public-safe semantic action for renewing a route-token ref."""
 
+    reason_text = _string(reason)
+    if reason_text == REF_STATUS_SUPERSEDED:
+        return route_token_ref_same_scope_issue_next_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            observer_session_id=observer_session_id,
+            reason=reason_text,
+        )
+
     return {
         "schema_version": REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION,
         "action": "renew_route_token_ref",
@@ -1091,8 +1103,54 @@ def route_token_ref_renewal_next_action(
             "backlog_id": _string(backlog_id),
             "task_id": _string(task_id),
         },
-        "reason": _string(reason),
+        "reason": reason_text,
         "observer_session_must_be_active": True,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def route_token_ref_same_scope_issue_next_action(
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    task_id: str = "",
+    route_token_ref: str = "",
+    observer_session_id: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Return guidance for replacing a superseded route-token ref without renew loops."""
+
+    return {
+        "schema_version": REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION,
+        "action": "issue_fresh_same_scope_route_token_ref",
+        "semantic_next_action": "observer_route_context_issue",
+        "mcp_tool": "observer_route_context_issue",
+        "http_entrypoint": {
+            "method": "POST",
+            "path": "/api/projects/{project_id}/observer/route-context/issue",
+            "path_params": {"project_id": _string(project_id) or "{project_id}"},
+        },
+        "required_fields": [
+            "project_id",
+            "observer_session_id",
+            "backlog_id",
+            "task_id",
+            "allowed_actions",
+        ],
+        "project_id": _string(project_id),
+        "observer_session_id": _string(observer_session_id),
+        "superseded_route_token_ref": _string(route_token_ref),
+        "scope": {
+            "project_id": _string(project_id),
+            "backlog_id": _string(backlog_id),
+            "task_id": _string(task_id),
+        },
+        "reason": _string(reason) or REF_STATUS_SUPERSEDED,
+        "preferred_over": "renew_route_token_ref",
+        "renew_loop_allowed": False,
+        "same_scope_required": True,
+        "expired_or_near_expired_refs_still_use_renew": True,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -2266,7 +2324,17 @@ def renew_route_token_ref(
             raise RouteTokenRefError(
                 f"route_token_ref {old_ref!r} is superseded; renewal refused",
                 code="route_token_ref_superseded",
-                details={"route_token_ref": old_ref, "status": status},
+                details={
+                    "route_token_ref": old_ref,
+                    "status": status,
+                    "next_action": route_token_ref_same_scope_issue_next_action(
+                        project_id=project_id,
+                        backlog_id=backlog_id or _string(row_dict.get("backlog_id")),
+                        task_id=task_id or _string(row_dict.get("task_id")),
+                        route_token_ref=old_ref,
+                        reason=status,
+                    ),
+                },
             )
         if status not in {REF_STATUS_ACTIVE, REF_STATUS_EXPIRED}:
             raise RouteTokenRefError(

@@ -35706,6 +35706,39 @@ def _contract_runtime_stable_id(prefix: str, *parts: Any) -> str:
     return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
 
 
+def _contract_runtime_submit_line_guidance(guide: Mapping[str, Any]) -> dict[str, Any]:
+    safe_copy = (
+        guide.get("writer_role_safe_copy_payload")
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        safe_copy.get("copy_payload")
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    required_hash = str(copy_payload.get("runtime_guide_hash") or "")
+    guidance = {
+        "schema_version": "contract_runtime.submit_line_guidance.v1",
+        "required_runtime_guide_hash_source": (
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+        ),
+        "every_line_must_copy_current_writer_hash": True,
+        "hash_may_change_after_each_accepted_line": True,
+        "top_level_runtime_guide_hash_is_reader_hash": True,
+        "copy_payload_available": bool(copy_payload),
+        "message": (
+            "For every contract_runtime_submit_line, copy "
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash from "
+            "the current guide; re-read after each accepted line because the "
+            "required writer hash may change."
+        ),
+    }
+    if required_hash:
+        guidance["current_required_runtime_guide_hash"] = required_hash
+    return guidance
+
+
 def _runtime_next_action_from_guide(
     guide: Mapping[str, Any],
     *,
@@ -35740,6 +35773,7 @@ def _runtime_next_action_from_guide(
         "evidence_kind": evidence_kind,
         "required": bool(next_line.get("required", True)),
         "meta_contract_gate_decision_source": False,
+        "submit_line_guidance": _contract_runtime_submit_line_guidance(guide),
     }
     for key in (
         "line_instance_id",
@@ -37002,6 +37036,7 @@ def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "contract_runtime_current_state": current_state,
         "runtime_guide": guide,
         "next_legal_action": _runtime_next_action_from_guide(guide),
+        "submit_line_guidance": _contract_runtime_submit_line_guidance(guide),
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
@@ -45826,6 +45861,49 @@ def _mf_parallel_successor_runtime_enter(
                 "observer_route_context_issue_payload": issue_payload,
             }
         )
+    root_close_route_issue_payload = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": root_execution_id,
+        "allowed_actions": ["close_or_merge_after_evidence"],
+        "evidence_refs": [
+            ref
+            for ref in (
+                f"contract_runtime:{root_execution_id}" if root_execution_id else "",
+                f"contract_runtime:{successor_execution_id}"
+                if successor_execution_id
+                else "",
+                f"backlog:{backlog_id}" if backlog_id else "",
+            )
+            if ref
+        ],
+        "parent_route_token_ref": route_token_ref,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    merge_route_scope_guidance = {
+        "schema_version": "mf_parallel.merge_route_scope_guidance.v1",
+        "successor_contract_execution_id": successor_execution_id,
+        "successor_contract_execution_id_role": (
+            "current child mf_parallel contract runtime writes"
+        ),
+        "root_contract_execution_id": root_execution_id,
+        "root_contract_execution_id_role": (
+            "root-scope close_or_merge_after_evidence route authorization"
+        ),
+        "close_or_merge_after_evidence_route_issue_shape": (
+            root_close_route_issue_payload
+        ),
+        "copy_safe_route_token_ref_only": True,
+        "message": (
+            "Use successor_contract_execution_id for child runtime lines. Issue "
+            "close_or_merge_after_evidence authority at root_contract_execution_id "
+            "scope and pass only route_token_ref, never a raw route token."
+        ),
+    }
+    successor_contract["merge_route_scope_guidance"] = merge_route_scope_guidance
+    route_token_ref_guidance["merge_route_scope_guidance"] = merge_route_scope_guidance
     current_projection = upsert_contract_chain_successor_binding(
         conn,
         parent_record=parent_record,
@@ -45849,6 +45927,7 @@ def _mf_parallel_successor_runtime_enter(
         "contract_chain_current": current_projection,
         "route_token_ref": response_route_ref,
         "route_token_ref_guidance": route_token_ref_guidance,
+        "merge_route_scope_guidance": merge_route_scope_guidance,
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {
             "required": True,
@@ -51075,6 +51154,7 @@ def _bounded_worker_dispatch_recovery_payload(
         "base_commit": "<base-sha>",
         "target_head_commit": "<target-head-sha>",
         "merge_queue_id": merge_queue_id or "<merge-queue-id>",
+        "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
     }
     return {
         "schema_version": "bounded_worker_dispatch_recovery.v1",
@@ -51093,6 +51173,7 @@ def _bounded_worker_dispatch_recovery_payload(
             "observer_command_id": observer_command_id,
             "worker_id": worker_id,
             "merge_queue_id": merge_queue_id,
+            "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
             "route_identity": dict(route_identity),
             "missing_fields": missing,
         },
@@ -51137,6 +51218,21 @@ def _bounded_worker_dispatch_recovery_payload(
             "merge_queue_id",
             "owned_files or target_files",
         ],
+        "merge_queue_guidance": {
+            "runtime_context_merge_queue_id_authoritative": True,
+            "merge_materialization_prompt_merge_queue_id_source": (
+                "runtime_context.current_values.merge_queue_id"
+            ),
+            "merge_apply_prompt_merge_queue_id_source": (
+                "runtime_context.current_values.merge_queue_id"
+            ),
+            "newly_minted_route_token_merge_queue_id_allowed": False,
+            "message": (
+                "Use the runtime-context merge_queue_id for merge materialization "
+                "and apply prompts; ignore merge_queue_id values from newly "
+                "issued route-token payloads for this lane."
+            ),
+        },
         "payload_shape": repair_payload,
         "error": error,
     }
@@ -57773,6 +57869,10 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
         "route_token_ref": successor_runtime.get("route_token_ref", ""),
         "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
+        or {},
+        "merge_route_scope_guidance": successor_runtime.get(
+            "merge_route_scope_guidance"
+        )
         or {},
         "worker_fence": successor_runtime.get("worker_fence") or {},
         "qa_independent_verification": successor_runtime.get(

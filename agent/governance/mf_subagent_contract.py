@@ -213,7 +213,23 @@ MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS = (
     ),
     (
         "Runtime context merge_queue_id is authoritative if route issue returns "
-        "another queue id."
+        "another queue id; merge materialization/apply prompts must use the "
+        "runtime-context merge_queue_id."
+    ),
+    (
+        "Successor contract_execution_id is for the current child runtime; "
+        "close_or_merge_after_evidence route issuance stays at "
+        "root_contract_execution_id scope with copy-safe route_token_ref only."
+    ),
+    (
+        "Route authorization and runtime-context fence freshness are separate; "
+        "if branch context is reclaimed or fence mismatch occurs, re-read "
+        "runtime_context_current and pass the current fence_token."
+    ),
+    (
+        "For every contract_runtime_submit_line, copy "
+        "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash from "
+        "the current guide; the hash may change after each accepted line."
     ),
 )
 _MF_SUBAGENT_ALLOWED_QUERY_PURPOSES = {
