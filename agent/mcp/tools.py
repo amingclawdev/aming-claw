@@ -3198,9 +3198,8 @@ def _runtime_status_hash_match(left: Any, right: Any) -> bool:
 
 
 def _runtime_status_target_clean(version: dict[str, Any]) -> bool:
-    target_version = version.get("target_project_version")
-    if not isinstance(target_version, dict):
-        target_version = {}
+    raw_target_version = version.get("target_project_version")
+    target_version = raw_target_version if isinstance(raw_target_version, dict) else {}
     target_head = (
         version.get("target_head")
         or target_version.get("head")
@@ -3213,14 +3212,25 @@ def _runtime_status_target_clean(version: dict[str, Any]) -> bool:
         or version.get("chain_version")
         or ""
     )
-    target_synced = version.get(
-        "target_synced_with_governance",
-        target_version.get("synced_with_governance", True),
+    target_synced = version.get("target_synced_with_governance")
+    sync_evidence_present = "target_synced_with_governance" in version
+    if target_synced is None and "synced_with_governance" in target_version:
+        target_synced = target_version.get("synced_with_governance")
+        sync_evidence_present = True
+    governance_synced_head = (
+        version.get("governance_synced_head")
+        or target_version.get("governance_synced_head")
+        or ""
+    )
+    synced_head_matches = (
+        not governance_synced_head
+        or _runtime_status_hash_match(target_head, governance_synced_head)
     )
     return bool(
         not _runtime_status_target_dirty(version)
+        and sync_evidence_present
         and target_synced is not False
-        and _runtime_status_hash_match(target_head, target_chain)
+        and synced_head_matches
     )
 
 
@@ -3254,6 +3264,37 @@ def _runtime_status_legacy_runtime_waivers(
     )
     legacy_chain = legacy_project_version.get("chain_version", "")
     waivers: list[dict[str, Any]] = []
+
+    if target_chain and target_head and not _runtime_status_hash_match(target_head, target_chain):
+        waivers.append(
+            {
+                "id": "target_project_version_chain_drift",
+                "scope": "target_project_version",
+                "blocking": False,
+                "capability": "core_runtime",
+                "reason": (
+                    "target CHAIN_VERSION/trailer metadata lags target HEAD, "
+                    "but target HEAD is clean and synced with governance"
+                ),
+                "evidence": {
+                    "target_chain_version": target_chain,
+                    "target_head": target_head,
+                    "source": target_version.get("source", version.get("source", "")),
+                    "synced_with_governance": target_version.get(
+                        "synced_with_governance",
+                        version.get("target_synced_with_governance"),
+                    ),
+                    "governance_synced_head": (
+                        target_version.get("governance_synced_head")
+                        or version.get("governance_synced_head", "")
+                    ),
+                    "git_synced_at": target_version.get(
+                        "git_synced_at",
+                        version.get("git_synced_at", ""),
+                    ),
+                },
+            }
+        )
 
     if legacy_chain and not _runtime_status_hash_match(legacy_chain, target_chain or target_head):
         waivers.append(
@@ -4385,9 +4426,15 @@ class ToolDispatcher:
                 status["recommended_actions"].append("governance_redeploy")
             if not manager.get("ok"):
                 status["recommended_actions"].append("advanced_chain_ops_manager_start")
-            if version.get("dirty"):
+            if _runtime_status_target_dirty(version):
                 status["recommended_actions"].append("commit_or_stash_dirty_files")
-            if not version.get("runtime_match"):
+            waived_ids = {
+                str(waiver.get("id") or "")
+                for waiver in status.get("legacy_runtime_waivers", [])
+                if isinstance(waiver, dict) and not waiver.get("blocking", False)
+            }
+            advanced_runtime_waived = "advanced_runtime_version_mismatch" in waived_ids
+            if not version.get("runtime_match") and not advanced_runtime_waived:
                 status["recommended_actions"].append("advanced_chain_ops_redeploy_or_restart")
             runtime_branch_state = status.get("runtime_branch_state")
             if isinstance(runtime_branch_state, dict) and runtime_branch_state.get("follow_up_merge_blocked"):

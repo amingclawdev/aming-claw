@@ -8408,7 +8408,19 @@ def _runtime_context_service_graph_trace_refs(
         trace_id for trace_id in requested_trace_ids if trace_id not in row_trace_ids
     ]
     requested_set = set(requested_trace_ids)
-    db_verified = bool(verified) and not missing_trace_ids and not identity_mismatches
+    if requested_set:
+        requested_identity_mismatches = [
+            item
+            for item in identity_mismatches
+            if str(item.get("trace_id") or "").strip() in requested_set
+        ]
+    else:
+        requested_identity_mismatches = identity_mismatches
+    db_verified = (
+        bool(verified)
+        and not missing_trace_ids
+        and not requested_identity_mismatches
+    )
     if requested_set and not requested_set.issubset(set(verified)):
         db_verified = False
     return {
@@ -8420,7 +8432,7 @@ def _runtime_context_service_graph_trace_refs(
         "verified_trace_ids": verified,
         "requested_trace_ids": requested_trace_ids,
         "missing_trace_ids": missing_trace_ids,
-        "identity_mismatches": identity_mismatches,
+        "identity_mismatches": requested_identity_mismatches,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,

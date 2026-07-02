@@ -227,6 +227,76 @@ class _AdvancedRuntimeMismatchGovRecorder(_Recorder):
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _PostMergeRuntimeWaiverGovRecorder(_Recorder):
+    head = "7e8d2ee81e8bad06c712e69b10fc8c3851d05317"
+    chain_version = "6b8c90a6"
+    legacy_chain_version = "d98dc4a27fbf5754846921cd8b041aee7a6d36ad"
+
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        self.calls.append((method, path, data))
+        if path == "/api/health":
+            return {"status": "ok", "version": "7e8d2ee8"}
+        if path == "/api/version-check/aming-claw":
+            legacy_project_version = {
+                "chain_version": self.legacy_chain_version,
+                "updated_at": "2026-06-20T13:59:35Z",
+                "git_head": self.head,
+                "dirty_files": [],
+                "git_synced_at": "2026-07-02T03:24:27Z",
+                "synced_with_target": True,
+            }
+            target_project_version = {
+                "project_id": "aming-claw",
+                "project_root": "/Users/yingzhang/my-system/aming-claw/aming-claw",
+                "head": self.head,
+                "head_short": "7e8d2ee8",
+                "chain_version": self.chain_version,
+                "dirty": False,
+                "dirty_files": [],
+                "source": "trailer",
+                "synced_with_governance": True,
+                "governance_synced_head": self.head,
+                "git_synced_at": "2026-07-02T03:24:27Z",
+                "legacy_project_version": legacy_project_version,
+            }
+            return {
+                "ok": False,
+                "project_id": "aming-claw",
+                "head": self.head,
+                "target_head": self.head,
+                "target_head_short": "7e8d2ee8",
+                "project_root": "/Users/yingzhang/my-system/aming-claw/aming-claw",
+                "target_project_root": "/Users/yingzhang/my-system/aming-claw/aming-claw",
+                "target_project_version": target_project_version,
+                "target_chain_version": self.chain_version,
+                "target_synced_with_governance": True,
+                "target_dirty": False,
+                "target_dirty_files": [],
+                "governance_synced_head": self.head,
+                "trailer_head": self.chain_version,
+                "chain_version": self.chain_version,
+                "dirty": False,
+                "dirty_files": [],
+                "git_synced_at": "2026-07-02T03:24:27Z",
+                "source": "trailer",
+                "message": f"HEAD ({self.head}) != CHAIN_VERSION ({self.chain_version})",
+                "legacy_project_version": legacy_project_version,
+                "governance_chain_version": self.chain_version,
+                "gov_runtime_version": "7e8d2ee8",
+                "sm_runtime_version": "fa63faf4",
+                "runtime_scope": "governance",
+                "runtime_match": False,
+                "governance_runtime": {
+                    "project_root": "/Users/yingzhang/my-system/aming-claw/aming-claw",
+                    "chain_version": self.chain_version,
+                    "gov_runtime_version": "7e8d2ee8",
+                    "sm_runtime_version": "fa63faf4",
+                    "runtime_match": False,
+                },
+            }
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+
 class _OfflineGovRecorder(_Recorder):
     def api(self, method: str, path: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
@@ -2408,7 +2478,59 @@ def test_mcp_runtime_status_service_manager_mismatch_keeps_core_ok():
     )
     assert advanced_waiver["scope"] == "advanced_chain_ops/executor"
     assert advanced_waiver["evidence"]["sm_runtime_version"] == "old1234"
-    assert "advanced_chain_ops_redeploy_or_restart" in status["recommended_actions"]
+    assert "advanced_chain_ops_redeploy_or_restart" not in status["recommended_actions"]
+
+
+def test_mcp_runtime_status_synced_stale_target_chain_uses_waivers():
+    governance = _PostMergeRuntimeWaiverGovRecorder()
+    manager = _Recorder()
+    dispatcher = _dispatcher(governance, manager)
+
+    status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
+
+    assert status["ok"] is True
+    assert status["strict_ok"] is True
+    assert status["severity"] == "ok"
+    assert status["usable"] is True
+    assert status["capabilities"]["core_runtime"] is True
+    assert status["capabilities"]["advanced_chain_ops"] is False
+    assert status["capabilities"]["executor"] is False
+    assert status["recommended_actions"] == []
+    waiver_ids = {waiver["id"] for waiver in status["legacy_runtime_waivers"]}
+    assert waiver_ids == {
+        "target_project_version_chain_drift",
+        "legacy_project_version_chain_drift",
+        "advanced_runtime_version_mismatch",
+    }
+    assert all(waiver["blocking"] is False for waiver in status["legacy_runtime_waivers"])
+
+    target_waiver = next(
+        waiver
+        for waiver in status["legacy_runtime_waivers"]
+        if waiver["id"] == "target_project_version_chain_drift"
+    )
+    assert target_waiver["evidence"]["target_head"] == _PostMergeRuntimeWaiverGovRecorder.head
+    assert target_waiver["evidence"]["target_chain_version"] == "6b8c90a6"
+    assert target_waiver["evidence"]["source"] == "trailer"
+    assert target_waiver["evidence"]["synced_with_governance"] is True
+
+    legacy_waiver = next(
+        waiver
+        for waiver in status["legacy_runtime_waivers"]
+        if waiver["id"] == "legacy_project_version_chain_drift"
+    )
+    assert legacy_waiver["evidence"]["legacy_chain_version"] == (
+        _PostMergeRuntimeWaiverGovRecorder.legacy_chain_version
+    )
+    assert legacy_waiver["evidence"]["legacy_git_head"] == _PostMergeRuntimeWaiverGovRecorder.head
+
+    advanced_waiver = next(
+        waiver
+        for waiver in status["legacy_runtime_waivers"]
+        if waiver["id"] == "advanced_runtime_version_mismatch"
+    )
+    assert advanced_waiver["evidence"]["gov_runtime_version"] == "7e8d2ee8"
+    assert advanced_waiver["evidence"]["sm_runtime_version"] == "fa63faf4"
 
 
 def test_mcp_runtime_status_governance_offline_reports_loaded_mcp():
