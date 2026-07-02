@@ -350,6 +350,18 @@ MERGE_READY_INPUT_STATES = {
     STATE_VALIDATED,
     STATE_MERGE_READY,
 }
+_MERGE_QUEUE_STATUS_ALIASES = {
+    "ready_for_merge": STATE_QUEUED_FOR_MERGE,
+}
+
+
+def _normalize_merge_queue_status(status: str) -> str:
+    value = str(status or "").strip()
+    if not value:
+        return STATE_QUEUED_FOR_MERGE
+    return _MERGE_QUEUE_STATUS_ALIASES.get(value, value)
+
+
 RUNTIME_CONTEXT_DEFAULT_LANE_CLAUSES = (
     "route_context",
     "route_action_precheck",
@@ -9702,6 +9714,7 @@ def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) 
 
 _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES = frozenset(
     {
+        STATE_QUEUED_FOR_MERGE,
         STATE_VALIDATED,
         STATE_MERGE_READY,
         "review_ready",
@@ -9731,7 +9744,8 @@ def _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
         raise ValueError("checkpoint_id does not match the validated finish gate")
     if context.replay_source != "mf_sub_finish_gate":
         raise ValueError("validated mf_sub finish gate checkpoint is required")
-    if context.status not in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES:
+    context_status = _normalize_merge_queue_status(context.status)
+    if context_status not in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES:
         raise ValueError("branch context is not merge-ready from a finish gate")
     return True
 
@@ -12782,6 +12796,7 @@ def queue_merge_item_for_branch_context(
     queue_id = str(merge_queue_id or "").strip()
     if not queue_id:
         raise ValueError("merge_queue_id is required")
+    requested_status = _normalize_merge_queue_status(status)
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
@@ -12810,7 +12825,7 @@ def queue_merge_item_for_branch_context(
         task_id=task_id,
         branch_ref=context.branch_ref,
         queue_index=queue_index,
-        status=status or STATE_QUEUED_FOR_MERGE,
+        status=requested_status,
         depends_on=tuple(depends_on or context.depends_on),
         hard_depends_on=tuple(hard_depends_on),
         serializes_after=tuple(serializes_after),

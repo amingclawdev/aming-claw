@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -12670,6 +12671,86 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-route-checkpoint"
     assert queued["queue_item"]["task_id"] == "mf-sub-route-checkpoint-task"
     assert queued["route_token_gate"]["action"] == "merge_queue"
+
+
+def test_mf_sub_merge_queue_normalizes_ready_for_merge_alias_after_finish_checkpoint(conn):
+    queue_id = "mergeq-api-finish-ready-alias"
+    task_id = "mf-sub-ready-alias-task"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+            status="worktree_ready",
+            fence_token="fence-mf-sub-ready-alias",
+            worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+            base_commit="base",
+            head_commit="head",
+            target_head_commit="target",
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T07:32:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-mf-sub-ready-alias",
+        worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+        branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+        head_commit="head",
+    )
+
+    server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-mf-sub-ready-alias",
+                "fence_token": "fence-mf-sub-ready-alias",
+                "head_commit": "head",
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-mf-sub-ready-alias",
+                    worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+                    branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+                    head_commit="head",
+                ),
+            },
+        )
+    )
+    finished_context = get_branch_context(conn, PID, task_id)
+    assert finished_context is not None
+    upsert_branch_context(
+        conn,
+        replace(finished_context, status="ready_for_merge"),
+        now_iso="2026-05-17T07:35:00Z",
+    )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "merge_queue_id": queue_id,
+                "worker_role": "mf_sub",
+                "checkpoint_id": "ckpt-mf-sub-ready-alias",
+                "status": "ready_for_merge",
+                "route_waiver": _route_waiver("merge_queue", task_id=task_id),
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
+    assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-ready-alias"
 
 
 def test_mf_sub_session_cannot_enqueue_or_execute_merge(conn):
