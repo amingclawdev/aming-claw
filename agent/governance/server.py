@@ -37824,11 +37824,310 @@ def _contract_runtime_projection_for_context(
         )
         if source_ref and source_ref not in source_refs:
             source_refs.append(source_ref)
+    for line in _contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=project_id,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+    ):
+        key = _contract_runtime_projection_line_key(line)
+        if _contract_runtime_projection_key_completed(key, local_keys):
+            continue
+        local_keys.add(key)
+        projected_lines.append(line)
+        source_ref = str(
+            line.get("_source_ref")
+            or (line.get("artifact_refs") or {}).get("source_ref")
+            or ""
+        )
+        projected_line_refs.append(
+            {
+                "stage_id": str(line.get("stage_id") or ""),
+                "line_id": str(line.get("line_id") or ""),
+                "evidence_kind": str(line.get("evidence_kind") or ""),
+                "line_instance_id": str(line.get("line_instance_id") or ""),
+                "source_ref": source_ref,
+            }
+        )
+        if source_ref and source_ref not in source_refs:
+            source_refs.append(source_ref)
     return {
         "projected_lines": projected_lines,
         "projected_line_refs": projected_line_refs,
         "source_refs": source_refs,
     }
+
+
+def _contract_runtime_projection_post_worker_lines(
+    *,
+    conn,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    backlog_id = str(getattr(context, "backlog_id", "") or record.get("backlog_id") or "")
+    timeline_events = _contract_runtime_projection_post_worker_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        timeline_events=timeline_events,
+    )
+    qa_event = _contract_runtime_projection_latest_timeline_event(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"independent_verification", "qa_verification"},
+        phase_tokens={"verification", "qa"},
+        actor_roles={"qa"},
+    )
+    merge_event = _contract_runtime_projection_latest_timeline_event(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"live_merge", "merge", "observer_merge"},
+        phase_tokens={"live_merge", "merge"},
+        actor_roles={"observer"},
+    )
+    reconcile_event = _contract_runtime_projection_latest_timeline_event(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"reconcile", "observer_reconcile"},
+        phase_tokens={"reconcile"},
+        actor_roles={"observer"},
+        allow_taskless=True,
+    )
+
+    lines: list[dict[str, Any]] = []
+    if qa_event:
+        lines.append(
+            _contract_runtime_projected_post_worker_line(
+                record=record,
+                context=context,
+                event=qa_event,
+                stage_id="qa",
+                line_id="qa_independent_verification",
+                evidence_kind="independent_verification",
+                actor_role="qa",
+                source_key="qa_independent_verification",
+            )
+        )
+    if merge_event:
+        lines.append(
+            _contract_runtime_projected_post_worker_line(
+                record=record,
+                context=context,
+                event=merge_event,
+                stage_id="observer_integration",
+                line_id="observer_merge",
+                evidence_kind="merge",
+                actor_role="observer",
+                source_key="observer_merge",
+            )
+        )
+    if reconcile_event:
+        lines.append(
+            _contract_runtime_projected_post_worker_line(
+                record=record,
+                context=context,
+                event=reconcile_event,
+                stage_id="observer_integration",
+                line_id="observer_reconcile",
+                evidence_kind="reconcile",
+                actor_role="observer",
+                source_key="observer_reconcile",
+            )
+        )
+    if merge_event and reconcile_event:
+        lines.append(
+            _contract_runtime_projected_post_worker_line(
+                record=record,
+                context=context,
+                event=reconcile_event,
+                stage_id="observer_integration",
+                line_id="observer_close_ready",
+                evidence_kind="close_ready",
+                actor_role="observer",
+                source_key="observer_close_ready",
+                derived_from=[
+                    _runtime_context_event_ref(merge_event),
+                    _runtime_context_event_ref(reconcile_event),
+                ],
+            )
+        )
+    return lines
+
+
+def _contract_runtime_projection_post_worker_timeline_events(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    backlog_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    events = [dict(event) for event in timeline_events if isinstance(event, Mapping)]
+    seen_ids = {
+        int(event.get("id") or 0)
+        for event in events
+        if str(event.get("id") or "").strip()
+    }
+    if not conn or not backlog_id:
+        return events
+    try:
+        from . import task_timeline
+
+        backlog_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    except Exception:
+        return events
+    for event in backlog_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_id = int(event.get("id") or 0)
+        if event_id and event_id in seen_ids:
+            continue
+        events.append(dict(event))
+        if event_id:
+            seen_ids.add(event_id)
+    events.sort(key=lambda item: int(item.get("id") or 0))
+    return events
+
+
+def _contract_runtime_projection_latest_timeline_event(
+    timeline_events: Sequence[Mapping[str, Any]],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    backlog_id: str,
+    kind_tokens: set[str],
+    phase_tokens: set[str],
+    actor_roles: set[str],
+    allow_taskless: bool = False,
+) -> dict[str, Any]:
+    for event in reversed([event for event in timeline_events if isinstance(event, Mapping)]):
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if status not in {"accepted", "ok", "pass", "passed", "succeeded", "success"}:
+            continue
+        event_backlog = str(event.get("backlog_id") or "").strip()
+        if backlog_id and event_backlog and event_backlog != backlog_id:
+            continue
+        event_context = _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(
+                event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
+                "runtime_context_id",
+            )
+        )
+        if runtime_context_id and event_context and event_context != runtime_context_id:
+            continue
+        event_task = str(event.get("task_id") or "").strip()
+        if (
+            task_id
+            and event_task
+            and event_task != task_id
+            and not allow_taskless
+            and event_context != runtime_context_id
+        ):
+            continue
+        event_kind = _contract_runtime_close_normalized(event.get("event_kind"))
+        event_type = _contract_runtime_close_normalized(event.get("event_type"))
+        phase = _contract_runtime_close_normalized(event.get("phase"))
+        if (
+            event_kind not in kind_tokens
+            and event_type not in kind_tokens
+            and phase not in phase_tokens
+        ):
+            continue
+        actor_role = _contract_runtime_close_authority_timeline_actor_role(event)
+        if actor_role not in actor_roles:
+            continue
+        return dict(event)
+    return {}
+
+
+def _contract_runtime_projected_post_worker_line(
+    *,
+    record: Mapping[str, Any],
+    context: Any,
+    event: Mapping[str, Any],
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    actor_role: str,
+    source_key: str,
+    derived_from: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    source_ref = _runtime_context_event_ref(event)
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    projected_payload = {
+        "schema_version": "mf_parallel.runtime_context_post_worker_line_projection.v1",
+        "source": "runtime_context_post_worker_timeline_evidence",
+        "source_key": source_key,
+        "source_ref": source_ref,
+        "source_backed": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "projection_contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "projection_persists_completed_line": False,
+        "observer_authored_worker_backfill": False,
+        "event_payload": dict(payload),
+    }
+    if derived_from:
+        projected_payload["derived_from"] = [
+            str(item) for item in derived_from if str(item or "").strip()
+        ]
+    line = {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": actor_role,
+        "evidence_kind": evidence_kind,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "status": str(event.get("status") or event.get("decision") or "passed"),
+        "payload": projected_payload,
+        "artifact_refs": {
+            "source": "runtime_context_post_worker_timeline_evidence",
+            "source_ref": source_ref,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "timeline_event_ref": source_ref,
+        },
+        "_source_ref": source_ref,
+    }
+    commit_sha = str(
+        event.get("commit_sha")
+        or payload.get("commit_sha")
+        or payload.get("merge_commit")
+        or payload.get("target_head_after_merge")
+        or payload.get("target_commit_sha")
+        or payload.get("verified_commit")
+        or payload.get("worker_commit")
+        or ""
+    ).strip()
+    if commit_sha:
+        line["commit_sha"] = commit_sha
+    return line
 
 
 def _contract_runtime_projection_source_map(

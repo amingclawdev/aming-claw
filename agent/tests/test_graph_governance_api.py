@@ -25143,77 +25143,65 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         ]["projected_completed_lines"]
     }
     assert "worker_graph_context" in projected_ids
-
-    qa = server.handle_project_contract_runtime_line_write(
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        status="passed",
+        actor="observer",
+        commit_sha=close_commit[:8],
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
+            "merge_commit": close_commit[:8],
+            "target_head_after_merge": close_commit[:8],
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        status="passed",
+        actor="observer",
+        commit_sha=close_commit,
+        payload={
+            "target_commit_sha": close_commit,
+            "graph_reconciled": True,
+            "scope_reconciled": True,
+        },
+    )
+    projected_after_timeline = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": contract_execution_id},
-            "qa",
-            method="POST",
-            body={
-                "stage_id": "qa",
-                "line_id": "qa_independent_verification",
-                "evidence_kind": "independent_verification",
-                "commit_sha": worker_commit,
-                "payload": {
-                    **route_identity,
-                    "principal_id": "qa:runtime-context-close-projection",
-                    "verdict": "passed",
-                    "verified_commit": worker_commit,
-                    "changed_files": ["agent/governance/server.py"],
-                },
-            },
+            "observer",
         )
     )
-    assert qa["ok"] is True
-    assert qa["next_legal_action"]["line_id"] == "observer_merge"
-
-    for stage_id, line_id, evidence_kind, payload in [
-        (
-            "observer_integration",
-            "observer_merge",
-            "merge",
-            {**route_identity, "merge_commit": close_commit},
-        ),
-        (
-            "observer_integration",
-            "observer_reconcile",
-            "reconcile",
-            {**route_identity, "graph_reconciled": True, "scope_reconciled": True},
-        ),
-        (
-            "observer_integration",
-            "observer_close_ready",
-            "close_ready",
-            {
-                **route_identity,
-                "merge_commit": close_commit,
-                "close_readiness": {
-                    "qa_independent_verification": True,
-                    "governance_redeploy": True,
-                    "graph_reconcile": True,
-                },
-            },
-        ),
-    ]:
-        line = server.handle_project_contract_runtime_line_write(
-            _ctx_with_role(
-                {"project_id": PID, "contract_execution_id": contract_execution_id},
-                "observer",
-                method="POST",
-                body={
-                    "stage_id": stage_id,
-                    "line_id": line_id,
-                    "evidence_kind": evidence_kind,
-                    "commit_sha": close_commit,
-                    "payload": payload,
-                },
-            )
-        )
-        assert line["ok"] is True, line
+    projected_after_ids = {
+        line["line_id"]
+        for line in projected_after_timeline["runtime_guide"][
+            "completed_lines_projection"
+        ]["projected_completed_lines"]
+    }
+    assert {
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }.issubset(projected_after_ids)
+    assert not projected_after_timeline["next_legal_action"]
 
     stored = server._contract_runtime_store(conn).get(contract_execution_id)
     stored_line_ids = {line["line_id"] for line in stored["completed_lines"]}
-    assert "observer_close_ready" in stored_line_ids
+    assert "observer_close_ready" not in stored_line_ids
+    assert "qa_independent_verification" not in stored_line_ids
     assert "worker_read_runtime_guide" not in stored_line_ids
     assert "worker_implementation" not in stored_line_ids
     assert stored["runtime_guide"]["next_legal_action"]["line_id"] == (
