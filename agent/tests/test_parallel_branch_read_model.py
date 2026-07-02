@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from agent.governance import mf_subagent_contract as mf_contract
 from agent.governance import parallel_branch_runtime as pbr
 from agent.tests.fixtures.parallel_project import (
     PB001RestartFixtureProject,
@@ -892,3 +893,157 @@ def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutat
     assert saved.status == "merged"
     assert saved.branch_ref == "refs/heads/codex/PB010-integrated"
     assert saved.merge_commit == "target-after"
+
+
+def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders() -> None:
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="T-reminders",
+        parent_task_id="cex-parent-reminders",
+        backlog_id="AC-REMINDERS",
+        branch_ref="refs/heads/codex/reminders",
+        status=pbr.STATE_WORKTREE_READY,
+        runtime_context_id="mfrctx-reminders",
+        worker_id="worker-reminders",
+        worker_slot_id="worker-reminders",
+        fence_token="fence-reminders",
+        worktree_path="/tmp/reminders",
+        base_commit="base-reminders",
+        head_commit="head-reminders",
+        target_head_commit="target-reminders",
+        merge_queue_id="mq-runtime-authoritative",
+        target_files=("agent/governance/parallel_branch_runtime.py",),
+        owned_files=("agent/governance/parallel_branch_runtime.py",),
+    )
+    current_view = pbr.build_runtime_context_current_view(
+        context,
+        route_identity={
+            "route_id": "route-reminders",
+            "route_context_hash": "sha256:route-reminders",
+            "prompt_contract_id": "rprompt-reminders",
+            "prompt_contract_hash": "sha256:prompt-reminders",
+            "route_token_ref": "rtok-reminders",
+            "visible_injection_manifest_hash": "sha256:visible-reminders",
+        },
+    )
+
+    action_plan = pbr.build_runtime_context_action_plan_view(current_view)
+    reminders = action_plan["mf_parallel_happy_path_reminders"]
+
+    assert reminders["schema_version"] == (
+        "runtime_context.mf_parallel_happy_path_reminders.v1"
+    )
+    assert reminders["merge_queue_id"] == "mq-runtime-authoritative"
+    assert reminders["merge_queue_authority"] == {
+        "runtime_context_merge_queue_id_authoritative": True,
+        "authoritative_merge_queue_id": "mq-runtime-authoritative",
+        "route_issue_queue_id_policy": (
+            "If route issue returns another queue id, keep the runtime "
+            "context merge_queue_id for this lane."
+        ),
+    }
+    assert reminders["worker_rules"]["no_historical_evidence_backfill"][
+        "allowed"
+    ] is False
+    assert reminders["worker_rules"]["finish_gate_before_git_commit"][
+        "sequence"
+    ] == [
+        "implementation_evidence",
+        "finish_time_worker_attestation",
+        "finish_gate",
+        "git_commit",
+    ]
+    durable_gate = reminders["worker_rules"][
+        "independent_qa_before_durable_merge_queue"
+    ]
+    assert durable_gate["requires_before"] == [
+        "parallel_branch_merge_queue_materialize",
+        "parallel_branch_merge_queue_apply",
+    ]
+    assert durable_gate["evidence_order"] == ["finish_gate", "independent_qa"]
+    assert reminders["merge_commit"]["required_trailers"] == ["Chain-Source-Stage"]
+    assert reminders["post_merge"]["sequence"] == [
+        "governance_redeploy",
+        "graph_current_full_reconcile",
+    ]
+    assert reminders["missed_close_evidence_ordering"]["action"] == (
+        "leave_row_open_for_later_audit_contract"
+    )
+    assert reminders["protected_successor_entry"]["required_fields"] == [
+        "observer_session_id",
+        "route_token_ref",
+    ]
+    assert reminders["dispatch_recovery"]["required_fields"] == [
+        "route_context_hash",
+        "prompt_contract_id",
+        "observer_command_id",
+    ]
+
+    read_action = action_plan["read_receipt_hash_action"]
+    assert read_action["mf_parallel_happy_path_reminders"] == reminders
+    assert read_action["ordered_worker_startup_bridge"][
+        "mf_parallel_happy_path_reminders"
+    ] == reminders
+
+    worker_view = pbr.build_runtime_context_worker_view(
+        current_view,
+        task_id="T-reminders",
+        fence_token="fence-reminders",
+        action_plan_view=action_plan,
+    )
+    assert worker_view["mf_parallel_happy_path_reminders"] == reminders
+    assert worker_view["control_plane"]["mf_parallel_happy_path_reminders"] == (
+        reminders
+    )
+    assert "mf_parallel_happy_path_reminders" in worker_view[
+        "role_filter_policy"
+    ]["allowed_sections"]
+
+    runtime_contract = mf_contract.build_mf_subagent_runtime_contract_view(
+        context,
+        route_identity={
+            "route_id": "route-reminders",
+            "route_context_hash": "sha256:route-reminders",
+            "prompt_contract_id": "rprompt-reminders",
+            "prompt_contract_hash": "sha256:prompt-reminders",
+            "route_token_ref": "rtok-reminders",
+            "visible_injection_manifest_hash": "sha256:visible-reminders",
+        },
+    )
+    assert runtime_contract["mf_parallel_happy_path_reminders"] == reminders
+    assert runtime_contract["contract"]["mf_parallel_happy_path_reminders"] == (
+        reminders
+    )
+    assert runtime_contract["agent_task_contract"][
+        "mf_parallel_happy_path_reminders"
+    ] == reminders
+    assert runtime_contract["worker_prompt_reminders"] == list(
+        mf_contract.MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS
+    )
+
+    worker_input = mf_contract.build_mf_subagent_input(
+        context,
+        prompt="Implement the reminder contract.",
+        target_files=("agent/governance/parallel_branch_runtime.py",),
+        route_context_hash="sha256:route-reminders",
+        prompt_contract_id="rprompt-reminders",
+        prompt_contract_hash="sha256:prompt-reminders",
+        route_id="route-reminders",
+        route_token_ref="rtok-reminders",
+        visible_injection_manifest_hash="sha256:visible-reminders",
+    )
+    prompt_reminders = worker_input["work"]["prompt_reminders"]
+    assert worker_input["mf_parallel_happy_path_reminders"] == reminders
+    assert worker_input["agent_task_contract"][
+        "mf_parallel_happy_path_reminders"
+    ] == reminders
+    assert prompt_reminders == list(mf_contract.MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS)
+    assert any("Do not backfill historical" in item for item in prompt_reminders)
+    assert any("Finish gate evidence" in item for item in prompt_reminders)
+    assert any("Independent QA" in item for item in prompt_reminders)
+    assert any("Chain-Source-Stage" in item for item in prompt_reminders)
+    assert any("graph_current_full_reconcile" in item for item in prompt_reminders)
+    assert any("leave the row open" in item for item in prompt_reminders)
+    assert any("observer_session_id" in item for item in prompt_reminders)
+    assert any("observer_command_id" in item for item in prompt_reminders)
+    assert any("merge_queue_id is authoritative" in item for item in prompt_reminders)

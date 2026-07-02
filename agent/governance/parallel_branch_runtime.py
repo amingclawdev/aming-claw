@@ -5568,6 +5568,113 @@ def _runtime_context_route_token_action(
     }
 
 
+def runtime_context_mf_parallel_happy_path_reminders(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    merge_queue_id = _runtime_context_text(values.get("merge_queue_id"))
+    return {
+        "schema_version": "runtime_context.mf_parallel_happy_path_reminders.v1",
+        "contract": "mf_parallel",
+        "status": "active",
+        "merge_queue_id": merge_queue_id,
+        "canonical_merge_queue_id_source": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "ordered_worker_happy_path": [
+            "read_runtime_context_worker_guide",
+            "runtime_context_read_receipt",
+            "mf_subagent_startup",
+            "worker_graph_query",
+            "implementation_and_tests",
+            "implementation_evidence",
+            "finish_time_worker_attestation",
+            "finish_gate_before_git_commit",
+            "git_commit_after_finish_gate",
+            "independent_qa_before_merge_queue",
+            "durable_merge_queue_materialize",
+            "merge_queue_apply",
+            "merge_commit_with_chain_source_stage_trailer",
+            "governance_redeploy",
+            "graph_current_full_reconcile",
+        ],
+        "worker_rules": {
+            "no_historical_evidence_backfill": {
+                "allowed": False,
+                "message": (
+                    "Do not backfill historical worker, QA, close, or merge "
+                    "evidence to satisfy missed ordering."
+                ),
+            },
+            "finish_gate_before_git_commit": {
+                "required": True,
+                "sequence": [
+                    "implementation_evidence",
+                    "finish_time_worker_attestation",
+                    "finish_gate",
+                    "git_commit",
+                ],
+            },
+            "independent_qa_before_durable_merge_queue": {
+                "required": True,
+                "requires_before": [
+                    "parallel_branch_merge_queue_materialize",
+                    "parallel_branch_merge_queue_apply",
+                ],
+                "evidence_order": ["finish_gate", "independent_qa"],
+            },
+        },
+        "merge_commit": {
+            "required_trailers": ["Chain-Source-Stage"],
+            "message": "Merge commits must include a Chain-Source-Stage trailer.",
+        },
+        "post_merge": {
+            "sequence": ["governance_redeploy", "graph_current_full_reconcile"],
+            "message": (
+                "Redeploy governance after the ordered merge, then run "
+                "graph_current_full_reconcile."
+            ),
+        },
+        "missed_close_evidence_ordering": {
+            "action": "leave_row_open_for_later_audit_contract",
+            "forbidden_actions": [
+                "historical_evidence_backfill",
+                "looping_close_attempts",
+            ],
+            "message": (
+                "If legal close evidence ordering was missed, leave the row open "
+                "for a later audit contract instead of looping or backfilling."
+            ),
+        },
+        "protected_successor_entry": {
+            "required_fields": ["observer_session_id", "route_token_ref"],
+            "message": (
+                "Protected successor entry requires observer_session_id plus "
+                "route_token_ref; route_token_ref alone does not prove observer "
+                "session liveness."
+            ),
+        },
+        "dispatch_recovery": {
+            "required_fields": [
+                "route_context_hash",
+                "prompt_contract_id",
+                "observer_command_id",
+            ],
+            "message": (
+                "Dispatch recovery must preserve route_context_hash, "
+                "prompt_contract_id, and observer_command_id."
+            ),
+        },
+        "merge_queue_authority": {
+            "runtime_context_merge_queue_id_authoritative": True,
+            "authoritative_merge_queue_id": merge_queue_id,
+            "route_issue_queue_id_policy": (
+                "If route issue returns another queue id, keep the runtime "
+                "context merge_queue_id for this lane."
+            ),
+        },
+    }
+
+
 def _runtime_context_read_receipt_hash_action(
     *,
     current_view: Mapping[str, Any],
@@ -5609,6 +5716,7 @@ def _runtime_context_read_receipt_hash_action(
         "worker_id": _runtime_context_text(values.get("worker_id")),
         "worker_slot_id": _runtime_context_text(values.get("worker_slot_id")),
     }
+    happy_path_reminders = runtime_context_mf_parallel_happy_path_reminders(values)
     hash_material = {
         "projection_hash_source": (
             "runtime_context_service.content_address.projection_hash"
@@ -5624,6 +5732,7 @@ def _runtime_context_read_receipt_hash_action(
             "worker_identity": worker_identity,
             "owned_files": owned_files,
             "hash_material": hash_material,
+            "happy_path_reminders": happy_path_reminders,
         }
     )
     ordered_steps = [
@@ -5794,6 +5903,7 @@ def _runtime_context_read_receipt_hash_action(
             "close_gate_view": close_gate_node,
         },
         "hash_material": hash_material,
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "entrypoint": {
             "method": "POST",
             "path": "/api/task/{project_id}/timeline",
@@ -5843,6 +5953,7 @@ def _runtime_context_read_receipt_hash_action(
                 "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
                 "query_source": "mf_subagent",
             },
+            "mf_parallel_happy_path_reminders": happy_path_reminders,
         },
         "observer_remediation_actions": [
             {
@@ -5874,6 +5985,7 @@ def _runtime_context_read_receipt_hash_action(
             "schema_version": "runtime_context.worker_startup_bridge.v1",
             "status": "ready" if read_receipt_ref else "waiting_for_read_receipt",
             "steps": ordered_steps,
+            "mf_parallel_happy_path_reminders": happy_path_reminders,
             "privacy_boundary": {
                 "raw_session_token_persisted": False,
                 "raw_route_token_persisted": False,
@@ -7088,6 +7200,7 @@ def build_runtime_context_action_plan_view(
         },
         read_receipt_hash_action=read_receipt_hash_action,
     )
+    happy_path_reminders = runtime_context_mf_parallel_happy_path_reminders(values)
     failed_qa_revision_projection = _runtime_context_failed_qa_revision_projection(
         lane_plan=lane_plan,
         values=values,
@@ -7225,6 +7338,7 @@ def build_runtime_context_action_plan_view(
         "route_token_action": route_token_action,
         "read_receipt_hash_action": read_receipt_hash_action,
         "worker_handoff_projection": worker_handoff_projection,
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "audit_archive_action": audit_archive_action,
         "merge_dependency_projection": merge_dependency_projection,
         "close_precheck_gap_projection": close_precheck_gap_projection,
@@ -7644,6 +7758,9 @@ def build_runtime_context_control_plane_view(
         ),
         "worker_handoff_projection": dict(
             action_plan.get("worker_handoff_projection") or {}
+        ),
+        "mf_parallel_happy_path_reminders": dict(
+            action_plan.get("mf_parallel_happy_path_reminders") or {}
         ),
         "audit_archive_action": dict(action_plan.get("audit_archive_action") or {}),
         "merge_dependency_projection": dict(
@@ -8076,6 +8193,9 @@ def build_runtime_context_worker_view(
         "action_plan": action_plan,
         "gate_projection": gate_projection,
         "control_plane": control_plane,
+        "mf_parallel_happy_path_reminders": dict(
+            action_plan.get("mf_parallel_happy_path_reminders") or {}
+        ),
         "evidence_refs": {
             key: _runtime_context_mapping(current_view.get("evidence_refs")).get(
                 key,
@@ -8112,6 +8232,7 @@ def build_runtime_context_worker_view(
                 "action_plan",
                 "gate_projection",
                 "control_plane",
+                "mf_parallel_happy_path_reminders",
                 "evidence_refs",
             ],
             "blocked_sections": [

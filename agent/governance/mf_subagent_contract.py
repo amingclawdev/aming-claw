@@ -19,6 +19,7 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     build_runtime_context_projection,
+    runtime_context_mf_parallel_happy_path_reminders,
     runtime_context_id_for_branch_context,
 )
 
@@ -194,6 +195,26 @@ _DISPATCH_REQUIRED_FIELDS = (
     "route_token_ref",
     "route_context_hash",
     "prompt_contract_id",
+)
+MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS = (
+    "Do not backfill historical worker, QA, close, or merge evidence.",
+    "Finish gate evidence must be ready before any git commit.",
+    "Independent QA must pass before durable merge queue materialization or apply.",
+    "Merge commits must include a Chain-Source-Stage trailer.",
+    "After the merge, redeploy governance and run graph_current_full_reconcile.",
+    (
+        "If legal close evidence ordering was missed, leave the row open for a "
+        "later audit contract instead of looping."
+    ),
+    (
+        "Protected successor entry needs observer_session_id and route_token_ref; "
+        "dispatch recovery needs route_context_hash, prompt_contract_id, and "
+        "observer_command_id."
+    ),
+    (
+        "Runtime context merge_queue_id is authoritative if route issue returns "
+        "another queue id."
+    ),
 )
 _MF_SUBAGENT_ALLOWED_QUERY_PURPOSES = {
     "subagent_context_build",
@@ -931,6 +952,9 @@ def build_observer_owned_agent_task_contract(
         for item in (required_evidence or _DEFAULT_RUNTIME_CONTRACT_EVIDENCE)
         if _string(item)
     ]
+    happy_path_reminders = runtime_context_mf_parallel_happy_path_reminders(
+        {"merge_queue_id": context.merge_queue_id}
+    )
     target_file_values = [item for item in (target_files or []) if _string(item)]
     owned_file_values = [item for item in (owned_files or []) if _string(item)]
     if not owned_file_values:
@@ -956,6 +980,8 @@ def build_observer_owned_agent_task_contract(
         "allowed_actions": list(allowed_actions or MF_SUB_ALLOWED_CAPABILITIES),
         "blocked_actions": list(blocked_actions or MF_SUB_FORBIDDEN_ACTIONS),
         "required_evidence": evidence,
+        "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "target_files": target_file_values,
         "owned_files": owned_file_values,
         "target_fences": [item for item in (target_fences or []) if _string(item)]
@@ -1117,6 +1143,9 @@ def build_mf_subagent_runtime_contract_view(
             else {}
         ),
     )
+    happy_path_reminders = dict(
+        agent_task_contract.get("mf_parallel_happy_path_reminders") or {}
+    )
     projection_watermark = (
         latest_revision_text
         or context.checkpoint_id
@@ -1188,6 +1217,8 @@ def build_mf_subagent_runtime_contract_view(
         "forbidden_actions": list(MF_SUB_FORBIDDEN_ACTIONS),
         "required_output": list(MF_SUB_REQUIRED_OUTPUT),
         "required_evidence": list(evidence_ids),
+        "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "graph_query": {
             "query_source": "mf_subagent",
             "schema_version": GRAPH_TRACE_SCHEMA_VERSION,
@@ -1349,6 +1380,8 @@ def build_mf_subagent_runtime_contract_view(
         "runtime_context": runtime_context,
         "contract": contract,
         "agent_task_contract": agent_task_contract,
+        "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "route_identity": route_identity_safe,
         "route_id": route_identity_safe.get("route_id", ""),
         "route_context_hash": route_identity_safe.get("route_context_hash", ""),
@@ -6667,6 +6700,9 @@ def build_mf_subagent_input(
         target_fences=[context.fence_token],
         lifecycle_state=context.status,
     )
+    happy_path_reminders = dict(
+        agent_task_contract.get("mf_parallel_happy_path_reminders") or {}
+    )
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
@@ -6742,6 +6778,7 @@ def build_mf_subagent_input(
             "owned_files": list(agent_task_contract.get("owned_files") or []),
             "test_commands": _string_list(test_commands, field_name="test_commands"),
             "operator_notes": operator_notes,
+            "prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
         },
         "route_prompt_contract": child_route_prompt_contract,
         "parent_route_lineage": normalized_parent_route_lineage,
@@ -6750,6 +6787,8 @@ def build_mf_subagent_input(
             child_route_prompt_contract=child_route_prompt_contract,
         ),
         "agent_task_contract": agent_task_contract,
+        "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
+        "mf_parallel_happy_path_reminders": happy_path_reminders,
         "verification_route_policy": verification_route_policy_from_contract(
             {
                 "route_identity": child_route_prompt_contract,
