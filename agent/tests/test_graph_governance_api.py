@@ -25113,10 +25113,10 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "2026-06-29T01:05:00Z",
         ),
     )
-    task_timeline.record_event(
+    qa_event = task_timeline.record_event(
         conn,
         project_id=PID,
-        task_id=runtime_context.task_id,
+        task_id=contract_execution_id,
         backlog_id=backlog_id,
         event_type="independent_verification.completed",
         event_kind="independent_verification",
@@ -25125,11 +25125,43 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         actor="qa:runtime-context-close-projection",
         payload={
             "contract_execution_id": contract_execution_id,
-            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
             "verified_commit": worker_commit,
             "graph_trace_ids": [qa_graph_trace_id],
         },
     )
+    qa_decoy = conn.execute(
+        """
+        INSERT INTO task_timeline_events
+          (project_id, backlog_id, task_id, event_type, event_kind, phase,
+           actor, status, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            PID,
+            backlog_id,
+            contract_execution_id,
+            "independent_verification.completed",
+            "independent_verification",
+            "verification",
+            "observer",
+            "passed",
+            json.dumps(
+                {
+                    "actor_role": "qa",
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": contract_execution_id,
+                    "verified_commit": worker_commit,
+                },
+                sort_keys=True,
+            ),
+            "2026-06-29T01:05:01Z",
+        ),
+    )
+    qa_decoy_id = int(qa_decoy.lastrowid)
     projected_current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": contract_execution_id},
@@ -25143,10 +25175,10 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         ]["projected_completed_lines"]
     }
     assert "worker_graph_context" in projected_ids
-    task_timeline.record_event(
+    merge_event = task_timeline.record_event(
         conn,
         project_id=PID,
-        task_id=runtime_context.task_id,
+        task_id=contract_execution_id,
         backlog_id=backlog_id,
         event_type="parallel.live_merge",
         event_kind="live_merge",
@@ -25155,16 +25187,16 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         actor="observer",
         commit_sha=close_commit[:8],
         payload={
-            "runtime_context_id": runtime_context.runtime_context_id,
             "task_id": runtime_context.task_id,
             "parent_task_id": contract_execution_id,
             "merge_commit": close_commit[:8],
             "target_head_after_merge": close_commit[:8],
         },
     )
-    task_timeline.record_event(
+    reconcile_event = task_timeline.record_event(
         conn,
         project_id=PID,
+        task_id=started["contract_execution_id"],
         backlog_id=backlog_id,
         event_type="graph.reconcile",
         event_kind="reconcile",
@@ -25173,9 +25205,34 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         actor="observer",
         commit_sha=close_commit,
         payload={
+            "contract_execution_id": contract_execution_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
             "target_commit_sha": close_commit,
             "graph_reconciled": True,
             "scope_reconciled": True,
+        },
+    )
+    close_ready_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=started["contract_execution_id"],
+        backlog_id=backlog_id,
+        event_type="observer.close_ready",
+        event_kind="close_ready",
+        phase="close_ready",
+        status="passed",
+        actor="observer",
+        commit_sha=close_commit,
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
+            "merge_commit": close_commit,
+            "close_readiness": {
+                "qa_independent_verification": True,
+                "graph_reconcile": True,
+            },
         },
     )
     projected_after_timeline = server.handle_project_contract_runtime_current_state(
@@ -25197,6 +25254,17 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         "observer_close_ready",
     }.issubset(projected_after_ids)
     assert not projected_after_timeline["next_legal_action"]
+    projected_refs = {
+        item["line_id"]: item["source_ref"]
+        for item in projected_after_timeline["runtime_guide"][
+            "completed_lines_projection"
+        ]["projected_line_refs"]
+    }
+    assert projected_refs["qa_independent_verification"] == f"timeline:{qa_event['id']}"
+    assert projected_refs["qa_independent_verification"] != f"timeline:{qa_decoy_id}"
+    assert projected_refs["observer_merge"] == f"timeline:{merge_event['id']}"
+    assert projected_refs["observer_reconcile"] == f"timeline:{reconcile_event['id']}"
+    assert projected_refs["observer_close_ready"] == f"timeline:{close_ready_event['id']}"
 
     stored = server._contract_runtime_store(conn).get(contract_execution_id)
     stored_line_ids = {line["line_id"] for line in stored["completed_lines"]}
