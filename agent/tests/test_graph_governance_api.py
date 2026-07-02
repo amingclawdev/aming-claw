@@ -11586,6 +11586,207 @@ def test_parallel_branch_startup_accepts_host_worker_surrogate_for_observer_allo
     assert started["startup_gate"]["close_satisfying"] is False
 
 
+def test_parallel_branch_startup_host_adapter_server_verified_ref_is_close_satisfying(
+    conn, tmp_path
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="host-adapter-server-ref-startup",
+    )
+    worktree = fixture.root
+    branch_name = "codex/host-adapter-server-ref-startup"
+    branch_ref = f"refs/heads/{branch_name}"
+    changed_path = "agent/governance/parallel_branch_runtime.py"
+    subprocess.run(
+        ["git", "checkout", "-B", branch_name, fixture.main_head],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_file = worktree / changed_path
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(
+        "def host_adapter_server_ref_marker():\n"
+        "    return 'startup-server-ref'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", changed_path],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "host adapter server ref startup"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    runtime_context = BranchTaskRuntimeContext(
+        project_id=PID,
+        batch_id="PB-api-host-server-ref-startup",
+        task_id="host-server-ref-mf-sub-task",
+        root_task_id="host-server-ref-parent",
+        stage_task_id="host-server-ref-mf-sub-task",
+        backlog_id="FEAT-HOST-STARTUP-GATE",
+        branch_ref=branch_ref,
+        status="worktree_ready",
+        worker_id="host-server-ref-worker-slot",
+        agent_id="observer-allocation-owner",
+        allocation_owner="observer-allocation-owner",
+        worker_slot_id="host-server-ref-worker-slot",
+        fence_token="fence-host-server-ref-mf-sub",
+        session_token_hash=mf_subagent_session_token_hash(
+            "host-server-ref-session-token"
+        ),
+        worktree_path=str(worktree),
+        base_commit=fixture.main_head,
+        head_commit=fixture.main_head,
+        target_head_commit=fixture.main_head,
+        merge_queue_id="mergeq-api-host-server-ref",
+    )
+    upsert_branch_context(
+        conn,
+        runtime_context,
+        now_iso="2026-06-05T04:40:00Z",
+    )
+    host_worker_id = "019e95fd-host-server-ref-worker"
+    host_startup_id = f"multi_agent_v1.spawn_agent:{host_worker_id}"
+    session_surrogate = f"codex_desktop_multi_agent_v1:{host_worker_id}"
+    route_identity = {
+        "route_id": "route-host-server-ref",
+        "route_context_hash": "sha256:route-host-server-ref",
+        "prompt_contract_id": "rprompt-host-server-ref",
+        "prompt_contract_hash": "sha256:prompt-host-server-ref",
+        "route_token_ref": "rtok-host-server-ref",
+        "visible_injection_manifest_hash": "sha256:visible-host-server-ref",
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        payload={
+            "registered_host_adapter_spawn": {
+                "schema_version": "mf_subagent_host_adapter_spawn_identity.v1",
+                "source": "test_registered_host_adapter_spawn",
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    runtime_context
+                ),
+                "task_id": "host-server-ref-mf-sub-task",
+                "worker_slot_id": "host-server-ref-worker-slot",
+                "agent_id": host_worker_id,
+                "actual_host_worker_id": host_worker_id,
+                "host_startup_id": host_startup_id,
+                "host_session_id": host_startup_id,
+                "session_token_surrogate": session_surrogate,
+            }
+        },
+        route_identity=route_identity,
+        now_iso="2026-06-05T04:41:00Z",
+    )
+    runtime_context_id = runtime_context_id_for_branch_context(runtime_context)
+    graph_trace_id = "gqt-host-server-ref-startup"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id="host-server-ref-parent",
+        snapshot_id="scope-host-server-ref",
+        runtime_context_id=runtime_context_id,
+        task_id="host-server-ref-mf-sub-task",
+        worker_role="mf_sub",
+        fence_token="fence-host-server-ref-mf-sub",
+        run_id=_mf_sub_run_id(
+            "host-server-ref-mf-sub-task",
+            "fence-host-server-ref-mf-sub",
+        ),
+    )
+    conn.commit()
+    transcript_path = tmp_path / "host-server-ref-transcript.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "event": "mf_subagent graph_query startup attestation",
+                "worker_session_id": host_worker_id,
+                "task_id": "host-server-ref-mf-sub-task",
+                "runtime_context_id": runtime_context_id,
+                "fence_token": "fence-host-server-ref-mf-sub",
+                "worktree_path": str(worktree),
+                "branch_ref": branch_ref,
+                "changed_files": [changed_path],
+                "graph_trace_ids": [graph_trace_id],
+                "observer_command_id": "cmd-host-server-ref",
+                "read_receipt_hash": "sha256:read-host-server-ref",
+                "read_receipt_event_id": "2875",
+                "route_token_ref": "rtok-host-server-ref",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    started = server.handle_graph_governance_parallel_branch_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": "host-server-ref-mf-sub-task",
+                "parent_task_id": "host-server-ref-parent",
+                "worker_role": "mf_sub",
+                "worker_id": "host-server-ref-worker-slot",
+                "worker_slot_id": "host-server-ref-worker-slot",
+                "agent_id": host_worker_id,
+                "actual_host_worker_id": host_worker_id,
+                "worker_session_id": host_worker_id,
+                "worker_transcript_path": str(transcript_path),
+                "worker_transcript_ref": f"multi_agent:{host_worker_id}",
+                "harness_type": "codex",
+                "filer_principal": host_worker_id,
+                "runtime_context_id": runtime_context_id,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "session_token_surrogate": session_surrogate,
+                "host_startup_id": host_startup_id,
+                "startup_source": "codex_desktop_multi_agent_v1.spawn_agent",
+                "fence_token": "fence-host-server-ref-mf-sub",
+                "actual_cwd": str(worktree),
+                "actual_git_root": str(worktree),
+                "branch": branch_ref,
+                "head_commit": head_commit,
+                "base_commit": fixture.main_head,
+                "target_head_commit": fixture.main_head,
+                "merge_queue_id": "mergeq-api-host-server-ref",
+                "owned_files": [changed_path],
+                "graph_trace_ids": [graph_trace_id],
+                **route_identity,
+                "observer_command_id": "cmd-host-server-ref",
+                "read_receipt_hash": "sha256:read-host-server-ref",
+                "read_receipt_event_id": "2875",
+            },
+        )
+    )
+
+    assert started["ok"] is True
+    gate = started["startup_gate"]
+    assert gate["agent_id_match_mode"] == "host_adapter_server_verified_session"
+    assert gate["host_adapter_startup_token_accepted"] is True
+    assert gate["host_adapter_startup_surrogate_not_close_satisfying"] is False
+    assert gate["session_token_evidence_type"] == "server_verified_ref"
+    assert gate["server_issued_session_token_verified"] is True
+    assert gate["close_satisfying"] is True
+
+
 def test_parallel_branch_startup_accepts_codex_cli_host_startup_id_for_observer_allocation(
     conn, tmp_path
 ):
@@ -37129,6 +37330,7 @@ def test_timeline_gate_blocks_event_4178_surrogate_startup_without_real_join(con
         task_id=task_id,
         suffix="event-4178",
         same_owner_startup=False,
+        startup_overrides={"close_satisfying": False},
     )
 
     result = server.handle_backlog_timeline_gate(

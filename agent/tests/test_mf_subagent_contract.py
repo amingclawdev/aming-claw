@@ -994,6 +994,55 @@ def test_meta_contract_rejects_observer_forbidden_action_d2_boundary() -> None:
         )
 
 
+def test_meta_contract_rejects_legacy_host_adapter_surrogate_even_with_verified_ref() -> None:
+    with pytest.raises(MfSubagentContractError, match="surrogate_startup"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "mf_subagent.startup",
+                "event_kind": "mf_subagent_startup",
+                "actor": "worker-host-adapter",
+                "status": "passed",
+                "payload": {
+                    "mf_subagent_startup_gate": {
+                        "schema_version": "mf_subagent_startup_gate.v1",
+                        "agent_id_match_mode": "host_adapter_startup_token_surrogate",
+                        "session_token_evidence_type": "server_verified_ref",
+                        "session_token_ref_present": True,
+                        "host_adapter_startup_token_accepted": True,
+                        "close_satisfying": True,
+                        "worker_self_attesting": True,
+                    }
+                },
+            }
+        )
+
+
+def test_meta_contract_allows_host_adapter_server_verified_session_startup() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent.startup",
+            "event_kind": "mf_subagent_startup",
+            "actor": "worker-host-adapter",
+            "status": "passed",
+            "payload": {
+                "mf_subagent_startup_gate": {
+                    "schema_version": "mf_subagent_startup_gate.v1",
+                    "agent_id_match_mode": "host_adapter_server_verified_session",
+                    "session_token_evidence_type": "server_verified_ref",
+                    "session_token_ref_present": True,
+                    "host_adapter_startup_token_accepted": True,
+                    "close_satisfying": True,
+                    "worker_self_attesting": True,
+                }
+            },
+        }
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == "mf_sub"
+    assert gate["action"] == "mf_subagent_startup"
+
+
 def test_meta_contract_ignores_forged_payload_gate_for_action_derivation() -> None:
     with pytest.raises(MfSubagentContractError, match="unknown timeline action"):
         validate_meta_contract_timeline_event(

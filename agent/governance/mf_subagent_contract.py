@@ -5739,21 +5739,24 @@ def _meta_surrogate_startup_present(event: Mapping[str, Any], *, action: str) ->
     for container in _meta_contract_containers(event):
         token_type = _normalized_action(container.get("session_token_evidence_type"))
         match_mode = _normalized_action(container.get("agent_id_match_mode"))
+        server_verified_token = token_type in {
+            "server_verified",
+            "server_verified_ref",
+        }
+        token_or_ref_present = _bool(container.get("session_token_present")) or _bool(
+            container.get("session_token_ref_present")
+        )
         claims_close_satisfying = (
             _bool(container.get("close_satisfying"))
             or _bool(container.get("worker_self_attesting"))
             or _bool(container.get("self_attesting"))
         )
-        if token_type in {"surrogate", "claimed_unverified"}:
+        if token_type in {"surrogate", "claimed_unverified", "claimed_unverified_ref"}:
             return claims_close_satisfying
-        token_present = _bool(container.get("session_token_present"))
-        if (
-            match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE
-            and (token_type != "server_verified" or not token_present)
-        ):
+        if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
             return claims_close_satisfying
-        if _bool(container.get("host_adapter_startup_token_accepted")) and not _bool(
-            container.get("session_token_present")
+        if _bool(container.get("host_adapter_startup_token_accepted")) and not (
+            server_verified_token and token_or_ref_present
         ):
             return claims_close_satisfying
     return False

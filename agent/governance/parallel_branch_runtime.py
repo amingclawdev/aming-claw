@@ -11811,11 +11811,20 @@ def record_mf_subagent_startup(
                 "expected_worker_slot_id": context.worker_slot_id or context.worker_id,
             },
         ))
+    session_token_evidence_type = str(
+        token_evidence["session_token_evidence_type"] or ""
+    )
+    server_verified_session_token_evidence = session_token_evidence_type in {
+        "server_verified",
+        "server_verified_ref",
+    }
     agent_id_match_mode = "actual_host_worker_bound"
     if allocation_owner and agent_id == allocation_owner:
         agent_id_match_mode = "same_as_allocation_owner"
     elif service_dispatch_worker_binding:
         agent_id_match_mode = "observer_subagent_service_dispatch"
+    elif host_adapter_startup and server_verified_session_token_evidence:
+        agent_id_match_mode = "host_adapter_server_verified_session"
     elif host_adapter_startup:
         agent_id_match_mode = "host_adapter_startup_token_surrogate"
     elif allocation_owner:
@@ -11971,6 +11980,7 @@ def record_mf_subagent_startup(
     server_verified_identity_modes = {
         "same_as_allocation_owner",
         "observer_subagent_service_dispatch",
+        "host_adapter_server_verified_session",
     }
     if agent_id_match_mode in server_verified_identity_modes:
         if not context.session_token_hash:
@@ -12024,15 +12034,8 @@ def record_mf_subagent_startup(
         runtime_context_id=runtime_context_id,
         fence_token=fence_token,
     )
-    session_token_evidence_type = str(
-        token_evidence["session_token_evidence_type"] or ""
-    )
-    service_dispatch_verified_startup = bool(
-        agent_id_match_mode == "observer_subagent_service_dispatch"
-        and session_token_evidence_type in {"server_verified", "server_verified_ref"}
-    )
     host_adapter_surrogate_startup = bool(
-        host_adapter_startup and not service_dispatch_verified_startup
+        host_adapter_startup and not server_verified_session_token_evidence
     )
     worker_self_attestation_payload = {
         **dict(payload),
@@ -12073,7 +12076,8 @@ def record_mf_subagent_startup(
     )
     surrogate_startup_not_close_satisfying = bool(
         host_adapter_surrogate_startup
-        or session_token_evidence_type in {"surrogate", "claimed_unverified_ref"}
+        or session_token_evidence_type
+        in {"surrogate", "claimed_unverified", "claimed_unverified_ref"}
     )
     if surrogate_startup_not_close_satisfying:
         blockers = _runtime_context_dedupe(
