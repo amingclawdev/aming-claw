@@ -198,13 +198,31 @@ _DISPATCH_REQUIRED_FIELDS = (
 )
 MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS = (
     "Do not backfill historical worker, QA, close, or merge evidence.",
+    (
+        "Graph-first trace evidence is a pre-implementation blocker; run "
+        "worker-scoped graph queries and carry DB-verified trace ids before edits."
+    ),
     "Finish gate evidence must be ready before any git commit.",
+    (
+        "Record finish-time worker self-attestation after implementation "
+        "evidence and before finish_gate; missed ordering stays open for "
+        "re-dispatch, not post-hoc recovery."
+    ),
     "Independent QA must pass before durable merge queue materialization or apply.",
     "Merge commits must include a Chain-Source-Stage trailer.",
     "After the merge, redeploy governance and run graph_current_full_reconcile.",
     (
         "If legal close evidence ordering was missed, leave the row open for a "
         "later audit contract instead of looping."
+    ),
+    (
+        "Historical implementation without verified graph trace is non-closeable; "
+        "keep the branch open and re-dispatch graph-first recovery instead of "
+        "recording post-hoc evidence."
+    ),
+    (
+        "Out-of-fence file requirements keep the old branch open and require "
+        "re-dispatch with expanded scope."
     ),
     (
         "Protected successor entry needs observer_session_id and route_token_ref; "

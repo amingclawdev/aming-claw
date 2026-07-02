@@ -544,6 +544,29 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
             ),
             "properties": route_identity_properties,
         },
+        "parent_route_lineage": {
+            "type": "object",
+            "description": (
+                "Public-safe parent route lineage preserved from the observer "
+                "dispatch route. Used with child_route_lineage to bind the "
+                "worker allocation to its route parent."
+            ),
+        },
+        "child_route_lineage": {
+            "type": "object",
+            "description": (
+                "Public-safe child route lineage for the allocated worker lane, "
+                "including task/route lineage and optional merge_queue_id."
+            ),
+        },
+        "route_lineage": {
+            "type": "object",
+            "description": (
+                "Combined public-safe parent/child route lineage envelope. "
+                "Callers may pass this alongside parent_route_lineage and "
+                "child_route_lineage."
+            ),
+        },
         "issue_same_owner_session_token": {
             "type": "boolean",
             "description": (

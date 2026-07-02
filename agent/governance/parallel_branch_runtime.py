@@ -5622,6 +5622,53 @@ def runtime_context_mf_parallel_happy_path_reminders(
                 ],
                 "evidence_order": ["finish_gate", "independent_qa"],
             },
+            "graph_trace_before_implementation": {
+                "required": True,
+                "sequence": [
+                    "runtime_context_read_receipt",
+                    "mf_subagent_startup",
+                    "worker_graph_query",
+                    "implementation_and_tests",
+                ],
+                "blocker": "pre_implementation_graph_trace_missing",
+                "message": (
+                    "Worker implementation must not begin until mf_subagent "
+                    "graph trace ids are DB-verified for the current runtime "
+                    "context and fence."
+                ),
+            },
+            "finish_time_attestation_recovery": {
+                "required_before": "finish_gate",
+                "sequence": [
+                    "implementation_evidence",
+                    "finish_time_worker_attestation",
+                    "refresh_runtime_context_current",
+                    "finish_gate",
+                ],
+                "blocked_recovery": [
+                    "historical_finish_gate_backfill",
+                    "post_hoc_worker_attestation",
+                ],
+                "message": (
+                    "If finish-time worker self-attestation was missed, keep "
+                    "the row open and re-dispatch a legal worker lane instead "
+                    "of recording post-hoc finish-gate evidence."
+                ),
+            },
+            "graph_trace_recovery_gap": {
+                "historical_implementation_without_verified_graph_trace_closeable": False,
+                "recommended_action": "keep_open_and_redispatch_with_graph_first_trace",
+                "forbidden_actions": [
+                    "post_hoc_graph_trace_evidence",
+                    "historical_evidence_backfill",
+                    "close_ready_reconstruction",
+                ],
+                "scope_mismatch_rule": (
+                    "If an out-of-fence file is required, keep the old branch "
+                    "open and re-dispatch expanded scope instead of widening "
+                    "the original worker lane."
+                ),
+            },
         },
         "merge_commit": {
             "required_trailers": ["Chain-Source-Stage"],
@@ -5643,6 +5690,20 @@ def runtime_context_mf_parallel_happy_path_reminders(
             "message": (
                 "If legal close evidence ordering was missed, leave the row open "
                 "for a later audit contract instead of looping or backfilling."
+            ),
+        },
+        "graph_trace_recovery_gap": {
+            "status": "non_closeable_without_verified_pre_implementation_trace",
+            "historical_implementation_without_verified_graph_trace_closeable": False,
+            "worker_next_action": "keep_open_and_redispatch_graph_first_worker",
+            "forbidden_actions": [
+                "post_hoc_graph_trace_evidence",
+                "historical_evidence_backfill",
+                "close_ready_reconstruction",
+            ],
+            "scope_mismatch_rule": (
+                "Out-of-fence file requirements keep the old branch open and "
+                "require re-dispatch with expanded scope."
             ),
         },
         "protected_successor_entry": {
@@ -6243,6 +6304,9 @@ def _runtime_context_worker_handoff_projection(
             "observer_must_not_backfill_worker_evidence": True,
             "reuse_runtime_scope": True,
         },
+        "graph_trace_recovery_gap": _runtime_context_graph_trace_recovery_gap(
+            values
+        ),
         "direct_fix_return_contract": {
             "after_repair": "run_independent_qa_then_resume_parent_contract",
             "requires_independent_qa_after_repair": True,
@@ -6405,6 +6469,57 @@ def _runtime_context_audit_archive_action(
             for item in explanations
             if item.get("code")
         ],
+    }
+
+
+def _runtime_context_graph_trace_recovery_gap(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    graph_trace_ids = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("graph_trace_ids"))
+    )
+    implementation_refs = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("implementation_event_refs"))
+    )
+    changed_files = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("changed_files"))
+        + _runtime_context_string_list(values.get("owned_changed_files"))
+        + _runtime_context_string_list(values.get("worker_changed_files"))
+    )
+    has_historical_implementation = bool(implementation_refs or changed_files)
+    gap_open = bool(has_historical_implementation and not graph_trace_ids)
+    return {
+        "schema_version": "runtime_context.graph_trace_recovery_gap.v1",
+        "status": "non_closeable_recovery_required" if gap_open else "clear",
+        "graph_trace_verified": bool(graph_trace_ids),
+        "graph_trace_ids": graph_trace_ids,
+        "implementation_evidence_present": bool(implementation_refs),
+        "implementation_event_refs": implementation_refs,
+        "changed_files": changed_files,
+        "historical_implementation_without_verified_graph_trace": gap_open,
+        "closeable": not gap_open,
+        "can_close": not gap_open,
+        "recommended_action": (
+            "keep_open_and_redispatch_with_graph_first_trace"
+            if gap_open
+            else "none"
+        ),
+        "keep_open": gap_open,
+        "redispatch_recommended": gap_open,
+        "blocked_actions": [
+            "post_hoc_graph_trace_evidence",
+            "historical_evidence_backfill",
+            "close_ready_reconstruction",
+        ],
+        "scope_mismatch_rule": {
+            "out_of_fence_file_requirement_keeps_old_branch_open": True,
+            "next_action": "redispatch_expanded_scope",
+            "message": (
+                "If the recovery requires files outside the current worker "
+                "fence, keep the old branch open and re-dispatch expanded "
+                "scope instead of widening this lane."
+            ),
+        },
     }
 
 
@@ -7869,6 +7984,10 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
         and cwd_matches
         and git_root_matches
     )
+    graph_trace_ids = _runtime_context_dedupe(
+        _runtime_context_string_list(values.get("graph_trace_ids"))
+    )
+    verified_graph_trace = bool(graph_trace_ids)
     blockers: list[dict[str, Any]] = []
     if not assigned_worktree:
         blockers.append(
@@ -7924,9 +8043,26 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
                     "next_action": "stop_and_relaunch_in_assigned_worktree",
                 }
             )
+    if not verified_graph_trace:
+        blockers.append(
+            {
+                "code": "pre_implementation_graph_trace_missing",
+                "message": (
+                    "run worker-scoped graph queries and verify mf_subagent "
+                    "graph trace ids before implementation edits"
+                ),
+                "next_action": "run_worker_graph_query",
+                "required_identity": {
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+                },
+            }
+        )
+    pre_edit_verified = bool(verified_workdir and verified_graph_trace)
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
-        "status": "verified" if verified_workdir else "pre_edit_blocked",
+        "status": "verified" if pre_edit_verified else "pre_edit_blocked",
         "assigned_worktree_path": assigned_worktree,
         "target_project_root": target_project_root,
         "startup_event_ref": startup_event_ref,
@@ -7936,8 +8072,10 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
         "actual_git_root_matches_assigned_worktree": git_root_matches,
         "session_cwd_observed_by_runtime": bool(startup_actual_cwd),
         "actual_git_root_observed_by_runtime": bool(startup_actual_git_root),
-        "relative_patch_safe": verified_workdir,
-        "apply_patch_relative_paths_allowed": verified_workdir,
+        "graph_trace_verified": verified_graph_trace,
+        "graph_trace_ids": graph_trace_ids,
+        "relative_patch_safe": pre_edit_verified,
+        "apply_patch_relative_paths_allowed": pre_edit_verified,
         "required_patch_path_mode": (
             "verified_workdir_or_absolute_paths_under_assigned_worktree"
         ),
@@ -7946,6 +8084,7 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
             "mf_subagent_startup.actual_cwd",
             "mf_subagent_startup.actual_git_root",
             "mf_subagent_startup.worktree_path",
+            "graph_query_trace.trace_ids",
         ],
         "pre_edit_blockers": blockers,
         "recovery_actions": [
@@ -7958,6 +8097,12 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
             {
                 "id": "record_startup_before_edit",
                 "action": "record_mf_subagent_startup",
+            },
+            {
+                "id": "run_worker_graph_query_before_edit",
+                "action": "run_worker_graph_query",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
             },
             {
                 "id": "use_absolute_paths",
