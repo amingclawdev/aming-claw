@@ -49590,35 +49590,57 @@ def _contract_runtime_authoritative_close_verification(
     )
     authority_gate = direct_fix_gate if bool(direct_fix_gate.get("passed")) else mf_parallel_gate
     if not bool(authority_gate.get("passed")):
-        if mf_parallel_gate:
+        failed_authority_kind = ""
+        failed_authority_gate: Mapping[str, Any] = {}
+        if direct_fix_gate:
+            failed_authority_kind = "direct_fix"
+            failed_authority_gate = direct_fix_gate
+        elif mf_parallel_gate:
+            failed_authority_kind = "mf_parallel"
+            failed_authority_gate = mf_parallel_gate
+        if failed_authority_gate:
             result = dict(verification)
             result["passed"] = False
             result["can_close"] = False
             result["status"] = "failed"
-            result["contract_runtime_mf_parallel_close_authority_gate"] = dict(
-                mf_parallel_gate
+            gate_result_key = (
+                f"contract_runtime_{failed_authority_kind}_close_authority_gate"
             )
+            result[gate_result_key] = dict(failed_authority_gate)
             result["runtime_projection_authority_failed"] = True
             checks = dict(result.get("checks") or {})
-            checks["contract_runtime_mf_parallel_close_authority"] = False
+            checks[f"contract_runtime_{failed_authority_kind}_close_authority"] = False
             result["checks"] = checks
-            missing_ids = list(mf_parallel_gate.get("missing_requirement_ids") or [])
+            missing_ids = list(
+                failed_authority_gate.get("missing_requirement_ids") or []
+            )
             groups_root = dict(result.get("missing_evidence_groups") or {})
             groups = dict(groups_root.get("groups") or {})
-            groups["contract_runtime_mf_parallel_close_authority"] = {
-                "label": "ContractRuntime mf_parallel close authority",
-                "missing": missing_ids,
-                "next_action": (
+            group_key = f"contract_runtime_{failed_authority_kind}_close_authority"
+            next_action = (
+                "complete direct_fix repair, independent QA, return-to-parent, "
+                "and parent acknowledgement evidence in ContractRuntime"
+                if failed_authority_kind == "direct_fix"
+                else (
                     "complete source-backed mf_parallel worker, QA, observer "
                     "merge/reconcile/close-ready evidence in ContractRuntime"
+                )
+            )
+            groups[group_key] = {
+                "label": (
+                    "ContractRuntime direct_fix close authority"
+                    if failed_authority_kind == "direct_fix"
+                    else "ContractRuntime mf_parallel close authority"
                 ),
+                "missing": missing_ids,
+                "next_action": next_action,
             }
             groups_root["groups"] = groups
             result["missing_evidence_groups"] = groups_root
             failed_gates = list(result.get("failed_gates") or [])
             failed_gates.append({
-                "gate": "contract_runtime_mf_parallel_close_authority_gate",
-                "status": str(mf_parallel_gate.get("status") or "failed"),
+                "gate": gate_result_key,
+                "status": str(failed_authority_gate.get("status") or "failed"),
                 "missing_requirement_ids": missing_ids,
             })
             result["failed_gates"] = failed_gates

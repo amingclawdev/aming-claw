@@ -26448,6 +26448,214 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-TIMELINE-GATE-DIRECT-FIX-INCOMPLETE"
+    close_commit = "2fe991b4e21942f36500ce4f6b791652bde0c101"
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    direct_execution_id = "cex-direct-fix-incomplete-close-authority"
+    route_token_ref = "rtok-direct-fix-incomplete-parent"
+    close_route_token_ref = "rtok-direct-fix-incomplete-close"
+    route_identity = {
+        "route_id": "route-direct-fix-incomplete",
+        "route_context_hash": _fake_sha("route-direct-fix-incomplete"),
+        "prompt_contract_id": "rprompt-direct-fix-incomplete",
+        "prompt_contract_hash": _fake_sha("prompt-direct-fix-incomplete"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-direct-fix-incomplete"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    entered = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Repair close gate after onboard service.",
+                "backlog_id": backlog_id,
+                "task_id": direct_execution_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "contract_execution_id": direct_execution_id,
+                "route_token_ref": route_token_ref,
+                "blocked_successor_entry": {
+                    "status": "blocked",
+                    "blocked_successor_contract_id": "backlog_close",
+                    "blocker_id": "mf_timeline_gate_failed",
+                    "recommended_successor_contract_id": "direct_fix",
+                    "recommended_next_action": "enter_direct_fix_successor",
+                },
+            },
+        )
+    )
+    assert entered["contract_execution_id"] == direct_execution_id
+
+    runtime = server._contract_runtime(conn)
+
+    def write_runtime_line(
+        *,
+        actor_role: str,
+        stage_id: str,
+        line_id: str,
+        evidence_kind: str,
+        payload: dict,
+        commit_sha: str = "",
+    ) -> None:
+        runtime.current_guide(direct_execution_id, actor_role=actor_role)
+        record = runtime.store.get(direct_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            direct_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        assert result["ok"] is True
+
+    write_runtime_line(
+        actor_role="observer",
+        stage_id="operator_approval",
+        line_id="direct_fix_operator_approval",
+        evidence_kind="operator_approval",
+        payload=route_identity,
+    )
+    write_runtime_line(
+        actor_role="observer",
+        stage_id="dispatch_context",
+        line_id="direct_fix_dispatch_context",
+        evidence_kind="dispatch_bounded_worker",
+        payload={**route_identity, "owned_files": ["agent/governance/server.py"]},
+    )
+    write_runtime_line(
+        actor_role="mf_sub",
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        evidence_kind="direct_fix_repair_evidence",
+        payload={
+            **route_identity,
+            "status": "implemented",
+            "changed_files": ["agent/governance/server.py"],
+            "commit_sha": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_runtime_line(
+        actor_role="qa",
+        stage_id="qa",
+        line_id="qa_independent_verification",
+        evidence_kind="independent_verification",
+        payload={
+            **route_identity,
+            "status": "pass",
+            "verdict": "PASS",
+            "independent": True,
+            "verified_commit": close_commit,
+        },
+        commit_sha=close_commit,
+    )
+    write_runtime_line(
+        actor_role="observer",
+        stage_id="return_to_parent",
+        line_id="direct_fix_return_to_parent",
+        evidence_kind="direct_fix_return_to_parent",
+        payload={
+            **route_identity,
+            "parent_contract_execution_id": parent_execution_id,
+            "successor_contract_execution_id": direct_execution_id,
+            "successor_contract_id": "direct_fix",
+        },
+    )
+
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[
+            f"contract_runtime:{parent_execution_id}",
+            f"contract_runtime:{direct_execution_id}",
+        ],
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+    assert precheck["can_close"] is False
+    timeline_gate = precheck["timeline_gate"]
+    direct_gate = timeline_gate["contract_runtime_direct_fix_close_authority_gate"]
+    assert direct_gate["passed"] is False
+    assert direct_gate["missing_requirement_ids"] == [
+        "parent_return_acknowledgement"
+    ]
+    assert timeline_gate["runtime_projection_authority_failed"] is True
+    direct_group = timeline_gate["missing_evidence_groups"]["groups"][
+        "contract_runtime_direct_fix_close_authority"
+    ]
+    assert direct_group["missing"] == ["parent_return_acknowledgement"]
+    assert "parent acknowledgement" in direct_group["next_action"]
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "route_token_ref": close_route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "contract_runtime_close_authority_incomplete"
+    assert "parent_return_acknowledgement" in exc.value.message
+    assert "observer_led_parallel_lanes" not in exc.value.message
+    details = exc.value.details
+    assert details["missing_contract_runtime_close_authority_requirement_ids"] == [
+        "parent_return_acknowledgement"
+    ]
+    projection = details["contract_runtime_close_authority_projection"]
+    assert projection["direct_fix_close_authority_gate"]["missing_requirement_ids"] == [
+        "parent_return_acknowledgement"
+    ]
+    assert details["failed_gates"] == [
+        {
+            "gate": "contract_runtime_close_authority_projection",
+            "status": "projected",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": (
+                "contract_runtime_close_authority_projection"
+            ),
+            "missing_requirement_ids": ["parent_return_acknowledgement"],
+            "contract_execution_id": direct_execution_id,
+        }
+    ]
+
+
 def test_backlog_close_projects_child_authority_from_completed_overlap_component(
     conn,
     monkeypatch,
