@@ -25081,6 +25081,68 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         graph_trace_id="gqt-runtime-context-close-projection",
         head_commit=worker_commit,
     )
+    graph_query_trace.ensure_schema(conn)
+    qa_graph_trace_id = "gqt-runtime-context-close-projection-qa"
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces
+          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
+           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           fence_token, status, budget_json, usage_json, artifact_path,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            qa_graph_trace_id,
+            PID,
+            "scope-runtime-context-close-projection-qa",
+            "qa",
+            "qa",
+            "independent_verification",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "complete",
+            "{}",
+            "{}",
+            "",
+            "2026-06-29T01:05:00Z",
+            "2026-06-29T01:05:00Z",
+        ),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_type="independent_verification.completed",
+        event_kind="independent_verification",
+        phase="verification",
+        status="passed",
+        actor="qa:runtime-context-close-projection",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "verified_commit": worker_commit,
+            "graph_trace_ids": [qa_graph_trace_id],
+        },
+    )
+    projected_current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "observer",
+        )
+    )
+    projected_ids = {
+        line["line_id"]
+        for line in projected_current["runtime_guide"][
+            "completed_lines_projection"
+        ]["projected_completed_lines"]
+    }
+    assert "worker_graph_context" in projected_ids
 
     qa = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(

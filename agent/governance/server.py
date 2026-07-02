@@ -8005,7 +8005,9 @@ def _runtime_context_service_timeline_refs(
     finish_event: dict[str, Any] = {}
     finish_attestation: dict[str, Any] = {}
     close_event: dict[str, Any] = {}
-    timeline_graph_trace_ids: list[str] = []
+    worker_graph_trace_ids: list[str] = []
+    verification_graph_trace_ids: list[str] = []
+    close_graph_trace_ids: list[str] = []
     for event in events:
         event_task_id = str(event.get("task_id") or "").strip()
         if task_id and event_task_id and event_task_id != task_id:
@@ -8172,19 +8174,26 @@ def _runtime_context_service_timeline_refs(
         )
         if is_verification:
             refs["verification_event_refs"].append(ref)
-        if (
-            is_verification
-            or is_implementation
-            or is_finish_gate
-            or is_finish_time_worker_attestation
-            or event_kind_normalized == "close_ready"
-        ):
-            timeline_graph_trace_ids.extend(
-                _runtime_context_service_graph_trace_values_from_event(event)
-            )
-    if timeline_graph_trace_ids:
+        event_graph_trace_ids = _runtime_context_service_graph_trace_values_from_event(
+            event
+        )
+        if is_implementation or is_finish_gate or is_finish_time_worker_attestation:
+            worker_graph_trace_ids.extend(event_graph_trace_ids)
+        elif is_verification:
+            verification_graph_trace_ids.extend(event_graph_trace_ids)
+        elif event_kind_normalized == "close_ready":
+            close_graph_trace_ids.extend(event_graph_trace_ids)
+    if worker_graph_trace_ids:
         refs["graph_trace_ids"] = _runtime_context_service_dedupe(
-            timeline_graph_trace_ids
+            worker_graph_trace_ids
+        )
+    if verification_graph_trace_ids:
+        refs["verification_graph_trace_ids"] = _runtime_context_service_dedupe(
+            verification_graph_trace_ids
+        )
+    if close_graph_trace_ids:
+        refs["close_graph_trace_ids"] = _runtime_context_service_dedupe(
+            close_graph_trace_ids
         )
     startup_hint = (
         refs.get("startup_hint") if isinstance(refs.get("startup_hint"), Mapping) else {}
