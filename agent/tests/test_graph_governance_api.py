@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -12670,6 +12671,86 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-route-checkpoint"
     assert queued["queue_item"]["task_id"] == "mf-sub-route-checkpoint-task"
     assert queued["route_token_gate"]["action"] == "merge_queue"
+
+
+def test_mf_sub_merge_queue_normalizes_ready_for_merge_alias_after_finish_checkpoint(conn):
+    queue_id = "mergeq-api-finish-ready-alias"
+    task_id = "mf-sub-ready-alias-task"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+            status="worktree_ready",
+            fence_token="fence-mf-sub-ready-alias",
+            worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+            base_commit="base",
+            head_commit="head",
+            target_head_commit="target",
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T07:32:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id="FEAT-FINISH-GATE",
+        fence_token="fence-mf-sub-ready-alias",
+        worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+        branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+        head_commit="head",
+    )
+
+    server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-mf-sub-ready-alias",
+                "fence_token": "fence-mf-sub-ready-alias",
+                "head_commit": "head",
+                "evidence": _finish_gate_evidence(
+                    fence_token="fence-mf-sub-ready-alias",
+                    worktree_path="/tmp/nonexistent-mf-sub-ready-alias-task",
+                    branch_ref="refs/heads/codex/mf-sub-ready-alias-task",
+                    head_commit="head",
+                ),
+            },
+        )
+    )
+    finished_context = get_branch_context(conn, PID, task_id)
+    assert finished_context is not None
+    upsert_branch_context(
+        conn,
+        replace(finished_context, status="ready_for_merge"),
+        now_iso="2026-05-17T07:35:00Z",
+    )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "merge_queue_id": queue_id,
+                "worker_role": "mf_sub",
+                "checkpoint_id": "ckpt-mf-sub-ready-alias",
+                "status": "ready_for_merge",
+                "route_waiver": _route_waiver("merge_queue", task_id=task_id),
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
+    assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-ready-alias"
 
 
 def test_mf_sub_session_cannot_enqueue_or_execute_merge(conn):
@@ -37398,6 +37479,110 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     assert graph_trace["worker_role"] == "mf_sub"
     assert graph_trace["missing_trace_ids"] == []
     assert graph_trace["identity_mismatches"] == []
+
+
+def test_finish_gate_explicit_worker_trace_ignores_same_task_qa_trace(conn):
+    task_id = "explicit-worker-trace-with-qa-task"
+    parent_task_id = "explicit-worker-trace-with-qa-parent"
+    fence_token = "fence-explicit-worker-trace"
+    worktree_path = "/tmp/nonexistent-explicit-worker-trace"
+    branch_ref = "refs/heads/f2/explicit-worker-trace"
+    worker_trace_id = "gqt-explicit-worker-trace"
+    qa_trace_id = "gqt-same-task-qa-trace"
+
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id="AC-FINISH-GATE-EXPLICIT-GRAPH-TRACE-QA-CONTAMINATION",
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-explicit-worker-trace",
+            head_commit="base-explicit-worker-trace",
+            target_head_commit="target-explicit-worker-trace",
+            merge_queue_id="mergeq-explicit-worker-trace",
+        ),
+        now_iso="2026-07-02T04:15:00Z",
+    )
+    real_event_payload = _make_real_startup_timeline_event(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    task_timeline.ensure_schema(conn)
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id="AC-FINISH-GATE-EXPLICIT-GRAPH-TRACE-QA-CONTAMINATION",
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor="mf_sub",
+        payload={"mf_subagent_startup_gate": real_event_payload},
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=worker_trace_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id_for_branch_context(context),
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token=fence_token,
+        run_id=_mf_sub_run_id(task_id, fence_token),
+        created_at="2026-07-02T04:16:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=qa_trace_id,
+        parent_task_id=runtime_context_id_for_branch_context(context),
+        runtime_context_id="",
+        task_id=task_id,
+        worker_role="",
+        fence_token="",
+        run_id="qa:explicit-worker-trace",
+        created_at="2026-07-02T04:17:00Z",
+    )
+    conn.execute(
+        """
+        UPDATE graph_query_traces
+        SET query_source = 'qa',
+            query_purpose = 'independent_verification'
+        WHERE project_id = ? AND trace_id = ?
+        """,
+        (PID, qa_trace_id),
+    )
+    conn.commit()
+
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+    )
+    body.update(
+        {
+            "parent_task_id": parent_task_id,
+            "changed_files": ["agent/governance/server.py"],
+            "graph_trace_ids": [worker_trace_id],
+        }
+    )
+
+    result = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    graph_trace = result["gate"]["graph_trace_evidence"]
+    assert graph_trace["db_verified"] is True
+    assert graph_trace["trace_ids"] == [worker_trace_id]
+    assert graph_trace["identity_mismatches"] == []
+    assert qa_trace_id not in graph_trace["trace_ids"]
 
 
 def test_finish_gate_derives_parent_lineage_from_runtime_contract_route_ref(conn):
