@@ -5637,6 +5637,37 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "context and fence."
                 ),
             },
+            "pre_edit_worktree_guard": {
+                "required": True,
+                "required_startup_fields": [
+                    "actual_cwd",
+                    "actual_git_root",
+                    "worktree_path",
+                ],
+                "must_match": {
+                    "actual_cwd": "runtime_context.current_values.worktree_path",
+                    "actual_git_root": (
+                        "runtime_context.current_values.worktree_path"
+                    ),
+                },
+                "blockers": [
+                    "pre_edit_startup_missing",
+                    "actual_cwd_not_assigned_worktree",
+                    "actual_git_root_not_assigned_worktree",
+                    "pre_implementation_graph_trace_missing",
+                ],
+                "recovery": [
+                    "stop_before_edits",
+                    "relaunch_in_assigned_worktree",
+                    "record_mf_subagent_startup",
+                    "run_worker_graph_query",
+                ],
+                "message": (
+                    "Before any implementation edit, verify pwd and git root "
+                    "match the assigned runtime worktree; if either points at "
+                    "the target/main worktree, stop before editing."
+                ),
+            },
             "finish_time_attestation_recovery": {
                 "required_before": "finish_gate",
                 "sequence": [
