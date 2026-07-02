@@ -12931,6 +12931,9 @@ def _runtime_context_raise_child_route_lineage_error(
             "next_legal_action": (
                 "reissue_child_route_token_from_latest_runtime_contract_parent_route"
             ),
+            "next_protected_action": "runtime_context_implementation_evidence",
+            "mcp_tool": "runtime_context_implementation_evidence",
+            "next_protected_payload": retry_parent_ref_body,
             "repair": {
                 "action": "refresh_runtime_contract_or_reissue_child_route_token",
                 "detail": (
@@ -12949,6 +12952,9 @@ def _runtime_context_raise_child_route_lineage_error(
                     },
                     "parent_route_token_ref_body": retry_parent_ref_body,
                 },
+                "next_protected_action": "runtime_context_implementation_evidence",
+                "mcp_tool": "runtime_context_implementation_evidence",
+                "protected_payload": retry_parent_ref_body,
                 "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
             },
             "retry_implementation_evidence_parent_route_ref_body": (
@@ -13086,6 +13092,7 @@ def _runtime_context_validate_parent_bound_route_identity(
     runtime_context_id: str,
     context,
     parent_route_identity: Mapping[str, Any],
+    resolved_from_ref: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     token_parent_mismatches = _runtime_context_route_identity_mismatch_fields(
         parent_route_identity,
@@ -13099,33 +13106,78 @@ def _runtime_context_validate_parent_bound_route_identity(
         if isinstance(token.get("parent_route_lineage"), Mapping)
         else {}
     )
-
-    def lineage_payload(parent_lineage_value: Mapping[str, Any]) -> dict[str, Any]:
-        child_lineage = (
-            dict(token.get("child_route_lineage"))
-            if isinstance(token.get("child_route_lineage"), Mapping)
-            else _route_identity_public_summary(child_route_identity)
+    token_child_lineage_present = isinstance(token.get("child_route_lineage"), Mapping)
+    child_lineage = (
+        dict(token.get("child_route_lineage"))
+        if token_child_lineage_present
+        else _route_identity_public_summary(child_route_identity)
+    )
+    if (
+        child_route_identity.get("route_token_ref")
+        and not child_lineage.get("route_token_ref")
+    ):
+        child_lineage["route_token_ref"] = child_route_identity["route_token_ref"]
+    if token_child_lineage_present:
+        child_lineage_mismatches = _runtime_context_route_identity_mismatch_fields(
+            child_route_identity,
+            child_lineage,
+            prefix="child_route_lineage.",
         )
-        if (
-            child_route_identity.get("route_token_ref")
-            and not child_lineage.get("route_token_ref")
-        ):
-            child_lineage["route_token_ref"] = child_route_identity["route_token_ref"]
-        route_lineage = (
-            dict(token.get("route_lineage"))
-            if isinstance(token.get("route_lineage"), Mapping)
-            else {
+        if child_lineage_mismatches:
+            _runtime_context_raise_child_route_lineage_error(
+                code="child_route_lineage_mismatch",
+                runtime_context_id=runtime_context_id,
+                context=context,
+                parent_route_identity=parent_route_identity,
+                child_route_identity=child_route_identity,
+                mismatched_fields=child_lineage_mismatches,
+            )
+
+    def lineage_payload(
+        parent_lineage_value: Mapping[str, Any],
+        *,
+        use_token_route_lineage: bool = True,
+        status: str = "parent_bound",
+    ) -> dict[str, Any]:
+        route_lineage = {}
+        if use_token_route_lineage and isinstance(token.get("route_lineage"), Mapping):
+            route_lineage = dict(token.get("route_lineage") or {})
+        if not route_lineage:
+            route_lineage = {
                 "schema_version": "runtime_context.implementation_route_lineage.v1",
-                "status": "parent_bound",
+                "status": status,
                 "parent_route_lineage": dict(parent_lineage_value),
                 "child_route_lineage": dict(child_lineage),
             }
-        )
         return {
             "parent_route_lineage": dict(parent_lineage_value),
             "child_route_lineage": dict(child_lineage),
             "route_lineage": route_lineage,
         }
+
+    def current_contract_lineage_payload(
+        mismatches: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        parent_lineage = _route_identity_public_summary(parent_route_identity)
+        payload = lineage_payload(
+            parent_lineage,
+            use_token_route_lineage=False,
+            status="parent_lineage_repaired_from_runtime_contract",
+        )
+        payload["parent_route_lineage_repair"] = {
+            "schema_version": "runtime_context.parent_route_lineage_repair.v1",
+            "status": "stale_parent_lineage_ignored_for_ref_resolved_current_route",
+            "reason": (
+                "route_token_ref resolved to the active runtime contract route "
+                "identity; stale registry parent_route_lineage was replaced with "
+                "the current contract route identity for worker evidence."
+            ),
+            "mismatched_fields": list(mismatches),
+            "next_protected_action": "runtime_context_implementation_evidence",
+            "mcp_tool": "runtime_context_implementation_evidence",
+            "payload_source": "server_derived_current_runtime_contract_route_identity",
+        }
+        return payload
 
     if not parent_lineage:
         if token_matches_parent:
@@ -13148,6 +13200,12 @@ def _runtime_context_validate_parent_bound_route_identity(
         prefix="parent_route_lineage.",
     )
     if mismatches:
+        if resolved_from_ref and token_matches_parent:
+            identity = dict(parent_route_identity)
+            for key, value in child_route_identity.items():
+                if value and (key == "route_token_ref" or not identity.get(key)):
+                    identity[key] = value
+            return identity, current_contract_lineage_payload(mismatches)
         _runtime_context_raise_child_route_lineage_error(
             code="parent_route_lineage_mismatch",
             runtime_context_id=runtime_context_id,
@@ -13178,6 +13236,7 @@ def _runtime_context_implementation_resolved_ref_route_identity(
         runtime_context_id=runtime_context_id,
         context=context,
         parent_route_identity=parent_route_identity,
+        resolved_from_ref=True,
     )
     lineage_payload = dict(lineage_payload)
     lineage_payload["_runtime_context_route_ref_resolved"] = True
@@ -14707,6 +14766,33 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "fail_closed": True,
                 },
             )
+        expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        supplied_route_identity = dict(
+            _runtime_context_request_route_identity_shapes(ctx).get("supplied") or {}
+        )
+        if expected_route_identity and any(
+            str(supplied_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        ):
+            mismatches = _runtime_context_route_identity_mismatch_fields(
+                expected_route_identity,
+                supplied_route_identity,
+            )
+            if mismatches:
+                raise GovernanceError(
+                    "runtime_context_rejoin_route_identity_mismatch",
+                    "runtime-context session rejoin route identity does not match the active runtime contract",
+                    403,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "route_identity_mismatch_fields": mismatches,
+                        "next_legal_action": (
+                            "retry_runtime_context_session_token_rejoin_with_current_route_identity"
+                        ),
+                        "fail_closed": True,
+                    },
+                )
         reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
             context=context,
             runtime_context_id=runtime_context_id,
@@ -14746,6 +14832,34 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 },
             ) from exc
 
+        safe_route_identity = {
+            field: str(expected_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(expected_route_identity.get(field) or "").strip()
+        }
+        if safe_route_identity:
+            result["route_identity"] = dict(safe_route_identity)
+        if result.get("session_token") and result.get("fence_token"):
+            host_envelope = {
+                "schema_version": "mf_subagent_session_token_rejoin_host_envelope.v1",
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "task_id": result.get("task_id") or context.task_id,
+                "parent_task_id": result.get("parent_task_id") or parent_task_id,
+                "target_project_root": _runtime_context_effective_target_project_root(
+                    context
+                ),
+                "worker_role": "mf_sub",
+                "session_token_env": "AMING_WORKER_SESSION_TOKEN",
+                "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": result["session_token"],
+                    "AMING_WORKER_FENCE_TOKEN": result["fence_token"],
+                },
+                "raw_tokens_persisted_to_timeline": False,
+            }
+            if safe_route_identity:
+                host_envelope["route_identity"] = dict(safe_route_identity)
+            result["host_envelope"] = host_envelope
         audit_payload = {
             key: value
             for key, value in result.items()
@@ -14754,6 +14868,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "session_token",
                 "session_token_hash",
                 "fence_token",
+                "host_envelope",
             }
         }
         audit_payload.update(
@@ -14762,6 +14877,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "caller_role": "observer",
                 "raw_session_token_persisted": False,
                 "raw_fence_token_persisted_to_timeline": False,
+                "host_envelope_returned": True,
+                "host_envelope_env_keys": [
+                    "AMING_WORKER_SESSION_TOKEN",
+                    "AMING_WORKER_FENCE_TOKEN",
+                ],
                 "reason": reason,
                 "operator_session_role": session_role(session),
                 "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
@@ -15792,7 +15912,16 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         raw_session_token=raw_session_token,
     )
     for key, value in route_lineage_payload.items():
-        if key in {"parent_route_lineage", "child_route_lineage", "route_lineage"} and value:
+        if (
+            key
+            in {
+                "parent_route_lineage",
+                "child_route_lineage",
+                "route_lineage",
+                "parent_route_lineage_repair",
+            }
+            and value
+        ):
             payload[key] = value
     parent_task_id = (
         str(body.get("parent_task_id") or "").strip()

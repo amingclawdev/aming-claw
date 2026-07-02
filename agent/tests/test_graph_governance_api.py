@@ -8144,6 +8144,326 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_child_rout
     assert "route_token" not in ref_only_payload
 
 
+def test_runtime_context_route_ref_repairs_stale_parent_lineage_for_worker_writes(
+    conn,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="runtime-stale-parent-lineage-worker",
+    )
+    worktree = fixture.root
+    task_id = "runtime-stale-parent-lineage-task"
+    parent_task_id = "runtime-stale-parent-lineage-parent"
+    backlog_id = "AC-RUNTIME-STALE-PARENT-LINEAGE"
+    branch_name = "codex/runtime-stale-parent-lineage"
+    branch_ref = f"refs/heads/{branch_name}"
+    changed_path = "tests/runtime-stale-parent-lineage.test.mjs"
+    subprocess.run(
+        ["git", "checkout", "-B", branch_name, fixture.main_head],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_file = worktree / changed_path
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("console.log('stale parent lineage');\n", encoding="utf-8")
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(worktree),
+            task_id=task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            stage_task_id=task_id,
+            worker_id="worker-stale-parent-lineage",
+            worker_slot_id="slot-stale-parent-lineage",
+            actual_host_worker_id="slot-stale-parent-lineage",
+            agent_id="slot-stale-parent-lineage",
+            allocation_owner="slot-stale-parent-lineage",
+            branch_ref=branch_ref,
+            worktree_path=str(worktree),
+            base_commit=fixture.main_head,
+            head_commit=fixture.main_head,
+            target_head_commit=fixture.main_head,
+            snapshot_id="scope-stale-parent-lineage",
+            projection_id="semproj-stale-parent-lineage",
+            merge_queue_id="mq-stale-parent-lineage",
+            fence_token="fence-stale-parent-lineage",
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-stale-parent-lineage"
+            ),
+            status=STATE_WORKTREE_READY,
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    current_route_identity = {
+        "route_id": "route-runtime-stale-parent-current",
+        "route_context_hash": _fake_sha("route-runtime-stale-parent-current"),
+        "prompt_contract_id": "rprompt-runtime-stale-parent-current",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-stale-parent-current"),
+        "route_token_ref": "rtok-runtime-stale-parent-current",
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-runtime-stale-parent-current"
+        ),
+    }
+    stale_parent_lineage = {
+        **current_route_identity,
+        "route_id": "route-runtime-stale-parent-old",
+        "route_context_hash": _fake_sha("route-runtime-stale-parent-old"),
+        "prompt_contract_id": "rprompt-runtime-stale-parent-old",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-stale-parent-old"),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-runtime-stale-parent-old"
+        ),
+        "selected_project": PID,
+        "selected_backlog_id": backlog_id,
+    }
+    child_route_lineage = {
+        **current_route_identity,
+        "schema_version": "child_route_lineage.v1",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=current_route_identity["route_token_ref"],
+        token={
+            **current_route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:test-stale-parent-lineage"],
+            "parent_route_lineage": stale_parent_lineage,
+            "child_route_lineage": child_route_lineage,
+            "route_lineage": {
+                "schema_version": "observer_route_parent_child_lineage.v1",
+                "status": "parent_bound",
+                "parent_route_lineage": stale_parent_lineage,
+                "child_route_lineage": child_route_lineage,
+            },
+        },
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-stale-parent-lineage",
+        contract_version="direct_fix.v1",
+        payload={"target_files": [changed_path]},
+        route_identity=current_route_identity,
+        route_evidence_type="observer_route_token_ref",
+        actor="observer",
+        now_iso="2026-06-28T00:00:00Z",
+    )
+    graph_trace_id = "gqt-runtime-stale-parent-lineage"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=parent_task_id,
+        snapshot_id="scope-stale-parent-lineage",
+        runtime_context_id=context.runtime_context_id,
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token="fence-stale-parent-lineage",
+        run_id=_mf_sub_run_id(task_id, "fence-stale-parent-lineage"),
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="read_receipt",
+        status="accepted",
+        actor="slot-stale-parent-lineage",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_slot_id": "slot-stale-parent-lineage",
+            "fence_token_hash": _fake_sha("fence-stale-parent-lineage"),
+            "read_receipt_hash": _fake_sha("read-stale-parent-lineage"),
+            "route_token_ref": current_route_identity["route_token_ref"],
+        },
+    )
+    conn.commit()
+
+    common_body = {
+        "parent_task_id": parent_task_id,
+        "fence_token": "fence-stale-parent-lineage",
+        "session_token": "session-stale-parent-lineage",
+        "target_project_root": str(worktree),
+        **current_route_identity,
+    }
+    implementation = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                **common_body,
+                "changed_files": [changed_path],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "test_results": {
+                    "status": "passed",
+                    "passed": True,
+                    "command": "pytest -q",
+                },
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "copy-safe ref with stale parent lineage",
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            },
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["route_token_gate"]["decision"] == "route_token_ref_resolved"
+    stored_implementation = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (implementation["timeline_event"]["id"],),
+    ).fetchone()
+    implementation_payload = json.loads(stored_implementation["payload_json"])
+    assert implementation_payload["route_id"] == current_route_identity["route_id"]
+    assert implementation_payload["parent_route_lineage"]["route_id"] == (
+        current_route_identity["route_id"]
+    )
+    assert implementation_payload["child_route_lineage"]["route_id"] == (
+        current_route_identity["route_id"]
+    )
+    assert implementation_payload["parent_route_lineage_repair"]["status"] == (
+        "stale_parent_lineage_ignored_for_ref_resolved_current_route"
+    )
+    assert stale_parent_lineage["route_id"] not in json.dumps(
+        implementation_payload["route_lineage"],
+        sort_keys=True,
+    )
+
+    forged_child_ref = "rtok-runtime-stale-parent-forged-child"
+    forged_child_route_identity = {
+        **current_route_identity,
+        "route_token_ref": forged_child_ref,
+    }
+    forged_child_lineage = {
+        **child_route_lineage,
+        "route_id": "route-runtime-stale-parent-forged-child",
+        "route_context_hash": _fake_sha("route-runtime-stale-parent-forged-child"),
+        "prompt_contract_id": "rprompt-runtime-stale-parent-forged-child",
+        "prompt_contract_hash": _fake_sha(
+            "prompt-runtime-stale-parent-forged-child"
+        ),
+        "route_token_ref": forged_child_ref,
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-runtime-stale-parent-forged-child"
+        ),
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=forged_child_ref,
+        token={
+            **forged_child_route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["timeline:test-stale-parent-forged-child"],
+            "parent_route_lineage": stale_parent_lineage,
+            "child_route_lineage": forged_child_lineage,
+            "route_lineage": {
+                "schema_version": "observer_route_parent_child_lineage.v1",
+                "status": "parent_bound",
+                "parent_route_lineage": stale_parent_lineage,
+                "child_route_lineage": forged_child_lineage,
+            },
+        },
+    )
+    with pytest.raises(GovernanceError) as forged_child:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "route_token_ref": forged_child_ref,
+                    "payload": {
+                        "worker_role": "mf_sub",
+                        "summary": "ref with forged nested child lineage",
+                        "graph_trace_ids": [graph_trace_id],
+                    },
+                },
+            )
+        )
+    assert forged_child.value.code == "child_route_lineage_mismatch"
+    assert forged_child.value.status == 422
+    assert forged_child.value.details["mismatched_fields"][0]["field"] == (
+        "child_route_lineage.route_id"
+    )
+
+    finish_attestation = (
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    **common_body,
+                    "worker_session_id": "slot-stale-parent-lineage",
+                    "filer_principal": "slot-stale-parent-lineage",
+                    "worker_transcript_ref": "multi_agent:slot-stale-parent-lineage",
+                    "harness_type": "codex",
+                    "graph_trace_ids": [graph_trace_id],
+                    "read_receipt_hash": _fake_sha("read-stale-parent-lineage"),
+                    "read_receipt_event_id": read_receipt["id"],
+                    "observer_command_id": "cmd-stale-parent-lineage",
+                    "head_commit": fixture.main_head,
+                    "changed_files": [changed_path],
+                    "owned_files": [changed_path],
+                    "actual_cwd": str(worktree),
+                    "actual_git_root": str(worktree),
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "command": "pytest -q",
+                    },
+                },
+            )
+        )
+    )
+    assert finish_attestation["ok"] is True
+    assert finish_attestation["action"] == "record_finish_time_worker_attestation"
+    stored_finish = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (finish_attestation["timeline_event"]["id"],),
+    ).fetchone()
+    finish_payload = json.loads(stored_finish["payload_json"])
+    assert finish_payload["route_id"] == current_route_identity["route_id"]
+    assert finish_payload["parent_route_lineage"]["route_id"] == (
+        current_route_identity["route_id"]
+    )
+    assert finish_payload["parent_route_lineage_repair"]["status"] == (
+        "stale_parent_lineage_ignored_for_ref_resolved_current_route"
+    )
+
+
 def test_runtime_context_implementation_evidence_accepts_parent_backlog_route_ref(
     conn,
     tmp_path,
@@ -17606,6 +17926,25 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
             session_token_hash=mf_subagent_session_token_hash("lost-runtime-token"),
         ),
     )
+    route_identity = {
+        "route_id": "route-runtime-rejoin-current",
+        "route_context_hash": _fake_sha("route-runtime-rejoin-current"),
+        "prompt_contract_id": "rprompt-runtime-rejoin-current",
+        "prompt_contract_hash": _fake_sha("prompt-runtime-rejoin-current"),
+        "visible_injection_manifest_hash": _fake_sha("visible-runtime-rejoin-current"),
+        "route_token_ref": "rtok-runtime-rejoin-current",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-rejoin-current",
+        contract_version="direct_fix.v1",
+        payload={"route_identity": route_identity},
+        route_identity=route_identity,
+        route_evidence_type="observer_route_token_ref",
+        actor="observer",
+        now_iso="2026-06-21T17:55:00Z",
+    )
     task_timeline.record_event(
         conn,
         project_id=PID,
@@ -17689,6 +18028,9 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert result["status"] == "session_token_rejoin_issued"
     assert result["session_token"]
     assert result["fence_token"] == "fence-runtime-rejoin"
+    assert result["route_identity"] == route_identity
+    assert result["host_envelope"]["route_identity"] == route_identity
+    assert result["host_envelope"]["runtime_context_id"] == context.runtime_context_id
     assert result["raw_tokens_persisted_to_timeline"] is False
     saved = get_branch_context(conn, PID, "worker-runtime-rejoin")
     assert saved is not None
@@ -17714,6 +18056,8 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert rejoin_payload["worker_role"] == "mf_sub"
     assert rejoin_payload["meta_contract_gate"]["role"] == "observer"
     assert rejoin_payload["meta_contract_gate"]["action"] == "observer_command"
+    assert rejoin_payload["host_envelope_returned"] is True
+    assert rejoin_payload["route_identity"] == route_identity
     serialized_event = json.dumps(rejoin_events[0], sort_keys=True)
     assert result["session_token"] not in serialized_event
     assert "fence-runtime-rejoin" not in serialized_event
