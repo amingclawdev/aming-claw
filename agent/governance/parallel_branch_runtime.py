@@ -9417,17 +9417,17 @@ def record_merge_queue_result(
         task_id=task_id,
     )
     context = get_branch_context(conn, project_id, selected.task_id)
-    route_gated_reclaimed_fence = (
-        bool(allow_route_gated_reclaimed_fence_without_token)
-        and result_status == STATE_MERGED
-        and not str(fence_token or "").strip()
-        and bool(str(merge_commit or "").strip())
-        and bool(str(target_head_before_merge or "").strip())
-        and bool(str(target_head_after_merge or "").strip())
+    _require_merge_queue_result_record_authority(
+        context,
+        result_status=result_status,
+        fence_token=fence_token,
+        allow_route_gated_reclaimed_fence_without_token=(
+            allow_route_gated_reclaimed_fence_without_token
+        ),
+        merge_commit=merge_commit,
+        target_head_before_merge=target_head_before_merge,
+        target_head_after_merge=target_head_after_merge,
     )
-    if context is not None and (context.fence_token or fence_token):
-        if fence_token or not route_gated_reclaimed_fence:
-            _require_current_fence(context, fence_token)
 
     now = now_iso or utc_now()
     before = (
@@ -9473,6 +9473,118 @@ def record_merge_queue_result(
     return {
         "queue_item": merge_queue_item_to_dict(saved_item),
         "context": branch_context_to_dict(saved_context) if saved_context is not None else None,
+    }
+
+
+def _merge_queue_result_has_route_gated_reclaimed_fence_authority(
+    *,
+    result_status: str,
+    fence_token: str,
+    allow_route_gated_reclaimed_fence_without_token: bool,
+    merge_commit: str,
+    target_head_before_merge: str,
+    target_head_after_merge: str,
+) -> bool:
+    return (
+        bool(allow_route_gated_reclaimed_fence_without_token)
+        and result_status == STATE_MERGED
+        and not str(fence_token or "").strip()
+        and bool(str(merge_commit or "").strip())
+        and bool(str(target_head_before_merge or "").strip())
+        and bool(str(target_head_after_merge or "").strip())
+    )
+
+
+def _require_merge_queue_result_record_authority(
+    context: BranchTaskRuntimeContext | None,
+    *,
+    result_status: str,
+    fence_token: str,
+    allow_route_gated_reclaimed_fence_without_token: bool,
+    merge_commit: str,
+    target_head_before_merge: str,
+    target_head_after_merge: str,
+) -> None:
+    if context is None or not (context.fence_token or fence_token):
+        return
+    if fence_token:
+        _require_current_fence(context, fence_token)
+        return
+    if _merge_queue_result_has_route_gated_reclaimed_fence_authority(
+        result_status=result_status,
+        fence_token=fence_token,
+        allow_route_gated_reclaimed_fence_without_token=(
+            allow_route_gated_reclaimed_fence_without_token
+        ),
+        merge_commit=merge_commit,
+        target_head_before_merge=target_head_before_merge,
+        target_head_after_merge=target_head_after_merge,
+    ):
+        return
+    _require_current_fence(context, fence_token)
+
+
+def preflight_merge_queue_result_record_authority(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str = "",
+    task_id: str = "",
+    target_ref: str = "",
+    target_head_before_merge: str = "",
+    fence_token: str = "",
+) -> dict[str, Any]:
+    """Validate live-apply result recording authority before mutating target refs."""
+    ensure_branch_runtime_schema(conn)
+    items = _context_enriched_merge_queue_items(
+        conn,
+        _list_merge_queue_items_with_target_fallback(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
+        target_ref=target_ref,
+    )
+    selected = _select_merge_gate_item(
+        items,
+        queue_item_id=queue_item_id,
+        task_id=task_id,
+    )
+    context = get_branch_context(conn, project_id, selected.task_id)
+    before = (
+        target_head_before_merge
+        or selected.target_head_before_merge
+        or selected.current_target_head
+        or selected.validated_target_head
+    )
+    for result_status in (STATE_MERGED, STATE_MERGE_FAILED):
+        _require_merge_queue_result_record_authority(
+            context,
+            result_status=result_status,
+            fence_token=fence_token,
+            allow_route_gated_reclaimed_fence_without_token=False,
+            merge_commit="preflight-merge-commit"
+            if result_status == STATE_MERGED
+            else "",
+            target_head_before_merge=before,
+            target_head_after_merge="preflight-target-head"
+            if result_status == STATE_MERGED
+            else before,
+        )
+    return {
+        "ok": True,
+        "queue_item": merge_queue_item_to_dict(selected),
+        "context": (
+            {
+                "task_id": context.task_id,
+                "status": context.status,
+                "has_fence_token": bool(context.fence_token),
+            }
+            if context is not None
+            else None
+        ),
     }
 
 
@@ -13795,6 +13907,21 @@ def execute_merge_queue_item(
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": None,
         }
+
+    preflight_merge_queue_result_record_authority(
+        conn,
+        project_id=project_id,
+        merge_queue_id=merge_queue_id,
+        queue_item_id=item.queue_item_id,
+        task_id=item.task_id,
+        target_ref=target_ref or item.target_ref,
+        target_head_before_merge=(
+            item.target_head_before_merge
+            or item.current_target_head
+            or item.validated_target_head
+        ),
+        fence_token=fence_token,
+    )
 
     target_branch = _branch_name_from_ref(target_ref or item.target_ref)
     branch_name = _branch_name_from_ref(item.branch_ref)

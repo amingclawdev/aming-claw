@@ -27,6 +27,7 @@ from agent.governance.parallel_branch_runtime import (
     decide_merge_queue,
     decide_persisted_merge_gate,
     decide_persisted_merge_queue,
+    execute_merge_queue_item,
     get_branch_context,
     git_merge_preview_evidence,
     list_merge_queue_items,
@@ -793,6 +794,77 @@ def test_merge_result_recording_updates_queue_and_context_with_fence() -> None:
     )
     assert plan.decisions[0].target_graph_activation_allowed is True
     assert plan.decisions[0].target_semantic_activation_allowed is True
+
+
+def test_execute_merge_queue_item_preflights_fence_before_live_writer(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = create_merge_preview_fixture_project(tmp_path)
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id="PB-016",
+            task_id="T-live-preflight",
+            branch_ref=fixture.clean_branch,
+            status=STATE_MERGE_READY,
+            fence_token="fence-live-current",
+            target_head_commit=fixture.main_head,
+            merge_queue_id="mergeq-live-preflight",
+        ),
+        now_iso="2026-05-17T08:30:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-live-preflight",
+                queue_item_id="item-live-preflight",
+                task_id="T-live-preflight",
+                branch_ref=fixture.clean_branch,
+                queue_index=1,
+                status=STATE_MERGE_READY,
+                target_ref="main",
+                branch_head=fixture.clean_branch,
+                validated_target_head=fixture.main_head,
+                current_target_head=fixture.main_head,
+            )
+        ],
+        now_iso="2026-05-17T08:30:00Z",
+    )
+    writer_calls: list[dict[str, str]] = []
+
+    def fake_write_merge_with_trailer(*args, **kwargs):
+        writer_calls.append({"message": str(args[0]) if args else ""})
+        return True, "merge-should-not-happen", ""
+
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        fake_write_merge_with_trailer,
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        execute_merge_queue_item(
+            conn,
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-live-preflight",
+            repo_root_path=fixture.root,
+            queue_item_id="item-live-preflight",
+            target_ref="main",
+            evidence=_passing_merge_evidence(),
+            dry_run=False,
+            allow_target_ref_mutation=True,
+            fence_token="fence-live-stale",
+            message="merge feature-clean",
+            now_iso="2026-05-17T08:31:00Z",
+        )
+
+    assert writer_calls == []
+    context = get_branch_context(conn, PROJECT_ID, "T-live-preflight")
+    assert context is not None
+    assert context.status == STATE_MERGE_READY
 
 
 def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None:
