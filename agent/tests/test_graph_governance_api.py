@@ -2519,6 +2519,97 @@ def test_observer_runtime_text_prepare_projects_route_identity_to_allocated_cont
     assert worker_view["next_legal_action"] == "submit_mf_subagent_read_receipt"
 
 
+def test_parallel_branch_allocate_persists_merge_queue_id_from_child_route_lineage(
+    conn,
+    tmp_path,
+):
+    workspace = tmp_path / "workers"
+    worktree = workspace / "lineage-worker" / "allocate-lineage-task"
+    child_route_lineage = {
+        "schema_version": "child_route_lineage.v1",
+        "route_id": "route-allocate-lineage",
+        "route_context_hash": "sha256:route-allocate-lineage",
+        "prompt_contract_id": "rprompt-allocate-lineage",
+        "prompt_contract_hash": "sha256:prompt-allocate-lineage",
+        "visible_injection_manifest_hash": "sha256:visible-allocate-lineage",
+        "route_token_ref": "rtok-allocate-lineage",
+        "merge_queue_id": "mq-allocate-lineage",
+    }
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "allocate-lineage-task",
+                "parent_task_id": "AC-ALLOCATE-LINEAGE",
+                "backlog_id": "AC-ALLOCATE-LINEAGE",
+                "observer_command_id": "cmd-allocate-lineage",
+                "workspace_root": str(workspace),
+                "worktree_path": str(worktree),
+                "worker_id": "lineage-worker",
+                "fence_token": "fence-allocate-lineage",
+                "base_commit": "base-allocate-lineage",
+                "target_head_commit": "target-allocate-lineage",
+                "route_id": "route-allocate-lineage",
+                "route_context_hash": "sha256:route-allocate-lineage",
+                "prompt_contract_id": "rprompt-allocate-lineage",
+                "prompt_contract_hash": "sha256:prompt-allocate-lineage",
+                "route_token_ref": "rtok-allocate-lineage",
+                "visible_injection_manifest_hash": "sha256:visible-allocate-lineage",
+                "child_route_lineage": child_route_lineage,
+                "route_lineage": {
+                    "schema_version": "observer_route_parent_child_lineage.v1",
+                    "child_route_lineage": child_route_lineage,
+                },
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": False,
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["ok"] is True
+    context = created["context"]
+    assert context["merge_queue_id"] == "mq-allocate-lineage"
+    assert created["runtime_contract_revision"]["payload"]["merge_queue_id"] == (
+        "mq-allocate-lineage"
+    )
+    assert created["dispatch_timeline_event"]["status"] == "recorded"
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-ALLOCATE-LINEAGE",
+        task_id="allocate-lineage-task",
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["merge_queue_id"] == "mq-allocate-lineage"
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "AC-ALLOCATE-LINEAGE",
+                "fence_token": "fence-allocate-lineage",
+                "target_project_root": str(worktree),
+            },
+        )
+    )
+    worker_view = current_state["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["branch"]["merge_queue_id"] == "mq-allocate-lineage"
+    assert worker_view["action_plan"]["mf_parallel_happy_path_reminders"][
+        "merge_queue_id"
+    ] == "mq-allocate-lineage"
+
+
 def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     conn,
     tmp_path,

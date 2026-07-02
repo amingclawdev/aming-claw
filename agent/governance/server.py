@@ -7471,6 +7471,36 @@ def _parallel_branch_allocate_route_gate(
     }
 
 
+def _parallel_branch_allocate_merge_queue_id(body: Mapping[str, Any]) -> str:
+    candidates: list[Any] = [body.get("merge_queue_id")]
+    seen: set[int] = set()
+
+    def collect(value: Any, *, depth: int = 0) -> None:
+        if depth > 5 or not isinstance(value, Mapping):
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        candidates.append(value.get("merge_queue_id"))
+        for key in (
+            "child_route_lineage",
+            "route_lineage",
+            "execute_backlog_row_payload",
+            "route_token",
+            "route_token_gate",
+            "route_identity",
+            "canonical_route_identity",
+            "payload",
+        ):
+            nested = value.get(key)
+            if isinstance(nested, Mapping):
+                collect(nested, depth=depth + 1)
+
+    collect(body)
+    return _runtime_context_public_text(*candidates)
+
+
 def _parallel_branch_allocate_should_persist_contract_revision(
     body: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
@@ -7562,6 +7592,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     if not request_target_files:
         request_target_files = list(request_owned_files)
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
+    normalized_merge_queue_id = _parallel_branch_allocate_merge_queue_id(ctx.body or {})
     context = plan_branch_runtime_context(
         project_id=project_id,
         task_id=task_id,
@@ -7592,7 +7623,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ref_name=str(ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"),
         base_commit=base_commit,
         target_head_commit=target_head_commit,
-        merge_queue_id=str(ctx.body.get("merge_queue_id") or ""),
+        merge_queue_id=normalized_merge_queue_id,
         fence_token=allocation_fence_token,
     )
     context = _parallel_branch_allocate_normalize_worktree_path(
