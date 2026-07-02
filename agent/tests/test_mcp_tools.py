@@ -1440,6 +1440,9 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     assert "execution_state_revision" in submit_properties
     assert "runtime_guide_hash" in submit_properties
     assert submit_properties.keys() >= {
+        "backlog_id",
+        "definition_hash",
+        "instruction_bundle_hash",
         "runtime_context_id",
         "task_id",
         "parent_task_id",

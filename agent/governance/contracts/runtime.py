@@ -24,7 +24,7 @@ from .execution_state import (
     build_execution_state,
 )
 from .gate_kernel import ContractGateKernel
-from .guide_compiler import compile_runtime_guide
+from .guide_compiler import attach_writer_role_safe_copy_payload, compile_runtime_guide
 from .hash import stable_sha256
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
@@ -2235,6 +2235,16 @@ class ContractRuntime:
                         if key != "runtime_guide_hash"
                     }
                 )
+        _attach_writer_role_safe_submit_payload(
+            guide,
+            definition=definition,
+            record=record,
+            instruction_bundle=instruction_bundle,
+            completed_lines=line_items,
+            completion_satisfying_lines=completion_satisfying_lines,
+            sanitized_projection=sanitized_projection,
+            reader_role=effective_actor_role,
+        )
         current_precheck = self.gate_kernel.precheck(
             definition,
             action="current_state",
@@ -2754,6 +2764,191 @@ def _line_instance_id_from_write(write: Mapping[str, Any]) -> str:
     if lane_id:
         return f"lane:{lane_id}"
     return ""
+
+
+def _attach_writer_role_safe_submit_payload(
+    guide: dict[str, Any],
+    *,
+    definition: Mapping[str, Any],
+    record: Mapping[str, Any],
+    instruction_bundle: Mapping[str, Any],
+    completed_lines: Sequence[Mapping[str, Any]],
+    completion_satisfying_lines: Sequence[Mapping[str, Any]],
+    sanitized_projection: Mapping[str, Any],
+    reader_role: str,
+) -> None:
+    next_action = guide.get("next_legal_action")
+    if not isinstance(next_action, Mapping):
+        return
+    writer_role = _next_action_writer_role(next_action, fallback_role=reader_role)
+    if not writer_role:
+        return
+    role_hashes = _runtime_guide_role_hashes(
+        definition,
+        record=record,
+        instruction_bundle=instruction_bundle,
+        completed_lines=completed_lines,
+        completion_satisfying_lines=completion_satisfying_lines,
+        sanitized_projection=sanitized_projection,
+        reader_role=reader_role,
+        writer_role=writer_role,
+        next_action=next_action,
+        reader_runtime_guide_hash=str(guide.get("runtime_guide_hash") or ""),
+    )
+    writer_hash = ""
+    for item in role_hashes:
+        if str(item.get("role") or "") == writer_role:
+            writer_hash = str(item.get("runtime_guide_hash") or "")
+            break
+    attach_writer_role_safe_copy_payload(
+        guide,
+        reader_role=reader_role,
+        writer_role=writer_role,
+        writer_runtime_guide_hash=writer_hash or str(guide.get("runtime_guide_hash") or ""),
+        role_runtime_guide_hashes=role_hashes,
+    )
+
+
+def _runtime_guide_role_hashes(
+    definition: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+    instruction_bundle: Mapping[str, Any],
+    completed_lines: Sequence[Mapping[str, Any]],
+    completion_satisfying_lines: Sequence[Mapping[str, Any]],
+    sanitized_projection: Mapping[str, Any],
+    reader_role: str,
+    writer_role: str,
+    next_action: Mapping[str, Any] | None,
+    reader_runtime_guide_hash: str,
+) -> list[dict[str, str]]:
+    role_hashes: list[dict[str, str]] = []
+    for role in _known_contract_roles(
+        definition,
+        next_action=next_action,
+        reader_role=reader_role,
+        writer_role=writer_role,
+    ):
+        runtime_guide_hash = reader_runtime_guide_hash if role == reader_role else ""
+        if not runtime_guide_hash:
+            runtime_guide_hash = _runtime_guide_hash_for_role(
+                definition,
+                record=record,
+                instruction_bundle=instruction_bundle,
+                completed_lines=completed_lines,
+                completion_satisfying_lines=completion_satisfying_lines,
+                sanitized_projection=sanitized_projection,
+                actor_role=role,
+            )
+        role_hashes.append(
+            {
+                "role": role,
+                "runtime_guide_hash": runtime_guide_hash,
+                "role_kind": "required_writer" if role == writer_role else "reader_or_known",
+            }
+        )
+    return role_hashes
+
+
+def _runtime_guide_hash_for_role(
+    definition: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+    instruction_bundle: Mapping[str, Any],
+    completed_lines: Sequence[Mapping[str, Any]],
+    completion_satisfying_lines: Sequence[Mapping[str, Any]],
+    sanitized_projection: Mapping[str, Any],
+    actor_role: str,
+) -> str:
+    state = build_execution_state(
+        definition,
+        project_id=str(record["project_id"]),
+        backlog_id=str(record["backlog_id"]),
+        contract_execution_id=str(record["contract_execution_id"]),
+        actor_role=actor_role,
+        completed_lines=completion_satisfying_lines,
+        route_token_ref=str(record.get("route_token_ref") or ""),
+        instruction_bundle_hash=str(record.get("instruction_bundle_hash") or ""),
+        execution_state_revision=int(record.get("execution_state_revision") or 1),
+    )
+    role_guide = compile_runtime_guide(
+        definition,
+        state,
+        instruction_bundle=instruction_bundle,
+    )
+    _attach_completed_line_evidence(role_guide, completed_lines)
+    if sanitized_projection:
+        role_guide["completed_lines_projection"] = dict(sanitized_projection)
+        role_guide["runtime_guide_hash"] = stable_sha256(
+            {
+                key: value
+                for key, value in role_guide.items()
+                if key != "runtime_guide_hash"
+            }
+        )
+    return str(role_guide.get("runtime_guide_hash") or "")
+
+
+def _known_contract_roles(
+    definition: Mapping[str, Any],
+    *,
+    next_action: Mapping[str, Any] | None,
+    reader_role: str,
+    writer_role: str,
+) -> list[str]:
+    roles: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        role = str(value or "").strip()
+        if role and role not in seen:
+            seen.add(role)
+            roles.append(role)
+
+    add(reader_role)
+    add(writer_role)
+    if isinstance(next_action, Mapping):
+        add(next_action.get("owner_role"))
+        for role in next_action.get("allowed_writer_roles") or []:
+            add(role)
+    add(definition.get("role"))
+    read_model = definition.get("read_model")
+    if isinstance(read_model, Mapping):
+        for role in read_model.get("allowed_writer_roles") or []:
+            add(role)
+        for line in read_model.get("rule_lines") or []:
+            if not isinstance(line, Mapping):
+                continue
+            add(line.get("owner_role"))
+            for role in line.get("allowed_writer_roles") or []:
+                add(role)
+    rule_layer = definition.get("rule_layer")
+    stages = rule_layer.get("stages") if isinstance(rule_layer, Mapping) else []
+    for stage in stages or []:
+        if not isinstance(stage, Mapping):
+            continue
+        for line in stage.get("lines") or []:
+            if not isinstance(line, Mapping):
+                continue
+            add(line.get("owner_role"))
+            for role in line.get("allowed_writer_roles") or []:
+                add(role)
+    return roles
+
+
+def _next_action_writer_role(
+    next_action: Mapping[str, Any],
+    *,
+    fallback_role: str,
+) -> str:
+    owner_role = str(next_action.get("owner_role") or "").strip()
+    if owner_role:
+        return owner_role
+    for role in next_action.get("allowed_writer_roles") or []:
+        text = str(role or "").strip()
+        if text:
+            return text
+    return str(fallback_role or "").strip()
 
 
 def _attach_completed_line_evidence(

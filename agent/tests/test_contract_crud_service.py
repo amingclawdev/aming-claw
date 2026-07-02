@@ -720,7 +720,8 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
     successor_policy = definition["system_layer"]["successor_policy"]
     assert successor_policy["allow_successor_start"] is True
     assert successor_policy["allowed_parent_contracts"] == [
-        {"contract_id": "onboard_contract", "version": "v1"}
+        {"contract_id": "onboard_contract", "version": "v1"},
+        {"contract_id": "onboard_route_guide", "version": "service"},
     ]
     assert "observer_work_mode_transition" in successor_policy[
         "requires_handoff_evidence"
@@ -942,6 +943,78 @@ def test_default_registry_exposes_mf_parallel_contract_definition_and_runtime_pa
         record = accepted["record"]
 
     assert record["runtime_guide"]["next_legal_action"] is None
+
+
+def test_contract_runtime_writer_role_safe_copy_payload_for_observer_to_mf_sub():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    execution_id = "cex-mf-parallel-writer-role-copy-observer-worker-test"
+    _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-WRITER-ROLE-GUIDE-HASH-MISMATCH-20260701",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-writer-role-copy",
+    )
+    _submit_next_runtime_line(runtime, execution_id, actor_role="observer")
+    _submit_next_runtime_line(runtime, execution_id, actor_role="observer")
+
+    observer_guide = runtime.current_guide(execution_id, actor_role="observer")
+    copy_payload = observer_guide["writer_role_safe_copy_payload"]["copy_payload"]
+    assert observer_guide["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    assert copy_payload["actor_role"] == "mf_sub"
+    assert copy_payload["runtime_guide_hash"] != observer_guide["runtime_guide_hash"]
+
+    stale_reader_payload = dict(copy_payload)
+    stale_reader_payload["runtime_guide_hash"] = observer_guide["runtime_guide_hash"]
+    rejected = runtime.submit_line_write(execution_id, stale_reader_payload)
+
+    assert rejected["ok"] is False
+    mismatch = "\n".join(rejected["decision"]["errors"])
+    assert "reader-role guide hash for role 'observer'" in mismatch
+    assert "owner/writer-role guide hash for role 'mf_sub'" in mismatch
+    assert "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash" in mismatch
+
+    accepted = runtime.submit_line_write(execution_id, copy_payload)
+    assert accepted["ok"] is True
+    assert accepted["record"]["completed_lines"][-1]["actor_role"] == "mf_sub"
+
+
+def test_contract_runtime_writer_role_safe_copy_payload_for_mf_sub_to_qa():
+    service = ContractCrudService()
+    runtime = ContractRuntime(service.registry)
+    execution_id = "cex-mf-parallel-writer-role-copy-worker-qa-test"
+    _start_mf_parallel_successor(
+        runtime,
+        project_id="aming-claw",
+        backlog_id="AC-CONTRACT-RUNTIME-WRITER-ROLE-GUIDE-HASH-MISMATCH-20260701",
+        contract_execution_id=execution_id,
+        route_token_ref="rtok-writer-role-copy",
+    )
+    _submit_next_runtime_line(runtime, execution_id, actor_role="observer")
+    _submit_next_runtime_line(runtime, execution_id, actor_role="observer")
+    for _ in range(7):
+        _submit_next_runtime_line(runtime, execution_id, actor_role="mf_sub")
+
+    mf_sub_guide = runtime.current_guide(execution_id, actor_role="mf_sub")
+    copy_payload = mf_sub_guide["writer_role_safe_copy_payload"]["copy_payload"]
+    assert mf_sub_guide["next_legal_action"]["line_id"] == "qa_independent_verification"
+    assert copy_payload["actor_role"] == "qa"
+    assert copy_payload["runtime_guide_hash"] != mf_sub_guide["runtime_guide_hash"]
+
+    stale_reader_payload = dict(copy_payload)
+    stale_reader_payload["runtime_guide_hash"] = mf_sub_guide["runtime_guide_hash"]
+    rejected = runtime.submit_line_write(execution_id, stale_reader_payload)
+
+    assert rejected["ok"] is False
+    mismatch = "\n".join(rejected["decision"]["errors"])
+    assert "reader-role guide hash for role 'mf_sub'" in mismatch
+    assert "owner/writer-role guide hash for role 'qa'" in mismatch
+    assert "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash" in mismatch
+
+    accepted = runtime.submit_line_write(execution_id, copy_payload)
+    assert accepted["ok"] is True
+    assert accepted["record"]["completed_lines"][-1]["actor_role"] == "qa"
 
 
 @pytest.mark.parametrize("qa_status", ["failed", "blocked", "rejected"])
