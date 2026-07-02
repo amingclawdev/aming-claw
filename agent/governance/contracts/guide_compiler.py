@@ -58,6 +58,79 @@ def compile_runtime_guide(
     return guide
 
 
+def attach_writer_role_safe_copy_payload(
+    guide: dict[str, Any],
+    *,
+    reader_role: str,
+    writer_role: str,
+    writer_runtime_guide_hash: str,
+    role_runtime_guide_hashes: list[Mapping[str, Any]] | None = None,
+) -> None:
+    """Attach a submit_line payload whose guide hash is aligned to the writer role."""
+
+    next_action = guide.get("next_legal_action")
+    if not isinstance(next_action, Mapping):
+        return
+    execution = guide.get("execution") if isinstance(guide.get("execution"), Mapping) else {}
+    contract = guide.get("contract") if isinstance(guide.get("contract"), Mapping) else {}
+    reader_runtime_guide_hash = str(guide.get("runtime_guide_hash") or "")
+    writer_role = str(writer_role or "").strip()
+    required_hash = str(writer_runtime_guide_hash or reader_runtime_guide_hash)
+    copy_payload: dict[str, Any] = {
+        "project_id": str(execution.get("project_id") or ""),
+        "backlog_id": str(execution.get("backlog_id") or ""),
+        "contract_execution_id": str(execution.get("contract_execution_id") or ""),
+        "definition_hash": str(contract.get("definition_hash") or ""),
+        "instruction_bundle_hash": str(execution.get("instruction_bundle_hash") or ""),
+        "execution_state_revision": int(execution.get("execution_state_revision") or 0),
+        "runtime_guide_hash": required_hash,
+        "stage_id": str(next_action.get("stage_id") or ""),
+        "line_id": str(next_action.get("line_id") or ""),
+        "actor_role": writer_role,
+        "evidence_kind": str(next_action.get("evidence_kind") or ""),
+    }
+    for field in (
+        "line_instance_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "lane_id",
+        "worker_slot_id",
+        "worker_id",
+    ):
+        value = next_action.get(field)
+        if value not in (None, ""):
+            copy_payload[field] = value
+
+    role_hashes = [
+        dict(item)
+        for item in (role_runtime_guide_hashes or [])
+        if isinstance(item, Mapping)
+    ]
+    guide["writer_role_safe_copy_payload"] = {
+        "schema_version": "contract_runtime.writer_role_safe_copy_payload.v1",
+        "tool": "contract_runtime_submit_line",
+        "copy_payload": copy_payload,
+        "hash_alignment": {
+            "schema_version": "contract_runtime.writer_role_hash_alignment.v1",
+            "status": "writer_role_aligned",
+            "reader_role": str(reader_role or ""),
+            "reader_runtime_guide_hash": reader_runtime_guide_hash,
+            "required_owner_role": str(next_action.get("owner_role") or ""),
+            "required_writer_role": writer_role,
+            "required_writer_runtime_guide_hash": required_hash,
+            "reader_hash_is_writer_hash": reader_runtime_guide_hash == required_hash,
+            "known_role_runtime_guide_hashes": role_hashes,
+            "recovery": (
+                "Use writer_role_safe_copy_payload.copy_payload.runtime_guide_hash "
+                "for contract_runtime_submit_line; the top-level runtime_guide_hash "
+                "belongs to the reader role that produced this guide."
+            ),
+        },
+    }
+
+
 def _ref_visible(ref: Any, *, role: str, stage_id: str) -> bool:
     if not isinstance(ref, Mapping):
         return False

@@ -41,12 +41,7 @@ def validate_contract_write(
     _expect_equal(errors, write, execution_state, "execution_state_revision")
 
     if runtime_guide is not None:
-        _expect_value(
-            errors,
-            write,
-            "runtime_guide_hash",
-            runtime_guide.get("runtime_guide_hash"),
-        )
+        _expect_runtime_guide_hash(errors, write, runtime_guide)
 
     stage_id = str(write.get("stage_id") or "")
     line_id = str(write.get("line_id") or "")
@@ -184,3 +179,79 @@ def _expect_value(
         return
     if write.get(field) != expected:
         errors.append(f"{field} mismatch")
+
+
+def _expect_runtime_guide_hash(
+    errors: list[str],
+    write: Mapping[str, Any],
+    runtime_guide: Mapping[str, Any],
+) -> None:
+    field = "runtime_guide_hash"
+    expected = runtime_guide.get(field)
+    if field not in write:
+        errors.append(f"missing {field}")
+        return
+    actual = write.get(field)
+    if actual == expected:
+        return
+    errors.append(_runtime_guide_hash_mismatch_message(write, runtime_guide, actual, expected))
+
+
+def _runtime_guide_hash_mismatch_message(
+    write: Mapping[str, Any],
+    runtime_guide: Mapping[str, Any],
+    actual: Any,
+    expected: Any,
+) -> str:
+    copy_payload = _mapping(runtime_guide.get("writer_role_safe_copy_payload"))
+    alignment = _mapping(copy_payload.get("hash_alignment"))
+    submit_payload = _mapping(copy_payload.get("copy_payload"))
+    actor_role = str(write.get("actor_role") or submit_payload.get("actor_role") or "")
+    required_role = str(
+        alignment.get("required_writer_role")
+        or alignment.get("required_owner_role")
+        or actor_role
+    )
+    required_hash = str(
+        alignment.get("required_writer_runtime_guide_hash")
+        or submit_payload.get("runtime_guide_hash")
+        or expected
+        or ""
+    )
+    actual_hash = str(actual or "")
+    reader_role = _matching_reader_role(alignment, actual_hash, required_role)
+    if not reader_role:
+        reader_role = str(alignment.get("reader_role") or "")
+    reader_fragment = (
+        f"received reader-role guide hash for role {reader_role!r} ({actual_hash})"
+        if reader_role and actual_hash
+        else f"received {actual_hash!r}, which is not the required owner/writer-role hash"
+    )
+    return (
+        "runtime_guide_hash mismatch: "
+        f"{reader_fragment}; submit_line requires owner/writer-role guide hash "
+        f"for role {required_role!r} ({required_hash}). "
+        "Recover by copying writer_role_safe_copy_payload.copy_payload.runtime_guide_hash "
+        "or the full writer_role_safe_copy_payload.copy_payload from the current guide "
+        "before calling contract_runtime_submit_line."
+    )
+
+
+def _matching_reader_role(
+    alignment: Mapping[str, Any],
+    actual_hash: str,
+    required_role: str,
+) -> str:
+    for item in alignment.get("known_role_runtime_guide_hashes") or []:
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "")
+        if role == required_role:
+            continue
+        if str(item.get("runtime_guide_hash") or "") == actual_hash:
+            return role
+    return ""
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}

@@ -412,7 +412,10 @@ def _onboard_route_guide_body(args: dict) -> dict:
 def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     properties: dict[str, Any] = {
         "project_id": {"type": "string"},
+        "backlog_id": {"type": "string"},
         "contract_execution_id": {"type": "string"},
+        "definition_hash": {"type": "string"},
+        "instruction_bundle_hash": {"type": "string"},
         "execution_state_revision": {"type": "integer"},
         "runtime_guide_hash": {"type": "string"},
         "stage_id": {"type": "string"},

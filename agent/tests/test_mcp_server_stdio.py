@@ -1537,6 +1537,9 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "inputSchema"
     ]["properties"]
     assert set(tool_by_name["contract_runtime_submit_line"]["inputSchema"]["properties"]) >= {
+        "backlog_id",
+        "definition_hash",
+        "instruction_bundle_hash",
         "runtime_context_id",
         "task_id",
         "parent_task_id",
