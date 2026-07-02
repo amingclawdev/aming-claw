@@ -38007,6 +38007,13 @@ def _contract_runtime_projection_post_worker_lines(
         context
     )
     backlog_id = str(getattr(context, "backlog_id", "") or record.get("backlog_id") or "")
+    related_task_ids = {
+        str(parent_task_id or "").strip(),
+        str(record.get("contract_execution_id") or "").strip(),
+        str(record.get("parent_contract_execution_id") or "").strip(),
+        str(record.get("root_contract_execution_id") or "").strip(),
+    }
+    related_task_ids = {item for item in related_task_ids if item}
     timeline_events = _contract_runtime_projection_post_worker_timeline_events(
         conn,
         project_id=project_id,
@@ -38022,6 +38029,7 @@ def _contract_runtime_projection_post_worker_lines(
         kind_tokens={"independent_verification", "qa_verification"},
         phase_tokens={"verification", "qa"},
         actor_roles={"qa"},
+        related_task_ids=related_task_ids,
     )
     merge_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
@@ -38031,6 +38039,7 @@ def _contract_runtime_projection_post_worker_lines(
         kind_tokens={"live_merge", "merge", "observer_merge"},
         phase_tokens={"live_merge", "merge"},
         actor_roles={"observer"},
+        related_task_ids=related_task_ids,
     )
     reconcile_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
@@ -38041,6 +38050,17 @@ def _contract_runtime_projection_post_worker_lines(
         phase_tokens={"reconcile"},
         actor_roles={"observer"},
         allow_taskless=True,
+        related_task_ids=related_task_ids,
+    )
+    close_ready_event = _contract_runtime_projection_latest_timeline_event(
+        timeline_events,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"close_ready", "observer_close_ready"},
+        phase_tokens={"close_ready", "close"},
+        actor_roles={"observer"},
+        related_task_ids=related_task_ids,
     )
 
     lines: list[dict[str, Any]] = []
@@ -38083,7 +38103,26 @@ def _contract_runtime_projection_post_worker_lines(
                 source_key="observer_reconcile",
             )
         )
-    if merge_event and reconcile_event:
+    if close_ready_event:
+        derived_from = []
+        if merge_event:
+            derived_from.append(_runtime_context_event_ref(merge_event))
+        if reconcile_event:
+            derived_from.append(_runtime_context_event_ref(reconcile_event))
+        lines.append(
+            _contract_runtime_projected_post_worker_line(
+                record=record,
+                context=context,
+                event=close_ready_event,
+                stage_id="observer_integration",
+                line_id="observer_close_ready",
+                evidence_kind="close_ready",
+                actor_role="observer",
+                source_key="observer_close_ready",
+                derived_from=derived_from,
+            )
+        )
+    elif merge_event and reconcile_event:
         lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
@@ -38153,6 +38192,7 @@ def _contract_runtime_projection_latest_timeline_event(
     phase_tokens: set[str],
     actor_roles: set[str],
     allow_taskless: bool = False,
+    related_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     for event in reversed([event for event in timeline_events if isinstance(event, Mapping)]):
         status = str(event.get("status") or event.get("decision") or "").strip().lower()
@@ -38161,21 +38201,12 @@ def _contract_runtime_projection_latest_timeline_event(
         event_backlog = str(event.get("backlog_id") or "").strip()
         if backlog_id and event_backlog and event_backlog != backlog_id:
             continue
-        event_context = _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(
-                event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
-                "runtime_context_id",
-            )
-        )
-        if runtime_context_id and event_context and event_context != runtime_context_id:
-            continue
-        event_task = str(event.get("task_id") or "").strip()
-        if (
-            task_id
-            and event_task
-            and event_task != task_id
-            and not allow_taskless
-            and event_context != runtime_context_id
+        if not _contract_runtime_projection_timeline_scope_matches(
+            event,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            related_task_ids=related_task_ids or set(),
+            allow_taskless=allow_taskless,
         ):
             continue
         event_kind = _contract_runtime_close_normalized(event.get("event_kind"))
@@ -38187,11 +38218,75 @@ def _contract_runtime_projection_latest_timeline_event(
             and phase not in phase_tokens
         ):
             continue
-        actor_role = _contract_runtime_close_authority_timeline_actor_role(event)
+        actor_role = _contract_runtime_projection_timeline_actor_role(event)
         if actor_role not in actor_roles:
             continue
         return dict(event)
     return {}
+
+
+def _contract_runtime_projection_timeline_scope_matches(
+    event: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    related_task_ids: set[str],
+    allow_taskless: bool,
+) -> bool:
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    event_context = _runtime_context_non_placeholder_text(
+        _timeline_first_deep_text(payload, "runtime_context_id")
+    )
+    if runtime_context_id and event_context:
+        return event_context == runtime_context_id
+
+    expected_task_id = str(task_id or "").strip()
+    expected_related = {
+        str(item or "").strip() for item in related_task_ids if str(item or "").strip()
+    }
+    expected_ids = ({expected_task_id} if expected_task_id else set()) | expected_related
+    event_task_values = {
+        str(event.get("task_id") or "").strip(),
+        _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(payload, "task_id")
+        ),
+        _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(payload, "worker_task_id")
+        ),
+        _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(payload, "parent_task_id")
+        ),
+        _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(payload, "contract_execution_id")
+        ),
+        _runtime_context_non_placeholder_text(
+            _timeline_first_deep_text(payload, "observer_command_id")
+        ),
+    }
+    event_task_values = {item for item in event_task_values if item}
+    if expected_ids and event_task_values.intersection(expected_ids):
+        return True
+    if allow_taskless:
+        return True
+    return not event_task_values
+
+
+def _contract_runtime_projection_timeline_actor_role(
+    event: Mapping[str, Any],
+) -> str:
+    role = str(event.get("actor_role") or "").strip().lower()
+    if role in {"observer", "qa", "mf_sub"}:
+        return role
+    actor = str(event.get("actor") or "").strip().lower()
+    if "mf_sub" in actor:
+        return "mf_sub"
+    if "qa" in actor:
+        return "qa"
+    if "observer" in actor or "operator" in actor:
+        return "observer"
+    if "worker" in actor:
+        return "mf_sub"
+    return ""
 
 
 def _contract_runtime_projected_post_worker_line(
