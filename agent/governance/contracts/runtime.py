@@ -1469,6 +1469,55 @@ def _contract_completion_satisfying_lines(
     return satisfying
 
 
+def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
+    failed_index = _last_failed_qa_line_index(lines)
+    if failed_index < 0:
+        return -1
+    for index, line in enumerate(lines):
+        if index <= failed_index or not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "qa_independent_verification":
+            continue
+        if not _line_shape_allows_contract_completion(line):
+            continue
+        if _line_status_allows_contract_completion(line):
+            return -1
+    return failed_index
+
+
+def _attach_failed_qa_rework_guidance(
+    guide: dict[str, Any],
+    *,
+    line_items: Sequence[Mapping[str, Any]],
+) -> None:
+    failed_index = _active_failed_qa_line_index(line_items)
+    if failed_index < 0:
+        return
+    next_action = guide.get("next_legal_action")
+    if not isinstance(next_action, dict) or not next_action:
+        return
+    failed_line = line_items[failed_index]
+    blocker = {
+        "schema_version": "contract_runtime.failed_qa_rework_guidance.v1",
+        "status": "blocked_by_failed_independent_qa",
+        "semantic_next_action": "revise_after_failed_independent_qa",
+        "failed_qa_completed_line_index": failed_index,
+        "failed_qa_line_id": str(failed_line.get("line_id") or ""),
+        "failed_qa_stage_id": str(failed_line.get("stage_id") or ""),
+        "failed_qa_status": str(failed_line.get("status") or ""),
+        "next_required_line_id": str(next_action.get("line_id") or ""),
+        "next_required_owner_role": str(next_action.get("owner_role") or ""),
+        "reason": (
+            "Independent QA recorded a failing verdict; merge/materialize stay "
+            "blocked until a worker revision and a later passing independent QA line."
+        ),
+    }
+    next_action.setdefault("semantic_next_action", blocker["semantic_next_action"])
+    next_action.setdefault("blocked_by_failed_qa", True)
+    next_action.setdefault("failed_qa_blocker", blocker)
+    guide.setdefault("failed_qa_rework", blocker)
+
+
 def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
     failed_index = -1
     for index, line in enumerate(lines):
@@ -2221,6 +2270,7 @@ class ContractRuntime:
             state,
             instruction_bundle=instruction_bundle,
         )
+        _attach_failed_qa_rework_guidance(guide, line_items=line_items)
         _attach_completed_line_evidence(guide, line_items)
         sanitized_projection: dict[str, Any] = {}
         if projection:

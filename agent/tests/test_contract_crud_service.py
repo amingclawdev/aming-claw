@@ -1076,6 +1076,11 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
     )
     failed_qa_write["status"] = qa_status
     failed_qa_write["payload"] = {"status": qa_status}
+    if qa_status == "failed":
+        failed_qa_write["verification"] = {
+            "verdict": "fail",
+            "summary": "Independent QA failed the worker commit due to scope drift.",
+        }
     accepted_failed_qa = runtime.submit_line_write(
         f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
         failed_qa_write,
@@ -1086,6 +1091,11 @@ def test_mf_parallel_qa_failed_blocked_or_rejected_does_not_unlock_observer_merg
     assert next_action["line_id"] == "worker_read_runtime_guide"
     assert next_action["owner_role"] == "mf_sub"
     assert next_action["line_id"] != "observer_merge"
+    assert next_action["semantic_next_action"] == "revise_after_failed_independent_qa"
+    assert next_action["failed_qa_blocker"]["status"] == (
+        "blocked_by_failed_independent_qa"
+    )
+    assert next_action["failed_qa_blocker"]["failed_qa_status"] == qa_status
 
     runtime.current_guide(
         f"cex-mf-parallel-qa-{qa_status}-blocks-merge-test",
