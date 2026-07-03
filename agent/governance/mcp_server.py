@@ -757,7 +757,14 @@ def _parallel_branch_merge_queue_materialize_schema_properties() -> dict[str, An
             "description": "Defaults to true when checkpoint_id is provided.",
         },
         "worker_role": {"type": "string"},
-        "status": {"type": "string"},
+        "status": {
+            "type": "string",
+            "description": (
+                "Durable merge queue item status. Use queued_for_merge after worker "
+                "finish gate and independent QA; this does not change the branch "
+                "runtime context status."
+            ),
+        },
         "fence_token": {"type": "string"},
         "depends_on": {"type": "array", "items": {"type": "string"}},
         "hard_depends_on": {"type": "array", "items": {"type": "string"}},

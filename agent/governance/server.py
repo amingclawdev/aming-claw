@@ -12039,6 +12039,15 @@ def _runtime_context_worker_recovery_payloads(
                 "merge-queue/materialize"
             ),
             "body_source": "copy_safe_body",
+            "status_policy": {
+                "queue_item_status": "queued_for_merge",
+                "status_scope": "durable merge queue item only",
+                "branch_runtime_context_status": (
+                    "preserved from the worker finish gate; materialize must not "
+                    "downgrade it to queued/queued_for_merge"
+                ),
+                "avoid_status_values": ["queued"],
+            },
             "body": dict(merge_materialize_body),
             "copy_safe_body": dict(merge_materialize_body),
         },

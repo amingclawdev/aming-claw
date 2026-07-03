@@ -351,6 +351,7 @@ MERGE_READY_INPUT_STATES = {
     STATE_MERGE_READY,
 }
 _MERGE_QUEUE_STATUS_ALIASES = {
+    "queued": STATE_QUEUED_FOR_MERGE,
     "ready_for_merge": STATE_QUEUED_FOR_MERGE,
 }
 
@@ -10492,6 +10493,19 @@ def _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
     return True
 
 
+def _finish_checkpoint_context_status_after_merge_queue_materialize(
+    context: BranchTaskRuntimeContext,
+) -> str:
+    """Preserve the worker finish-gate state when adding a durable queue item."""
+
+    status = str(context.status or "").strip()
+    if status in {"queued", STATE_QUEUED_FOR_MERGE}:
+        return STATE_VALIDATED
+    if status == "ready_for_merge":
+        return STATE_MERGE_READY
+    return status
+
+
 MF_SUBAGENT_ROUTE_IDENTITY_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -13672,9 +13686,14 @@ def queue_merge_item_for_branch_context(
         projection_id=context.projection_id,
     )
     saved_item = upsert_merge_queue_item(conn, item, now_iso=now_iso)
+    next_context_status = (
+        _finish_checkpoint_context_status_after_merge_queue_materialize(context)
+        if require_finish_gate
+        else saved_item.status
+    )
     updated_context = replace(
         context,
-        status=saved_item.status,
+        status=next_context_status,
         merge_queue_id=saved_item.merge_queue_id,
         merge_preview_id=saved_item.merge_preview_id,
         head_commit=saved_item.branch_head or context.head_commit,

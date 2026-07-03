@@ -6971,9 +6971,59 @@ def test_merge_queue_accepts_route_gated_finish_checkpoint_without_raw_fence() -
         now_iso=NOW,
     )
 
-    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["status"] == STATE_VALIDATED
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-route-checkpoint"
     assert queued["queue_item"]["branch_head"] == "head-route-checkpoint"
+
+
+def test_merge_queue_materialize_repairs_legacy_queued_finish_context() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-route-legacy-queued",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-route-legacy-queued",
+            status="queued",
+            fence_token="fence-route-legacy-queued",
+            base_commit="base-route-legacy-queued",
+            head_commit="head-route-legacy-queued",
+            target_head_commit="target-route-legacy-queued",
+            checkpoint_id="ckpt-route-legacy-queued",
+            replay_source="mf_sub_finish_gate",
+            merge_queue_id="mergeq-route-legacy-queued",
+        ),
+        now_iso=NOW,
+    )
+
+    queued = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-route-legacy-queued",
+        merge_queue_id="mergeq-route-legacy-queued",
+        status="queued",
+        require_finish_gate=True,
+        checkpoint_id="ckpt-route-legacy-queued",
+        allow_finish_checkpoint_without_fence=True,
+        now_iso=NOW,
+    )
+    repaired = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-route-legacy-queued",
+        merge_queue_id="mergeq-route-legacy-queued",
+        require_finish_gate=True,
+        checkpoint_id="ckpt-route-legacy-queued",
+        allow_finish_checkpoint_without_fence=True,
+        now_iso=NOW,
+    )
+
+    assert queued["context"]["status"] == STATE_VALIDATED
+    assert queued["queue_item"]["status"] == "queued_for_merge"
+    assert repaired["context"]["status"] == STATE_VALIDATED
+    assert repaired["queue_item"]["status"] == "queued_for_merge"
 
 
 def _finished_qa_runtime_projection(

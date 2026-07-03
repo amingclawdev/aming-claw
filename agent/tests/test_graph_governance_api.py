@@ -10623,6 +10623,7 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
 
     assert queued["ok"] is True
     assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["queue_item"]["merge_preview_id"] == "preview-queue"
     assert queued["decision"]["blocked_task_ids"] == ["queue-task"]
     row = queued["decision"]["rows"][0]
@@ -10730,6 +10731,7 @@ def test_parallel_branch_merge_queue_accepts_root_route_token_ref_for_child_lane
     gate = queued["route_token_gate"]
     assert queued["ok"] is True
     assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["queue_item"]["task_id"] == child_task_id
     assert gate["action"] == "merge_queue"
     assert gate["protected_action"] == "merge_queue"
@@ -10796,7 +10798,8 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
     )
 
     assert queued["ok"] is True
-    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["status"] == "validated"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["queue_item"]["task_id"] == child_task_id
     assert queued["timeline_event_recorded"]["event_kind"] == (
         "merge_queue_item_materialize"
@@ -13011,7 +13014,8 @@ def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
     )
 
     assert queued["ok"] is True
-    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["status"] == "validated"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub"
 
 
@@ -13103,7 +13107,8 @@ def test_mf_sub_merge_queue_accepts_route_gate_finish_checkpoint_without_raw_fen
     )
 
     assert queued["ok"] is True
-    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["status"] == "validated"
+    assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-route-checkpoint"
     assert queued["queue_item"]["task_id"] == "mf-sub-route-checkpoint-task"
     assert queued["route_token_gate"]["action"] == "merge_queue"
@@ -13184,7 +13189,7 @@ def test_mf_sub_merge_queue_normalizes_ready_for_merge_alias_after_finish_checkp
     )
 
     assert queued["ok"] is True
-    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["status"] == "merge_ready"
     assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub-ready-alias"
 
