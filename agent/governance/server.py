@@ -10335,6 +10335,54 @@ def _runtime_context_worker_guide_response(
         or hinted_worker_session_id
         or ""
     ).strip()
+    hinted_worker_transcript_ref = str(
+        finish_attestation_hint.get("worker_transcript_ref")
+        or finish_attestation_hint.get("transcript_ref")
+        or ""
+    ).strip()
+    hinted_worker_transcript_path = str(
+        finish_attestation_hint.get("worker_transcript_path")
+        or finish_attestation_hint.get("transcript_path")
+        or ""
+    ).strip()
+    finish_attestation_transcript_readiness = {
+        "schema_version": (
+            "runtime_context.finish_time_transcript_readiness.v1"
+        ),
+        "status": (
+            "ready"
+            if (hinted_worker_transcript_ref or hinted_worker_transcript_path)
+            else "worker_must_supply_before_finish_time_attestation"
+        ),
+        "required_before": [
+            "implementation_and_tests",
+            "finish_time_worker_attestation",
+        ],
+        "required_fields": [
+            "worker_session_id",
+            "filer_principal",
+            "worker_transcript_ref or worker_transcript_path",
+            "harness_type",
+        ],
+        "copy_safe_sources": [
+            "runtime_context_worker_guide.worker_guide.write_guides.startup",
+            (
+                "runtime_context_worker_guide.actionable_payloads."
+                "startup_facade_payload_skeleton.copy_safe_body"
+            ),
+            (
+                "runtime_context_worker_guide.actionable_payloads."
+                "finish_time_worker_attestation_submission.copy_safe_body"
+            ),
+        ],
+        "if_unavailable": (
+            "stop before implementation edits and ask the observer to re-dispatch "
+            "or provide a worker host envelope that includes a verifiable "
+            "transcript ref/path"
+        ),
+        "happy_path_ref_only_supported": True,
+        "raw_transcript_required": False,
+    }
     hinted_read_receipt_event_id = str(
         finish_attestation_hint.get("read_receipt_event_id")
         or _runtime_context_timeline_event_id(
@@ -10369,11 +10417,14 @@ def _runtime_context_worker_guide_response(
         "filer_principal": (
             hinted_filer_principal or "<same value as worker_session_id>"
         ),
-        "worker_transcript_ref": str(
-            finish_attestation_hint.get("worker_transcript_ref")
+        "worker_transcript_ref": (
+            hinted_worker_transcript_ref
             or "<host transcript ref, e.g. codex:<session-id>>"
         ),
         "harness_type": str(finish_attestation_hint.get("harness_type") or "codex"),
+        "finish_time_transcript_readiness": (
+            finish_attestation_transcript_readiness
+        ),
         "graph_trace_ids": hinted_graph_trace_ids
         or ["<worker-owned-graph-query-trace-id>"],
         "read_receipt_event_id": (
@@ -10413,10 +10464,8 @@ def _runtime_context_worker_guide_response(
             if str(route_identity.get(field) or "").strip()
         },
     }
-    if finish_attestation_hint.get("worker_transcript_path"):
-        finish_attestation_body["worker_transcript_path"] = str(
-            finish_attestation_hint.get("worker_transcript_path") or ""
-        )
+    if hinted_worker_transcript_path:
+        finish_attestation_body["worker_transcript_path"] = hinted_worker_transcript_path
     finish_attestation_missing = [
         field
         for field, value in {
@@ -10427,6 +10476,9 @@ def _runtime_context_worker_guide_response(
             "read_receipt_hash": hinted_read_receipt_hash,
             "worker_session_id": hinted_worker_session_id,
             "filer_principal": hinted_filer_principal,
+            "worker_transcript_ref_or_path": (
+                hinted_worker_transcript_ref or hinted_worker_transcript_path
+            ),
         }.items()
         if not value
     ]
@@ -10483,6 +10535,8 @@ def _runtime_context_worker_guide_response(
                 "read_receipt_event_id",
                 "worker_session_id",
                 "filer_principal",
+                "worker_transcript_ref or worker_transcript_path",
+                "harness_type",
                 "graph_trace_ids",
                 "test_results",
             ],
@@ -10501,6 +10555,13 @@ def _runtime_context_worker_guide_response(
                 "attestation and finish gate pass; only then create the worker "
                 "git commit."
             ),
+            "transcript_identity_before_edit": (
+                "Before implementation edits, ensure startup evidence already "
+                "contains worker_session_id, filer_principal, harness_type, and "
+                "worker_transcript_ref or worker_transcript_path. If not, stop "
+                "before editing instead of discovering the gap at finish-time."
+            ),
+            "transcript_readiness": finish_attestation_transcript_readiness,
             "observer_must_not_author": True,
             "raw_tokens_exposed": False,
             "test_results_source": (
@@ -11067,6 +11128,9 @@ def _runtime_context_worker_guide_response(
     actionable_payloads["finish_time_worker_attestation_body"] = dict(
         finish_attestation_submission["body"]
     )
+    actionable_payloads["finish_time_transcript_readiness"] = dict(
+        finish_attestation_transcript_readiness
+    )
     actionable_payloads["row_scoped_finish_head_projection"] = (
         row_scoped_finish_head_projection
     )
@@ -11137,6 +11201,10 @@ def _runtime_context_worker_guide_response(
             "implementation_evidence_facade_payload_skeleton",
             {},
         ),
+        "finish_time_transcript_readiness": actionable_payloads.get(
+            "finish_time_transcript_readiness",
+            {},
+        ),
         "independent_verification_runtime": qa_verification_guide,
         "role_scope": current_state_response.get("role_scope"),
         "worker_guide": {
@@ -11195,6 +11263,10 @@ def _runtime_context_worker_guide_response(
             ),
             "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
                 "implementation_evidence_facade_payload_skeleton",
+                {},
+            ),
+            "finish_time_transcript_readiness": actionable_payloads.get(
+                "finish_time_transcript_readiness",
                 {},
             ),
             "independent_verification_runtime": qa_verification_guide,

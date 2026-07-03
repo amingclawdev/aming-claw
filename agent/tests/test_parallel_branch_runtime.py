@@ -1344,17 +1344,38 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert implementation_step["owned_files"] == [
         "agent/governance/parallel_branch_runtime.py"
     ]
+    assert (
+        "startup transcript identity available for finish-time attestation"
+        in implementation_step["required_outputs"]
+    )
+    assert "mf_subagent_startup.worker_transcript_ref_or_path" in implementation_step[
+        "pre_edit_required_evidence"
+    ]
     assert implementation_step["evidence_to_file"] == [
         "implementation_evidence",
         "finish_time_worker_attestation",
         "finish_gate",
         "verification_or_test_results",
     ]
+    transcript_step = bridge["steps"][5]
+    assert "worker_session_id and filer_principal from the real worker" in transcript_step[
+        "required_facts"
+    ]
+    assert "worker_transcript_ref or worker_transcript_path" in transcript_step[
+        "required_facts"
+    ]
     assert read_action["worker_next_moves"][0]["id"] == "query_runtime_contract"
     assert read_action["worker_constraints"]["scope"]["owned_files"] == [
         "agent/governance/parallel_branch_runtime.py"
     ]
     assert "merge" in read_action["worker_constraints"]["blocked_actions"]
+    finish_proof_rule = read_action["worker_constraints"][
+        "mf_parallel_happy_path_reminders"
+    ]["worker_rules"]["finish_time_transcript_proof"]
+    assert finish_proof_rule["blocker"] == "pre_edit_worker_transcript_identity_missing"
+    assert "worker_transcript_ref or worker_transcript_path" in finish_proof_rule[
+        "copy_safe_payload_fields"
+    ]
     assert read_action["observer_remediation_actions"][0]["role"] == "observer"
     assert read_action["observer_remediation_actions"][0]["id"] == (
         "request_runtime_context_initial_join_host_envelope"
@@ -1910,8 +1931,20 @@ def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_sta
     assert startup_only_safety["relative_patch_safe"] is False
     assert startup_only_safety["apply_patch_relative_paths_allowed"] is False
     assert {item["code"] for item in startup_only_safety["pre_edit_blockers"]} == {
+        "pre_edit_worker_transcript_identity_missing",
         "pre_implementation_graph_trace_missing"
     }
+    transcript_blocker = next(
+        item
+        for item in startup_only_safety["pre_edit_blockers"]
+        if item["code"] == "pre_edit_worker_transcript_identity_missing"
+    )
+    assert transcript_blocker["missing"] == [
+        "worker_session_id",
+        "worker_transcript_ref_or_path",
+        "harness_type",
+        "filer_principal",
+    ]
 
     verified_projection = build_runtime_context_projection(
         context,
@@ -1926,6 +1959,10 @@ def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_sta
         startup_gate={
             "actual_cwd": "/repo/.worktrees/mf-sub-runtime-context",
             "actual_git_root": "/repo/.worktrees/mf-sub-runtime-context",
+            "worker_session_id": "codex-session-runtime-context",
+            "worker_transcript_ref": "codex:codex-session-runtime-context",
+            "harness_type": "codex",
+            "filer_principal": "codex-session-runtime-context",
         },
         graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
         generated_at=NOW,
@@ -1937,6 +1974,7 @@ def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_sta
     assert verified_safety["status"] == "verified"
     assert verified_safety["relative_patch_safe"] is True
     assert verified_safety["apply_patch_relative_paths_allowed"] is True
+    assert verified_safety["startup_transcript_identity_ready"] is True
     assert verified_safety["pre_edit_blockers"] == []
 
 

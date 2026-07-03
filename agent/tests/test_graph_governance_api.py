@@ -6434,8 +6434,27 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     finish_time_attestation_body = write_guides["finish_time_worker_attestation"][
         "finish_time_worker_attestation_submission"
     ]["body"]
+    finish_time_attestation_submission = write_guides[
+        "finish_time_worker_attestation"
+    ]["finish_time_worker_attestation_submission"]
     assert finish_time_attestation_body["test_results"]["status"] == (
         "<worker-provided passed status>"
+    )
+    assert "worker_transcript_ref_or_path" in finish_time_attestation_submission[
+        "missing_required_fields"
+    ]
+    assert "worker_transcript_ref or worker_transcript_path" in (
+        finish_time_attestation_submission["reminders"]["required_top_level_fields"]
+    )
+    assert finish_time_attestation_submission["reminders"][
+        "transcript_identity_before_edit"
+    ].startswith("Before implementation edits")
+    readiness = worker_guide["finish_time_transcript_readiness"]
+    assert readiness["status"] == "worker_must_supply_before_finish_time_attestation"
+    assert readiness["if_unavailable"].startswith("stop before implementation edits")
+    assert (
+        finish_time_attestation_body["finish_time_transcript_readiness"]
+        == readiness
     )
     assert finish_time_submission["action"] == "record_finish_gate"
     assert finish_time_submission["name"] == "record_finish_gate"

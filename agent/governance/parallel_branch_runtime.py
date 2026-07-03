@@ -5748,6 +5748,17 @@ def runtime_context_mf_parallel_happy_path_reminders(
     values: Mapping[str, Any],
 ) -> dict[str, Any]:
     merge_queue_id = _runtime_context_text(values.get("merge_queue_id"))
+    finish_time_transcript_required_fields = [
+        "worker_session_id",
+        "filer_principal",
+        "worker_transcript_ref or worker_transcript_path",
+        "harness_type",
+        "read_receipt_event_id",
+        "read_receipt_hash",
+        "graph_trace_ids",
+        "changed_files",
+        "test_results",
+    ]
     return {
         "schema_version": "runtime_context.mf_parallel_happy_path_reminders.v1",
         "contract": "mf_parallel",
@@ -5819,6 +5830,10 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "actual_cwd",
                     "actual_git_root",
                     "worktree_path",
+                    "worker_session_id",
+                    "worker_transcript_ref or worker_transcript_path",
+                    "harness_type",
+                    "filer_principal",
                 ],
                 "must_match": {
                     "actual_cwd": "runtime_context.current_values.worktree_path",
@@ -5830,6 +5845,7 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "pre_edit_startup_missing",
                     "actual_cwd_not_assigned_worktree",
                     "actual_git_root_not_assigned_worktree",
+                    "pre_edit_worker_transcript_identity_missing",
                     "pre_implementation_graph_trace_missing",
                 ],
                 "recovery": [
@@ -5842,6 +5858,26 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "Before any implementation edit, verify pwd and git root "
                     "match the assigned runtime worktree; if either points at "
                     "the target/main worktree, stop before editing."
+                ),
+            },
+            "finish_time_transcript_proof": {
+                "required": True,
+                "required_before": [
+                    "implementation_and_tests",
+                    "finish_time_worker_attestation",
+                ],
+                "copy_safe_payload_fields": finish_time_transcript_required_fields,
+                "startup_source_fields": [
+                    "startup_worker_session_id",
+                    "startup_worker_transcript_ref or startup_worker_transcript_path",
+                    "startup_harness_type",
+                    "startup_filer_principal",
+                ],
+                "blocker": "pre_edit_worker_transcript_identity_missing",
+                "message": (
+                    "Do not begin implementation if the startup evidence does "
+                    "not bind a worker_session_id, filer_principal, harness_type, "
+                    "and worker_transcript_ref/path for finish-time attestation."
                 ),
             },
             "finish_time_attestation_recovery": {
@@ -6171,7 +6207,16 @@ def _runtime_context_read_receipt_hash_action(
                 "owned file diff",
                 "focused tests",
                 "git diff --check",
+                "startup transcript identity available for finish-time attestation",
                 "uncommitted worker diff until finish-time attestation and finish gate pass",
+            ],
+            "must_precede": ["finish_time_worker_attestation"],
+            "pre_edit_required_evidence": [
+                "mf_subagent_startup.worker_session_id",
+                "mf_subagent_startup.worker_transcript_ref_or_path",
+                "mf_subagent_startup.harness_type",
+                "mf_subagent_startup.filer_principal",
+                "DB-verified mf_subagent graph traces",
             ],
             "evidence_to_file": [
                 "implementation_evidence",
@@ -6186,6 +6231,9 @@ def _runtime_context_read_receipt_hash_action(
             "required_facts": [
                 "runtime identity",
                 "timeline read receipt",
+                "worker_session_id and filer_principal from the real worker",
+                "worker_transcript_ref or worker_transcript_path",
+                "harness_type",
                 "owned file diff",
                 "DB-verified mf_subagent graph traces",
             ],
@@ -8243,6 +8291,19 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
         values.get("target_project_root") or assigned_worktree
     )
     startup_event_ref = _runtime_context_text(values.get("startup_event_ref"))
+    startup_worker_session_id = _runtime_context_text(
+        values.get("startup_worker_session_id")
+    )
+    startup_worker_transcript_ref = _runtime_context_text(
+        values.get("startup_worker_transcript_ref")
+    )
+    startup_worker_transcript_path = _runtime_context_text(
+        values.get("startup_worker_transcript_path")
+    )
+    startup_harness_type = _runtime_context_text(values.get("startup_harness_type"))
+    startup_filer_principal = _runtime_context_text(
+        values.get("startup_filer_principal")
+    )
     startup_actual_cwd = _runtime_context_text(values.get("startup_actual_cwd"))
     startup_actual_git_root = _runtime_context_text(values.get("startup_actual_git_root"))
     cwd_matches = _runtime_context_path_matches(startup_actual_cwd, assigned_worktree)
@@ -8317,6 +8378,41 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
                     "next_action": "stop_and_relaunch_in_assigned_worktree",
                 }
             )
+    startup_transcript_identity_ready = bool(
+        startup_event_ref
+        and startup_worker_session_id
+        and (startup_worker_transcript_ref or startup_worker_transcript_path)
+        and startup_harness_type
+        and startup_filer_principal
+    )
+    if startup_event_ref and not startup_transcript_identity_ready:
+        missing_transcript_identity = []
+        if not startup_worker_session_id:
+            missing_transcript_identity.append("worker_session_id")
+        if not (startup_worker_transcript_ref or startup_worker_transcript_path):
+            missing_transcript_identity.append("worker_transcript_ref_or_path")
+        if not startup_harness_type:
+            missing_transcript_identity.append("harness_type")
+        if not startup_filer_principal:
+            missing_transcript_identity.append("filer_principal")
+        blockers.append(
+            {
+                "code": "pre_edit_worker_transcript_identity_missing",
+                "message": (
+                    "startup evidence must bind worker transcript identity before "
+                    "implementation edits so finish-time attestation has a "
+                    "copy-safe worker_transcript_ref/path"
+                ),
+                "missing": missing_transcript_identity,
+                "next_action": "record_mf_subagent_startup_with_worker_transcript_identity",
+                "required_fields": [
+                    "worker_session_id",
+                    "filer_principal",
+                    "worker_transcript_ref or worker_transcript_path",
+                    "harness_type",
+                ],
+            }
+        )
     if not verified_graph_trace:
         blockers.append(
             {
@@ -8333,13 +8429,21 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
                 },
             }
         )
-    pre_edit_verified = bool(verified_workdir and verified_graph_trace)
+    pre_edit_verified = bool(
+        verified_workdir and startup_transcript_identity_ready and verified_graph_trace
+    )
     return {
         "schema_version": RUNTIME_CONTEXT_WORKER_EXECUTION_SAFETY_SCHEMA_VERSION,
         "status": "verified" if pre_edit_verified else "pre_edit_blocked",
         "assigned_worktree_path": assigned_worktree,
         "target_project_root": target_project_root,
         "startup_event_ref": startup_event_ref,
+        "startup_worker_session_id": startup_worker_session_id,
+        "startup_worker_transcript_ref": startup_worker_transcript_ref,
+        "startup_worker_transcript_path": startup_worker_transcript_path,
+        "startup_harness_type": startup_harness_type,
+        "startup_filer_principal": startup_filer_principal,
+        "startup_transcript_identity_ready": startup_transcript_identity_ready,
         "startup_actual_cwd": startup_actual_cwd,
         "startup_actual_git_root": startup_actual_git_root,
         "actual_cwd_matches_assigned_worktree": cwd_matches,
@@ -8358,6 +8462,10 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
             "mf_subagent_startup.actual_cwd",
             "mf_subagent_startup.actual_git_root",
             "mf_subagent_startup.worktree_path",
+            "mf_subagent_startup.worker_session_id",
+            "mf_subagent_startup.worker_transcript_ref_or_path",
+            "mf_subagent_startup.harness_type",
+            "mf_subagent_startup.filer_principal",
             "graph_query_trace.trace_ids",
         ],
         "pre_edit_blockers": blockers,
@@ -8371,6 +8479,16 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
             {
                 "id": "record_startup_before_edit",
                 "action": "record_mf_subagent_startup",
+            },
+            {
+                "id": "record_startup_transcript_identity_before_edit",
+                "action": "record_mf_subagent_startup_with_worker_transcript_identity",
+                "required_fields": [
+                    "worker_session_id",
+                    "filer_principal",
+                    "worker_transcript_ref or worker_transcript_path",
+                    "harness_type",
+                ],
             },
             {
                 "id": "run_worker_graph_query_before_edit",
