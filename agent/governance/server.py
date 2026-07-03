@@ -15130,13 +15130,53 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
             action="graph-governance.runtime-context.startup",
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
+        parent_task_id = (
+            str(body.get("parent_task_id") or "").strip()
+            or _runtime_context_mf_sub_parent_task_id(context)
+        )
+        explicit_graph_trace_ids = _runtime_context_service_dedupe(
+            [
+                trace_id
+                for trace_id in (
+                    _runtime_context_service_query_values(
+                        body,
+                        "graph_trace_ids",
+                        "graph_query_trace_ids",
+                        "trace_ids",
+                        "graph_trace_id",
+                        "graph_query_trace_id",
+                    )
+                    + _runtime_context_service_query_values(
+                        body.get("graph_trace_evidence")
+                        if isinstance(body.get("graph_trace_evidence"), Mapping)
+                        else {},
+                        "graph_trace_ids",
+                        "graph_query_trace_ids",
+                        "trace_ids",
+                        "graph_trace_id",
+                        "graph_query_trace_id",
+                    )
+                )
+                if not str(trace_id or "").strip().startswith("<")
+            ]
+        )
+        graph_trace_refs = (
+            {}
+            if explicit_graph_trace_ids
+            else _runtime_context_service_graph_trace_refs(
+                conn,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=context.task_id,
+                parent_task_id=parent_task_id,
+                backlog_id=context.backlog_id,
+                fence_token=_runtime_context_request_value(ctx, "fence_token"),
+                explicit_trace_ids=[],
+            )
+        )
     finally:
         conn.close()
 
-    parent_task_id = (
-        str(body.get("parent_task_id") or "").strip()
-        or _runtime_context_mf_sub_parent_task_id(context)
-    )
     target_project_root = _runtime_context_effective_target_project_root(context)
     startup_body = {
         **body,
@@ -15172,6 +15212,17 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
     ):
         if route_identity.get(key):
             startup_body.setdefault(key, route_identity.get(key))
+    verified_graph_trace_ids = list(
+        graph_trace_refs.get("verified_trace_ids")
+        or graph_trace_refs.get("trace_ids")
+        or []
+    )
+    if graph_trace_refs.get("db_verified") and verified_graph_trace_ids:
+        startup_body.setdefault("graph_trace_ids", verified_graph_trace_ids)
+        startup_body.setdefault(
+            "graph_trace_evidence",
+            _runtime_context_service_redact_graph_trace_refs(graph_trace_refs),
+        )
     result = handle_graph_governance_parallel_branch_startup(
         _runtime_context_forward_request(ctx, body=startup_body)
     )

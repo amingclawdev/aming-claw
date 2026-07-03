@@ -6688,7 +6688,6 @@ def test_runtime_context_write_facade_accepts_runtime_session_token_without_gov_
         "worker_session_id": "worker-session-facade",
         "worker_transcript_path": str(transcript_path),
         "harness_type": "codex",
-        "graph_trace_ids": [graph_trace_id],
     }
 
     with pytest.raises(GovernanceError) as wrong_root:
@@ -6722,8 +6721,19 @@ def test_runtime_context_write_facade_accepts_runtime_session_token_without_gov_
     assert startup["action"] == "startup"
     assert startup["timeline_event"]["event_kind"] == "mf_subagent_startup"
     assert startup["gate"]["actual_startup_recorded"] is True
+    assert startup["gate"]["close_satisfying"] is True
     assert startup["gate"]["session_token_evidence_type"] == "server_verified"
     assert startup["context"]["status"] == "running"
+    stored_startup = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (startup["timeline_event"]["id"],),
+    ).fetchone()
+    stored_startup_payload = json.loads(stored_startup["payload_json"])
+    full_startup_gate = stored_startup_payload["mf_subagent_startup_gate"]
+    assert full_startup_gate["graph_trace_db_evidence"]["db_verified"] is True
+    assert full_startup_gate["graph_trace_db_evidence"]["trace_ids"] == [
+        graph_trace_id
+    ]
     response_json = json.dumps(startup, sort_keys=True)
     assert "runtime-session-facade-token" not in response_json
     assert "fence-session-facade" not in response_json
