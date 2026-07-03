@@ -4475,6 +4475,7 @@ def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
                 "fence_token": "fence-runtime-text-append-child",
                 "session_token": session_token,
                 "target_project_root": str(worktree),
+                "actor": "codex-mf-sub-observer-intervention-amendment",
                 "changed_files": ["agent/governance/server.py"],
                 "tests": [{"command": "pytest -q", "status": "passed"}],
                 "payload": {
@@ -4491,10 +4492,13 @@ def test_observer_runtime_text_prepare_mints_append_scoped_worker_route_ref(
     assert response["route_token_gate"]["decision"] == "route_token_ref_resolved"
     assert response["route_token_gate"]["route_token_ref"] == child_ref
     stored = conn.execute(
-        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        "SELECT actor, payload_json FROM task_timeline_events WHERE id = ?",
         (response["timeline_event"]["id"],),
     ).fetchone()
+    assert stored["actor"] == "mf_sub"
     payload = json.loads(stored["payload_json"])
+    assert payload["submitted_actor"] == "codex-mf-sub-observer-intervention-amendment"
+    assert payload["actor_session_principal"]
     assert payload["route_token_ref"] == child_ref
     assert payload["parent_route_lineage"]["route_token_ref"] == (
         parent_issue["route_token_ref"]
@@ -19572,13 +19576,13 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     receipt_body["session_token"] = ""
     receipt_body["session_token_ref"] = session_ref
     receipt_body["fence_token"] = "fence-session-ref"
+    receipt_body["actor"] = "codex-mf-sub-observer-intervention-amendment"
     receipt_body["read_receipt_hash"] = "sha256:session-ref-receipt"
     receipt_body["launch_text_hash"] = "sha256:session-ref-launch"
 
     receipt_response = server.handle_graph_governance_runtime_context_read_receipt(
-        _ctx_with_role(
+        _ctx(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
-            "mf_sub",
             method="POST",
             body=receipt_body,
         )
@@ -19591,7 +19595,12 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         event_kind="mf_subagent_read_receipt",
     )
     assert len(read_events) == 1
+    assert read_events[0]["actor"] == "mf_sub"
     assert read_events[0]["payload"]["session_token_ref"] == session_ref
+    assert read_events[0]["payload"]["submitted_actor"] == (
+        "codex-mf-sub-observer-intervention-amendment"
+    )
+    assert read_events[0]["payload"]["actor_session_principal"] == "slot-session-ref"
 
     initial_join_body = dict(initial_join_submission["copy_safe_body"])
     initial_join_body["reason"] = "host envelope required before startup retry"

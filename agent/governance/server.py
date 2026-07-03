@@ -15657,6 +15657,7 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         return value
 
     payload = _scrub_receipt_payload(payload)
+    submitted_actor = str(body.get("actor") or "").strip()
     for key, value in {
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
@@ -15675,6 +15676,8 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "actor_session_principal": context.worker_slot_id or context.worker_id,
+        "submitted_actor": submitted_actor,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
         "target_project_root": target_project_root,
@@ -15704,12 +15707,7 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "event_type": body.get("event_type") or "mf_subagent_read_receipt",
         "event_kind": body.get("event_kind") or "mf_subagent_read_receipt",
         "phase": body.get("phase") or "startup_read_receipt",
-        "actor": (
-            body.get("actor")
-            or context.worker_slot_id
-            or context.worker_id
-            or "mf_sub"
-        ),
+        "actor": "mf_sub",
         "status": body.get("status") or "ok",
         "payload": payload,
         "verification": body.get("verification") or {},
@@ -16634,6 +16632,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
     raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
     raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    submitted_actor = str(body.get("actor") or "").strip()
     fence_token_hash = _runtime_context_implementation_fence_hash(
         ctx,
         context=context,
@@ -16681,6 +16680,8 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "actor_session_principal": context.worker_slot_id or context.worker_id,
+        "submitted_actor": submitted_actor,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
         "target_project_root": context.target_project_root,
@@ -16727,12 +16728,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "event_type": body.get("event_type") or "mf.implementation",
         "event_kind": event_kind,
         "phase": body.get("phase") or "implementation",
-        "actor": (
-            body.get("actor")
-            or context.worker_slot_id
-            or context.worker_id
-            or "mf_sub"
-        ),
+        "actor": "mf_sub",
         "status": body.get("status") or "passed",
         "payload": payload,
         "verification": body.get("verification") or {},
