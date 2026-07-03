@@ -19508,10 +19508,28 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert rejoin_submission["security_boundary"][
         "session_token_ref_alone_authorizes_writes"
     ] is False
+    assert rejoin_submission["copy_safe_body"]["agent_id"] == "agent-session-ref"
+    assert rejoin_submission["copy_safe_body"]["allocation_owner"] == (
+        "agent-session-ref"
+    )
+    initial_join_submission = worker_guide["actionable_payloads"][
+        "session_token_initial_join_submission"
+    ]
+    assert initial_join_submission["copy_safe_body"]["agent_id"] == "agent-session-ref"
+    assert initial_join_submission["copy_safe_body"]["allocation_owner"] == (
+        "agent-session-ref"
+    )
+    assert initial_join_submission["copy_safe_body"]["route_id"] == "route-session-ref"
     startup_skeleton = worker_guide["startup_facade_payload_skeleton"]
     assert startup_skeleton["body_source"] == "copy_safe_body"
     startup_copy = startup_skeleton["copy_safe_body"]
     assert startup_copy["agent_id"] == "agent-session-ref"
+    assert startup_copy["allocation_owner"] == "agent-session-ref"
+    assert startup_copy["observer_allocation_owner"] == "agent-session-ref"
+    assert startup_copy["worker_identity_pointers"]["agent_id"] == "agent-session-ref"
+    assert startup_copy["worker_identity_pointers"]["allocation_owner"] == (
+        "agent-session-ref"
+    )
     assert startup_copy["branch"] == "refs/heads/codex/worker-session-ref"
     assert startup_copy["branch_ref"] == "refs/heads/codex/worker-session-ref"
     assert startup_copy["base_commit"] == "base-session-ref"
@@ -19556,18 +19574,33 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert len(read_events) == 1
     assert read_events[0]["payload"]["session_token_ref"] == session_ref
 
+    initial_join_body = dict(initial_join_submission["copy_safe_body"])
+    initial_join_body["reason"] = "host envelope required before startup retry"
+    initial_join = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body=initial_join_body,
+        )
+    )
+    assert initial_join["ok"] is True
+    assert initial_join["status"] == "session_token_initial_join_issued"
+    host_envelope = initial_join["host_envelope"]
+    assert host_envelope["session_token_ref"] == initial_join["session_token_ref"]
+
     startup_body = dict(worker_guide["startup_facade_payload_skeleton"]["body"])
     startup_body.update(
         {
-            "session_token": "",
-            "session_token_ref": session_ref,
+            "session_token": initial_join["session_token"],
+            "session_token_ref": initial_join["session_token_ref"],
             "fence_token": "fence-session-ref",
             "agent_id": "agent-session-ref",
-            "actual_host_worker_id": "agent-session-ref",
-            "worker_session_id": "agent-session-ref",
-            "worker_transcript_ref": "multi_agent:agent-session-ref",
+            "actual_host_worker_id": host_envelope["principal_id"],
+            "worker_session_id": host_envelope["principal_id"],
+            "worker_transcript_ref": f"multi_agent:{host_envelope['principal_id']}",
             "harness_type": "codex",
-            "filer_principal": "agent-session-ref",
+            "filer_principal": host_envelope["principal_id"],
             "observer_command_id": "cmd-session-ref",
             "actual_cwd": str(target_root),
             "actual_git_root": str(target_root),
@@ -19592,7 +19625,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     )
     assert startup_response["ok"] is True
     startup_gate = startup_response["gate"]
-    assert startup_gate["session_token_evidence_type"] == "server_verified_ref"
+    assert startup_gate["session_token_evidence_type"] == "server_verified"
     assert startup_gate["server_issued_session_token_verified"] is True
 
     graph_body = {
@@ -19605,7 +19638,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "parent_task_id": "parent-session-ref",
         "worker_role": "mf_sub",
         "fence_token": "fence-session-ref",
-        "session_token_ref": session_ref,
+        "session_token_ref": initial_join["session_token_ref"],
         "target_project_root": str(target_root),
         **route_identity,
     }
@@ -19622,7 +19655,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     )
     assert session["role"] == "mf_sub"
     assert graph_body["task_id"] == "worker-session-ref"
-    assert graph_body["session_token_ref"] == session_ref
+    assert graph_body["session_token_ref"] == initial_join["session_token_ref"]
 
 
 def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(

@@ -6200,6 +6200,105 @@ def test_mf_sub_startup_rejects_agent_only_registered_identity_echoed_as_host_st
     assert refusal["registered_host_adapter_spawn_present"] is False
 
 
+def test_mf_sub_startup_refusal_points_session_ref_workers_to_initial_join(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-session-ref-join"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup-session-ref-join",
+        root_task_id="parent-startup-session-ref-join",
+        stage_task_id="mf-sub-startup-session-ref-join",
+        backlog_id="BUG-STARTUP-SESSION-REF-JOIN",
+        worker_id="worker-startup-session-ref-join",
+        worker_slot_id="slot-startup-session-ref-join",
+        agent_id="agent-startup-session-ref-join",
+        allocation_owner="agent-startup-session-ref-join",
+        branch_ref="refs/heads/codex/mf-sub-startup-session-ref-join",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup-session-ref-join",
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup-session-ref-join",
+        merge_queue_id="mq-startup-session-ref-join",
+        session_token_hash=mf_subagent_session_token_hash(
+            "raw-startup-session-ref-join"
+        ),
+    )
+    context = upsert_branch_context(conn, context, now_iso=NOW)
+    route_identity = {
+        "route_id": "route-startup-session-ref-join",
+        "route_context_hash": "sha256:route-startup-session-ref-join",
+        "prompt_contract_id": "rprompt-startup-session-ref-join",
+        "prompt_contract_hash": "sha256:prompt-startup-session-ref-join",
+        "route_token_ref": "rtok-startup-session-ref-join",
+        "visible_injection_manifest_hash": "sha256:visible-startup-session-ref-join",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup-session-ref-join",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "parent_task_id": "parent-startup-session-ref-join",
+            "worker_role": "mf_sub",
+            "fence_token": "fence-startup-session-ref-join",
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "actual_cwd": str(worktree),
+            "actual_git_root": str(worktree),
+            "branch": "refs/heads/codex/mf-sub-startup-session-ref-join",
+            "head_commit": head_commit,
+            "base_commit": base_commit,
+            "target_head_commit": "target-startup-session-ref-join",
+            "merge_queue_id": "mq-startup-session-ref-join",
+            "governance_project_id": PROJECT_ID,
+            "target_project_id": PROJECT_ID,
+            "owned_files": ["agent/governance/server.py"],
+            "observer_command_id": "cmd-startup-session-ref-join",
+            "read_receipt_hash": "sha256:read-startup-session-ref-join",
+            "read_receipt_event_id": "read-startup-session-ref-join",
+            **route_identity,
+        },
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "no_truthful_bounded_mf_sub_startup_surface_available"
+    assert "actual_host_worker_id" in result["missing_required_fields"]
+    next_action = result["next_action"]
+    assert next_action["action"] == "request_runtime_context_initial_join_host_envelope"
+    join_before_startup = next_action["join_before_parallel_branch_startup"]
+    assert join_before_startup["copy_safe_body"]["agent_id"] == (
+        "agent-startup-session-ref-join"
+    )
+    assert join_before_startup["copy_safe_body"]["allocation_owner"] == (
+        "agent-startup-session-ref-join"
+    )
+    assert join_before_startup["copy_safe_body"]["route_token_ref"] == (
+        "rtok-startup-session-ref-join"
+    )
+    assert join_before_startup["security_boundary"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    retry_payload = join_before_startup["then"]["copyable_retry_payload"]
+    assert retry_payload["append_tool"] == "parallel_branch_startup"
+    assert retry_payload["actual_host_worker_id"] == (
+        "<fill actual_host_worker_id>"
+    )
+
+
 def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(tmp_path) -> None:
     conn = _runtime_conn()
     target_root = tmp_path / "target-project"
