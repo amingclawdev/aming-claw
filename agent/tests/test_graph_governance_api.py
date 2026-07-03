@@ -24597,6 +24597,54 @@ def _rewrite_completed_line_actor_roles(
     )
 
 
+def _mf_parallel_close_authority_chain_projection(contract_execution_id: str) -> dict:
+    return {
+        "projection_source": "backlog_contract_chain_current",
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+        "active_chain": {"execution_ids": [contract_execution_id]},
+    }
+
+
+def _mf_parallel_close_authority_line(
+    line_id: str,
+    evidence_kind: str,
+    actor_role: str,
+    *,
+    source_ref: str = "",
+    commit_sha: str = "",
+    payload: dict | None = None,
+) -> dict:
+    return {
+        "stage_id": line_id.rsplit("_", 1)[0],
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "actor_role": actor_role,
+        "status": "passed",
+        "commit_sha": commit_sha,
+        "payload": dict(payload or {}),
+        "_source_ref": source_ref,
+    }
+
+
+def _mf_parallel_close_authority_record(
+    contract_execution_id: str,
+    lines: list[dict],
+) -> list[dict]:
+    return [
+        {
+            "contract_execution_id": contract_execution_id,
+            "contract_id": server.MF_PARALLEL_RECORD_CONTRACT_ID,
+            "project_id": PID,
+            "backlog_id": "AC-MF-PARALLEL-CLOSE-AUTHORITY-ORDERING",
+            "completed_lines": lines,
+            "runtime_guide": {
+                "completed_lines": lines,
+                "next_legal_action": None,
+            },
+        }
+    ]
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -24686,6 +24734,154 @@ def test_timeline_gate_authoritatively_accepts_completed_mf_parallel_runtime_cha
     assert full["timeline_gate"]["checks"][
         "contract_runtime_mf_parallel_close_authority"
     ] is True
+
+
+def test_mf_parallel_close_authority_prefers_source_event_order_over_projection_index():
+    contract_execution_id = "cex-mf-parallel-source-order-pass"
+    close_commit = "ab49e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "cd5d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    lines = [
+        _mf_parallel_close_authority_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            source_ref="timeline:100",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            source_ref="timeline:101",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            source_ref="timeline:103",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_reconcile",
+            "reconcile",
+            "observer",
+            source_ref="timeline:104",
+            commit_sha=close_commit,
+            payload={"target_commit_sha": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_close_ready",
+            "close_ready",
+            "observer",
+            source_ref="timeline:105",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "qa_independent_verification",
+            "independent_verification",
+            "qa",
+            source_ref="timeline:102",
+            commit_sha=worker_commit,
+            payload={"verified_commit": worker_commit},
+        ),
+    ]
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        _mf_parallel_close_authority_record(contract_execution_id, lines),
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            contract_execution_id
+        ),
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is True
+    assert "contract_runtime.merge_after_qa" not in gate["missing_requirement_ids"]
+    merge_after_qa = {
+        item["requirement_id"]: item for item in gate["ordering_diagnostics"]
+    }["contract_runtime.merge_after_qa"]
+    assert merge_after_qa["ordering_source"] == "source_event_id"
+    assert merge_after_qa["before_completed_line_index"] > (
+        merge_after_qa["after_completed_line_index"]
+    )
+    assert merge_after_qa["before_source_event_id"] == 102
+    assert merge_after_qa["after_source_event_id"] == 103
+
+
+def test_mf_parallel_close_authority_rejects_source_merge_before_qa_even_when_index_passes():
+    contract_execution_id = "cex-mf-parallel-source-order-fail"
+    close_commit = "bb49e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "dd5d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    lines = [
+        _mf_parallel_close_authority_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            source_ref="timeline:200",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            source_ref="timeline:201",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "qa_independent_verification",
+            "independent_verification",
+            "qa",
+            source_ref="timeline:203",
+            commit_sha=worker_commit,
+            payload={"verified_commit": worker_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            source_ref="timeline:202",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_reconcile",
+            "reconcile",
+            "observer",
+            source_ref="timeline:204",
+            commit_sha=close_commit,
+            payload={"target_commit_sha": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_close_ready",
+            "close_ready",
+            "observer",
+            source_ref="timeline:205",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+    ]
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        _mf_parallel_close_authority_record(contract_execution_id, lines),
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            contract_execution_id
+        ),
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is False
+    assert "contract_runtime.merge_after_qa" in gate["missing_requirement_ids"]
+    merge_after_qa = {
+        item["requirement_id"]: item for item in gate["ordering_diagnostics"]
+    }["contract_runtime.merge_after_qa"]
+    assert merge_after_qa["ordering_source"] == "source_event_id"
+    assert merge_after_qa["before_completed_line_index"] < (
+        merge_after_qa["after_completed_line_index"]
+    )
+    assert merge_after_qa["before_source_event_id"] == 203
+    assert merge_after_qa["after_source_event_id"] == 202
 
 
 def test_timeline_gate_mf_parallel_authority_rejects_observer_replacing_worker_or_qa(

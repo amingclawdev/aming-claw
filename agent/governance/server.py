@@ -49582,6 +49582,155 @@ def _contract_runtime_close_authority_explicit_commit(
     return ""
 
 
+_MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER = {
+    "worker_implementation": 10,
+    "worker_finish_gate": 20,
+    "qa_independent_verification": 30,
+    "observer_merge": 40,
+    "observer_reconcile": 50,
+    "observer_close_ready": 60,
+}
+
+
+def _contract_runtime_close_authority_source_event_id(
+    line: Mapping[str, Any],
+) -> int:
+    candidates: list[Any] = [
+        line.get("source_event_id"),
+        line.get("_source_event_id"),
+    ]
+    source_ref = str(line.get("_source_ref") or "").strip()
+    match = re.fullmatch(r"timeline:(\d+)", source_ref)
+    if match:
+        candidates.append(match.group(1))
+    for key in ("payload", "verification", "artifact_refs"):
+        value = line.get(key)
+        if isinstance(value, Mapping):
+            candidates.extend((
+                value.get("source_event_id"),
+                value.get("timeline_event_id"),
+                value.get("event_id"),
+            ))
+    for candidate in candidates:
+        try:
+            event_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if event_id > 0:
+            return event_id
+    return 0
+
+
+def _contract_runtime_close_authority_source_event_time(
+    line: Mapping[str, Any],
+) -> str:
+    containers: list[Mapping[str, Any]] = [line]
+    for key in ("payload", "verification", "artifact_refs"):
+        value = line.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    for container in containers:
+        for key in (
+            "source_event_time",
+            "source_event_at",
+            "event_time",
+            "event_created_at",
+            "created_at",
+            "updated_at",
+            "recorded_at",
+            "completed_at",
+        ):
+            text = str(container.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _contract_runtime_close_authority_time_order_value(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _contract_runtime_mf_parallel_ordering_diagnostic(
+    *,
+    before: str,
+    after: str,
+    missing_id: str,
+    before_line: Mapping[str, Any],
+    after_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    before_source_id = _contract_runtime_close_authority_source_event_id(before_line)
+    after_source_id = _contract_runtime_close_authority_source_event_id(after_line)
+    before_source_time = _contract_runtime_close_authority_source_event_time(before_line)
+    after_source_time = _contract_runtime_close_authority_source_event_time(after_line)
+    before_time_order = _contract_runtime_close_authority_time_order_value(
+        before_source_time
+    )
+    after_time_order = _contract_runtime_close_authority_time_order_value(
+        after_source_time
+    )
+    before_index = int(before_line.get("_completed_line_index", -1) or -1)
+    after_index = int(after_line.get("_completed_line_index", -1) or -1)
+    before_semantic = _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER.get(before, -1)
+    after_semantic = _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER.get(after, -1)
+
+    source = "completed_line_index_fallback"
+    before_order: int | float = before_index
+    after_order: int | float = after_index
+    if (
+        before_source_id > 0
+        and after_source_id > 0
+        and before_source_id != after_source_id
+    ):
+        source = "source_event_id"
+        before_order = before_source_id
+        after_order = after_source_id
+    elif (
+        before_time_order is not None
+        and after_time_order is not None
+        and before_time_order != after_time_order
+    ):
+        source = "source_event_time"
+        before_order = before_time_order
+        after_order = after_time_order
+    elif (
+        before_semantic >= 0
+        and after_semantic >= 0
+        and before_semantic != after_semantic
+    ):
+        source = "semantic_contract_line_order"
+        before_order = before_semantic
+        after_order = after_semantic
+
+    passed = after_order > before_order
+    return {
+        "requirement_id": missing_id,
+        "before": before,
+        "after": after,
+        "passed": passed,
+        "ordering_source": source,
+        "before_order": before_order,
+        "after_order": after_order,
+        "before_completed_line_index": before_index,
+        "after_completed_line_index": after_index,
+        "before_source_ref": str(before_line.get("_source_ref") or ""),
+        "after_source_ref": str(after_line.get("_source_ref") or ""),
+        "before_source_event_id": before_source_id,
+        "after_source_event_id": after_source_id,
+        "before_source_event_time": before_source_time,
+        "after_source_event_time": after_source_time,
+    }
+
+
 def _contract_runtime_mf_parallel_close_authority_gate(
     records: list[dict[str, Any]],
     *,
@@ -49709,14 +49858,21 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "contract_runtime.close_ready_after_reconcile",
         ),
     ]
+    ordering_diagnostics: list[dict[str, Any]] = []
     for before, after, missing_id in ordering_pairs:
         before_line = found.get(before)
         after_line = found.get(after)
         if not before_line or not after_line:
             continue
-        before_index = int(before_line.get("_completed_line_index", -1) or -1)
-        after_index = int(after_line.get("_completed_line_index", -1) or -1)
-        if after_index <= before_index:
+        ordering = _contract_runtime_mf_parallel_ordering_diagnostic(
+            before=before,
+            after=after,
+            missing_id=missing_id,
+            before_line=before_line,
+            after_line=after_line,
+        )
+        ordering_diagnostics.append(ordering)
+        if not bool(ordering.get("passed")):
             missing.append(missing_id)
 
     commit_mismatches: list[dict[str, Any]] = []
@@ -49776,6 +49932,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             requirement_id: str(line.get("_source_ref") or "")
             for requirement_id, line in found.items()
         },
+        "ordering_diagnostics": ordering_diagnostics,
         "rejected_evidence_by_requirement": {
             key: value for key, value in rejected_by_requirement.items() if value
         },
