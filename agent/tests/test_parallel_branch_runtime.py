@@ -1882,7 +1882,35 @@ def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_sta
     assert safety["relative_patch_safe"] is False
     assert safety["apply_patch_relative_paths_allowed"] is False
     assert {item["code"] for item in safety["pre_edit_blockers"]} == {
-        "pre_edit_startup_missing"
+        "pre_edit_startup_missing",
+        "pre_implementation_graph_trace_missing",
+    }
+
+    startup_only_projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        timeline_refs={"startup_event_ref": "timeline:startup"},
+        startup_gate={
+            "actual_cwd": "/repo/.worktrees/mf-sub-runtime-context",
+            "actual_git_root": "/repo/.worktrees/mf-sub-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    startup_only_safety = startup_only_projection["views"]["worker_view"][
+        "worker_execution_safety"
+    ]
+    assert startup_only_safety["status"] == "pre_edit_blocked"
+    assert startup_only_safety["relative_patch_safe"] is False
+    assert startup_only_safety["apply_patch_relative_paths_allowed"] is False
+    assert {item["code"] for item in startup_only_safety["pre_edit_blockers"]} == {
+        "pre_implementation_graph_trace_missing"
     }
 
     verified_projection = build_runtime_context_projection(
@@ -1899,6 +1927,7 @@ def test_runtime_context_worker_execution_safety_blocks_relative_patch_until_sta
             "actual_cwd": "/repo/.worktrees/mf-sub-runtime-context",
             "actual_git_root": "/repo/.worktrees/mf-sub-runtime-context",
         },
+        graph_trace_refs={"trace_ids": ["gqt-runtime-context"]},
         generated_at=NOW,
     ).to_dict()
 

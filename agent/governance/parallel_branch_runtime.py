@@ -7919,6 +7919,18 @@ def build_runtime_context_timeline_gate_projection(
     }
 
 
+def _runtime_context_strip_closeability_claims(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _runtime_context_strip_closeability_claims(item)
+            for key, item in value.items()
+            if str(key) not in {"can_close", "closeable"}
+        }
+    if isinstance(value, list):
+        return [_runtime_context_strip_closeability_claims(item) for item in value]
+    return copy.deepcopy(value)
+
+
 def build_runtime_context_gate_projection_view(
     *,
     gate_inputs_view: Mapping[str, Any],
@@ -8078,7 +8090,9 @@ def build_runtime_context_gate_projection_view(
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
-        "worker_handoff_projection": copy.deepcopy(worker_handoff_projection),
+        "worker_handoff_projection": _runtime_context_strip_closeability_claims(
+            worker_handoff_projection
+        ),
         "audit_archive_action": sanitized_audit_archive_action,
         "close_precheck_gap_projection": copy.deepcopy(
             dict(action_plan.get("close_precheck_gap_projection") or {})
