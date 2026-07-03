@@ -36805,6 +36805,11 @@ def test_mf_parallel_enter_accepts_verified_observer_route_ref(conn):
 def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
     backlog_id = "AC-MF-PARALLEL-ONBOARD-SERVICE-WAIVER"
     _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET test_files = ? WHERE bug_id = ?",
+        (json.dumps(["agent/tests/test_graph_governance_api.py"]), backlog_id),
+    )
+    conn.commit()
     observer_session_id = _insert_active_observer_session_ref(
         conn,
         session_id="obs-mf-parallel-onboard-service",
@@ -36844,6 +36849,14 @@ def test_mf_parallel_enter_accepts_onboard_service_waiver_parent(conn):
     assert result["ok"] is True
     assert result["parent_contract_execution_id"] == service_parent
     assert result["root_contract_execution_id"] == service_parent
+    assert result["event"]["payload"]["owned_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    assert result["event"]["payload"]["target_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
     assert result["event"]["payload"]["legacy_onboard_contract_waived"] is True
     assert result["next_legal_action"]["id"] == "observer_prefill_child_contracts"
     child_ref = result["route_token_ref"]
@@ -37115,6 +37128,14 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert [item["backlog_id"] for item in result["merge_queue_plan"]["planned_items"]] == [
         child_b,
         child_a,
+    ]
+    assert result["merge_queue_plan"]["planned_items"][0]["owned_files"] == [
+        "agent/governance/parallel_branch_runtime.py",
+        "agent/tests/test_parallel_branch_read_model.py",
+    ]
+    assert result["merge_queue_plan"]["planned_items"][1]["owned_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
     ]
     persisted_items = list_merge_queue_items(
         conn,

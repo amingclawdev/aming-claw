@@ -1205,6 +1205,9 @@ def plan_mf_batch_parallel_preflight(
             dict.fromkeys([*strict_predecessors, *overlap_predecessors])
         )
         queue_item_id = _stable_plan_id("mqitem", project_id, merge_queue_id, task_id, row_id)
+        owned_scope_files = list(
+            dict.fromkeys([*row["target_files"], *row["test_files"]])
+        )
         planned_items.append(
             {
                 "schema_version": "mf_batch_parallel.planned_merge_queue_item.v1",
@@ -1214,7 +1217,8 @@ def plan_mf_batch_parallel_preflight(
                 "queue_index": index + 1,
                 "backlog_id": row_id,
                 "task_id": task_id,
-                "owned_files": list(row["target_files"]),
+                "owned_files": owned_scope_files,
+                "test_files": list(row["test_files"]),
                 "target_ref": target_ref,
                 "status": "planned",
                 "durable_status_after_worker_finish": STATE_QUEUED_FOR_MERGE,

@@ -59008,20 +59008,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             "mf_parallel entry requires worker_fence, owned_files, or target_files"
         )
     metadata = body.get("metadata") if isinstance(body.get("metadata"), Mapping) else {}
-    metadata = {
-        **dict(metadata),
-        "owned_files": list(owned_files),
-        "target_files": list(target_files),
-        "worker_fence": dict(worker_fence),
-    }
     onboard_service_waiver = _onboard_service_waiver_requested(body, metadata)
-    if onboard_service_waiver:
-        metadata = {
-            **metadata,
-            "entrypoint": "onboard_service_waiver",
-            "legacy_onboard_contract_waived": True,
-            "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
-        }
 
     from . import task_timeline
     from .mf_subagent_contract import validate_meta_contract_timeline_event
@@ -59092,6 +59079,42 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "next_legal_action": current_state.get("next_legal_action") or {},
                 },
             )
+        row = conn.execute(
+            "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+        row_target_files = _string_list_field(_row_get(row, "target_files", ""))
+        row_test_files = _string_list_field(_row_get(row, "test_files", ""))
+        owned_scope_files = _runtime_context_public_file_values(
+            [
+                *(owned_files or target_files or row_target_files),
+                *row_test_files,
+            ]
+        )
+        target_scope_files = _runtime_context_public_file_values(
+            [
+                *(target_files or owned_files or row_target_files),
+                *row_test_files,
+            ]
+        )
+        if owned_scope_files:
+            owned_files = owned_scope_files
+        if target_scope_files:
+            target_files = target_scope_files
+        metadata = {
+            **dict(metadata),
+            "owned_files": list(owned_files),
+            "target_files": list(target_files),
+            "test_files": list(row_test_files),
+            "worker_fence": dict(worker_fence),
+        }
+        if onboard_service_waiver:
+            metadata = {
+                **metadata,
+                "entrypoint": "onboard_service_waiver",
+                "legacy_onboard_contract_waived": True,
+                "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+            }
         successor_runtime = _mf_parallel_successor_runtime_enter(
             conn,
             project_id=project_id,
