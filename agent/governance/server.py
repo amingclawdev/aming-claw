@@ -50836,6 +50836,14 @@ def _contract_runtime_authoritative_close_verification(
     verification: Mapping[str, Any],
     runtime_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
+    parentless_direct_gate = (
+        runtime_projection.get("parentless_direct_main_close_authority_gate")
+        if isinstance(
+            runtime_projection.get("parentless_direct_main_close_authority_gate"),
+            Mapping,
+        )
+        else {}
+    )
     direct_fix_gate = (
         runtime_projection.get("direct_fix_close_authority_gate")
         if isinstance(runtime_projection.get("direct_fix_close_authority_gate"), Mapping)
@@ -50846,11 +50854,20 @@ def _contract_runtime_authoritative_close_verification(
         if isinstance(runtime_projection.get("mf_parallel_close_authority_gate"), Mapping)
         else {}
     )
-    authority_gate = direct_fix_gate if bool(direct_fix_gate.get("passed")) else mf_parallel_gate
+    authority_gate = (
+        parentless_direct_gate
+        if bool(parentless_direct_gate.get("passed"))
+        else direct_fix_gate
+        if bool(direct_fix_gate.get("passed"))
+        else mf_parallel_gate
+    )
     if not bool(authority_gate.get("passed")):
         failed_authority_kind = ""
         failed_authority_gate: Mapping[str, Any] = {}
-        if direct_fix_gate:
+        if parentless_direct_gate:
+            failed_authority_kind = "parentless_direct_main"
+            failed_authority_gate = parentless_direct_gate
+        elif direct_fix_gate:
             failed_authority_kind = "direct_fix"
             failed_authority_gate = direct_fix_gate
         elif mf_parallel_gate:
@@ -50876,7 +50893,10 @@ def _contract_runtime_authoritative_close_verification(
             groups = dict(groups_root.get("groups") or {})
             group_key = f"contract_runtime_{failed_authority_kind}_close_authority"
             next_action = (
-                "complete direct_fix repair, independent QA, return-to-parent, "
+                "complete parentless operator-supervised direct-main exception, "
+                "implementation, verification, close-ready, redeploy, and reconcile evidence"
+                if failed_authority_kind == "parentless_direct_main"
+                else "complete direct_fix repair, independent QA, return-to-parent, "
                 "and parent acknowledgement evidence in ContractRuntime"
                 if failed_authority_kind == "direct_fix"
                 else (
@@ -50886,7 +50906,9 @@ def _contract_runtime_authoritative_close_verification(
             )
             groups[group_key] = {
                 "label": (
-                    "ContractRuntime direct_fix close authority"
+                    "ContractRuntime parentless direct-main close authority"
+                    if failed_authority_kind == "parentless_direct_main"
+                    else "ContractRuntime direct_fix close authority"
                     if failed_authority_kind == "direct_fix"
                     else "ContractRuntime mf_parallel close authority"
                 ),
@@ -50905,17 +50927,24 @@ def _contract_runtime_authoritative_close_verification(
             return result
         return dict(verification)
     authority_kind = (
-        "direct_fix"
+        "parentless_direct_main"
+        if authority_gate is parentless_direct_gate
+        else "direct_fix"
         if authority_gate is direct_fix_gate
         else "mf_parallel"
     )
     source = (
-        "contract_runtime_completed_direct_fix_chain"
+        "contract_runtime_parentless_direct_main_timeline"
+        if authority_kind == "parentless_direct_main"
+        else "contract_runtime_completed_direct_fix_chain"
         if authority_kind == "direct_fix"
         else "contract_runtime_completed_mf_parallel_chain"
     )
     message = (
-        "backlog_close accepted server-derived completed ContractRuntime "
+        "backlog_close accepted server-derived parentless operator-supervised "
+        "direct-main close authority."
+        if authority_kind == "parentless_direct_main"
+        else "backlog_close accepted server-derived completed ContractRuntime "
         "direct-fix evidence with independent QA."
         if authority_kind == "direct_fix"
         else (
@@ -50931,7 +50960,11 @@ def _contract_runtime_authoritative_close_verification(
     result["status"] = "passed"
     result["missing_event_kinds"] = []
     result["ignored_required_events"] = []
-    if authority_kind == "direct_fix":
+    if authority_kind == "parentless_direct_main":
+        result["contract_runtime_parentless_direct_main_close_authority_gate"] = dict(
+            authority_gate
+        )
+    elif authority_kind == "direct_fix":
         result["contract_runtime_direct_fix_close_authority_gate"] = dict(authority_gate)
     else:
         result["contract_runtime_mf_parallel_close_authority_gate"] = dict(authority_gate)
@@ -50998,6 +51031,9 @@ def _contract_runtime_authoritative_close_verification(
         "has_verification": True,
         "has_close_ready": True,
         "has_independent_qa": True,
+        "contract_runtime_parentless_direct_main_close_authority": (
+            authority_kind == "parentless_direct_main"
+        ),
         "contract_runtime_direct_fix_close_authority": authority_kind == "direct_fix",
         "contract_runtime_mf_parallel_close_authority": authority_kind == "mf_parallel",
         "close_commit_has_timeline_evidence": True,
@@ -51107,6 +51143,7 @@ def _contract_runtime_close_authority_failure_details(
         missing_ids.append("contract_runtime_completed_lines")
 
     for gate_key in (
+        "parentless_direct_main_close_authority_gate",
         "direct_fix_close_authority_gate",
         "mf_parallel_close_authority_gate",
     ):
@@ -51330,15 +51367,10 @@ def _contract_runtime_close_authority_first_deep_mapping(
 def _contract_runtime_close_authority_route_token_backed_event(
     event: Mapping[str, Any],
     identity: Mapping[str, Any],
+    *,
+    require_source_backed_authority: bool = False,
 ) -> bool:
     from . import task_timeline
-
-    route_gate = _contract_runtime_close_authority_first_deep_mapping(
-        event,
-        "route_token_gate",
-    )
-    if task_timeline._source_backed_route_gate_accepted(route_gate):
-        return True
 
     authority = _contract_runtime_close_authority_first_deep_mapping(
         event,
@@ -51349,8 +51381,19 @@ def _contract_runtime_close_authority_route_token_backed_event(
     )
     if (
         isinstance(authority_gate, Mapping)
+        and task_timeline._source_backed_route_gate_authority_valid(authority)
         and task_timeline._source_backed_route_gate_accepted(authority_gate)
     ):
+        return True
+
+    if require_source_backed_authority:
+        return False
+
+    route_gate = _contract_runtime_close_authority_first_deep_mapping(
+        event,
+        "route_token_gate",
+    )
+    if task_timeline._source_backed_route_gate_accepted(route_gate):
         return True
 
     expected_ref = str(identity.get("route_token_ref") or "").strip()
@@ -51418,6 +51461,204 @@ def _contract_runtime_close_authority_timeline_route_context_events(
     return selected
 
 
+def _contract_runtime_parentless_direct_main_close_authority_gate(
+    *,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Project parentless operator-supervised direct-main close authority."""
+
+    from . import task_timeline
+
+    if not requested_execution_id.startswith("onboard-service-"):
+        return {}
+
+    events = [
+        dict(event)
+        for event in timeline_events or []
+        if isinstance(event, Mapping)
+        and str(event.get("project_id") or "").strip() == project_id
+        and str(event.get("backlog_id") or "").strip() == bug_id
+    ]
+    if not events:
+        return {}
+
+    direct_event: dict[str, Any] = {}
+    direct_identity: dict[str, str] = {}
+    for event in events:
+        identity = _observer_root_route_identity_from_event(event)
+        route_identity = {
+            "route_ids": [identity.get("route_id", "")]
+            if identity.get("route_id")
+            else [],
+            "route_context_hashes": [identity.get("route_context_hash", "")]
+            if identity.get("route_context_hash")
+            else [],
+        }
+        exception = task_timeline._observer_direct_exception_event(
+            dict(event),
+            route_identity,
+        )
+        if not bool(exception.get("accepted")):
+            continue
+        if not _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            identity,
+            require_source_backed_authority=True,
+        ):
+            continue
+        direct_event = event
+        direct_identity = identity
+
+    if not direct_event:
+        return {}
+
+    allowed_files = task_timeline._event_deep_string_list(
+        direct_event,
+        {"allowed_files", "target_files", "owned_files", "allowed_changed_files"},
+    )
+    contract = {
+        "project_id": project_id,
+        "template_id": "operator_supervised_direct_main.v1",
+        "contract_instance_id": requested_execution_id,
+        "contract_execution_id": requested_execution_id,
+        "route_id": direct_identity.get("route_id", ""),
+        "route_context_hash": direct_identity.get("route_context_hash", ""),
+        "prompt_contract_id": direct_identity.get("prompt_contract_id", ""),
+        "prompt_contract_hash": direct_identity.get("prompt_contract_hash", ""),
+        "visible_injection_manifest_hash": direct_identity.get(
+            "visible_injection_manifest_hash",
+            "",
+        ),
+        "close_context": {
+            "close_commit": close_commit,
+            "target_files": allowed_files,
+            "allowed_files": allowed_files,
+            "owned_files": allowed_files,
+        },
+        "governance_policy": {
+            "requirements": {
+                "close_timeline": True,
+                "worker_graph_trace": False,
+                "independent_qa": False,
+            }
+        },
+    }
+    verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+    direct_gate = (
+        verification.get("observer_direct_close_exception_gate")
+        if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
+        else {}
+    )
+    missing_ids = list(direct_gate.get("missing_requirement_ids") or [])
+    if not bool(direct_gate.get("passed")):
+        if not missing_ids:
+            missing_ids = list(verification.get("missing_event_kinds") or [])
+        return {
+            "schema_version": "contract_runtime_parentless_direct_main_close_authority_gate.v1",
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "source": "server_derived_parentless_observer_direct_main_timeline",
+            "primary_decision_source": False,
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": requested_execution_id,
+            "close_commit": close_commit,
+            "missing_requirement_ids": missing_ids,
+            "source_refs": [
+                f"timeline:{direct_event.get('id')}"
+                if direct_event.get("id")
+                else str(direct_event.get("event_id") or "")
+            ],
+            "checks": {
+                "has_observer_direct_exception": True,
+                "observer_direct_close_exception_gate_passed": False,
+            },
+        }
+
+    source_refs = [
+        ref
+        for ref in (
+            f"contract_runtime:{requested_execution_id}",
+            f"timeline:{direct_event.get('id')}" if direct_event.get("id") else "",
+            f"timeline:{direct_gate.get('implementation_event', {}).get('id')}"
+            if isinstance(direct_gate.get("implementation_event"), Mapping)
+            and direct_gate.get("implementation_event", {}).get("id")
+            else "",
+            f"timeline:{direct_gate.get('verification_event', {}).get('id')}"
+            if isinstance(direct_gate.get("verification_event"), Mapping)
+            and direct_gate.get("verification_event", {}).get("id")
+            else "",
+            f"timeline:{direct_gate.get('close_ready_event', {}).get('id')}"
+            if isinstance(direct_gate.get("close_ready_event"), Mapping)
+            and direct_gate.get("close_ready_event", {}).get("id")
+            else "",
+        )
+        if ref
+    ]
+    return {
+        "schema_version": "contract_runtime_parentless_direct_main_close_authority_gate.v1",
+        "accepted": True,
+        "passed": True,
+        "status": "passed",
+        "source": "server_derived_parentless_observer_direct_main_timeline",
+        "primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": requested_execution_id,
+        "close_commit": close_commit,
+        "missing_requirement_ids": [],
+        "source_refs": list(dict.fromkeys(source_refs)),
+        "checks": {
+            "has_observer_direct_exception": True,
+            "observer_direct_close_exception_gate_passed": True,
+            "worker_or_successor_contract_required": False,
+        },
+    }
+
+
+def _contract_runtime_parentless_direct_main_projection(
+    *,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    gate = _contract_runtime_parentless_direct_main_close_authority_gate(
+        project_id=project_id,
+        bug_id=bug_id,
+        requested_execution_id=requested_execution_id,
+        close_commit=close_commit,
+        timeline_events=timeline_events,
+    )
+    if not gate:
+        return {}
+    accepted = bool(gate.get("passed"))
+    return {
+        **_contract_runtime_close_authority_payload_fields(),
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": accepted,
+        "status": "projected_parentless_direct_main" if accepted else "incomplete",
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=requested_execution_id,
+        ),
+        "legacy_advisory": not accepted,
+        "authoritative": accepted,
+        "projection_authoritative": accepted,
+        "contract_execution_id": requested_execution_id,
+        "contract_id": "onboard_route_guide",
+        "parentless_direct_main_close_authority_gate": gate,
+        "source_contract_execution_ids": [requested_execution_id],
+        "projected_events": list(timeline_events or []),
+    }
+
+
 def _contract_runtime_close_authority_projected_events_for_gate(
     runtime_projection: Mapping[str, Any],
     timeline_events: list[dict[str, Any]] | None,
@@ -51449,13 +51690,28 @@ def _contract_runtime_close_authority_projection(
     if not contract_execution_id:
         requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
         if requested_execution_id.startswith("onboard-service-"):
-            return _runtime_context_child_lane_close_authority_projection(
+            child_lane_projection = _runtime_context_child_lane_close_authority_projection(
                 project_id=project_id,
                 bug_id=bug_id,
                 requested_execution_id=requested_execution_id,
                 close_commit=close_commit,
                 timeline_events=timeline_events,
             )
+            if child_lane_projection and bool(child_lane_projection.get("accepted")):
+                return child_lane_projection
+            parentless_direct_projection = (
+                _contract_runtime_parentless_direct_main_projection(
+                    project_id=project_id,
+                    bug_id=bug_id,
+                    requested_execution_id=requested_execution_id,
+                    close_commit=close_commit,
+                    timeline_events=timeline_events,
+                )
+            )
+            if parentless_direct_projection:
+                return parentless_direct_projection
+            if child_lane_projection:
+                return child_lane_projection
         return {}
     runtime = _contract_runtime(conn)
     try:
@@ -51640,6 +51896,15 @@ def _contract_runtime_close_authority_projection(
         chain_projection=server_chain_projection,
         close_commit=close_commit,
     )
+    parentless_direct_main_gate = (
+        _contract_runtime_parentless_direct_main_close_authority_gate(
+            project_id=project_id,
+            bug_id=bug_id,
+            requested_execution_id=contract_execution_id,
+            close_commit=close_commit,
+            timeline_events=timeline_events,
+        )
+    )
     mf_parallel_gate = _contract_runtime_mf_parallel_close_authority_gate(
         chain_records,
         chain_projection=server_chain_projection,
@@ -51719,6 +51984,7 @@ def _contract_runtime_close_authority_projection(
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
         "direct_fix_close_authority_gate": direct_fix_gate,
+        "parentless_direct_main_close_authority_gate": parentless_direct_main_gate,
         "mf_parallel_close_authority_gate": mf_parallel_gate,
         "route_identity": _route_identity_public_summary(identity),
         "server_contract_chain_current_projection": {

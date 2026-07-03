@@ -7942,12 +7942,15 @@ def _latest_passing_close_event(
     key: str,
     *,
     after_event_id: int = 0,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     selected: dict[str, Any] = {}
     selected_order = -1
     for index, raw in enumerate(rows):
         event = _mapping(raw)
         if not event or _close_event_key(event) != key or not _event_passed(event):
+            continue
+        if predicate is not None and not predicate(event):
             continue
         event_id = _event_numeric_id(event)
         if after_event_id and event_id and event_id <= after_event_id:
@@ -7961,6 +7964,14 @@ def _latest_passing_close_event(
 
 def _event_has_evidence(event: dict[str, Any], keys: set[str]) -> bool:
     return bool(_event_deep_string_list(event, keys)) or _event_deep_truthy(event, keys)
+
+
+def _observer_direct_independent_verification_event(event: dict[str, Any]) -> bool:
+    return (
+        _independent_qa_event_kind_matches(event)
+        and _independent_qa_reviewer_or_actor_is_qa(event)
+        and not _is_independent_qa_observer_transport(event)
+    )
 
 
 def _observer_direct_close_exception_gate(
@@ -8013,6 +8024,7 @@ def _observer_direct_close_exception_gate(
         rows,
         "verification",
         after_event_id=implementation_event_id,
+        predicate=_observer_direct_independent_verification_event,
     )
     close_ready = _latest_passing_close_event(
         rows,
@@ -8030,7 +8042,7 @@ def _observer_direct_close_exception_gate(
     elif changed_file_scope["unexpected_changed_files"]:
         missing.append("changed_files_within_allowed_scope")
     if not verification:
-        missing.append("verification_after_implementation")
+        missing.append("independent_verification_after_implementation")
     if not _event_has_evidence(
         verification,
         {
