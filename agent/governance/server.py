@@ -8820,6 +8820,8 @@ def _runtime_context_projection_response(
         branch_contract_revision_to_dict,
         build_runtime_context_projection,
         get_latest_branch_contract_revision,
+        get_merge_queue_item_for_branch_context,
+        merge_queue_item_to_dict,
         record_runtime_context_access_audit,
         runtime_context_audit_nodes_for_views,
         runtime_context_filter_content_address,
@@ -8885,6 +8887,12 @@ def _runtime_context_projection_response(
     redacted_graph_trace_refs = _runtime_context_service_redact_graph_trace_refs(
         graph_trace_refs
     )
+    durable_merge_queue_item = get_merge_queue_item_for_branch_context(
+        conn,
+        context_project_id,
+        str(getattr(context, "task_id", "") or ""),
+        merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
+    )
     projection = build_runtime_context_projection(
         context,
         contract_revision=latest_revision,
@@ -8897,6 +8905,11 @@ def _runtime_context_projection_response(
         timeline_events=timeline_events,
         role="mf_sub",
         fence_token=str(getattr(context, "fence_token", "") or ""),
+        durable_merge_queue_item=(
+            merge_queue_item_to_dict(durable_merge_queue_item)
+            if durable_merge_queue_item is not None
+            else {}
+        ),
     ).to_dict()
     views = projection.get("views") if isinstance(projection.get("views"), dict) else {}
     full_worker_view_for_scope = dict(views.get("worker_view") or {})

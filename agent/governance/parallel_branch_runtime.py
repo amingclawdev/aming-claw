@@ -4977,6 +4977,169 @@ def build_runtime_context_gate_inputs_view(
     }
 
 
+def _runtime_context_merge_queue_target_ref(values: Mapping[str, Any]) -> str:
+    ref_name = _runtime_context_text(values.get("ref_name"))
+    if not ref_name:
+        return "refs/heads/main"
+    if ref_name.startswith("refs/"):
+        return ref_name
+    return f"refs/heads/{ref_name}"
+
+
+def _runtime_context_merge_queue_bootstrap_payload(
+    *,
+    values: Mapping[str, Any],
+    merge_queue_id: str,
+) -> dict[str, Any]:
+    task_id = _runtime_context_text(values.get("task_id"))
+    tool_args = {
+        "project_id": _runtime_context_text(values.get("project_id")),
+        "task_id": task_id,
+        "backlog_id": _runtime_context_text(values.get("backlog_id")),
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": f"{merge_queue_id}:{task_id}",
+        "target_ref": _runtime_context_merge_queue_target_ref(values),
+        "current_target_head": _runtime_context_text(values.get("target_head_commit")),
+        "checkpoint_id": _runtime_context_text(values.get("checkpoint_id")),
+        "require_finish_gate": True,
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "status": STATE_QUEUED_FOR_MERGE,
+        "route_token_ref": _runtime_context_text(values.get("route_token_ref")),
+    }
+    return {
+        "schema_version": "runtime_context.merge_queue_materialize_bootstrap_payload.v1",
+        "tool": "parallel_branch_merge_queue_materialize",
+        "protected_action": "parallel_branch_merge_queue_materialize",
+        "tool_args": {key: value for key, value in tool_args.items() if value != ""},
+        "context": {
+            "runtime_context_id": _runtime_context_text(
+                values.get("runtime_context_id")
+            ),
+            "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
+            "branch_ref": _runtime_context_text(values.get("branch_ref")),
+            "finish_gate_ref": _runtime_context_text(values.get("finish_gate_ref")),
+            "verification_event_refs": list(
+                values.get("verification_event_refs") or []
+            ),
+            "route_id": _runtime_context_text(values.get("route_id")),
+            "route_context_hash": _runtime_context_text(
+                values.get("route_context_hash")
+            ),
+            "prompt_contract_id": _runtime_context_text(
+                values.get("prompt_contract_id")
+            ),
+            "prompt_contract_hash": _runtime_context_text(
+                values.get("prompt_contract_hash")
+            ),
+        },
+        "safety": {
+            "copy_safe": True,
+            "raw_fence_token_included": False,
+            "raw_session_token_included": False,
+            "finish_gate_authority_preserved": True,
+            "requires_authoritative_protected_action": True,
+        },
+    }
+
+
+def _runtime_context_durable_merge_queue_item_projection(
+    *,
+    context: BranchTaskRuntimeContext,
+    values: Mapping[str, Any],
+    durable_merge_queue_item: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = public_contract_revision_payload(durable_merge_queue_item or {})
+    merge_queue_id = _runtime_context_text(
+        item.get("merge_queue_id")
+        or values.get("merge_queue_id")
+        or context.merge_queue_id
+    )
+    task_id = _runtime_context_text(item.get("task_id") or values.get("task_id"))
+    queue_item_id = _runtime_context_text(item.get("queue_item_id"))
+    checkpoint_id = _runtime_context_text(values.get("checkpoint_id"))
+    finish_gate_ref = _runtime_context_text(values.get("finish_gate_ref"))
+    verification_event_refs = _runtime_context_string_list(
+        values.get("verification_event_refs")
+    )
+    base: dict[str, Any] = {
+        "schema_version": "runtime_context.durable_merge_queue_item_projection.v1",
+        "source": "parallel_branch_merge_queue_items",
+        "project_id": _runtime_context_text(values.get("project_id")),
+        "runtime_context_id": _runtime_context_text(values.get("runtime_context_id")),
+        "task_id": task_id,
+        "merge_queue_id": merge_queue_id,
+        "checkpoint_id": checkpoint_id,
+        "finish_gate_ref": finish_gate_ref,
+        "verification_event_refs": verification_event_refs,
+        "protected_action": "parallel_branch_merge_queue_materialize",
+        "durable_queue_item_present": False,
+        "raw_fence_token_exposed": False,
+        "raw_session_token_exposed": False,
+    }
+    if queue_item_id:
+        status = _runtime_context_text(item.get("status") or STATE_QUEUED_FOR_MERGE)
+        return {
+            **base,
+            "status": status,
+            "materialization_status": "durable_merge_queue_item_materialized",
+            "queue_state": status,
+            "durable_queue_item_present": True,
+            "queue_item_id": queue_item_id,
+            "branch_ref": _runtime_context_text(
+                item.get("branch_ref") or values.get("branch_ref")
+            ),
+            "target_ref": _runtime_context_text(
+                item.get("target_ref")
+                or _runtime_context_merge_queue_target_ref(values)
+            ),
+            "current_target_head": _runtime_context_text(
+                item.get("current_target_head") or values.get("target_head_commit")
+            ),
+            "merge_preview_id": _runtime_context_text(
+                item.get("merge_preview_id") or values.get("merge_preview_id")
+            ),
+            "queue_item": item,
+            "next_action": "none",
+            "next_actions": [],
+        }
+    if not merge_queue_id:
+        return {
+            **base,
+            "status": "merge_queue_id_missing",
+            "next_action": "bind_merge_queue_id",
+            "next_actions": ["bind_merge_queue_id"],
+        }
+    if not finish_gate_ref or not checkpoint_id:
+        return {
+            **base,
+            "status": "waiting_for_finish_gate",
+            "next_action": "record_finish_gate",
+            "next_actions": ["record_finish_gate"],
+        }
+    if not verification_event_refs:
+        return {
+            **base,
+            "status": "waiting_for_independent_qa",
+            "next_action": "handoff_to_independent_qa",
+            "next_actions": ["handoff_to_independent_qa"],
+        }
+    return {
+        **base,
+        "status": "validated_without_durable_merge_queue_item",
+        "queue_item_id": f"{merge_queue_id}:{task_id}",
+        "branch_ref": _runtime_context_text(values.get("branch_ref")),
+        "target_ref": _runtime_context_merge_queue_target_ref(values),
+        "current_target_head": _runtime_context_text(values.get("target_head_commit")),
+        "merge_preview_id": _runtime_context_text(values.get("merge_preview_id")),
+        "next_action": "parallel_branch_merge_queue_materialize",
+        "next_actions": ["parallel_branch_merge_queue_materialize"],
+        "copy_safe_bootstrap_payload": _runtime_context_merge_queue_bootstrap_payload(
+            values=values,
+            merge_queue_id=merge_queue_id,
+        ),
+    }
+
+
 def build_runtime_context_current_view(
     context: BranchTaskRuntimeContext,
     *,
@@ -4993,6 +5156,7 @@ def build_runtime_context_current_view(
     required_evidence: Sequence[str] | None = None,
     timeline_events: Sequence[Mapping[str, Any]] | None = None,
     lane_required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
+    durable_merge_queue_item: Mapping[str, Any] | None = None,
     generated_at: str = "",
 ) -> dict[str, Any]:
     """Build the canonical current-state projection for runtime-context gates."""
@@ -5139,6 +5303,13 @@ def build_runtime_context_current_view(
     )
     current_values["merge_queue_projection"] = public_contract_revision_payload(
         revision_payload.get("merge_queue_projection")
+    )
+    current_values["durable_merge_queue_item_projection"] = (
+        _runtime_context_durable_merge_queue_item_projection(
+            context=context,
+            values=current_values,
+            durable_merge_queue_item=durable_merge_queue_item,
+        )
     )
     current_values["ordered_merge_dependencies"] = _runtime_context_string_list(
         revision_payload.get("ordered_merge_dependencies")
@@ -6559,6 +6730,9 @@ def _runtime_context_merge_dependency_projection(
     values: Mapping[str, Any],
 ) -> dict[str, Any]:
     queue_projection = _runtime_context_mapping(values.get("merge_queue_projection"))
+    durable_queue_projection = _runtime_context_mapping(
+        values.get("durable_merge_queue_item_projection")
+    )
     blockers = _runtime_context_string_list(queue_projection.get("dependency_blockers"))
     queue_state = _runtime_context_text(
         queue_projection.get("queue_state") or queue_projection.get("status")
@@ -6637,6 +6811,15 @@ def _runtime_context_merge_dependency_projection(
         "queue_state": queue_state,
         "merge_queue_id": _runtime_context_text(values.get("merge_queue_id")),
         "queue_item_id": _runtime_context_text(queue_projection.get("queue_item_id")),
+        "durable_queue_item_id": _runtime_context_text(
+            durable_queue_projection.get("queue_item_id")
+        ),
+        "durable_queue_item_present": bool(
+            durable_queue_projection.get("durable_queue_item_present")
+        ),
+        "durable_materialization_status": _runtime_context_text(
+            durable_queue_projection.get("status")
+        ),
         "task_id": _runtime_context_text(
             queue_projection.get("task_id") or values.get("task_id")
         ),
@@ -6659,6 +6842,9 @@ def _runtime_context_merge_dependency_projection(
         "target_branch_mutation_allowed": target_branch_mutation_allowed,
         "next_action": next_action,
         "next_actions": next_actions,
+        "durable_merge_queue_item_projection": public_contract_revision_payload(
+            durable_queue_projection
+        ),
         "ordered_merge_dependencies": _runtime_context_string_list(
             values.get("ordered_merge_dependencies")
         ),
@@ -6671,6 +6857,9 @@ def _runtime_context_close_precheck_gap_projection(
     close_gate_view: Mapping[str, Any],
 ) -> dict[str, Any]:
     close_precheck = _runtime_context_mapping(values.get("close_precheck"))
+    durable_merge_queue_item_projection = _runtime_context_mapping(
+        values.get("durable_merge_queue_item_projection")
+    )
     missing_close_fields = _runtime_context_dedupe(
         [
             _runtime_context_text(item.get("field"))
@@ -6841,6 +7030,29 @@ def _runtime_context_close_precheck_gap_projection(
                     next_action="record_mf_subagent_startup",
                     field=field,
                 )
+    durable_status = _runtime_context_text(
+        durable_merge_queue_item_projection.get("status")
+    )
+    durable_missing = durable_status == "validated_without_durable_merge_queue_item"
+    if durable_missing:
+        _add_gap(
+            code="durable_merge_queue_item_missing",
+            message=(
+                "Worker finish gate and independent QA are present, but the "
+                "durable merge queue item row is missing."
+            ),
+            next_action="parallel_branch_merge_queue_materialize",
+            field="durable_merge_queue_item",
+        )
+    done_status = "review_ready" if close_gate_view.get("ready") else "gap_open"
+    handoff_terminal_status = (
+        "terminal_dispatch_blocked"
+        if terminal_dispatch_blockers
+        else ("review_ready" if close_gate_view.get("ready") else "waiting_merge_gap")
+    )
+    if durable_missing:
+        done_status = "validated_without_durable_merge_queue_item"
+        handoff_terminal_status = "validated_without_durable_merge_queue_item"
     return {
         "schema_version": "runtime_context.close_precheck_gap_projection.v1",
         "status": "blocked" if gaps else "clear",
@@ -6848,7 +7060,7 @@ def _runtime_context_close_precheck_gap_projection(
         "next_actions": next_actions,
         "done_state_projection": {
             "schema_version": "runtime_context.done_state_projection.v1",
-            "status": "review_ready" if close_gate_view.get("ready") else "gap_open",
+            "status": done_status,
             "close_gate_ready": bool(close_gate_view.get("ready")),
             "close_ready_event_ref": _runtime_context_text(
                 values.get("close_ready_event_ref")
@@ -6860,10 +7072,12 @@ def _runtime_context_close_precheck_gap_projection(
                 values.get("verification_event_refs") or []
             ),
             "missing_close_fields": missing_close_fields,
-            "handoff_terminal_status": (
-                "terminal_dispatch_blocked"
-                if terminal_dispatch_blockers
-                else ("review_ready" if close_gate_view.get("ready") else "waiting_merge_gap")
+            "handoff_terminal_status": handoff_terminal_status,
+            "durable_merge_queue_item_projection": public_contract_revision_payload(
+                durable_merge_queue_item_projection
+            ),
+            "copy_safe_bootstrap_payload": public_contract_revision_payload(
+                durable_merge_queue_item_projection.get("copy_safe_bootstrap_payload")
             ),
         },
     }
@@ -6927,8 +7141,18 @@ def _runtime_context_next_legal_action(
         ("checkpoint_id", "record_checkpoint"),
         ("verification_event_refs", "handoff_to_independent_qa"),
         ("route_action_precheck_event_ref", "record_route_action_precheck"),
-        ("close_ready_event_ref", "record_close_ready"),
     ):
+        if field in missing_fields:
+            return action
+    durable_merge_queue_item_projection = _runtime_context_mapping(
+        values.get("durable_merge_queue_item_projection")
+    )
+    if (
+        _runtime_context_text(durable_merge_queue_item_projection.get("status"))
+        == "validated_without_durable_merge_queue_item"
+    ):
+        return "parallel_branch_merge_queue_materialize"
+    for field, action in (("close_ready_event_ref", "record_close_ready"),):
         if field in missing_fields:
             return action
     if lane_plan.get("blocking_events"):
@@ -7695,6 +7919,18 @@ def build_runtime_context_timeline_gate_projection(
     }
 
 
+def _runtime_context_strip_closeability_claims(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _runtime_context_strip_closeability_claims(item)
+            for key, item in value.items()
+            if str(key) not in {"can_close", "closeable"}
+        }
+    if isinstance(value, list):
+        return [_runtime_context_strip_closeability_claims(item) for item in value]
+    return copy.deepcopy(value)
+
+
 def build_runtime_context_gate_projection_view(
     *,
     gate_inputs_view: Mapping[str, Any],
@@ -7854,7 +8090,9 @@ def build_runtime_context_gate_projection_view(
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
-        "worker_handoff_projection": copy.deepcopy(worker_handoff_projection),
+        "worker_handoff_projection": _runtime_context_strip_closeability_claims(
+            worker_handoff_projection
+        ),
         "audit_archive_action": sanitized_audit_archive_action,
         "close_precheck_gap_projection": copy.deepcopy(
             dict(action_plan.get("close_precheck_gap_projection") or {})
@@ -8528,6 +8766,7 @@ def build_runtime_context_projection(
     lane_required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
     role: str = RUNTIME_CONTEXT_WORKER_ROLE,
     fence_token: str = "",
+    durable_merge_queue_item: Mapping[str, Any] | None = None,
     generated_at: str = "",
 ) -> RuntimeContextProjection:
     """Build all Runtime Context Service projections for internal consumers."""
@@ -8547,6 +8786,7 @@ def build_runtime_context_projection(
         required_evidence=required_evidence,
         timeline_events=timeline_events,
         lane_required_clauses=lane_required_clauses,
+        durable_merge_queue_item=durable_merge_queue_item,
         generated_at=generated_at,
     )
     gate_inputs = build_runtime_context_gate_inputs_view(current)
@@ -9586,6 +9826,38 @@ def list_merge_queue_items(
             (project_id, merge_queue_id),
         ).fetchall()
     return [_merge_queue_item_from_row(row) for row in rows]
+
+
+def get_merge_queue_item_for_branch_context(
+    conn: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    *,
+    merge_queue_id: str = "",
+) -> MergeQueueItem | None:
+    ensure_branch_runtime_schema(conn)
+    queue_id = str(merge_queue_id or "").strip()
+    if queue_id:
+        row = conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+            ORDER BY queue_index, updated_at DESC, queue_item_id
+            LIMIT 1
+            """,
+            (project_id, queue_id, task_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND task_id = ?
+            ORDER BY updated_at DESC, merge_queue_id, queue_index, queue_item_id
+            LIMIT 1
+            """,
+            (project_id, task_id),
+        ).fetchone()
+    return _merge_queue_item_from_row(row) if row else None
 
 
 def _list_merge_queue_items_with_target_fallback(
