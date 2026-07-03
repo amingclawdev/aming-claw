@@ -38,6 +38,7 @@ try:
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
         runtime_context_id_for_branch_context,
+        runtime_context_session_token_ref,
     )
 except ImportError:  # pragma: no cover - package import path
     from agent.ai_invocation import (
@@ -61,6 +62,7 @@ except ImportError:  # pragma: no cover - package import path
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
         runtime_context_id_for_branch_context,
+        runtime_context_session_token_ref,
     )
 else:  # pragma: no cover - direct module import path
     from ai_invocation import BACKEND_CLAUDE_CLI, BACKEND_CODEX_CLI, BACKEND_DOCKER_LIVE_AI
@@ -5600,6 +5602,12 @@ def _runtime_text_worker_envelope_claim(
         or getattr(context, "worker_id", "")
         or ""
     ).strip()
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    base_commit = str(getattr(context, "base_commit", "") or "").strip()
+    target_head_commit = str(getattr(context, "target_head_commit", "") or "").strip()
+    merge_queue_id = str(getattr(context, "merge_queue_id", "") or "").strip()
+    session_token_ref = runtime_context_session_token_ref(context)
     safe_route_identity = {
         str(field): str(route_identity.get(field) or "").strip()
         for field in (
@@ -5623,7 +5631,16 @@ def _runtime_text_worker_envelope_claim(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "observer_command_id": observer_command_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "merge_queue_id": merge_queue_id,
         **safe_route_identity,
         "reason": "Codex app worker claims first runtime-context host envelope",
         "ttl_seconds": 3600,
@@ -5632,7 +5649,16 @@ def _runtime_text_worker_envelope_claim(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "observer_command_id": observer_command_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "merge_queue_id": merge_queue_id,
         "reason": "Codex app worker lost raw runtime-context auth after startup",
         "ttl_seconds": 3600,
     }
@@ -5641,6 +5667,12 @@ def _runtime_text_worker_envelope_claim(
         "task_id",
         "parent_task_id",
         "target_project_root",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "worktree_path",
+        "branch_ref",
+        "merge_queue_id",
         "route_id",
         "route_context_hash",
         "prompt_contract_id",
@@ -5668,14 +5700,33 @@ def _runtime_text_worker_envelope_claim(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
-        "worktree_path": str(getattr(context, "worktree_path", "") or ""),
-        "branch": str(getattr(context, "branch_ref", "") or ""),
+        "worktree_path": worktree_path,
+        "branch": branch_ref,
+        "branch_ref": branch_ref,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "merge_queue_id": merge_queue_id,
         "route_identity": dict(safe_route_identity),
+        "session_token_ref": session_token_ref,
+        "worker_session_token_ref": session_token_ref,
+        "session_token_ref_source": (
+            "runtime_context_session_token_ref"
+            if session_token_ref
+            else "initial_join.response.session_token_ref"
+        ),
+        "session_token_ref_expected_after_initial_join": True,
         "required_fields": required_fields,
         "missing_fields": missing_fields,
         "host_env_injection_required": False,
         "worker_claims_host_envelope": True,
         "host_envelope_delivery": "runtime_context_session_token_initial_join",
+        "host_envelope_expected_fields": [
+            "AMING_WORKER_SESSION_TOKEN",
+            "AMING_WORKER_FENCE_TOKEN",
+            "session_token_ref",
+            "worker_slot_id",
+            "runtime_context_id",
+        ],
         "session_token_ref_alone_authorizes_writes": False,
         "raw_tokens_in_prompt_allowed": False,
         "raw_host_envelope_persisted": False,
@@ -6096,11 +6147,41 @@ def _runtime_text_executable_worker_launch(
     }
     startup_body_skeleton = {
         "runtime_context_id": runtime_context_id,
+        "task_id": payload["task_id"],
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
+        "worker_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "worker_slot_id": str(
+            worker_launch_pack.get("worker_id")
+            or getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ),
+        "agent_id": str(registered_host_adapter_spawn.get("agent_id") or ""),
+        "actual_host_worker_id": str(
+            registered_host_adapter_spawn.get("actual_host_worker_id") or ""
+        ),
+        "host_startup_id": str(
+            registered_host_adapter_spawn.get("host_startup_id") or ""
+        ),
+        "host_session_id": str(
+            registered_host_adapter_spawn.get("host_session_id") or ""
+        ),
+        "session_token_surrogate": str(
+            registered_host_adapter_spawn.get("session_token_surrogate") or ""
+        ),
+        "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "observer_command_id": observer_command_id,
         "fence_token": fence_token_placeholder,
         "session_token": session_token_placeholder,
+        "session_token_ref": str(
+            worker_envelope_claim.get("session_token_ref")
+            or "<copy from initial_join response.session_token_ref>"
+        ),
         "fence_token_env": fence_token_env,
         "session_token_env": session_token_env,
         "target_project_root": target_project_root,
@@ -6141,12 +6222,79 @@ def _runtime_text_executable_worker_launch(
         "body": startup_body_skeleton,
         "payload": startup_persisted_payload_skeleton,
     }
+    service_dispatch_worker = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": payload["task_id"],
+        "parent_task_id": parent_task_id,
+        "observer_command_id": observer_command_id,
+        "worker_role": "mf_sub",
+        "worker_id": read_receipt_body_skeleton["worker_id"],
+        "worker_slot_id": read_receipt_body_skeleton["worker_slot_id"],
+        "agent_id": "<actual host-created Codex subagent id>",
+        "actual_host_worker_id": "<actual host-created Codex subagent id>",
+        "worker_session_id": "<actual host-created Codex subagent session id>",
+        "transcript_ref": "<host transcript ref, e.g. codex:<session-id>>",
+        "worker_transcript_ref": "<host transcript ref, e.g. codex:<session-id>>",
+        "session_token_ref": "<copy from initial_join response.session_token_ref>",
+        "worktree_path": worktree_path,
+        "branch_ref": payload["branch_ref"],
+        "target_project_root": target_project_root,
+        "merge_queue_id": payload["merge_queue_id"],
+        **route_identity,
+    }
+    service_dispatch_timeline_payload = {
+        "event_type": "observer.subagent.service_dispatch",
+        "event_kind": "observer_subagent_service_dispatch",
+        "phase": "dispatch",
+        "status": "accepted",
+        "task_id": parent_task_id,
+        "backlog_id": request.backlog_id,
+        "payload": {
+            "schema_version": "observer_subagent_service_dispatch.v1",
+            "observer_command_id": observer_command_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": payload["task_id"],
+            "parent_task_id": parent_task_id,
+            "merge_queue_id": payload["merge_queue_id"],
+            "workers": [dict(service_dispatch_worker)],
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            **route_identity,
+        },
+    }
+    service_dispatch_payload_skeleton = {
+        "schema_version": "observer_runtime_text.service_dispatch_payload_skeleton.v1",
+        "required_before": ["runtime_context.startup"],
+        "purpose": (
+            "Bind the host-created Codex subagent id to the runtime allocated "
+            "mf_sub worker slot before startup, so startup can validate through "
+            "observer_subagent_service_dispatch instead of self-asserted identity."
+        ),
+        "mcp_tool": "task_timeline_append",
+        "event_kind": "observer_subagent_service_dispatch",
+        "body_source": "copy_safe_body",
+        "copy_safe_body": service_dispatch_timeline_payload,
+        "required_operator_fills": [
+            "payload.workers[0].agent_id",
+            "payload.workers[0].actual_host_worker_id",
+            "payload.workers[0].worker_session_id",
+            "payload.workers[0].transcript_ref",
+            "payload.workers[0].session_token_ref",
+        ],
+        "worker_identity_source": "host_spawn_result",
+        "session_token_ref_source": "initial_join.response.session_token_ref",
+        "route_identity": dict(route_identity),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+    }
     operator_must_fill = (
         [
             "response.launch_text",
             "host.actual_host_worker_id",
             "host.worker_session_id",
             "host.worker_transcript_ref",
+            "service_dispatch_payload_skeleton.copy_safe_body.payload.workers[0].agent_id",
+            "service_dispatch_payload_skeleton.copy_safe_body.payload.workers[0].session_token_ref",
         ]
         if codex_app_bridge_ready
         else [
@@ -6208,6 +6356,7 @@ def _runtime_text_executable_worker_launch(
         "worker_envelope_claim_source": (
             "response.executable_worker_launch.runtime_context_worker_envelope_claim"
         ),
+        "service_dispatch_payload_skeleton": service_dispatch_payload_skeleton,
         "read_receipt_facade_payload_skeleton": read_receipt_payload_skeleton,
         "startup_facade_payload_skeleton": startup_payload_skeleton,
         "next_step": handoff_next_step,
@@ -6265,6 +6414,11 @@ def _runtime_text_executable_worker_launch(
         "runtime_context_worker_envelope_claim_source": (
             "response.executable_worker_launch.runtime_context_worker_envelope_claim"
         ),
+        "service_dispatch_payload_skeleton": service_dispatch_payload_skeleton,
+        "service_dispatch_payload_source": (
+            "response.executable_worker_launch.handoff_packet."
+            "service_dispatch_payload_skeleton.copy_safe_body"
+        ),
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
     }
@@ -6306,6 +6460,7 @@ def _runtime_text_executable_worker_launch(
         "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "startup_recording": dict(startup_recording),
         "runtime_context_worker_envelope_claim": dict(worker_envelope_claim),
+        "service_dispatch_payload_skeleton": service_dispatch_payload_skeleton,
         "worker_launch_pack_hash": str(
             worker_launch_pack.get("worker_launch_pack_hash") or ""
         ),

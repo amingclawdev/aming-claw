@@ -18481,6 +18481,17 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
     assert result["fence_token"] == "fence-runtime-initial-join"
     assert result["raw_tokens_persisted_to_timeline"] is False
     host_envelope = result["host_envelope"]
+    assert host_envelope["project_id"] == PID
+    assert host_envelope["runtime_context_id"] == context.runtime_context_id
+    assert host_envelope["worker_role"] == "mf_sub"
+    assert host_envelope["worker_id"] == "worker-runtime-initial-join"
+    assert host_envelope["worker_slot_id"] == "slot-runtime-initial-join"
+    assert host_envelope["principal_id"] == "slot-runtime-initial-join"
+    assert host_envelope["session_token_ref"] == result["session_token_ref"]
+    assert host_envelope["branch_ref"] == (
+        "refs/heads/codex/worker-runtime-initial-join"
+    )
+    assert host_envelope["target_project_root"] == str(target_root)
     assert host_envelope["env"]["AMING_WORKER_SESSION_TOKEN"] == result["session_token"]
     assert host_envelope["env"]["AMING_WORKER_FENCE_TOKEN"] == (
         "fence-runtime-initial-join"

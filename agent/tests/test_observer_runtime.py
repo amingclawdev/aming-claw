@@ -261,6 +261,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
             branch_runtime_evidence=allocation_evidence,
             route_id="route-a1",
             visible_injection_manifest_hash="sha256:visible-a1",
+            backend_mode="codex_app_subagent",
         )
     )
 
@@ -352,6 +353,45 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["startup_intent_event"]["artifact_refs"]["runtime_context_id"] == (
         "mfrctx-runtime-text-a1"
     )
+    envelope_claim = prepared["runtime_context_worker_envelope_claim"]
+    assert envelope_claim["status"] == "ready"
+    assert envelope_claim["worker_role"] == "mf_sub"
+    assert envelope_claim["worker_slot_id"] == "worker-a1"
+    assert envelope_claim["session_token_ref_expected_after_initial_join"] is True
+    initial_join_body = envelope_claim["initial_join"]["copy_safe_body"]
+    assert initial_join_body["observer_command_id"] == "cmd-a1"
+    assert initial_join_body["worker_slot_id"] == "worker-a1"
+    assert initial_join_body["branch_ref"] == "refs/heads/codex/task-a1"
+    executable_launch = prepared["executable_worker_launch"]
+    service_dispatch = executable_launch["handoff_packet"][
+        "service_dispatch_payload_skeleton"
+    ]
+    assert service_dispatch["required_before"] == ["runtime_context.startup"]
+    assert service_dispatch["session_token_ref_source"] == (
+        "initial_join.response.session_token_ref"
+    )
+    service_worker = service_dispatch["copy_safe_body"]["payload"]["workers"][0]
+    assert service_worker["runtime_context_id"] == "mfrctx-runtime-text-a1"
+    assert service_worker["worker_slot_id"] == "worker-a1"
+    assert service_worker["session_token_ref"] == (
+        "<copy from initial_join response.session_token_ref>"
+    )
+    startup_body = executable_launch["handoff_packet"][
+        "startup_facade_payload_skeleton"
+    ]["body"]
+    assert startup_body["task_id"] == "task-a1"
+    assert startup_body["worker_slot_id"] == "worker-a1"
+    assert startup_body["registered_host_adapter_spawn"]["worker_slot_id"] == (
+        "worker-a1"
+    )
+    assert executable_launch["backend_mode"] == "codex_app_subagent"
+    assert executable_launch["host_adapter_launchable"] is True
+    assert executable_launch["handoff_packet"]["next_step"]["action"] == (
+        "spawn_codex_app_subagent_with_runtime_context_bridge"
+    )
+    assert executable_launch["host_adapter_handoff"][
+        "service_dispatch_payload_skeleton"
+    ] == service_dispatch
     assert prepared["first_progress_contract"]["startup_is_progress"] is False
     assert (
         "first_progress_evidence"
