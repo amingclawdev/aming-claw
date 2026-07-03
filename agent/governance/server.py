@@ -6271,11 +6271,33 @@ def _require_graph_governance_operator(ctx: RequestContext, conn, action: str) -
 
 
 def _current_full_route_ref(ctx: RequestContext) -> str:
-    return _contract_runtime_ref_value(
+    return str(_current_full_route_ref_projection(ctx).get("route_token_ref") or "")
+
+
+def _current_full_route_ref_projection(ctx: RequestContext) -> dict[str, Any]:
+    values = _contract_runtime_ref_values(
         ctx,
         "observer_route_token_ref",
         "route_token_ref",
     )
+    supplied: dict[str, list[str]] = {}
+    distinct: list[str] = []
+    for key, value in values:
+        supplied.setdefault(key, [])
+        if value not in supplied[key]:
+            supplied[key].append(value)
+        if value not in distinct:
+            distinct.append(value)
+    return {
+        "route_token_ref": distinct[0] if distinct else "",
+        "alias_conflict": len(distinct) > 1,
+        "supplied": supplied,
+        "distinct_values": distinct,
+        "aliases": {
+            "observer_route_token_ref": ["observer_route_token_ref", "route_token_ref"],
+            "route_token_ref": ["observer_route_token_ref", "route_token_ref"],
+        },
+    }
 
 
 def _current_full_route_proof_requested(ctx: RequestContext) -> bool:
@@ -6329,7 +6351,18 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
     observer_session_id = _contract_runtime_ref_value(
         ctx, "observer_session_id", "observer_session_ref"
     )
-    route_token_ref = _current_full_route_ref(ctx)
+    route_token_ref_projection = _current_full_route_ref_projection(ctx)
+    if route_token_ref_projection.get("alias_conflict"):
+        _raise_current_full_route_proof(
+            "route_token_ref_alias_conflict",
+            "current-full reconcile received conflicting route_token_ref aliases",
+            status=422,
+            route_token_ref_aliases=route_token_ref_projection.get("aliases") or {},
+            supplied_route_token_refs=route_token_ref_projection.get("supplied") or {},
+            raw_route_token_required=False,
+            raw_route_token_exposed=False,
+        )
+    route_token_ref = str(route_token_ref_projection.get("route_token_ref") or "")
     backlog_id = _contract_runtime_ref_value(ctx, "backlog_id", "bug_id")
     task_id = _contract_runtime_ref_value(ctx, "task_id", "contract_execution_id")
 
@@ -6396,7 +6429,11 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
-            **renewal_details,
+            **{
+                key: value
+                for key, value in renewal_details.items()
+                if key not in {"route_token_ref", "backlog_id", "task_id"}
+            },
         )
 
     if not resolved:
@@ -38985,6 +39022,29 @@ def _contract_runtime_ref_value(ctx: RequestContext, *keys: str) -> str:
         if text:
             return text
     return ""
+
+
+def _contract_runtime_ref_values(
+    ctx: RequestContext,
+    *keys: str,
+) -> list[tuple[str, str]]:
+    body_value = getattr(ctx, "body", {})
+    query_value = getattr(ctx, "query", {})
+    body = body_value if isinstance(body_value, Mapping) else {}
+    query = query_value if isinstance(query_value, Mapping) else {}
+    values: list[tuple[str, str]] = []
+    for key in keys:
+        for source in (body, query):
+            value = source.get(key)
+            if isinstance(value, list):
+                candidates = value
+            else:
+                candidates = [value]
+            for candidate in candidates:
+                text = str(candidate or "").strip()
+                if text:
+                    values.append((key, text))
+    return values
 
 
 def _normalized_contract_runtime_action(value: str) -> str:

@@ -186,6 +186,55 @@ def _current_full_reconcile_timeout_response(
     }
 
 
+def _current_full_reconcile_route_token_alias_error(
+    observer_route_token_ref: str,
+    route_token_ref: str,
+) -> dict:
+    return {
+        "ok": False,
+        "error": "route_token_ref_alias_conflict",
+        "code": "route_token_ref_alias_conflict",
+        "message": (
+            "graph_current_full_reconcile received conflicting route-token "
+            "alias values; pass only one of observer_route_token_ref or "
+            "route_token_ref, or pass the same value for both."
+        ),
+        "aliases": {
+            "observer_route_token_ref": "route_token_ref",
+            "route_token_ref": "observer_route_token_ref",
+        },
+        "observer_route_token_ref": observer_route_token_ref,
+        "route_token_ref": route_token_ref,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _normalize_current_full_reconcile_route_token_aliases(
+    body: dict,
+) -> tuple[dict, dict | None]:
+    normalized = dict(body)
+    observer_route_token_ref = str(
+        normalized.get("observer_route_token_ref") or ""
+    ).strip()
+    route_token_ref = str(normalized.get("route_token_ref") or "").strip()
+    if observer_route_token_ref and route_token_ref:
+        if observer_route_token_ref != route_token_ref:
+            return normalized, _current_full_reconcile_route_token_alias_error(
+                observer_route_token_ref,
+                route_token_ref,
+            )
+        normalized["observer_route_token_ref"] = observer_route_token_ref
+        normalized.pop("route_token_ref", None)
+    elif route_token_ref:
+        normalized["observer_route_token_ref"] = route_token_ref
+        normalized.pop("route_token_ref", None)
+    elif observer_route_token_ref:
+        normalized["observer_route_token_ref"] = observer_route_token_ref
+        normalized.pop("route_token_ref", None)
+    return normalized, None
+
+
 def _backlog_list_query(args: dict) -> dict:
     query: dict[str, Any] = {
         "view": str(args.get("view") or "compact"),
@@ -2404,8 +2453,8 @@ TOOLS: list[dict] = [
         "description": (
             "Run the canonical current-commit full graph reconcile path. "
             "Defaults to current clean HEAD and activate=true; route-proof "
-            "calls use observer_session_id with observer_route_token_ref or "
-            "route_token_ref."
+            "calls use observer_session_id with exactly one of "
+            "observer_route_token_ref or route_token_ref."
         ),
         "inputSchema": {
             "type": "object",
@@ -4196,6 +4245,11 @@ class ToolDispatcher:
                 for key, value in args.items()
                 if key not in {"project_id", "timeout_seconds"} and value is not None
             }
+            body, alias_error = _normalize_current_full_reconcile_route_token_aliases(
+                body
+            )
+            if alias_error:
+                return alias_error
             result = self._governance_api_with_timeout(
                 "POST",
                 f"/api/graph-governance/{pid}/reconcile/current-full",
