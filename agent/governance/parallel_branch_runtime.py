@@ -13511,6 +13511,81 @@ def materialize_branch_worktree(
     }
 
 
+def _materialization_git_root(context: BranchTaskRuntimeContext) -> Path | None:
+    for raw_path in (context.worktree_path, context.target_project_root):
+        if not str(raw_path or "").strip():
+            continue
+        candidate = Path(str(raw_path)).expanduser()
+        if not candidate.exists():
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(candidate),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip()).resolve()
+    return None
+
+
+def _refresh_merge_queue_heads_for_materialization(
+    context: BranchTaskRuntimeContext,
+    *,
+    target_ref: str,
+    current_target_head: str = "",
+) -> tuple[str, str]:
+    git_root = _materialization_git_root(context)
+    branch_head = str(context.head_commit or "").strip()
+    target_head = str(current_target_head or context.target_head_commit or "").strip()
+    if git_root is None:
+        return branch_head, target_head
+
+    branch_ref = str(context.branch_ref or "").strip()
+    resolved_branch_head, _ = _git_preview_commit(
+        git_root,
+        branch_ref,
+        timeout_seconds=10,
+    )
+    if resolved_branch_head:
+        branch_head = resolved_branch_head
+
+    resolved_target_head, _ = _git_preview_commit(
+        git_root,
+        str(target_ref or context.ref_name or "refs/heads/main").strip(),
+        timeout_seconds=10,
+    )
+    if resolved_target_head:
+        target_head = resolved_target_head
+    return branch_head, target_head
+
+
+def _is_graph_snapshot_ref(value: object) -> bool:
+    text = str(value or "").strip()
+    return text.startswith(
+        (
+            "full-",
+            "scope-",
+            "snapshot-",
+            "graph-snapshot-",
+            "semproj-",
+        )
+    )
+
+
+def _durable_graph_epoch_dependencies(values: Sequence[str]) -> tuple[str, ...]:
+    return tuple(
+        dep
+        for dep in _runtime_context_string_list(values)
+        if not _is_graph_snapshot_ref(dep)
+    )
+
+
 def queue_merge_item_for_branch_context(
     conn: sqlite3.Connection,
     *,
@@ -13564,6 +13639,14 @@ def queue_merge_item_for_branch_context(
         if context.replay_source != "mf_sub_finish_gate":
             raise ValueError("validated mf_sub finish gate checkpoint is required")
 
+    (
+        refreshed_branch_head,
+        refreshed_target_head,
+    ) = _refresh_merge_queue_heads_for_materialization(
+        context,
+        target_ref=target_ref,
+        current_target_head=current_target_head,
+    )
     item = MergeQueueItem(
         project_id=project_id,
         merge_queue_id=queue_id,
@@ -13577,12 +13660,12 @@ def queue_merge_item_for_branch_context(
         serializes_after=tuple(serializes_after),
         conflicts_with=tuple(conflicts_with),
         same_node_or_file_conflicts=tuple(same_node_or_file_conflicts),
-        requires_graph_epoch=tuple(requires_graph_epoch),
+        requires_graph_epoch=_durable_graph_epoch_dependencies(requires_graph_epoch),
         target_ref=target_ref or context.ref_name or "refs/heads/main",
         base_commit=context.base_commit,
-        branch_head=context.head_commit,
+        branch_head=refreshed_branch_head,
         validated_target_head=validated_target_head,
-        current_target_head=current_target_head or context.target_head_commit,
+        current_target_head=refreshed_target_head,
         validation_attempt=validation_attempt,
         merge_preview_id=merge_preview_id or context.merge_preview_id,
         snapshot_id=context.snapshot_id,
@@ -13594,6 +13677,7 @@ def queue_merge_item_for_branch_context(
         status=saved_item.status,
         merge_queue_id=saved_item.merge_queue_id,
         merge_preview_id=saved_item.merge_preview_id,
+        head_commit=saved_item.branch_head or context.head_commit,
         target_head_commit=saved_item.current_target_head or context.target_head_commit,
     )
     saved_context = upsert_branch_context(conn, updated_context, now_iso=now_iso)
@@ -13734,6 +13818,12 @@ def _merge_dependency_blockers(
     for blocker_type, deps in dependency_groups:
         for dep in deps:
             dep_item = items_by_task.get(dep)
+            if (
+                blocker_type == "requires_graph_epoch"
+                and dep_item is None
+                and _is_graph_snapshot_ref(dep)
+            ):
+                continue
             if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
                 add(dep, blocker_type)
                 continue
