@@ -73,6 +73,7 @@ from agent.governance.parallel_branch_runtime import (
     ensure_branch_runtime_schema,
     get_branch_context,
     get_latest_branch_contract_revision,
+    get_merge_queue_item_for_branch_context,
     list_branch_contexts,
     materialize_branch_worktree,
     mf_subagent_session_token_hash,
@@ -3690,9 +3691,11 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     )
     assert worker_view["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert worker_view["worker_next_moves"] == []
-    assert worker_view["done_state_projection"]["status"] == "review_ready"
+    assert worker_view["done_state_projection"]["status"] == (
+        "validated_without_durable_merge_queue_item"
+    )
     assert worker_view["control_plane"]["done_state_projection"]["status"] == (
-        "review_ready"
+        "validated_without_durable_merge_queue_item"
     )
     dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
         "fence_token"
@@ -6942,6 +6945,168 @@ def test_merge_queue_accepts_route_gated_finish_checkpoint_without_raw_fence() -
     assert queued["context"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-route-checkpoint"
     assert queued["queue_item"]["branch_head"] == "head-route-checkpoint"
+
+
+def _finished_qa_runtime_projection(
+    context: BranchTaskRuntimeContext,
+    *,
+    durable_merge_queue_item: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    return build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": f"route-{context.task_id}",
+            "route_context_hash": "sha256:route-finish-startup",
+            "prompt_contract_id": f"rprompt-{context.task_id}",
+            "prompt_contract_hash": "sha256:prompt-finish-startup",
+            "route_token_ref": f"rtok-{context.task_id}",
+            "visible_injection_manifest_hash": "sha256:visible-finish-startup",
+        },
+        target_files=["agent/governance/parallel_branch_runtime.py"],
+        graph_trace_refs={"trace_ids": [f"gqt-{context.task_id}"]},
+        timeline_refs={
+            "startup_event_ref": f"timeline:startup-{context.task_id}",
+            "read_receipt_event_ref": f"timeline:read-{context.task_id}",
+            "route_action_precheck_event_ref": f"timeline:route-{context.task_id}",
+            "implementation_event_refs": [f"timeline:implementation-{context.task_id}"],
+            "finish_event_ref": f"timeline:finish-{context.task_id}",
+            "verification_event_refs": [f"timeline:qa-{context.task_id}"],
+            "close_ready_event_ref": f"timeline:close-{context.task_id}",
+        },
+        startup_gate=_finish_startup_gate(context),
+        finish_gate={
+            "event_id": f"timeline:finish-{context.task_id}",
+            "checkpoint_id": context.checkpoint_id,
+            "worker_self_attestation": {
+                "status": "passed",
+                "worker_self_attesting": True,
+                "finish_time_self_attesting": True,
+                "attestation_phase": "finish",
+            },
+            "worker_self_attestation_gate": {
+                "status": "passed",
+                "passed": True,
+            },
+        },
+        close_evidence={"event_id": f"timeline:close-{context.task_id}"},
+        durable_merge_queue_item=durable_merge_queue_item or {},
+        generated_at=NOW,
+    ).to_dict()
+
+
+def test_runtime_context_projects_validated_missing_durable_merge_queue_item() -> None:
+    context = _runtime_projection_context(
+        task_id="mf-sub-durable-missing",
+        branch_ref="refs/heads/codex/mf-sub-durable-missing",
+        status=STATE_VALIDATED,
+        checkpoint_id="ckpt-durable-missing",
+        replay_source="mf_sub_finish_gate",
+        merge_queue_id="mq-durable-missing",
+    )
+
+    projection = _finished_qa_runtime_projection(context)
+
+    current_values = projection["views"]["current"]["current_values"]
+    durable_projection = current_values["durable_merge_queue_item_projection"]
+    action_plan = projection["views"]["action_plan"]
+    done_state = action_plan["close_precheck_gap_projection"][
+        "done_state_projection"
+    ]
+    bootstrap = durable_projection["copy_safe_bootstrap_payload"]
+    tool_args = bootstrap["tool_args"]
+
+    assert durable_projection["status"] == (
+        "validated_without_durable_merge_queue_item"
+    )
+    assert durable_projection["durable_queue_item_present"] is False
+    assert action_plan["next_legal_action"] == "parallel_branch_merge_queue_materialize"
+    assert done_state["status"] == "validated_without_durable_merge_queue_item"
+    assert done_state["handoff_terminal_status"] == (
+        "validated_without_durable_merge_queue_item"
+    )
+    assert tool_args == {
+        "project_id": PROJECT_ID,
+        "task_id": "mf-sub-durable-missing",
+        "backlog_id": "BUG-RUNTIME-CONTEXT",
+        "merge_queue_id": "mq-durable-missing",
+        "queue_item_id": "mq-durable-missing:mf-sub-durable-missing",
+        "target_ref": "refs/heads/main",
+        "current_target_head": "target-runtime-context",
+        "checkpoint_id": "ckpt-durable-missing",
+        "require_finish_gate": True,
+        "worker_role": "mf_sub",
+        "status": "queued_for_merge",
+        "route_token_ref": "rtok-mf-sub-durable-missing",
+    }
+    assert "fence_token" not in tool_args
+    assert context.fence_token not in json.dumps(bootstrap)
+
+
+def test_runtime_context_projects_materialized_durable_merge_queue_item() -> None:
+    conn = _runtime_conn()
+    context = _runtime_projection_context(
+        task_id="mf-sub-durable-present",
+        branch_ref="refs/heads/codex/mf-sub-durable-present",
+        status=STATE_VALIDATED,
+        checkpoint_id="ckpt-durable-present",
+        replay_source="mf_sub_finish_gate",
+        merge_queue_id="mq-durable-present",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+
+    queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-durable-present",
+        merge_queue_id="mq-durable-present",
+        require_finish_gate=True,
+        checkpoint_id="ckpt-durable-present",
+        allow_finish_checkpoint_without_fence=True,
+        now_iso=NOW,
+    )
+    durable_item = get_merge_queue_item_for_branch_context(
+        conn,
+        PROJECT_ID,
+        "mf-sub-durable-present",
+        merge_queue_id="mq-durable-present",
+    )
+    assert durable_item is not None
+    saved_context = get_branch_context(conn, PROJECT_ID, "mf-sub-durable-present")
+    assert saved_context is not None
+
+    queued_item = {
+        "project_id": durable_item.project_id,
+        "merge_queue_id": durable_item.merge_queue_id,
+        "queue_item_id": durable_item.queue_item_id,
+        "task_id": durable_item.task_id,
+        "branch_ref": durable_item.branch_ref,
+        "status": durable_item.status,
+        "target_ref": durable_item.target_ref,
+        "current_target_head": durable_item.current_target_head,
+        "merge_preview_id": durable_item.merge_preview_id,
+    }
+    projection = _finished_qa_runtime_projection(
+        saved_context,
+        durable_merge_queue_item=queued_item,
+    )
+
+    durable_projection = projection["views"]["current"]["current_values"][
+        "durable_merge_queue_item_projection"
+    ]
+    action_plan = projection["views"]["action_plan"]
+
+    assert queued_item["queue_item_id"] == (
+        "mq-durable-present:mf-sub-durable-present"
+    )
+    assert durable_projection["durable_queue_item_present"] is True
+    assert durable_projection["status"] == "queued_for_merge"
+    assert durable_projection["queue_item_id"] == (
+        "mq-durable-present:mf-sub-durable-present"
+    )
+    assert durable_projection["materialization_status"] == (
+        "durable_merge_queue_item_materialized"
+    )
+    assert action_plan["next_legal_action"] == "handoff_review_ready"
 
 
 def test_merge_queue_route_gated_finish_checkpoint_rejects_non_finish_source() -> None:
