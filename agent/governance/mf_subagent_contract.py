@@ -246,8 +246,10 @@ MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS = (
     ),
     (
         "For every contract_runtime_submit_line, copy "
-        "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash from "
-        "the current guide; the hash may change after each accepted line."
+        "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash: the "
+        "runtime_guide_hash from writer_role_safe_copy_payload.copy_payload "
+        "for the target writer line in the current guide. Re-read after each "
+        "accepted line because the writer hash may change."
     ),
 )
 _MF_SUBAGENT_ALLOWED_QUERY_PURPOSES = {
