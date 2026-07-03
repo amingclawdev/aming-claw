@@ -17846,6 +17846,35 @@ def _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
     }
 
 
+def _parallel_branch_merge_execute_allows_reclaimed_fence_without_token(
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+) -> bool:
+    if str(body.get("fence_token") or "").strip():
+        return False
+    if route_gate.get("allowed") is not True:
+        return False
+    if str(route_gate.get("status") or "").strip() != "accepted":
+        return False
+    if (
+        str(route_gate.get("decision") or "").strip()
+        not in _PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS
+    ):
+        return False
+    if str(route_gate.get("action") or "").strip() != "merge_execute":
+        return False
+    authorized_action = str(
+        route_gate.get("authorized_action")
+        or route_gate.get("allowed_action")
+        or route_gate.get("action")
+        or ""
+    ).strip()
+    return authorized_action in {
+        "merge_execute",
+        _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
+    }
+
+
 def _parallel_branch_parent_scope_from_recorded_merge(
     recorded: Mapping[str, Any] | None,
     *,
@@ -18559,6 +18588,12 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 action="merge_execute",
                 task_id=str(ctx.body.get("task_id") or ""),
             )
+        allow_reclaimed_fence = (
+            _parallel_branch_merge_execute_allows_reclaimed_fence_without_token(
+                ctx.body,
+                route_gate,
+            )
+        )
         with sqlite_write_lock():
             result = execute_merge_queue_item(
                 conn,
@@ -18577,7 +18612,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                     "allow_target_ref_mutation",
                     False,
                 ),
-                allow_route_gated_reclaimed_fence_without_token=bool(route_gate),
+                allow_route_gated_reclaimed_fence_without_token=allow_reclaimed_fence,
                 message=str(ctx.body.get("message") or ""),
                 bug_id=str(ctx.body.get("bug_id") or ""),
                 source_contract_id=str(

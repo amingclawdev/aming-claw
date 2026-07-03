@@ -10056,6 +10056,7 @@ def record_merge_queue_result(
             allow_route_gated_reclaimed_fence_without_token
         ),
         merge_commit=merge_commit,
+        failure_reason=failure_reason,
         target_head_before_merge=target_head_before_merge,
         target_head_after_merge=target_head_after_merge,
     )
@@ -10113,17 +10114,23 @@ def _merge_queue_result_has_route_gated_reclaimed_fence_authority(
     fence_token: str,
     allow_route_gated_reclaimed_fence_without_token: bool,
     merge_commit: str,
+    failure_reason: str,
     target_head_before_merge: str,
     target_head_after_merge: str,
 ) -> bool:
-    return (
-        bool(allow_route_gated_reclaimed_fence_without_token)
-        and result_status == STATE_MERGED
-        and not str(fence_token or "").strip()
-        and bool(str(merge_commit or "").strip())
-        and bool(str(target_head_before_merge or "").strip())
-        and bool(str(target_head_after_merge or "").strip())
-    )
+    if not bool(allow_route_gated_reclaimed_fence_without_token):
+        return False
+    if str(fence_token or "").strip():
+        return False
+    before = str(target_head_before_merge or "").strip()
+    after = str(target_head_after_merge or "").strip()
+    if not before or not after:
+        return False
+    if result_status == STATE_MERGED:
+        return bool(str(merge_commit or "").strip())
+    if result_status == STATE_MERGE_FAILED:
+        return bool(str(failure_reason or "").strip()) and before == after
+    return False
 
 
 def _require_merge_queue_result_record_authority(
@@ -10133,6 +10140,7 @@ def _require_merge_queue_result_record_authority(
     fence_token: str,
     allow_route_gated_reclaimed_fence_without_token: bool,
     merge_commit: str,
+    failure_reason: str = "",
     target_head_before_merge: str,
     target_head_after_merge: str,
 ) -> None:
@@ -10148,6 +10156,7 @@ def _require_merge_queue_result_record_authority(
             allow_route_gated_reclaimed_fence_without_token
         ),
         merge_commit=merge_commit,
+        failure_reason=failure_reason,
         target_head_before_merge=target_head_before_merge,
         target_head_after_merge=target_head_after_merge,
     ):
@@ -10165,6 +10174,7 @@ def preflight_merge_queue_result_record_authority(
     target_ref: str = "",
     target_head_before_merge: str = "",
     fence_token: str = "",
+    allow_route_gated_reclaimed_fence_without_token: bool = False,
 ) -> dict[str, Any]:
     """Validate live-apply result recording authority before mutating target refs."""
     ensure_branch_runtime_schema(conn)
@@ -10195,9 +10205,14 @@ def preflight_merge_queue_result_record_authority(
             context,
             result_status=result_status,
             fence_token=fence_token,
-            allow_route_gated_reclaimed_fence_without_token=False,
+            allow_route_gated_reclaimed_fence_without_token=(
+                allow_route_gated_reclaimed_fence_without_token
+            ),
             merge_commit="preflight-merge-commit"
             if result_status == STATE_MERGED
+            else "",
+            failure_reason="preflight-merge-failure"
+            if result_status == STATE_MERGE_FAILED
             else "",
             target_head_before_merge=before,
             target_head_after_merge="preflight-target-head"
@@ -14664,6 +14679,9 @@ def execute_merge_queue_item(
             or item.validated_target_head
         ),
         fence_token=fence_token,
+        allow_route_gated_reclaimed_fence_without_token=(
+            allow_route_gated_reclaimed_fence_without_token
+        ),
     )
 
     target_branch = _branch_name_from_ref(target_ref or item.target_ref)
@@ -14726,6 +14744,9 @@ def execute_merge_queue_item(
             target_head_before_merge=before_commit,
             target_head_after_merge=before_commit,
             fence_token=fence_token,
+            allow_route_gated_reclaimed_fence_without_token=(
+                allow_route_gated_reclaimed_fence_without_token
+            ),
             now_iso=now_iso,
         )
         return {
@@ -14750,6 +14771,9 @@ def execute_merge_queue_item(
         target_head_before_merge=before_commit,
         target_head_after_merge=merge_commit,
         fence_token=fence_token,
+        allow_route_gated_reclaimed_fence_without_token=(
+            allow_route_gated_reclaimed_fence_without_token
+        ),
         now_iso=now_iso,
     )
     return {
