@@ -652,6 +652,28 @@ def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
         "workspace_root": {"type": "string"},
         "target_ref": {"type": "string"},
         "evidence": {"type": "object"},
+        "runtime_context_id": {"type": "string"},
+        "parent_task_id": {"type": "string"},
+        "checkpoint_id": {
+            "type": "string",
+            "description": "Worker finish-gate checkpoint id copied into merge_gate_evidence.",
+        },
+        "finish_gate_ref": {
+            "type": "string",
+            "description": "Accepted runtime_context.finish_gate timeline ref for merge gate evidence.",
+        },
+        "verification_event_refs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Independent QA verification event refs required before live merge.",
+        },
+        "graph_trace_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Worker-owned graph query trace ids used by the finish gate.",
+        },
+        "route_action_precheck_event_ref": {"type": "string"},
+        "close_ready_event_ref": {"type": "string"},
         "qa_evidence": {
             "type": "object",
             "description": "Copied into evidence.qa_evidence for live merge evidence records.",
@@ -703,10 +725,28 @@ def _parallel_branch_merge_queue_materialize_schema_properties() -> dict[str, An
         "validated_target_head": {"type": "string"},
         "validation_attempt": {"type": "integer"},
         "merge_preview_id": {"type": "string"},
+        "runtime_context_id": {"type": "string"},
+        "parent_task_id": {"type": "string"},
         "checkpoint_id": {
             "type": "string",
             "description": "Worker finish-gate checkpoint id; required when require_finish_gate is true.",
         },
+        "finish_gate_ref": {
+            "type": "string",
+            "description": "Accepted runtime_context.finish_gate timeline ref.",
+        },
+        "verification_event_refs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Independent QA verification event refs required before materialized merge.",
+        },
+        "graph_trace_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Worker-owned graph query trace ids used by finish evidence.",
+        },
+        "route_action_precheck_event_ref": {"type": "string"},
+        "close_ready_event_ref": {"type": "string"},
         "require_finish_gate": {
             "type": "boolean",
             "description": "Defaults to true when checkpoint_id is provided.",
@@ -778,6 +818,8 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "contract_execution_id",
         "active_contract_execution_id",
         "fence_token",
+        "runtime_context_id",
+        "parent_task_id",
         "route_token",
         "route_token_ref",
         "route_waiver",
@@ -788,13 +830,31 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "actor",
         "contract_actor",
     }
+    merge_evidence_keys = {
+        "checkpoint_id",
+        "finish_gate_ref",
+        "verification_event_refs",
+        "graph_trace_ids",
+        "route_action_precheck_event_ref",
+        "close_ready_event_ref",
+    }
     body = {
         key: value
         for key, value in args.items()
-        if key in allowed_keys and value is not None
+        if key in allowed_keys and key not in merge_evidence_keys and value is not None
     }
     if body.get("backlog_id") and not body.get("bug_id"):
         body["bug_id"] = body["backlog_id"]
+    merge_gate_evidence = {
+        key: args[key]
+        for key in merge_evidence_keys
+        if key in args and args[key] is not None
+    }
+    if merge_gate_evidence:
+        evidence = body.get("evidence") if isinstance(body.get("evidence"), dict) else {}
+        evidence = dict(evidence)
+        evidence.setdefault("merge_gate_evidence", merge_gate_evidence)
+        body["evidence"] = evidence
     if args.get("qa_evidence") is not None:
         evidence = body.get("evidence") if isinstance(body.get("evidence"), dict) else {}
         evidence = dict(evidence)
@@ -815,7 +875,14 @@ def _parallel_branch_merge_queue_materialize_body(args: dict) -> dict:
         "validated_target_head",
         "validation_attempt",
         "merge_preview_id",
+        "runtime_context_id",
+        "parent_task_id",
         "checkpoint_id",
+        "finish_gate_ref",
+        "verification_event_refs",
+        "graph_trace_ids",
+        "route_action_precheck_event_ref",
+        "close_ready_event_ref",
         "require_finish_gate",
         "worker_role",
         "status",
