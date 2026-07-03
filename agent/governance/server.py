@@ -10957,6 +10957,61 @@ def _runtime_context_worker_guide_response(
             or branch_view.get("agent_id")
             or ""
         ),
+        allocation_owner=str(
+            graph_identity.get("allocation_owner")
+            or task.get("allocation_owner")
+            or task.get("observer_allocation_owner")
+            or worker_view.get("allocation_owner")
+            or worker_view.get("observer_allocation_owner")
+            or branch_view.get("allocation_owner")
+            or branch_view.get("observer_allocation_owner")
+            or ""
+        ),
+        actual_host_worker_id=str(
+            graph_identity.get("actual_host_worker_id")
+            or task.get("actual_host_worker_id")
+            or worker_view.get("actual_host_worker_id")
+            or branch_view.get("actual_host_worker_id")
+            or ""
+        ),
+        worker_session_id=str(
+            graph_identity.get("worker_session_id")
+            or task.get("worker_session_id")
+            or worker_view.get("worker_session_id")
+            or branch_view.get("worker_session_id")
+            or finish_attestation_hint.get("worker_session_id")
+            or ""
+        ),
+        worker_transcript_ref=str(
+            graph_identity.get("worker_transcript_ref")
+            or task.get("worker_transcript_ref")
+            or worker_view.get("worker_transcript_ref")
+            or branch_view.get("worker_transcript_ref")
+            or finish_attestation_hint.get("worker_transcript_ref")
+            or ""
+        ),
+        worker_transcript_path=str(
+            graph_identity.get("worker_transcript_path")
+            or task.get("worker_transcript_path")
+            or worker_view.get("worker_transcript_path")
+            or branch_view.get("worker_transcript_path")
+            or finish_attestation_hint.get("worker_transcript_path")
+            or ""
+        ),
+        host_startup_id=str(
+            graph_identity.get("host_startup_id")
+            or task.get("host_startup_id")
+            or worker_view.get("host_startup_id")
+            or branch_view.get("host_startup_id")
+            or ""
+        ),
+        host_session_id=str(
+            graph_identity.get("host_session_id")
+            or task.get("host_session_id")
+            or worker_view.get("host_session_id")
+            or branch_view.get("host_session_id")
+            or ""
+        ),
         branch_ref=str(
             graph_identity.get("branch_ref")
             or task.get("branch_ref")
@@ -11523,6 +11578,13 @@ def _runtime_context_worker_recovery_payloads(
     target_project_root: str,
     backlog_id: str = "",
     agent_id: str = "",
+    allocation_owner: str = "",
+    actual_host_worker_id: str = "",
+    worker_session_id: str = "",
+    worker_transcript_ref: str = "",
+    worker_transcript_path: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
     branch_ref: str = "",
     base_commit: str = "",
     target_head_commit: str = "",
@@ -11587,6 +11649,15 @@ def _runtime_context_worker_recovery_payloads(
         f"{runtime_context_id}/session-token/rejoin"
     )
     normalized_agent_id = str(agent_id or worker_slot_id or worker_id or "").strip()
+    normalized_allocation_owner = str(
+        allocation_owner or normalized_agent_id or worker_slot_id or worker_id or ""
+    ).strip()
+    normalized_actual_host_worker_id = str(actual_host_worker_id or "").strip()
+    normalized_worker_session_id = str(worker_session_id or "").strip()
+    normalized_worker_transcript_ref = str(worker_transcript_ref or "").strip()
+    normalized_worker_transcript_path = str(worker_transcript_path or "").strip()
+    normalized_host_startup_id = str(host_startup_id or "").strip()
+    normalized_host_session_id = str(host_session_id or "").strip()
     normalized_branch_ref = str(branch_ref or "").strip()
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
@@ -11622,6 +11693,76 @@ def _runtime_context_worker_recovery_payloads(
             "request_runtime_context_rejoin_host_envelope"
         ),
     }
+    worker_identity_pointers = {
+        "schema_version": "runtime_context.worker_identity_pointers.v1",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": normalized_agent_id,
+        "allocation_owner": normalized_allocation_owner,
+        "observer_allocation_owner": normalized_allocation_owner,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "worker_session_id": normalized_worker_session_id,
+        "worker_transcript_ref": normalized_worker_transcript_ref,
+        "worker_transcript_path": normalized_worker_transcript_path,
+        "host_startup_id": normalized_host_startup_id,
+        "host_session_id": normalized_host_session_id,
+        "copy_safe": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+    }
+    session_token_initial_join_submission = {
+        "schema_version": "runtime_context.session_token_initial_join_submission.v1",
+        "action": "request_runtime_context_initial_join_host_envelope",
+        "method": "POST",
+        "path": initial_join_path,
+        "body_source": "copy_safe_body",
+        "body": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "agent_id": normalized_agent_id,
+            "allocation_owner": normalized_allocation_owner,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "worker_session_id": normalized_worker_session_id,
+            **safe_route_identity,
+            "reason": "<operator reason: host adapter needs first worker auth env>",
+            "ttl_seconds": 3600,
+        },
+        "copy_safe_body": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "agent_id": normalized_agent_id,
+            "allocation_owner": normalized_allocation_owner,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "worker_session_id": normalized_worker_session_id,
+            **safe_route_identity,
+            "reason": "<operator reason: host adapter needs first worker auth env>",
+            "ttl_seconds": 3600,
+        },
+        "valid_when_lineage_missing": [
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+        ],
+        "required_before_worker_evidence": [
+            "inject host_envelope env into the real mf_sub worker",
+            "worker submits read receipt",
+            "worker records startup",
+        ],
+        "worker_identity_pointers": dict(worker_identity_pointers),
+        "security_boundary": {
+            "session_token_ref_alone_authorizes_writes": False,
+            "raw_tokens_persisted_to_timeline": False,
+            "observer_authors_worker_evidence": False,
+            "delivery": "worker_host_envelope",
+        },
+    }
     session_token_rejoin_submission = {
         "schema_version": "runtime_context.session_token_rejoin_submission.v1",
         "action": "request_runtime_context_rejoin_host_envelope",
@@ -11633,6 +11774,13 @@ def _runtime_context_worker_recovery_payloads(
             "task_id": task_id,
             "parent_task_id": parent_task_id,
             "target_project_root": target_project_root,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "agent_id": normalized_agent_id,
+            "allocation_owner": normalized_allocation_owner,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "worker_session_id": normalized_worker_session_id,
+            **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
         },
@@ -11641,6 +11789,13 @@ def _runtime_context_worker_recovery_payloads(
             "task_id": task_id,
             "parent_task_id": parent_task_id,
             "target_project_root": target_project_root,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "agent_id": normalized_agent_id,
+            "allocation_owner": normalized_allocation_owner,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "worker_session_id": normalized_worker_session_id,
+            **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
         },
@@ -11654,6 +11809,7 @@ def _runtime_context_worker_recovery_payloads(
             "observer_authors_worker_evidence": False,
             "delivery": "worker_host_envelope",
         },
+        "worker_identity_pointers": dict(worker_identity_pointers),
     }
     session_token_reissue_body = {
         "runtime_context_id": runtime_context_id,
@@ -11698,6 +11854,7 @@ def _runtime_context_worker_recovery_payloads(
         "session_token_ref_alone_authorizes_writes": False,
         "preferred_for_live_worker": "session_token_reissue_submission",
         "observer_recovery_when_raw_auth_lost": "session_token_rejoin_submission",
+        "initial_join": session_token_initial_join_submission,
         "reissue": session_token_reissue_submission,
         "rejoin": session_token_rejoin_submission,
         "raw_session_token_exposed": False,
@@ -11876,6 +12033,10 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "agent_id": normalized_agent_id or "<assigned worker agent_id>",
+        "allocation_owner": normalized_allocation_owner or "<allocation owner>",
+        "observer_allocation_owner": (
+            normalized_allocation_owner or "<allocation owner>"
+        ),
         "branch": normalized_branch_ref or "<assigned worker branch>",
         "branch_ref": normalized_branch_ref or "<assigned worker branch>",
         "base_commit": normalized_base_commit or "<assigned base commit>",
@@ -11890,14 +12051,25 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": fence_token_placeholder,
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
-        "worker_session_id": "<actual worker-owned session id>",
-        "worker_transcript_ref": "<host transcript ref, e.g. codex:<session-id>>",
-        "worker_transcript_path": "<local transcript path if available>",
+        "worker_session_id": (
+            normalized_worker_session_id or "<actual worker-owned session id>"
+        ),
+        "worker_transcript_ref": (
+            normalized_worker_transcript_ref
+            or "<host transcript ref, e.g. codex:<session-id>>"
+        ),
+        "worker_transcript_path": (
+            normalized_worker_transcript_path
+            or "<local transcript path if available>"
+        ),
         "harness_type": "codex",
         "filer_principal": "<actual worker principal filing startup>",
-        "actual_host_worker_id": "<actual host-created worker/session id>",
-        "host_startup_id": "<host startup event/thread id>",
-        "host_session_id": "<host session id>",
+        "actual_host_worker_id": (
+            normalized_actual_host_worker_id
+            or "<actual host-created worker/session id>"
+        ),
+        "host_startup_id": normalized_host_startup_id or "<host startup event/thread id>",
+        "host_session_id": normalized_host_session_id or "<host session id>",
         "actual_cwd": target_project_root,
         "actual_git_root": target_project_root,
         "head_commit": "<worker worktree HEAD after launch>",
@@ -11907,6 +12079,7 @@ def _runtime_context_worker_recovery_payloads(
         ),
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
+        "worker_identity_pointers": dict(worker_identity_pointers),
         **safe_route_identity,
     }
     startup_payload = {
@@ -11918,6 +12091,12 @@ def _runtime_context_worker_recovery_payloads(
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
             "agent_id": normalized_agent_id,
+            "allocation_owner": normalized_allocation_owner,
+            "observer_allocation_owner": normalized_allocation_owner,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
+            "worker_session_id": normalized_worker_session_id,
+            "host_startup_id": normalized_host_startup_id,
+            "host_session_id": normalized_host_session_id,
             "branch": normalized_branch_ref,
             "branch_ref": normalized_branch_ref,
             "base_commit": normalized_base_commit,
@@ -11933,6 +12112,7 @@ def _runtime_context_worker_recovery_payloads(
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
             "required_real_worker_identity_fields": startup_identity_required_fields,
+            "worker_identity_pointers": dict(worker_identity_pointers),
             **safe_route_identity,
         }
     }
@@ -12119,6 +12299,13 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "agent_id": normalized_agent_id,
+        "allocation_owner": normalized_allocation_owner,
+        "observer_allocation_owner": normalized_allocation_owner,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "worker_session_id": normalized_worker_session_id,
+        "host_startup_id": normalized_host_startup_id,
+        "host_session_id": normalized_host_session_id,
+        "worker_identity_pointers": worker_identity_pointers,
         "branch": normalized_branch_ref,
         "branch_ref": normalized_branch_ref,
         "base_commit": normalized_base_commit,
@@ -12369,6 +12556,7 @@ def _runtime_context_worker_recovery_payloads(
             },
         },
         "session_token_rejoin_submission": session_token_rejoin_submission,
+        "session_token_initial_join_submission": session_token_initial_join_submission,
         "session_token_reissue_submission": session_token_reissue_submission,
     }
 
@@ -12799,6 +12987,16 @@ def _runtime_context_worker_recovery_details(
             ),
             target_project_root=expected_target_root,
             agent_id=str(getattr(context, "agent_id", "") or ""),
+            allocation_owner=str(
+                getattr(context, "allocation_owner", "")
+                or getattr(context, "agent_id", "")
+                or ""
+            ),
+            actual_host_worker_id=str(
+                getattr(context, "actual_host_worker_id", "") or ""
+            ),
+            host_startup_id=str(getattr(context, "host_startup_id", "") or ""),
+            host_session_id=str(getattr(context, "host_session_id", "") or ""),
             branch_ref=str(getattr(context, "branch_ref", "") or ""),
             base_commit=str(getattr(context, "base_commit", "") or ""),
             target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
@@ -12813,6 +13011,7 @@ def _runtime_context_worker_recovery_details(
                 session_token_initial_join_submission
             )
         if session_token_rejoin_submission:
+            actionable_payloads.pop("session_token_initial_join_submission", None)
             actionable_payloads["session_token_rejoin_submission"] = (
                 session_token_rejoin_submission
             )

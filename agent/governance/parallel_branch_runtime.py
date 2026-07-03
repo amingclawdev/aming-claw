@@ -11935,6 +11935,105 @@ def _startup_refusal_timeline_event(
             missing=missing,
             identity_fields=startup_identity_fields,
         )
+        token_evidence_type = str(
+            (token_evidence or {}).get("session_token_evidence_type") or ""
+        )
+        only_copy_safe_session_ref = bool(
+            str(payload.get("session_token_ref") or "").strip()
+            and not str(payload.get("session_token") or "").strip()
+        )
+        startup_surface_missing = bool(
+            {
+                "actual_host_worker_id",
+                "worker_session_id",
+                "host_startup_id",
+                "host_session_id",
+                "session_token_surrogate_or_host_startup_id",
+            }.intersection(missing)
+        )
+        join_before_startup: dict[str, Any] = {}
+        if only_copy_safe_session_ref and startup_surface_missing:
+            join_action = (
+                "request_runtime_context_rejoin_host_envelope"
+                if worker_session_id
+                else "request_runtime_context_initial_join_host_envelope"
+            )
+            join_path_suffix = (
+                "session-token/rejoin"
+                if join_action == "request_runtime_context_rejoin_host_envelope"
+                else "session-token/initial-join"
+            )
+            join_before_startup = {
+                "schema_version": "mf_subagent_startup_join_before_retry.v1",
+                "action": join_action,
+                "tool": (
+                    "runtime_context_session_token_rejoin"
+                    if join_action == "request_runtime_context_rejoin_host_envelope"
+                    else "runtime_context_session_token_initial_join"
+                ),
+                "reason": (
+                    "startup has only a copy-safe session_token_ref and is missing "
+                    "truthful host worker/session surface"
+                ),
+                "path": (
+                    "/api/graph-governance/{project_id}/runtime-contexts/"
+                    f"{runtime_context_id}/{join_path_suffix}"
+                ),
+                "copy_safe_body": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id or str(payload.get("task_id") or ""),
+                    "parent_task_id": str(
+                        payload.get("parent_task_id")
+                        or (context.root_task_id if context is not None else "")
+                        or ""
+                    ),
+                    "target_project_root": str(
+                        payload.get("target_project_root")
+                        or (context.target_project_root if context is not None else "")
+                        or (context.worktree_path if context is not None else "")
+                        or ""
+                    ),
+                    "worker_id": str(payload.get("worker_id") or "").strip(),
+                    "worker_slot_id": str(
+                        payload.get("worker_slot_id")
+                        or (context.worker_slot_id if context is not None else "")
+                        or (context.worker_id if context is not None else "")
+                        or ""
+                    ).strip(),
+                    "agent_id": agent_id,
+                    "allocation_owner": allocation_owner,
+                    "actual_host_worker_id": actual_host_worker_id,
+                    "worker_session_id": worker_session_id,
+                    **route_identity,
+                    "reason": (
+                        "<operator reason: host envelope required before retrying "
+                        "parallel_branch_startup>"
+                    ),
+                    "ttl_seconds": 3600,
+                },
+                "then": {
+                    "action": "retry_parallel_branch_startup_with_host_envelope",
+                    "tool": "parallel_branch_startup",
+                    "copyable_retry_payload": retry_template,
+                },
+                "security_boundary": {
+                    "session_token_ref_alone_authorizes_writes": False,
+                    "raw_tokens_persisted_to_timeline": False,
+                    "observer_authors_worker_evidence": False,
+                    "delivery": "worker_host_envelope",
+                },
+            }
+            next_action["action"] = join_action
+            next_action["tool"] = join_before_startup["tool"]
+            next_action["description"] = (
+                "Request a runtime-context host envelope first, inject it into "
+                "the real mf_sub worker, then retry parallel_branch_startup with "
+                "the returned worker/session identity. Do not paste a raw token "
+                "or treat session_token_ref as the worker session."
+            )
+            next_action["startup_retry_after_join"] = join_before_startup["then"]
+            next_action["join_before_parallel_branch_startup"] = join_before_startup
+            next_action["session_token_evidence_type"] = token_evidence_type
         next_action.update(
             {
                 "canonical_retry_payload_source": (
