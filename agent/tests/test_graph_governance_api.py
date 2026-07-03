@@ -13721,6 +13721,138 @@ def test_parallel_branch_merge_execute_preflights_fence_before_live_writer(
     ).stdout.strip() == main_head
 
 
+def test_parallel_branch_merge_execute_accepts_parent_route_for_reclaimed_context_without_raw_fence(
+    conn, tmp_path
+):
+    repo = _git_repo(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature-parent-route-live"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "parent-route-live.txt").write_text("parent route live\n", encoding="utf-8")
+    subprocess.run(["git", "add", "parent-route-live.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "parent route live branch"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    parent_task_id = "parent-route-live-merge"
+    child_task_id = f"{parent_task_id}:worker:1"
+    queue_id = "mergeq-api-execute-parent-route"
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=parent_task_id,
+        task_id=parent_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["timeline:finish-gate", "timeline:independent-qa"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-execute-parent-route",
+            backlog_id=parent_task_id,
+            root_task_id=parent_task_id,
+            task_id=child_task_id,
+            branch_ref="feature-parent-route-live",
+            status="reclaimable",
+            fence_token="fence-parent-route-live-reclaimed",
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T08:34:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-execute-parent-route",
+                task_id=child_task_id,
+                branch_ref="feature-parent-route-live",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="feature-parent-route-live",
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-execute-parent-route",
+                projection_id="semproj-execute-parent-route",
+            )
+        ],
+        now_iso="2026-05-17T08:34:00Z",
+    )
+    conn.commit()
+
+    live = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "queue_item_id": "item-execute-parent-route",
+                "target_ref": "main",
+                "task_id": child_task_id,
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "route_token_ref": issued["route_token_ref"],
+                "message": "merge feature-parent-route-live",
+                "bug_id": parent_task_id,
+                "now_iso": "2026-05-17T08:35:00Z",
+            },
+        )
+    )
+
+    gate = live["route_token_gate"]
+    assert live["ok"] is True
+    assert live["executed"] is True
+    assert gate["action"] == "merge_execute"
+    assert gate["authorized_action"] == "close_or_merge_after_evidence"
+    assert gate["parent_task_scope_accepted"] is True
+    assert live["recorded"]["queue_item"]["status"] == "merged"
+    assert live["recorded"]["context"]["status"] == "merged"
+    assert live["recorded"]["context"]["task_id"] == child_task_id
+    assert (repo / "parent-route-live.txt").read_text(encoding="utf-8") == (
+        "parent route live\n"
+    )
+
+
 def test_parallel_branch_merge_result_route_records_with_fence(conn):
     queue_id = "mergeq-api-result"
     upsert_branch_context(
