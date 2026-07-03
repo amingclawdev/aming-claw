@@ -3102,6 +3102,69 @@ def _observer_session_route_token_checklist(
     }
 
 
+def _copy_safe_route_token_scope_payload(
+    *,
+    schema_version: str,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str = "",
+    status: str = "",
+    purpose: str = "",
+    task_id_source: str = "",
+    aliases: Sequence[str] | None = None,
+    allowed_actions: Sequence[str] | None = None,
+    issue_payload: Mapping[str, Any] | None = None,
+    renewal: Mapping[str, Any] | None = None,
+    observer_session_route_token_checklist: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    ref = str(route_token_ref or "").strip()
+    scope = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+    }
+    payload: dict[str, Any] = {
+        "schema_version": schema_version,
+        "status": str(status or ("current_ref_present" if ref else "issue_required")),
+        "purpose": str(purpose or "").strip(),
+        "route_token_ref": ref,
+        "route_token_ref_present": bool(ref),
+        "scope": scope,
+        "task_id_source": str(task_id_source or "").strip(),
+        "pass_ref_to_next_runtime_writes_as": [
+            str(alias).strip()
+            for alias in (aliases or ("route_token_ref",))
+            if str(alias or "").strip()
+        ],
+        "allowed_actions": [
+            str(action).strip()
+            for action in (allowed_actions or [])
+            if str(action or "").strip()
+        ],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "raw_route_token_persisted": False,
+        "copy_rule": (
+            "Pass only route_token_ref/observer_route_token_ref; never paste a "
+            "raw route token into guide, timeline, or merge evidence payloads."
+        ),
+    }
+    if isinstance(issue_payload, Mapping) and issue_payload:
+        payload["observer_route_context_issue_payload"] = dict(issue_payload)
+    if isinstance(renewal, Mapping) and renewal:
+        payload["renewal"] = dict(renewal)
+        payload["route_token_ref_renewal"] = dict(renewal)
+    if (
+        isinstance(observer_session_route_token_checklist, Mapping)
+        and observer_session_route_token_checklist
+    ):
+        payload["observer_session_route_token_checklist"] = dict(
+            observer_session_route_token_checklist
+        )
+    return payload
+
+
 def _direct_fix_topology_guidance() -> dict[str, Any]:
     return {
         "schema_version": "onboard_route_guide.direct_fix_topology_guidance.v1",
@@ -9097,6 +9160,7 @@ def _runtime_context_projection_response(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
+        backlog_id=str(getattr(context, "backlog_id", "") or ""),
         parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         worker_id=str(
             worker_view_for_summary.get("worker_id")
@@ -10844,6 +10908,7 @@ def _runtime_context_worker_guide_response(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
         task_id=task_id,
+        backlog_id=str(task.get("backlog_id") or worker_view.get("backlog_id") or ""),
         parent_task_id=parent_task_id,
         worker_id=worker_id,
         worker_slot_id=worker_slot_id,
@@ -10944,6 +11009,18 @@ def _runtime_context_worker_guide_response(
         "raw_session_token_exposed": False,
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
+        "copy_safe_route_token_scope": actionable_payloads.get(
+            "copy_safe_route_token_scope",
+            {},
+        ),
+        "merge_gate_evidence_payloads": actionable_payloads.get(
+            "merge_gate_evidence_payloads",
+            {},
+        ),
+        "session_renewal_hints": actionable_payloads.get(
+            "session_renewal_hints",
+            {},
+        ),
         "next_legal_action": next_legal_action,
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
@@ -10995,6 +11072,18 @@ def _runtime_context_worker_guide_response(
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,
+            "copy_safe_route_token_scope": actionable_payloads.get(
+                "copy_safe_route_token_scope",
+                {},
+            ),
+            "merge_gate_evidence_payloads": actionable_payloads.get(
+                "merge_gate_evidence_payloads",
+                {},
+            ),
+            "session_renewal_hints": actionable_payloads.get(
+                "session_renewal_hints",
+                {},
+            ),
             "worker_session_lifecycle_policy": actionable_payloads.get(
                 "worker_session_lifecycle_policy",
                 {},
@@ -11395,6 +11484,7 @@ def _runtime_context_worker_recovery_payloads(
     worker_id: str,
     worker_slot_id: str,
     target_project_root: str,
+    backlog_id: str = "",
     agent_id: str = "",
     branch_ref: str = "",
     base_commit: str = "",
@@ -11451,6 +11541,10 @@ def _runtime_context_worker_recovery_payloads(
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/implementation-evidence"
     )
+    reissue_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token/reissue"
+    )
     rejoin_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/session-token/rejoin"
@@ -11460,6 +11554,7 @@ def _runtime_context_worker_recovery_payloads(
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
     normalized_merge_queue_id = str(merge_queue_id or "").strip()
+    normalized_backlog_id = str(backlog_id or "").strip()
     worker_session_lifecycle_policy = {
         "schema_version": "runtime_context.worker_session_lifecycle_policy.v1",
         "startup_and_implementation_same_live_session_required": True,
@@ -11523,6 +11618,72 @@ def _runtime_context_worker_recovery_payloads(
             "delivery": "worker_host_envelope",
         },
     }
+    session_token_reissue_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "reason": "<worker reason: renew long-running mf_sub session>",
+        "ttl_seconds": 3600,
+    }
+    session_token_reissue_submission = {
+        "schema_version": "runtime_context.session_token_reissue_submission.v1",
+        "action": "session_token_reissue",
+        "semantic_next_action": "session_token_reissue",
+        "method": "POST",
+        "path": reissue_path,
+        "body_source": "copy_safe_body",
+        "body": dict(session_token_reissue_body),
+        "copy_safe_body": dict(session_token_reissue_body),
+        "required_current_lineage": [
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "fence_token",
+            "session_token or session_token_ref",
+            "target_project_root",
+        ],
+        "security_boundary": {
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "raw_tokens_persisted_to_timeline": False,
+        },
+    }
+    session_renewal_hints = {
+        "schema_version": "runtime_context.session_renewal_hints.v1",
+        "session_token_ref": session_token_ref_placeholder,
+        "session_token_ref_available": bool(context_session_token_ref),
+        "session_token_ref_alone_authorizes_writes": False,
+        "preferred_for_live_worker": "session_token_reissue_submission",
+        "observer_recovery_when_raw_auth_lost": "session_token_rejoin_submission",
+        "reissue": session_token_reissue_submission,
+        "rejoin": session_token_rejoin_submission,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+    }
+    copy_safe_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="runtime_context.worker_copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=normalized_backlog_id or "<current worker backlog_id>",
+        task_id=task_id,
+        route_token_ref=safe_route_identity.get("route_token_ref", ""),
+        status="current_worker_route_identity",
+        purpose="worker runtime-context evidence writes",
+        task_id_source="runtime_context.task_id",
+        aliases=["route_token_ref"],
+        allowed_actions=[
+            "runtime_context_read_receipt",
+            "runtime_context_startup",
+            "runtime_context_implementation_evidence",
+            "runtime_context_finish_gate",
+            "task_timeline_append",
+        ],
+    )
     canonical_context_receipt_template = {
         "schema_version": "contract_context_read_receipt.v1",
         "event_kind": "contract_context_read_receipt",
@@ -11797,6 +11958,111 @@ def _runtime_context_worker_recovery_payloads(
         "tests": "copy_safe_body.tests",
         "route_token_ref": "copy_safe_body.route_token_ref",
     }
+    merge_materialize_body = {
+        "project_id": project_id,
+        "merge_queue_id": (
+            normalized_merge_queue_id
+            or "<runtime_context.current_values.merge_queue_id>"
+        ),
+        "task_id": task_id,
+        "backlog_id": normalized_backlog_id or "<current worker backlog_id>",
+        "checkpoint_id": "<finish-gate checkpoint_id>",
+        "require_finish_gate": True,
+        "worker_role": "mf_sub",
+        "status": "review_ready",
+        "fence_token": fence_token_placeholder,
+        "route_token_ref": safe_route_identity.get(
+            "route_token_ref",
+            "<root close_or_merge_after_evidence route_token_ref>",
+        ),
+    }
+    merge_apply_body = {
+        "project_id": project_id,
+        "merge_queue_id": (
+            normalized_merge_queue_id
+            or "<runtime_context.current_values.merge_queue_id>"
+        ),
+        "task_id": task_id,
+        "branch_ref": normalized_branch_ref or "<worker branch_ref>",
+        "target_ref": "refs/heads/main",
+        "dry_run": True,
+        "allow_target_ref_mutation": False,
+        "fence_token": fence_token_placeholder,
+        "route_token_ref": safe_route_identity.get(
+            "route_token_ref",
+            "<root close_or_merge_after_evidence route_token_ref>",
+        ),
+        "evidence": {
+            "schema_version": "runtime_context.merge_gate_evidence.v1",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": normalized_backlog_id or "<current worker backlog_id>",
+            "merge_queue_id": (
+                normalized_merge_queue_id
+                or "<runtime_context.current_values.merge_queue_id>"
+            ),
+            "checkpoint_id": "<finish-gate checkpoint_id>",
+            "finish_gate_ref": "<runtime_context.finish_gate timeline ref>",
+            "verification_event_refs": ["<independent QA timeline ref>"],
+            "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+            "route_token_scope_source": (
+                "mf_parallel.merge_route_scope_guidance.copy_safe_route_token_scope"
+            ),
+            "source_contract_execution_id": successor_contract_execution_id
+            or contract_execution_id
+            or parent_task_id,
+            "raw_route_token_persisted": False,
+        },
+    }
+    merge_gate_evidence_payloads = {
+        "schema_version": "runtime_context.merge_gate_evidence_payloads.v1",
+        "status": "copy_safe_templates",
+        "owner_role": "observer",
+        "worker_must_not_execute_merge": True,
+        "runtime_context_merge_queue_id_authoritative": True,
+        "merge_queue_id": normalized_merge_queue_id,
+        "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
+        "required_order": [
+            "mf_sub finish_time_worker_attestation",
+            "mf_sub finish_gate",
+            "independent QA verification",
+            "parallel_branch_merge_queue_materialize",
+            "parallel_branch_merge_queue_apply",
+        ],
+        "route_token_scope": dict(copy_safe_route_token_scope),
+        "materialize_merge_queue_item": {
+            "mcp_tool": "parallel_branch_merge_queue_materialize",
+            "method": "POST",
+            "path": (
+                f"/api/graph-governance/{project_id}/parallel-branches/"
+                "merge-queue/materialize"
+            ),
+            "body_source": "copy_safe_body",
+            "body": dict(merge_materialize_body),
+            "copy_safe_body": dict(merge_materialize_body),
+        },
+        "apply_merge_queue_item": {
+            "mcp_tool": "parallel_branch_merge_queue_apply",
+            "method": "POST",
+            "path": (
+                f"/api/graph-governance/{project_id}/parallel-branches/"
+                "merge-execute"
+            ),
+            "body_source": "copy_safe_body",
+            "body": dict(merge_apply_body),
+            "copy_safe_body": dict(merge_apply_body),
+            "live_mutation_requirements": [
+                "dry_run=false",
+                "allow_target_ref_mutation=true",
+                "root close_or_merge_after_evidence route_token_ref",
+                "finish_gate_ref",
+                "independent QA verification_event_refs",
+            ],
+        },
+        "raw_route_token_exposed": False,
+        "raw_route_token_persisted": False,
+    }
     return {
         "schema_version": "runtime_context.worker_recovery_payloads.v1",
         "project_id": project_id,
@@ -11815,12 +12081,15 @@ def _runtime_context_worker_recovery_payloads(
         "target_project_root": target_project_root,
         "route_identity": present_route_identity,
         "route_token_ref": safe_route_identity.get("route_token_ref", ""),
+        "copy_safe_route_token_scope": copy_safe_route_token_scope,
         "session_token_ref": session_token_ref,
         "session_token_ref_available": bool(context_session_token_ref),
         "fence_token_ref": fence_token_ref,
         "fence_token_hash": fence_token_hash,
+        "session_renewal_hints": session_renewal_hints,
         "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
         "write_authorization_policy": write_authorization_policy,
+        "merge_gate_evidence_payloads": merge_gate_evidence_payloads,
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
@@ -11847,6 +12116,13 @@ def _runtime_context_worker_recovery_payloads(
                 "facade": "runtime_context.session_token_initial_join",
                 "body_source": "session_token_initial_join_submission.copy_safe_body",
             },
+            "runtime_context_session_token_reissue": {
+                "method": "POST",
+                "path": reissue_path,
+                "tool": "runtime_context_session_token_reissue",
+                "facade": "runtime_context.session_token_reissue",
+                "body_source": "session_token_reissue_submission.copy_safe_body",
+            },
             "runtime_context_session_token_rejoin": {
                 "method": "POST",
                 "path": rejoin_path,
@@ -11861,6 +12137,30 @@ def _runtime_context_worker_recovery_payloads(
                 "facade": "runtime_context.implementation_evidence",
                 "body_source": (
                     "implementation_evidence_facade_payload_skeleton.copy_safe_body"
+                ),
+            },
+            "parallel_branch_merge_queue_materialize": {
+                "method": "POST",
+                "path": (
+                    f"/api/graph-governance/{project_id}/parallel-branches/"
+                    "merge-queue/materialize"
+                ),
+                "tool": "parallel_branch_merge_queue_materialize",
+                "body_source": (
+                    "merge_gate_evidence_payloads."
+                    "materialize_merge_queue_item.copy_safe_body"
+                ),
+            },
+            "parallel_branch_merge_queue_apply": {
+                "method": "POST",
+                "path": (
+                    f"/api/graph-governance/{project_id}/parallel-branches/"
+                    "merge-execute"
+                ),
+                "tool": "parallel_branch_merge_queue_apply",
+                "body_source": (
+                    "merge_gate_evidence_payloads."
+                    "apply_merge_queue_item.copy_safe_body"
                 ),
             },
         },
@@ -12023,6 +12323,7 @@ def _runtime_context_worker_recovery_payloads(
             },
         },
         "session_token_rejoin_submission": session_token_rejoin_submission,
+        "session_token_reissue_submission": session_token_reissue_submission,
     }
 
 
@@ -12442,6 +12743,7 @@ def _runtime_context_worker_recovery_details(
             project_id=project_id,
             runtime_context_id=expected_runtime_context_id,
             task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
             parent_task_id=expected_parent_task_id,
             worker_id=str(getattr(context, "worker_id", "") or ""),
             worker_slot_id=str(
@@ -42083,6 +42385,21 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         task_id=target_execution_id,
         route_token_ref=renewal_ref,
     )
+    copy_safe_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="onboard_route_guide.copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=target_execution_id,
+        route_token_ref=current_ref,
+        status=status,
+        purpose="current_contract_runtime_writes",
+        task_id_source="target_contract_execution_id",
+        aliases=pass_aliases,
+        allowed_actions=_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS,
+        issue_payload=issue_payload,
+        renewal=renewal_guidance,
+        observer_session_route_token_checklist=observer_route_checklist,
+    )
     if verified_ref:
         patched_next_action["route_token_ref"] = verified_ref
         patched_next_action["route_token_ref_status"] = status
@@ -42091,13 +42408,23 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
             "backlog_id": backlog_id,
             "task_id": target_execution_id,
         }
+        patched_next_action["copy_safe_route_token_scope"] = dict(
+            copy_safe_route_token_scope
+        )
     else:
         status = "issue_required_for_current_contract_runtime"
         pass_aliases = []
         current_ref = ""
+        copy_safe_route_token_scope["status"] = status
+        copy_safe_route_token_scope["route_token_ref"] = ""
+        copy_safe_route_token_scope["route_token_ref_present"] = False
+        copy_safe_route_token_scope["pass_ref_to_next_runtime_writes_as"] = []
         patched_next_action["route_token_ref"] = ""
         patched_next_action["route_token_ref_status"] = status
         patched_next_action["observer_route_context_issue_payload"] = issue_payload
+        patched_next_action["copy_safe_route_token_scope"] = dict(
+            copy_safe_route_token_scope
+        )
         if fallback_ref:
             patched_next_action["enter_only_route_token_ref"] = fallback_ref
             patched_next_action["enter_only_route_token_ref_binding"] = fallback_binding
@@ -42122,6 +42449,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         "renewal": renewal_guidance,
         "route_token_ref_renewal": renewal_guidance,
         "observer_session_route_token_checklist": observer_route_checklist,
+        "copy_safe_route_token_scope": copy_safe_route_token_scope,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -42137,6 +42465,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
 
     guidance["route_token_ref"] = current_ref
     guidance["route_token_ref_present"] = bool(current_ref)
+    guidance["copy_safe_route_token_scope"] = copy_safe_route_token_scope
     guidance["route_token_issue"] = {
         "schema_version": "onboard_contract.route_token_issue_guidance.v1",
         "status": "current_ref_present" if current_ref else status,
@@ -42149,6 +42478,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
         "observer_route_context_issue_payload": issue_payload,
         "renewal": renewal_guidance,
         "observer_session_route_token_checklist": observer_route_checklist,
+        "copy_safe_route_token_scope": copy_safe_route_token_scope,
         "scope": {
             "project_id": project_id,
             "backlog_id": backlog_id,
@@ -42172,6 +42502,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     if isinstance(route_guide, dict):
         route_guide["route_token_ref"] = current_ref
         route_guide["route_token_ref_present"] = bool(current_ref)
+        route_guide["copy_safe_route_token_scope"] = copy_safe_route_token_scope
         _onboard_route_guide_patch_next_action(
             route_guide,
             target_contract_execution_id=target_execution_id,
@@ -46515,8 +46846,9 @@ def _mf_parallel_successor_runtime_enter(
         "raw_route_token_exposed": False,
         "pass_ref_to_next_runtime_write": bool(successor_route_ref),
     }
+    child_issue_payload: dict[str, Any] = {}
     if not successor_route_ref:
-        issue_payload = _contract_runtime_route_token_issue_payload(
+        child_issue_payload = _contract_runtime_route_token_issue_payload(
             project_id=project_id,
             backlog_id=backlog_id,
             contract_execution_id=successor_execution_id,
@@ -46533,9 +46865,22 @@ def _mf_parallel_successor_runtime_enter(
             {
                 "status": "issue_required_for_current_contract_runtime",
                 "enter_only_route_token_ref": route_token_ref,
-                "observer_route_context_issue_payload": issue_payload,
+                "observer_route_context_issue_payload": child_issue_payload,
             }
         )
+    child_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="mf_parallel.child_copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=successor_execution_id,
+        route_token_ref=successor_route_ref,
+        status=str(route_token_ref_guidance.get("status") or ""),
+        purpose="current child mf_parallel contract runtime writes",
+        task_id_source="successor_contract_execution_id",
+        aliases=["observer_route_token_ref", "route_token_ref"],
+        allowed_actions=_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS,
+        issue_payload=child_issue_payload,
+    )
     root_close_route_issue_payload = {
         "project_id": project_id,
         "caller_role": "observer",
@@ -46557,6 +46902,19 @@ def _mf_parallel_successor_runtime_enter(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    root_close_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="mf_parallel.merge_copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=root_execution_id,
+        route_token_ref="",
+        status="issue_required_for_root_close_or_merge",
+        purpose="root-scope close_or_merge_after_evidence route authorization",
+        task_id_source="root_contract_execution_id",
+        aliases=["route_token_ref"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        issue_payload=root_close_route_issue_payload,
+    )
     merge_route_scope_guidance = {
         "schema_version": "mf_parallel.merge_route_scope_guidance.v1",
         "successor_contract_execution_id": successor_execution_id,
@@ -46570,6 +46928,7 @@ def _mf_parallel_successor_runtime_enter(
         "close_or_merge_after_evidence_route_issue_shape": (
             root_close_route_issue_payload
         ),
+        "copy_safe_route_token_scope": root_close_route_token_scope,
         "copy_safe_route_token_ref_only": True,
         "message": (
             "Use successor_contract_execution_id for child runtime lines. Issue "
@@ -46579,6 +46938,11 @@ def _mf_parallel_successor_runtime_enter(
     }
     successor_contract["merge_route_scope_guidance"] = merge_route_scope_guidance
     route_token_ref_guidance["merge_route_scope_guidance"] = merge_route_scope_guidance
+    route_token_ref_guidance["copy_safe_route_token_scope"] = child_route_token_scope
+    route_token_ref_guidance["copy_safe_route_token_scopes"] = {
+        "child_runtime_writes": child_route_token_scope,
+        "root_close_or_merge_after_evidence": root_close_route_token_scope,
+    }
     current_projection = upsert_contract_chain_successor_binding(
         conn,
         parent_record=parent_record,
@@ -46603,6 +46967,10 @@ def _mf_parallel_successor_runtime_enter(
         "route_token_ref": response_route_ref,
         "route_token_ref_guidance": route_token_ref_guidance,
         "merge_route_scope_guidance": merge_route_scope_guidance,
+        "copy_safe_route_token_scopes": {
+            "child_runtime_writes": child_route_token_scope,
+            "root_close_or_merge_after_evidence": root_close_route_token_scope,
+        },
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {
             "required": True,
