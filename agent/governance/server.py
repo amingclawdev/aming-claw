@@ -38492,8 +38492,7 @@ def _contract_runtime_contexts_for_dispatch_line(
     contexts: list[Any] = []
     seen: set[str] = set()
     for candidate in _contract_runtime_mapping_candidates(line):
-        if _contract_runtime_mapping_worker_role(candidate) != "mf_sub":
-            continue
+        worker_role = _contract_runtime_mapping_worker_role(candidate)
         runtime_context_id = _contract_runtime_mapping_value(
             candidate,
             "runtime_context_id",
@@ -38503,6 +38502,12 @@ def _contract_runtime_contexts_for_dispatch_line(
             "task_id",
             "worker_task_id",
         )
+        if worker_role != "mf_sub" and not (
+            str(record.get("contract_id") or "").strip()
+            == MF_PARALLEL_RECORD_CONTRACT_ID
+            and (runtime_context_id or task_id)
+        ):
+            continue
         context = (
             get_branch_context_by_runtime_context_id(
                 conn,
@@ -39594,6 +39599,7 @@ def _contract_runtime_source_backed_dispatch_mapping_matches_context(
     task_id: str,
     parent_task_id: str,
     contract_execution_id: str,
+    parent_contract_execution_id: str = "",
     task_id_keys: tuple[str, ...] = ("task_id",),
 ) -> bool:
     expected_worker_ids = _contract_runtime_context_worker_identity_values(context)
@@ -39606,7 +39612,8 @@ def _contract_runtime_source_backed_dispatch_mapping_matches_context(
             != runtime_context_id
         ):
             continue
-        if _contract_runtime_mapping_worker_role(payload) != "mf_sub":
+        worker_role = _contract_runtime_mapping_worker_role(payload)
+        if worker_role and worker_role != "mf_sub":
             continue
 
         task_values = _contract_runtime_mapping_values(payload, *task_id_keys)
@@ -39624,12 +39631,25 @@ def _contract_runtime_source_backed_dispatch_mapping_matches_context(
             "successor_contract_execution_id",
             "parent_contract_execution_id",
         )
+        valid_contract_values = {
+            value
+            for value in (
+                contract_execution_id,
+                parent_task_id,
+                parent_contract_execution_id,
+            )
+            if value
+        }
         if contract_values and not all(
-            candidate in {contract_execution_id, parent_task_id}
+            candidate in valid_contract_values
             for candidate in contract_values
         ):
             continue
-        if not parent_values and parent_task_id != contract_execution_id:
+        if (
+            not parent_values
+            and parent_task_id != contract_execution_id
+            and parent_task_id != parent_contract_execution_id
+        ):
             continue
 
         worker_values = set(
@@ -39699,6 +39719,11 @@ def _contract_runtime_dispatch_line_match(
 
     contract_id = str(record.get("contract_id") or "").strip()
     contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    parent_contract_execution_id = str(
+        record.get("parent_contract_execution_id")
+        or record.get("root_contract_execution_id")
+        or ""
+    ).strip()
 
     def _matches_context(
         value: Mapping[str, Any],
@@ -39725,6 +39750,7 @@ def _contract_runtime_dispatch_line_match(
             task_id=task_id,
             parent_task_id=parent_task_id,
             contract_execution_id=contract_execution_id,
+            parent_contract_execution_id=parent_contract_execution_id,
             task_id_keys=task_id_keys,
         )
 
