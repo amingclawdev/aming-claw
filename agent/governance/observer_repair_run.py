@@ -38,6 +38,7 @@ WORKER_DISPATCH_ROUTE_ACTIONS = {
     "dispatch_worker",
     "dispatch_bounded_lanes_after_route_token",
 }
+JUDGMENT_BRAIN_ADVISORY_HINT_ACTION = "consume_judgment_brain_advisory_hints_fail_open"
 PUBLIC_ROUTE_LINEAGE_FIELDS = (
     "route_token_ref",
     "contract_execution_id",
@@ -78,6 +79,7 @@ LANE_ACTIONS = {
     "route_context": [
         "request_route_prompt_alert_bundle",
         "run_route_action_precheck",
+        JUDGMENT_BRAIN_ADVISORY_HINT_ACTION,
         "supersede_or_reset_stale_route_identity",
         "retry_protected_action_with_matching_route_token_or_valid_waiver",
     ],
@@ -436,6 +438,7 @@ def _build_route_context(project_id: str, root_backlog_ids: Sequence[str], seed:
         "allowed_actions": [
             "diagnose_backlog_dependency_dag",
             "create_read_only_repair_run_plan",
+            JUDGMENT_BRAIN_ADVISORY_HINT_ACTION,
             "dispatch_bounded_lanes_after_route_token",
             "run_close_gate_precheck",
         ],

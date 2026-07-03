@@ -236,8 +236,9 @@ DEFAULT_CAPABILITIES = {
 #
 # An observer session moves through work modes. The default is
 # ``observer_look_before_act``: the observer may read, inspect, file findings,
-# and propose the next legal action, but must NOT edit implementation files,
-# self-clear judge blockers, dispatch implementation workers, merge, or close.
+# propose the next legal action, and consume fail-open advisory hint data, but
+# must NOT edit implementation files, self-clear judge blockers, dispatch
+# implementation workers, merge, or close.
 # Moving to ``observer_execution_supervisor`` (where dispatch/close coordination
 # becomes legal) requires an explicit, recorded work_mode transition event AND a
 # route_action_precheck bound to the current canonical route identity. The
@@ -263,6 +264,9 @@ WORK_MODE_ACTION_READ = "read"
 WORK_MODE_ACTION_INSPECT = "inspect"
 WORK_MODE_ACTION_FILE_FINDINGS = "file_findings"
 WORK_MODE_ACTION_PROPOSE_NEXT = "propose_next"
+WORK_MODE_ACTION_CONSUME_JUDGMENT_BRAIN_ADVISORY_HINTS_FAIL_OPEN = (
+    "consume_judgment_brain_advisory_hints_fail_open"
+)
 WORK_MODE_ACTION_EDIT_IMPLEMENTATION = "edit_implementation"
 WORK_MODE_ACTION_SELF_CLEAR_JUDGE_BLOCKER = "self_clear_judge_blocker"
 WORK_MODE_ACTION_DISPATCH_IMPLEMENTATION = "dispatch_implementation"
@@ -276,6 +280,7 @@ WORK_MODE_ALWAYS_ALLOWED_ACTIONS = {
     WORK_MODE_ACTION_INSPECT,
     WORK_MODE_ACTION_FILE_FINDINGS,
     WORK_MODE_ACTION_PROPOSE_NEXT,
+    WORK_MODE_ACTION_CONSUME_JUDGMENT_BRAIN_ADVISORY_HINTS_FAIL_OPEN,
 }
 
 # Actions that observer_look_before_act always blocks.

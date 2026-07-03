@@ -19,12 +19,14 @@ evidence. Caller-supplied ``allowed_actions`` are sanitized at mint (wildcard an
 any blocked-action intersection are rejected) and ``ttl_hours`` is clamped to a
 maximum so a leaked token has a bounded blast radius.
 
-Provider independence: this module does NOT import or call any external route
-provider at import time or runtime. ``resolve_route_provider`` only *records*
-whether an external provider is declared in project config; when one is declared
-the caller is told to route issuance through it, but this module never invokes
-it. When none is declared, the aming-local default (``owner="aming-claw"``) is
-used.
+Provider independence: AC 不依赖 JB(fail-open),但可 best-effort 消费其 advisory
+hints. ``judgment_brain_required=False`` means judgment-brain is not required
+for route minting; it does not mean advisory data is never consumed. This module
+still does NOT import or call any external route provider at import time or
+runtime. ``resolve_route_provider`` only *records* whether an external provider
+is declared in project config; when one is declared the caller is told to route
+issuance through it, but this module never invokes it. When none is declared,
+the aming-local default (``owner="aming-claw"``) is used.
 
 Consumability: ``issue_observer_write_route_context`` returns, in addition to the
 token, a deterministic opaque ``route_token_ref`` (the raw token text is never

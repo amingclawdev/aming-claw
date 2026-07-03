@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import pytest
 import tempfile
 import unittest
 from unittest import mock
 
-from agent.governance import observer_repair_run
+from agent.governance import observer_repair_run, observer_route_context, observer_session
+from agent.governance.mf_subagent_contract import (
+    MfSubagentContractError,
+    _IMPLEMENTATION_ACTIONS,
+    validate_route_action_gate,
+)
 
 
 def _rows():
@@ -112,6 +118,71 @@ def test_repair_run_plan_is_deterministic_and_judge_independent():
     assert first["route_context"]["authorizes_protected_write"] is False
     assert first["protected_write_policy"]["diagnostic_events_count_as_close_evidence"] is False
     assert first["observer_step_monitor"]["schema_version"] == "observer_step_monitor.v1"
+
+
+def test_judgment_brain_advisory_action_is_fail_open_and_not_denied():
+    action = observer_repair_run.JUDGMENT_BRAIN_ADVISORY_HINT_ACTION
+    plan = observer_repair_run.build_repair_run_plan(
+        project_id="aming-claw",
+        root_backlog_ids=[row["bug_id"] for row in _rows()],
+        backlog_rows=_rows(),
+    )
+
+    route_context_actions = set(plan["route_context"]["allowed_actions"])
+    route_lane_actions = {
+        action_name
+        for lane in plan["lane_dispatches"]
+        if lane["lane_id"] == "route_context"
+        for action_name in lane["allowed_actions"]
+    }
+
+    assert action in route_context_actions
+    assert action in route_lane_actions
+    assert action not in observer_repair_run.LANE_BLOCKED_ACTIONS
+    assert action not in observer_route_context.BLOCKED_ACTIONS
+    assert action not in _IMPLEMENTATION_ACTIONS
+
+    fail_open_payload = {
+        "action": action,
+        "caller_role": "implementation_worker",
+        "provider_unavailable": True,
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-1",
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "visible_injection_manifest_hash": "sha256:visible-injection",
+        "route_token_ref": "rtok-route",
+        "allowed_actions": [action, "apply_patch"],
+        "blocked_actions": [],
+        "required_lanes": ["bounded_implementation_worker"],
+        "required_evidence": ["route_context", "route_action_precheck"],
+    }
+    evidence = validate_route_action_gate(fail_open_payload)
+
+    assert evidence["allowed"] is True
+    assert evidence["action"] == action
+    assert evidence["implementation_action"] is False
+
+    with pytest.raises(MfSubagentContractError, match="blocked_route_context_unavailable"):
+        validate_route_action_gate({**fail_open_payload, "action": "apply_patch"})
+
+
+def test_judgment_brain_advisory_action_is_explicit_look_before_act_allow():
+    action = observer_repair_run.JUDGMENT_BRAIN_ADVISORY_HINT_ACTION
+    gate = observer_session.work_mode_action_gate(
+        "observer_look_before_act",
+        action,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == ""
+    assert action in gate["always_allowed_actions"]
+
+    ctx = observer_session.build_observer_root_route_context(
+        backlog_id="AC-JB-INDEPENDENCE-INVARIANT-RENEGOTIATION-20260703",
+        route_context={"route_id": "route-jb-advisory"},
+    )
+    assert action in ctx["allowed_actions"]
+    assert action not in ctx["blocked_actions"]
 
 
 def test_repair_run_groups_lanes_and_orders_dependencies():
