@@ -35814,15 +35814,21 @@ def _contract_runtime_submit_line_guidance(guide: Mapping[str, Any]) -> dict[str
         "required_runtime_guide_hash_source": (
             "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
         ),
+        "target_writer_line_runtime_guide_hash_source": (
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+        ),
         "every_line_must_copy_current_writer_hash": True,
         "hash_may_change_after_each_accepted_line": True,
+        "writer_hash_may_change_after_each_accepted_line": True,
         "top_level_runtime_guide_hash_is_reader_hash": True,
         "copy_payload_available": bool(copy_payload),
         "message": (
             "For every contract_runtime_submit_line, copy "
-            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash from "
-            "the current guide; re-read after each accepted line because the "
-            "required writer hash may change."
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash: "
+            "the runtime_guide_hash from writer_role_safe_copy_payload."
+            "copy_payload for the target writer line in the current guide. "
+            "Re-read after each accepted line because the writer hash may "
+            "change."
         ),
     }
     if required_hash:
