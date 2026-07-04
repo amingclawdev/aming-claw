@@ -9,6 +9,54 @@ from typing import Any
 from .schema import ContractDefinitionError, find_line
 
 
+_DIRECT_FIX_GRAPH_CONTEXT_POLICIES = {
+    "direct_fix_observer_graph_scope": {
+        "actor_role": "observer",
+        "query_sources": {"observer"},
+        "query_purposes": {
+            "observer_scope_build",
+            "observer_scope_validation",
+            "graph_scope_before_dispatch",
+        },
+        "required_identity_fields": ("target_project_root",),
+    },
+    "direct_fix_worker_graph_context": {
+        "actor_role": "mf_sub",
+        "query_sources": {"mf_subagent"},
+        "query_purposes": {
+            "subagent_context_build",
+            "subagent_gate_validation",
+            "subagent_scope_validation",
+        },
+        "required_identity_fields": (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+        ),
+        "worker_role": "mf_sub",
+    },
+    "direct_fix_qa_graph_context": {
+        "actor_role": "qa",
+        "query_sources": {"qa"},
+        "query_purposes": {
+            "qa_context_build",
+            "qa_gate_validation",
+            "independent_verification",
+        },
+        "required_identity_fields": ("target_project_root",),
+    },
+}
+
+_GRAPH_TRACE_ID_KEYS = {
+    "graph_trace_id",
+    "graph_trace_ids",
+    "trace_id",
+    "trace_ids",
+    "verified_trace_ids",
+}
+
+
 @dataclass(frozen=True)
 class WriteGateDecision:
     ok: bool
@@ -88,7 +136,153 @@ def validate_contract_write(
     elif require_next_action and next_action is None:
         errors.append("contract execution has no remaining next legal action")
 
+    _validate_direct_fix_graph_context(errors, write, line_id=line_id, actor_role=actor_role)
+
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
+
+
+def _validate_direct_fix_graph_context(
+    errors: list[str],
+    write: Mapping[str, Any],
+    *,
+    line_id: str,
+    actor_role: str,
+) -> None:
+    policy = _DIRECT_FIX_GRAPH_CONTEXT_POLICIES.get(line_id)
+    if not policy:
+        return
+    expected_actor = str(policy.get("actor_role") or "")
+    if actor_role != expected_actor:
+        errors.append(f"{line_id} requires actor_role={expected_actor}")
+
+    trace_ids = _graph_trace_ids(write)
+    if not trace_ids:
+        errors.append(f"{line_id} requires non-empty graph_trace_ids")
+    elif not all(_is_plausible_graph_trace_id(trace_id) for trace_id in trace_ids):
+        errors.append(f"{line_id} contains invalid graph_trace_ids")
+
+    db_verified = _graph_bool(write, "db_verified")
+    if not db_verified:
+        errors.append(f"{line_id} requires db_verified graph_trace_evidence")
+
+    query_source = _graph_text(write, "query_source")
+    allowed_sources = set(policy.get("query_sources") or [])
+    if not query_source:
+        errors.append(f"{line_id} requires graph query_source")
+    elif query_source not in allowed_sources:
+        errors.append(f"{line_id} query_source must be one of {sorted(allowed_sources)!r}")
+
+    query_purpose = _graph_text(write, "query_purpose")
+    allowed_purposes = set(policy.get("query_purposes") or [])
+    if not query_purpose:
+        errors.append(f"{line_id} requires graph query_purpose")
+    elif query_purpose not in allowed_purposes:
+        errors.append(f"{line_id} query_purpose must be one of {sorted(allowed_purposes)!r}")
+
+    expected_worker_role = str(policy.get("worker_role") or "")
+    if expected_worker_role:
+        worker_role = _graph_text(write, "worker_role")
+        if worker_role != expected_worker_role:
+            errors.append(f"{line_id} requires worker_role={expected_worker_role}")
+
+    for field in policy.get("required_identity_fields") or ():
+        write_value = _write_field(write, field)
+        graph_value = _graph_text(write, field)
+        value = write_value or graph_value
+        if not value:
+            errors.append(f"{line_id} requires {field}")
+            continue
+        if write_value and graph_value and write_value != graph_value:
+            errors.append(f"{line_id} {field} does not match graph_trace_evidence")
+
+
+def _graph_trace_ids(write: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in _GRAPH_TRACE_ID_KEYS:
+        values.extend(_flatten_graph_text_values(write.get(key)))
+    for candidate in _graph_evidence_candidates(write):
+        for key in _GRAPH_TRACE_ID_KEYS:
+            values.extend(_flatten_graph_text_values(candidate.get(key)))
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _graph_text(write: Mapping[str, Any], key: str) -> str:
+    value = _write_field(write, key)
+    if value:
+        return value
+    for candidate in _graph_evidence_candidates(write):
+        value = _first_deep_text(candidate, key)
+        if value:
+            return value
+    return ""
+
+
+def _graph_bool(write: Mapping[str, Any], key: str) -> bool:
+    for candidate in _graph_evidence_candidates(write):
+        value = _first_deep_value(candidate, key)
+        if isinstance(value, bool):
+            return value
+        if str(value or "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def _graph_evidence_candidates(write: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    candidates: list[Mapping[str, Any]] = []
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    for source in (write, payload):
+        for key in (
+            "graph_trace_evidence",
+            "graph_trace_db_evidence",
+            "graph_trace",
+            "graph_context",
+        ):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+        if any(key in source for key in ("query_source", "query_purpose", "db_verified")):
+            candidates.append(source)
+    return candidates
+
+
+def _flatten_graph_text_values(value: Any) -> list[str]:
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for child in value.values():
+            values.extend(_flatten_graph_text_values(child))
+        return values
+    if isinstance(value, list):
+        values = []
+        for child in value:
+            values.extend(_flatten_graph_text_values(child))
+        return values
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _first_deep_text(value: Any, key: str) -> str:
+    item = _first_deep_value(value, key)
+    return str(item or "").strip()
+
+
+def _first_deep_value(value: Any, key: str) -> Any:
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            if str(raw_key or "") == key:
+                return child
+            found = _first_deep_value(child, key)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _first_deep_value(child, key)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _is_plausible_graph_trace_id(value: str) -> bool:
+    return value.startswith("gqt-") and len(value) >= 8
 
 
 def _validate_next_action_instance(

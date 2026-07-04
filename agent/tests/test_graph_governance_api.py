@@ -237,6 +237,145 @@ def _persist_contract_runtime_observer_route_ref(
     )
 
 
+def _direct_fix_graph_trace_payload(
+    *,
+    actor_role: str,
+    trace_id: str,
+    target_project_root: str,
+    runtime_context_id: str = "",
+    task_id: str = "",
+    parent_task_id: str = "",
+) -> dict:
+    query_source = {
+        "observer": "observer",
+        "mf_sub": "mf_subagent",
+        "qa": "qa",
+    }[actor_role]
+    query_purpose = {
+        "observer": "observer_scope_build",
+        "mf_sub": "subagent_context_build",
+        "qa": "independent_verification",
+    }[actor_role]
+    evidence = {
+        "schema_version": "direct_fix_graph_trace_db_evidence.v1",
+        "db_verified": True,
+        "trace_ids": [trace_id],
+        "verified_trace_ids": [trace_id],
+        "query_source": query_source,
+        "query_purpose": query_purpose,
+        "target_project_root": target_project_root,
+    }
+    if actor_role == "mf_sub":
+        evidence.update(
+            {
+                "worker_role": "mf_sub",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            }
+        )
+    return {
+        "schema_version": "direct_fix_graph_context.v1",
+        "graph_trace_ids": [trace_id],
+        "graph_trace_evidence": evidence,
+    }
+
+
+def _submit_direct_fix_observer_graph_scope(
+    *,
+    contract_execution_id: str,
+    route_token_ref: str,
+    target_project_root: str,
+):
+    return server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_graph_scope",
+                "line_id": "direct_fix_observer_graph_scope",
+                "evidence_kind": "graph_trace",
+                "route_token_ref": route_token_ref,
+                "payload": _direct_fix_graph_trace_payload(
+                    actor_role="observer",
+                    trace_id=f"gqt-observer-{contract_execution_id}",
+                    target_project_root=target_project_root,
+                ),
+            },
+        )
+    )
+
+
+def _submit_direct_fix_worker_graph_context(
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    fence_token: str = "",
+    session_token: str = "",
+    session_token_ref: str = "",
+):
+    body = {
+        "stage_id": "worker_graph_context",
+        "line_id": "direct_fix_worker_graph_context",
+        "evidence_kind": "graph_trace",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "target_project_root": target_project_root,
+        "payload": _direct_fix_graph_trace_payload(
+            actor_role="mf_sub",
+            trace_id=f"gqt-worker-{contract_execution_id}",
+            target_project_root=target_project_root,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        ),
+    }
+    if fence_token:
+        body["fence_token"] = fence_token
+    if session_token:
+        body["session_token"] = session_token
+    if session_token_ref:
+        body["session_token_ref"] = session_token_ref
+    return server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "coordinator",
+            method="POST",
+            body=body,
+        )
+    )
+
+
+def _submit_direct_fix_qa_graph_context(
+    *,
+    contract_execution_id: str,
+    target_project_root: str,
+):
+    return server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": contract_execution_id},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa_graph_context",
+                "line_id": "direct_fix_qa_graph_context",
+                "evidence_kind": "graph_trace",
+                "payload": _direct_fix_graph_trace_payload(
+                    actor_role="qa",
+                    trace_id=f"gqt-qa-{contract_execution_id}",
+                    target_project_root=target_project_root,
+                ),
+            },
+        )
+    )
+
+
 class _NoCloseConn:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -28303,10 +28442,37 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
     write_runtime_line(
         direct_execution_id,
         actor_role="observer",
+        stage_id="observer_graph_scope",
+        line_id="direct_fix_observer_graph_scope",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="observer",
+            trace_id=f"gqt-observer-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="observer",
         stage_id="dispatch_context",
         line_id="direct_fix_dispatch_context",
         evidence_kind="dispatch_bounded_worker",
         payload={**route_identity, "owned_files": ["agent/governance/server.py"]},
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="mf_sub",
+        stage_id="worker_graph_context",
+        line_id="direct_fix_worker_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="mf_sub",
+            trace_id=f"gqt-worker-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+            runtime_context_id=f"mfrctx-{direct_execution_id}",
+            task_id=f"worker-{direct_execution_id}",
+            parent_task_id=direct_execution_id,
+        ),
     )
     write_runtime_line(
         direct_execution_id,
@@ -28321,6 +28487,18 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
             "commit_sha": close_commit,
         },
         commit_sha=close_commit,
+    )
+    write_runtime_line(
+        direct_execution_id,
+        actor_role="qa",
+        stage_id="qa_graph_context",
+        line_id="direct_fix_qa_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="qa",
+            trace_id=f"gqt-qa-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
     )
     write_runtime_line(
         direct_execution_id,
@@ -28510,10 +28688,35 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
     )
     write_runtime_line(
         actor_role="observer",
+        stage_id="observer_graph_scope",
+        line_id="direct_fix_observer_graph_scope",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="observer",
+            trace_id=f"gqt-observer-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
+    )
+    write_runtime_line(
+        actor_role="observer",
         stage_id="dispatch_context",
         line_id="direct_fix_dispatch_context",
         evidence_kind="dispatch_bounded_worker",
         payload={**route_identity, "owned_files": ["agent/governance/server.py"]},
+    )
+    write_runtime_line(
+        actor_role="mf_sub",
+        stage_id="worker_graph_context",
+        line_id="direct_fix_worker_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="mf_sub",
+            trace_id=f"gqt-worker-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+            runtime_context_id=f"mfrctx-{direct_execution_id}",
+            task_id=f"worker-{direct_execution_id}",
+            parent_task_id=direct_execution_id,
+        ),
     )
     write_runtime_line(
         actor_role="mf_sub",
@@ -28527,6 +28730,17 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
             "commit_sha": close_commit,
         },
         commit_sha=close_commit,
+    )
+    write_runtime_line(
+        actor_role="qa",
+        stage_id="qa_graph_context",
+        line_id="direct_fix_qa_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="qa",
+            trace_id=f"gqt-qa-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
     )
     write_runtime_line(
         actor_role="qa",
@@ -31551,7 +31765,7 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
     )
     assert approval["ok"] is True
     assert approval["actor_role"] == "observer"
-    assert approval["next_legal_action"]["line_id"] == "direct_fix_dispatch_context"
+    assert approval["next_legal_action"]["line_id"] == "direct_fix_observer_graph_scope"
 
 
 def test_direct_fix_enter_binds_legacy_existing_successor_once(conn):
@@ -31830,6 +32044,13 @@ def test_direct_fix_dispatch_materializes_missing_worker_identity_and_commits(
     )
     assert approved["ok"] is True
 
+    observer_graph = _submit_direct_fix_observer_graph_scope(
+        contract_execution_id=direct_execution_id,
+        route_token_ref=route_token_ref,
+        target_project_root=target_root,
+    )
+    assert observer_graph["ok"] is True
+
     dispatched = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": direct_execution_id},
@@ -31969,6 +32190,17 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     )
     assert approved["ok"] is True
     next_action = approved["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["stage_id"] == "observer_graph_scope"
+    assert next_action["line_id"] == "direct_fix_observer_graph_scope"
+    assert next_action["owner_role"] == "observer"
+
+    observer_graph = _submit_direct_fix_observer_graph_scope(
+        contract_execution_id=direct_execution_id,
+        route_token_ref=route_token_ref,
+        target_project_root=target_root,
+    )
+    assert observer_graph["ok"] is True
+    next_action = observer_graph["contract_runtime_current_state"]["next_legal_action"]
     assert next_action["stage_id"] == "dispatch_context"
     assert next_action["line_id"] == "direct_fix_dispatch_context"
     assert next_action["owner_role"] == "observer"
@@ -32054,8 +32286,8 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     assert dispatch_marker["target_head_commit"] == runtime_context.target_head_commit
     assert dispatch_marker["merge_queue_id"] == runtime_context.merge_queue_id
     next_action = dispatched["contract_runtime_current_state"]["next_legal_action"]
-    assert next_action["stage_id"] == "candidate_repair"
-    assert next_action["line_id"] == "direct_fix_candidate_repair"
+    assert next_action["stage_id"] == "worker_graph_context"
+    assert next_action["line_id"] == "direct_fix_worker_graph_context"
     assert next_action["owner_role"] == "mf_sub"
 
     observer_repair = server.handle_project_contract_runtime_line_write(
@@ -32085,6 +32317,19 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
         for error in observer_repair["decision"]["errors"]
     )
 
+    worker_graph = _submit_direct_fix_worker_graph_context(
+        contract_execution_id=direct_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=worker_task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_root,
+        fence_token=fence_token,
+        session_token_ref=session_token_ref,
+    )
+    assert worker_graph["ok"] is True
+    next_action = worker_graph["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["line_id"] == "direct_fix_candidate_repair"
+
     repaired = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": direct_execution_id},
@@ -32113,7 +32358,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     )
     assert repaired["ok"] is True
     next_action = repaired["contract_runtime_current_state"]["next_legal_action"]
-    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["line_id"] == "direct_fix_qa_graph_context"
     assert next_action["owner_role"] == "qa"
     direct_record = server._contract_runtime_store(conn).get(direct_execution_id)
     direct_generation = int(direct_record["execution_state_revision"])
@@ -32121,6 +32366,14 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
         f"contract_runtime:{direct_execution_id}:"
         f"completed_lines:{len(direct_record['completed_lines']) - 1}"
     )
+
+    qa_graph = _submit_direct_fix_qa_graph_context(
+        contract_execution_id=direct_execution_id,
+        target_project_root=target_root,
+    )
+    assert qa_graph["ok"] is True
+    next_action = qa_graph["contract_runtime_current_state"]["next_legal_action"]
+    assert next_action["line_id"] == "qa_independent_verification"
 
     qa = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -32466,6 +32719,13 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
     )
     assert approved["ok"] is True
 
+    observer_graph = _submit_direct_fix_observer_graph_scope(
+        contract_execution_id=direct_execution_id,
+        route_token_ref=route_token_ref,
+        target_project_root=target_root,
+    )
+    assert observer_graph["ok"] is True
+
     runtime_context = upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -32570,6 +32830,17 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
     )
     conn.commit()
 
+    worker_graph = _submit_direct_fix_worker_graph_context(
+        contract_execution_id=direct_execution_id,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        parent_task_id=direct_execution_id,
+        target_project_root=target_root,
+        fence_token=fence_token,
+        session_token=worker_session_token,
+    )
+    assert worker_graph["ok"] is True
+
     repair_body = {
         "stage_id": "candidate_repair",
         "line_id": "direct_fix_candidate_repair",
@@ -32631,7 +32902,7 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
     assert repaired["actor_role"] == "mf_sub"
     assert (
         repaired["contract_runtime_current_state"]["next_legal_action"]["line_id"]
-        == "qa_independent_verification"
+        == "direct_fix_qa_graph_context"
     )
 
 
@@ -32806,15 +33077,51 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
     )
     _write_line(
         actor_role="observer",
+        stage_id="observer_graph_scope",
+        line_id="direct_fix_observer_graph_scope",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="observer",
+            trace_id=f"gqt-observer-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
+    )
+    _write_line(
+        actor_role="observer",
         stage_id="dispatch_context",
         line_id="direct_fix_dispatch_context",
         evidence_kind="dispatch_bounded_worker",
     )
     _write_line(
         actor_role="mf_sub",
+        stage_id="worker_graph_context",
+        line_id="direct_fix_worker_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="mf_sub",
+            trace_id=f"gqt-worker-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+            runtime_context_id=f"mfrctx-{direct_execution_id}",
+            task_id=f"worker-{direct_execution_id}",
+            parent_task_id=direct_execution_id,
+        ),
+    )
+    _write_line(
+        actor_role="mf_sub",
         stage_id="candidate_repair",
         line_id="direct_fix_candidate_repair",
         evidence_kind="direct_fix_repair_evidence",
+    )
+    _write_line(
+        actor_role="qa",
+        stage_id="qa_graph_context",
+        line_id="direct_fix_qa_graph_context",
+        evidence_kind="graph_trace",
+        payload=_direct_fix_graph_trace_payload(
+            actor_role="qa",
+            trace_id=f"gqt-qa-{direct_execution_id}",
+            target_project_root="/tmp/aming-claw-test",
+        ),
     )
     _write_line(
         actor_role="qa",

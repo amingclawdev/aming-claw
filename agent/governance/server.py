@@ -40391,10 +40391,11 @@ def _contract_runtime_timeline_references_runtime_context(
         return False
     contract_id = str(record.get("contract_id") or "").strip()
     next_line = _contract_runtime_next_line(record)
-    if (
-        contract_id != DIRECT_FIX_CONTRACT_ID
-        or str(next_line.get("line_id") or "").strip() != "direct_fix_candidate_repair"
-    ):
+    next_line_id = str(next_line.get("line_id") or "").strip()
+    if contract_id != DIRECT_FIX_CONTRACT_ID or next_line_id not in {
+        "direct_fix_worker_graph_context",
+        "direct_fix_candidate_repair",
+    }:
         return False
     if not _contract_runtime_has_legacy_direct_fix_dispatch_without_context(record):
         return False
@@ -40532,7 +40533,10 @@ def _contract_runtime_timeline_references_runtime_context(
             if is_worker_implementation:
                 worker_implementation_seen = True
 
-        if dispatch_seen and worker_start_seen and worker_implementation_seen:
+        if next_line_id == "direct_fix_worker_graph_context":
+            if dispatch_seen and worker_start_seen:
+                return True
+        elif dispatch_seen and worker_start_seen and worker_implementation_seen:
             return True
     return False
 
@@ -50054,7 +50058,13 @@ def _contract_runtime_close_authority_event(
     if str(line.get("actor_role") or "").strip() == "mf_sub":
         payload.setdefault("worker_role", "mf_sub")
     if _contract_runtime_close_normalized(line.get("evidence_kind")) == "graph_trace":
-        payload.setdefault("query_source", "mf_subagent")
+        actor_role = str(line.get("actor_role") or "").strip()
+        if actor_role == "qa":
+            payload.setdefault("query_source", "qa")
+        elif actor_role == "observer":
+            payload.setdefault("query_source", "observer")
+        else:
+            payload.setdefault("query_source", "mf_subagent")
     if event_kind == "mf_subagent_startup":
         for key, value in dict(line_context or {}).items():
             if value:

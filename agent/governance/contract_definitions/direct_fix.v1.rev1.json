@@ -37,11 +37,11 @@
         ],
         "stage_id": "parent_blocked_handoff"
       },
-      {
-        "description": "Observer records operator approval and successor-scoped route identity.",
-        "lines": [
-          {
-            "allowed_writer_roles": [
+            {
+                "description": "Observer records operator approval and successor-scoped route identity.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
               "observer"
             ],
             "description": "Operator approval with exact scope/files, risk, target head, graph anchor, token subject, expiry, and rationale.",
@@ -52,62 +52,116 @@
               "direct_fix_handoff_request"
             ]
           }
-        ],
-        "stage_id": "operator_approval"
-      },
-      {
-        "description": "Observer binds a bounded worker runtime context before worker repair evidence.",
-        "lines": [
-          {
-            "allowed_writer_roles": [
+                ],
+                "stage_id": "operator_approval"
+            },
+            {
+                "description": "Observer records DB-backed graph scope before dispatch.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
+                            "observer"
+                        ],
+                        "description": "Observer-owned graph scope trace for exact files/symbols before bounded worker dispatch.",
+                        "evidence_kind": "graph_trace",
+                        "line_id": "direct_fix_observer_graph_scope",
+                        "owner_role": "observer",
+                        "requires": [
+                            "direct_fix_operator_approval"
+                        ]
+                    }
+                ],
+                "stage_id": "observer_graph_scope"
+            },
+            {
+                "description": "Observer binds a bounded worker runtime context before worker repair evidence.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
               "observer"
             ],
             "description": "Dispatch/context binding for the bounded worker that will record direct_fix repair evidence.",
-            "evidence_kind": "dispatch_bounded_worker",
-            "line_id": "direct_fix_dispatch_context",
-            "owner_role": "observer",
-            "requires": [
-              "direct_fix_operator_approval"
-            ]
-          }
-        ],
-        "stage_id": "dispatch_context"
-      },
-      {
-        "description": "Bounded worker records candidate-lane repair evidence.",
-        "lines": [
-          {
-            "allowed_writer_roles": [
+                        "evidence_kind": "dispatch_bounded_worker",
+                        "line_id": "direct_fix_dispatch_context",
+                        "owner_role": "observer",
+                        "requires": [
+                            "direct_fix_observer_graph_scope"
+                        ]
+                    }
+                ],
+                "stage_id": "dispatch_context"
+            },
+            {
+                "description": "Bounded worker records DB-backed graph context after dispatch and before repair evidence.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
+                            "mf_sub"
+                        ],
+                        "description": "Worker-owned graph trace/context bound to the worker runtime identity, query_source=mf_subagent, and exact target project root.",
+                        "evidence_kind": "graph_trace",
+                        "line_id": "direct_fix_worker_graph_context",
+                        "owner_role": "mf_sub",
+                        "requires": [
+                            "direct_fix_dispatch_context"
+                        ]
+                    }
+                ],
+                "stage_id": "worker_graph_context"
+            },
+            {
+                "description": "Bounded worker records candidate-lane repair evidence.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
               "mf_sub"
             ],
             "description": "Candidate branch/worktree repair evidence with changed files, tests, graph traces, and no target-truth activation.",
-            "evidence_kind": "direct_fix_repair_evidence",
-            "line_id": "direct_fix_candidate_repair",
-            "owner_role": "mf_sub",
-            "requires": [
-              "direct_fix_dispatch_context"
-            ]
-          }
-        ],
-        "stage_id": "candidate_repair"
-      },
-      {
-        "description": "Independent QA verifies the blocker repair.",
-        "lines": [
-          {
+                        "evidence_kind": "direct_fix_repair_evidence",
+                        "line_id": "direct_fix_candidate_repair",
+                        "owner_role": "mf_sub",
+                        "requires": [
+                            "direct_fix_worker_graph_context"
+                        ]
+                    }
+                ],
+                "stage_id": "candidate_repair"
+            },
+            {
+                "description": "Independent QA records a distinct DB-backed graph context before verification.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
+                            "qa"
+                        ],
+                        "description": "QA-owned independent graph trace/context for verification scope; observer and worker traces are not interchangeable.",
+                        "evidence_kind": "graph_trace",
+                        "line_id": "direct_fix_qa_graph_context",
+                        "owner_role": "qa",
+                        "requires": [
+                            "direct_fix_candidate_repair"
+                        ]
+                    }
+                ],
+                "stage_id": "qa_graph_context"
+            },
+            {
+                "description": "Independent QA verifies the blocker repair.",
+                "lines": [
+                    {
             "allowed_writer_roles": [
               "qa"
             ],
             "description": "QA-authored independent verification of direct_fix repair evidence and parent-return safety.",
-            "evidence_kind": "independent_verification",
-            "line_id": "qa_independent_verification",
-            "owner_role": "qa",
-            "requires": [
-              "direct_fix_candidate_repair"
-            ]
-          }
-        ],
-        "stage_id": "qa"
+                        "evidence_kind": "independent_verification",
+                        "line_id": "qa_independent_verification",
+                        "owner_role": "qa",
+                        "requires": [
+                            "direct_fix_qa_graph_context"
+                        ]
+                    }
+                ],
+                "stage_id": "qa"
       },
       {
         "description": "Observer records server-verifiable return to the blocked parent contract.",
@@ -197,12 +251,61 @@
       "same_revision_semantic_change_allowed": false,
       "semantic_change_requires_new_revision": true
     },
-    "graph_binding_policy": {
-      "direct_trusted_graph_db_writes_allowed": false,
-      "graph_binding_gap_blocks_close": true,
-      "source_asset_materialization_required": true
-    }
-  },
+        "graph_binding_policy": {
+            "direct_trusted_graph_db_writes_allowed": false,
+            "distinct_role_traces_required": true,
+            "graph_binding_gap_blocks_close": true,
+            "graph_query_checkpoints": [
+                {
+                    "line_id": "direct_fix_observer_graph_scope",
+                    "owner_role": "observer",
+                    "query_source": "observer",
+                    "query_purposes": [
+                        "observer_scope_build",
+                        "observer_scope_validation",
+                        "graph_scope_before_dispatch"
+                    ],
+                    "required_before": "direct_fix_dispatch_context"
+                },
+                {
+                    "line_id": "direct_fix_worker_graph_context",
+                    "owner_role": "mf_sub",
+                    "query_source": "mf_subagent",
+                    "query_purposes": [
+                        "subagent_context_build",
+                        "subagent_gate_validation",
+                        "subagent_scope_validation"
+                    ],
+                    "required_before": "direct_fix_candidate_repair",
+                    "required_identity_fields": [
+                        "runtime_context_id",
+                        "task_id",
+                        "parent_task_id",
+                        "target_project_root"
+                    ]
+                },
+                {
+                    "line_id": "direct_fix_qa_graph_context",
+                    "owner_role": "qa",
+                    "query_source": "qa",
+                    "query_purposes": [
+                        "qa_context_build",
+                        "qa_gate_validation",
+                        "independent_verification"
+                    ],
+                    "required_before": "qa_independent_verification"
+                }
+            ],
+            "reject_empty_fake_or_missing_source_graph_evidence": true,
+            "role_traces_interchangeable": false,
+            "source_asset_materialization_required": true
+        },
+        "migration_policy": {
+            "active_execution_rewrite": "forbidden",
+            "same_revision_definition_hash_drift": "stale_pinned_execution_error",
+            "new_graph_checkpoints_apply_to": "new_direct_fix_executions_only"
+        }
+    },
   "successors": [],
   "version": "v1"
 }
