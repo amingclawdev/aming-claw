@@ -705,6 +705,11 @@ def _parallel_branch_merge_queue_apply_schema_properties() -> dict[str, Any]:
         "repo_root_path": {"type": "string"},
         "workspace_root": {"type": "string"},
         "target_ref": {"type": "string"},
+        "current_target_head": {"type": "string"},
+        "latest_target_head": {
+            "type": "string",
+            "description": "Alias for current_target_head.",
+        },
         "evidence": {"type": "object"},
         "runtime_context_id": {"type": "string"},
         "parent_task_id": {"type": "string"},
@@ -868,6 +873,7 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
         "repo_root_path",
         "workspace_root",
         "target_ref",
+        "current_target_head",
         "evidence",
         "batch_status",
         "dry_run",
@@ -906,6 +912,9 @@ def _parallel_branch_merge_queue_apply_body(args: dict) -> dict:
     }
     if body.get("backlog_id") and not body.get("bug_id"):
         body["bug_id"] = body["backlog_id"]
+    latest_target_head = str(args.get("latest_target_head") or "").strip()
+    if latest_target_head and not body.get("current_target_head"):
+        body["current_target_head"] = latest_target_head
     merge_gate_evidence = {
         key: args[key]
         for key in merge_evidence_keys

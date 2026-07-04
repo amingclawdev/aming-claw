@@ -24,6 +24,8 @@ def test_mf_timeline_precheck_schema_exposes_repair_view():
 def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     properties = _tool_properties("parallel_branch_merge_queue_apply")
     assert "branch_ref" in properties
+    assert "current_target_head" in properties
+    assert "latest_target_head" in properties
 
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)
@@ -34,6 +36,7 @@ def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
             "merge_queue_id": "mq-1",
             "task_id": "task-1",
             "branch_ref": "refs/heads/codex/task-1",
+            "latest_target_head": "abc123",
             "dry_run": True,
         },
     )
@@ -45,6 +48,7 @@ def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
             "merge_queue_id": "mq-1",
             "task_id": "task-1",
             "branch_ref": "refs/heads/codex/task-1",
+            "current_target_head": "abc123",
             "dry_run": True,
         },
     )
