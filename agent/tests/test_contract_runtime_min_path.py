@@ -184,13 +184,29 @@ def _start_repaired_direct_fix(runtime, *, backlog_id: str):
         actor_role="observer",
         route_token_ref=f"rtok-root-{backlog_id}",
     )
+    direct_fix, generation, repair_ref = _start_repaired_direct_fix_child(
+        runtime,
+        root,
+        backlog_id=backlog_id,
+        contract_execution_id=f"cex-direct-{backlog_id}",
+    )
+    return root, direct_fix, generation, repair_ref
+
+
+def _start_repaired_direct_fix_child(
+    runtime,
+    root,
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+):
     direct_fix = runtime.start_execution(
         "direct_fix",
         project_id="aming-claw",
         backlog_id=backlog_id,
-        contract_execution_id=f"cex-direct-{backlog_id}",
+        contract_execution_id=contract_execution_id,
         actor_role="observer",
-        route_token_ref=f"rtok-direct-{backlog_id}",
+        route_token_ref=f"rtok-{contract_execution_id}",
         parent_contract_execution_id=root["contract_execution_id"],
         root_contract_execution_id=root["root_contract_execution_id"],
         contract_chain_id=root["contract_chain_id"],
@@ -217,7 +233,7 @@ def _start_repaired_direct_fix(runtime, *, backlog_id: str):
     )
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     record = runtime.store.get(record["contract_execution_id"])
-    return root, record, int(record["execution_state_revision"]), repair_ref
+    return record, int(record["execution_state_revision"]), repair_ref
 
 
 def _direct_fix_qa_write(record, *, generation: int, repair_ref: str):
@@ -242,6 +258,60 @@ def _direct_fix_qa_write(record, *, generation: int, repair_ref: str):
         "source_ref": repair_ref,
     }
     return write
+
+
+def _return_direct_fix_to_parent(runtime, record, *, generation: int, repair_ref: str):
+    qa = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _direct_fix_qa_write(
+            record,
+            generation=generation,
+            repair_ref=repair_ref,
+        ),
+        actor_role="qa",
+    )
+    assert qa["ok"] is True
+    runtime.current_guide(record["contract_execution_id"], actor_role="observer")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+    returned = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _write_from(
+            qa_record,
+            actor_role="observer",
+            stage_id="return_to_parent",
+            line_id="direct_fix_return_to_parent",
+            evidence_kind="direct_fix_return_to_parent",
+        ),
+        actor_role="observer",
+    )
+    assert returned["ok"] is True
+    return returned["record"]
+
+
+def _append_parent_successor_ack(runtime, *, parent_id: str, child_id: str):
+    parent = runtime.store.get(parent_id)
+    completed_lines = list(parent.get("completed_lines") or [])
+    completed_lines.append(
+        {
+            "stage_id": "successor_return",
+            "line_id": "resume_parent_after_successor_return",
+            "actor_role": "observer",
+            "evidence_kind": "successor_return_acknowledgement",
+            "payload": {
+                "schema_version": "successor_return_acknowledgement.v1",
+                "parent_contract_execution_id": parent_id,
+                "successor_contract_execution_id": child_id,
+                "successor_contract_id": "direct_fix",
+            },
+        }
+    )
+    parent["completed_lines"] = completed_lines
+    revision = int(parent.get("execution_state_revision") or 0) + 1
+    parent["execution_state_revision"] = revision
+    execution_state = parent.get("execution_state")
+    if isinstance(execution_state, dict):
+        execution_state["execution_state_revision"] = revision
+    return runtime.store.update(parent_id, parent)
 
 
 def test_minimal_contract_runtime_drives_next_action_and_role_gate(tmp_path):
@@ -742,6 +812,84 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     )
     assert current["current_contract_id"] == "mf_parallel.v1"
     assert current["readiness_state"] == "contract_active"
+
+
+def test_parent_resume_cursor_advances_across_returned_direct_fix_children(tmp_path):
+    _write_chain_projection_contracts(tmp_path)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    backlog_id = "AC-DIRECT-FIX-MULTI-RETURN-CURSOR"
+    root, first_child, first_generation, first_repair_ref = _start_repaired_direct_fix(
+        runtime,
+        backlog_id=backlog_id,
+    )
+    first_child = _return_direct_fix_to_parent(
+        runtime,
+        first_child,
+        generation=first_generation,
+        repair_ref=first_repair_ref,
+    )
+    second_child, second_generation, second_repair_ref = _start_repaired_direct_fix_child(
+        runtime,
+        root,
+        backlog_id=backlog_id,
+        contract_execution_id=f"cex-direct-b-{backlog_id}",
+    )
+    second_child = _return_direct_fix_to_parent(
+        runtime,
+        second_child,
+        generation=second_generation,
+        repair_ref=second_repair_ref,
+    )
+
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert current["readiness_state"] == (
+        "parent_resume_required_after_direct_fix_qa"
+    )
+    assert current["next_legal_action"]["successor_contract_execution_id"] == (
+        first_child["contract_execution_id"]
+    )
+
+    _append_parent_successor_ack(
+        runtime,
+        parent_id=root["contract_execution_id"],
+        child_id=first_child["contract_execution_id"],
+    )
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert current["readiness_state"] == (
+        "parent_resume_required_after_direct_fix_qa"
+    )
+    assert current["next_legal_action"]["successor_contract_execution_id"] == (
+        second_child["contract_execution_id"]
+    )
+
+    _append_parent_successor_ack(
+        runtime,
+        parent_id=root["contract_execution_id"],
+        child_id=second_child["contract_execution_id"],
+    )
+    current = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+    )
+    assert current["current_contract_execution_id"] == root["contract_execution_id"]
+    assert current["parent_to_resume_contract_execution_id"] == ""
+    assert current["readiness_state"] == "contract_active"
+    assert current["next_legal_action"]["line_id"] == "read_context"
 
 
 def test_server_chain_current_refreshes_stale_next_action_after_finish(tmp_path):

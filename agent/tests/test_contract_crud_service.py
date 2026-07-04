@@ -1559,6 +1559,94 @@ def test_direct_fix_close_authority_gate_rejects_failed_qa_provenance():
     assert accepted["checks"]["has_independent_qa"] is True
 
 
+def test_direct_fix_close_authority_requires_ack_for_each_returned_child():
+    def returned_direct_fix_record(child_id: str):
+        return {
+            "contract_id": "direct_fix",
+            "contract_execution_id": child_id,
+            "parent_contract_execution_id": "cex-parent",
+            "completed_lines": [
+                {
+                    "stage_id": "candidate_repair",
+                    "line_id": "direct_fix_candidate_repair",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "direct_fix_repair_evidence",
+                },
+                {
+                    "stage_id": "qa",
+                    "line_id": "qa_independent_verification",
+                    "actor_role": "qa",
+                    "evidence_kind": "independent_verification",
+                    "qa_evidence_provenance": {"status": "passed"},
+                },
+                {
+                    "stage_id": "return_to_parent",
+                    "line_id": "direct_fix_return_to_parent",
+                    "actor_role": "observer",
+                    "evidence_kind": "direct_fix_return_to_parent",
+                },
+            ],
+        }
+
+    def parent_ack_line(child_id: str):
+        return {
+            "stage_id": "successor_return",
+            "line_id": "resume_parent_after_successor_return",
+            "actor_role": "observer",
+            "evidence_kind": "successor_return_acknowledgement",
+            "payload": {
+                "parent_contract_execution_id": "cex-parent",
+                "successor_contract_execution_id": child_id,
+                "successor_contract_id": "direct_fix",
+            },
+        }
+
+    projection = {
+        "projection_source": "backlog_contract_chain_current",
+        "source_of_proof": "contract_runtime_executions.completed_lines",
+        "active_chain": {
+            "execution_ids": ["cex-parent", "cex-child-a", "cex-child-b"]
+        },
+    }
+    parent_record = {
+        "contract_id": "onboard_contract",
+        "contract_execution_id": "cex-parent",
+        "completed_lines": [parent_ack_line("cex-child-b")],
+    }
+    child_a = returned_direct_fix_record("cex-child-a")
+    child_b = returned_direct_fix_record("cex-child-b")
+
+    rejected = _contract_runtime_direct_fix_close_authority_gate(
+        [parent_record, child_a, child_b],
+        chain_projection=projection,
+        close_commit="",
+    )
+    assert rejected["passed"] is False
+    assert rejected["missing_requirement_ids"] == ["parent_return_acknowledgement"]
+    assert rejected["returned_successor_contract_execution_ids"] == [
+        "cex-child-a",
+        "cex-child-b",
+    ]
+    assert rejected["acknowledged_successor_contract_execution_ids"] == [
+        "cex-child-b"
+    ]
+    assert rejected["unacknowledged_successor_contract_execution_ids"] == [
+        "cex-child-a"
+    ]
+    assert rejected["checks"]["all_returned_children_acknowledged"] is False
+
+    parent_record["completed_lines"].append(parent_ack_line("cex-child-a"))
+    accepted = _contract_runtime_direct_fix_close_authority_gate(
+        [parent_record, child_a, child_b],
+        chain_projection=projection,
+        close_commit="",
+    )
+    assert accepted["passed"] is True
+    assert accepted["missing_requirement_ids"] == []
+    assert accepted["unacknowledged_successor_contract_execution_ids"] == []
+    assert accepted["checks"]["all_returned_children_acknowledged"] is True
+
+
 def test_mf_parallel_gate_precheck_requires_onboard_parent():
     service = ContractCrudService()
     definition = service.read("mf_parallel.v1")["data"]["definition"]

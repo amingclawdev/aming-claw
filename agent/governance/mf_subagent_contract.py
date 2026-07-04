@@ -3390,6 +3390,15 @@ OBSERVER_HOTFIX_EXCEPTION_MODE = "observer_hotfix_exception"
 SURROGATE_STARTUP_GATE_SCHEMA_VERSION = "mf_surrogate_startup_evidence_gate.v1"
 REAL_WORKER_JOIN_SCHEMA_VERSION = "mf_surrogate_real_worker_join.v1"
 CLOSE_TIMELINE_STARTUP_GATE_SCHEMA_VERSION = "mf_close_timeline_startup_gate.v1"
+REAL_WORKER_STARTUP_MATCH_MODES = {
+    "same_as_allocation_owner",
+    "observer_subagent_service_dispatch",
+    "initial_join_actual_host_worker",
+}
+SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES = {
+    "server_verified",
+    "server_verified_ref",
+}
 
 # Lineage fields used to match a surrogate startup against a real worker startup.
 _SURROGATE_JOIN_LINEAGE_FIELDS = (
@@ -3453,7 +3462,7 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
         return True
     # "claimed_unverified": worker presented a token but the server found a hash
     # mismatch — the claim is not trustworthy; treat as surrogate.
-    if token_type == "claimed_unverified":
+    if token_type in {"claimed_unverified", "claimed_unverified_ref"}:
         return True
     # Resolve match_mode early — needed for TOFU mutual-exclusion check below.
     match_mode = _string(
@@ -3468,6 +3477,7 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
     if match_mode == HOST_ADAPTER_SURROGATE_MATCH_MODE:
         return True
     agent_id = _string(evidence.get("agent_id"))
+    actual_host_worker_id = _string(evidence.get("actual_host_worker_id"))
     allocation_owner = _string(
         evidence.get("allocation_owner")
         or evidence.get("observer_allocation_owner")
@@ -3479,19 +3489,49 @@ def _startup_is_host_adapter_surrogate(evidence: Mapping[str, Any]) -> bool:
         or _nested_mapping(evidence, "host_adapter_spawn_identity")
         or _nested_mapping(evidence, "host_adapter_startup_identity")
     )
+    server_verified_session_token = bool(
+        token_type in SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES
+        and (
+            _bool(evidence.get("session_token_present"))
+            or _bool(evidence.get("session_token_ref_present"))
+            or _string(evidence.get("session_token_hash"))
+            or _string(evidence.get("session_token_ref"))
+        )
+    )
+    if match_mode == "initial_join_actual_host_worker":
+        if (
+            server_verified_session_token
+            and actual_host_worker_id
+            and (not agent_id or agent_id == actual_host_worker_id)
+        ):
+            return False
+        return True
+    if match_mode == "observer_subagent_service_dispatch":
+        service_dispatch_binding = bool(
+            _bool(evidence.get("service_dispatch_worker_binding_present"))
+            or _nested_mapping(evidence, "service_dispatch_worker_binding")
+        )
+        if server_verified_session_token and service_dispatch_binding:
+            return False
+        return True
     if (
         agent_id
         and allocation_owner
         and agent_id != allocation_owner
-        and match_mode != "same_as_allocation_owner"
+        and match_mode not in REAL_WORKER_STARTUP_MATCH_MODES
         and not registered_host_adapter
     ):
         return True
     # Server-verified or first-sight hash on same_as_allocation_owner (or other
     # non-host-adapter) mode: NOT a surrogate.
-    if token_type in ("server_verified", "hash"):
+    if token_type in (*SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES, "hash"):
         if _string(evidence.get("session_token_hash")) and _bool(
             evidence.get("session_token_present")
+        ):
+            return False
+        if token_type in SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES and (
+            _string(evidence.get("session_token_ref"))
+            or _bool(evidence.get("session_token_ref_present"))
         ):
             return False
     # Legacy path: real session token hash present without explicit evidence type
@@ -3579,14 +3619,19 @@ def _startup_real_worker_join(
             gate.get("agent_id_match_mode")
             or _nested_mapping(gate, "identity_join").get("agent_id_match_mode")
         ).lower()
-        if match_mode != "same_as_allocation_owner":
+        if match_mode not in REAL_WORKER_STARTUP_MATCH_MODES:
             continue
         # It must carry a real session token.
         if not _string(gate.get("session_token_hash")) and not _bool(
             gate.get("session_token_present")
         ):
             token_type = _string(gate.get("session_token_evidence_type")).lower()
-            if token_type not in ("hash",):
+            if token_type not in ("hash", *SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES):
+                continue
+            if token_type in SERVER_VERIFIED_SESSION_TOKEN_EVIDENCE_TYPES and not (
+                _string(gate.get("session_token_ref"))
+                or _bool(gate.get("session_token_ref_present"))
+            ):
                 continue
         # F3 fix: all four lineage fields must be NON-EMPTY on the candidate
         # AND equal to the surrogate's lineage.  An empty candidate field means

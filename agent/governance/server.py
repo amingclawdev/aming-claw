@@ -50566,6 +50566,62 @@ def _contract_runtime_direct_fix_parent_ack_matches(
     return True
 
 
+def _contract_runtime_direct_fix_parent_ack_matches_child(
+    line: Mapping[str, Any],
+    *,
+    parent_execution_id: str,
+    child_execution_id: str,
+) -> bool:
+    if not _contract_runtime_direct_fix_parent_ack_matches(
+        line,
+        parent_execution_id=parent_execution_id,
+        child_execution_id=child_execution_id,
+    ):
+        return False
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    payload_child = str(
+        payload.get("successor_contract_execution_id")
+        or payload.get("child_contract_execution_id")
+        or ""
+    ).strip()
+    return bool(payload_child and payload_child == child_execution_id)
+
+
+def _contract_runtime_direct_fix_authority_lines(
+    child: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    repair_line: dict[str, Any] = {}
+    qa_line: dict[str, Any] = {}
+    return_line: dict[str, Any] = {}
+    for line in _contract_runtime_completed_line_items(child):
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_candidate_repair"},
+            evidence_kinds={"direct_fix_repair_evidence"},
+            actor_roles={"mf_sub"},
+        ):
+            repair_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"qa_independent_verification"},
+            evidence_kinds={"independent_verification", "direct_fix_independent_qa"},
+            actor_roles={"qa"},
+        ):
+            qa_line = line
+        if _contract_runtime_direct_fix_line_matches(
+            line,
+            line_ids={"direct_fix_return_to_parent"},
+            evidence_kinds={"direct_fix_return_to_parent"},
+            actor_roles={"observer"},
+        ):
+            return_line = line
+    return {
+        "repair": repair_line,
+        "qa": qa_line,
+        "return": return_line,
+    }
+
+
 def _contract_runtime_authority_evaluable_commit(value: Any) -> str:
     text = str(value or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{7,40}", text):
@@ -51003,47 +51059,81 @@ def _contract_runtime_direct_fix_close_authority_gate(
     child = direct_fix_records[-1]
     child_id = str(child.get("contract_execution_id") or "").strip()
     parent_id = str(child.get("parent_contract_execution_id") or "").strip()
-    repair_line: dict[str, Any] = {}
-    qa_line: dict[str, Any] = {}
-    return_line: dict[str, Any] = {}
-    for line in _contract_runtime_completed_line_items(child):
-        if _contract_runtime_direct_fix_line_matches(
-            line,
-            line_ids={"direct_fix_candidate_repair"},
-            evidence_kinds={"direct_fix_repair_evidence"},
-            actor_roles={"mf_sub"},
-        ):
-            repair_line = line
-        if _contract_runtime_direct_fix_line_matches(
-            line,
-            line_ids={"qa_independent_verification"},
-            evidence_kinds={"independent_verification", "direct_fix_independent_qa"},
-            actor_roles={"qa"},
-        ):
-            qa_line = line
-        if _contract_runtime_direct_fix_line_matches(
-            line,
-            line_ids={"direct_fix_return_to_parent"},
-            evidence_kinds={"direct_fix_return_to_parent"},
-            actor_roles={"observer"},
-        ):
-            return_line = line
+    child_lines = _contract_runtime_direct_fix_authority_lines(child)
+    repair_line = child_lines["repair"]
+    qa_line = child_lines["qa"]
+    return_line = child_lines["return"]
 
     repair_index = int(repair_line.get("_completed_line_index", -1) or -1)
     qa_index = int(qa_line.get("_completed_line_index", -1) or -1)
     return_index = int(return_line.get("_completed_line_index", -1) or -1)
+    parent_records = {
+        str(record.get("contract_execution_id") or "").strip(): record
+        for record in records
+        if str(record.get("contract_execution_id") or "").strip()
+    }
     parent_ack_line: dict[str, Any] = {}
     if parent_id and child_id:
-        for record in records:
-            if str(record.get("contract_execution_id") or "").strip() != parent_id:
-                continue
-            for line in _contract_runtime_completed_line_items(record):
-                if _contract_runtime_direct_fix_parent_ack_matches(
-                    line,
-                    parent_execution_id=parent_id,
-                    child_execution_id=child_id,
-                ):
-                    parent_ack_line = line
+        parent_record = parent_records.get(parent_id, {})
+        for line in _contract_runtime_completed_line_items(parent_record):
+            if _contract_runtime_direct_fix_parent_ack_matches(
+                line,
+                parent_execution_id=parent_id,
+                child_execution_id=child_id,
+            ):
+                parent_ack_line = line
+
+    returned_child_ids: list[str] = []
+    acknowledged_child_ids: list[str] = []
+    unacknowledged_child_ids: list[str] = []
+    child_ack_lines: list[dict[str, Any]] = []
+    returned_child_source_lines: list[dict[str, Any]] = []
+    for direct_child in direct_fix_records:
+        returned_child_id = str(
+            direct_child.get("contract_execution_id") or ""
+        ).strip()
+        returned_parent_id = str(
+            direct_child.get("parent_contract_execution_id") or ""
+        ).strip()
+        if not returned_child_id or not returned_parent_id:
+            continue
+        lines = _contract_runtime_direct_fix_authority_lines(direct_child)
+        child_repair = lines["repair"]
+        child_qa = lines["qa"]
+        child_return = lines["return"]
+        child_repair_index = int(
+            child_repair.get("_completed_line_index", -1) or -1
+        )
+        child_qa_index = int(child_qa.get("_completed_line_index", -1) or -1)
+        child_return_index = int(
+            child_return.get("_completed_line_index", -1) or -1
+        )
+        if not (
+            child_repair
+            and child_qa
+            and child_return
+            and child_qa_index > child_repair_index
+            and child_return_index > child_qa_index
+        ):
+            continue
+        returned_child_ids.append(returned_child_id)
+        returned_child_source_lines.extend((child_repair, child_qa, child_return))
+        child_ack_line: dict[str, Any] = {}
+        parent_record = parent_records.get(returned_parent_id, {})
+        for line in _contract_runtime_completed_line_items(parent_record):
+            if _contract_runtime_direct_fix_parent_ack_matches_child(
+                line,
+                parent_execution_id=returned_parent_id,
+                child_execution_id=returned_child_id,
+            ):
+                child_ack_line = line
+        if child_ack_line:
+            acknowledged_child_ids.append(returned_child_id)
+            child_ack_lines.append(child_ack_line)
+            if returned_child_id == child_id:
+                parent_ack_line = child_ack_line
+        else:
+            unacknowledged_child_ids.append(returned_child_id)
 
     missing: list[str] = []
     if not repair_line:
@@ -51054,17 +51144,28 @@ def _contract_runtime_direct_fix_close_authority_gate(
         missing.append("direct_fix_return_to_parent")
     if not parent_ack_line:
         missing.append("parent_return_acknowledgement")
+    if unacknowledged_child_ids:
+        missing.append("parent_return_acknowledgement")
     if repair_line and qa_line and qa_index <= repair_index:
         missing.append("independent_qa_after_repair")
     if qa_line and return_line and return_index <= qa_index:
         missing.append("return_to_parent_after_qa")
 
+    missing = list(dict.fromkeys(item for item in missing if item))
     passed = not missing
     source_refs = [
         str(line.get("_source_ref") or "")
-        for line in (repair_line, qa_line, return_line, parent_ack_line)
+        for line in (
+            repair_line,
+            qa_line,
+            return_line,
+            parent_ack_line,
+            *returned_child_source_lines,
+            *child_ack_lines,
+        )
         if str(line.get("_source_ref") or "")
     ]
+    source_refs = list(dict.fromkeys(source_refs))
     return {
         "schema_version": "contract_runtime_direct_fix_close_authority_gate.v1",
         "accepted": passed,
@@ -51078,11 +51179,17 @@ def _contract_runtime_direct_fix_close_authority_gate(
         "close_commit": close_commit,
         "missing_requirement_ids": missing,
         "source_refs": source_refs,
+        "returned_successor_contract_execution_ids": returned_child_ids,
+        "acknowledged_successor_contract_execution_ids": acknowledged_child_ids,
+        "unacknowledged_successor_contract_execution_ids": unacknowledged_child_ids,
         "checks": {
             "has_direct_fix_repair_evidence": bool(repair_line),
             "has_independent_qa": bool(qa_line),
             "has_return_to_parent": bool(return_line),
-            "has_parent_return_acknowledgement": bool(parent_ack_line),
+            "has_parent_return_acknowledgement": (
+                bool(parent_ack_line) and not unacknowledged_child_ids
+            ),
+            "all_returned_children_acknowledged": not unacknowledged_child_ids,
             "independent_qa_after_repair": bool(qa_line and qa_index > repair_index),
             "return_to_parent_after_qa": bool(return_line and return_index > qa_index),
         },

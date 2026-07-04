@@ -1040,14 +1040,15 @@ def _project_current_contract_state(
 ) -> dict[str, Any]:
     if not records:
         return _empty_projected_state("missing_contract_runtime_execution")
-    direct_fix = _latest_record(
-        [
+    direct_fix_records = sorted(
+        (
             record
             for record in records
             if _record_contract_id(record) in DIRECT_FIX_CONTRACT_IDS
-        ],
-        row_times=row_times,
+        ),
+        key=lambda record: _record_order_key(record, row_times=row_times),
     )
+    direct_fix = direct_fix_records[-1] if direct_fix_records else {}
     if direct_fix:
         direct_state = _project_direct_fix_state(direct_fix, root_record=root_record)
         if direct_state:
@@ -1067,8 +1068,18 @@ def _project_current_contract_state(
                 )
                 if later_successor:
                     return _project_record_state(later_successor)
-                if _parent_resume_acknowledged(root_record, direct_fix):
-                    return _project_record_state(root_record)
+                for returned_child in direct_fix_records:
+                    returned_state = _project_direct_fix_state(
+                        returned_child,
+                        root_record=root_record,
+                    )
+                    if returned_state.get("readiness_state") != (
+                        "parent_resume_required_after_direct_fix_qa"
+                    ):
+                        continue
+                    if not _parent_resume_acknowledged(root_record, returned_child):
+                        return returned_state
+                return _project_record_state(root_record)
             return direct_state
     incomplete = [
         record
@@ -1390,26 +1401,22 @@ def _parent_resume_acknowledged(
     parent_id = str(parent.get("contract_execution_id") or "").strip()
     if not child_id:
         return False
-    line = _find_parent_resume_ack_line(parent)
+    line = _find_parent_resume_ack_line(
+        parent,
+        parent_id=parent_id,
+        child_id=child_id,
+    )
     if not line:
         return False
-    if str(line.get("actor_role") or "").strip() != "observer":
-        return False
-    if not _line_status_allows_direct_fix_qa(line):
-        return False
-    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
-    if str(payload.get("parent_contract_execution_id") or "").strip() != parent_id:
-        return False
-    successor_contract_id = str(payload.get("successor_contract_id") or "").strip()
-    if successor_contract_id not in DIRECT_FIX_CONTRACT_IDS:
-        return False
-    successor_execution_id = str(
-        payload.get("successor_contract_execution_id") or ""
-    ).strip()
-    return successor_execution_id == child_id
+    return True
 
 
-def _find_parent_resume_ack_line(record: Mapping[str, Any]) -> dict[str, Any]:
+def _find_parent_resume_ack_line(
+    record: Mapping[str, Any],
+    *,
+    parent_id: str = "",
+    child_id: str = "",
+) -> dict[str, Any]:
     lines = (
         record.get("completed_lines")
         if isinstance(record.get("completed_lines"), list)
@@ -1418,14 +1425,47 @@ def _find_parent_resume_ack_line(record: Mapping[str, Any]) -> dict[str, Any]:
     for index, line in reversed(list(enumerate(lines))):
         if not isinstance(line, Mapping):
             continue
-        if str(line.get("line_id") or "") != "resume_parent_after_successor_return":
-            continue
-        if str(line.get("evidence_kind") or "") != "successor_return_acknowledgement":
+        if not _parent_resume_ack_line_matches(
+            line,
+            parent_id=parent_id,
+            child_id=child_id,
+        ):
             continue
         enriched = dict(line)
         enriched["_completed_line_index"] = index
         return enriched
     return {}
+
+
+def _parent_resume_ack_line_matches(
+    line: Mapping[str, Any],
+    *,
+    parent_id: str = "",
+    child_id: str = "",
+) -> bool:
+    if str(line.get("line_id") or "") != "resume_parent_after_successor_return":
+        return False
+    if str(line.get("evidence_kind") or "") != "successor_return_acknowledgement":
+        return False
+    if str(line.get("actor_role") or "").strip() != "observer":
+        return False
+    if not _line_status_allows_direct_fix_qa(line):
+        return False
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    if (
+        parent_id
+        and str(payload.get("parent_contract_execution_id") or "").strip() != parent_id
+    ):
+        return False
+    successor_contract_id = str(payload.get("successor_contract_id") or "").strip()
+    if successor_contract_id not in DIRECT_FIX_CONTRACT_IDS:
+        return False
+    successor_execution_id = str(
+        payload.get("successor_contract_execution_id") or ""
+    ).strip()
+    if child_id and successor_execution_id != child_id:
+        return False
+    return True
 
 
 def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:

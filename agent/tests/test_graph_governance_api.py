@@ -24462,6 +24462,239 @@ def _make_real_startup_timeline_event(
     }
 
 
+def _make_initial_join_startup_gate(
+    *,
+    task_id: str,
+    fence_token: str,
+    worktree_path: str,
+    branch_ref: str,
+    runtime_context_id: str,
+    actual_worker_id: str,
+    token_evidence_type: str = "server_verified_ref",
+) -> dict:
+    return {
+        "schema_version": "mf_subagent_startup_gate.v1",
+        "gate_kind": "mf_subagent.startup",
+        "status": "passed",
+        "ok": True,
+        "allowed": True,
+        "bounded": True,
+        "started": True,
+        "startup_complete": True,
+        "actual_startup_recorded": True,
+        "close_satisfying": False,
+        "session_token_evidence_type": token_evidence_type,
+        "session_token_present": True,
+        "session_token_ref": f"stref-{task_id}",
+        "session_token_ref_present": True,
+        "server_issued_session_token_verified": (
+            token_evidence_type in {"server_verified", "server_verified_ref"}
+        ),
+        "agent_id_match_mode": "initial_join_actual_host_worker",
+        "agent_id": actual_worker_id,
+        "actual_host_worker_id": actual_worker_id,
+        "allocation_owner": f"allocation-owner-{task_id}",
+        "expected_agent_id": f"allocation-owner-{task_id}",
+        "host_adapter_startup_token_accepted": False,
+        "host_adapter_startup_surrogate_not_close_satisfying": False,
+        "worker_role": "mf_sub",
+        "task_id": task_id,
+        "parent_task_id": f"parent-{task_id}",
+        "worker_slot_id": f"wslot-{task_id}",
+        "worker_id": f"wslot-{task_id}",
+        "runtime_context_id": runtime_context_id,
+        "fence_token": fence_token,
+        "fence_token_present": True,
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "branch": branch_ref,
+        "base_commit": f"base-{task_id}",
+        "target_head_commit": f"target-{task_id}",
+        "head_commit": f"head-{task_id}",
+        "merge_queue_id": f"mq-{task_id}",
+        "route_id": f"route-{fence_token}",
+        "route_context_hash": f"sha256:route-{fence_token}",
+        "prompt_contract_id": f"rprompt-{fence_token}",
+        "prompt_contract_hash": f"sha256:prompt-{fence_token}",
+        "visible_injection_manifest_hash": f"sha256:visible-{fence_token}",
+        "route_token_ref": f"rtok-{fence_token}",
+        "observer_command_id": f"cmd-{fence_token}",
+        "read_receipt_hash": f"sha256:rr-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
+        "worker_session_id": actual_worker_id,
+        "filer_principal": actual_worker_id,
+        "worker_transcript_ref": f"multi_agent:{actual_worker_id}",
+        "harness_type": "codex",
+        "worker_self_attesting": False,
+        "finish_time_self_attesting": False,
+    }
+
+
+def _initial_join_finish_gate_body(
+    *,
+    startup: dict,
+    task_id: str,
+    fence_token: str,
+    actual_worker_id: str,
+) -> dict:
+    return {
+        "project_id": PID,
+        "task_id": task_id,
+        "parent_task_id": f"parent-{task_id}",
+        "status": "review_ready",
+        "changed_files": [],
+        "test_results": {"status": "passed"},
+        "checkpoint_id": f"ckpt-{task_id}",
+        "fence_token": fence_token,
+        "head_commit": f"head-{task_id}",
+        "agent_id": actual_worker_id,
+        "db_startup_events": [
+            {
+                "id": f"startup-{task_id}",
+                "event_kind": "mf_subagent_startup",
+                "event_type": "mf_subagent.startup",
+                "phase": "startup_gate",
+                "status": "passed",
+                "actor": actual_worker_id,
+                "payload": {"mf_subagent_startup_gate": startup},
+            }
+        ],
+        "read_receipt_hash": f"sha256:rr-{fence_token}",
+        "read_receipt_event_id": f"rr-{fence_token}",
+        "observer_command_id": f"cmd-{fence_token}",
+        "route_id": f"route-{fence_token}",
+        "route_context_hash": f"sha256:route-{fence_token}",
+        "prompt_contract_id": f"rprompt-{fence_token}",
+        "prompt_contract_hash": f"sha256:prompt-{fence_token}",
+        "visible_injection_manifest_hash": f"sha256:visible-{fence_token}",
+        "route_token_ref": f"rtok-{fence_token}",
+        "finish_time_worker_self_attestation": {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": actual_worker_id,
+            "filer_principal": actual_worker_id,
+            "worker_transcript_ref": f"multi_agent:{actual_worker_id}",
+            "harness_type": "codex",
+            "blockers": [],
+        },
+    }
+
+
+def test_finish_gate_accepts_initial_join_actual_host_worker_startup_identity():
+    task_id = "initial-join-finish-task"
+    fence_token = "fence-initial-join-finish"
+    runtime_context_id = "mfrctx-initial-join-finish"
+    actual_worker_id = "019f-initial-join-real-worker"
+    worktree_path = "/tmp/initial-join-finish"
+    branch_ref = "refs/heads/codex/initial-join-finish"
+    startup = _make_initial_join_startup_gate(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        runtime_context_id=runtime_context_id,
+        actual_worker_id=actual_worker_id,
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id,
+        parent_task_id=f"parent-{task_id}",
+        backlog_id="AC-MF-PARALLEL-V2-STARTUP-FINISH-GATE-DOGFOOD-20260704",
+        runtime_context_id=runtime_context_id,
+        branch_ref=branch_ref,
+        status=STATE_WORKTREE_READY,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        base_commit=f"base-{task_id}",
+        target_head_commit=f"target-{task_id}",
+        head_commit=f"head-{task_id}",
+        merge_queue_id=f"mq-{task_id}",
+        allocation_owner=f"allocation-owner-{task_id}",
+        worker_id=f"wslot-{task_id}",
+        worker_slot_id=f"wslot-{task_id}",
+        actual_host_worker_id=actual_worker_id,
+        agent_id=actual_worker_id,
+    )
+
+    result = validate_mf_subagent_finish_gate(
+        _initial_join_finish_gate_body(
+            startup=startup,
+            task_id=task_id,
+            fence_token=fence_token,
+            actual_worker_id=actual_worker_id,
+        ),
+        context=context,
+    )
+
+    assert result["startup_worker_identity_gate"]["passed"] is True
+    assert result["worker_self_attestation_gate"]["passed"] is True
+    assert result["startup_evidence"]["agent_id_match_mode"] == (
+        "initial_join_actual_host_worker"
+    )
+    assert result["startup_evidence"]["close_satisfying"] is False
+    assert result["close_ready"] is True
+
+
+def test_finish_gate_rejects_unverified_initial_join_startup_identity():
+    task_id = "initial-join-unverified-task"
+    fence_token = "fence-initial-join-unverified"
+    runtime_context_id = "mfrctx-initial-join-unverified"
+    actual_worker_id = "019f-initial-join-unverified-worker"
+    worktree_path = "/tmp/initial-join-unverified"
+    branch_ref = "refs/heads/codex/initial-join-unverified"
+    startup = _make_initial_join_startup_gate(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        runtime_context_id=runtime_context_id,
+        actual_worker_id=actual_worker_id,
+        token_evidence_type="claimed_unverified_ref",
+    )
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id,
+        parent_task_id=f"parent-{task_id}",
+        backlog_id="AC-MF-PARALLEL-V2-STARTUP-FINISH-GATE-DOGFOOD-20260704",
+        runtime_context_id=runtime_context_id,
+        branch_ref=branch_ref,
+        status=STATE_WORKTREE_READY,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        base_commit=f"base-{task_id}",
+        target_head_commit=f"target-{task_id}",
+        head_commit=f"head-{task_id}",
+        merge_queue_id=f"mq-{task_id}",
+        allocation_owner=f"allocation-owner-{task_id}",
+        worker_id=f"wslot-{task_id}",
+        worker_slot_id=f"wslot-{task_id}",
+        actual_host_worker_id=actual_worker_id,
+        agent_id=actual_worker_id,
+    )
+
+    with pytest.raises(
+        MfSubagentContractError,
+        match="requires actual mf_subagent_startup evidence",
+    ):
+        validate_mf_subagent_finish_gate(
+            _initial_join_finish_gate_body(
+                startup=startup,
+                task_id=task_id,
+                fence_token=fence_token,
+                actual_worker_id=actual_worker_id,
+            ),
+            context=context,
+        )
+
+
 def _close_timeline_route_identity(suffix: str) -> dict:
     return {
         "route_id": f"route-close-{suffix}",
