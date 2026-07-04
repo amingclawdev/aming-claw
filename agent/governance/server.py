@@ -14178,6 +14178,7 @@ def _runtime_context_forward_request(
     *,
     body: Mapping[str, Any],
     trusted_route_gate: Mapping[str, Any] | None = None,
+    trusted_runtime_context_worker_proof: bool = False,
 ) -> RequestContext:
     forward = RequestContext(
         ctx.handler,
@@ -14192,6 +14193,8 @@ def _runtime_context_forward_request(
     forward._session = ctx._session
     if isinstance(trusted_route_gate, Mapping) and trusted_route_gate:
         forward._trusted_route_token_gate = dict(trusted_route_gate)
+    if trusted_runtime_context_worker_proof:
+        forward._trusted_runtime_context_worker_proof = True
     return forward
 
 
@@ -15658,6 +15661,10 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
 
     payload = _scrub_receipt_payload(payload)
     submitted_actor = str(body.get("actor") or "").strip()
+    evidence_owner = (
+        str(context.worker_slot_id or context.worker_id or submitted_actor or "mf_sub")
+        .strip()
+    )
     for key, value in {
         "runtime_context_id": runtime_context_id,
         "task_id": context.task_id,
@@ -15676,7 +15683,14 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
-        "actor_session_principal": context.worker_slot_id or context.worker_id,
+        "actor_session_principal": evidence_owner,
+        "authorization_source": "runtime_context_copy_safe_worker_proof",
+        "evidence_owner_actor": evidence_owner,
+        "evidence_owner_role": "mf_sub",
+        "evidence_owner_session_ref": session_token_ref,
+        "submitter_principal": evidence_owner,
+        "submitter_session": session_token_ref,
+        "observer_impersonation": False,
         "submitted_actor": submitted_actor,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
@@ -15687,6 +15701,23 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
     payload["raw_fence_token_persisted"] = False
     payload["raw_session_token_persisted"] = False
     payload["fence_token_redacted"] = bool(fence_token_hash)
+    payload["observer_impersonation"] = False
+    from .runtime_context import worker_proof_line_provenance
+
+    worker_provenance = worker_proof_line_provenance(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "target_project_root": target_project_root,
+            "session_token_ref": session_token_ref,
+            "fence_token_hash": fence_token_hash,
+        }
+    )
+    if worker_provenance:
+        payload["worker_evidence_provenance"] = worker_provenance
     for key in (
         "route_id",
         "route_context_hash",
@@ -15728,6 +15759,7 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
             ctx,
             body=event_body,
             trusted_route_gate=trusted_route_gate,
+            trusted_runtime_context_worker_proof=bool(worker_provenance),
         )
     )
     response = _runtime_context_write_response(
@@ -52027,6 +52059,62 @@ def _trusted_contract_runtime_actor_role_from_context(
     return session_role if session_role in {"observer", "qa", "mf_sub"} else ""
 
 
+def _timeline_trusted_runtime_context_worker_proof(
+    ctx: RequestContext,
+    conn,
+    payload: Mapping[str, Any],
+) -> bool:
+    if not bool(getattr(ctx, "_trusted_runtime_context_worker_proof", False)):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    proof = payload.get("worker_evidence_provenance")
+    if not isinstance(proof, Mapping):
+        return False
+    try:
+        from .permissions import session_role
+
+        role = session_role(ctx.require_auth(conn))
+    except Exception:
+        return False
+    if role != "mf_sub":
+        return False
+    if str(proof.get("source") or proof.get("authorization_source") or "").strip() != (
+        "runtime_context_copy_safe_worker_proof"
+    ):
+        return False
+    if str(proof.get("worker_role") or "").strip() != "mf_sub":
+        return False
+    if proof.get("verified") is not True or proof.get("worker_owned") is not True:
+        return False
+    if proof.get("observer_impersonation") is not False:
+        return False
+    if payload.get("observer_impersonation") is not False:
+        return False
+
+    def _matches_required(field: str) -> bool:
+        proof_value = str(proof.get(field) or "").strip()
+        payload_value = str(payload.get(field) or "").strip()
+        return bool(proof_value and payload_value and proof_value == payload_value)
+
+    required_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "session_token_ref",
+    )
+    if not all(_matches_required(field) for field in required_fields):
+        return False
+    if not _matches_required("fence_token_hash"):
+        return False
+    proof_worker = str(proof.get("worker_slot_id") or proof.get("worker_id") or "").strip()
+    payload_worker = str(
+        payload.get("worker_slot_id") or payload.get("worker_id") or ""
+    ).strip()
+    return bool(proof_worker and payload_worker and proof_worker == payload_worker)
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
@@ -52191,7 +52279,14 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "artifact_refs": ctx.body.get("artifact_refs") or {},
                     "backlog_id": ctx.body.get("backlog_id", ""),
                     "task_id": ctx.body.get("task_id", ""),
-                }
+                },
+                trusted_runtime_context_worker_proof=(
+                    _timeline_trusted_runtime_context_worker_proof(
+                        ctx,
+                        conn,
+                        validation_payload,
+                    )
+                ),
             )
         except MfSubagentContractError as exc:
             meta_contract_error_message = str(exc)

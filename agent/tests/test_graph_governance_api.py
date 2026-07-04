@@ -19601,6 +19601,22 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "codex-mf-sub-observer-intervention-amendment"
     )
     assert read_events[0]["payload"]["actor_session_principal"] == "slot-session-ref"
+    assert read_events[0]["payload"]["authorization_source"] == (
+        "runtime_context_copy_safe_worker_proof"
+    )
+    assert read_events[0]["payload"]["evidence_owner_role"] == "mf_sub"
+    assert read_events[0]["payload"]["evidence_owner_actor"] == "slot-session-ref"
+    assert read_events[0]["payload"]["observer_impersonation"] is False
+    provenance = read_events[0]["payload"]["worker_evidence_provenance"]
+    assert provenance["source"] == "runtime_context_copy_safe_worker_proof"
+    assert provenance["verified"] is True
+    assert provenance["worker_owned"] is True
+    assert provenance["observer_impersonation"] is False
+    assert provenance["runtime_context_id"] == context.runtime_context_id
+    assert provenance["session_token_ref"] == session_ref
+    persisted_receipt = json.dumps(read_events[0]["payload"], sort_keys=True)
+    assert "raw-session-ref" not in persisted_receipt
+    assert "fence-session-ref" not in persisted_receipt
 
     initial_join_body = dict(initial_join_submission["copy_safe_body"])
     initial_join_body["reason"] = "host envelope required before startup retry"

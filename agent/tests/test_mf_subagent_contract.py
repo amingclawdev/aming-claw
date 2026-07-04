@@ -239,7 +239,7 @@ def test_runtime_contract_view_is_worker_scoped_and_redacts_private_route_body()
             "visible_injection_manifest_hash": "sha256:visible",
             "raw_private_context": "do not expose",
             "hidden_context": "do not expose",
-        },
+        }
     )
 
     assert view["schema_version"] == RUNTIME_CONTRACT_VIEW_SCHEMA_VERSION
@@ -610,7 +610,7 @@ def test_runtime_contract_view_reports_revision_polling_state() -> None:
             "revision_id": "crev-2",
             "payload": {"summary": "updated evidence request"},
             "route_identity": {"route_context_hash": "sha256:route"},
-        },
+        }
     )
 
     assert changed["latest_revision_id"] == "crev-2"
@@ -933,7 +933,7 @@ def test_meta_contract_allows_design_review_as_non_worker_review_evidence() -> N
                 "reviewed_contract_summary": "Contract State Layer additive design review.",
                 "close_satisfying": False,
             },
-        }
+        },
     )
 
     assert gate["allowed"] is True
@@ -958,7 +958,7 @@ def test_meta_contract_allows_contract_revision_created_as_state_evidence() -> N
                 },
                 "close_satisfying": False,
             },
-        }
+        },
     )
 
     assert gate["allowed"] is True
@@ -1177,6 +1177,93 @@ def test_meta_contract_rejects_observer_direct_worker_evidence() -> None:
                 "actor": "observer",
                 "status": "passed",
                 "payload": {"changed_files": ["agent/governance/server.py"]},
+            }
+        )
+
+
+def test_meta_contract_accepts_server_verified_runtime_context_worker_proof() -> None:
+    gate = validate_meta_contract_timeline_event(
+        {
+            "event_type": "mf_subagent_read_receipt",
+            "event_kind": "mf_subagent_read_receipt",
+            "actor": "observer",
+            "status": "passed",
+            "payload": {
+                "authorization_source": "runtime_context_copy_safe_worker_proof",
+                "runtime_context_id": "mfrctx-proof",
+                "task_id": "worker-proof",
+                "parent_task_id": "onboard-service-proof",
+                "target_project_root": "/tmp/worker-proof",
+                "worker_role": "mf_sub",
+                "worker_id": "multi_agent:019f29da-proof",
+                "worker_slot_id": "multi_agent:019f29da-proof",
+                "session_token_ref": "wstok-proof",
+                "fence_token_hash": "sha256:fence-proof",
+                "read_receipt_hash": "sha256:receipt-proof",
+                "observer_impersonation": False,
+                "worker_evidence_provenance": {
+                    "source": "runtime_context_copy_safe_worker_proof",
+                    "verified": True,
+                    "worker_owned": True,
+                    "observer_impersonation": False,
+                    "runtime_context_id": "mfrctx-proof",
+                    "task_id": "worker-proof",
+                    "parent_task_id": "onboard-service-proof",
+                    "target_project_root": "/tmp/worker-proof",
+                    "worker_role": "mf_sub",
+                    "worker_id": "multi_agent:019f29da-proof",
+                    "worker_slot_id": "multi_agent:019f29da-proof",
+                    "session_token_ref": "wstok-proof",
+                    "fence_token_hash": "sha256:fence-proof",
+                },
+            },
+        },
+        trusted_runtime_context_worker_proof=True,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "read_receipt"
+    assert gate["observer_worker_transport"] is False
+
+
+def test_meta_contract_rejects_observer_claimed_runtime_context_worker_proof() -> None:
+    with pytest.raises(MfSubagentContractError, match="author_worker_evidence"):
+        validate_meta_contract_timeline_event(
+            {
+                "event_type": "mf_subagent_read_receipt",
+                "event_kind": "mf_subagent_read_receipt",
+                "actor": "observer",
+                "status": "passed",
+                "payload": {
+                    "authorization_source": "runtime_context_copy_safe_worker_proof",
+                    "runtime_context_id": "mfrctx-proof",
+                    "task_id": "worker-proof",
+                    "parent_task_id": "onboard-service-proof",
+                    "target_project_root": "/tmp/worker-proof",
+                    "worker_role": "mf_sub",
+                    "worker_id": "multi_agent:019f29da-proof",
+                    "worker_slot_id": "multi_agent:019f29da-proof",
+                    "session_token_ref": "wstok-proof",
+                    "fence_token_hash": "sha256:fence-proof",
+                    "read_receipt_hash": "sha256:receipt-proof",
+                    "observer_impersonation": False,
+                    "worker_evidence_provenance": {
+                        "source": "runtime_context_copy_safe_worker_proof",
+                        "verified": True,
+                        "worker_owned": True,
+                        "observer_impersonation": False,
+                        "runtime_context_id": "mfrctx-proof",
+                        "task_id": "worker-proof",
+                        "parent_task_id": "onboard-service-proof",
+                        "target_project_root": "/tmp/worker-proof",
+                        "worker_role": "mf_sub",
+                        "worker_id": "multi_agent:019f29da-proof",
+                        "worker_slot_id": "multi_agent:019f29da-proof",
+                        "session_token_ref": "wstok-proof",
+                        "fence_token_hash": "sha256:fence-proof",
+                    },
+                },
             }
         )
 

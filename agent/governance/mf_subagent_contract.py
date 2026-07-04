@@ -5726,6 +5726,78 @@ def _meta_worker_evidence_present(event: Mapping[str, Any]) -> bool:
     return False
 
 
+def _meta_runtime_context_worker_proof_present(event: Mapping[str, Any]) -> bool:
+    """Return true for server-verified Runtime Context mf_sub proof.
+
+    This is intentionally narrower than generic worker evidence. It lets a
+    Codex host-created subagent write worker evidence through the runtime
+    context facade without being treated as observer-authored transport, while
+    preserving the no-surrogate rule for ordinary observer timeline writes.
+    """
+
+    if _meta_self_attesting_present(event):
+        return False
+    for container in _meta_evidence_containers(event):
+        candidates: list[Mapping[str, Any]] = []
+        for key in (
+            "worker_evidence_provenance",
+            "runtime_context_worker_proof",
+            "worker_proof",
+        ):
+            child = container.get(key)
+            if isinstance(child, Mapping):
+                candidates.append(child)
+        for proof in candidates:
+            source = _normalized_action(
+                proof.get("authorization_source")
+                or proof.get("source")
+                or container.get("authorization_source")
+            )
+            if source != "runtime_context_copy_safe_worker_proof":
+                continue
+            role = _meta_normalize_role(
+                proof.get("worker_role") or container.get("worker_role")
+            )
+            if role != MF_SUB_ROLE:
+                continue
+            if _bool(proof.get("observer_impersonation")) or _bool(
+                container.get("observer_impersonation")
+            ):
+                continue
+            if not _bool(
+                proof.get("verified") or proof.get("runtime_context_worker_proof_verified")
+            ):
+                continue
+            if not _bool(proof.get("worker_owned")):
+                continue
+            required = (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "target_project_root",
+                "session_token_ref",
+            )
+            if any(
+                not _string(proof.get(field) or container.get(field))
+                for field in required
+            ):
+                continue
+            if not (
+                _string(proof.get("fence_token_hash") or container.get("fence_token_hash"))
+                or _string(proof.get("fence_token") or container.get("fence_token"))
+            ):
+                continue
+            if not _string(
+                proof.get("worker_slot_id")
+                or proof.get("worker_id")
+                or container.get("worker_slot_id")
+                or container.get("worker_id")
+            ):
+                continue
+            return True
+    return False
+
+
 def _meta_explicit_qa_marker(event: Mapping[str, Any]) -> bool:
     for marker in _meta_event_markers(event):
         if marker.startswith("qa_") or "independent_verification" in marker:
@@ -5734,9 +5806,28 @@ def _meta_explicit_qa_marker(event: Mapping[str, Any]) -> bool:
 
 
 def _meta_role_from_event(event: Mapping[str, Any], *, action: str) -> str:
+    return _meta_role_from_event_with_trust(
+        event,
+        action=action,
+        trusted_runtime_context_worker_proof=False,
+    )
+
+
+def _meta_role_from_event_with_trust(
+    event: Mapping[str, Any],
+    *,
+    action: str,
+    trusted_runtime_context_worker_proof: bool,
+) -> str:
     actor = _normalized_action(event.get("actor"))
     if actor.startswith("observer_on_behalf_of"):
         return OBSERVER_COORDINATOR_ROLE
+    if (
+        trusted_runtime_context_worker_proof
+        and action in _META_WORKER_AUTHORED_ACTIONS
+        and _meta_runtime_context_worker_proof_present(event)
+    ):
+        return MF_SUB_ROLE
     actor_role = _meta_normalize_role(actor)
     if actor_role in {OBSERVER_COORDINATOR_ROLE, "qa", MF_SUB_ROLE, "operator", "judge", "system"}:
         return actor_role
@@ -5891,6 +5982,7 @@ def validate_meta_contract_timeline_event(
     event: Mapping[str, Any],
     *,
     meta_contract: Mapping[str, Any] | None = None,
+    trusted_runtime_context_worker_proof: bool = False,
 ) -> dict[str, Any]:
     """Validate one timeline event against the meta-contract role/action whitelist.
 
@@ -5911,7 +6003,11 @@ def validate_meta_contract_timeline_event(
             "meta-contract whitelist rejected unknown timeline action"
             + (f": {markers}" if markers else "")
         )
-    role = _meta_role_from_event(event, action=action)
+    role = _meta_role_from_event_with_trust(
+        event,
+        action=action,
+        trusted_runtime_context_worker_proof=trusted_runtime_context_worker_proof,
+    )
     forbidden_always = {
         _normalized_action(item)
         for item in _string_list_forgiving(meta.get("forbidden_always"))
