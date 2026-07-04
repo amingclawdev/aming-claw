@@ -20,6 +20,8 @@ FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
 NON_TEMPLATE_CONTRACT_FILES = {"meta_contract.v1.json"}
 CONTRACT_TEMPLATE_ALIASES = {
     "direct_fix": "direct_fix.v1",
+    "mf_parallel": "mf_parallel.v2",
+    "parallel_worker": "mf_parallel.v2",
     "hotfix.v1": "observer_hotfix_direct_mutation.v1",
     "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
 }

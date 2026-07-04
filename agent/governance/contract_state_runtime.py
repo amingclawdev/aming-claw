@@ -239,12 +239,14 @@ _DIRECT_TIMELINE_APPEND_EVENT_KINDS = {
     "observer_visual_smoke",
     "observer_work_mode_transition",
     "plan_precheck",
+    "qa_graph_trace",
     "qa_review",
     "qa_verification",
     "read_receipt",
     "reconcile",
     "record_finish_time_worker_attestation",
     "record_blocker",
+    "review_ready",
     "review_lane",
     "route_action_precheck",
     "route_context",
@@ -261,6 +263,7 @@ _CONTRACT_FIRST_CANDIDATE_TEMPLATES = [
     "onboard_contract.v1",
     "observer_hotfix_direct_mutation.v1",
     _DIRECT_FIX_CONTRACT_TEMPLATE_ID,
+    "mf_parallel.v2",
     "mf_parallel.v1",
     _QA_EVIDENCE_CONTRACT_TEMPLATE_ID,
     _AUDIT_CLOSE_CONTRACT_TEMPLATE_ID,
@@ -330,6 +333,8 @@ _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
         "independent_verification",
         "qa_verification",
         "qa_review",
+        "graph_trace",
+        "qa_graph_trace",
         "record_blocker",
         "review_ready",
     },
@@ -369,6 +374,7 @@ _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
 
 _QA_TIMELINE_EVENT_KINDS = {
     "independent_verification",
+    "qa_graph_trace",
     "qa_review",
     "qa_verification",
 }
@@ -441,8 +447,13 @@ _LEGACY_HOTFIX_DIRECT_OBSERVER_SUPPRESSED_REQUIREMENTS = {
 
 _MF_PARALLEL_CONTRACT_IDS = {
     "mf_parallel",
+    "mf_parallel.v2",
     "mf_parallel.v1",
     "parallel_worker.v1",
+}
+
+_MF_PARALLEL_V2_CONTRACT_IDS = {
+    "mf_parallel.v2",
 }
 
 _MF_PARALLEL_DEFAULT_REQUIREMENTS = [
@@ -1943,8 +1954,22 @@ def _enrich_next_action_append_hint(
         return None
     enriched = dict(action)
     hint = _mapping(enriched.get("timeline_append_hint"))
+    default_hint: dict[str, Any] = {}
     if not hint:
-        hint = _default_timeline_append_hint_for_action(enriched)
+        default_hint = _default_timeline_append_hint_for_action(enriched)
+    if not hint and (
+        enriched.get("accepted_event_kinds")
+        or enriched.get("event_kinds")
+        or enriched.get("event_kind")
+    ):
+        candidate_hint = _timeline_append_hint(enriched)
+        if not default_hint or (
+            str(default_hint.get("event_kind") or "") == "contract_state_changed"
+            and str(candidate_hint.get("event_kind") or "") != "contract_state_changed"
+        ):
+            hint = candidate_hint
+    if not hint:
+        hint = default_hint
     if not hint:
         return enriched
 
@@ -2359,8 +2384,58 @@ def _contract_is_mf_parallel(contract_id: str, template_id: str) -> bool:
     )
 
 
-def _mf_parallel_default_requirements() -> list[dict[str, Any]]:
-    return [dict(item) for item in _MF_PARALLEL_DEFAULT_REQUIREMENTS]
+def _contract_is_mf_parallel_v2(contract_id: str, template_id: str) -> bool:
+    return bool(
+        str(contract_id or "").strip() in _MF_PARALLEL_V2_CONTRACT_IDS
+        or str(template_id or "").strip() in _MF_PARALLEL_V2_CONTRACT_IDS
+    )
+
+
+def _mf_parallel_default_requirements(
+    *,
+    contract_id: str = "",
+    template_id: str = "",
+) -> list[dict[str, Any]]:
+    requirements = [dict(item) for item in _MF_PARALLEL_DEFAULT_REQUIREMENTS]
+    if not _contract_is_mf_parallel_v2(contract_id, template_id):
+        return requirements
+
+    for requirement in requirements:
+        if requirement.get("id") == "qa_independent_verification":
+            requirement["requires"] = ["qa_graph_context"]
+            requirement["order"] = 720
+
+    requirements.extend(
+        [
+            {
+                "id": "worker_review_ready_handoff",
+                "action": "record_worker_review_ready_handoff",
+                "detail": (
+                    "mf_sub worker records review_ready handoff before independent "
+                    "QA begins; observer must not synthesize this evidence"
+                ),
+                "accepted_event_kinds": ["review_ready"],
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+                "requires": ["worker_finish_gate"],
+                "order": 650,
+            },
+            {
+                "id": "qa_graph_context",
+                "action": "record_qa_graph_trace",
+                "detail": (
+                    "QA records graph_trace evidence with QA identity before "
+                    "independent_verification"
+                ),
+                "accepted_event_kinds": ["qa_graph_trace"],
+                "owner_role": "qa",
+                "allowed_writer_roles": ["qa"],
+                "requires": ["worker_review_ready_handoff"],
+                "order": 680,
+            },
+        ]
+    )
+    return sorted(requirements, key=lambda item: int(item.get("order") or 0))
 
 
 def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int = 0) -> bool:
@@ -3602,6 +3677,7 @@ def _contract_first_selection_step(
             "observer_hotfix_direct_mutation.v1": (
                 "POST /api/projects/{project_id}/hotfix/enter"
             ),
+            "mf_parallel.v2": "instantiate and bind a graph-gated role-scoped parallel contract",
             "mf_parallel.v1": "instantiate and bind a role-scoped parallel contract",
             _QA_EVIDENCE_CONTRACT_TEMPLATE_ID: (
                 "create a QA-owned successor contract/evidence lane"
@@ -3709,7 +3785,10 @@ def build_contract_state_projection(
     ):
         root = {
             **root,
-            "evidence_requirements": _mf_parallel_default_requirements(),
+            "evidence_requirements": _mf_parallel_default_requirements(
+                contract_id=contract_id,
+                template_id=template_id,
+            ),
             "requirements_source": "builtin_mf_parallel_contract_defaults",
         }
     current_revision_id = str(

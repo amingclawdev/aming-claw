@@ -177,10 +177,22 @@ def test_mf_parallel_template_is_discoverable_by_runtime_filters():
     ids = {template["template_id"] for template in templates}
 
     assert "mf_parallel.v1" in ids
+    assert "mf_parallel.v2" in ids
     assert "mf_workflow_runtime.v1" in ids
+    assert get_contract_template("mf_parallel")["template_id"] == "mf_parallel.v2"
+    assert resolve_contract_template(template_id="mf_parallel", task_type="mf_parallel")[
+        "template_id"
+    ] == "mf_parallel.v2"
     assert resolve_contract_template(template_id="mf_parallel.v1", task_type="mf_parallel")[
         "template_id"
     ] == "mf_parallel.v1"
+    v2 = resolve_contract_template(template_id="mf_parallel.v2", task_type="mf_parallel")
+    assert v2["template_id"] == "mf_parallel.v2"
+    qa_graph = {
+        item["id"]: item for item in v2["evidence_requirements"]
+    }["qa_graph_trace_evidence"]
+    assert qa_graph["required"] is True
+    assert qa_graph["phase"] == "verification"
 
 
 def test_mf_workflow_runtime_template_is_discoverable_by_merge_stage():

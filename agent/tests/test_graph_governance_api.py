@@ -30628,8 +30628,12 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     templates_root = Path("agent/governance/contract_templates")
     batch = json.loads((templates_root / "mf_batch_parallel.v1.json").read_text())
     row = json.loads((templates_root / "mf_parallel.v1.json").read_text())
+    row_v2 = json.loads((templates_root / "mf_parallel.v2.json").read_text())
     definition = json.loads(
         Path("agent/governance/contract_definitions/mf_parallel.v1.rev2.json").read_text()
+    )
+    definition_v2 = json.loads(
+        Path("agent/governance/contract_definitions/mf_parallel.v2.rev1.json").read_text()
     )
 
     assert batch["template_id"] == "mf_batch_parallel.v1"
@@ -30649,13 +30653,24 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     assert row["row_scope_policy"]["multi_backlog_parent_template"] == (
         "mf_batch_parallel.v1"
     )
+    assert row_v2["row_scope_policy"]["scope"] == "single_backlog_row"
+    assert row_v2["row_scope_policy"]["multi_backlog_parent_template"] == (
+        "mf_batch_parallel.v1"
+    )
     parent_contracts = {
         (item["contract_id"], item["version"])
         for item in definition["system_layer"]["successor_policy"][
             "allowed_parent_contracts"
         ]
     }
+    parent_contracts_v2 = {
+        (item["contract_id"], item["version"])
+        for item in definition_v2["system_layer"]["successor_policy"][
+            "allowed_parent_contracts"
+        ]
+    }
     assert ("onboard_route_guide", "service") in parent_contracts
+    assert ("onboard_route_guide", "service") in parent_contracts_v2
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
@@ -39031,7 +39046,7 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert payload["fanout_policy"]["preflight_gate_required"] is True
     assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
-    assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v1"
+    assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v2"
 
 
 def test_observer_route_context_issue_blocks_multi_backlog_task_mismatch(conn):

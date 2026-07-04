@@ -9654,7 +9654,7 @@ def append_branch_contract_revision(
     context: BranchTaskRuntimeContext,
     *,
     revision_id: str = "",
-    contract_version: str = "mf_parallel.v1",
+    contract_version: str = "mf_parallel.v2",
     payload: Mapping[str, Any] | None = None,
     route_gate: Mapping[str, Any] | None = None,
     route_identity: Mapping[str, Any] | None = None,

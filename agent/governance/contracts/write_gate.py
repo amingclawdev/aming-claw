@@ -9,7 +9,7 @@ from typing import Any
 from .schema import ContractDefinitionError, find_line
 
 
-_DIRECT_FIX_GRAPH_CONTEXT_POLICIES = {
+_GRAPH_CONTEXT_POLICIES = {
     "direct_fix_observer_graph_scope": {
         "actor_role": "observer",
         "query_sources": {"observer"},
@@ -36,7 +36,33 @@ _DIRECT_FIX_GRAPH_CONTEXT_POLICIES = {
         ),
         "worker_role": "mf_sub",
     },
+    "worker_graph_context": {
+        "actor_role": "mf_sub",
+        "query_sources": {"mf_subagent"},
+        "query_purposes": {
+            "subagent_context_build",
+            "subagent_gate_validation",
+            "subagent_scope_validation",
+        },
+        "required_identity_fields": (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+        ),
+        "worker_role": "mf_sub",
+    },
     "direct_fix_qa_graph_context": {
+        "actor_role": "qa",
+        "query_sources": {"qa"},
+        "query_purposes": {
+            "qa_context_build",
+            "qa_gate_validation",
+            "independent_verification",
+        },
+        "required_identity_fields": ("target_project_root",),
+    },
+    "qa_graph_context": {
         "actor_role": "qa",
         "query_sources": {"qa"},
         "query_purposes": {
@@ -136,19 +162,19 @@ def validate_contract_write(
     elif require_next_action and next_action is None:
         errors.append("contract execution has no remaining next legal action")
 
-    _validate_direct_fix_graph_context(errors, write, line_id=line_id, actor_role=actor_role)
+    _validate_graph_context(errors, write, line_id=line_id, actor_role=actor_role)
 
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
 
 
-def _validate_direct_fix_graph_context(
+def _validate_graph_context(
     errors: list[str],
     write: Mapping[str, Any],
     *,
     line_id: str,
     actor_role: str,
 ) -> None:
-    policy = _DIRECT_FIX_GRAPH_CONTEXT_POLICIES.get(line_id)
+    policy = _GRAPH_CONTEXT_POLICIES.get(line_id)
     if not policy:
         return
     expected_actor = str(policy.get("actor_role") or "")

@@ -1456,6 +1456,96 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
     )
 
 
+def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_context():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev-mf-v2-defaults",
+            "state": "bound",
+        }
+    }
+
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert projection["missing_evidence"] == [
+        "observer_prefill_child_contracts",
+        "observer_dispatch_bounded_workers",
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_merge_queue_item_materialize",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    ]
+
+    handoff = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert handoff["next_legal_action"]["id"] == "worker_review_ready_handoff"
+    assert handoff["next_legal_action"]["timeline_append_hint"]["actor_role"] == "mf_sub"
+
+    qa_graph = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+            _event(9, "review_ready"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert qa_graph["next_legal_action"]["id"] == "qa_graph_context"
+    assert qa_graph["next_legal_action"]["timeline_append_hint"]["event_kind"] == "qa_graph_trace"
+    assert qa_graph["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+
+    qa = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "record_finish_time_worker_attestation"),
+            _event(8, "mf_subagent_finish_gate"),
+            _event(9, "review_ready"),
+            _event(10, "qa_graph_trace"),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert qa["next_legal_action"]["id"] == "qa_independent_verification"
+    assert qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+
+
 def test_finish_gate_completion_satisfies_worker_startup_and_finish_requirements():
     contract = {
         "contract": {

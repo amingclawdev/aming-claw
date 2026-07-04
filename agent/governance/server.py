@@ -7867,7 +7867,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     conn,
                     saved,
                     contract_version=str(
-                        ctx.body.get("contract_version") or "mf_parallel.v1"
+                        ctx.body.get("contract_version") or MF_PARALLEL_CONTRACT_ID
                     ),
                     payload=_parallel_branch_allocate_contract_revision_payload(
                         ctx.body or {},
@@ -8038,7 +8038,7 @@ def _parallel_branch_runtime_contract_response(
         contract_version=str(
             ctx.query.get("contract_version")
             or (latest_revision.contract_version if latest_revision else "")
-            or "mf_parallel.v1"
+            or MF_PARALLEL_CONTRACT_ID
         ),
         latest_revision_id=latest_revision_id,
         known_revision_id=known_revision_id,
@@ -17002,7 +17002,7 @@ def handle_graph_governance_parallel_branch_runtime_contract_revision_append(ctx
                     context,
                     revision_id=str(ctx.body.get("revision_id") or ""),
                     contract_version=str(
-                        ctx.body.get("contract_version") or "mf_parallel.v1"
+                        ctx.body.get("contract_version") or MF_PARALLEL_CONTRACT_ID
                     ),
                     payload=revision_payload,
                     route_gate=route_gate,
@@ -34135,7 +34135,7 @@ def handle_task_create(ctx: RequestContext):
                     "(pm->dev->test->qa->merge). For V1 observer-led Manual "
                     "Fix work, do NOT use this entrypoint. Instead: "
                     "1) backlog_upsert with chain_trigger_json.parallel_contract "
-                    "using the mf_parallel.v1 template; 2) task_timeline_append "
+                    "using the mf_parallel.v2 template; 2) task_timeline_append "
                     "events tied to mf_id. Start from MCP onboard_route_guide; "
                     "aming-claw://mf-sop is archived provenance, not an entrypoint. "
                     "If you genuinely need to test chain automation, pass "
@@ -37774,6 +37774,7 @@ def _contract_runtime_stale_recovery_id(
         CONTRACT_ADD_CONTRACT_ID: "cex-contract-add-recovery",
         CONTRACT_UPDATE_CONTRACT_ID: "cex-contract-update-recovery",
         MF_PARALLEL_RECORD_CONTRACT_ID: "cex-mf-parallel-recovery",
+        "mf_parallel.v2": "cex-mf-parallel-recovery",
     }.get(contract_id, "cex-contract-recovery")
     current_definition_hash = (
         stale.actual
@@ -38594,7 +38595,7 @@ def _contract_runtime_mf_parallel_context_projection(
 ) -> dict[str, Any]:
     if conn is None:
         return {}
-    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
+    if not _is_mf_parallel_record_contract_id(str(record.get("contract_id") or "")):
         return {}
     completed_lines = [
         dict(line)
@@ -38749,8 +38750,7 @@ def _contract_runtime_contexts_for_dispatch_line(
             "worker_task_id",
         )
         if worker_role != "mf_sub" and not (
-            str(record.get("contract_id") or "").strip()
-            == MF_PARALLEL_RECORD_CONTRACT_ID
+            _is_mf_parallel_record_contract_id(str(record.get("contract_id") or ""))
             and (runtime_context_id or task_id)
         ):
             continue
@@ -39575,8 +39575,7 @@ def _contract_runtime_next_line_requires_mf_sub_proof(
     if not _contract_runtime_next_line_allows_mf_sub(record):
         return False
     if (
-        str((record or {}).get("contract_id") or "").strip()
-        == MF_PARALLEL_RECORD_CONTRACT_ID
+        _is_mf_parallel_record_contract_id(str((record or {}).get("contract_id") or ""))
     ):
         return True
     next_line = _contract_runtime_next_line(record or {})
@@ -40228,11 +40227,16 @@ def _contract_runtime_dispatch_bridge_for_startup(
             SELECT record_json
             FROM contract_runtime_executions
             WHERE project_id = ?
-              AND contract_id IN (?, ?)
+              AND contract_id IN (?, ?, ?)
             ORDER BY updated_at DESC, contract_execution_id DESC
             LIMIT 200
             """,
-            (project_id, MF_PARALLEL_RECORD_CONTRACT_ID, DIRECT_FIX_CONTRACT_ID),
+            (
+                project_id,
+                MF_PARALLEL_RECORD_CONTRACT_ID,
+                MF_PARALLEL_CONTRACT_ID,
+                DIRECT_FIX_CONTRACT_ID,
+            ),
         ).fetchall()
     except sqlite3.Error:
         rows = []
@@ -47330,10 +47334,17 @@ def _direct_fix_successor_runtime_enter(
     }
 
 
-MF_PARALLEL_CONTRACT_ID = "mf_parallel.v1"
+MF_PARALLEL_CONTRACT_ID = "mf_parallel.v2"
 MF_PARALLEL_RECORD_CONTRACT_ID = "mf_parallel"
 MF_BATCH_PARALLEL_CONTRACT_ID = "mf_batch_parallel.v1"
 MF_BATCH_PARALLEL_RECORD_CONTRACT_ID = "mf_batch_parallel"
+MF_PARALLEL_RECORD_CONTRACT_IDS = frozenset(
+    {MF_PARALLEL_RECORD_CONTRACT_ID, MF_PARALLEL_CONTRACT_ID}
+)
+
+
+def _is_mf_parallel_record_contract_id(contract_id: str) -> bool:
+    return str(contract_id or "").strip() in MF_PARALLEL_RECORD_CONTRACT_IDS
 
 
 def _mf_parallel_execution_id(
@@ -47432,7 +47443,7 @@ def _mf_parallel_successor_runtime_enter(
             },
         )
     else:
-        if str(successor.get("contract_id") or "") != MF_PARALLEL_RECORD_CONTRACT_ID:
+        if not _is_mf_parallel_record_contract_id(str(successor.get("contract_id") or "")):
             raise ValidationError(
                 "mf_parallel facade can only enter mf_parallel executions",
                 {
@@ -50843,7 +50854,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     mf_parallel_records = [
         record
         for record in records
-        if str(record.get("contract_id") or "").strip() == MF_PARALLEL_RECORD_CONTRACT_ID
+        if _is_mf_parallel_record_contract_id(str(record.get("contract_id") or ""))
     ]
     if not mf_parallel_records:
         return {}
@@ -54237,7 +54248,7 @@ def _record_contract_runtime_mf_parallel_dispatch_event(
     result: Mapping[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
-    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_RECORD_CONTRACT_ID:
+    if not _is_mf_parallel_record_contract_id(str(record.get("contract_id") or "")):
         return {}
     if (
         str(write.get("stage_id") or "").strip() != "dispatch"
@@ -54707,7 +54718,7 @@ def _persist_observer_runtime_text_contract_revision(
             revision = append_branch_contract_revision(
                 conn,
                 context,
-                contract_version=str(body.get("contract_version") or "mf_parallel.v1"),
+                contract_version=str(body.get("contract_version") or MF_PARALLEL_CONTRACT_ID),
                 payload=_observer_runtime_text_contract_revision_payload(body, prepared),
                 route_gate=route_gate,
                 route_identity=route_identity if isinstance(route_identity, Mapping) else {},

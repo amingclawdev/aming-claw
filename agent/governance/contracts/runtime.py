@@ -443,7 +443,7 @@ CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_current_chain
 
 
 DIRECT_FIX_CONTRACT_IDS = frozenset({"direct_fix", "direct_fix.v1"})
-MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v1"})
+MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v2", "mf_parallel.v1"})
 DIRECT_FIX_QA_EVIDENCE_KINDS = frozenset(
     {"independent_verification", "direct_fix_independent_qa"}
 )
@@ -2877,7 +2877,11 @@ def _enforce_start_precheck(definition: Mapping[str, Any]) -> bool:
 
     contract_id = str(definition.get("contract_id") or "")
     aliases = {str(item) for item in definition.get("compat_aliases") or []}
-    return contract_id == "mf_parallel" or "mf_parallel.v1" in aliases
+    return (
+        contract_id == "mf_parallel"
+        or "mf_parallel.v2" in aliases
+        or "mf_parallel.v1" in aliases
+    )
 
 
 def _attach_precheck_decision(

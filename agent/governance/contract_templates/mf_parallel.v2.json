@@ -1,0 +1,856 @@
+{
+  "schema_version": "mf_contract_template.v1",
+  "template_id": "mf_parallel.v2",
+  "version": "v2",
+  "description": "Template for observer-led manual-fix work split across parallel agents with worker and QA graph context gates. Observer instantiates this template into backlog chain_trigger_json before delegation.",
+  "task_types": [
+    "mf_parallel",
+    "manual_fix",
+    "chain_rescue"
+  ],
+  "stages": [
+    "contract_draft",
+    "parallel_planning",
+    "worker_dispatch",
+    "worker_implementation",
+    "worker_review",
+    "qa_handoff",
+    "qa_graph_context",
+    "observer_merge_close_gate"
+  ],
+  "required_instance_fields": [
+    "contract_instance_id",
+    "workers",
+    "test_scenario_policy",
+    "evidence_requirements"
+  ],
+  "lifecycle_states": [
+    "contract_draft",
+    "implementation_in_progress",
+    "review_ready",
+    "waiting_merge",
+    "needs_revision",
+    "accepted_for_merge",
+    "merged",
+    "rejected"
+  ],
+  "row_scope_policy": {
+    "schema_version": "mf_parallel.row_scope_policy.v1",
+    "scope": "single_backlog_row",
+    "backlog_id_cardinality": "one",
+    "multi_backlog_parent_template": "mf_batch_parallel.v1",
+    "batch_parent_handoff_fields": [
+      "parent_batch_id",
+      "merge_queue_id",
+      "queue_item_id",
+      "queue_index",
+      "depends_on",
+      "hard_depends_on",
+      "serializes_after",
+      "conflicts_with",
+      "same_node_or_file_conflicts",
+      "requires_graph_epoch"
+    ],
+    "shared_backlog_close_token_allowed": false,
+    "description": "mf_parallel.v2 remains scoped to one backlog row. For multiple backlog rows, create an mf_batch_parallel.v1 parent route that fans out to one mf_parallel successor per row."
+  },
+  "route_topology_policy": {
+    "schema_version": "route_topology_policy.v1",
+    "classification_service_id": "route.prompt_alert_bundle",
+    "low_risk": {
+      "selected_topology": "lightweight_single_lane",
+      "recommended_topology": "single_lane.v1",
+      "reason_codes": [
+        "small_deterministic"
+      ],
+      "required_lanes": [
+        "single_bounded_worker"
+      ]
+    },
+    "high_risk": {
+      "selected_topology": "observer_led_parallel_lanes",
+      "recommended_topology": "mf_parallel.v2",
+      "reason_codes": [
+        "priority_p0",
+        "priority_p1",
+        "governance_routing_runtime_surface",
+        "governance_routing_runtime_terms",
+        "cross_module_change",
+        "observer_direct_implementation_risk"
+      ],
+      "required_lanes": [
+        "observer_coordinator",
+        "bounded_implementation_worker",
+        "independent_verification_lane",
+        "observer_merge_close_gate"
+      ],
+      "observer_authorities": [
+        "merge",
+        "redeploy_governance",
+        "graph_reconcile",
+        "backlog_close",
+        "waiver_approval",
+        "merge_queue_mutation"
+      ]
+    },
+    "p0_p1_governance_gate": {
+      "requires_independent_verification_before": [
+        "workflow.merge",
+        "backlog.close"
+      ],
+      "required_evidence_ids": [
+        "independent_verification",
+        "independent_verification_lane",
+        "independent_verification_evidence"
+      ]
+    },
+    "strategic_judge_routed_review_lanes": {
+      "default_required": false,
+      "description": "Strategic Judge-routed repairs may require explicit architecture and QA review lanes. Ordinary mf_parallel.v2 instances do not require architecture_review_lane unless route_topology_policy.required_lanes or evidence_requirements names it.",
+      "lane_ids": [
+        "architecture_review_lane",
+        "qa_evidence_gate_review"
+      ],
+      "review_pack_templates": [
+        "architecture_data_continuity_review.v1",
+        "qa_evidence_gate_review.v1"
+      ]
+    }
+  },
+  "observer_contract": {
+    "mode": "observer_only",
+    "observer_direct_code": false,
+    "default_state": "contract_draft",
+    "role_boundary": {
+      "default": "no_direct_implementation_code",
+      "applies_to": [
+        "governed_nontrivial_code",
+        "tests",
+        "dashboard_assets",
+        "runtime_config",
+        "governance_docs"
+      ],
+      "description": "Observer/judge coordinates intent, topology, dispatch, review, merge, reconcile, and close decisions. Governed nontrivial implementation is performed by bounded worker lanes, not by the same observer."
+    },
+    "route_preflight": {
+      "local_provider_optional": true,
+      "provider_boundary": "Private provider names and provider-specific tool names live only in local runtime config or evidence refs, not in source-controlled Aming prompts or templates.",
+      "provider_registry_preflight": {
+        "service_id": "route.provider_registry_preflight",
+        "required_before": "implementation_planning"
+      },
+      "topology_precheck": {
+        "service_id": "route.topology_precheck",
+        "required_before": "implementation_planning",
+        "records": [
+          "precheck_run_id",
+          "decision",
+          "status",
+          "recommended_topology",
+          "required_lanes",
+          "evidence_hash"
+        ]
+      }
+    },
+    "responsibilities": [
+      "clarify_requirements",
+      "check_runtime_graph_backlog",
+      "run_route_provider_registry_preflight",
+      "run_topology_precheck",
+      "write_backlog_and_contract",
+      "start_agents_when_requested_or_contract_approved",
+      "review_merge_candidates"
+    ],
+    "default_forbidden_actions": [
+      "direct_implementation_code",
+      "wait_for_agents",
+      "merge",
+      "push",
+      "release_gates",
+      "activate_graph_refs",
+      "close_backlog",
+      "delete_worktrees",
+      "mutate_merge_queues"
+    ],
+    "direct_mutation_exception_policy": {
+      "schema_version": "observer_direct_mutation_exception.v1",
+      "allowed": true,
+      "default": "reject",
+      "allowed_only_for": "tiny_deterministic_same_observer_mutation",
+      "local_precheck": {
+        "function": "agent.governance.mf_subagent_contract.validate_observer_direct_mutation_exception",
+        "description": "Run and record this validator before any same-observer direct mutation. It is not valid for governed nontrivial implementation work."
+      },
+      "requires": [
+        "observer_direct_mutation=true",
+        "observer_role=observer",
+        "tiny_deterministic_scope",
+        "explicit_reason",
+        "allowed_files",
+        "dirty_scope_exact_match",
+        "timeline_evidence_before_mutation"
+      ],
+      "description": "Same-observer direct mutation is rejected unless the exception proves a tiny deterministic scope, an explicit reason, exact allowed files, exact dirty-scope evidence, and timeline evidence recorded before mutation."
+    },
+    "exception_policy": "Privileged observer transitions such as waiting, merge, close, reconcile, gate release, or merge queue mutation require explicit user intent or documented governance transition evidence. Direct implementation code remains forbidden for governed nontrivial work unless the direct_mutation_exception_policy passes before mutation."
+  },
+  "worker_contract": {
+    "required_fields": [
+      "task_id",
+      "parent_task_id",
+      "worker_role",
+      "fence_token",
+      "route_identity",
+      "selected_topology",
+      "recommended_topology",
+      "owned_files",
+      "target_files",
+      "test_files",
+      "test_commands",
+      "responsibility",
+      "required_evidence",
+      "review_evidence",
+      "branch_runtime_evidence",
+      "graph_trace_evidence",
+      "service_dispatch_evidence",
+      "graph_queries",
+      "self_precheck",
+      "gate_alignment",
+      "final_output"
+    ],
+    "worker_prompt_contract": {
+      "schema_version": "worker_prompt_contract.v1",
+      "bounded_fields_only": [
+        "target_files",
+        "test_files",
+        "acceptance_criteria",
+        "route_identity",
+        "evidence_required",
+        "selected_topology",
+        "recommended_topology",
+        "required_lanes"
+      ],
+      "forbidden_context_sources": [
+        "observer_only_context",
+        "raw_private_memory",
+        "hidden_context",
+        "unmanifested_prompt_text"
+      ],
+      "description": "Worker-facing prompts receive bounded files, acceptance criteria, route identity, topology, lane, and evidence requirements only. Observer-only context stays with the observer lane."
+    },
+    "nontrivial_implementation": {
+      "default_topology": "dispatch_to_bounded_worker_lane",
+      "required_lane_evidence": [
+        "target_files",
+        "test_commands",
+        "worktree_path",
+        "branch",
+        "fence_token",
+        "owned_files",
+        "dirty_scope_check",
+        "review_evidence"
+      ],
+      "description": "Governed nontrivial implementation must be assigned to bounded mf_sub/worker lanes with explicit target files, tests, worktree/fence evidence, and observer review evidence."
+    },
+    "allowed_terminal_states": [
+      "review_ready",
+      "waiting_merge",
+      "needs_revision",
+      "rejected"
+    ],
+    "runtime_identity": {
+      "worker_role": "mf_sub",
+      "required_fields": [
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token"
+      ],
+      "description": "Observer must instantiate these values from durable task metadata before delegating work. Subagents must echo them in implementation and verification evidence."
+    },
+    "worktree_policy": {
+      "mode": "isolated_worktree_required",
+      "dispatch_default": "non_blocking_after_gate",
+      "same_worktree_allowed": false,
+      "target_main_worktree_dispatch": "blocked_by_default",
+      "local_precheck": {
+        "schema_version": "mf_subagent_dispatch_gate.v1",
+        "function": "agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+        "description": "Observer must run and record this dispatch gate before spawn_agent. Passing evidence proves the local mf_sub worker has an isolated branch/worktree/file fence before non-blocking handoff."
+      },
+      "required_dispatch_fields": [
+        "branch",
+        "worktree",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "fence_token",
+        "owned_files",
+        "dirty_scope_check"
+      ],
+      "override_policy": {
+        "allowed": true,
+        "default": "reject",
+        "requires": [
+          "same_worktree_allowed=true",
+          "explicit_operator_reason",
+          "dirty_scope_exact_match",
+          "observer_timeline_event_before_dispatch"
+        ],
+        "description": "Dispatch into the target/main worktree is blocked by default. A same-worktree exception must be operator-approved, exact dirty-scope checked, and recorded to timeline before spawn_agent."
+      }
+    },
+    "graph_queries": {
+      "audited": true,
+      "query_source": "mf_subagent",
+      "evidence_schema_version": "mf_subagent_graph_trace.v1",
+      "query_source_required": true,
+      "precondition": "observer must allocate/register branch runtime context before spawn_agent so validate_mf_subagent_graph_query_identity can resolve the task/fence",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required",
+        "parent_route_lineage_present",
+        "mf_parallel.v2",
+        "observer_led_parallel_lanes"
+      ],
+      "required_context_fields": [
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "fence_token"
+      ],
+      "timeline_trace_requirement": "graph_trace_ids",
+      "dispatch_finish_gate": "validate_mf_subagent_dispatch_gate and validate_mf_subagent_finish_gate require normalized graph trace evidence for governed nontrivial, Judge-routed, or parent-route-bound work.",
+      "description": "Any subagent graph lookup must use audited query_source=mf_subagent with task identity and fence context; returned trace ids must be recorded in timeline evidence."
+    },
+    "branch_runtime": {
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required",
+        "mf_parallel.v2",
+        "observer_led_parallel_lanes"
+      ],
+      "valid_registration_refs": [
+        "/api/graph-governance/{project_id}/parallel-branches/allocate",
+        "agent.governance.parallel_branch_runtime.upsert_branch_context"
+      ],
+      "runtime_text_prepare_boundary": "observer_runtime_text_prepare consumes caller-supplied branch_runtime_registration_ref or branch_runtime_evidence from this allocation step. It must return allocation_required and dispatch_ready=false when real allocation evidence is not supplied.",
+      "required_fields": [
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id"
+      ],
+      "description": "Observer must allocate/register the branch runtime context before spawn_agent; otherwise mf_subagent graph queries fail fence validation as fence_invalidated_or_unknown."
+    },
+    "runtime_contract_service": {
+      "schema_version": "mf_subagent_runtime_contract_view.v1",
+      "source_of_truth": "contract_service",
+      "query_route": "GET /api/graph-governance/{project_id}/parallel-branches/{task_id}/runtime-contract",
+      "required_query_fields": [
+        "task_id",
+        "fence_token",
+        "contract_version"
+      ],
+      "role_scoped_views": [
+        "worker",
+        "operator"
+      ],
+      "privacy_boundary": {
+        "raw_private_context_exposed": false,
+        "safe_route_identity_only": true
+      },
+      "description": "Worker and observer lanes query the shared runtime/contract view by task/fence identity instead of treating generated runtime text as the source of truth. Observer changes must append contract revisions; workers poll this service for current bounded execution state."
+    },
+    "parent_child_prefill_policy": {
+      "schema_version": "mf_parallel.parent_child_prefill_policy.v1",
+      "parent_orchestration": {
+        "owner": "observer_coordinator",
+        "responsibilities": [
+          "split parallel work into child contracts before dispatch",
+          "allocate/register each child branch runtime context",
+          "prefill each child contract with route identity, parent lineage, owned_files, tests, evidence ids, and dispatch readiness",
+          "refresh missing or stale child prefill before spawn_agent"
+        ]
+      },
+      "child_prefill": {
+        "owner": "mf_sub",
+        "required_before_implementation": [
+          "runtime_context_id",
+          "task_id",
+          "parent_task_id",
+          "worker_role",
+          "branch_ref",
+          "worktree_path",
+          "target_project_root",
+          "base_commit",
+          "target_head_commit",
+          "merge_queue_id",
+          "fence_token",
+          "route_context_hash",
+          "prompt_contract_id",
+          "prompt_contract_hash",
+          "route_token_ref",
+          "owned_files",
+          "test_commands",
+          "required_evidence"
+        ],
+        "child_ownership": "The child worker may modify only owned_files in its assigned worktree and must report missing/stale prefill as a blocker instead of widening scope."
+      },
+      "dispatch_readiness": {
+        "ready_when": [
+          "branch runtime registration is current",
+          "child route identity and parent lineage are present",
+          "owned_files are non-empty and projected into worker_constraints.scope.owned_files",
+          "runtime worker guide implementation_and_tests step lists the same owned_files",
+          "worker graph query identity is mf_subagent-scoped"
+        ],
+        "blocked_when": [
+          "child prefill is missing",
+          "child prefill is stale relative to parent route identity",
+          "owned_files are empty or differ between dispatch payload and runtime guide",
+          "worktree_path is used as target_project_root for write facades instead of the canonical target_project_root"
+        ],
+        "next_action_on_block": "refresh_child_contract_prefill_before_dispatch"
+      },
+      "parallelization_guidance": "Prefer splitting parent work into explicit child contracts with owned_files fences before dispatching parallel mf_sub workers."
+    },
+    "service_dispatch": {
+      "schema_version": "observer_subagent_service_dispatch.v1",
+      "required_for": [
+        "governed_nontrivial",
+        "judge_routed",
+        "parent_route_required",
+        "mf_parallel.v2",
+        "observer_led_parallel_lanes"
+      ],
+      "valid_evidence": [
+        "dispatch_command_ref + monitor_ref",
+        "documented_host_adapter_boundary + boundary_documentation_ref"
+      ],
+      "description": "Observer-to-subagent service dispatch must be replayable from command/monitor refs or documented as a host-adapter boundary before governed handoff."
+    },
+    "runtime_text_service": {
+      "schema_version": "observer_runtime_text_service.v1",
+      "required_for": [
+        "host_created_mf_sub_worker",
+        "codex_mf_sub_worker",
+        "mf_parallel.v2",
+        "parent_route_required"
+      ],
+      "entrypoints": [
+        "aming-claw observer runtime-text prepare --json-output",
+        "MCP observer_runtime_text_prepare",
+        "POST /api/projects/{project_id}/observer/runtime-text/prepare"
+      ],
+      "persistence_policy": {
+        "raw_launch_text_persisted": false,
+        "persistent_fields": [
+          "runtime_context_id",
+          "launch_text_hash",
+          "dispatch_ready",
+          "allocation_required"
+        ]
+      },
+      "required_inputs_for_dispatch_ready": [
+        "branch_runtime_registration_ref or branch_runtime_evidence from prior branch runtime allocation",
+        "graph_trace_evidence with query_source=mf_subagent and matching identity",
+        "observer_subagent_service_dispatch replay refs or documented host-adapter boundary"
+      ],
+      "public_boundary": "Worker prompts may include bounded route identity, file fences, branch/runtime identity, and evidence contracts. Raw private route/context-pack content must not be embedded in generated prompts, timeline rows, or persisted evidence.",
+      "description": "Prepares launch text for host/Codex-created mf_sub workers without invoking a model, ServiceManager, executor worker, or branch allocation service. Governed dispatch still requires parent_route_lineage, graph_trace_evidence, caller-supplied branch_runtime_evidence, and observer_subagent_service_dispatch evidence."
+    },
+    "self_precheck": {
+      "required": true,
+      "description": "Observer must include the local self-precheck or gate precheck command/API expected for machine-consumed output, and the subagent must record compact self_check evidence."
+    },
+    "gate_alignment": {
+      "required": true,
+      "description": "Observer must align required evidence ids, focused tests, E2E decision, and finish-gate expectations before delegation."
+    },
+    "final_output": {
+      "required": true,
+      "stop_states": [
+        "review_ready",
+        "waiting_merge"
+      ],
+      "required_fields": [
+        "status",
+        "branch",
+        "worktree",
+        "owned_changed_files",
+        "tests_run",
+        "graph_query_trace_ids",
+        "precheck_evidence",
+        "generated_assets_policy",
+        "risks_open_questions"
+      ],
+      "description": "Worker must stop with structured review evidence and must not merge, push, mutate merge queues, close backlog, activate graph refs, release gates, or delete worktrees."
+    },
+    "forbidden_capabilities": [
+      "merge",
+      "push",
+      "activate_graph",
+      "activate_graph_refs",
+      "release_gates",
+      "close_backlog",
+      "delete_worktrees",
+      "mutate_merge_queues"
+    ]
+  },
+  "merge_review_checklist": [
+    {
+      "id": "contract_fit",
+      "description": "Candidate output satisfies the instantiated worker contract and stops in an allowed review state."
+    },
+    {
+      "id": "diff_scope",
+      "description": "Changed files stay within the assigned branch/worktree/file fence and match the owned-file list."
+    },
+    {
+      "id": "test_e2e_evidence",
+      "description": "Focused tests and required E2E evidence are present, passing, or explicitly deferred with a follow-up backlog row."
+    },
+    {
+      "id": "docs_test_config_impact",
+      "description": "Docs, test, config, fixture, and generated artifact impact is declared and reviewed."
+    },
+    {
+      "id": "generated_assets_policy",
+      "description": "Generated assets are either source-of-truth updates, reproducible outputs, or excluded from review with a reason."
+    },
+    {
+      "id": "graph_reconcile_plan",
+      "description": "Graph binding, Asset Inbox/Governance Hint needs, and post-merge reconcile/update plan are recorded."
+    },
+    {
+      "id": "commit_trailers",
+      "description": "Expected Chain trailers and explicit commit file list are ready before merge."
+    },
+    {
+      "id": "backlog_close_policy",
+      "description": "Backlog close is deferred until merge, verification, reconcile/update, and close-ready evidence are complete."
+    }
+  ],
+  "service_routes": [
+    {
+      "route_id": "service.test_governance.preview",
+      "service_id": "test_governance.preview",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.review.recommendations",
+      "service_id": "review.recommendations",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.gate.close",
+      "service_id": "gate.close",
+      "mode": "gate",
+      "side_effect_class": "gate",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.cleanup.preview",
+      "service_id": "cleanup.preview",
+      "mode": "preview",
+      "side_effect_class": "read",
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    },
+    {
+      "route_id": "service.cleanup.apply",
+      "service_id": "cleanup.apply",
+      "mode": "apply",
+      "side_effect_class": "write",
+      "required_permissions": [
+        "cleanup.apply"
+      ],
+      "idempotency_key_policy": {
+        "fields": [
+          "event_id",
+          "event_kind",
+          "stage",
+          "task_id",
+          "backlog_id",
+          "route_id",
+          "service_id"
+        ]
+      }
+    }
+  ],
+  "event_routes": [
+    {
+      "route_id": "event.task_completed.test_preview",
+      "event_kind": "task.completed",
+      "service_route_id": "service.test_governance.preview",
+      "enabled": true
+    },
+    {
+      "route_id": "event.task_completed.review_recommendations",
+      "event_kind": "task.completed",
+      "service_route_id": "service.review.recommendations",
+      "enabled": true
+    },
+    {
+      "route_id": "event.backlog_close.gate",
+      "event_kind": "backlog.close.requested",
+      "service_route_id": "service.gate.close",
+      "enabled": true
+    },
+    {
+      "route_id": "event.cleanup.preview",
+      "event_kind": "cleanup.requested",
+      "service_route_id": "service.cleanup.preview",
+      "enabled": true
+    },
+    {
+      "route_id": "event.cleanup.apply",
+      "event_kind": "cleanup.requested",
+      "service_route_id": "service.cleanup.apply",
+      "enabled": true
+    }
+  ],
+  "test_scenario_policy": {
+    "mode": "observer_configured",
+    "decision": "",
+    "allowed_decisions": [
+      "none",
+      "reuse_existing",
+      "new_scenario_required"
+    ],
+    "reason": "",
+    "required_evidence_ids": [
+      "observer_test_strategy",
+      "focused_tests"
+    ],
+    "timeline_event_type": "mf.test_scenario.decision",
+    "timeline_event_kind": "scenario_spec",
+    "e2e_decision": "",
+    "allowed_e2e_decisions": [
+      "e2e_current",
+      "e2e_added",
+      "e2e_deferred",
+      "e2e_not_applicable"
+    ],
+    "followup_backlog_id": ""
+  },
+  "evidence_requirements": [
+    {
+      "id": "route_context",
+      "required": true,
+      "phase": "dispatch",
+      "kind": "service_route",
+      "description": "Route context resolution evidence with route_context_hash, prompt_contract_id, prompt_contract_hash, allowed_actions, blocked_actions, required_lanes, and visible injection manifest hash."
+    },
+    {
+      "id": "route_action_precheck",
+      "required": true,
+      "phase": "pre_mutation",
+      "kind": "local_precheck",
+      "description": "Route action gate evidence proving the writer consumed the route identity before any write-capable action."
+    },
+    {
+      "id": "bounded_implementation_worker_dispatch",
+      "required": true,
+      "phase": "dispatch",
+      "kind": "local_precheck",
+      "description": "Dispatch gate evidence for the bounded implementation worker/subagent tied to the same route_context_hash, prompt_contract_id, and prompt_contract_hash."
+    },
+    {
+      "id": "mf_subagent_startup",
+      "required": true,
+      "phase": "startup_gate",
+      "kind": "local_precheck",
+      "description": "Startup gate evidence proving the bounded worker/subagent actually began in the assigned worktree/fence context before implementation."
+    },
+    {
+      "id": "graph_trace_evidence",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "graph_query_trace",
+      "schema_version": "mf_subagent_graph_trace.v1",
+      "description": "Set required=true for governed nontrivial, Judge-routed, or parent-route-bound mf_sub work; query_source=mf_subagent is explicit and required, and dispatch/finish gates normalize returned graph trace ids."
+    },
+    {
+      "id": "qa_graph_trace_evidence",
+      "required": true,
+      "phase": "verification",
+      "kind": "graph_query_trace",
+      "schema_version": "qa_graph_trace.v1",
+      "description": "QA must query graph with QA/independent_verification identity after worker handoff and before independent_verification; trace ids must be recorded as QA-authored evidence."
+    },
+    {
+      "id": "branch_runtime_registration",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "branch_runtime",
+      "schema_version": "mf_subagent_branch_runtime.v1",
+      "description": "Set required=true for governed mf_sub dispatch; evidence must show observer allocated/registered the branch runtime context via parallel-branches/allocate or upsert_branch_context before spawn_agent. Runtime text prepare may consume this evidence but must not fabricate it."
+    },
+    {
+      "id": "observer_subagent_service_dispatch",
+      "required": false,
+      "phase": "dispatch",
+      "kind": "service_dispatch",
+      "schema_version": "observer_subagent_service_dispatch.v1",
+      "description": "Set required=true for governed subagent handoff; evidence must include replayable command/monitor refs or a documented host-adapter boundary."
+    },
+    {
+      "id": "architecture_review_lane",
+      "required": false,
+      "phase": "architecture_review",
+      "kind": "review_pack",
+      "review_pack_template": "architecture_data_continuity_review.v1",
+      "description": "Strategic Judge-routed repairs set required=true when architecture/data-continuity review is part of route_topology_policy.required_lanes."
+    },
+    {
+      "id": "qa_evidence_gate_review",
+      "required": false,
+      "phase": "verification",
+      "kind": "review_pack",
+      "review_pack_template": "qa_evidence_gate_review.v1",
+      "description": "Strategic repairs may require this QA review pack in addition to focused tests and independent verification lane evidence."
+    },
+    {
+      "id": "observer_test_strategy",
+      "required": true,
+      "phase": "plan",
+      "kind": "test_strategy",
+      "description": "Observer records the test-scenario decision, reason, required evidence ids, and E2E run/defer/not-applicable decision before delegation."
+    },
+    {
+      "id": "implementation_evidence",
+      "required": true,
+      "phase": "implementation",
+      "description": "Worker or observer records changed files, scope, and implementation notes."
+    },
+    {
+      "id": "focused_tests",
+      "required": true,
+      "phase": "verification",
+      "description": "Focused unit/API/typecheck evidence for each changed surface."
+    },
+    {
+      "id": "integration_build",
+      "required": false,
+      "phase": "integration",
+      "description": "Build or compile evidence when frontend/runtime assets are affected."
+    },
+    {
+      "id": "integration_e2e",
+      "required": false,
+      "phase": "integration",
+      "kind": "e2e",
+      "description": "Observer sets required=true when the instantiated work affects UI/API/operator flows or any E2E-covered surface."
+    },
+    {
+      "id": "contract_gate_tests",
+      "required": false,
+      "phase": "verification",
+      "kind": "pytest",
+      "description": "Focused tests for the instantiated contract gate behavior when the work changes contract validation or close-gate policy."
+    },
+    {
+      "id": "docs_policy_update",
+      "required": false,
+      "phase": "implementation",
+      "kind": "docs",
+      "description": "Documentation update evidence when the work changes MF/subagent policy."
+    },
+    {
+      "id": "e2e_deferred_followup",
+      "required": false,
+      "phase": "integration",
+      "kind": "e2e_defer",
+      "description": "Follow-up backlog evidence when observer explicitly defers E2E."
+    }
+  ],
+  "timeline_contract": {
+    "requirement_id_locations": [
+      "payload.requirement_id",
+      "payload.requirement_ids",
+      "verification.requirement_id",
+      "verification.requirement_ids",
+      "verification.contract_evidence[].requirement_id"
+    ],
+    "trace_id_locations": [
+      "payload.graph_trace_ids",
+      "payload.graph_trace_evidence.trace_ids",
+      "payload.graph_query_trace_ids",
+      "verification.graph_trace_ids",
+      "verification.graph_trace_evidence.trace_ids",
+      "verification.graph_query_trace_ids",
+      "verification.contract_evidence[].graph_trace_ids"
+    ],
+    "passing_statuses": [
+      "accepted",
+      "ok",
+      "passed",
+      "succeeded"
+    ]
+  },
+  "gate_contract": {
+    "close_requires": [
+      "implementation",
+      "verification",
+      "close_ready",
+      "route_context",
+      "route_action_precheck",
+      "bounded_implementation_worker_dispatch",
+      "mf_subagent_startup",
+      "qa_graph_trace_evidence",
+      "all_required_evidence_requirements"
+    ],
+    "waiver_policy": "Required E2E can be disabled only in the instantiated contract with a reason and follow-up backlog for user-visible or API behavior."
+  }
+}

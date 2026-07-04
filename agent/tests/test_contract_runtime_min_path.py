@@ -532,6 +532,178 @@ def test_direct_fix_graph_context_gates_repair_and_qa(tmp_path):
     assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
 
 
+def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel_graph_gate",
+        stages=[
+            {
+                "stage_id": "worker_context",
+                "lines": [
+                    {
+                        "line_id": "worker_graph_context",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "graph_trace",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_implementation",
+                "lines": [
+                    {
+                        "line_id": "worker_implementation",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "implementation",
+                        "requires": ["worker_graph_context"],
+                    }
+                ],
+            },
+            {
+                "stage_id": "qa_graph_context",
+                "lines": [
+                    {
+                        "line_id": "qa_graph_context",
+                        "owner_role": "qa",
+                        "allowed_writer_roles": ["qa"],
+                        "evidence_kind": "graph_trace",
+                        "requires": ["worker_implementation"],
+                    }
+                ],
+            },
+            {
+                "stage_id": "qa",
+                "lines": [
+                    {
+                        "line_id": "qa_independent_verification",
+                        "owner_role": "qa",
+                        "allowed_writer_roles": ["qa"],
+                        "evidence_kind": "independent_verification",
+                        "requires": ["qa_graph_context"],
+                    }
+                ],
+            },
+        ],
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    record = runtime.start_execution(
+        "mf_parallel_graph_gate",
+        project_id="aming-claw",
+        backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+        contract_execution_id="cex-mf-parallel-v2-graph-gate",
+        actor_role="observer",
+        route_token_ref="rtok-mf-parallel-v2-graph-gate",
+    )
+    assert record["runtime_guide"]["next_legal_action"]["line_id"] == "worker_graph_context"
+    runtime.current_guide(record["contract_execution_id"], actor_role="mf_sub")
+    record = runtime.store.get(record["contract_execution_id"])
+
+    missing_worker_graph = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _write_from(
+            record,
+            actor_role="mf_sub",
+            stage_id="worker_context",
+            line_id="worker_graph_context",
+            evidence_kind="graph_trace",
+        ),
+        actor_role="mf_sub",
+    )
+    assert missing_worker_graph["ok"] is False
+    assert "worker_graph_context requires non-empty graph_trace_ids" in (
+        missing_worker_graph["decision"]["errors"]
+    )
+
+    worker_graph = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                runtime.store.get(record["contract_execution_id"]),
+                actor_role="mf_sub",
+                stage_id="worker_context",
+                line_id="worker_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "runtime_context_id": "mfrctx-mf-parallel-v2-test",
+            "task_id": "mf-parallel-v2-worker",
+            "parent_task_id": "cex-mf-parallel-v2-parent",
+            "payload": _direct_fix_graph_payload(
+                actor_role="mf_sub",
+                trace_id="gqt-mf-parallel-v2-worker",
+            ),
+        },
+        actor_role="mf_sub",
+    )
+    assert worker_graph["ok"] is True
+
+    implementation = runtime.submit_line_write(
+        record["contract_execution_id"],
+        _write_from(
+            worker_graph["record"],
+            actor_role="mf_sub",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        ),
+        actor_role="mf_sub",
+    )
+    assert implementation["ok"] is True
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    bad_qa_graph = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": _direct_fix_graph_payload(
+                actor_role="mf_sub",
+                trace_id="gqt-mf-parallel-v2-wrong-source",
+            ),
+        },
+        actor_role="qa",
+    )
+    assert bad_qa_graph["ok"] is False
+    assert any(
+        "qa_graph_context query_source must be one of ['qa']" in error
+        for error in bad_qa_graph["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    qa_graph = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": _direct_fix_graph_payload(
+                actor_role="qa",
+                trace_id="gqt-mf-parallel-v2-qa",
+            ),
+        },
+        actor_role="qa",
+    )
+    assert qa_graph["ok"] is True
+    assert (
+        qa_graph["record"]["runtime_guide"]["next_legal_action"]["line_id"]
+        == "qa_independent_verification"
+    )
+
+
 def test_direct_fix_same_revision_graph_gate_migration_is_explicit(tmp_path):
     _write_contract_definition(
         tmp_path,

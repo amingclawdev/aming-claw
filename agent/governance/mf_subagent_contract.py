@@ -43,6 +43,7 @@ VERIFICATION_ROUTE_POLICY_SCHEMA_VERSION = "verification_route_policy.v1"
 PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "mf_subagent_route_lineage.v1"
 GRAPH_TRACE_SCHEMA_VERSION = "mf_subagent_graph_trace.v1"
+MF_PARALLEL_CONTRACT_VERSION = "mf_parallel.v2"
 SERVICE_DISPATCH_SCHEMA_VERSION = "observer_subagent_service_dispatch.v1"
 BRANCH_RUNTIME_SCHEMA_VERSION = "mf_subagent_branch_runtime.v1"
 OBSERVER_DIRECT_MUTATION_SCHEMA_VERSION = "observer_direct_mutation_exception.v1"
@@ -445,6 +446,8 @@ _WORKER_ROLES = {
 _HIGH_RISK_ROUTE_PRIORITIES = {"P0", "P1"}
 _PARALLEL_ROUTE_TOPOLOGIES = {
     "mf_parallel",
+    "mf_parallel_v2",
+    "mf_parallel.v2",
     "mf_parallel_v1",
     "mf_parallel.v1",
     "observer_led_parallel_lanes",
@@ -959,7 +962,7 @@ def build_observer_owned_agent_task_contract(
     executor_lane: str = MF_SUB_ROLE,
     verifier_lane: str = "qa",
     route_identity: Mapping[str, Any] | None = None,
-    contract_version: str = "mf_parallel.v1",
+    contract_version: str = MF_PARALLEL_CONTRACT_VERSION,
     contract_revision_id: str = "",
     previous_revision_hash: str = "",
     actor_role: str = "",
@@ -998,7 +1001,7 @@ def build_observer_owned_agent_task_contract(
     core = {
         "schema_version": AGENT_TASK_CONTRACT_SCHEMA_VERSION,
         "source_of_truth": "Contract/Revision/Event",
-        "contract_version": _string(contract_version) or "mf_parallel.v1",
+        "contract_version": _string(contract_version) or MF_PARALLEL_CONTRACT_VERSION,
         "contract_revision_id": _string(contract_revision_id),
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
@@ -1084,7 +1087,7 @@ def build_mf_subagent_runtime_contract_view(
     context: BranchTaskRuntimeContext,
     *,
     role: str = MF_SUB_ROLE,
-    contract_version: str = "mf_parallel.v1",
+    contract_version: str = MF_PARALLEL_CONTRACT_VERSION,
     contract_revision_id: str = "",
     latest_revision_id: str = "",
     known_revision_id: str = "",
@@ -1147,7 +1150,7 @@ def build_mf_subagent_runtime_contract_view(
         executor_lane=_string(latest_revision_payload.get("executor_lane")) or MF_SUB_ROLE,
         verifier_lane=_string(latest_revision_payload.get("verifier_lane")) or "qa",
         route_identity=route_identity_safe,
-        contract_version=_string(contract_version) or "mf_parallel.v1",
+        contract_version=_string(contract_version) or MF_PARALLEL_CONTRACT_VERSION,
         contract_revision_id=latest_revision_text,
         previous_revision_hash=_string(
             latest_revision_receipt.get("previous_revision_hash")
@@ -1243,7 +1246,7 @@ def build_mf_subagent_runtime_contract_view(
 
     contract = {
         "source_of_truth": "Contract/Revision/Event",
-        "contract_version": _string(contract_version) or "mf_parallel.v1",
+        "contract_version": _string(contract_version) or MF_PARALLEL_CONTRACT_VERSION,
         "contract_revision_id": latest_revision_text,
         "agent_task_contract_schema_version": AGENT_TASK_CONTRACT_SCHEMA_VERSION,
         "backend_contract": BACKEND_CONTRACT,
@@ -6870,7 +6873,7 @@ def build_mf_subagent_input(
     agent_task_contract = build_observer_owned_agent_task_contract(
         context,
         route_identity=child_route_prompt_contract,
-        contract_version="mf_parallel.v1",
+        contract_version=MF_PARALLEL_CONTRACT_VERSION,
         required_evidence=_DEFAULT_RUNTIME_CONTRACT_EVIDENCE,
         target_files=target_files,
         owned_files=target_files,

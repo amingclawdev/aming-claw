@@ -1,0 +1,365 @@
+{
+  "compat_aliases": [
+    "mf_parallel.v2",
+    "parallel_worker.v1"
+  ],
+  "contract_id": "mf_parallel.v2",
+  "contract_type": "parallel_worker",
+  "instruction_layer": {
+    "inline": [
+      "The compiled runtime guide is authoritative for the next legal action.",
+      "Observer owns orchestration, child-contract prefill, dispatch, merge, reconcile, and close-ready evidence only.",
+      "mf_sub workers own read receipt, startup, graph trace, implementation, finish-time attestation, and finish gate evidence in their assigned worktree/fence.",
+      "QA owns QA graph context and independent verification evidence; observer must not write or reconstruct QA evidence.",
+      "Prefer explicit parallel child contracts with owned_files fences before dispatching workers."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "backlog_id": "AC-MF-PARALLEL-V2-DIRECT-FIX-GRAPH-GATED-REPAIR-20260704",
+    "legacy_template_id": "mf_parallel.v1",
+    "previous_revision": "mf_parallel.v1.rev2",
+    "revision_reason": "Materialize mf_parallel.v2 with direct-fix-style graph context gates for worker repair and QA verification after guided-runtime drift.",
+    "runtime_dogfood": true,
+    "updated_by_contract": "contract_update.v1",
+    "updated_by_contract_execution": "cex-contract-update-5b46a7af44c50fd39a97"
+  },
+  "revision": "rev1",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer binds parent route context and prefills role-bound child contracts before dispatch.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record the parent mf_parallel contract binding, route identity, child contract plan, owned_files fences, test commands, merge queue identity, and route_token_ref.",
+            "evidence_kind": "contract_binding",
+            "line_id": "observer_prefill_child_contracts",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "orchestration"
+      },
+      {
+        "description": "Observer dispatches bounded workers only after runtime prefill and local dispatch gates are ready.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record bounded worker dispatch evidence with task_id, parent_task_id, runtime_context_id, branch/worktree/fence, and merge_queue_id.",
+            "evidence_kind": "dispatch_bounded_worker",
+            "line_id": "observer_dispatch_bounded_workers",
+            "owner_role": "observer",
+            "requires": [
+              "observer_prefill_child_contracts"
+            ]
+          }
+        ],
+        "stage_id": "dispatch"
+      },
+      {
+        "description": "The bounded mf_sub worker proves it read the runtime guide before implementation.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored read receipt for runtime_context_worker_guide/current-state.",
+            "evidence_kind": "read_receipt",
+            "line_id": "worker_read_runtime_guide",
+            "owner_role": "mf_sub",
+            "requires": [
+              "observer_dispatch_bounded_workers"
+            ]
+          }
+        ],
+        "stage_id": "worker_read"
+      },
+      {
+        "description": "The bounded mf_sub worker proves actual startup inside its assigned runtime context.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored startup evidence with runtime_context_id, task_id, parent_task_id, worker_slot_id, session token evidence, worktree, branch, and fence.",
+            "evidence_kind": "mf_subagent_startup",
+            "line_id": "worker_startup",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_read_runtime_guide"
+            ]
+          }
+        ],
+        "stage_id": "worker_startup"
+      },
+      {
+        "description": "The worker gathers graph context using the mf_subagent query identity.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Audited graph trace ids produced with query_source=mf_subagent and matching task/fence identity.",
+            "evidence_kind": "graph_trace",
+            "line_id": "worker_graph_context",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_startup"
+            ]
+          }
+        ],
+        "stage_id": "worker_context"
+      },
+      {
+        "description": "The worker records bounded implementation evidence for owned files only.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Implementation evidence with changed files, tests run or planned, graph traces, and generated-assets policy.",
+            "evidence_kind": "implementation",
+            "line_id": "worker_implementation",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_graph_context"
+            ]
+          }
+        ],
+        "stage_id": "worker_implementation"
+      },
+      {
+        "description": "The worker records finish-time self-attestation before the finish gate.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Finish-time worker self-attestation authored by the worker session, not observer reconstruction.",
+            "evidence_kind": "record_finish_time_worker_attestation",
+            "line_id": "worker_finish_time_attestation",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_implementation"
+            ]
+          }
+        ],
+        "stage_id": "worker_attestation"
+      },
+      {
+        "description": "The worker records the close-satisfying finish gate and stops at review_ready or waiting_merge.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Passed finish gate with route identity, runtime lineage, observer command id, implementation commit, changed files, tests, review_ready, and close_ready projection.",
+            "evidence_kind": "mf_subagent_finish_gate",
+            "line_id": "worker_finish_gate",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_finish_time_attestation"
+            ]
+          }
+        ],
+        "stage_id": "worker_finish"
+      },
+      {
+        "description": "The bounded mf_sub worker explicitly hands the finished lane to QA after review_ready or waiting_merge.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored handoff that confirms the lane stopped at review_ready or waiting_merge and is ready for independent QA; observer must not synthesize this evidence.",
+            "evidence_kind": "review_ready",
+            "line_id": "worker_review_ready_handoff",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_finish_gate"
+            ]
+          }
+        ],
+        "stage_id": "qa_handoff"
+      },
+      {
+        "description": "Independent QA gathers graph context with QA identity before verification.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored audited graph trace ids produced with query_source=qa or independent_verification and recorded before QA verification.",
+            "evidence_kind": "graph_trace",
+            "line_id": "qa_graph_context",
+            "owner_role": "qa",
+            "requires": [
+              "worker_review_ready_handoff"
+            ]
+          }
+        ],
+        "stage_id": "qa_graph_context"
+      },
+      {
+        "description": "Independent QA verifies the worker result after explicit handoff evidence exists.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "QA-authored independent_verification evidence for the active parallel contract execution; qa_review is review-only and does not satisfy this line.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "qa_graph_context"
+            ]
+          }
+        ],
+        "stage_id": "qa"
+      },
+      {
+        "description": "Observer performs privileged post-QA integration steps.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer merge evidence for QA-accepted worker candidates.",
+            "evidence_kind": "merge",
+            "line_id": "observer_merge",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer graph reconcile/update evidence after merge lands on the target ref.",
+            "evidence_kind": "reconcile",
+            "line_id": "observer_reconcile",
+            "owner_role": "observer",
+            "requires": [
+              "observer_merge"
+            ]
+          },
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer close-ready evidence after merge, verification, reconcile, and close-gate prerequisites are satisfied or explicitly blocked.",
+            "evidence_kind": "close_ready",
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "requires": [
+              "observer_reconcile"
+            ]
+          }
+        ],
+        "stage_id": "observer_integration"
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "root_start_default": "deny",
+      "requires_parent_execution": true,
+      "denied_reason": "mf_parallel workers run under an approved parent contract and fenced worktree, not as a root entrypoint"
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "allowed_parent_contracts": [
+        {
+          "contract_id": "onboard_contract",
+          "version": "v1"
+        },
+        {
+          "contract_id": "onboard_route_guide",
+          "version": "service"
+        }
+      ],
+      "allowed_successors": [
+        {
+          "contract_id": "qa_evidence_gate_review.v1",
+          "version": "v1"
+        },
+        {
+          "contract_id": "observer_hotfix",
+          "version": "v1"
+        },
+        {
+          "contract_id": "audit_close_with_qa_acceptance.v1",
+          "version": "v1"
+        }
+      ],
+      "successor_start_default": "deny_until_parent_path_is_source_backed",
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "requires_contract_chain_id": true,
+      "requires_handoff_evidence": [
+        "observer_work_mode_transition"
+      ],
+      "requires_worker_fence": true
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state",
+      "mutable_completed_lines_trust_root": false
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "independent_review_required": true,
+      "formatting_only_drift_must_remain_visible": true
+    },
+    "graph_binding_policy": {
+      "source_asset_materialization_required": true,
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true
+    }
+  },
+  "successors": [
+    {
+      "contract_id": "qa_evidence_gate_review.v1",
+      "reason": "Run a stricter QA evidence gate when parallel QA finds missing or ambiguous evidence.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "observer_hotfix",
+      "reason": "Open a bounded observer hotfix only for tiny runtime or evidence-surface repairs found while running the parallel contract.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "audit_close_with_qa_acceptance.v1",
+      "reason": "Use audit close only when QA accepts the implementation but historical close evidence cannot legally be reconstructed.",
+      "version": "v1"
+    }
+  ],
+  "version": "v2"
+}
