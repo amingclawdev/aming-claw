@@ -9,14 +9,17 @@
     "chain_rescue",
     "manual_fix"
   ],
-  "stages": [
-    "blocked_parent_handoff",
-    "operator_approval",
-    "candidate_branch",
-    "repair_implementation",
-    "qa_verification",
-    "return_to_parent"
-  ],
+    "stages": [
+        "blocked_parent_handoff",
+        "operator_approval",
+        "observer_graph_scope",
+        "candidate_branch",
+        "worker_graph_context",
+        "repair_implementation",
+        "qa_graph_context",
+        "qa_verification",
+        "return_to_parent"
+    ],
   "required_instance_fields": [
     "contract_instance_id",
     "backlog_id",
@@ -83,21 +86,86 @@
     "root_start_allowed": false,
     "parent_blocked_handoff_required": true,
     "operator_approval_required": true,
-    "successor_route_token_ref_required": true,
-    "independent_qa_required": true,
-    "parent_close_gate_recheck_required": true,
-    "child_must_not_write_parent_close_evidence": true
+        "successor_route_token_ref_required": true,
+        "observer_graph_scope_required_before_dispatch": true,
+        "worker_graph_context_required_before_repair": true,
+        "qa_graph_context_required_before_verification": true,
+        "independent_qa_required": true,
+        "parent_close_gate_recheck_required": true,
+        "child_must_not_write_parent_close_evidence": true
   },
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "direct_fix",
     "contract_definition_revision": "rev1",
-    "entrypoint": "direct_fix_enter",
-    "blocked_parent_projection": true,
-    "return_to_parent": {
-      "required": true,
-      "parent_close_gate_recheck_required": true
-    }
+        "entrypoint": "direct_fix_enter",
+        "blocked_parent_projection": true,
+        "graph_query_checkpoints": [
+            {
+                "id": "observer_graph_scope",
+                "line_id": "direct_fix_observer_graph_scope",
+                "owner_role": "observer",
+                "event_kind": "graph_trace",
+                "required_before": "direct_fix_dispatch_context",
+                "packet": {
+                    "query_source": "observer",
+                    "query_purpose": "observer_scope_build",
+                    "required_fields": [
+                        "project_id",
+                        "backlog_id",
+                        "contract_execution_id",
+                        "target_project_root",
+                        "graph_trace_ids",
+                        "graph_trace_evidence.db_verified"
+                    ]
+                }
+            },
+            {
+                "id": "worker_graph_context",
+                "line_id": "direct_fix_worker_graph_context",
+                "owner_role": "mf_sub",
+                "event_kind": "graph_trace",
+                "required_before": "direct_fix_candidate_repair",
+                "packet": {
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "worker_role": "mf_sub",
+                    "required_fields": [
+                        "runtime_context_id",
+                        "task_id",
+                        "parent_task_id",
+                        "target_project_root",
+                        "graph_trace_ids",
+                        "graph_trace_evidence.db_verified"
+                    ]
+                }
+            },
+            {
+                "id": "qa_graph_context",
+                "line_id": "direct_fix_qa_graph_context",
+                "owner_role": "qa",
+                "event_kind": "graph_trace",
+                "required_before": "qa_independent_verification",
+                "packet": {
+                    "query_source": "qa",
+                    "query_purpose": "independent_verification",
+                    "required_fields": [
+                        "target_project_root",
+                        "graph_trace_ids",
+                        "graph_trace_evidence.db_verified"
+                    ]
+                }
+            }
+        ],
+        "migration_policy": {
+            "active_execution_rewrite": "forbidden",
+            "same_revision_definition_hash_drift": "stale_pinned_execution_error",
+            "new_graph_checkpoints_apply_to": "new_direct_fix_executions_only"
+        },
+        "return_to_parent": {
+            "required": true,
+            "parent_close_gate_recheck_required": true
+        }
   },
   "evidence_requirements": [
     {
@@ -105,24 +173,39 @@
       "owner_role": "observer",
       "event_kind": "direct_fix_handoff_request"
     },
-    {
-      "id": "direct_fix_operator_approval",
-      "owner_role": "observer",
-      "event_kind": "operator_approval"
-    },
-    {
-      "id": "direct_fix_dispatch_context",
-      "owner_role": "observer",
-      "event_kind": "dispatch_bounded_worker"
-    },
-    {
-      "id": "direct_fix_candidate_repair",
-      "owner_role": "mf_sub",
-      "event_kind": "direct_fix_repair_evidence"
-    },
-    {
-      "id": "qa_independent_verification",
-      "owner_role": "qa",
+        {
+            "id": "direct_fix_operator_approval",
+            "owner_role": "observer",
+            "event_kind": "operator_approval"
+        },
+        {
+            "id": "direct_fix_observer_graph_scope",
+            "owner_role": "observer",
+            "event_kind": "graph_trace"
+        },
+        {
+            "id": "direct_fix_dispatch_context",
+            "owner_role": "observer",
+            "event_kind": "dispatch_bounded_worker"
+        },
+        {
+            "id": "direct_fix_worker_graph_context",
+            "owner_role": "mf_sub",
+            "event_kind": "graph_trace"
+        },
+        {
+            "id": "direct_fix_candidate_repair",
+            "owner_role": "mf_sub",
+            "event_kind": "direct_fix_repair_evidence"
+        },
+        {
+            "id": "direct_fix_qa_graph_context",
+            "owner_role": "qa",
+            "event_kind": "graph_trace"
+        },
+        {
+            "id": "qa_independent_verification",
+            "owner_role": "qa",
       "event_kind": "independent_verification"
     },
     {

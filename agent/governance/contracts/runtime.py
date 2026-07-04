@@ -33,7 +33,7 @@ from .guide_compiler import attach_writer_role_safe_copy_payload, compile_runtim
 from .hash import stable_sha256
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
-from .schema import ContractDefinitionError, is_new_execution_allowed
+from .schema import ContractDefinitionError, is_new_execution_allowed, iter_stage_lines
 from .write_gate import WriteGateDecision
 
 
@@ -1129,6 +1129,7 @@ def _project_direct_fix_state(
     if not child_id:
         return {}
     repair_line = _find_direct_fix_repair_line(child)
+    qa_graph_line = _find_direct_fix_qa_graph_line(child, repair_line=repair_line)
     return_line = _find_completed_line(
         child,
         line_ids={"direct_fix_return_to_parent"},
@@ -1138,6 +1139,7 @@ def _project_direct_fix_state(
         child,
         generation=generation,
         repair_line=repair_line,
+        qa_graph_line=qa_graph_line,
     )
     if return_line and qa_line and _direct_fix_return_follows_qa(
         return_line,
@@ -1174,6 +1176,20 @@ def _project_direct_fix_state(
             ),
         }
     if repair_line:
+        if _direct_fix_graph_gates_active(child) and not qa_graph_line:
+            return {
+                "current_contract_execution_id": child_id,
+                "current_contract_id": _record_contract_id(child),
+                "parent_to_resume_contract_execution_id": parent_id,
+                "active_child_contract_execution_id": child_id,
+                "readiness_state": "direct_fix_complete_awaiting_independent_qa_graph",
+                "generation": generation,
+                "next_legal_action": _direct_fix_qa_graph_next_action(
+                    child,
+                    generation=generation,
+                    repair_line=repair_line,
+                ),
+            }
         return {
             "current_contract_execution_id": child_id,
             "current_contract_id": _record_contract_id(child),
@@ -1185,6 +1201,7 @@ def _project_direct_fix_state(
                 child,
                 generation=generation,
                 repair_line=repair_line,
+                qa_graph_line=qa_graph_line,
             ),
         }
     return {
@@ -1238,6 +1255,53 @@ def _record_order_key(
 
 def _record_contract_id(record: Mapping[str, Any]) -> str:
     return str(record.get("contract_id") or "").strip()
+
+
+_DIRECT_FIX_GRAPH_GATE_LINE_IDS = frozenset(
+    {
+        "direct_fix_observer_graph_scope",
+        "direct_fix_worker_graph_context",
+        "direct_fix_qa_graph_context",
+    }
+)
+_DIRECT_FIX_REPAIR_QA_GRAPH_GATE_LINE_IDS = frozenset(
+    {
+        "direct_fix_worker_graph_context",
+        "direct_fix_qa_graph_context",
+    }
+)
+
+
+def _direct_fix_graph_gates_active(record: Mapping[str, Any]) -> bool:
+    features = (
+        record.get("contract_runtime_features")
+        if isinstance(record.get("contract_runtime_features"), Mapping)
+        else {}
+    )
+    if "direct_fix_graph_query_gate" in features:
+        return bool(features.get("direct_fix_graph_query_gate"))
+    for line in record.get("completed_lines") or []:
+        if (
+            isinstance(line, Mapping)
+            and str(line.get("line_id") or "") in _DIRECT_FIX_GRAPH_GATE_LINE_IDS
+        ):
+            return True
+    guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    next_line = guide.get("next_legal_action") if isinstance(guide.get("next_legal_action"), Mapping) else {}
+    return str(next_line.get("line_id") or "") in _DIRECT_FIX_GRAPH_GATE_LINE_IDS
+
+
+def _contract_runtime_features(definition: Mapping[str, Any]) -> dict[str, Any]:
+    line_ids = {
+        str(line.get("line_id") or "")
+        for _, line in iter_stage_lines(definition)
+    }
+    return {
+        "schema_version": "contract_runtime_features.v1",
+        "direct_fix_graph_query_gate": (
+            _DIRECT_FIX_REPAIR_QA_GRAPH_GATE_LINE_IDS.issubset(line_ids)
+        ),
+    }
 
 
 def _record_is_complete(record: Mapping[str, Any]) -> bool:
@@ -1317,11 +1381,40 @@ def _find_direct_fix_repair_line(record: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(record.get("completed_lines"), list)
         else []
     )
+    after_index = _last_failed_qa_line_index(lines)
+    if _direct_fix_graph_gates_active(record):
+        worker_graph = _find_completed_line(
+            record,
+            line_ids={"direct_fix_worker_graph_context"},
+            evidence_kinds=set(),
+            after_index=after_index,
+        )
+        if not worker_graph:
+            return {}
+        after_index = max(after_index, _completed_line_index(worker_graph))
     return _find_completed_line(
         record,
         line_ids={"direct_fix_candidate_repair"},
         evidence_kinds={"direct_fix_repair_evidence"},
-        after_index=_last_failed_qa_line_index(lines),
+        after_index=after_index,
+    )
+
+
+def _find_direct_fix_qa_graph_line(
+    record: Mapping[str, Any],
+    *,
+    repair_line: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not _direct_fix_graph_gates_active(record):
+        return {}
+    repair_index = _completed_line_index(repair_line or {})
+    if repair_index < 0:
+        return {}
+    return _find_completed_line(
+        record,
+        line_ids={"direct_fix_qa_graph_context"},
+        evidence_kinds=set(),
+        after_index=repair_index,
     )
 
 
@@ -1330,6 +1423,7 @@ def _find_direct_fix_qa_line(
     *,
     generation: int,
     repair_line: Mapping[str, Any] | None = None,
+    qa_graph_line: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     lines = (
         record.get("completed_lines")
@@ -1338,6 +1432,12 @@ def _find_direct_fix_qa_line(
     )
     execution_id = str(record.get("contract_execution_id") or "")
     repair_index = _completed_line_index(repair_line or {})
+    required_after_index = repair_index
+    if _direct_fix_graph_gates_active(record):
+        qa_graph_index = _completed_line_index(qa_graph_line or {})
+        if qa_graph_index < 0:
+            return {}
+        required_after_index = max(required_after_index, qa_graph_index)
     for index, line in reversed(list(enumerate(lines))):
         if not isinstance(line, Mapping):
             continue
@@ -1354,7 +1454,7 @@ def _find_direct_fix_qa_line(
         )
         if not explicit_scope_matches and not _line_is_post_repair_child_qa(
             index,
-            repair_index=repair_index,
+            repair_index=required_after_index,
         ):
             continue
         enriched = dict(line)
@@ -1584,6 +1684,8 @@ def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
 
 _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
     {
+        "direct_fix_worker_graph_context",
+        "direct_fix_qa_graph_context",
         "worker_read_runtime_guide",
         "worker_startup",
         "worker_graph_context",
@@ -1955,9 +2057,10 @@ def _direct_fix_qa_next_action(
     *,
     generation: int,
     repair_line: Mapping[str, Any],
+    qa_graph_line: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     child_id = str(child.get("contract_execution_id") or "")
-    return {
+    action = {
         "schema_version": "backlog_contract_chain.next_action.v1",
         "id": "qa_independent_verification",
         "action": "record_direct_fix_independent_qa",
@@ -1979,6 +2082,53 @@ def _direct_fix_qa_next_action(
         "required_binding": {
             "contract_execution_id": child_id,
             "generation": generation,
+            "source_ref": f"contract_runtime:{child_id}:completed_lines:{repair_line.get('_completed_line_index', '')}",
+        },
+        "meta_contract_gate_decision_source": False,
+    }
+    qa_graph_index = _completed_line_index(qa_graph_line or {})
+    if qa_graph_index >= 0:
+        action["qa_graph_evidence_ref"] = (
+            f"contract_runtime:{child_id}:completed_lines:{qa_graph_index}"
+        )
+    return action
+
+
+def _direct_fix_qa_graph_next_action(
+    child: Mapping[str, Any],
+    *,
+    generation: int,
+    repair_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    child_id = str(child.get("contract_execution_id") or "")
+    return {
+        "schema_version": "backlog_contract_chain.next_action.v1",
+        "id": "direct_fix_qa_graph_context",
+        "action": "record_direct_fix_qa_graph_context",
+        "source": "backlog_contract_chain_current",
+        "precedence": "direct_fix_qa_graph_gate",
+        "role": "qa",
+        "work_type": "qa_verification",
+        "contract_execution_id": child_id,
+        "parent_contract_execution_id": str(
+            child.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(child.get("root_contract_execution_id") or ""),
+        "contract_chain_id": str(child.get("contract_chain_id") or ""),
+        "contract_id": _record_contract_id(child),
+        "stage_id": "qa_graph_context",
+        "line_id": "direct_fix_qa_graph_context",
+        "evidence_kind": "graph_trace",
+        "required": True,
+        "required_binding": {
+            "contract_execution_id": child_id,
+            "generation": generation,
+            "source_ref": f"contract_runtime:{child_id}:completed_lines:{repair_line.get('_completed_line_index', '')}",
+        },
+        "graph_query_packet": {
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "runtime_context_binding_required": False,
             "source_ref": f"contract_runtime:{child_id}:completed_lines:{repair_line.get('_completed_line_index', '')}",
         },
         "meta_contract_gate_decision_source": False,
@@ -2364,6 +2514,7 @@ class ContractRuntime:
             "role_binding": dict(role_binding or {}),
             "backlog_lineage": dict(backlog_lineage or {}),
             "metadata": dict(metadata or {}),
+            "contract_runtime_features": _contract_runtime_features(definition),
         }
         return self.store.create(record)
 

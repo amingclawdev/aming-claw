@@ -130,6 +130,60 @@ def _runtime_next_write(record, *, actor_role: str):
     )
 
 
+def _direct_fix_graph_payload(*, actor_role: str, trace_id: str):
+    query_source = {
+        "observer": "observer",
+        "mf_sub": "mf_subagent",
+        "qa": "qa",
+    }[actor_role]
+    query_purpose = {
+        "observer": "observer_scope_build",
+        "mf_sub": "subagent_context_build",
+        "qa": "independent_verification",
+    }[actor_role]
+    evidence = {
+        "schema_version": "direct_fix_graph_trace_db_evidence.v1",
+        "db_verified": True,
+        "trace_ids": [trace_id],
+        "verified_trace_ids": [trace_id],
+        "query_source": query_source,
+        "query_purpose": query_purpose,
+        "target_project_root": "/tmp/aming-claw-test",
+    }
+    if actor_role == "mf_sub":
+        evidence.update(
+            {
+                "worker_role": "mf_sub",
+                "runtime_context_id": "mfrctx-test",
+                "task_id": "direct-fix-worker-test",
+                "parent_task_id": "cex-direct-fix-parent-test",
+            }
+        )
+    return {
+        "schema_version": "direct_fix_graph_context.v1",
+        "graph_trace_ids": [trace_id],
+        "graph_trace_evidence": evidence,
+    }
+
+
+def _direct_fix_graph_write_identity(actor_role: str) -> dict:
+    if actor_role != "mf_sub":
+        return {}
+    return {
+        "runtime_context_id": "mfrctx-test",
+        "task_id": "direct-fix-worker-test",
+        "parent_task_id": "cex-direct-fix-parent-test",
+    }
+
+
+def _is_direct_fix_graph_checkpoint(write: dict) -> bool:
+    return str(write.get("line_id") or "") in {
+        "direct_fix_observer_graph_scope",
+        "direct_fix_worker_graph_context",
+        "direct_fix_qa_graph_context",
+    }
+
+
 def _submit_next_runtime_line(
     runtime: ContractRuntime,
     contract_execution_id: str,
@@ -140,6 +194,19 @@ def _submit_next_runtime_line(
     runtime.current_guide(contract_execution_id, actor_role=actor_role)
     record = runtime.store.get(contract_execution_id)
     write = _runtime_next_write(record, actor_role=actor_role)
+    if _is_direct_fix_graph_checkpoint(write):
+        trace_id = f"gqt-{actor_role}-{contract_execution_id}"
+        write.update(_direct_fix_graph_write_identity(actor_role))
+        write["payload"] = _direct_fix_graph_payload(
+            actor_role=actor_role,
+            trace_id=trace_id,
+        )
+        graph_result = runtime.submit_line_write(contract_execution_id, write)
+        if not graph_result["ok"]:
+            return graph_result
+        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        record = runtime.store.get(contract_execution_id)
+        write = _runtime_next_write(record, actor_role=actor_role)
     write.update(overrides)
     return runtime.submit_line_write(contract_execution_id, write)
 
@@ -1387,7 +1454,7 @@ def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
         backlog_id=backlog_id,
     )
     assert projection["readiness_state"] == "direct_fix_child_active"
-    assert projection["next_legal_action"]["line_id"] == "direct_fix_candidate_repair"
+    assert projection["next_legal_action"]["line_id"] == "direct_fix_worker_graph_context"
 
     runtime.current_guide(child_id, actor_role="observer")
     record = runtime.store.get(child_id)
@@ -1485,7 +1552,7 @@ def test_direct_fix_repair_diagnostic_blocked_status_still_advances_to_qa():
 
     assert repair["ok"] is True
     next_action = repair["record"]["runtime_guide"]["next_legal_action"]
-    assert next_action["line_id"] == "qa_independent_verification"
+    assert next_action["line_id"] == "direct_fix_qa_graph_context"
     assert next_action["owner_role"] == "qa"
 
 
