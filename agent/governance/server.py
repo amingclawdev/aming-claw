@@ -7514,6 +7514,7 @@ def _parallel_branch_allocate_contract_revision_payload(
     saved_context: Mapping[str, Any],
     route_identity: Mapping[str, Any],
     owned_files: Sequence[str],
+    test_files: Sequence[str] = (),
 ) -> dict[str, Any]:
     return {
         "schema_version": "parallel_branch_allocate_contract_revision.v1",
@@ -7527,6 +7528,7 @@ def _parallel_branch_allocate_contract_revision_payload(
         "route_identity": dict(route_identity),
         "target_files": list(owned_files),
         "owned_files": list(owned_files),
+        "test_files": list(test_files),
         "acceptance_criteria": _runtime_context_service_query_values(
             body,
             "acceptance_criteria",
@@ -7601,14 +7603,39 @@ def _parallel_branch_allocate_merge_queue_id(body: Mapping[str, Any]) -> str:
     return _runtime_context_public_text(*candidates)
 
 
+def _parallel_branch_allocate_row_test_files(
+    project_id: str,
+    backlog_id: str,
+) -> list[str]:
+    if not str(backlog_id or "").strip():
+        return []
+    conn = get_connection(project_id)
+    try:
+        try:
+            row = conn.execute(
+                "SELECT test_files FROM backlog_bugs WHERE bug_id = ?",
+                (str(backlog_id).strip(),),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+    finally:
+        conn.close()
+    return _string_list_field(_row_get(row, "test_files", ""))
+
+
 def _parallel_branch_allocate_should_persist_contract_revision(
     body: Mapping[str, Any],
+    *,
+    owned_files: Sequence[str] = (),
 ) -> tuple[dict[str, Any], list[str]]:
     route_identity = _parallel_branch_runtime_contract_route_identity(body)
-    owned_files = _runtime_context_service_query_values(
-        body,
-        "owned_files",
-        "target_files",
+    revision_owned_files = _runtime_context_public_file_values(
+        list(owned_files)
+        or _runtime_context_service_query_values(
+            body,
+            "owned_files",
+            "target_files",
+        )
     )
     required_route_fields = (
         "route_id",
@@ -7617,11 +7644,11 @@ def _parallel_branch_allocate_should_persist_contract_revision(
         "prompt_contract_hash",
         "route_token_ref",
     )
-    if not owned_files:
+    if not revision_owned_files:
         return {}, []
     if not all(str(route_identity.get(field) or "").strip() for field in required_route_fields):
         return {}, []
-    return route_identity, owned_files
+    return route_identity, revision_owned_files
 
 
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
@@ -7687,10 +7714,21 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ctx.body or {},
         "target_files",
     )
+    backlog_test_files = _parallel_branch_allocate_row_test_files(
+        project_id,
+        str(ctx.body.get("backlog_id") or ""),
+    )
     if not request_owned_files:
         request_owned_files = list(request_target_files)
     if not request_target_files:
         request_target_files = list(request_owned_files)
+    if backlog_test_files:
+        request_owned_files = _runtime_context_public_file_values(
+            [*request_owned_files, *backlog_test_files]
+        )
+        request_target_files = _runtime_context_public_file_values(
+            [*request_target_files, *backlog_test_files]
+        )
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
     normalized_merge_queue_id = _parallel_branch_allocate_merge_queue_id(ctx.body or {})
     context = plan_branch_runtime_context(
@@ -7813,7 +7851,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
 
         runtime_contract_revision: dict[str, Any] = {}
         route_identity_for_revision, owned_files_for_revision = (
-            _parallel_branch_allocate_should_persist_contract_revision(ctx.body or {})
+            _parallel_branch_allocate_should_persist_contract_revision(
+                ctx.body or {},
+                owned_files=saved.owned_files or request_owned_files,
+            )
         )
         if route_identity_for_revision and owned_files_for_revision:
             saved_context = branch_context_to_dict(saved)
@@ -7833,6 +7874,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         saved_context,
                         route_identity_for_revision,
                         owned_files_for_revision,
+                        test_files=backlog_test_files,
                     ),
                     route_gate=route_gate,
                     route_identity=route_identity_for_revision,
@@ -7858,10 +7900,15 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
         try:
+            dispatch_body = {
+                **dict(ctx.body or {}),
+                "target_files": list(saved.target_files),
+                "owned_files": list(saved.owned_files),
+            }
             response["dispatch_timeline_event"] = _record_bounded_worker_dispatch_event(
                 conn,
                 project_id,
-                body=ctx.body or {},
+                body=dispatch_body,
                 prepared={
                     "runtime_context_id": saved.runtime_context_id,
                     "task_id": saved.task_id,
