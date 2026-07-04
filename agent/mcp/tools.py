@@ -373,6 +373,17 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     properties.update(
         {
             "task_id": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "actual_host_worker_id": {
+                "type": "string",
+                "description": "Actual host-created worker/session id when known.",
+            },
+            "host_worker_id": {
+                "type": "string",
+                "description": "Alias for actual_host_worker_id.",
+            },
+            "host_startup_id": {"type": "string"},
+            "host_session_id": {"type": "string"},
             "worker_session_id": {"type": "string"},
             "worker_id": {"type": "string"},
             "worker_slot_id": {"type": "string"},

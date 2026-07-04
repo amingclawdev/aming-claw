@@ -11782,6 +11782,44 @@ def _runtime_context_worker_recovery_payloads(
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
     }
+    actual_host_identity_binding = {
+        "schema_version": "runtime_context.actual_host_identity_binding.v1",
+        "required_before_initial_join_when_agent_id_is_placeholder": True,
+        "placeholder_agent_id": normalized_agent_id,
+        "allocation_owner": normalized_allocation_owner,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
+        "worker_session_id": normalized_worker_session_id,
+        "binding_fields": [
+            "agent_id",
+            "actual_host_worker_id",
+            "worker_session_id",
+        ],
+        "copy_safe_body_overrides_before_submit": {
+            "agent_id": (
+                normalized_actual_host_worker_id
+                or "<actual host-created worker/session id>"
+            ),
+            "actual_host_worker_id": (
+                normalized_actual_host_worker_id
+                or "<actual host-created worker/session id>"
+            ),
+            "worker_session_id": (
+                normalized_worker_session_id
+                or normalized_actual_host_worker_id
+                or "<actual host worker session id>"
+            ),
+        },
+        "then": (
+            "submit runtime_context_session_token_initial_join, inject the returned "
+            "host_envelope into that same live worker, then record read receipt and "
+            "parallel_branch_startup from the worker"
+        ),
+        "security_boundary": {
+            "worker_may_self_widen_identity": False,
+            "observer_may_bind_only_host_created_worker_identity": True,
+            "raw_tokens_persisted_to_timeline": False,
+        },
+    }
     session_token_initial_join_submission = {
         "schema_version": "runtime_context.session_token_initial_join_submission.v1",
         "action": "request_runtime_context_initial_join_host_envelope",
@@ -11823,11 +11861,13 @@ def _runtime_context_worker_recovery_payloads(
             "mf_subagent_startup",
         ],
         "required_before_worker_evidence": [
+            "replace placeholder agent_id/actual_host_worker_id with the real host-created worker id",
             "inject host_envelope env into the real mf_sub worker",
             "worker submits read receipt",
             "worker records startup",
         ],
         "worker_identity_pointers": dict(worker_identity_pointers),
+        "actual_host_identity_binding": dict(actual_host_identity_binding),
         "security_boundary": {
             "session_token_ref_alone_authorizes_writes": False,
             "raw_tokens_persisted_to_timeline": False,
@@ -12378,6 +12418,7 @@ def _runtime_context_worker_recovery_payloads(
         "host_startup_id": normalized_host_startup_id,
         "host_session_id": normalized_host_session_id,
         "worker_identity_pointers": worker_identity_pointers,
+        "actual_host_identity_binding": actual_host_identity_binding,
         "branch": normalized_branch_ref,
         "branch_ref": normalized_branch_ref,
         "base_commit": normalized_base_commit,
@@ -15210,6 +15251,23 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     or body.get("repo_root")
                     or ""
                 ).strip(),
+                agent_id=str(
+                    body.get("agent_id")
+                    or body.get("host_agent_id")
+                    or ""
+                ).strip(),
+                actual_host_worker_id=str(
+                    body.get("actual_host_worker_id")
+                    or body.get("host_worker_id")
+                    or ""
+                ).strip(),
+                worker_session_id=str(
+                    body.get("worker_session_id")
+                    or body.get("session_id")
+                    or ""
+                ).strip(),
+                host_startup_id=str(body.get("host_startup_id") or "").strip(),
+                host_session_id=str(body.get("host_session_id") or "").strip(),
                 ttl_seconds=body.get("ttl_seconds"),
                 reason=reason,
                 now_iso=str(body.get("now_iso") or ""),
@@ -15265,6 +15323,13 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 "operator_session_role": session_role(session),
                 "missing_lineage": missing_lineage,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "agent_id": str(result.get("agent_id") or ""),
+                "actual_host_worker_id": str(
+                    result.get("actual_host_worker_id") or ""
+                ),
+                "worker_session_id": str(result.get("worker_session_id") or ""),
+                "host_startup_id": str(result.get("host_startup_id") or ""),
+                "host_session_id": str(result.get("host_session_id") or ""),
             }
         )
         audit_event = task_timeline.record_event(

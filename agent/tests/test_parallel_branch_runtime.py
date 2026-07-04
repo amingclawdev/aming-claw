@@ -73,6 +73,7 @@ from agent.governance.parallel_branch_runtime import (
     ensure_branch_runtime_schema,
     get_branch_context,
     get_latest_branch_contract_revision,
+    initial_join_mf_subagent_runtime_session_token,
     get_merge_queue_item_for_branch_context,
     list_branch_contexts,
     materialize_branch_worktree,
@@ -692,6 +693,185 @@ def _insert_startup_context(conn: sqlite3.Connection, worktree: str) -> None:
         now_iso=NOW,
     )
     _insert_startup_graph_trace(conn)
+
+
+def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-initial-join-bound"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="pending-codex-subagent",
+        allocation_owner="pending-codex-subagent",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+    _insert_startup_graph_trace(conn)
+
+    actual_worker_id = "019f2aae-4097-73c0-9d55-e3934c85bc3c"
+    initial_join = initial_join_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
+        task_id="mf-sub-startup",
+        parent_task_id="parent-startup",
+        target_project_root=str(worktree),
+        agent_id=actual_worker_id,
+        actual_host_worker_id=actual_worker_id,
+        worker_session_id=actual_worker_id,
+        reason="host envelope required for actual Codex subagent startup",
+        now_iso=NOW,
+    )
+
+    saved_after_join = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert saved_after_join is not None
+    assert saved_after_join.actual_host_worker_id == actual_worker_id
+    assert initial_join["host_envelope"]["actual_host_worker_id"] == actual_worker_id
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            agent_id=actual_worker_id,
+            actual_host_worker_id=actual_worker_id,
+            worker_session_id=actual_worker_id,
+            worker_transcript_ref=f"multi_agent:{actual_worker_id}",
+            filer_principal=actual_worker_id,
+            session_token="",
+            session_token_ref=initial_join["session_token_ref"],
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is True
+    gate = result["startup_gate"]
+    assert gate["allocation_owner"] == "pending-codex-subagent"
+    assert gate["agent_id"] == actual_worker_id
+    assert gate["actual_host_worker_id"] == actual_worker_id
+    assert gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
+    assert gate["session_token_evidence_type"] == "server_verified_ref"
+    assert gate["server_issued_session_token_verified"] is True
+
+
+def test_mf_sub_startup_rejects_initial_join_bound_worker_replay_by_other_agent(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    worktree = tmp_path / "workers" / "mf-sub-startup-initial-join-replay"
+    worktree.mkdir(parents=True)
+    base_commit, head_commit = _ensure_startup_git_worktree(worktree)
+    context = BranchTaskRuntimeContext(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        root_task_id="parent-startup",
+        stage_task_id="mf-sub-startup",
+        backlog_id="BUG-STARTUP",
+        worker_id="worker-startup",
+        worker_slot_id="worker-startup",
+        agent_id="pending-codex-subagent",
+        allocation_owner="pending-codex-subagent",
+        branch_ref="refs/heads/codex/mf-sub-startup",
+        status=STATE_WORKTREE_READY,
+        fence_token="fence-startup",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit="target-startup",
+        merge_queue_id="mq-startup",
+    )
+    upsert_branch_context(conn, context, now_iso=NOW)
+    append_branch_contract_revision(
+        conn,
+        context,
+        route_identity={
+            "route_id": "route-startup",
+            "route_context_hash": "sha256:route-startup",
+            "prompt_contract_id": "rprompt-startup",
+            "prompt_contract_hash": "sha256:prompt-startup",
+            "route_token_ref": "rtok-startup",
+            "visible_injection_manifest_hash": "sha256:visible-startup",
+        },
+        now_iso=NOW,
+    )
+    _insert_startup_graph_trace(conn)
+
+    bound_worker_id = "019f-bound-worker"
+    replay_worker_id = "019f-replay-worker"
+    initial_join = initial_join_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=branch_runtime_context_id(PROJECT_ID, "mf-sub-startup"),
+        task_id="mf-sub-startup",
+        parent_task_id="parent-startup",
+        target_project_root=str(worktree),
+        agent_id=bound_worker_id,
+        actual_host_worker_id=bound_worker_id,
+        worker_session_id=bound_worker_id,
+        reason="host envelope required for actual Codex subagent startup",
+        now_iso=NOW,
+    )
+
+    result = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-sub-startup",
+        payload=_startup_payload(
+            str(worktree),
+            agent_id=replay_worker_id,
+            actual_host_worker_id=replay_worker_id,
+            worker_session_id=replay_worker_id,
+            worker_transcript_ref=f"multi_agent:{replay_worker_id}",
+            filer_principal=replay_worker_id,
+            session_token="",
+            session_token_ref=initial_join["session_token_ref"],
+        ),
+        now_iso=NOW,
+    )
+
+    assert result["ok"] is False
+    assert result["blocker_id"] == "agent_id_mismatch"
+    refusal = result["timeline_event"]["payload"]["mf_subagent_startup_refusal"]
+    assert refusal["agent_id"] == replay_worker_id
+    assert refusal["actual_host_worker_id"] == replay_worker_id
+    saved_after_replay = get_branch_context(conn, PROJECT_ID, "mf-sub-startup")
+    assert saved_after_replay is not None
+    assert saved_after_replay.actual_host_worker_id == bound_worker_id
+    assert refusal["next_action"]["action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
 
 
 def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext:

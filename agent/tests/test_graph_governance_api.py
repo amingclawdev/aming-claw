@@ -19543,6 +19543,13 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
         "agent-session-ref"
     )
     assert initial_join_submission["copy_safe_body"]["route_id"] == "route-session-ref"
+    identity_binding = initial_join_submission["actual_host_identity_binding"]
+    assert identity_binding[
+        "required_before_initial_join_when_agent_id_is_placeholder"
+    ] is True
+    assert identity_binding["copy_safe_body_overrides_before_submit"][
+        "actual_host_worker_id"
+    ] == "<actual host-created worker/session id>"
     startup_skeleton = worker_guide["startup_facade_payload_skeleton"]
     assert startup_skeleton["body_source"] == "copy_safe_body"
     startup_copy = startup_skeleton["copy_safe_body"]
@@ -19618,7 +19625,15 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert "raw-session-ref" not in persisted_receipt
     assert "fence-session-ref" not in persisted_receipt
 
+    actual_worker_id = "019f-session-ref-real-worker"
     initial_join_body = dict(initial_join_submission["copy_safe_body"])
+    initial_join_body.update(
+        {
+            "agent_id": actual_worker_id,
+            "actual_host_worker_id": actual_worker_id,
+            "worker_session_id": actual_worker_id,
+        }
+    )
     initial_join_body["reason"] = "host envelope required before startup retry"
     initial_join = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
@@ -19632,6 +19647,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     assert initial_join["status"] == "session_token_initial_join_issued"
     host_envelope = initial_join["host_envelope"]
     assert host_envelope["session_token_ref"] == initial_join["session_token_ref"]
+    assert host_envelope["actual_host_worker_id"] == actual_worker_id
 
     startup_body = dict(worker_guide["startup_facade_payload_skeleton"]["body"])
     startup_body.update(
@@ -19639,7 +19655,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
             "session_token": initial_join["session_token"],
             "session_token_ref": initial_join["session_token_ref"],
             "fence_token": "fence-session-ref",
-            "agent_id": "agent-session-ref",
+            "agent_id": actual_worker_id,
             "actual_host_worker_id": host_envelope["principal_id"],
             "worker_session_id": host_envelope["principal_id"],
             "worker_transcript_ref": f"multi_agent:{host_envelope['principal_id']}",
@@ -19671,6 +19687,7 @@ def test_runtime_context_session_token_ref_drives_worker_startup_and_graph_gate(
     startup_gate = startup_response["gate"]
     assert startup_gate["session_token_evidence_type"] == "server_verified"
     assert startup_gate["server_issued_session_token_verified"] is True
+    assert startup_gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
 
     graph_body = {
         "tool": "find_node_by_path",

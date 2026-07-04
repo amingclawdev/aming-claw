@@ -1976,6 +1976,9 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     startup = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_startup")
     checkpoint = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_checkpoint")
     finish_gate = next(tool for tool in TOOLS if tool.get("name") == "parallel_branch_finish_gate")
+    initial_join = next(
+        tool for tool in TOOLS if tool.get("name") == "runtime_context_session_token_initial_join"
+    )
     runtime_text = next(
         tool for tool in TOOLS if tool.get("name") == "observer_runtime_text_prepare"
     )
@@ -1984,6 +1987,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     startup_props = startup["inputSchema"]["properties"]
     checkpoint_props = checkpoint["inputSchema"]["properties"]
     finish_props = finish_gate["inputSchema"]["properties"]
+    initial_join_props = initial_join["inputSchema"]["properties"]
     runtime_text_props = runtime_text["inputSchema"]["properties"]
     assert runtime_text["inputSchema"]["required"] == [
         "project_id",
@@ -2080,6 +2084,15 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "parent_route_lineage",
     ):
         assert key in finish_props
+    for key in (
+        "agent_id",
+        "actual_host_worker_id",
+        "host_worker_id",
+        "worker_session_id",
+        "host_startup_id",
+        "host_session_id",
+    ):
+        assert key in initial_join_props
 
     for props in (allocate_props, checkpoint_props, finish_props):
         assert props["route_token"]["type"] == "object"

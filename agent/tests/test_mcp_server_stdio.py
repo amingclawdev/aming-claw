@@ -719,6 +719,27 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
     }.issubset(properties)
 
 
+def test_mcp_stdio_initial_join_schema_exposes_actual_host_identity_fields():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    properties = tools["runtime_context_session_token_initial_join"]["inputSchema"][
+        "properties"
+    ]
+    assert {
+        "agent_id",
+        "actual_host_worker_id",
+        "host_worker_id",
+        "worker_session_id",
+        "host_startup_id",
+        "host_session_id",
+    }.issubset(properties)
+
+
 def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},

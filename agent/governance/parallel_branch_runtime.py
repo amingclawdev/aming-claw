@@ -9448,6 +9448,11 @@ def initial_join_mf_subagent_runtime_session_token(
     task_id: str,
     parent_task_id: str = "",
     target_project_root: str = "",
+    agent_id: str = "",
+    actual_host_worker_id: str = "",
+    worker_session_id: str = "",
+    host_startup_id: str = "",
+    host_session_id: str = "",
     ttl_seconds: Any = None,
     reason: str = "",
     now_iso: str = "",
@@ -9502,6 +9507,18 @@ def initial_join_mf_subagent_runtime_session_token(
     new_token = secrets.token_urlsafe(32)
     new_hash = mf_subagent_session_token_hash(new_token)
     lease_id = "mfrlease-" + uuid.uuid4().hex[:16]
+    requested_agent_id = str(agent_id or "").strip()
+    requested_actual_host_worker_id = str(
+        actual_host_worker_id or requested_agent_id or ""
+    ).strip()
+    requested_worker_session_id = str(worker_session_id or "").strip()
+    requested_host_startup_id = str(host_startup_id or "").strip()
+    requested_host_session_id = str(
+        host_session_id
+        or requested_worker_session_id
+        or requested_actual_host_worker_id
+        or ""
+    ).strip()
     saved = upsert_branch_context(
         conn,
         replace(
@@ -9509,6 +9526,11 @@ def initial_join_mf_subagent_runtime_session_token(
             lease_id=lease_id,
             lease_expires_at=expires_at,
             session_token_hash=new_hash,
+            actual_host_worker_id=(
+                requested_actual_host_worker_id or context.actual_host_worker_id
+            ),
+            host_startup_id=requested_host_startup_id or context.host_startup_id,
+            host_session_id=requested_host_session_id or context.host_session_id,
             last_recovery_action="mf_subagent_initial_join_issued",
         ),
         now_iso=_runtime_context_iso(now_dt),
@@ -9519,7 +9541,15 @@ def initial_join_mf_subagent_runtime_session_token(
     )
     fence_hash = runtime_context_secret_hash(saved.fence_token)
     session_token_ref = runtime_context_session_token_ref(saved)
-    principal_id = saved.worker_slot_id or saved.worker_id or saved.agent_id
+    principal_id = (
+        saved.actual_host_worker_id
+        or saved.worker_slot_id
+        or saved.worker_id
+        or saved.agent_id
+    )
+    worker_session_principal = (
+        requested_worker_session_id or saved.host_session_id or principal_id
+    )
     host_envelope = {
         "schema_version": "mf_subagent_initial_join_host_envelope.v1",
         "project_id": saved.project_id,
@@ -9531,6 +9561,11 @@ def initial_join_mf_subagent_runtime_session_token(
         "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
         "worker_id": saved.worker_id,
         "worker_slot_id": saved.worker_slot_id or saved.worker_id,
+        "agent_id": requested_agent_id or saved.agent_id,
+        "actual_host_worker_id": saved.actual_host_worker_id,
+        "worker_session_id": worker_session_principal,
+        "host_startup_id": saved.host_startup_id,
+        "host_session_id": saved.host_session_id,
         "principal_id": principal_id,
         "session_token_ref": session_token_ref,
         "session_token_ref_source": "runtime_context_session_token_initial_join",
@@ -9562,6 +9597,11 @@ def initial_join_mf_subagent_runtime_session_token(
         "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
         "worker_id": saved.worker_id,
         "worker_slot_id": saved.worker_slot_id or saved.worker_id,
+        "agent_id": requested_agent_id or saved.agent_id,
+        "actual_host_worker_id": saved.actual_host_worker_id,
+        "worker_session_id": worker_session_principal,
+        "host_startup_id": saved.host_startup_id,
+        "host_session_id": saved.host_session_id,
         "principal_id": principal_id,
         "session_token": new_token,
         "session_token_hash": new_hash,
@@ -12152,6 +12192,100 @@ def _startup_refusal_timeline_event(
             next_action["startup_retry_after_join"] = join_before_startup["then"]
             next_action["join_before_parallel_branch_startup"] = join_before_startup
             next_action["session_token_evidence_type"] = token_evidence_type
+        if str(result.get("blocker_id") or "") == "agent_id_mismatch":
+            host_worker_id = (
+                agent_id
+                if agent_id and agent_id != allocation_owner
+                else actual_host_worker_id
+            )
+            worker_session = worker_session_id or host_worker_id
+            join_before_startup = {
+                "schema_version": "mf_subagent_startup_actual_host_bind_before_retry.v1",
+                "action": "request_runtime_context_initial_join_host_envelope",
+                "tool": "runtime_context_session_token_initial_join",
+                "reason": (
+                    "startup agent_id differs from allocation_owner because the "
+                    "preallocated lane used a placeholder; bind the real host "
+                    "worker id before retrying startup"
+                ),
+                "path": (
+                    "/api/graph-governance/{project_id}/runtime-contexts/"
+                    f"{runtime_context_id}/session-token/initial-join"
+                ),
+                "copy_safe_body": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id or str(payload.get("task_id") or ""),
+                    "parent_task_id": str(
+                        payload.get("parent_task_id")
+                        or (context.root_task_id if context is not None else "")
+                        or ""
+                    ),
+                    "target_project_root": str(
+                        payload.get("target_project_root")
+                        or (context.target_project_root if context is not None else "")
+                        or (context.worktree_path if context is not None else "")
+                        or ""
+                    ),
+                    "worker_id": str(payload.get("worker_id") or "").strip(),
+                    "worker_slot_id": str(
+                        payload.get("worker_slot_id")
+                        or (context.worker_slot_id if context is not None else "")
+                        or (context.worker_id if context is not None else "")
+                        or ""
+                    ).strip(),
+                    "agent_id": host_worker_id or "<actual host-created worker/session id>",
+                    "allocation_owner": allocation_owner,
+                    "actual_host_worker_id": (
+                        host_worker_id or "<actual host-created worker/session id>"
+                    ),
+                    "worker_session_id": (
+                        worker_session or "<actual host worker session id>"
+                    ),
+                    **route_identity,
+                    "reason": (
+                        "<operator reason: bind real host worker id before "
+                        "retrying parallel_branch_startup>"
+                    ),
+                    "ttl_seconds": 3600,
+                },
+                "then": {
+                    "action": "retry_parallel_branch_startup_with_bound_host_identity",
+                    "tool": "parallel_branch_startup",
+                    "copyable_retry_payload": {
+                        **retry_template,
+                        "agent_id": host_worker_id or retry_template.get("agent_id", ""),
+                        "actual_host_worker_id": (
+                            host_worker_id
+                            or retry_template.get("actual_host_worker_id", "")
+                        ),
+                        "worker_session_id": (
+                            worker_session
+                            or retry_template.get("worker_session_id", "")
+                        ),
+                        "session_token_ref": "<copy from initial_join response>",
+                        "session_token": "<inject raw token into worker env; do not persist>",
+                    },
+                },
+                "security_boundary": {
+                    "session_token_ref_alone_authorizes_identity_binding": False,
+                    "observer_authors_worker_evidence": False,
+                    "raw_tokens_persisted_to_timeline": False,
+                },
+            }
+            next_action.update(
+                {
+                    "action": "request_runtime_context_initial_join_host_envelope",
+                    "tool": "runtime_context_session_token_initial_join",
+                    "description": (
+                        "Bind the real host-created worker id to the runtime "
+                        "context, inject the returned host envelope into that "
+                        "same worker, then retry startup from the worker."
+                    ),
+                    "join_before_parallel_branch_startup": join_before_startup,
+                    "startup_retry_after_join": join_before_startup["then"],
+                    "agent_id_match_mode": "blocked_without_actual_host_binding",
+                }
+            )
         next_action.update(
             {
                 "canonical_retry_payload_source": (
@@ -12810,11 +12944,21 @@ def record_mf_subagent_startup(
         "server_verified",
         "server_verified_ref",
     }
+    context_actual_host_worker_id = str(
+        context.actual_host_worker_id if context is not None else ""
+    ).strip()
     agent_id_match_mode = "actual_host_worker_bound"
     if allocation_owner and agent_id == allocation_owner:
         agent_id_match_mode = "same_as_allocation_owner"
     elif service_dispatch_worker_binding:
         agent_id_match_mode = "observer_subagent_service_dispatch"
+    elif (
+        context_actual_host_worker_id
+        and agent_id == context_actual_host_worker_id
+        and actual_host_worker_id == context_actual_host_worker_id
+        and server_verified_session_token_evidence
+    ):
+        agent_id_match_mode = "initial_join_actual_host_worker"
     elif host_adapter_startup and server_verified_session_token_evidence:
         agent_id_match_mode = "host_adapter_server_verified_session"
     elif host_adapter_startup:
@@ -12972,6 +13116,7 @@ def record_mf_subagent_startup(
     server_verified_identity_modes = {
         "same_as_allocation_owner",
         "observer_subagent_service_dispatch",
+        "initial_join_actual_host_worker",
         "host_adapter_server_verified_session",
     }
     if agent_id_match_mode in server_verified_identity_modes:
