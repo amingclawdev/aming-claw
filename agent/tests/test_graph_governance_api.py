@@ -20367,6 +20367,88 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert "raw-route-token" not in public_json
 
 
+def test_runtime_context_worker_guide_corrected_shapes_default_worker_identity(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "identity-default-root"
+    target_root.mkdir()
+    task_id = "worker-identity-default"
+    route_identity = {
+        "route_id": "route-identity-default",
+        "route_context_hash": "sha256:route-identity-default",
+        "prompt_contract_id": "rprompt-identity-default",
+        "prompt_contract_hash": "sha256:prompt-identity-default",
+        "route_token_ref": "rtok-identity-default",
+        "visible_injection_manifest_hash": "sha256:visible-identity-default",
+    }
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id=task_id,
+            root_task_id="parent-identity-default",
+            backlog_id="AC-RUNTIME-IDENTITY-DEFAULT",
+            stage_task_id=task_id,
+            worker_id="",
+            worker_slot_id="",
+            agent_id="pending-codex-subagent",
+            allocation_owner="pending-codex-subagent",
+            branch_ref="refs/heads/codex/worker-identity-default",
+            worktree_path=str(target_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-identity-default",
+            session_token_hash=mf_subagent_session_token_hash(
+                "identity-default-session"
+            ),
+            lease_id="lease-identity-default",
+            lease_expires_at="2999-01-01T00:00:00Z",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-identity-default",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "observer",
+            query={"view": "all"},
+        )
+    )
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    assert context.worker_id == task_id
+    assert context.worker_slot_id == task_id
+    corrected = current["corrected_request_shapes"]
+    assert corrected["write_facade_body"]["worker_id"] == task_id
+    assert corrected["write_facade_body"]["worker_slot_id"] == task_id
+    assert corrected["graph_query_body"]["worker_id"] == task_id
+    worker_guide = guide["worker_guide"]
+    guide_corrected = worker_guide["corrected_request_shapes"]
+    assert guide_corrected["write_facade_body"]["worker_id"] == task_id
+    assert guide_corrected["write_facade_body"]["worker_slot_id"] == task_id
+    receipt_body = worker_guide["read_receipt_facade_payload_skeleton"][
+        "copy_safe_body"
+    ]
+    assert receipt_body["worker_id"] == task_id
+    assert receipt_body["worker_slot_id"] == task_id
+
+
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):
     _activate_basic_graph(conn, "full-query-mf-sub-unknown")
 

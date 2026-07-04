@@ -2283,7 +2283,8 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
     if "runtime_context_id" in row_keys:
         runtime_context_id = row["runtime_context_id"] or ""
     agent_id = row["agent_id"] or ""
-    worker_id = row["worker_id"] or ""
+    row_worker_slot_id = row["worker_slot_id"] if "worker_slot_id" in row_keys else ""
+    worker_id = row["worker_id"] or row_worker_slot_id or row["task_id"] or ""
     return BranchTaskRuntimeContext(
         project_id=row["project_id"],
         task_id=row["task_id"],
@@ -2306,10 +2307,10 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
             row["allocation_owner"] if "allocation_owner" in row_keys else ""
         )
         or agent_id,
-        worker_slot_id=(
-            row["worker_slot_id"] if "worker_slot_id" in row_keys else ""
-        )
-        or worker_id,
+        worker_slot_id=row_worker_slot_id
+        or worker_id
+        or row["task_id"]
+        or "",
         actual_host_worker_id=(
             row["actual_host_worker_id"]
             if "actual_host_worker_id" in row_keys
@@ -4103,6 +4104,10 @@ def _runtime_context_current_values(
         target_project_root_source = "context.target_project_root"
     elif _runtime_context_text(context.worktree_path):
         target_project_root_source = "context.worktree_path"
+    worker_id = _runtime_context_text(
+        context.worker_id or context.worker_slot_id or context.task_id
+    )
+    worker_slot_id = _runtime_context_text(context.worker_slot_id or worker_id)
     return {
         "project_id": context.project_id,
         "governance_project_id": context.governance_project_id or context.project_id,
@@ -4117,8 +4122,8 @@ def _runtime_context_current_values(
         "parent_task_id": parent_task_id,
         "backlog_id": context.backlog_id,
         "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
-        "worker_id": context.worker_id,
-        "worker_slot_id": context.worker_slot_id or context.worker_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
         "actual_host_worker_id": context.actual_host_worker_id,
         "agent_id": context.agent_id,
         "allocation_owner": context.allocation_owner or context.agent_id,
@@ -13749,7 +13754,8 @@ def plan_branch_runtime_context(
 ) -> BranchTaskRuntimeContext:
     """Plan deterministic branch/worktree identity without invoking git."""
     task_slug = _safe_slug(task_id, "task")
-    slot_id = worker_slot_id or worker_id
+    slot_id = worker_slot_id or worker_id or task_id
+    worker_identity = worker_id or slot_id
     worker_slug = _safe_slug(slot_id, "") if slot_id else ""
     prefix = _safe_slug(branch_prefix, "codex")
     try:
@@ -13791,7 +13797,7 @@ def plan_branch_runtime_context(
         stage_task_id=stage_task_id or task_id,
         stage_type=stage_type,
         agent_id=agent_id,
-        worker_id=worker_id,
+        worker_id=worker_identity,
         allocation_owner=allocation_owner or agent_id,
         worker_slot_id=slot_id,
         actual_host_worker_id=actual_host_worker_id,
@@ -14143,6 +14149,8 @@ def branch_context_from_chain_stage(
     if not stage_task:
         raise ValueError("stage_task_id or task_id is required")
     round_num = max(0, int(retry_round or 0))
+    worker_identity = worker_id or worker_slot_id or stage_task
+    slot_identity = worker_slot_id or worker_identity
     return BranchTaskRuntimeContext(
         project_id=project_id,
         task_id=task_id or stage_task,
@@ -14155,9 +14163,9 @@ def branch_context_from_chain_stage(
         stage_type=stage_type,
         retry_round=round_num,
         agent_id=agent_id,
-        worker_id=worker_id,
+        worker_id=worker_identity,
         allocation_owner=allocation_owner or agent_id,
-        worker_slot_id=worker_slot_id or worker_id,
+        worker_slot_id=slot_identity,
         actual_host_worker_id=actual_host_worker_id,
         host_startup_id=host_startup_id,
         host_session_id=host_session_id,

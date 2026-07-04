@@ -906,6 +906,48 @@ def _runtime_projection_context(**overrides: object) -> BranchTaskRuntimeContext
     return BranchTaskRuntimeContext(**payload)
 
 
+def test_runtime_context_projection_defaults_missing_worker_identity_to_task_id() -> None:
+    context = _runtime_projection_context(
+        worker_id="",
+        worker_slot_id="",
+        agent_id="pending-codex-subagent",
+    )
+    projection = build_runtime_context_projection(
+        context,
+        route_identity={
+            "route_id": "route-runtime-context",
+            "route_context_hash": "sha256:route-runtime-context",
+            "prompt_contract_id": "rprompt-runtime-context",
+            "prompt_contract_hash": "sha256:prompt-runtime-context",
+            "route_token_ref": "rtok-runtime-context",
+        },
+        generated_at=NOW,
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
+    handoff = projection["views"]["action_plan"]["worker_handoff_projection"]
+
+    assert current_values["worker_id"] == "mf-sub-runtime-context"
+    assert current_values["worker_slot_id"] == "mf-sub-runtime-context"
+    assert read_action["worker_identity"]["worker_id"] == "mf-sub-runtime-context"
+    assert read_action["worker_identity"]["worker_slot_id"] == "mf-sub-runtime-context"
+    assert handoff["dispatch_present"] is True
+
+
+def test_plan_branch_runtime_context_defaults_missing_worker_identity_to_task_id() -> None:
+    context = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id="mf-sub-missing-worker-identity",
+        workspace_root="/repo",
+        branch_prefix="codex",
+        worktree_root=".worktrees",
+    )
+
+    assert context.worker_id == "mf-sub-missing-worker-identity"
+    assert context.worker_slot_id == "mf-sub-missing-worker-identity"
+
+
 def test_append_branch_contract_revision_defaults_revision_id_to_visible_content_hash() -> None:
     conn = _runtime_conn()
     context = _contract_revision_test_context()

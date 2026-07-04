@@ -9101,20 +9101,25 @@ def _runtime_context_projection_response(
         if isinstance(exposed_views.get("worker_view"), Mapping)
         else {}
     )
+    worker_summary_id = str(
+        worker_view_for_summary.get("worker_id")
+        or getattr(context, "worker_id", "")
+        or worker_view_for_summary.get("worker_slot_id")
+        or getattr(context, "worker_slot_id", "")
+        or getattr(context, "task_id", "")
+        or worker_view_for_summary.get("agent_id")
+        or ""
+    )
+    worker_summary_slot_id = str(
+        worker_view_for_summary.get("worker_slot_id")
+        or getattr(context, "worker_slot_id", "")
+        or worker_summary_id
+        or ""
+    )
     worker_scope_files = _runtime_context_collect_worker_scope_files(
         task_id=str(getattr(context, "task_id", "") or ""),
-        worker_id=str(
-            worker_view_for_summary.get("worker_id")
-            or worker_view_for_summary.get("agent_id")
-            or getattr(context, "worker_id", "")
-            or ""
-        ),
-        worker_slot_id=str(
-            worker_view_for_summary.get("worker_slot_id")
-            or getattr(context, "worker_slot_id", "")
-            or getattr(context, "worker_id", "")
-            or ""
-        ),
+        worker_id=worker_summary_id,
+        worker_slot_id=worker_summary_slot_id,
         latest_revision_payload=latest_revision_payload,
         sources=[
             ctx.query,
@@ -9123,18 +9128,8 @@ def _runtime_context_projection_response(
             *_runtime_context_timeline_worker_scope_sources(
                 timeline_events,
                 task_id=str(getattr(context, "task_id", "") or ""),
-                worker_id=str(
-                    worker_view_for_summary.get("worker_id")
-                    or worker_view_for_summary.get("agent_id")
-                    or getattr(context, "worker_id", "")
-                    or ""
-                ),
-                worker_slot_id=str(
-                    worker_view_for_summary.get("worker_slot_id")
-                    or getattr(context, "worker_slot_id", "")
-                    or getattr(context, "worker_id", "")
-                    or ""
-                ),
+                worker_id=worker_summary_id,
+                worker_slot_id=worker_summary_slot_id,
             ),
             {
                 "owned_files": getattr(context, "owned_files", []),
@@ -9165,6 +9160,8 @@ def _runtime_context_projection_response(
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
         parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+        worker_id=worker_summary_id,
+        worker_slot_id=worker_summary_slot_id,
     )
     audit = record_runtime_context_access_audit(
         conn,
@@ -9246,18 +9243,8 @@ def _runtime_context_projection_response(
         task_id=str(getattr(context, "task_id", "") or ""),
         backlog_id=str(getattr(context, "backlog_id", "") or ""),
         parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
-        worker_id=str(
-            worker_view_for_summary.get("worker_id")
-            or worker_view_for_summary.get("agent_id")
-            or getattr(context, "worker_id", "")
-            or ""
-        ),
-        worker_slot_id=str(
-            worker_view_for_summary.get("worker_slot_id")
-            or getattr(context, "worker_slot_id", "")
-            or getattr(context, "worker_id", "")
-            or ""
-        ),
+        worker_id=worker_summary_id,
+        worker_slot_id=worker_summary_slot_id,
         target_project_root=target_project_root,
         agent_id=str(
             worker_view_for_summary.get("agent_id")
@@ -9469,6 +9456,7 @@ def _runtime_context_executable_contract_envelope(
         graph_identity.get("worker_id")
         or task.get("worker_id")
         or worker_view.get("worker_id")
+        or task_id
         or worker_view.get("agent_id")
         or ""
     )
@@ -10006,6 +9994,7 @@ def _runtime_context_worker_guide_response(
         graph_identity.get("worker_id")
         or task.get("worker_id")
         or worker_view.get("worker_id")
+        or task_id
         or worker_view.get("agent_id")
         or ""
     )
@@ -10052,6 +10041,8 @@ def _runtime_context_worker_guide_response(
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             parent_task_id=parent_task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
         )
     corrected_request_shapes = dict(
         target_root_projection.get("corrected_request_shapes") or {}
@@ -11530,6 +11521,8 @@ def _runtime_context_target_root_projection(
     runtime_context_id: str = "",
     task_id: str = "",
     parent_task_id: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
 ) -> dict[str, Any]:
     requested = str(requested_target_project_root or "").strip()
     canonical = str(canonical_target_project_root or "").strip()
@@ -11550,6 +11543,16 @@ def _runtime_context_target_root_projection(
         "project_root": canonical,
         "repo_root": canonical,
         "worktree_path": worktree,
+    }
+    worker_identity = str(
+        worker_id or worker_slot_id or identity_shape["task_id"] or ""
+    ).strip()
+    worker_slot_identity = str(worker_slot_id or worker_identity or "").strip()
+    write_identity_shape = {
+        **identity_shape,
+        "worker_role": "mf_sub",
+        "worker_id": worker_identity,
+        "worker_slot_id": worker_slot_identity,
     }
     return {
         "schema_version": "runtime_context.target_project_root_projection.v1",
@@ -11577,13 +11580,13 @@ def _runtime_context_target_root_projection(
             "current_state_query": dict(identity_shape),
             "worker_guide_query": dict(identity_shape),
             "graph_query_body": {
-                **identity_shape,
+                **write_identity_shape,
                 "worker_role": "mf_sub",
                 "query_source": "mf_subagent",
                 "query_purpose": "subagent_context_build",
             },
-            "write_facade_body": dict(identity_shape),
-            "startup_body": dict(identity_shape),
+            "write_facade_body": dict(write_identity_shape),
+            "startup_body": dict(write_identity_shape),
         },
         "strict_gates_validate_canonical_target_project_root": True,
         "raw_session_token_exposed": False,
@@ -12864,15 +12867,21 @@ def _runtime_context_worker_recovery_details(
             )
         except Exception:
             fence_matches = False
+        expected_worker_id = str(
+            getattr(context, "worker_id", "")
+            or getattr(context, "worker_slot_id", "")
+            or getattr(context, "task_id", "")
+            or ""
+        )
+        expected_worker_slot_id = str(
+            getattr(context, "worker_slot_id", "") or expected_worker_id or ""
+        )
         diagnostics["expected"] = {
             "runtime_context_id": expected_runtime_context_id,
             "task_id": getattr(context, "task_id", ""),
             "parent_task_id": expected_parent_task_id,
-            "worker_id": getattr(context, "worker_id", ""),
-            "worker_slot_id": (
-                getattr(context, "worker_slot_id", "")
-                or getattr(context, "worker_id", "")
-            ),
+            "worker_id": expected_worker_id,
+            "worker_slot_id": expected_worker_slot_id,
             "agent_id": getattr(context, "agent_id", ""),
             "allocation_owner": getattr(context, "allocation_owner", ""),
             "target_project_root": expected_target_root,
@@ -12903,6 +12912,8 @@ def _runtime_context_worker_recovery_details(
             runtime_context_id=expected_runtime_context_id,
             task_id=getattr(context, "task_id", ""),
             parent_task_id=expected_parent_task_id,
+            worker_id=expected_worker_id,
+            worker_slot_id=expected_worker_slot_id,
         )
         diagnostics["target_project_root_projection"] = target_root_projection
         diagnostics["matches"] = {
@@ -13139,12 +13150,8 @@ def _runtime_context_worker_recovery_details(
             task_id=str(getattr(context, "task_id", "") or ""),
             backlog_id=str(getattr(context, "backlog_id", "") or ""),
             parent_task_id=expected_parent_task_id,
-            worker_id=str(getattr(context, "worker_id", "") or ""),
-            worker_slot_id=str(
-                getattr(context, "worker_slot_id", "")
-                or getattr(context, "worker_id", "")
-                or ""
-            ),
+            worker_id=expected_worker_id,
+            worker_slot_id=expected_worker_slot_id,
             target_project_root=expected_target_root,
             agent_id=str(getattr(context, "agent_id", "") or ""),
             allocation_owner=str(
