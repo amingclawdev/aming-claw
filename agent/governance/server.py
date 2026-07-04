@@ -18114,12 +18114,13 @@ def _require_parallel_branch_merge_route_gate(
 ) -> dict:
     """Authorize a child-lane merge action against its root route contract.
 
-    Existing mf_parallel route contracts mint the observer merge authority at the
-    root task/backlog scope and name it ``close_or_merge_after_evidence``.  The
-    concrete merge endpoints run against child lane task ids (``merge_queue``,
-    ``merge_execute`` and ``merge_result``).  Try the concrete action first, then
-    fall back to the parent/root route scope when the request supplies a route
-    token/ref and the branch context binds the child lane to that root.
+    Existing mf_parallel route contracts can mint the observer merge authority
+    at either the child lane or root task/backlog scope and name it
+    ``close_or_merge_after_evidence``.  The concrete merge endpoints run against
+    child lane task ids (``merge_queue``, ``merge_execute`` and
+    ``merge_result``).  Try the concrete action first, then fall back to the
+    contract merge authority at child scope before trying the parent/root route
+    scope.
     """
 
     concrete_action = str(action or "").strip()
@@ -18152,6 +18153,30 @@ def _require_parallel_branch_merge_route_gate(
         if not root_task_id or root_task_id == lane_task_id:
             raise
 
+        child_scope_error = ""
+        try:
+            gate = _require_route_token_mutation_gate(
+                ctx,
+                action=_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
+                backlog_id=backlog_id,
+                task_id=lane_task_id,
+            )
+        except GovernanceError as child_exc:
+            child_scope_error = str(child_exc.message or child_exc)
+        else:
+            gate = dict(gate)
+            gate["action"] = concrete_action
+            gate["protected_action"] = concrete_action
+            gate["authorized_action"] = _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION
+            gate["child_task_scope_accepted"] = True
+            gate["parent_task_scope_accepted"] = False
+            gate["accepted_task_scope"] = "child"
+            gate["parent_task_id"] = root_task_id
+            gate["child_task_id"] = lane_task_id
+            gate["backlog_id"] = backlog_id
+            gate["fallback_reason"] = str(exc.message or exc)
+            return gate
+
         gate = _require_route_token_mutation_gate(
             ctx,
             action=_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION,
@@ -18163,10 +18188,14 @@ def _require_parallel_branch_merge_route_gate(
         gate["protected_action"] = concrete_action
         gate["authorized_action"] = _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION
         gate["parent_task_scope_accepted"] = True
+        gate["child_task_scope_accepted"] = False
+        gate["accepted_task_scope"] = "parent"
         gate["parent_task_id"] = root_task_id
         gate["child_task_id"] = lane_task_id
         gate["backlog_id"] = backlog_id
         gate["fallback_reason"] = str(exc.message or exc)
+        if child_scope_error:
+            gate["child_scope_fallback_reason"] = child_scope_error
         return gate
 
 
