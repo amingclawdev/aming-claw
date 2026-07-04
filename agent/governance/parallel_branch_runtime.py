@@ -14843,6 +14843,7 @@ def execute_merge_queue_item(
     task_id: str = "",
     branch_ref: str = "",
     target_ref: str = "",
+    current_target_head: str = "",
     evidence: dict[str, Any] | None = None,
     batch_status: str = "",
     dry_run: bool = True,
@@ -14876,6 +14877,17 @@ def execute_merge_queue_item(
     explicit_branch = str(branch_ref or "").strip()
     if explicit_branch:
         item = replace(item, branch_ref=explicit_branch)
+        items = [
+            item if candidate.queue_item_id == item.queue_item_id else candidate
+            for candidate in items
+        ]
+    refreshed_target_head = str(current_target_head or "").strip()
+    if refreshed_target_head and item.status in MERGE_READY_INPUT_STATES:
+        item = replace(
+            item,
+            current_target_head=refreshed_target_head,
+            validated_target_head=refreshed_target_head,
+        )
         items = [
             item if candidate.queue_item_id == item.queue_item_id else candidate
             for candidate in items

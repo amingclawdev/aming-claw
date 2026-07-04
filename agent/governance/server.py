@@ -18997,6 +18997,11 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 task_id=str(ctx.body.get("task_id") or ""),
                 branch_ref=str(ctx.body.get("branch_ref") or ""),
                 target_ref=target_ref,
+                current_target_head=_parallel_branch_current_target_head(
+                    project_id,
+                    ctx.body,
+                    target_ref=target_ref,
+                ),
                 evidence=evidence,
                 batch_status=str(ctx.body.get("batch_status") or ""),
                 dry_run=dry_run,

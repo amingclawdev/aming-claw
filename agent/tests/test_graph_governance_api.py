@@ -13699,6 +13699,113 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     ).stdout.find("Chain-Source-Stage: merge") != -1
 
 
+def test_parallel_branch_merge_execute_accepts_refreshed_current_target_head(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "feature-refresh"], cwd=repo, check=True)
+    (repo / "worker.txt").write_text("worker\n", encoding="utf-8")
+    subprocess.run(["git", "add", "worker.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "worker branch"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    old_main = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "direct-fix.txt").write_text("direct fix\n", encoding="utf-8")
+    subprocess.run(["git", "add", "direct-fix.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "direct fix"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    new_main = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    queue_id = "mergeq-api-refresh-target-head"
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-refresh-target-head",
+                task_id="refresh-target-head-task",
+                branch_ref="feature-refresh",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="feature-refresh",
+                validated_target_head=old_main,
+                current_target_head=old_main,
+            )
+        ],
+        now_iso="2026-05-17T08:31:00Z",
+    )
+
+    stale = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": "refresh-target-head-task",
+                "evidence": evidence,
+                "dry_run": True,
+            },
+        )
+    )
+
+    assert stale["preview"]["status"] == "stale"
+    assert stale["gate_plan"]["merge_gate_passed"] is False
+    assert "failed_evidence:git_conflict_check" in stale["gate_plan"]["blocker_codes"]
+
+    refreshed = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": "refresh-target-head-task",
+                "current_target_head": new_main,
+                "evidence": evidence,
+                "dry_run": True,
+            },
+        )
+    )
+
+    assert refreshed["ok"] is True
+    assert refreshed["preview"]["status"] == "pass"
+    assert refreshed["preview"]["target_commit"] == new_main
+    assert refreshed["gate_plan"]["merge_gate_passed"] is True
+
+
 def test_parallel_branch_merge_execute_preflights_fence_before_live_writer(
     conn, tmp_path, monkeypatch
 ):
