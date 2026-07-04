@@ -5800,6 +5800,12 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "finish_gate",
                     "git_commit",
                 ],
+                "worker_final_must_not_commit_before_finish_gate": True,
+                "forbidden_before_finish_gate": [
+                    "git commit",
+                    "::git-commit final directive",
+                    "host commit request",
+                ],
             },
             "independent_qa_before_durable_merge_queue": {
                 "required": True,
@@ -6289,6 +6295,7 @@ def _runtime_context_read_receipt_hash_action(
                 "author_worker_evidence_as_observer",
                 "bypass_timeline_gate",
                 "git_commit_before_finish_gate",
+                "emit_git_commit_directive_before_finish_gate",
             ],
             "precommit_finish_order": {
                 "required": True,

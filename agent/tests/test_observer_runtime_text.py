@@ -270,6 +270,10 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert "post-hoc read receipt after counted evidence does not satisfy" in result[
         "launch_text"
     ]
+    assert "Completion order is strict" in result["launch_text"]
+    assert "finish-time worker attestation" in result["launch_text"]
+    assert "Do not run `git commit`" in result["launch_text"]
+    assert "`::git-commit` final directive" in result["launch_text"]
     assert "test_environment_preflight.setup_commands" in result["launch_text"]
     assert "installs missing pytest runner dependencies" in result["launch_text"]
     assert result["finish_gate_contract"]["required"] is True
@@ -343,6 +347,31 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert launch_pack["next_legal_action"] == "submit_mf_subagent_read_receipt"
     assert "submit_mf_subagent_read_receipt" in launch_pack["allowed_actions"]
     assert "merge" in launch_pack["blocked_actions"]
+    assert "git_commit_before_finish_gate" in launch_pack["blocked_actions"]
+    assert "emit_git_commit_directive_before_finish_gate" in launch_pack[
+        "blocked_actions"
+    ]
+    precommit_policy = launch_pack["precommit_finish_policy"]
+    assert precommit_policy["required"] is True
+    assert precommit_policy["finish_gate_before_git_commit"] is True
+    assert precommit_policy["worker_final_must_not_commit_before_finish_gate"] is True
+    assert precommit_policy["sequence"] == [
+        "record_implementation_evidence",
+        "record_finish_time_worker_attestation",
+        "record_finish_gate",
+        "git_commit",
+        "report_review_ready_or_waiting_merge",
+    ]
+    assert "::git-commit final directive" in precommit_policy[
+        "forbidden_before_finish_gate"
+    ]
+    assert launch_pack["worker_guide"]["precommit_finish_policy"] == precommit_policy
+    assert launch_pack["worker_guide"]["constraints"]["precommit_finish_policy"] == (
+        precommit_policy
+    )
+    assert "create_git_commit_after_finish_gate" in launch_pack["worker_guide"][
+        "worker_next_moves"
+    ]
     assert launch_pack["startup_preflight"]["allowed"] is True
     assert launch_pack["startup_preflight"]["status"] == "passed"
     assert launch_pack["startup_preflight"]["blockers"] == []
@@ -418,6 +447,7 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     ]
     assert executable["payload"]["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
     handoff = executable["handoff_packet"]
+    assert handoff["precommit_finish_policy"] == precommit_policy
     receipt_skeleton = handoff["read_receipt_facade_payload_skeleton"]
     receipt_body = receipt_skeleton["copy_safe_body"]
     assert receipt_skeleton["top_level_body_required"] is True

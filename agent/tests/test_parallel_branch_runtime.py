@@ -1549,6 +1549,19 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "agent/governance/parallel_branch_runtime.py"
     ]
     assert "merge" in read_action["worker_constraints"]["blocked_actions"]
+    assert "git_commit_before_finish_gate" in read_action["worker_constraints"][
+        "blocked_actions"
+    ]
+    assert "emit_git_commit_directive_before_finish_gate" in read_action[
+        "worker_constraints"
+    ]["blocked_actions"]
+    finish_order_rule = read_action["worker_constraints"][
+        "mf_parallel_happy_path_reminders"
+    ]["worker_rules"]["finish_gate_before_git_commit"]
+    assert finish_order_rule["worker_final_must_not_commit_before_finish_gate"] is True
+    assert "::git-commit final directive" in finish_order_rule[
+        "forbidden_before_finish_gate"
+    ]
     finish_proof_rule = read_action["worker_constraints"][
         "mf_parallel_happy_path_reminders"
     ]["worker_rules"]["finish_time_transcript_proof"]

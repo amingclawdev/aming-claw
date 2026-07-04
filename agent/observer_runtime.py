@@ -231,6 +231,8 @@ WORKER_LAUNCH_PACK_BLOCKED_ACTIONS = (
     "bypass_timeline_gate",
     "surrogate_startup",
     "raw_token_exfiltration",
+    "git_commit_before_finish_gate",
+    "emit_git_commit_directive_before_finish_gate",
     "merge",
     "push",
     "activate_graph",
@@ -4475,9 +4477,11 @@ def _runtime_text_worker_prompt(
         f"Implement backlog {request.backlog_id} as a bounded mf_sub worker. "
         f"Work only in the assigned worktree and only within these owned files: {files}. "
         "Run graph-first discovery before edits, run focused tests, and stop at "
-        "review_ready with structured evidence. Do not merge, push, activate graph "
-        "refs, mutate merge queues, delete worktrees, or expose raw private "
-        "route/context-pack content."
+        "review_ready with structured evidence. Do not create a git commit or "
+        "emit a ::git-commit final directive until finish-time worker "
+        "attestation and the runtime-context finish gate have both passed. Do "
+        "not merge, push, activate graph refs, mutate merge queues, delete "
+        "worktrees, or expose raw private route/context-pack content."
     )
 
 
@@ -4599,6 +4603,13 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "stop before graph queries or implementation and report the blocker. "
         "Do not treat an event id for `mf_subagent_startup_refusal` as startup "
         "acceptance.\n\n"
+        "Completion order is strict: record implementation evidence, record "
+        "finish-time worker attestation, pass the runtime-context finish gate, "
+        "and only then create the worker git commit. Leave the worker diff "
+        "uncommitted until finish gate passes. Do not run `git commit`, do not "
+        "emit a `::git-commit` final directive, and do not ask the host to "
+        "commit before finish gate passes; if this cannot be satisfied, stop "
+        "and report the blocker instead of backfilling evidence.\n\n"
         "Before handing off review_ready, run the local task precheck when "
         "available, normally `python -m agent.cli mf precommit-check --json-output` "
         "from the assigned worktree. Include the precheck command, exit code, "
@@ -5170,6 +5181,31 @@ def _runtime_text_worker_launch_pack(
             "done_state": ["review_ready", "waiting_merge"],
         },
     ]
+    precommit_finish_policy = {
+        "schema_version": "observer_worker_launch_pack.precommit_finish_policy.v1",
+        "required": True,
+        "finish_gate_before_git_commit": True,
+        "worker_final_must_not_commit_before_finish_gate": True,
+        "sequence": [
+            "record_implementation_evidence",
+            "record_finish_time_worker_attestation",
+            "record_finish_gate",
+            "git_commit",
+            "report_review_ready_or_waiting_merge",
+        ],
+        "forbidden_before_finish_gate": [
+            "git commit",
+            "::git-commit final directive",
+            "host commit request",
+            "push",
+            "merge",
+        ],
+        "allowed_after_finish_gate": [
+            "git commit with Chain/Runtime trailers",
+            "report_review_ready_or_waiting_merge",
+        ],
+        "blocker_if_unavailable": "finish_gate_before_commit_required",
+    }
     worker_guide = {
         "schema_version": "worker_guide.schema.v1",
         "guide_id": f"{runtime_context_id}:worker-guide:{context.task_id}",
@@ -5193,6 +5229,7 @@ def _runtime_text_worker_launch_pack(
             "record_implementation_evidence",
             "record_finish_time_worker_attestation",
             "record_finish_gate",
+            "create_git_commit_after_finish_gate",
             "report_review_ready_or_waiting_merge",
         ],
         "observer_remediation": [
@@ -5205,6 +5242,7 @@ def _runtime_text_worker_launch_pack(
             "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
             "raw_tokens_persisted": False,
             "worker_evidence_substitution_allowed": False,
+            "precommit_finish_policy": dict(precommit_finish_policy),
         },
         "startup_alternatives": startup_alternatives,
         "startup_identity_policy": startup_identity_policy,
@@ -5217,6 +5255,7 @@ def _runtime_text_worker_launch_pack(
         "test_environment_preflight": test_environment_preflight,
         "tests_to_run": list(normalized_test_commands or request.test_commands),
         "evidence_to_file": required_evidence,
+        "precommit_finish_policy": dict(precommit_finish_policy),
         "runtime_context_entrypoints": runtime_context_entrypoints,
         "done_state": ["review_ready", "waiting_merge"],
     }
@@ -5386,6 +5425,7 @@ def _runtime_text_worker_launch_pack(
         "worker_guide": worker_guide,
         "allowed_actions": list(WORKER_LAUNCH_PACK_ALLOWED_ACTIONS),
         "blocked_actions": list(WORKER_LAUNCH_PACK_BLOCKED_ACTIONS),
+        "precommit_finish_policy": dict(precommit_finish_policy),
         "next_legal_action": next_legal_action,
         "startup_preflight": startup_preflight,
         "test_environment_preflight": test_environment_preflight,
@@ -6359,6 +6399,11 @@ def _runtime_text_executable_worker_launch(
         "service_dispatch_payload_skeleton": service_dispatch_payload_skeleton,
         "read_receipt_facade_payload_skeleton": read_receipt_payload_skeleton,
         "startup_facade_payload_skeleton": startup_payload_skeleton,
+        "precommit_finish_policy": dict(
+            worker_launch_pack.get("precommit_finish_policy")
+            if isinstance(worker_launch_pack.get("precommit_finish_policy"), Mapping)
+            else {}
+        ),
         "next_step": handoff_next_step,
     }
     host_adapter_handoff = {
