@@ -2417,6 +2417,105 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     ]["scope"]["owned_files"] == ["agent/governance/server.py"]
 
 
+def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-ALLOCATE-CONTRACT-TEST-SCOPE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    workspace = tmp_path / "workers"
+    worktree = workspace / "scope-worker" / "allocate-test-scope-task"
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "allocate-test-scope-task",
+                "parent_task_id": backlog_id,
+                "backlog_id": backlog_id,
+                "observer_command_id": "cmd-allocate-test-scope",
+                "workspace_root": str(workspace),
+                "worktree_path": str(worktree),
+                "worker_id": "scope-worker",
+                "fence_token": "fence-allocate-test-scope",
+                "base_commit": "base-allocate-test-scope",
+                "target_head_commit": "target-allocate-test-scope",
+                "merge_queue_id": "mq-allocate-test-scope",
+                "route_id": "route-allocate-test-scope",
+                "route_context_hash": "sha256:route-allocate-test-scope",
+                "prompt_contract_id": "rprompt-allocate-test-scope",
+                "prompt_contract_hash": "sha256:prompt-allocate-test-scope",
+                "route_token_ref": "rtok-allocate-test-scope",
+                "visible_injection_manifest_hash": "sha256:visible-test-scope",
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": False,
+            },
+        )
+    )
+
+    expected_scope = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    assert status == 201
+    assert created["ok"] is True
+    context = created["context"]
+    assert context["owned_files"] == expected_scope
+    assert context["target_files"] == expected_scope
+
+    revision = created["runtime_contract_revision"]
+    assert revision["payload"]["owned_files"] == expected_scope
+    assert revision["payload"]["target_files"] == expected_scope
+    assert revision["payload"]["test_files"] == [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+
+    dispatch = created["dispatch_timeline_event"]
+    assert dispatch["status"] == "recorded"
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id="allocate-test-scope-task",
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["owned_files"] == expected_scope
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": "fence-allocate-test-scope",
+            },
+        )
+    )
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["owned_files"] == expected_scope
+    assert worker_guide["control_plane_summary"]["read_receipt_hash_action"][
+        "worker_constraints"
+    ]["scope"]["owned_files"] == expected_scope
+
+
 def test_observer_runtime_text_prepare_projects_route_identity_to_allocated_context(
     conn,
     tmp_path,
