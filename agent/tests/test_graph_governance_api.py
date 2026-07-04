@@ -73,6 +73,16 @@ PID = "graph-api-test"
 
 
 def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
+    parent_identity = {
+        "route_id": "route-superseded-parent",
+        "route_context_hash": "sha256:route-superseded-parent",
+        "prompt_contract_id": "rprompt-superseded-parent",
+        "prompt_contract_hash": "sha256:prompt-superseded-parent",
+        "visible_injection_manifest_hash": "sha256:visible-superseded-parent",
+        "route_token_ref": "rtok-superseded-parent",
+        "selected_project": PID,
+        "selected_backlog_id": "AC-ROUTE-TOKEN-SUPERSEDED",
+    }
     superseded = observer_route_context.route_token_ref_renewal_next_action(
         project_id=PID,
         backlog_id="AC-ROUTE-TOKEN-SUPERSEDED",
@@ -80,6 +90,10 @@ def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
         route_token_ref="rtok-superseded",
         observer_session_id="obs-session",
         reason=observer_route_context.REF_STATUS_SUPERSEDED,
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        evidence_refs=["contract_runtime:cex-root-scope"],
+        parent_route_identity=parent_identity,
     )
     assert superseded["schema_version"] == (
         observer_route_context.REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION
@@ -94,6 +108,21 @@ def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
         "backlog_id": "AC-ROUTE-TOKEN-SUPERSEDED",
         "task_id": "cex-root-scope",
     }
+    assert superseded["parent_route_identity_required"] is True
+    assert superseded["parent_route_identity"]["route_id"] == (
+        parent_identity["route_id"]
+    )
+    assert "parent_route_identity" in superseded["required_fields"]
+    issue_payload = superseded["observer_route_context_issue_payload"]
+    assert issue_payload["project_id"] == PID
+    assert issue_payload["caller_role"] == "observer"
+    assert issue_payload["backlog_id"] == "AC-ROUTE-TOKEN-SUPERSEDED"
+    assert issue_payload["task_id"] == "cex-root-scope"
+    assert issue_payload["allowed_actions"] == ["task_timeline_append"]
+    assert issue_payload["target_files"] == ["agent/governance/server.py"]
+    assert issue_payload["parent_route_token_ref"] == "rtok-superseded-parent"
+    assert issue_payload["parent_route_identity"] == parent_identity
+    assert "route_token" not in issue_payload
 
     expired = observer_route_context.route_token_ref_renewal_next_action(
         project_id=PID,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import sys
 
 import pytest
@@ -718,6 +719,63 @@ def test_parent_lineage_route_token_ref_is_opaque_and_stable():
     )
     c = _issue(parent_route_identity=different_parent)
     assert c["route_token_ref"] != ref
+
+
+def test_superseded_parent_bound_ref_next_action_carries_issue_payload():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    issued = _issue(
+        parent_route_identity=_PARENT_ROUTE_IDENTITY,
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["contract_runtime:cex-parent"],
+    )
+    ref = issued["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=_PROJECT,
+        route_token_ref=ref,
+        token=issued["route_token"],
+    )
+    assert observer_route_context.supersede_route_token_ref(
+        conn,
+        project_id=_PROJECT,
+        route_token_ref=ref,
+    )
+
+    with pytest.raises(observer_route_context.RouteTokenRefError) as exc:
+        observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            backlog_id=_BACKLOG,
+            task_id=_TASK,
+        )
+
+    assert exc.value.code == "route_token_ref_not_active"
+    next_action = exc.value.details["next_action"]
+    assert next_action["action"] == "issue_fresh_same_scope_route_token_ref"
+    assert next_action["semantic_next_action"] == "observer_route_context_issue"
+    assert next_action["parent_route_identity_required"] is True
+    assert "parent_route_identity" in next_action["required_fields"]
+
+    issue_payload = next_action["observer_route_context_issue_payload"]
+    assert issue_payload["project_id"] == _PROJECT
+    assert issue_payload["caller_role"] == "observer"
+    assert issue_payload["backlog_id"] == _BACKLOG
+    assert issue_payload["task_id"] == _TASK
+    assert issue_payload["allowed_actions"] == ["task_timeline_append"]
+    assert issue_payload["target_files"] == _TARGET_FILES
+    assert issue_payload["parent_route_token_ref"] == (
+        _PARENT_ROUTE_IDENTITY["route_token_ref"]
+    )
+    assert issue_payload["parent_route_identity"]["route_id"] == (
+        _PARENT_ROUTE_IDENTITY["route_id"]
+    )
+    assert issue_payload["parent_route_identity"]["route_context_hash"] == (
+        _PARENT_ROUTE_IDENTITY["route_context_hash"]
+    )
+    assert f"reissued_from:{ref}" in issue_payload["evidence_refs"]
+    _assert_no_raw_token_keys(next_action)
 
 
 # --- AC7 / dogfood: redaction — raw token never persisted in the ref --------

@@ -1066,6 +1066,11 @@ def route_token_ref_renewal_next_action(
     route_token_ref: str = "",
     observer_session_id: str = "",
     reason: str = "",
+    allowed_actions: Sequence[str] | None = None,
+    target_files: Sequence[str] | None = None,
+    owned_files: Sequence[str] | None = None,
+    evidence_refs: Sequence[str] | None = None,
+    parent_route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the public-safe semantic action for renewing a route-token ref."""
 
@@ -1078,6 +1083,11 @@ def route_token_ref_renewal_next_action(
             route_token_ref=route_token_ref,
             observer_session_id=observer_session_id,
             reason=reason_text,
+            allowed_actions=allowed_actions,
+            target_files=target_files,
+            owned_files=owned_files,
+            evidence_refs=evidence_refs,
+            parent_route_identity=parent_route_identity,
         )
 
     return {
@@ -1120,10 +1130,61 @@ def route_token_ref_same_scope_issue_next_action(
     route_token_ref: str = "",
     observer_session_id: str = "",
     reason: str = "",
+    allowed_actions: Sequence[str] | None = None,
+    target_files: Sequence[str] | None = None,
+    owned_files: Sequence[str] | None = None,
+    evidence_refs: Sequence[str] | None = None,
+    parent_route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return guidance for replacing a superseded route-token ref without renew loops."""
 
-    return {
+    project = _string(project_id)
+    backlog = _string(backlog_id)
+    task = _string(task_id)
+    parent_identity = _public_mapping(parent_route_identity)
+    actions = _normalized_action_list(allowed_actions or [])
+    targets = _string_list(target_files or [])
+    owned = _string_list(owned_files or [])
+    evidence = _dedupe(
+        [
+            *_string_list(evidence_refs or []),
+            f"reissued_from:{_string(route_token_ref)}" if _string(route_token_ref) else "",
+        ]
+    )
+    issue_payload: dict[str, Any] = {
+        "project_id": project,
+        "caller_role": CALLER_ROLE,
+        "backlog_id": backlog,
+        "task_id": task,
+    }
+    if actions:
+        issue_payload["allowed_actions"] = actions
+    if targets:
+        issue_payload["target_files"] = targets
+    if owned:
+        issue_payload["owned_files"] = owned
+    if evidence:
+        issue_payload["evidence_refs"] = evidence
+    if parent_identity:
+        issue_payload["parent_route_identity"] = dict(parent_identity)
+        parent_ref = _string(
+            parent_identity.get("route_token_ref")
+            or parent_identity.get("parent_route_token_ref")
+        )
+        if parent_ref:
+            issue_payload["parent_route_token_ref"] = parent_ref
+
+    required_fields = [
+        "project_id",
+        "observer_session_id",
+        "backlog_id",
+        "task_id",
+        "allowed_actions",
+    ]
+    if parent_identity:
+        required_fields.append("parent_route_identity")
+
+    action = {
         "schema_version": REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION,
         "action": "issue_fresh_same_scope_route_token_ref",
         "semantic_next_action": "observer_route_context_issue",
@@ -1131,31 +1192,30 @@ def route_token_ref_same_scope_issue_next_action(
         "http_entrypoint": {
             "method": "POST",
             "path": "/api/projects/{project_id}/observer/route-context/issue",
-            "path_params": {"project_id": _string(project_id) or "{project_id}"},
+            "path_params": {"project_id": project or "{project_id}"},
         },
-        "required_fields": [
-            "project_id",
-            "observer_session_id",
-            "backlog_id",
-            "task_id",
-            "allowed_actions",
-        ],
-        "project_id": _string(project_id),
+        "required_fields": required_fields,
+        "project_id": project,
         "observer_session_id": _string(observer_session_id),
         "superseded_route_token_ref": _string(route_token_ref),
         "scope": {
-            "project_id": _string(project_id),
-            "backlog_id": _string(backlog_id),
-            "task_id": _string(task_id),
+            "project_id": project,
+            "backlog_id": backlog,
+            "task_id": task,
         },
         "reason": _string(reason) or REF_STATUS_SUPERSEDED,
         "preferred_over": "renew_route_token_ref",
         "renew_loop_allowed": False,
         "same_scope_required": True,
         "expired_or_near_expired_refs_still_use_renew": True,
+        "observer_route_context_issue_payload": issue_payload,
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    if parent_identity:
+        action["parent_route_identity_required"] = True
+        action["parent_route_identity"] = dict(parent_identity)
+    return action
 
 
 def route_token_ref_expiry_status(
@@ -1860,6 +1920,11 @@ def resolve_route_token_ref(
     row_dict = dict(row)
     status = _string(row_dict.get("status"))
     if status != REF_STATUS_ACTIVE:
+        stored_backlog = backlog_id or _string(row_dict.get("backlog_id"))
+        stored_task = task_id or _string(row_dict.get("task_id"))
+        parent_lineage = _json_loads_public_mapping(
+            row_dict.get(_REF_LINEAGE_COLUMNS["parent_route_lineage"])
+        )
         raise RouteTokenRefError(
             f"route_token_ref {route_token_ref!r} is not active (status={status!r}); "
             "ref resolution refused",
@@ -1868,10 +1933,15 @@ def resolve_route_token_ref(
                 "status": status,
                 "next_action": route_token_ref_renewal_next_action(
                     project_id=project_id,
-                    backlog_id=backlog_id or _string(row_dict.get("backlog_id")),
-                    task_id=task_id or _string(row_dict.get("task_id")),
+                    backlog_id=stored_backlog,
+                    task_id=stored_task,
                     route_token_ref=route_token_ref,
                     reason=status or "not_active",
+                    allowed_actions=_row_allowed_actions(row_dict),
+                    target_files=_row_target_files(row_dict),
+                    owned_files=_row_owned_files(row_dict),
+                    evidence_refs=_row_evidence_refs(row_dict),
+                    parent_route_identity=parent_lineage or None,
                 ),
             },
         )
@@ -2323,6 +2393,9 @@ def renew_route_token_ref(
         row_dict = dict(row)
         status = _string(row_dict.get("status"))
         if status == REF_STATUS_SUPERSEDED:
+            stored_parent_lineage = _json_loads_public_mapping(
+                row_dict.get(_REF_LINEAGE_COLUMNS["parent_route_lineage"])
+            )
             raise RouteTokenRefError(
                 f"route_token_ref {old_ref!r} is superseded; renewal refused",
                 code="route_token_ref_superseded",
@@ -2335,6 +2408,11 @@ def renew_route_token_ref(
                         task_id=task_id or _string(row_dict.get("task_id")),
                         route_token_ref=old_ref,
                         reason=status,
+                        allowed_actions=_row_allowed_actions(row_dict),
+                        target_files=_row_target_files(row_dict),
+                        owned_files=_row_owned_files(row_dict),
+                        evidence_refs=_row_evidence_refs(row_dict),
+                        parent_route_identity=stored_parent_lineage or None,
                     ),
                 },
             )
