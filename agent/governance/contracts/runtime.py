@@ -1,8 +1,8 @@
 """Minimal executable runtime path for config-backed contracts.
 
-This module intentionally stays independent from HTTP, MCP, and timeline
-facades. It proves the new contract system can drive the next legal action and
-line-level write authorization from source-controlled definitions before legacy
+This module intentionally stays independent from MCP and timeline facades. It
+proves the new contract system can drive the next legal action and line-level
+write authorization from source-controlled definitions before legacy
 route-context migration begins. Live integrations should use the SQLite store
 below so execution state has durable rows and compare-and-swap updates.
 """
@@ -13,9 +13,14 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import logging
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
+import urllib.error
+import urllib.parse
+import urllib.request
 from uuid import uuid4
 
 from .execution_state import (
@@ -30,6 +35,13 @@ from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
 from .schema import ContractDefinitionError, is_new_execution_allowed
 from .write_gate import WriteGateDecision
+
+
+log = logging.getLogger(__name__)
+_JUDGMENT_HINTS_DISABLED_ENV = "AMING_JB_HINTS_DISABLED"
+_JUDGMENT_HINT_PORT_ENV = "JUDGMENT_BRAIN_HINT_PORT"
+_JUDGMENT_HINT_DEFAULT_PORT = "40123"
+_JUDGMENT_HINT_TIMEOUT_SECONDS = 1.0
 
 
 class ContractRuntimeError(ValueError):
@@ -2058,6 +2070,131 @@ def _json_field(raw: Any, fallback: Any) -> Any:
     return value
 
 
+def _judgment_hints_disabled() -> bool:
+    value = str(os.environ.get(_JUDGMENT_HINTS_DISABLED_ENV) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _runtime_judgment_hints_task_id(
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+    backlog_lineage: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+) -> str:
+    for source in (metadata, backlog_lineage):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("task_id", "parent_task_id"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    return str(backlog_id or contract_execution_id or "").strip()
+
+
+def _default_judgment_hints_fetcher(
+    *,
+    project_id: str,
+    task_id: str,
+    timeout: float = _JUDGMENT_HINT_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    port = str(os.environ.get(_JUDGMENT_HINT_PORT_ENV) or _JUDGMENT_HINT_DEFAULT_PORT)
+    port = port.strip() or _JUDGMENT_HINT_DEFAULT_PORT
+    query = urllib.parse.urlencode({"project_id": project_id, "task_id": task_id})
+    url = f"http://127.0.0.1:{port}/hints?{query}"
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        status = int(getattr(response, "status", response.getcode()) or 0)
+        body = response.read().decode("utf-8")
+    return status, body
+
+
+def _decode_judgment_hints_fetch_result(result: Any) -> Any:
+    status = 200
+    payload = result
+    if isinstance(result, tuple) and len(result) == 2:
+        status = int(result[0] or 0)
+        payload = result[1]
+    if status != 200:
+        raise ValueError(f"judgment_hints_non_200:{status}")
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return payload
+
+
+def _normalize_judgment_hints_payload(payload: Any) -> list[Any] | None:
+    raw_hints = payload
+    if isinstance(payload, Mapping):
+        raw_hints = payload.get("judgment_hints", payload.get("hints"))
+    if not isinstance(raw_hints, list) or not raw_hints:
+        return None
+    json.dumps(raw_hints, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    hints = deepcopy(raw_hints)
+    return hints if hints else None
+
+
+def _fetch_judgment_hints(
+    *,
+    project_id: str,
+    task_id: str,
+    fetcher: Any = None,
+) -> list[Any] | None:
+    if _judgment_hints_disabled():
+        log.info("judgment_hints_gap: disabled by %s", _JUDGMENT_HINTS_DISABLED_ENV)
+        return None
+    project_id = str(project_id or "").strip()
+    task_id = str(task_id or "").strip()
+    if not project_id or not task_id:
+        log.info("judgment_hints_gap: missing project_id or task_id")
+        return None
+    fetch = fetcher or _default_judgment_hints_fetcher
+    try:
+        result = fetch(
+            project_id=project_id,
+            task_id=task_id,
+            timeout=_JUDGMENT_HINT_TIMEOUT_SECONDS,
+        )
+        payload = _decode_judgment_hints_fetch_result(result)
+        hints = _normalize_judgment_hints_payload(payload)
+    except (
+        OSError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+    ) as exc:
+        log.info("judgment_hints_gap: fetch failed open: %s", exc)
+        return None
+    if not hints:
+        log.info("judgment_hints_gap: empty or missing hints")
+        return None
+    return hints
+
+
+def _record_judgment_hints(record: Mapping[str, Any]) -> list[Any] | None:
+    hints = record.get("judgment_hints")
+    if not isinstance(hints, list) or not hints:
+        return None
+    return deepcopy(hints)
+
+
+def _gate_decision_payload(decision: Any) -> dict[str, Any]:
+    payload = decision.to_dict()
+    errors = [str(item) for item in payload.get("errors") or []]
+    has_detailed_hash_mismatch = any(
+        error.startswith("runtime_guide_hash mismatch:") for error in errors
+    )
+    if has_detailed_hash_mismatch and "runtime_guide_hash mismatch" not in errors:
+        payload["errors"] = ["runtime_guide_hash mismatch", *errors]
+        payload["decision_hash"] = stable_sha256(
+            {key: value for key, value in payload.items() if key != "decision_hash"}
+        )
+    return payload
+
+
 class ContractRuntime:
     """Runtime facade that compiles guides and validates writes from state."""
 
@@ -2067,11 +2204,13 @@ class ContractRuntime:
         *,
         instruction_root: str | Path | None = None,
         store: InMemoryContractExecutionStore | SQLiteContractExecutionStore | None = None,
+        judgment_hints_fetcher: Any = None,
     ) -> None:
         self.registry = registry
         self.instruction_root = Path(instruction_root) if instruction_root is not None else registry.root
         self.store = store or InMemoryContractExecutionStore()
         self.gate_kernel = ContractGateKernel(registry)
+        self.judgment_hints_fetcher = judgment_hints_fetcher
 
     def start_execution(
         self,
@@ -2134,6 +2273,16 @@ class ContractRuntime:
         execution_id = contract_execution_id or f"cex-{uuid4().hex}"
         root_execution_id = root_contract_execution_id or execution_id
         chain_id = contract_chain_id or f"cchain-{uuid4().hex}"
+        judgment_hints = _fetch_judgment_hints(
+            project_id=project_id,
+            task_id=_runtime_judgment_hints_task_id(
+                backlog_id=backlog_id,
+                contract_execution_id=execution_id,
+                backlog_lineage=backlog_lineage,
+                metadata=metadata,
+            ),
+            fetcher=self.judgment_hints_fetcher,
+        )
         state = build_execution_state(
             definition,
             project_id=project_id,
@@ -2147,6 +2296,7 @@ class ContractRuntime:
             definition,
             state,
             instruction_bundle=instruction_bundle,
+            judgment_hints=judgment_hints,
         )
         _attach_completed_line_evidence(guide, [])
         _attach_precheck_decision(guide, start_precheck.to_dict())
@@ -2169,6 +2319,7 @@ class ContractRuntime:
             "execution_state_revision": state["execution_state_revision"],
             "execution_state": state,
             "runtime_guide": guide,
+            "judgment_hints": judgment_hints,
             "precheck_decision": start_precheck.to_dict(),
             "role_binding": dict(role_binding or {}),
             "backlog_lineage": dict(backlog_lineage or {}),
@@ -2269,6 +2420,7 @@ class ContractRuntime:
             definition,
             state,
             instruction_bundle=instruction_bundle,
+            judgment_hints=_record_judgment_hints(record),
         )
         _attach_failed_qa_rework_guidance(guide, line_items=line_items)
         _attach_completed_line_evidence(guide, line_items)
@@ -2371,14 +2523,14 @@ class ContractRuntime:
                     ok=False,
                     errors=("line_write_declares_no_mutation_expected",),
                 ).to_dict(),
-                "precheck_decision": gate_decision.to_dict(),
+                "precheck_decision": _gate_decision_payload(gate_decision),
                 "record": gate_record,
             }
         if not gate_decision.ok:
             return {
                 "schema_version": "contract_runtime_write_result.v1",
                 "ok": False,
-                "decision": gate_decision.to_dict(),
+                "decision": _gate_decision_payload(gate_decision),
                 "record": gate_record,
             }
 
@@ -2421,7 +2573,7 @@ class ContractRuntime:
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,
-            "decision": gate_decision.to_dict(),
+            "decision": _gate_decision_payload(gate_decision),
             "record": result_record,
         }
 
@@ -2471,7 +2623,7 @@ class ContractRuntime:
         return {
             "schema_version": "contract_runtime_line_write_precheck_result.v1",
             "ok": gate_decision.ok,
-            "decision": gate_decision.to_dict(),
+            "decision": _gate_decision_payload(gate_decision),
             "record": gate_record,
             "write": effective_write,
             "would_mutate_completed_lines": False,
@@ -2925,6 +3077,7 @@ def _runtime_guide_hash_for_role(
         definition,
         state,
         instruction_bundle=instruction_bundle,
+        judgment_hints=_record_judgment_hints(record),
     )
     _attach_completed_line_evidence(role_guide, completed_lines)
     if sanitized_projection:

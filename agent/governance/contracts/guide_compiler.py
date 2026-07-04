@@ -13,10 +13,12 @@ def compile_runtime_guide(
     execution_state: Mapping[str, Any],
     *,
     instruction_bundle: Mapping[str, Any] | None = None,
+    judgment_hints: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Return the only agent-facing next-action guide for this execution."""
 
     instruction_bundle = instruction_bundle or {}
+    sealed_judgment_hints = list(judgment_hints or [])
     next_action = execution_state.get("next_action")
     role = str(execution_state.get("actor_role") or "")
     stage_id = ""
@@ -52,6 +54,9 @@ def compile_runtime_guide(
             "refs": visible_refs,
         },
     }
+    if sealed_judgment_hints:
+        guide["schema_version"] = "contract_runtime_guide.v2"
+        guide["judgment_hints"] = sealed_judgment_hints
     guide["runtime_guide_hash"] = stable_sha256(
         {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
     )
