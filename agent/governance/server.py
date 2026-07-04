@@ -40987,7 +40987,9 @@ def _onboard_service_refresh_execution_state(
         "route_token_ref": route_token_ref,
     }
     guide["completed_lines"] = list(state["completed_lines"])
-    guide["runtime_guide_hash"] = stable_sha256(guide)
+    guide["runtime_guide_hash"] = stable_sha256(
+        {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
+    )
     refreshed = dict(record)
     refreshed.update(
         {
