@@ -8719,10 +8719,10 @@ class TestTaskTimeline(unittest.TestCase):
             },
             {
                 "id": 7103,
-                "event_kind": "verification",
+                "event_kind": "independent_verification",
                 "phase": "verification",
                 "status": "passed",
-                "actor": "codex_observer",
+                "actor": "qa:observer-direct",
                 "commit_sha": close_commit,
                 "verification": {
                     "tests_run": ["pytest -q agent/tests/test_task_timeline.py"],

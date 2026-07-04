@@ -41184,6 +41184,35 @@ def _onboard_contract_route_issue_target_files_from_record(
     return deduped or list(_ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES)
 
 
+def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
+    """Return row-declared implementation and test files for direct close scope."""
+
+    if not backlog_id:
+        return []
+    try:
+        row = conn.execute(
+            "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return []
+    candidates = [
+        *_string_list_field(_row_get(row, "target_files", "")),
+        *_string_list_field(_row_get(row, "test_files", "")),
+    ]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        text = str(path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
 def _onboard_contract_route_issue_target_files(
     conn,
     *,
@@ -41196,15 +41225,7 @@ def _onboard_contract_route_issue_target_files(
         for key in ("route_token_issue_target_files", "target_files", "owned_files"):
             candidates.extend(_string_list_field(source.get(key)))
     if not candidates and backlog_id:
-        try:
-            row = conn.execute(
-                "SELECT target_files FROM backlog_bugs WHERE bug_id = ?",
-                (backlog_id,),
-            ).fetchone()
-        except sqlite3.Error:
-            row = None
-        if row is not None:
-            candidates.extend(_string_list_field(_row_get(row, "target_files", "")))
+        candidates.extend(_backlog_declared_direct_file_scope(conn, backlog_id))
     deduped: list[str] = []
     seen: set[str] = set()
     for path in candidates:
@@ -41960,6 +41981,9 @@ def _onboard_contract_route_guide(
         "raw_qa_session_token_exposed": False,
         "raw_route_token_exposed": False,
     }
+    direct_main_allowed_files = _onboard_contract_route_issue_target_files_from_record(
+        record
+    )
     direct_main_entry = {
         "schema_version": "onboard_contract.operator_supervised_direct_main.v1",
         "id": "operator_supervised_direct_main",
@@ -41993,6 +42017,59 @@ def _onboard_contract_route_guide(
             "record observer_direct_mutation_exception before mutation; "
             "then edit only approved row-scoped files and record tests"
         ),
+        "close_satisfying_evidence_template": {
+            "schema_version": (
+                "onboard_route_guide.parentless_direct_close_evidence_template.v1"
+            ),
+            "scope_source": "backlog.target_files + backlog.test_files",
+            "allowed_files": direct_main_allowed_files,
+            "pre_mutation_event": {
+                "mcp_tool": "task_timeline_append",
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "required_payload_fields": [
+                    "route_id or route_context_hash",
+                    "reason",
+                    "operator_approval",
+                    "dirty_scope_check",
+                    "allowed_files",
+                ],
+            },
+            "post_mutation_events": [
+                {
+                    "event_kind": "implementation",
+                    "required_payload_fields": [
+                        "changed_files",
+                        "dirty_scope_check",
+                    ],
+                },
+                {
+                    "event_kind": "verification",
+                    "required_actor": "independent QA/verifier",
+                    "required_payload_fields": [
+                        "tests_run or test_results",
+                        "diff_check",
+                        "live_regression",
+                    ],
+                },
+                {
+                    "event_kind": "close_ready",
+                    "required_payload_fields": [
+                        "governance_redeploy or runtime_version_sync",
+                        "graph_reconciled",
+                        "preflight_ok",
+                        "live_regression",
+                    ],
+                },
+            ],
+            "close_authority": {
+                "mcp_tool": "backlog_close",
+                "requires_contract_execution_id": contract_execution_id,
+                "requires_route_token_ref": True,
+            },
+        },
         "raw_operator_token_required": False,
         "raw_route_token_exposed": False,
     }
@@ -51565,6 +51642,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
     requested_execution_id: str,
     close_commit: str,
     timeline_events: list[dict[str, Any]] | None,
+    row_declared_files: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Project parentless operator-supervised direct-main close authority."""
 
@@ -51613,10 +51691,51 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
     if not direct_event:
         return {}
 
-    allowed_files = task_timeline._event_deep_string_list(
+    event_allowed_files = task_timeline._event_deep_string_list(
         direct_event,
         {"allowed_files", "target_files", "owned_files", "allowed_changed_files"},
     )
+    row_scope_files = [str(path or "").strip() for path in row_declared_files or []]
+    row_scope_set = {path for path in row_scope_files if path}
+    event_scope_set = {
+        str(path or "").strip()
+        for path in event_allowed_files
+        if str(path or "").strip()
+    }
+    event_scope_outside_row = sorted(event_scope_set - row_scope_set) if row_scope_set else []
+    if event_scope_outside_row:
+        return {
+            "schema_version": "contract_runtime_parentless_direct_main_close_authority_gate.v1",
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "source": "server_derived_parentless_observer_direct_main_timeline",
+            "primary_decision_source": False,
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": requested_execution_id,
+            "close_commit": close_commit,
+            "missing_requirement_ids": ["event_allowed_files_within_row_scope"],
+            "source_refs": [
+                f"timeline:{direct_event.get('id')}"
+                if direct_event.get("id")
+                else str(direct_event.get("event_id") or "")
+            ],
+            "checks": {
+                "has_observer_direct_exception": True,
+                "observer_direct_close_exception_gate_passed": False,
+                "row_declared_file_scope_applied": True,
+                "event_allowed_files_outside_row_scope": event_scope_outside_row,
+            },
+        }
+
+    allowed_files = []
+    seen_allowed_files: set[str] = set()
+    for path in (row_scope_files if row_scope_files else event_allowed_files):
+        text = str(path or "").strip()
+        if not text or text in seen_allowed_files:
+            continue
+        seen_allowed_files.add(text)
+        allowed_files.append(text)
     contract = {
         "project_id": project_id,
         "template_id": "operator_supervised_direct_main.v1",
@@ -51712,6 +51831,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "has_observer_direct_exception": True,
             "observer_direct_close_exception_gate_passed": True,
             "worker_or_successor_contract_required": False,
+            "row_declared_file_scope_applied": bool(row_declared_files),
         },
     }
 
@@ -51723,6 +51843,7 @@ def _contract_runtime_parentless_direct_main_projection(
     requested_execution_id: str,
     close_commit: str,
     timeline_events: list[dict[str, Any]] | None,
+    row_declared_files: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     gate = _contract_runtime_parentless_direct_main_close_authority_gate(
         project_id=project_id,
@@ -51730,6 +51851,7 @@ def _contract_runtime_parentless_direct_main_projection(
         requested_execution_id=requested_execution_id,
         close_commit=close_commit,
         timeline_events=timeline_events,
+        row_declared_files=row_declared_files,
     )
     if not gate:
         return {}
@@ -51803,6 +51925,10 @@ def _contract_runtime_close_authority_projection(
                     requested_execution_id=requested_execution_id,
                     close_commit=close_commit,
                     timeline_events=timeline_events,
+                    row_declared_files=_backlog_declared_direct_file_scope(
+                        conn,
+                        bug_id,
+                    ),
                 )
             )
             if parentless_direct_projection:
