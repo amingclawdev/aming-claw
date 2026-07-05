@@ -5834,6 +5834,12 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "graph trace ids are DB-verified for the current runtime "
                     "context and fence."
                 ),
+                "fake_or_empty_trace_policy": {
+                    "empty_graph_trace_ids_count": False,
+                    "placeholder_graph_trace_ids_count": False,
+                    "trace_like_strings_without_graph_query_trace_rows_count": False,
+                    "post_hoc_graph_trace_after_implementation_count": False,
+                },
             },
             "pre_edit_worktree_guard": {
                 "required": True,
@@ -5949,6 +5955,7 @@ def runtime_context_mf_parallel_happy_path_reminders(
         "graph_trace_recovery_gap": {
             "status": "non_closeable_without_verified_pre_implementation_trace",
             "historical_implementation_without_verified_graph_trace_closeable": False,
+            "empty_or_fake_graph_trace_closeable": False,
             "worker_next_action": "keep_open_and_redispatch_graph_first_worker",
             "forbidden_actions": [
                 "post_hoc_graph_trace_evidence",
@@ -8431,7 +8438,9 @@ def _runtime_context_worker_execution_safety(values: Mapping[str, Any]) -> dict[
                 "code": "pre_implementation_graph_trace_missing",
                 "message": (
                     "run worker-scoped graph queries and verify mf_subagent "
-                    "graph trace ids before implementation edits"
+                    "graph trace ids before implementation edits; empty, "
+                    "placeholder, or trace-like strings without graph_query_traces "
+                    "rows do not count"
                 ),
                 "next_action": "run_worker_graph_query",
                 "required_identity": {

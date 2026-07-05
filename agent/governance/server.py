@@ -14670,6 +14670,118 @@ def _runtime_context_test_results_passed(value: Any) -> bool:
     }
 
 
+_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS = {
+    "graph_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_id",
+    "graph_query_trace_ids",
+    "trace_ids",
+    "verified_trace_ids",
+}
+
+
+def _runtime_context_graph_trace_values(
+    value: Any,
+) -> tuple[bool, list[str]]:
+    found_key = False
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key_text = str(key)
+            if key_text in _RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS:
+                found_key = True
+                values.extend(
+                    _runtime_context_service_query_values({key_text: nested}, key_text)
+                )
+            nested_found, nested_values = _runtime_context_graph_trace_values(nested)
+            found_key = found_key or nested_found
+            values.extend(nested_values)
+    elif isinstance(value, (list, tuple, set)):
+        for nested in value:
+            nested_found, nested_values = _runtime_context_graph_trace_values(nested)
+            found_key = found_key or nested_found
+            values.extend(nested_values)
+    return found_key, _runtime_context_service_dedupe(values)
+
+
+def _runtime_context_implementation_graph_trace_db_evidence(
+    conn,
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    parent_task_id: str,
+    fence_token: str,
+    sources: Sequence[Any],
+) -> dict[str, Any]:
+    explicit_marker = False
+    explicit_values: list[str] = []
+    for source in sources:
+        found_key, values = _runtime_context_graph_trace_values(source)
+        explicit_marker = explicit_marker or found_key
+        explicit_values.extend(values)
+    explicit_trace_ids = _runtime_context_service_dedupe(explicit_values)
+    if explicit_marker and not explicit_trace_ids:
+        raise GovernanceError(
+            "runtime_context_graph_trace_evidence_rejected",
+            "runtime-context implementation evidence requires non-empty graph trace ids",
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "missing_requirement_ids": ["graph_trace_ids_nonempty"],
+                "rejects_empty_or_fake_graph_evidence": True,
+            },
+        )
+
+    if explicit_trace_ids:
+        refs = _runtime_context_service_graph_trace_refs(
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=context.backlog_id,
+            fence_token=fence_token,
+            explicit_trace_ids=explicit_trace_ids,
+            strict_explicit_trace_ids=True,
+        )
+        if not refs.get("db_verified"):
+            missing = ["graph_trace_ids_db_verified"]
+            if refs.get("identity_mismatches"):
+                missing.append("graph_trace_identity_current_runtime_context")
+            raise GovernanceError(
+                "runtime_context_graph_trace_evidence_rejected",
+                (
+                    "runtime-context implementation evidence graph trace ids must "
+                    "resolve to DB-verified mf_sub graph_query_traces rows"
+                ),
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": getattr(context, "task_id", ""),
+                    "missing_requirement_ids": missing,
+                    "graph_trace_db_evidence": (
+                        _runtime_context_service_redact_graph_trace_refs(refs)
+                    ),
+                    "rejects_empty_or_fake_graph_evidence": True,
+                },
+            )
+        return refs
+
+    refs = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=context.backlog_id,
+        fence_token=fence_token,
+        explicit_trace_ids=[],
+    )
+    return refs if refs.get("db_verified") else {}
+
+
 def _runtime_context_test_results_compatible(
     candidate: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -16963,6 +17075,44 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
     )
+    graph_trace_db_evidence: dict[str, Any] = {}
+    graph_trace_conn = get_connection(project_id)
+    try:
+        body_graph_trace_fields = {
+            key: body.get(key)
+            for key in _RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS
+            if key in body
+        }
+        graph_trace_db_evidence = _runtime_context_implementation_graph_trace_db_evidence(
+            graph_trace_conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_task_id=parent_task_id,
+            fence_token=raw_fence_token,
+            sources=[
+                body_graph_trace_fields,
+                payload,
+                body.get("verification")
+                if isinstance(body.get("verification"), Mapping)
+                else {},
+                body.get("artifact_refs")
+                if isinstance(body.get("artifact_refs"), Mapping)
+                else {},
+            ],
+        )
+    finally:
+        graph_trace_conn.close()
+    verified_graph_trace_ids = list(
+        graph_trace_db_evidence.get("verified_trace_ids") or []
+    )
+    if verified_graph_trace_ids:
+        payload["graph_trace_ids"] = verified_graph_trace_ids
+        payload["graph_trace_db_evidence"] = (
+            _runtime_context_service_redact_graph_trace_refs(
+                graph_trace_db_evidence,
+            )
+        )
     observer_command_id = _runtime_context_implementation_observer_command_id(
         body,
         context=context,
@@ -41557,6 +41707,32 @@ def _onboard_graph_first_policy() -> dict[str, Any]:
                 "contract_runtime_submit_line.payload",
                 "task_timeline_append.payload",
                 "runtime_context_read_receipt",
+                "runtime_context_implementation_evidence",
+                "operator_supervised_direct_main.pre_mutation_event.payload",
+            ],
+            "db_verified_required_for_close_authority": True,
+            "placeholder_or_trace_like_strings_without_graph_query_trace_rows_count": False,
+        },
+        "direct_main_graph_first_gate": {
+            "required": True,
+            "applies_to": "operator_supervised_direct_main",
+            "required_before": [
+                "observer_direct_mutation_exception",
+                "implementation",
+                "close_ready",
+                "backlog_close",
+            ],
+            "accepted_query_sources": ["observer", "chain_graph_gate"],
+            "accepted_query_purposes": [
+                "global_architecture_review",
+                "gate_validation",
+                "prompt_context_build",
+            ],
+            "rejects": [
+                "empty_graph_trace_ids",
+                "placeholder_graph_trace_ids",
+                "trace_like_ids_without_graph_query_traces_row",
+                "post_hoc_graph_trace_after_implementation",
             ],
         },
         "source_hint_policy": {
@@ -42253,6 +42429,7 @@ def _onboard_contract_route_guide(
             "tiny_deterministic_scope",
             "allowed_files",
             "dirty_scope_exact_match",
+            "db_verified_pre_implementation_graph_trace",
             "timeline_evidence_recorded_before_mutation",
             "focused_tests_or_no_test_decision",
         ],
@@ -42261,10 +42438,12 @@ def _onboard_contract_route_guide(
             "route_identity",
             "exact_target_files",
             "clean_baseline_or_exact_dirty_scope",
+            "db_verified_pre_implementation_graph_trace",
         ],
         "next_action": (
-            "record observer_direct_mutation_exception before mutation; "
-            "then edit only approved row-scoped files and record tests"
+            "run graph_query first, record observer_direct_mutation_exception "
+            "with DB-verified graph trace ids before mutation, then edit only "
+            "approved row-scoped files and record tests"
         ),
         "close_satisfying_evidence_template": {
             "schema_version": (
@@ -42272,6 +42451,36 @@ def _onboard_contract_route_guide(
             ),
             "scope_source": "backlog.target_files + backlog.test_files",
             "allowed_files": direct_main_allowed_files,
+            "graph_first_gate": {
+                "required": True,
+                "mcp_tool": "graph_query",
+                "query_source": "observer",
+                "allowed_query_purposes": [
+                    "global_architecture_review",
+                    "gate_validation",
+                    "prompt_context_build",
+                ],
+                "required_before": [
+                    "pre_mutation_event",
+                    "implementation",
+                    "close_ready",
+                    "backlog_close",
+                ],
+                "evidence_fields": [
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "graph_trace_evidence.verified_trace_ids",
+                ],
+                "server_gate": (
+                    "parentless_direct_main_pre_implementation_graph_trace_gate"
+                ),
+                "rejects": [
+                    "empty_graph_trace_ids",
+                    "placeholder_graph_trace_ids",
+                    "trace_like_ids_without_graph_query_traces_row",
+                    "post_hoc_graph_trace_after_implementation",
+                ],
+            },
             "pre_mutation_event": {
                 "mcp_tool": "task_timeline_append",
                 "event_type": "mf.observer_direct_implementation_exception",
@@ -42284,6 +42493,7 @@ def _onboard_contract_route_guide(
                     "operator_approval",
                     "dirty_scope_check",
                     "allowed_files",
+                    "graph_trace_ids or graph_query_trace_ids",
                 ],
             },
             "post_mutation_events": [
@@ -52004,8 +52214,394 @@ def _contract_runtime_close_authority_timeline_route_context_events(
     return selected
 
 
+_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS = {
+    "graph_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_id",
+    "graph_query_trace_ids",
+    "verified_trace_ids",
+}
+_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES = {"observer", "chain_graph_gate"}
+_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES = {
+    "global_architecture_review",
+    "gate_validation",
+    "prompt_context_build",
+}
+_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES = {
+    "accepted",
+    "complete",
+    "completed",
+    "ok",
+    "passed",
+    "success",
+    "succeeded",
+}
+
+
+def _contract_runtime_parentless_direct_main_event_order(
+    event: Mapping[str, Any],
+    fallback: int,
+) -> int:
+    for key in ("id", "event_id"):
+        value = str(event.get(key) or "").strip()
+        if not value:
+            continue
+        if value.startswith("timeline:"):
+            value = value.split(":", 1)[1]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return fallback
+
+
+def _contract_runtime_parentless_direct_main_marker(
+    event: Mapping[str, Any],
+) -> str:
+    return "_".join(
+        str(event.get(key) or "").strip().lower().replace("-", "_").replace(".", "_")
+        for key in ("event_type", "event_kind", "phase", "decision")
+        if str(event.get(key) or "").strip()
+    )
+
+
+def _contract_runtime_parentless_direct_main_graph_trace_key_present(
+    value: Any,
+) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if str(key) in _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS:
+                return True
+            if _contract_runtime_parentless_direct_main_graph_trace_key_present(
+                nested,
+            ):
+                return True
+    elif isinstance(value, (list, tuple, set)):
+        return any(
+            _contract_runtime_parentless_direct_main_graph_trace_key_present(item)
+            for item in value
+        )
+    return False
+
+
+def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    trace_ids: Sequence[str],
+) -> dict[str, Any]:
+    requested = _runtime_context_service_dedupe(
+        [str(trace_id or "").strip() for trace_id in trace_ids]
+    )
+    rows = []
+    if requested:
+        try:
+            from . import graph_query_trace
+
+            graph_query_trace.ensure_schema(conn)
+            placeholders = ",".join("?" for _ in requested)
+            rows = conn.execute(
+                f"""
+                SELECT trace_id, query_source, query_purpose, actor, status, task_id
+                FROM graph_query_traces
+                WHERE project_id = ?
+                  AND trace_id IN ({placeholders})
+                ORDER BY created_at DESC, trace_id DESC
+                """,
+                (project_id, *tuple(requested)),
+            ).fetchall()
+        except Exception:
+            rows = []
+    row_trace_ids: set[str] = set()
+    verified: list[str] = []
+    seen_verified: set[str] = set()
+    identity_mismatches: list[dict[str, str]] = []
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            trace_id = str(row["trace_id"] or "").strip()
+            query_source = str(row["query_source"] or "").strip()
+            query_purpose = str(row["query_purpose"] or "").strip()
+            actor = str(row["actor"] or "").strip()
+            status = str(row["status"] or "").strip().lower()
+            row_task_id = str(row["task_id"] or "").strip()
+        else:
+            trace_id = str(row[0] or "").strip()
+            query_source = str(row[1] or "").strip()
+            query_purpose = str(row[2] or "").strip()
+            actor = str(row[3] or "").strip()
+            status = str(row[4] or "").strip().lower()
+            row_task_id = str(row[5] or "").strip()
+        if not trace_id:
+            continue
+        row_trace_ids.add(trace_id)
+        mismatches: list[dict[str, str]] = []
+        if query_source not in _PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_source",
+                    "expected": "|".join(
+                        sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES)
+                    ),
+                    "actual": query_source,
+                }
+            )
+        if query_purpose not in _PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_purpose",
+                    "expected": "|".join(
+                        sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES)
+                    ),
+                    "actual": query_purpose,
+                }
+            )
+        if status not in _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "status",
+                    "expected": "|".join(
+                        sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES)
+                    ),
+                    "actual": status,
+                }
+            )
+        expected_task_id = str(task_id or "").strip()
+        if expected_task_id and row_task_id != expected_task_id:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "task_id",
+                    "expected": expected_task_id,
+                    "actual": row_task_id,
+                }
+            )
+        if mismatches:
+            identity_mismatches.extend(mismatches)
+            continue
+        if trace_id not in seen_verified:
+            seen_verified.add(trace_id)
+            verified.append(trace_id)
+    missing = [trace_id for trace_id in requested if trace_id not in row_trace_ids]
+    db_verified = (
+        bool(verified)
+        and not missing
+        and not identity_mismatches
+        and set(requested).issubset(set(verified))
+    )
+    return {
+        "schema_version": "parentless_direct_main_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
+        "producer": "graph_query_trace",
+        "db_verified": db_verified,
+        "requested_trace_ids": requested,
+        "trace_ids": verified,
+        "verified_trace_ids": verified,
+        "missing_trace_ids": missing,
+        "identity_mismatches": identity_mismatches,
+        "accepted_query_sources": sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES),
+        "accepted_query_purposes": sorted(_PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES),
+        "accepted_task_id": str(task_id or "").strip(),
+        "source_details": {
+            "graph_query_traces": bool(rows),
+            "project_id": project_id,
+        },
+    }
+
+
+def _contract_runtime_parentless_direct_main_graph_trace_gate(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+    timeline_events: list[dict[str, Any]],
+    direct_event: Mapping[str, Any],
+    direct_identity: Mapping[str, Any],
+    direct_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require real graph context before parentless direct-main mutation evidence."""
+
+    from . import task_timeline
+
+    ordered_events: list[tuple[int, dict[str, Any]]] = [
+        (
+            _contract_runtime_parentless_direct_main_event_order(event, index + 1),
+            dict(event),
+        )
+        for index, event in enumerate(timeline_events or [])
+        if isinstance(event, Mapping)
+    ]
+    direct_order = _contract_runtime_parentless_direct_main_event_order(
+        direct_event,
+        0,
+    )
+    direct_event_id = str(direct_event.get("id") or direct_event.get("event_id") or "")
+    implementation_event = (
+        direct_gate.get("implementation_event")
+        if isinstance(direct_gate.get("implementation_event"), Mapping)
+        else {}
+    )
+    implementation_order = _contract_runtime_parentless_direct_main_event_order(
+        implementation_event,
+        0,
+    )
+    if not implementation_order:
+        for event_order, event in ordered_events:
+            if event_order <= direct_order:
+                continue
+            marker = _contract_runtime_parentless_direct_main_marker(event)
+            status = str(event.get("status") or event.get("decision") or "").lower()
+            if "implementation" in marker and (
+                not status or status in _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES
+            ):
+                implementation_order = event_order
+                break
+
+    candidate_events: list[dict[str, Any]] = []
+    rejected_events: list[dict[str, Any]] = []
+    raw_trace_ids: list[str] = []
+    invalid_trace_ids: list[str] = []
+    post_hoc_trace_ids: list[str] = []
+    post_hoc_graph_trace_marker = False
+    for event_order, event in ordered_events:
+        has_graph_trace_key = (
+            _contract_runtime_parentless_direct_main_graph_trace_key_present(event)
+        )
+        ids = task_timeline._event_deep_string_list(
+            event,
+            _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS,
+        )
+        if not ids and not has_graph_trace_key:
+            continue
+        event_id = str(event.get("id") or event.get("event_id") or "")
+        is_direct_exception_event = bool(
+            direct_event_id and event_id and event_id == direct_event_id
+        )
+        marker = _contract_runtime_parentless_direct_main_marker(event)
+        event_ref = f"timeline:{event_id}" if event_id else marker
+        if implementation_order and event_order >= implementation_order:
+            post_hoc_trace_ids.extend(ids)
+            post_hoc_graph_trace_marker = True
+            rejected_events.append(
+                {
+                    "event_ref": event_ref,
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "reason": "graph_trace_recorded_after_direct_main_implementation",
+                    "graph_trace_ids": ids,
+                }
+            )
+            continue
+        if not is_direct_exception_event and "graph" not in marker:
+            rejected_events.append(
+                {
+                    "event_ref": event_ref,
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "reason": "unsupported_direct_main_graph_trace_event_kind",
+                    "graph_trace_ids": ids,
+                }
+            )
+            continue
+        status = str(event.get("status") or event.get("decision") or "").strip().lower()
+        if status and status not in _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES:
+            rejected_events.append(
+                {
+                    "event_ref": event_ref,
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "status": status,
+                    "reason": "non_passing_graph_trace_evidence_status",
+                    "graph_trace_ids": ids,
+                }
+            )
+            continue
+        if not _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            direct_identity,
+        ):
+            rejected_events.append(
+                {
+                    "event_ref": event_ref,
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "reason": "graph_trace_event_missing_route_token_authority",
+                    "graph_trace_ids": ids,
+                }
+            )
+            continue
+        event_valid_ids = [
+            str(trace_id or "").strip()
+            for trace_id in ids
+            if _is_plausible_graph_trace_id(trace_id)
+        ]
+        event_invalid_ids = [
+            str(trace_id or "").strip()
+            for trace_id in ids
+            if str(trace_id or "").strip()
+            and not _is_plausible_graph_trace_id(trace_id)
+        ]
+        raw_trace_ids.extend(event_valid_ids)
+        invalid_trace_ids.extend(event_invalid_ids)
+        candidate_events.append(
+            {
+                "event_ref": event_ref,
+                "event_kind": event.get("event_kind"),
+                "phase": event.get("phase"),
+                "graph_trace_ids": event_valid_ids,
+                "invalid_graph_trace_ids": event_invalid_ids,
+            }
+        )
+
+    trace_ids = _runtime_context_service_dedupe(raw_trace_ids)
+    invalid_trace_ids = _runtime_context_service_dedupe(invalid_trace_ids)
+    post_hoc_trace_ids = _runtime_context_service_dedupe(post_hoc_trace_ids)
+    db_evidence = _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        trace_ids=trace_ids,
+    )
+    missing: list[str] = []
+    if not candidate_events:
+        missing.append("pre_implementation_graph_trace")
+    if candidate_events and not trace_ids:
+        missing.append("graph_trace_ids_nonempty")
+    if invalid_trace_ids:
+        missing.append("graph_trace_ids_plausible")
+    if trace_ids and not db_evidence.get("db_verified"):
+        missing.append("graph_trace_ids_db_verified")
+    if post_hoc_trace_ids or post_hoc_graph_trace_marker:
+        missing.append("graph_trace_before_direct_main_implementation")
+    passed = bool(candidate_events and trace_ids) and not missing
+    return {
+        "schema_version": "parentless_direct_main_pre_implementation_graph_trace_gate.v1",
+        "required": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "missing_requirement_ids": missing,
+        "trace_ids": trace_ids,
+        "verified_trace_ids": list(db_evidence.get("verified_trace_ids") or []),
+        "invalid_trace_ids": invalid_trace_ids,
+        "post_hoc_trace_ids": post_hoc_trace_ids,
+        "evidence_events": candidate_events,
+        "rejected_evidence_events": rejected_events,
+        "db_evidence": db_evidence,
+        "ordering": {
+            "direct_exception_event_order": direct_order,
+            "implementation_event_order": implementation_order,
+            "graph_trace_must_precede_implementation": True,
+        },
+        "rejects_empty_or_fake_graph_evidence": True,
+    }
+
+
 def _contract_runtime_parentless_direct_main_close_authority_gate(
     *,
+    conn=None,
     project_id: str,
     bug_id: str,
     requested_execution_id: str,
@@ -52128,7 +52724,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "requirements": {
                 "close_timeline": True,
                 "worker_graph_trace": False,
-                "independent_qa": False,
+                "independent_qa": True,
             }
         },
     }
@@ -52138,8 +52734,30 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
         else {}
     )
+    graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
+        conn,
+        project_id=project_id,
+        task_id=requested_execution_id,
+        timeline_events=events,
+        direct_event=direct_event,
+        direct_identity=direct_identity,
+        direct_gate=direct_gate,
+    )
     missing_ids = list(direct_gate.get("missing_requirement_ids") or [])
-    if not bool(direct_gate.get("passed")):
+    if not bool(graph_trace_gate.get("passed")):
+        missing_ids = list(
+            dict.fromkeys(
+                [
+                    *missing_ids,
+                    *[
+                        str(item)
+                        for item in graph_trace_gate.get("missing_requirement_ids") or []
+                        if str(item)
+                    ],
+                ]
+            )
+        )
+    if not bool(direct_gate.get("passed")) or not bool(graph_trace_gate.get("passed")):
         if not missing_ids:
             missing_ids = list(verification.get("missing_event_kinds") or [])
         return {
@@ -52153,6 +52771,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "contract_execution_id": requested_execution_id,
             "close_commit": close_commit,
             "missing_requirement_ids": missing_ids,
+            "pre_implementation_graph_trace_gate": graph_trace_gate,
             "source_refs": [
                 f"timeline:{direct_event.get('id')}"
                 if direct_event.get("id")
@@ -52160,7 +52779,13 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             ],
             "checks": {
                 "has_observer_direct_exception": True,
-                "observer_direct_close_exception_gate_passed": False,
+                "observer_direct_close_exception_gate_passed": bool(
+                    direct_gate.get("passed")
+                ),
+                "pre_implementation_graph_trace_gate_passed": bool(
+                    graph_trace_gate.get("passed")
+                ),
+                "pre_implementation_graph_trace_gate": graph_trace_gate,
             },
         }
 
@@ -52181,6 +52806,10 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             if isinstance(direct_gate.get("close_ready_event"), Mapping)
             and direct_gate.get("close_ready_event", {}).get("id")
             else "",
+            *[
+                f"graph_query_trace:{trace_id}"
+                for trace_id in graph_trace_gate.get("verified_trace_ids") or []
+            ],
         )
         if ref
     ]
@@ -52195,10 +52824,13 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         "contract_execution_id": requested_execution_id,
         "close_commit": close_commit,
         "missing_requirement_ids": [],
+        "pre_implementation_graph_trace_gate": graph_trace_gate,
         "source_refs": list(dict.fromkeys(source_refs)),
         "checks": {
             "has_observer_direct_exception": True,
             "observer_direct_close_exception_gate_passed": True,
+            "pre_implementation_graph_trace_gate_passed": True,
+            "pre_implementation_graph_trace_gate": graph_trace_gate,
             "worker_or_successor_contract_required": False,
             "row_declared_file_scope_applied": bool(row_declared_files),
         },
@@ -52207,6 +52839,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
 
 def _contract_runtime_parentless_direct_main_projection(
     *,
+    conn=None,
     project_id: str,
     bug_id: str,
     requested_execution_id: str,
@@ -52215,6 +52848,7 @@ def _contract_runtime_parentless_direct_main_projection(
     row_declared_files: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     gate = _contract_runtime_parentless_direct_main_close_authority_gate(
+        conn=conn,
         project_id=project_id,
         bug_id=bug_id,
         requested_execution_id=requested_execution_id,
@@ -52289,6 +52923,7 @@ def _contract_runtime_close_authority_projection(
                 return child_lane_projection
             parentless_direct_projection = (
                 _contract_runtime_parentless_direct_main_projection(
+                    conn=conn,
                     project_id=project_id,
                     bug_id=bug_id,
                     requested_execution_id=requested_execution_id,
@@ -52490,6 +53125,7 @@ def _contract_runtime_close_authority_projection(
     )
     parentless_direct_main_gate = (
         _contract_runtime_parentless_direct_main_close_authority_gate(
+            conn=conn,
             project_id=project_id,
             bug_id=bug_id,
             requested_execution_id=contract_execution_id,
