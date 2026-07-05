@@ -5623,6 +5623,48 @@ def test_observer_runtime_text_prepare_exposes_repair_path_for_missing_launch_me
     assert action["missing_fields"] == evidence["missing_fields"]
 
 
+def test_bounded_worker_dispatch_recovery_projects_host_envelope_handoff():
+    recovery = server._bounded_worker_dispatch_recovery_payload(
+        project_id=PID,
+        missing_fields=["fence_token"],
+        runtime_context_id="mfrctx-recovery",
+        task_id="worker-recovery",
+        observer_command_id="cmd-recovery",
+        worker_id="agent-recovery",
+        merge_queue_id="mq-recovery",
+        route_identity={
+            "route_id": "route-recovery",
+            "route_context_hash": "sha256:route-recovery",
+            "prompt_contract_id": "rprompt-recovery",
+            "prompt_contract_hash": "sha256:prompt-recovery",
+            "route_token_ref": "rtok-recovery",
+            "visible_injection_manifest_hash": "sha256:visible-recovery",
+        },
+    )
+
+    actions = {action["id"]: action for action in recovery["next_legal_actions"]}
+    assert "request_runtime_context_initial_join_host_envelope" in actions
+    assert "request_runtime_context_rejoin_host_envelope" in actions
+    host_envelope = recovery["worker_host_envelope_handoff"]
+    assert host_envelope == recovery["copy_safe_bridge_payload"][
+        "worker_host_envelope_handoff"
+    ]
+    assert host_envelope["initial_join"]["copy_safe_body"][
+        "runtime_context_id"
+    ] == "mfrctx-recovery"
+    assert host_envelope["initial_join"]["copy_safe_body"][
+        "route_token_ref"
+    ] == "rtok-recovery"
+    assert host_envelope["rejoin"]["copy_safe_body"]["task_id"] == "worker-recovery"
+    assert host_envelope["session_token_ref_policy"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    assert (
+        host_envelope["observer_boundary"]["observer_authors_worker_evidence"]
+        is False
+    )
+
+
 def test_parallel_branch_runtime_contract_route_returns_worker_scoped_view(conn):
     raw_fence = "synthetic-raw-fence-runtime-contract-secret"
     raw_session = "synthetic-raw-session-runtime-contract-secret"
@@ -32345,6 +32387,29 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert bridge_guidance["copy_safe_bridge_payload"][
         "contract_runtime_submit_line_body_after_bridge"
     ]["session_token_ref"] == "<copy-safe worker session_token_ref>"
+    assert "runtime_context_session_token_initial_join" in bridge_guidance[
+        "next_action"
+    ]["tools"]
+    assert "runtime_context_session_token_rejoin" in bridge_guidance["next_action"][
+        "tools"
+    ]
+    host_envelope = bridge_guidance["worker_host_envelope_handoff"]
+    assert host_envelope == bridge_guidance["copy_safe_bridge_payload"][
+        "worker_host_envelope_handoff"
+    ]
+    assert host_envelope["initial_join"]["action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert host_envelope["rejoin"]["action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert host_envelope["session_token_ref_policy"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    assert (
+        host_envelope["observer_boundary"]["observer_authors_worker_evidence"]
+        is False
+    )
     assert accepted["contract_runtime_current_state"][
         "mf_sub_host_bridge_guidance"
     ] == bridge_guidance
@@ -38557,12 +38622,27 @@ def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(co
     )
     assert "parallel_branch_allocate" in bridge_guidance["next_action"]["tools"]
     assert "runtime_context_worker_guide" in bridge_guidance["next_action"]["tools"]
+    assert "runtime_context_session_token_initial_join" in bridge_guidance[
+        "next_action"
+    ]["tools"]
+    assert "runtime_context_session_token_rejoin" in bridge_guidance["next_action"][
+        "tools"
+    ]
     assert bridge_guidance["observer_body_actor_role_policy"][
         "body_actor_role_is_authorization"
     ] is False
     assert bridge_guidance["host_subagent_identity_policy"][
         "requires_runtime_context_bridge"
     ] is True
+    assert bridge_guidance["host_subagent_identity_policy"][
+        "session_token_ref_alone_authorizes_writes"
+    ] is False
+    host_envelope = bridge_guidance["worker_host_envelope_handoff"]
+    assert host_envelope["delivery"] == "worker_host_envelope"
+    assert host_envelope["initial_join"]["tool"] == (
+        "runtime_context_session_token_initial_join"
+    )
+    assert host_envelope["rejoin"]["tool"] == "runtime_context_session_token_rejoin"
 
 
 def test_contract_runtime_worker_line_attaches_verified_mf_sub_provenance(conn):
@@ -38671,8 +38751,14 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert result["parent_contract_execution_id"] == parent_record["contract_execution_id"]
     assert result["root_contract_execution_id"] == parent_record["root_contract_execution_id"]
     assert result["contract_chain_id"] == parent_record["contract_chain_id"]
-    assert result["runtime_guide"]["contract"]["contract_id"] == "mf_parallel"
-    assert result["contract_runtime_current_state"]["contract_id"] == "mf_parallel"
+    assert (
+        result["runtime_guide"]["contract"]["contract_id"]
+        == server.MF_PARALLEL_CONTRACT_ID
+    )
+    assert (
+        result["contract_runtime_current_state"]["contract_id"]
+        == server.MF_PARALLEL_CONTRACT_ID
+    )
     assert result["execution_state_revision"] == 1
     assert result["route_token_ref"] == "rtok-mf-parallel-root"
     merge_route_scope = result["merge_route_scope_guidance"]
@@ -38785,6 +38871,24 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert bridge_guidance["copy_safe_bridge_payload"][
         "contract_runtime_submit_line_body_after_bridge"
     ]["fence_token"] == "<worker fence_token from allocation envelope>"
+    host_envelope = bridge_guidance["copy_safe_bridge_payload"][
+        "worker_host_envelope_handoff"
+    ]
+    assert host_envelope == bridge_guidance["worker_host_envelope_handoff"]
+    assert host_envelope["raw_worker_env_required"] == [
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN",
+    ]
+    assert host_envelope["initial_join"]["action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert host_envelope["rejoin"]["action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert (
+        host_envelope["observer_boundary"]["raw_tokens_persisted_to_timeline"]
+        is False
+    )
 
     forged_worker_read = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(

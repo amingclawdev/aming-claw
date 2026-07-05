@@ -37013,6 +37013,125 @@ def _contract_runtime_next_action_requires_mf_sub(
     return "mf_sub" in roles or owner_role == "mf_sub" or worker_role == "mf_sub"
 
 
+def _mf_sub_worker_host_envelope_handoff(
+    *,
+    project_id: str,
+    runtime_context_id: str = "",
+    task_id: str = "",
+    parent_task_id: str = "",
+    target_project_root: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_context_id = runtime_context_id or "<worker runtime_context_id>"
+    task_id = task_id or "<worker task_id>"
+    parent_task_id = parent_task_id or "<parent MF task_id>"
+    target_project_root = target_project_root or "<assigned worker worktree path>"
+    worker_id = worker_id or "<actual host-created worker id>"
+    worker_slot_id = worker_slot_id or worker_id
+    safe_route_identity = {
+        field: str((route_identity or {}).get(field) or f"<{field}>").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    common_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": worker_id,
+        "actual_host_worker_id": worker_id,
+        "worker_session_id": "<actual host worker session id>",
+        **safe_route_identity,
+        "ttl_seconds": 3600,
+    }
+    initial_join_body = {
+        **common_body,
+        "reason": "<operator reason: host adapter needs first worker auth env>",
+    }
+    rejoin_body = {
+        **common_body,
+        "reason": "<operator reason: live worker lost raw auth env>",
+    }
+    base_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/session-token"
+    )
+    return {
+        "schema_version": "runtime_context.mf_sub_worker_host_envelope_handoff.v1",
+        "purpose": (
+            "recover or establish raw worker auth env without persisting raw tokens"
+        ),
+        "raw_worker_env_required": [
+            "AMING_WORKER_SESSION_TOKEN",
+            "AMING_WORKER_FENCE_TOKEN",
+        ],
+        "delivery": "worker_host_envelope",
+        "session_token_ref_policy": {
+            "copy_safe": True,
+            "session_token_ref_alone_authorizes_writes": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        },
+        "observer_boundary": {
+            "observer_requests_host_envelope": True,
+            "observer_injects_envelope_into_real_worker": True,
+            "observer_authors_worker_evidence": False,
+            "raw_tokens_persisted_to_timeline": False,
+        },
+        "initial_join": {
+            "schema_version": "runtime_context.session_token_initial_join_submission.v1",
+            "action": "request_runtime_context_initial_join_host_envelope",
+            "tool": "runtime_context_session_token_initial_join",
+            "method": "POST",
+            "path": f"{base_path}/initial-join",
+            "body_source": "copy_safe_body",
+            "copy_safe_body": initial_join_body,
+            "valid_when_lineage_missing": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ],
+            "after_success": [
+                "inject returned host_envelope env into the real mf_sub worker",
+                "worker records read receipt",
+                "worker records startup",
+            ],
+        },
+        "rejoin": {
+            "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+            "action": "request_runtime_context_rejoin_host_envelope",
+            "tool": "runtime_context_session_token_rejoin",
+            "method": "POST",
+            "path": f"{base_path}/rejoin",
+            "body_source": "copy_safe_body",
+            "copy_safe_body": rejoin_body,
+            "required_existing_lineage": [
+                "mf_subagent_read_receipt",
+                "mf_subagent_startup",
+            ],
+            "after_success": [
+                "inject returned host_envelope env into the same live mf_sub worker",
+                (
+                    "worker continues protected writes such as implementation "
+                    "evidence or finish gate"
+                ),
+            ],
+        },
+        "decision_tree": [
+            {
+                "when": "raw worker env is missing before read receipt or startup",
+                "action": "request_runtime_context_initial_join_host_envelope",
+            },
+            {
+                "when": "raw worker env is missing after read receipt and startup",
+                "action": "request_runtime_context_rejoin_host_envelope",
+            },
+        ],
+    }
+
+
 def _contract_runtime_mf_sub_host_bridge_guidance(
     guide: Mapping[str, Any],
     *,
@@ -37051,6 +37170,14 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "session_token_ref": "<copy-safe worker session_token_ref>",
         }
     )
+    worker_host_envelope_handoff = _mf_sub_worker_host_envelope_handoff(
+        project_id=str(execution.get("project_id") or ""),
+        runtime_context_id=str(submit_line_body.get("runtime_context_id") or ""),
+        task_id=str(submit_line_body.get("task_id") or ""),
+        parent_task_id=str(submit_line_body.get("parent_task_id") or ""),
+        target_project_root=str(submit_line_body.get("target_project_root") or ""),
+        route_identity=submit_line_body,
+    )
     return {
         "schema_version": "contract_runtime.mf_sub_host_bridge_guidance.v1",
         "status": "mf_sub_runtime_identity_required",
@@ -37076,8 +37203,14 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
                 "parallel_branch_allocate",
                 "runtime_context_worker_guide",
                 "runtime_context_current",
+                "runtime_context_session_token_initial_join",
+                "runtime_context_session_token_rejoin",
             ],
-            "produces": list(_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS),
+            "produces": [
+                *list(_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS),
+                "worker_host_envelope",
+            ],
+            "raw_env_recovery": "worker_host_envelope_handoff",
         },
         "copy_safe_bridge_payload": {
             "runtime_context_worker_guide": {
@@ -37090,7 +37223,9 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
                 "view": "worker_view",
             },
             "contract_runtime_submit_line_body_after_bridge": submit_line_body,
+            "worker_host_envelope_handoff": worker_host_envelope_handoff,
         },
+        "worker_host_envelope_handoff": worker_host_envelope_handoff,
         "forbidden_shortcuts": [
             "observer_body_actor_role_mf_sub",
             "observer_written_worker_evidence",
@@ -37111,6 +37246,8 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "requires_runtime_context_bridge": True,
             "raw_session_token_required": False,
             "raw_route_token_required": False,
+            "raw_worker_env_delivery": "worker_host_envelope",
+            "session_token_ref_alone_authorizes_writes": False,
         },
     }
 
@@ -54428,6 +54565,16 @@ def _bounded_worker_dispatch_recovery_payload(
         "merge_queue_id": merge_queue_id or "<merge-queue-id>",
         "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
     }
+    worker_host_envelope_handoff = _mf_sub_worker_host_envelope_handoff(
+        project_id=project_id,
+        runtime_context_id=str(repair_payload.get("runtime_context_id") or ""),
+        task_id=str(repair_payload.get("task_id") or ""),
+        parent_task_id=str(repair_payload.get("parent_task_id") or ""),
+        target_project_root=str(repair_payload.get("worktree_path") or ""),
+        worker_id=worker_id or "<actual host-created worker id>",
+        worker_slot_id=worker_id or "<worker-slot-id>",
+        route_identity=repair_payload,
+    )
     return {
         "schema_version": "bounded_worker_dispatch_recovery.v1",
         "recoverable": True,
@@ -54454,6 +54601,22 @@ def _bounded_worker_dispatch_recovery_payload(
                 "id": "repair_runtime_text_payload",
                 "action": "observer_runtime_text_prepare",
                 "reason": "bounded worker dispatch evidence is missing required launch fields",
+            },
+            {
+                "id": "request_runtime_context_initial_join_host_envelope",
+                "action": "runtime_context_session_token_initial_join",
+                "reason": (
+                    "use when the live mf_sub worker lacks raw auth env before "
+                    "read receipt/startup"
+                ),
+            },
+            {
+                "id": "request_runtime_context_rejoin_host_envelope",
+                "action": "runtime_context_session_token_rejoin",
+                "reason": (
+                    "use when startup/read receipt exists but the live mf_sub "
+                    "worker lost raw auth env before protected writes"
+                ),
             },
             {
                 "id": "retry_with_new_worker",
@@ -54506,6 +54669,10 @@ def _bounded_worker_dispatch_recovery_payload(
             ),
         },
         "payload_shape": repair_payload,
+        "worker_host_envelope_handoff": worker_host_envelope_handoff,
+        "copy_safe_bridge_payload": {
+            "worker_host_envelope_handoff": worker_host_envelope_handoff,
+        },
         "error": error,
     }
 
