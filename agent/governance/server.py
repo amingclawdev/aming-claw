@@ -52687,6 +52687,24 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         for path in event_allowed_files
         if str(path or "").strip()
     }
+    allowed_files = []
+    seen_allowed_files: set[str] = set()
+    for path in (row_scope_files if row_scope_files else event_allowed_files):
+        text = str(path or "").strip()
+        if not text or text in seen_allowed_files:
+            continue
+        seen_allowed_files.add(text)
+        allowed_files.append(text)
+    row_scope_diagnostics = {
+        "scope_source": (
+            "backlog.target_files + backlog.test_files"
+            if row_scope_files
+            else "observer_direct_event"
+        ),
+        "row_declared_file_scope": row_scope_files,
+        "event_allowed_files": event_allowed_files,
+        "effective_allowed_files": allowed_files,
+    }
     event_scope_outside_row = sorted(event_scope_set - row_scope_set) if row_scope_set else []
     if event_scope_outside_row:
         return {
@@ -52710,17 +52728,10 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 "observer_direct_close_exception_gate_passed": False,
                 "row_declared_file_scope_applied": True,
                 "event_allowed_files_outside_row_scope": event_scope_outside_row,
+                **row_scope_diagnostics,
             },
         }
 
-    allowed_files = []
-    seen_allowed_files: set[str] = set()
-    for path in (row_scope_files if row_scope_files else event_allowed_files):
-        text = str(path or "").strip()
-        if not text or text in seen_allowed_files:
-            continue
-        seen_allowed_files.add(text)
-        allowed_files.append(text)
     contract = {
         "project_id": project_id,
         "template_id": "operator_supervised_direct_main.v1",
@@ -52806,6 +52817,8 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                     graph_trace_gate.get("passed")
                 ),
                 "pre_implementation_graph_trace_gate": graph_trace_gate,
+                "row_declared_file_scope_applied": bool(row_declared_files),
+                **row_scope_diagnostics,
             },
         }
 
@@ -52853,6 +52866,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "pre_implementation_graph_trace_gate": graph_trace_gate,
             "worker_or_successor_contract_required": False,
             "row_declared_file_scope_applied": bool(row_declared_files),
+            **row_scope_diagnostics,
         },
     }
 

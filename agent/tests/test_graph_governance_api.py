@@ -28168,6 +28168,17 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     direct_gate = projection["parentless_direct_main_close_authority_gate"]
     assert direct_gate["passed"] is True
     assert direct_gate["checks"]["row_declared_file_scope_applied"] is True
+    assert direct_gate["checks"]["scope_source"] == (
+        "backlog.target_files + backlog.test_files"
+    )
+    assert direct_gate["checks"]["row_declared_file_scope"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    assert direct_gate["checks"]["effective_allowed_files"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
     graph_gate = direct_gate["checks"]["pre_implementation_graph_trace_gate"]
     assert graph_gate["passed"] is True
     assert graph_gate["verified_trace_ids"] == [graph_trace_id]
@@ -29134,6 +29145,13 @@ def test_parentless_direct_main_rejects_event_allowed_files_outside_row_scope(
     assert direct_gate["passed"] is False
     assert direct_gate["missing_requirement_ids"] == [
         "event_allowed_files_within_row_scope"
+    ]
+    assert direct_gate["checks"]["scope_source"] == (
+        "backlog.target_files + backlog.test_files"
+    )
+    assert direct_gate["checks"]["row_declared_file_scope"] == [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
     ]
     assert direct_gate["checks"]["event_allowed_files_outside_row_scope"] == [
         "outside.py"
