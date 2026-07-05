@@ -1399,6 +1399,57 @@ def test_close_gate_preserves_contract_runtime_projection_blocker(
     assert "mf_timeline_precheck_incomplete" not in errors
 
 
+def test_close_gate_preserves_parentless_direct_main_authority_blocker(
+    tmp_path: Path,
+) -> None:
+    contract = load_workflow_contract()
+    fixture = create_runtime_fixture(tmp_path)
+    source_commit = commit_worker_candidate(fixture)
+    token = make_precheck_token(source_commit)
+    subject = fixture.close_subject(
+        contract,
+        merge_commit=source_commit,
+        precheck_token=token,
+    )
+    subject["contract_runtime"] = {
+        "contract_execution_id": "onboard-service-unit-close",
+        "source": "contract_runtime",
+        "contract_runtime_close_authority_projection": {
+            "schema_version": "contract_runtime_close_authority_projection.v1",
+            "accepted": True,
+            "status": "projected_parentless_direct_main",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
+            "authoritative": True,
+            "parentless_direct_main_close_authority_gate": {
+                "schema_version": (
+                    "contract_runtime_parentless_direct_main_close_authority_gate.v1"
+                ),
+                "required": True,
+                "passed": False,
+                "status": "failed",
+                "missing_requirement_ids": [
+                    "event_allowed_files_within_row_scope",
+                ],
+            },
+        },
+    }
+
+    result = run_precheck(
+        "backlog.close",
+        CONTRACT_ID,
+        "close_gate",
+        subject,
+        "pytest",
+    )
+
+    evidence = result["evidence"]
+    assert result["decision"] == "block"
+    assert "contract_runtime_close_authority_incomplete" in evidence["errors"]
+    assert evidence["contract_runtime_close_authority_required"] is True
+    assert evidence["contract_runtime_close_authority_present"] is True
+
+
 def test_close_gate_counts_child_lane_finish_projection_but_keeps_qa_separate(
     tmp_path: Path,
 ) -> None:

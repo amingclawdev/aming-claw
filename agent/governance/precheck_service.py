@@ -1461,6 +1461,8 @@ def _contract_runtime_close_authority_incomplete(
             return True
         for gate_key in (
             "contract_projection_gate",
+            "parentless_direct_main_close_authority_gate",
+            "contract_runtime_parentless_direct_main_close_authority_gate",
             "contract_runtime_mf_parallel_close_authority_gate",
             "contract_runtime_direct_fix_close_authority_gate",
             "contract_runtime_close_authority_gate",
@@ -1508,6 +1510,8 @@ def _contract_runtime_close_gate_errors(
         if _contract_runtime_close_authority_incomplete(source):
             errors.append("contract_runtime_close_authority_incomplete")
         for gate_key in (
+            "parentless_direct_main_close_authority_gate",
+            "contract_runtime_parentless_direct_main_close_authority_gate",
             "contract_runtime_mf_parallel_close_authority_gate",
             "contract_runtime_direct_fix_close_authority_gate",
             "contract_runtime_close_authority_gate",
