@@ -38941,14 +38941,36 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert merge_route_scope["root_contract_execution_id"] == (
         result["root_contract_execution_id"]
     )
-    root_issue_shape = merge_route_scope[
+    current_contract_issue_shape = merge_route_scope[
         "close_or_merge_after_evidence_route_issue_shape"
     ]
-    assert root_issue_shape["task_id"] == result["root_contract_execution_id"]
-    assert root_issue_shape["allowed_actions"] == ["close_or_merge_after_evidence"]
-    assert root_issue_shape["raw_route_token_required"] is False
-    assert root_issue_shape["raw_route_token_exposed"] is False
+    assert current_contract_issue_shape["task_id"] == (
+        result["successor_contract_execution_id"]
+    )
+    assert current_contract_issue_shape["allowed_actions"] == [
+        "close_or_merge_after_evidence"
+    ]
+    assert current_contract_issue_shape["raw_route_token_required"] is False
+    assert current_contract_issue_shape["raw_route_token_exposed"] is False
+    assert merge_route_scope["primary_close_or_merge_route_scope"] == (
+        "successor_contract_execution_id"
+    )
+    assert merge_route_scope["accepted_route_scope_order"] == [
+        "worker_task_id_if_explicitly_minted",
+        "successor_contract_execution_id",
+        "root_contract_execution_id_fallback",
+    ]
+    fallback_issue_shape = merge_route_scope[
+        "fallback_close_or_merge_after_evidence_route_issue_shape"
+    ]
+    assert fallback_issue_shape["task_id"] == result["root_contract_execution_id"]
     assert merge_route_scope["copy_safe_route_token_ref_only"] is True
+    assert merge_route_scope["copy_safe_route_token_scope"]["scope"]["task_id"] == (
+        result["successor_contract_execution_id"]
+    )
+    assert merge_route_scope["copy_safe_route_token_scope"][
+        "observer_route_context_issue_payload"
+    ]["task_id"] == result["successor_contract_execution_id"]
     assert result["event"]["payload"]["successor_contract"][
         "merge_route_scope_guidance"
     ] == merge_route_scope
@@ -39156,6 +39178,105 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert worker_read["ok"] is True
     assert worker_read["actor_role"] == "mf_sub"
     assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+
+
+def test_mf_parallel_merge_route_guidance_scope_materializes_queue(conn):
+    backlog_id = "AC-MF-PARALLEL-GUIDED-MERGE-SCOPE"
+    task_id = "parallel-guided-merge-scope"
+    worker_task_id = f"{task_id}:worker"
+    merge_queue_id = "mq-guided-merge-scope"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-guided-merge-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "reason": "Human approved guided merge scope repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-guided-merge-root",
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    route_shape = result["merge_route_scope_guidance"][
+        "close_or_merge_after_evidence_route_issue_shape"
+    ]
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=route_shape["task_id"],
+        target_files=["agent/governance/server.py"],
+        allowed_actions=route_shape["allowed_actions"],
+        evidence_refs=["timeline:qa-independent-verification"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-guided-merge-scope",
+            backlog_id=backlog_id,
+            root_task_id=result["successor_contract_execution_id"],
+            task_id=worker_task_id,
+            branch_ref="refs/heads/codex/guided-merge-scope",
+            status=STATE_VALIDATED,
+            fence_token="fence-guided-merge-scope",
+            base_commit="base-guided-merge",
+            head_commit="head-guided-merge",
+            target_head_commit="target-guided-merge",
+            checkpoint_id="ckpt-guided-merge-scope",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-07-05T16:50:00Z",
+    )
+    conn.commit()
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": worker_task_id,
+                "merge_queue_id": merge_queue_id,
+                "queue_index": 1,
+                "checkpoint_id": "ckpt-guided-merge-scope",
+                "require_finish_gate": True,
+                "route_token_ref": issued["route_token_ref"],
+                "now_iso": "2026-07-05T16:51:00Z",
+            },
+        )
+    )
+
+    gate = queued["route_token_gate"]
+    assert queued["ok"] is True
+    assert queued["queue_item"]["task_id"] == worker_task_id
+    assert gate["authorized_action"] == "close_or_merge_after_evidence"
+    assert gate["accepted_task_scope"] == "parent"
+    assert gate["parent_task_id"] == result["successor_contract_execution_id"]
+    assert gate["child_task_id"] == worker_task_id
+    assert queued["timeline_event_recorded"]["event_kind"] == (
+        "merge_queue_item_materialize"
+    )
 
 
 def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_command(

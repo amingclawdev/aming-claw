@@ -13370,6 +13370,16 @@ def _apply_compact_contract_chain_current(
     row["projection_degraded_flags"] = (
         dict(degraded_flags) if isinstance(degraded_flags, Mapping) else {}
     )
+    readiness_state = str(current.get("readiness_state") or "").strip()
+    if readiness_state:
+        row["readiness_state"] = readiness_state
+    current_next_action = _compact_next_legal_action(current.get("next_legal_action"))
+    if current_next_action:
+        row["next_legal_action"] = current_next_action
+    elif readiness_state == "contract_complete":
+        row["next_legal_action"] = {}
+        row["blocker_summary"] = {}
+        row["legacy_advisory_blocker_suppressed"] = True
     row["contract_chain_current_authority"] = close_authority
     row["contract_chain_current"] = {
         **dict(current),

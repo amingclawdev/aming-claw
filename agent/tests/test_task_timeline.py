@@ -1870,6 +1870,58 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(current["projection_source"], "backlog_contract_chain_current")
         self.assertEqual(current["projection_hash"], row["projection_hash"])
 
+    def test_compact_ledger_contract_complete_suppresses_stale_blocker(self):
+        from agent.governance import server, task_timeline
+
+        backlog_id = "AC-COMPACT-COMPLETE-SUPPRESSES-BLOCKER"
+        self.conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, created_at, updated_at)
+               VALUES (?, ?, 'OPEN', 'P0', '2026-06-27T00:00:00Z', '2026-06-27T00:00:00Z')""",
+            (backlog_id, "Compact ledger complete projection test"),
+        )
+        parent = server._onboard_service_materialize_parent_record(
+            self.conn,
+            project_id="proj",
+            backlog_id=backlog_id,
+            route_token_ref="rtok-compact-ledger-complete",
+        )
+        blocked = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id=backlog_id,
+            task_id=parent["contract_execution_id"],
+            event_type="mf.blocker",
+            event_kind="blocker",
+            status="blocked",
+            payload={
+                "blockers": [
+                    {
+                        "id": "stale_compact_ledger_after_contract_complete",
+                        "message": "historical blocker",
+                    }
+                ],
+                "next_legal_action": {
+                    "id": "worker_read_runtime_guide",
+                    "action": "record_read_receipt",
+                },
+            },
+        )
+
+        ledger = task_timeline.build_compact_ledger(self.conn, "proj", [blocked])
+
+        row = ledger["rows"][0]
+        self.assertEqual(row["latest_event_id"], blocked["id"])
+        self.assertEqual(row["latest_status"], "blocked")
+        self.assertEqual(row["readiness_state"], "contract_complete")
+        self.assertEqual(row["next_legal_action"], {})
+        self.assertEqual(row["blocker_summary"], {})
+        self.assertTrue(row["legacy_advisory_blocker_suppressed"])
+        self.assertEqual(
+            row["contract_chain_current"]["readiness_state"],
+            "contract_complete",
+        )
+
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline
 

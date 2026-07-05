@@ -6008,21 +6008,35 @@ def runtime_context_mf_parallel_happy_path_reminders(
         },
         "merge_route_scope_guidance": {
             "successor_contract_execution_id_role": (
-                "current child mf_parallel contract runtime writes"
+                "current child mf_parallel contract runtime writes and "
+                "primary merge close_or_merge_after_evidence route scope"
             ),
             "root_contract_execution_id_role": (
-                "root-scope route authorization for close_or_merge_after_evidence"
+                "fallback root/onboard route authorization only"
             ),
+            "primary_close_or_merge_route_scope": "successor_contract_execution_id",
+            "accepted_route_scope_order": [
+                "worker_task_id_if_explicitly_minted",
+                "successor_contract_execution_id",
+                "root_contract_execution_id_fallback",
+            ],
             "close_or_merge_after_evidence_route_issue_shape": {
+                "task_id": "<successor_contract_execution_id>",
+                "allowed_actions": ["close_or_merge_after_evidence"],
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            },
+            "fallback_close_or_merge_after_evidence_route_issue_shape": {
                 "task_id": "<root_contract_execution_id>",
                 "allowed_actions": ["close_or_merge_after_evidence"],
                 "raw_route_token_required": False,
                 "raw_route_token_exposed": False,
             },
             "message": (
-                "Do not use the successor contract_execution_id as the root "
-                "route scope. Issue close_or_merge_after_evidence authority at "
-                "root_contract_execution_id scope and pass only route_token_ref."
+                "Issue close_or_merge_after_evidence authority at "
+                "successor_contract_execution_id scope for merge materialize/apply; "
+                "use root_contract_execution_id only as an explicit fallback and "
+                "pass only route_token_ref."
             ),
         },
         "live_merge_fence_guidance": {

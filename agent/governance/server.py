@@ -12395,7 +12395,7 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": fence_token_placeholder,
         "route_token_ref": safe_route_identity.get(
             "route_token_ref",
-            "<root close_or_merge_after_evidence route_token_ref>",
+            "<current child-contract close_or_merge_after_evidence route_token_ref>",
         ),
     }
     merge_apply_body = {
@@ -12412,7 +12412,7 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": fence_token_placeholder,
         "route_token_ref": safe_route_identity.get(
             "route_token_ref",
-            "<root close_or_merge_after_evidence route_token_ref>",
+            "<current child-contract close_or_merge_after_evidence route_token_ref>",
         ),
         "evidence": {
             "schema_version": "runtime_context.merge_gate_evidence.v1",
@@ -12486,7 +12486,7 @@ def _runtime_context_worker_recovery_payloads(
             "live_mutation_requirements": [
                 "dry_run=false",
                 "allow_target_ref_mutation=true",
-                "root close_or_merge_after_evidence route_token_ref",
+                "current child-contract close_or_merge_after_evidence route_token_ref",
                 "finish_gate_ref",
                 "independent QA verification_event_refs",
             ],
@@ -48260,6 +48260,43 @@ def _mf_parallel_successor_runtime_enter(
         allowed_actions=_CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS,
         issue_payload=child_issue_payload,
     )
+    current_contract_close_route_issue_payload = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": successor_execution_id,
+        "allowed_actions": ["close_or_merge_after_evidence"],
+        "evidence_refs": [
+            ref
+            for ref in (
+                f"contract_runtime:{root_execution_id}" if root_execution_id else "",
+                f"contract_runtime:{successor_execution_id}"
+                if successor_execution_id
+                else "",
+                f"backlog:{backlog_id}" if backlog_id else "",
+            )
+            if ref
+        ],
+        "parent_route_token_ref": route_token_ref,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    current_contract_close_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="mf_parallel.merge_copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=successor_execution_id,
+        route_token_ref="",
+        status="issue_required_for_current_contract_close_or_merge",
+        purpose=(
+            "current child mf_parallel contract / branch-root "
+            "close_or_merge_after_evidence route authorization"
+        ),
+        task_id_source="successor_contract_execution_id",
+        aliases=["route_token_ref"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        issue_payload=current_contract_close_route_issue_payload,
+    )
     root_close_route_issue_payload = {
         "project_id": project_id,
         "caller_role": "observer",
@@ -48287,8 +48324,11 @@ def _mf_parallel_successor_runtime_enter(
         backlog_id=backlog_id,
         task_id=root_execution_id,
         route_token_ref="",
-        status="issue_required_for_root_close_or_merge",
-        purpose="root-scope close_or_merge_after_evidence route authorization",
+        status="fallback_issue_available_for_root_close_or_merge",
+        purpose=(
+            "fallback root/onboard close_or_merge_after_evidence route "
+            "authorization"
+        ),
         task_id_source="root_contract_execution_id",
         aliases=["route_token_ref"],
         allowed_actions=["close_or_merge_after_evidence"],
@@ -48302,17 +48342,34 @@ def _mf_parallel_successor_runtime_enter(
         ),
         "root_contract_execution_id": root_execution_id,
         "root_contract_execution_id_role": (
-            "root-scope close_or_merge_after_evidence route authorization"
+            "fallback root/onboard route authorization only"
         ),
+        "primary_close_or_merge_route_scope": "successor_contract_execution_id",
+        "merge_endpoint_task_scope": (
+            "parallel branch merge endpoints receive worker task_id, then "
+            "validate close_or_merge_after_evidence at the current child "
+            "contract / branch-root scope"
+        ),
+        "accepted_route_scope_order": [
+            "worker_task_id_if_explicitly_minted",
+            "successor_contract_execution_id",
+            "root_contract_execution_id_fallback",
+        ],
         "close_or_merge_after_evidence_route_issue_shape": (
+            current_contract_close_route_issue_payload
+        ),
+        "fallback_close_or_merge_after_evidence_route_issue_shape": (
             root_close_route_issue_payload
         ),
-        "copy_safe_route_token_scope": root_close_route_token_scope,
+        "copy_safe_route_token_scope": current_contract_close_route_token_scope,
+        "fallback_copy_safe_route_token_scope": root_close_route_token_scope,
         "copy_safe_route_token_ref_only": True,
         "message": (
-            "Use successor_contract_execution_id for child runtime lines. Issue "
-            "close_or_merge_after_evidence authority at root_contract_execution_id "
-            "scope and pass only route_token_ref, never a raw route token."
+            "Use successor_contract_execution_id for child runtime lines and "
+            "for the primary close_or_merge_after_evidence route used by "
+            "merge materialize/apply. Use root_contract_execution_id only as "
+            "an explicit fallback. Pass only route_token_ref, never a raw "
+            "route token."
         ),
     }
     successor_contract["merge_route_scope_guidance"] = merge_route_scope_guidance
@@ -48320,7 +48377,10 @@ def _mf_parallel_successor_runtime_enter(
     route_token_ref_guidance["copy_safe_route_token_scope"] = child_route_token_scope
     route_token_ref_guidance["copy_safe_route_token_scopes"] = {
         "child_runtime_writes": child_route_token_scope,
-        "root_close_or_merge_after_evidence": root_close_route_token_scope,
+        "current_contract_close_or_merge_after_evidence": (
+            current_contract_close_route_token_scope
+        ),
+        "root_close_or_merge_after_evidence_fallback": root_close_route_token_scope,
     }
     current_projection = upsert_contract_chain_successor_binding(
         conn,
@@ -48348,7 +48408,10 @@ def _mf_parallel_successor_runtime_enter(
         "merge_route_scope_guidance": merge_route_scope_guidance,
         "copy_safe_route_token_scopes": {
             "child_runtime_writes": child_route_token_scope,
-            "root_close_or_merge_after_evidence": root_close_route_token_scope,
+            "current_contract_close_or_merge_after_evidence": (
+                current_contract_close_route_token_scope
+            ),
+            "root_close_or_merge_after_evidence_fallback": root_close_route_token_scope,
         },
         "worker_fence": dict((metadata or {}).get("worker_fence") or {}),
         "qa_independent_verification": {
