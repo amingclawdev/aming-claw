@@ -42756,12 +42756,14 @@ def _onboard_contract_route_guide(
             "tiny_deterministic_scope",
             "allowed_files",
             "dirty_scope_exact_match",
+            "operator_approval.close_satisfying_shape",
             "db_verified_pre_implementation_graph_trace",
             "timeline_evidence_recorded_before_mutation",
             "focused_tests_or_no_test_decision",
         ],
         "blocked_without": [
             "operator_approval_ref",
+            "operator_approval.close_satisfying_shape",
             "route_identity",
             "exact_target_files",
             "clean_baseline_or_exact_dirty_scope",
@@ -42823,6 +42825,27 @@ def _onboard_contract_route_guide(
                     "post_hoc_graph_trace_after_implementation",
                 ],
             },
+            "operator_approval_shape": {
+                "required": True,
+                "accepted_any_of": [
+                    "operator_approval.approved=true",
+                    "operator_approval.approved_by",
+                    "operator_approved=true",
+                    "approved_by",
+                ],
+                "rejected_legacy_loose_shape": {
+                    "operator_approval": {
+                        "approved_work_type": "<legacy work type only>",
+                        "ref": "<reference only>",
+                        "source": "<source only>",
+                    },
+                    "reason": (
+                        "legacy loose operator_approval metadata does not prove "
+                        "operator approval for close authority"
+                    ),
+                },
+                "server_diagnostic_field": "operator_approval_shape",
+            },
             "pre_mutation_event": {
                 "mcp_tool": "task_timeline_append",
                 "event_type": "mf.observer_direct_implementation_exception",
@@ -42832,7 +42855,7 @@ def _onboard_contract_route_guide(
                 "required_payload_fields": [
                     "route_id or route_context_hash",
                     "reason",
-                    "operator_approval",
+                    "operator_approval.approved=true or approved_by/operator_approved=true",
                     "dirty_scope_check",
                     "allowed_files",
                     "graph_trace_ids or graph_query_trace_ids",
@@ -53038,6 +53061,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
 
     direct_event: dict[str, Any] = {}
     direct_identity: dict[str, str] = {}
+    rejected_direct_exceptions: list[dict[str, Any]] = []
     for event in events:
         identity = _observer_root_route_identity_from_event(event)
         route_identity = {
@@ -53053,6 +53077,8 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             route_identity,
         )
         if not bool(exception.get("accepted")):
+            if exception.get("missing_fields") != ["observer_direct_exception_event"]:
+                rejected_direct_exceptions.append(exception)
             continue
         if not _contract_runtime_close_authority_route_token_backed_event(
             event,
@@ -53064,6 +53090,49 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         direct_identity = identity
 
     if not direct_event:
+        if rejected_direct_exceptions:
+            missing_ids = list(
+                dict.fromkeys(
+                    str(missing)
+                    for exception in rejected_direct_exceptions
+                    for missing in exception.get("missing_fields") or []
+                    if str(missing or "").strip()
+                )
+            )
+            if not missing_ids:
+                missing_ids = ["accepted_observer_direct_implementation_exception"]
+            source_refs = [
+                f"timeline:{event_summary.get('id')}"
+                for exception in rejected_direct_exceptions
+                for event_summary in [exception.get("event")]
+                if isinstance(event_summary, Mapping) and event_summary.get("id")
+            ]
+            operator_approval_shapes = [
+                shape
+                for exception in rejected_direct_exceptions
+                for shape in [exception.get("operator_approval_shape")]
+                if isinstance(shape, Mapping)
+            ]
+            return {
+                "schema_version": "contract_runtime_parentless_direct_main_close_authority_gate.v1",
+                "accepted": False,
+                "passed": False,
+                "status": "failed",
+                "source": "server_derived_parentless_observer_direct_main_timeline",
+                "primary_decision_source": False,
+                "meta_contract_gate_decision_source": False,
+                "contract_execution_id": requested_execution_id,
+                "close_commit": close_commit,
+                "missing_requirement_ids": missing_ids,
+                "source_refs": list(dict.fromkeys(source_refs)),
+                "checks": {
+                    "has_observer_direct_exception": True,
+                    "accepted_observer_direct_exception": False,
+                    "rejected_observer_direct_exceptions": rejected_direct_exceptions,
+                    "operator_approval_shapes": operator_approval_shapes,
+                    "row_declared_file_scope_applied": bool(row_declared_files),
+                },
+            }
         return {}
 
     event_allowed_files = task_timeline._event_deep_string_list(
