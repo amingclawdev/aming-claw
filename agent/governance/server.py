@@ -11203,6 +11203,10 @@ def _runtime_context_worker_guide_response(
         "raw_session_token_exposed": False,
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
+        "capacity_fallback_guidance": actionable_payloads.get(
+            "capacity_fallback_guidance",
+            {},
+        ),
         "copy_safe_route_token_scope": actionable_payloads.get(
             "copy_safe_route_token_scope",
             {},
@@ -11270,6 +11274,10 @@ def _runtime_context_worker_guide_response(
             "read_endpoints": read_endpoints,
             "write_guides": write_guides,
             "actionable_payloads": actionable_payloads,
+            "capacity_fallback_guidance": actionable_payloads.get(
+                "capacity_fallback_guidance",
+                {},
+            ),
             "copy_safe_route_token_scope": actionable_payloads.get(
                 "copy_safe_route_token_scope",
                 {},
@@ -11363,6 +11371,9 @@ def _runtime_context_worker_guide_response(
                 "bypass_timeline_gate",
                 "surrogate_startup",
                 "raw_token_exfiltration",
+                "observer_authored_mf_sub_evidence",
+                "raw_token_persistence",
+                "change_runtime_identity_to_work_around_capacity",
                 "merge",
                 "push",
                 "close_backlog_without_close_ready",
@@ -11394,6 +11405,24 @@ def _runtime_context_worker_guide_response(
                     "action": "session_token_rejoin",
                     "endpoint": "session_token_rejoin",
                     "status": "available_for_observer_recovery",
+                },
+                {
+                    "id": "reuse_existing_idle_subagent_same_runtime_envelope",
+                    "action": "reuse_existing_idle_subagent",
+                    "status": "available_for_capacity_fallback",
+                    "guidance_path": "capacity_fallback_guidance",
+                },
+                {
+                    "id": "queue_dispatch_until_capacity_available",
+                    "action": "queue_bounded_worker_dispatch",
+                    "status": "available_for_capacity_fallback",
+                    "guidance_path": "capacity_fallback_guidance",
+                },
+                {
+                    "id": "stop_and_record_capacity_blocker",
+                    "action": "record_blocker",
+                    "status": "available_for_capacity_fallback",
+                    "guidance_path": "capacity_fallback_guidance",
                 },
             ],
         },
@@ -11785,6 +11814,18 @@ def _runtime_context_worker_recovery_payloads(
     normalized_target_head_commit = str(target_head_commit or "").strip()
     normalized_merge_queue_id = str(merge_queue_id or "").strip()
     normalized_backlog_id = str(backlog_id or "").strip()
+    capacity_fallback_guidance = _mf_sub_capacity_fallback_guidance(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token_placeholder,
+        target_project_root=target_project_root,
+        session_token_ref=session_token_ref_placeholder,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        merge_queue_id=normalized_merge_queue_id,
+        route_identity=safe_route_identity,
+    )
     worker_session_lifecycle_policy = {
         "schema_version": "runtime_context.worker_session_lifecycle_policy.v1",
         "startup_and_implementation_same_live_session_required": True,
@@ -11794,6 +11835,7 @@ def _runtime_context_worker_recovery_payloads(
             "spawn a fresh implementation worker, then record fresh read receipt "
             "and startup evidence for that worker before implementation writes"
         ),
+        "capacity_or_thread_limit_fallback": dict(capacity_fallback_guidance),
         "observer_must_not_backfill_worker_evidence": True,
     }
     write_authorization_policy = {
@@ -11814,6 +11856,7 @@ def _runtime_context_worker_recovery_payloads(
         "missing_auth_next_legal_action_after_startup": (
             "request_runtime_context_rejoin_host_envelope"
         ),
+        "capacity_or_thread_limit_fallback": dict(capacity_fallback_guidance),
     }
     worker_identity_pointers = {
         "schema_version": "runtime_context.worker_identity_pointers.v1",
@@ -12485,6 +12528,7 @@ def _runtime_context_worker_recovery_payloads(
         "session_renewal_hints": session_renewal_hints,
         "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
         "write_authorization_policy": write_authorization_policy,
+        "capacity_fallback_guidance": capacity_fallback_guidance,
         "merge_gate_evidence_payloads": merge_gate_evidence_payloads,
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
@@ -37013,6 +37057,123 @@ def _contract_runtime_next_action_requires_mf_sub(
     return "mf_sub" in roles or owner_role == "mf_sub" or worker_role == "mf_sub"
 
 
+def _mf_sub_capacity_fallback_guidance(
+    *,
+    runtime_context_id: str = "",
+    task_id: str = "",
+    parent_task_id: str = "",
+    fence_token: str = "",
+    target_project_root: str = "",
+    session_token_ref: str = "",
+    worker_id: str = "",
+    worker_slot_id: str = "",
+    merge_queue_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    def _copy_value(value: str, placeholder: str) -> str:
+        text = str(value or "").strip()
+        return text or placeholder
+
+    preserved_identity = {
+        "runtime_context_id": _copy_value(runtime_context_id, "<worker runtime_context_id>"),
+        "task_id": _copy_value(task_id, "<worker task_id>"),
+        "parent_task_id": _copy_value(parent_task_id, "<parent MF task_id>"),
+        "fence_token": _copy_value(
+            fence_token,
+            "<same fence_token from the bounded worker runtime envelope>",
+        ),
+        "target_project_root": _copy_value(
+            target_project_root,
+            "<assigned worker worktree path>",
+        ),
+        "session_token_ref": _copy_value(
+            session_token_ref,
+            "<copy-safe worker session_token_ref>",
+        ),
+    }
+    worker_identity = {
+        "worker_id": _copy_value(worker_id, "<allocated worker id>"),
+        "worker_slot_id": _copy_value(worker_slot_id or worker_id, "<worker slot id>"),
+    }
+    safe_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    safe_route_identity = {
+        field: value for field, value in safe_route_identity.items() if value
+    }
+    preserved_dispatch = {
+        **preserved_identity,
+        **worker_identity,
+        "merge_queue_id": _copy_value(merge_queue_id, "<runtime_context merge_queue_id>"),
+        "route_identity": safe_route_identity,
+    }
+    return {
+        "schema_version": "mf_sub.capacity_fallback_guidance.v1",
+        "trigger": "codex_subagent_spawn_capacity_or_thread_limit",
+        "status": "fallbacks_available_without_identity_change",
+        "preserve_runtime_identity": preserved_identity,
+        "required_identity_fields": list(preserved_identity.keys()),
+        "official_fallback_options": [
+            "reuse_existing_idle_subagent_same_runtime_envelope",
+            "queue_dispatch_until_capacity_available",
+            "stop_and_record_capacity_blocker",
+        ],
+        "fallback_options": [
+            {
+                "id": "reuse_existing_idle_subagent_same_runtime_envelope",
+                "action": "reuse_existing_idle_subagent",
+                "allowed_when": (
+                    "an idle host-created subagent can receive the exact same "
+                    "bounded runtime envelope"
+                ),
+                "requires": dict(preserved_dispatch),
+                "worker_evidence_rule": (
+                    "the reused worker must author its own read receipt, startup, "
+                    "implementation evidence, finish-time attestation, and finish gate"
+                ),
+            },
+            {
+                "id": "queue_dispatch_until_capacity_available",
+                "action": "queue_bounded_worker_dispatch",
+                "allowed_when": (
+                    "no idle matching subagent is available but capacity is expected later"
+                ),
+                "queue_preserves": dict(preserved_dispatch),
+                "worker_evidence_rule": (
+                    "dispatch resumes with the same runtime_context_id, task_id, "
+                    "parent_task_id, fence_token, target_project_root, and "
+                    "session_token_ref"
+                ),
+            },
+            {
+                "id": "stop_and_record_capacity_blocker",
+                "action": "record_blocker",
+                "blocker_type": "subagent_capacity_or_thread_limit",
+                "allowed_when": (
+                    "no idle matching subagent and no queue slot are available"
+                ),
+                "blocker_preserves": dict(preserved_dispatch),
+            },
+        ],
+        "forbidden_shortcuts": [
+            "observer_authored_mf_sub_evidence",
+            "raw_token_persistence",
+            "change_runtime_identity_to_work_around_capacity",
+            "mint_new_runtime_context_id_to_bypass_capacity",
+            "change_task_id_or_parent_task_id_to_bypass_capacity",
+            "replace_fence_token_to_bypass_capacity",
+            "route_token_ref_as_session_auth",
+            "post_hoc_worker_evidence_backfill",
+        ],
+        "privacy_boundary": {
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "raw_route_token_persisted": False,
+        },
+    }
+
+
 def _mf_sub_worker_host_envelope_handoff(
     *,
     project_id: str,
@@ -37022,6 +37183,9 @@ def _mf_sub_worker_host_envelope_handoff(
     target_project_root: str = "",
     worker_id: str = "",
     worker_slot_id: str = "",
+    session_token_ref: str = "",
+    fence_token: str = "",
+    merge_queue_id: str = "",
     route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_context_id = runtime_context_id or "<worker runtime_context_id>"
@@ -37034,6 +37198,7 @@ def _mf_sub_worker_host_envelope_handoff(
         field: str((route_identity or {}).get(field) or f"<{field}>").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
+    session_token_ref = session_token_ref or "<copy-safe worker session_token_ref>"
     common_body = {
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -37044,9 +37209,22 @@ def _mf_sub_worker_host_envelope_handoff(
         "agent_id": worker_id,
         "actual_host_worker_id": worker_id,
         "worker_session_id": "<actual host worker session id>",
+        "session_token_ref": session_token_ref,
         **safe_route_identity,
         "ttl_seconds": 3600,
     }
+    capacity_fallback_guidance = _mf_sub_capacity_fallback_guidance(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=fence_token,
+        target_project_root=target_project_root,
+        session_token_ref=session_token_ref,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        merge_queue_id=merge_queue_id,
+        route_identity=safe_route_identity,
+    )
     initial_join_body = {
         **common_body,
         "reason": "<operator reason: host adapter needs first worker auth env>",
@@ -37129,6 +37307,7 @@ def _mf_sub_worker_host_envelope_handoff(
                 "action": "request_runtime_context_rejoin_host_envelope",
             },
         ],
+        "capacity_fallback_guidance": capacity_fallback_guidance,
     }
 
 
@@ -37176,7 +37355,13 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
         task_id=str(submit_line_body.get("task_id") or ""),
         parent_task_id=str(submit_line_body.get("parent_task_id") or ""),
         target_project_root=str(submit_line_body.get("target_project_root") or ""),
+        session_token_ref=str(submit_line_body.get("session_token_ref") or ""),
+        fence_token=str(submit_line_body.get("fence_token") or ""),
         route_identity=submit_line_body,
+    )
+    capacity_fallback_guidance = worker_host_envelope_handoff.get(
+        "capacity_fallback_guidance",
+        {},
     )
     return {
         "schema_version": "contract_runtime.mf_sub_host_bridge_guidance.v1",
@@ -37224,13 +37409,18 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             },
             "contract_runtime_submit_line_body_after_bridge": submit_line_body,
             "worker_host_envelope_handoff": worker_host_envelope_handoff,
+            "capacity_fallback_guidance": capacity_fallback_guidance,
         },
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
+        "capacity_fallback_guidance": capacity_fallback_guidance,
         "forbidden_shortcuts": [
             "observer_body_actor_role_mf_sub",
             "observer_written_worker_evidence",
             "codex_subagent_id_without_runtime_context",
             "post_hoc_worker_identity_backfill",
+            "observer_authored_mf_sub_evidence",
+            "raw_token_persistence",
+            "change_runtime_identity_to_work_around_capacity",
         ],
         "observer_body_actor_role_policy": {
             "body_actor_role_is_authorization": False,
@@ -54573,7 +54763,14 @@ def _bounded_worker_dispatch_recovery_payload(
         target_project_root=str(repair_payload.get("worktree_path") or ""),
         worker_id=worker_id or "<actual host-created worker id>",
         worker_slot_id=worker_id or "<worker-slot-id>",
+        session_token_ref="<copy-safe worker session_token_ref>",
+        fence_token=str(repair_payload.get("fence_token") or ""),
+        merge_queue_id=str(repair_payload.get("merge_queue_id") or ""),
         route_identity=repair_payload,
+    )
+    capacity_fallback_guidance = worker_host_envelope_handoff.get(
+        "capacity_fallback_guidance",
+        {},
     )
     return {
         "schema_version": "bounded_worker_dispatch_recovery.v1",
@@ -54584,9 +54781,15 @@ def _bounded_worker_dispatch_recovery_payload(
             "action": "repair_runtime_text_payload",
             "deterministic_order": [
                 "repair_runtime_text_payload",
+                "reuse_existing_idle_subagent_same_runtime_envelope",
+                "queue_dispatch_until_capacity_available",
+                "stop_and_record_capacity_blocker",
                 "retry_with_new_worker",
                 "authorize_explicit_hotfix_exception",
             ],
+            "capacity_fallback_order": list(
+                capacity_fallback_guidance.get("official_fallback_options") or []
+            ),
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "observer_command_id": observer_command_id,
@@ -54616,6 +54819,30 @@ def _bounded_worker_dispatch_recovery_payload(
                 "reason": (
                     "use when startup/read receipt exists but the live mf_sub "
                     "worker lost raw auth env before protected writes"
+                ),
+            },
+            {
+                "id": "reuse_existing_idle_subagent_same_runtime_envelope",
+                "action": "reuse_existing_idle_subagent",
+                "reason": (
+                    "use when Codex spawn hits capacity/thread limit and an idle "
+                    "subagent can receive the same bounded runtime envelope"
+                ),
+            },
+            {
+                "id": "queue_dispatch_until_capacity_available",
+                "action": "queue_bounded_worker_dispatch",
+                "reason": (
+                    "use when capacity is unavailable but dispatch can wait while "
+                    "preserving the same runtime identity"
+                ),
+            },
+            {
+                "id": "stop_and_record_capacity_blocker",
+                "action": "record_blocker",
+                "reason": (
+                    "use when no same-envelope idle subagent or queue slot is "
+                    "available"
                 ),
             },
             {
@@ -54670,8 +54897,10 @@ def _bounded_worker_dispatch_recovery_payload(
         },
         "payload_shape": repair_payload,
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
+        "capacity_fallback_guidance": capacity_fallback_guidance,
         "copy_safe_bridge_payload": {
             "worker_host_envelope_handoff": worker_host_envelope_handoff,
+            "capacity_fallback_guidance": capacity_fallback_guidance,
         },
         "error": error,
     }

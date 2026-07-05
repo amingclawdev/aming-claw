@@ -3098,8 +3098,16 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     assert next_action["action"] == "repair_runtime_text_payload"
     assert next_action["deterministic_order"] == [
         "repair_runtime_text_payload",
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
         "retry_with_new_worker",
         "authorize_explicit_hotfix_exception",
+    ]
+    assert next_action["capacity_fallback_order"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
     ]
     assert next_action["runtime_context_id"] == context["runtime_context_id"]
     assert next_action["task_id"] == "allocate-incomplete-task"
@@ -3130,6 +3138,33 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     assert payload_shape["prompt_contract_id"] == "rprompt-allocate-incomplete"
     assert payload_shape["prompt_contract_hash"] == "sha256:prompt-allocate-incomplete"
     assert payload_shape["route_token_ref"] == "rtok-allocate-incomplete"
+    capacity_guidance = dispatch_event["recovery"]["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert capacity_guidance["preserve_runtime_identity"][
+        "runtime_context_id"
+    ] == context["runtime_context_id"]
+    assert capacity_guidance["preserve_runtime_identity"]["task_id"] == (
+        "allocate-incomplete-task"
+    )
+    assert set(capacity_guidance["required_identity_fields"]) == {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "target_project_root",
+        "session_token_ref",
+    }
+    assert "observer_authored_mf_sub_evidence" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
+    assert "raw_token_persistence" in capacity_guidance["forbidden_shortcuts"]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
 
 
 def test_parallel_branch_allocate_issues_same_owner_scoped_session_token(conn, tmp_path):
@@ -5645,9 +5680,37 @@ def test_bounded_worker_dispatch_recovery_projects_host_envelope_handoff():
     actions = {action["id"]: action for action in recovery["next_legal_actions"]}
     assert "request_runtime_context_initial_join_host_envelope" in actions
     assert "request_runtime_context_rejoin_host_envelope" in actions
+    assert "reuse_existing_idle_subagent_same_runtime_envelope" in actions
+    assert "queue_dispatch_until_capacity_available" in actions
+    assert "stop_and_record_capacity_blocker" in actions
     host_envelope = recovery["worker_host_envelope_handoff"]
     assert host_envelope == recovery["copy_safe_bridge_payload"][
         "worker_host_envelope_handoff"
+    ]
+    capacity_guidance = recovery["capacity_fallback_guidance"]
+    assert capacity_guidance == recovery["copy_safe_bridge_payload"][
+        "capacity_fallback_guidance"
+    ]
+    assert capacity_guidance == host_envelope["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert capacity_guidance["preserve_runtime_identity"] == {
+        "runtime_context_id": "mfrctx-recovery",
+        "task_id": "worker-recovery",
+        "parent_task_id": "<observer-or-root-task-id>",
+        "fence_token": "<fence-token>",
+        "target_project_root": "<absolute-worker-worktree>",
+        "session_token_ref": "<copy-safe worker session_token_ref>",
+    }
+    assert "observer_authored_mf_sub_evidence" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
+    assert "raw_token_persistence" in capacity_guidance["forbidden_shortcuts"]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
     ]
     assert host_envelope["initial_join"]["copy_safe_body"][
         "runtime_context_id"
@@ -19248,6 +19311,28 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
         "mf_subagent_startup",
     ]
     assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
+    capacity_guidance = details["actionable_payloads"]["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert capacity_guidance["preserve_runtime_identity"][
+        "runtime_context_id"
+    ] == context.runtime_context_id
+    assert capacity_guidance["preserve_runtime_identity"]["task_id"] == (
+        "worker-auth-missing"
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["parent_task_id"] == (
+        "parent-auth-missing"
+    )
+    assert "observer_authored_mf_sub_evidence" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
+    assert "raw_token_persistence" in capacity_guidance["forbidden_shortcuts"]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
 
 
 def test_runtime_context_session_token_initial_join_audits_host_envelope_before_lineage(
@@ -20123,6 +20208,47 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     assert worker_guide["target_project_root"] == str(target_root)
     assert worker_guide["project_root"] == str(target_root)
     assert worker_guide["repo_root"] == str(target_root)
+    capacity_guidance = worker_guide["capacity_fallback_guidance"]
+    assert guide["capacity_fallback_guidance"] == capacity_guidance
+    assert worker_guide["actionable_payloads"][
+        "capacity_fallback_guidance"
+    ] == capacity_guidance
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert capacity_guidance["preserve_runtime_identity"][
+        "runtime_context_id"
+    ] == context.runtime_context_id
+    assert capacity_guidance["preserve_runtime_identity"]["task_id"] == (
+        "worker-empty-target-root"
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["parent_task_id"] == (
+        "parent-empty-target-root"
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["target_project_root"] == (
+        str(target_root)
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["session_token_ref"] == (
+        worker_guide["session_token_ref"]
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["fence_token"].startswith(
+        "<read from env:"
+    )
+    for blocked_action in [
+        "observer_authored_mf_sub_evidence",
+        "raw_token_persistence",
+        "change_runtime_identity_to_work_around_capacity",
+    ]:
+        assert blocked_action in worker_guide["blocked_actions"]
+        assert blocked_action in capacity_guidance["forbidden_shortcuts"]
+    recovery_action_ids = {action["id"] for action in worker_guide["recovery_actions"]}
+    assert {
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    }.issubset(recovery_action_ids)
     assert worker_guide["graph_query_identity"]["payload_shape"][
         "target_project_root"
     ] == str(target_root)
@@ -32397,6 +32523,43 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert host_envelope == bridge_guidance["copy_safe_bridge_payload"][
         "worker_host_envelope_handoff"
     ]
+    capacity_guidance = bridge_guidance["capacity_fallback_guidance"]
+    assert capacity_guidance == bridge_guidance["copy_safe_bridge_payload"][
+        "capacity_fallback_guidance"
+    ]
+    assert capacity_guidance == host_envelope["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert capacity_guidance["preserve_runtime_identity"][
+        "runtime_context_id"
+    ] == "<from parallel_branch_allocate/runtime_context>"
+    assert capacity_guidance["preserve_runtime_identity"]["task_id"] == (
+        "<worker task_id from runtime_context>"
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["parent_task_id"] == (
+        "<parent MF task_id from runtime_context>"
+    )
+    assert capacity_guidance["preserve_runtime_identity"]["target_project_root"] == (
+        "<assigned worker worktree path>"
+    )
+    assert set(capacity_guidance["required_identity_fields"]) == {
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "fence_token",
+        "target_project_root",
+        "session_token_ref",
+    }
+    assert "observer_authored_mf_sub_evidence" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
+    assert "raw_token_persistence" in capacity_guidance["forbidden_shortcuts"]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
     assert host_envelope["initial_join"]["action"] == (
         "request_runtime_context_initial_join_host_envelope"
     )
@@ -38643,6 +38806,16 @@ def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(co
         "runtime_context_session_token_initial_join"
     )
     assert host_envelope["rejoin"]["tool"] == "runtime_context_session_token_rejoin"
+    capacity_guidance = bridge_guidance["capacity_fallback_guidance"]
+    assert capacity_guidance == host_envelope["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
 
 
 def test_contract_runtime_worker_line_attaches_verified_mf_sub_provenance(conn):
@@ -38875,6 +39048,23 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
         "worker_host_envelope_handoff"
     ]
     assert host_envelope == bridge_guidance["worker_host_envelope_handoff"]
+    capacity_guidance = bridge_guidance["capacity_fallback_guidance"]
+    assert capacity_guidance == bridge_guidance["copy_safe_bridge_payload"][
+        "capacity_fallback_guidance"
+    ]
+    assert capacity_guidance == host_envelope["capacity_fallback_guidance"]
+    assert capacity_guidance["official_fallback_options"] == [
+        "reuse_existing_idle_subagent_same_runtime_envelope",
+        "queue_dispatch_until_capacity_available",
+        "stop_and_record_capacity_blocker",
+    ]
+    assert "observer_authored_mf_sub_evidence" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
+    assert "raw_token_persistence" in capacity_guidance["forbidden_shortcuts"]
+    assert "change_runtime_identity_to_work_around_capacity" in capacity_guidance[
+        "forbidden_shortcuts"
+    ]
     assert host_envelope["raw_worker_env_required"] == [
         "AMING_WORKER_SESSION_TOKEN",
         "AMING_WORKER_FENCE_TOKEN",
