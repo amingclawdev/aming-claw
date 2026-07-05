@@ -19343,6 +19343,219 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     )
 
 
+def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-rejoin-route-rebind"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-rejoin-route-rebind",
+            root_task_id="parent-runtime-rejoin-route-rebind",
+            backlog_id="AC-RUNTIME-TOKEN-REJOIN-ROUTE-REBIND",
+            stage_task_id="worker-runtime-rejoin-route-rebind",
+            worker_id="worker-runtime-rejoin-route-rebind",
+            worker_slot_id="slot-runtime-rejoin-route-rebind",
+            branch_ref="refs/heads/codex/worker-runtime-rejoin-route-rebind",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-rejoin-route-rebind",
+            session_token_hash=mf_subagent_session_token_hash(
+                "lost-runtime-rejoin-route-rebind"
+            ),
+        ),
+    )
+    old_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=8,
+        evidence_refs=["timeline:runtime-rejoin-route-rebind-old"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_issue["route_token_ref"],
+        token=old_issue["route_token"],
+    )
+    old_route_identity = {
+        "route_id": old_issue["route_id"],
+        "route_context_hash": old_issue["route_context_hash"],
+        "prompt_contract_id": old_issue["prompt_contract_id"],
+        "prompt_contract_hash": old_issue["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": old_issue[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": old_issue["route_token_ref"],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-rejoin-route-rebind-old",
+        contract_version="direct_fix.v1",
+        payload={"route_identity": old_route_identity},
+        route_identity=old_route_identity,
+        route_evidence_type="observer_route_token_ref",
+        actor="observer",
+        now_iso="2026-07-05T00:00:00Z",
+    )
+    assert observer_route_context.supersede_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_issue["route_token_ref"],
+    )
+    fresh_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=9,
+        evidence_refs=["timeline:runtime-rejoin-route-rebind-fresh"],
+        parent_route_identity={
+            **old_route_identity,
+            "selected_project": PID,
+            "selected_backlog_id": context.backlog_id,
+        },
+        parent_route_token_ref=old_issue["route_token_ref"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=fresh_issue["route_token_ref"],
+        token=fresh_issue["route_token"],
+    )
+    fresh_route_identity = {
+        "route_id": fresh_issue["route_id"],
+        "route_context_hash": fresh_issue["route_context_hash"],
+        "prompt_contract_id": fresh_issue["prompt_contract_id"],
+        "prompt_contract_hash": fresh_issue["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": fresh_issue[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": fresh_issue["route_token_ref"],
+    }
+    for event_kind, event_type, phase in (
+        ("mf_subagent_read_receipt", "mf_subagent.read_receipt", "read_receipt"),
+        ("mf_subagent_startup", "mf_subagent.startup", "startup"),
+    ):
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+            event_type=event_type,
+            event_kind=event_kind,
+            phase=phase,
+            status="accepted",
+            actor=context.worker_slot_id,
+            payload={
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.root_task_id,
+                "worker_role": "mf_sub",
+                "worker_slot_id": context.worker_slot_id,
+                "worker_session_id": context.worker_slot_id,
+                "session_token_evidence_type": "server_verified",
+            },
+        )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as stale_rejoin:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "target_project_root": str(target_root),
+                    "reason": "host worker session lost raw auth env after resume",
+                    **old_route_identity,
+                    "route_token_ref": old_issue["route_token_ref"],
+                },
+            )
+        )
+    assert stale_rejoin.value.code == "runtime_context_rejoin_route_token_ref_invalid"
+    assert stale_rejoin.value.details["route_token_ref_error_code"] == (
+        "route_token_ref_not_active"
+    )
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": context.task_id,
+                "parent_task_id": context.root_task_id,
+                "target_project_root": str(target_root),
+                "reason": "host worker session lost raw auth env after resume",
+                "ttl_seconds": 1200,
+                **fresh_route_identity,
+                "route_token_ref": fresh_issue["route_token_ref"],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["route_identity_source"] == "resolved_active_route_token_ref"
+    assert result["route_identity_rebound"] is True
+    assert result["route_identity"] == fresh_route_identity
+    assert result["previous_route_identity"] == old_route_identity
+    assert result["host_envelope"]["route_identity"] == fresh_route_identity
+    assert result["host_envelope"]["route_identity_source"] == (
+        "resolved_active_route_token_ref"
+    )
+    assert result["raw_tokens_persisted_to_timeline"] is False
+
+    implementation = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": context.root_task_id,
+                "fence_token": result["fence_token"],
+                "session_token": result["session_token"],
+                "target_project_root": str(target_root),
+                **fresh_route_identity,
+                "route_token_ref": fresh_issue["route_token_ref"],
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "summary": "fresh route ref after rejoin",
+                },
+            },
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["route_token_gate"]["route_token_ref"] == (
+        fresh_issue["route_token_ref"]
+    )
+    stored = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (implementation["timeline_event"]["id"],),
+    ).fetchone()
+    payload = json.loads(stored["payload_json"])
+    assert payload["route_token_ref"] == fresh_issue["route_token_ref"]
+    assert payload["parent_route_lineage"]["route_token_ref"] == (
+        old_issue["route_token_ref"]
+    )
+    assert payload["child_route_lineage"]["route_token_ref"] == (
+        fresh_issue["route_token_ref"]
+    )
+
+
 def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_failed_qa(
     conn,
     tmp_path,

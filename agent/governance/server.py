@@ -14022,6 +14022,116 @@ def _runtime_context_implementation_resolved_ref_route_identity(
     return identity, lineage_payload
 
 
+def _runtime_context_rejoin_resolved_ref_route_identity(
+    body: Mapping[str, Any],
+    supplied_route_identity: Mapping[str, Any],
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    expected_route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    route_token_ref = str(
+        body.get("route_token_ref")
+        or supplied_route_identity.get("route_token_ref")
+        or ""
+    ).strip()
+    if not route_token_ref:
+        return {}, {}
+
+    resolution_body = dict(body)
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(supplied_route_identity.get(field) or "").strip()
+        if supplied and not str(resolution_body.get(field) or "").strip():
+            resolution_body[field] = supplied
+    resolution_body["route_token_ref"] = route_token_ref
+
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _runtime_context_resolve_implementation_route_token_ref(
+            resolution_body,
+            project_id=project_id,
+            context=context,
+        )
+    except _orc.RouteTokenRefError as exc:
+        raise GovernanceError(
+            "runtime_context_rejoin_route_token_ref_invalid",
+            "runtime-context session rejoin route_token_ref is not active for the runtime route scope",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "route_token_ref_error_code": exc.code,
+                "route_token_ref_error": str(exc),
+                "route_token_ref_details": dict(exc.details or {}),
+                "next_legal_action": (
+                    "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
+                ),
+                "fail_closed": True,
+            },
+        ) from exc
+    if not resolved:
+        raise GovernanceError(
+            "runtime_context_rejoin_route_token_ref_invalid",
+            "runtime-context session rejoin route_token_ref could not be resolved from the server registry",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "next_legal_action": (
+                    "issue_fresh_same_scope_route_token_ref_and_retry_runtime_context_session_token_rejoin"
+                ),
+                "fail_closed": True,
+            },
+        )
+
+    resolved_identity, lineage_payload = (
+        _runtime_context_implementation_resolved_ref_route_identity(
+            resolved,
+            route_token_ref=route_token_ref,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=expected_route_identity,
+        )
+    )
+    supplied_mismatches = []
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(supplied_route_identity.get(field) or "").strip()
+        if not supplied:
+            continue
+        authoritative = str(resolved_identity.get(field) or "").strip()
+        if authoritative and supplied != authoritative:
+            supplied_mismatches.append(
+                {
+                    "field": field,
+                    "expected": authoritative,
+                    "actual": supplied,
+                }
+            )
+    if supplied_mismatches:
+        raise GovernanceError(
+            "runtime_context_rejoin_route_identity_mismatch",
+            "runtime-context session rejoin supplied route identity does not match the resolved active route token ref",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_identity_mismatch_fields": supplied_mismatches,
+                "next_legal_action": (
+                    "retry_runtime_context_session_token_rejoin_with_resolved_route_identity"
+                ),
+                "fail_closed": True,
+            },
+        )
+
+    lineage_payload = dict(lineage_payload)
+    lineage_payload["_runtime_context_rejoin_route_ref_resolved"] = True
+    return resolved_identity, lineage_payload
+
+
 def _runtime_context_timeline_route_gate(
     *,
     project_id: str,
@@ -15576,10 +15686,21 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         supplied_route_identity = dict(
             _runtime_context_request_route_identity_shapes(ctx).get("supplied") or {}
         )
+        rejoin_route_lineage_payload: dict[str, Any] = {}
+        resolved_route_identity, rejoin_route_lineage_payload = (
+            _runtime_context_rejoin_resolved_ref_route_identity(
+                body,
+                supplied_route_identity,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                expected_route_identity=expected_route_identity,
+            )
+        )
         if expected_route_identity and any(
             str(supplied_route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        ):
+        ) and not resolved_route_identity:
             mismatches = _runtime_context_route_identity_mismatch_fields(
                 expected_route_identity,
                 supplied_route_identity,
@@ -15599,6 +15720,14 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "fail_closed": True,
                     },
                 )
+        safe_route_source = (
+            "resolved_active_route_token_ref"
+            if resolved_route_identity
+            else "runtime_contract_route_identity"
+        )
+        selected_route_identity = (
+            resolved_route_identity if resolved_route_identity else expected_route_identity
+        )
         reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
             context=context,
             runtime_context_id=runtime_context_id,
@@ -15639,12 +15768,31 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             ) from exc
 
         safe_route_identity = {
-            field: str(expected_route_identity.get(field) or "").strip()
+            field: str(selected_route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-            if str(expected_route_identity.get(field) or "").strip()
+            if str(selected_route_identity.get(field) or "").strip()
         }
         if safe_route_identity:
             result["route_identity"] = dict(safe_route_identity)
+            result["route_identity_source"] = safe_route_source
+        if resolved_route_identity:
+            result["route_identity_rebound"] = True
+            result["previous_route_identity"] = _route_identity_public_summary(
+                expected_route_identity
+            )
+            if rejoin_route_lineage_payload:
+                result["route_lineage"] = {
+                    key: value
+                    for key, value in rejoin_route_lineage_payload.items()
+                    if key
+                    in {
+                        "parent_route_lineage",
+                        "child_route_lineage",
+                        "route_lineage",
+                        "parent_route_lineage_repair",
+                    }
+                    and value
+                }
         if result.get("session_token") and result.get("fence_token"):
             host_envelope = {
                 "schema_version": "mf_subagent_session_token_rejoin_host_envelope.v1",
@@ -15665,6 +15813,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             }
             if safe_route_identity:
                 host_envelope["route_identity"] = dict(safe_route_identity)
+                host_envelope["route_identity_source"] = safe_route_source
             result["host_envelope"] = host_envelope
         audit_payload = {
             key: value
@@ -15694,6 +15843,8 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
                 "reopen_for_revision": reopen_for_revision,
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
+                "route_identity_source": safe_route_source,
+                "route_identity_rebound": bool(resolved_route_identity),
             }
         )
         audit_event = task_timeline.record_event(
