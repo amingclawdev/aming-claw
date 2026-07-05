@@ -45,7 +45,7 @@
     "preflight_gate_required_before_fanout_ready": true,
     "preflight_planner_only": true,
     "durable_merge_queue_write_during_preflight": false,
-    "single_row_successor_contract": "mf_parallel.v1",
+    "single_row_successor_contract": "mf_parallel.v2",
     "row_scoped_successor_tokens": true,
     "shared_backlog_close_token_allowed": false,
     "description": "The batch parent never shares one backlog token across rows. It creates a per-row successor plan; each row remains responsible for its own worker, QA, merge, reconcile, and close evidence."
@@ -76,7 +76,7 @@
   },
   "row_fanout_contract": {
     "schema_version": "mf_batch_parallel.row_fanout_contract.v1",
-    "successor_template_id": "mf_parallel.v1",
+    "successor_template_id": "mf_parallel.v2",
     "successor_interface": "mf_parallel_enter",
     "required_per_row_fields": [
       "backlog_id",

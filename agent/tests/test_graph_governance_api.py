@@ -32299,6 +32299,67 @@ def test_onboard_route_guide_direct_main_complete_projection_points_to_exception
     assert "enter the selected successor interface" not in next_action["next_step"]
 
 
+@pytest.mark.parametrize(
+    ("role", "work_type", "expected_interface"),
+    [
+        ("observer", "multi_backlog_parallel", "mf_batch_parallel_enter"),
+        ("worker", "parallel_worker", "mf_parallel_enter"),
+    ],
+)
+def test_onboard_route_guide_completed_projection_returns_selected_successor_entrypoint(
+    conn,
+    role,
+    work_type,
+    expected_interface,
+):
+    backlog_id = f"AC-ONBOARD-COMPLETE-{work_type.upper().replace('_', '-')}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": role,
+                "work_type": work_type,
+                "route_token_ref": f"rtok-complete-{work_type}",
+            },
+        )
+    )
+
+    assert result["runtime_resume"]["readiness_state"] == "contract_complete"
+    next_action = result["next_legal_action"]
+    assert next_action["id"] == expected_interface
+    assert next_action["action"] == expected_interface
+    assert next_action["interface"] == expected_interface
+    assert next_action["contract_complete_runtime_no_remaining_line"] is True
+    assert next_action["legacy_onboard_contract_waived"] is True
+    assert next_action["meta_contract_gate_decision_source"] is False
+    assert next_action["requires_role"] == "observer"
+    assert next_action["requires_route_token_ref"] is True
+    assert result["onboard_route_guide"]["backlog_chain_binding"]["continue"][
+        "next_legal_action"
+    ]["id"] == expected_interface
+    assert result["next_legal_action"]["id"] != "contract_complete_no_runtime_action"
+
+    if work_type == "multi_backlog_parallel":
+        assert next_action["path"] == "/api/projects/{project_id}/mf-batch-parallel/enter"
+        assert next_action["requires_backlog_ids"] is True
+        assert next_action["contract_template_id"] == "mf_batch_parallel.v1"
+        assert next_action["successor_contract_template_id"] == "mf_parallel.v2"
+        assert next_action["row_scoped_successor_tokens"] is True
+    else:
+        assert next_action["path"] == "/api/projects/{project_id}/mf-parallel/enter"
+        assert next_action["contract_template_id"] == "mf_parallel.v2"
+        assert next_action["requires_observer_dispatch"] is True
+        assert next_action["worker_direct_entry_allowed"] is False
+        assert (
+            next_action["worker_runtime_guide_after_dispatch"]
+            == "runtime_context_worker_guide"
+        )
+
+
 def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-RESUME-DIRECT-FIX"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -32481,8 +32542,12 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     assert batch["batch_scope_policy"]["multi_backlog_parent"] is True
     assert batch["batch_scope_policy"]["row_scoped_successor_tokens"] is True
     assert (
+        batch["batch_scope_policy"]["single_row_successor_contract"]
+        == server.MF_PARALLEL_CONTRACT_ID
+    )
+    assert (
         batch["row_fanout_contract"]["successor_template_id"]
-        == "mf_parallel.v1"
+        == server.MF_PARALLEL_CONTRACT_ID
     )
     assert (
         batch["row_fanout_contract"]["close_policy"][

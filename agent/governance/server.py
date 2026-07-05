@@ -43994,6 +43994,46 @@ def _onboard_route_guide_completed_next_action(
                 "with DB-verified graph trace ids, then edit only approved files"
             ),
         }
+    if selected_work_type == "multi_backlog_parallel":
+        return {
+            **base,
+            "id": "mf_batch_parallel_enter",
+            "action": "mf_batch_parallel_enter",
+            "interface": "mf_batch_parallel_enter",
+            "path": "/api/projects/{project_id}/mf-batch-parallel/enter",
+            "requires_role": "observer",
+            "requires_route_token_ref": True,
+            "requires_backlog_ids": True,
+            "contract_template_id": MF_BATCH_PARALLEL_CONTRACT_ID,
+            "successor_contract_template_id": MF_PARALLEL_CONTRACT_ID,
+            "fanout_successor": "mf_parallel",
+            "row_scoped_successor_tokens": True,
+            "next_step": (
+                "call mf_batch_parallel_enter with backlog_ids, human reason, "
+                "observer_session_id, and route_token_ref to start row-scoped "
+                "mf_parallel.v2 successors"
+            ),
+        }
+    if selected_work_type == "parallel_worker":
+        return {
+            **base,
+            "id": "mf_parallel_enter",
+            "action": "mf_parallel_enter",
+            "interface": "mf_parallel_enter",
+            "path": "/api/projects/{project_id}/mf-parallel/enter",
+            "requires_role": "observer",
+            "requires_route_token_ref": True,
+            "contract_template_id": MF_PARALLEL_CONTRACT_ID,
+            "single_backlog_scoped": True,
+            "requires_observer_dispatch": True,
+            "worker_direct_entry_allowed": False,
+            "worker_runtime_guide_after_dispatch": "runtime_context_worker_guide",
+            "next_step": (
+                "use mf_parallel_enter from an observer route to create the "
+                "row-scoped worker runtime; the worker then reads "
+                "runtime_context_worker_guide"
+            ),
+        }
     return {
         **base,
         "id": "contract_complete_no_runtime_action",
