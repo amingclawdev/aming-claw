@@ -7867,6 +7867,7 @@ def _observer_direct_changed_file_scope(
     allowed_files = _dedupe_nonempty(
         [
             *_string_list(close_context.get("target_files")),
+            *_string_list(close_context.get("test_files")),
             *_string_list(close_context.get("owned_files")),
             *_string_list(close_context.get("allowed_files")),
             *_string_list(close_context.get("allowed_changed_files")),
