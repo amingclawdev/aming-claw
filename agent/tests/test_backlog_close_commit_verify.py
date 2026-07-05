@@ -422,6 +422,142 @@ def test_mf_close_accepts_operator_approved_observer_direct_exception(
     _mock_audit,
 ):
     """Operator-approved observer-direct rows can close without worker/QA lanes."""
+    from agent.governance import task_timeline
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    row = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "priority": "P0",
+        "target_files": '["agent/governance/server.py"]',
+        "title": "Direct close gate",
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": {
+            "governance_policy": {"requirements": {"independent_qa": True}},
+            "close_context": {"close_commit": "abc1234"},
+            "route_context_hash": _ROUTE_CONTEXT_HASH,
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        },
+    }
+    _mock_db.execute.return_value.fetchone.return_value = row
+    events = [
+        {
+            "id": 7101,
+            "event_type": "mf.observer_direct_implementation_exception",
+            "event_kind": "observer_direct_implementation_exception",
+            "phase": "pre_mutation",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "payload": {
+                "route_context_hash": _ROUTE_CONTEXT_HASH,
+                "prompt_contract_id": "prompt-contract-backlog-close",
+                "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
+                "reason": "operator-supervised direct repair of a close gate",
+                "operator_approval": {"approved": True, "approved_by": "operator"},
+                "dirty_scope_check": {"dirty_files": []},
+            },
+        },
+        {
+            "id": 7102,
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "commit_sha": "abc1234",
+            "payload": {
+                "changed_files": ["agent/governance/server.py"],
+                "dirty_scope_check": {
+                    "changed_files": ["agent/governance/server.py"],
+                    "unexpected_files": [],
+                },
+            },
+        },
+        {
+            "id": 7103,
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "status": "passed",
+            "actor": "qa:observer-direct",
+            "commit_sha": "abc1234",
+            "verification": {
+                "tests_run": ["pytest -q agent/tests/test_backlog_close_commit_verify.py"],
+                "test_results": {"passed": 1},
+                "diff_check": {"unexpected_files": []},
+                "live_regression": {"status": "passed"},
+            },
+        },
+        {
+            "id": 7104,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "accepted",
+            "actor": "codex_observer",
+            "commit_sha": "abc1234",
+            "verification": {
+                "governance_redeploy": {"status": "passed"},
+                "runtime_version_sync": True,
+                "graph_reconciled": True,
+                "preflight_ok": True,
+                "live_regression": {"status": "passed"},
+            },
+        },
+    ]
+    ctx = _make_ctx(commit="abc1234")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        result = handle_backlog_close(ctx)
+
+    assert result["ok"] is True
+    assert result["gate_summary"]["ok"] is True
+    assert result["gate_summary"]["can_close"] is True
+    assert result["gate_summary"]["failed_gates"] == []
+    direct_gate = result["gate_summary"]["observer_direct_close_exception_gate"]
+    assert direct_gate["passed"] is True
+    assert direct_gate["accepted_exception_event_id"] == 7101
+    assert "independent_qa_gate" in direct_gate["replaced_gate_ids"]
+    assert direct_gate["changed_file_scope"]["unexpected_changed_files"] == []
+    timeline_contract = dict(row["chain_trigger_json"])
+    timeline_contract["close_context"] = {
+        **timeline_contract["close_context"],
+        "target_files": ["agent/governance/server.py"],
+    }
+    timeline_gate = task_timeline.mf_close_gate_verification(
+        events,
+        contract=timeline_contract,
+    )
+    accepted_exception = timeline_gate["observer_direct_close_exception_gate"][
+        "accepted_exception"
+    ]
+    assert (
+        "operator_approval.close_satisfying_shape"
+        in accepted_exception["accepted_fields"]
+    )
+    approval_shape = accepted_exception["operator_approval_shape"]
+    assert approval_shape["accepted"] is True
+    assert "operator_approval.approved" in approval_shape["accepted_fields"]
+
+
+@patch("agent.governance.server.subprocess.run")
+def test_mf_close_operator_approved_observer_direct_exception_rejects_loose_operator_approval_shape(
+    _mock_subprocess,
+    _mock_db,
+    _mock_audit,
+):
+    """Legacy loose operator_approval metadata does not satisfy close authority."""
+    from agent.governance.errors import GovernanceError
     from agent.governance.server import handle_backlog_close
 
     _mock_subprocess.return_value = MagicMock(returncode=0)
@@ -464,7 +600,11 @@ def test_mf_close_accepts_operator_approved_observer_direct_exception(
                 "prompt_contract_id": "prompt-contract-backlog-close",
                 "prompt_contract_hash": _PROMPT_CONTRACT_HASH,
                 "reason": "operator-supervised direct repair of a close gate",
-                "operator_approval": {"approved": True, "approved_by": "operator"},
+                "operator_approval": {
+                    "approved_work_type": "observer_direct",
+                    "ref": "operator-note-1",
+                    "source": "operator",
+                },
                 "dirty_scope_check": {"dirty_files": []},
             },
         },
@@ -485,10 +625,10 @@ def test_mf_close_accepts_operator_approved_observer_direct_exception(
         },
         {
             "id": 7103,
-            "event_kind": "verification",
+            "event_kind": "independent_verification",
             "phase": "verification",
             "status": "passed",
-            "actor": "codex_observer",
+            "actor": "qa:observer-direct",
             "commit_sha": "abc1234",
             "verification": {
                 "tests_run": ["pytest -q agent/tests/test_backlog_close_commit_verify.py"],
@@ -516,17 +656,28 @@ def test_mf_close_accepts_operator_approved_observer_direct_exception(
     ctx = _make_ctx(commit="abc1234")
 
     with patch("agent.governance.task_timeline.list_events", return_value=events):
-        result = handle_backlog_close(ctx)
+        with pytest.raises(GovernanceError) as exc_info:
+            handle_backlog_close(ctx)
 
-    assert result["ok"] is True
-    assert result["gate_summary"]["ok"] is True
-    assert result["gate_summary"]["can_close"] is True
-    assert result["gate_summary"]["failed_gates"] == []
-    direct_gate = result["gate_summary"]["observer_direct_close_exception_gate"]
-    assert direct_gate["passed"] is True
-    assert direct_gate["accepted_exception_event_id"] == 7101
-    assert "independent_qa_gate" in direct_gate["replaced_gate_ids"]
-    assert direct_gate["changed_file_scope"]["unexpected_changed_files"] == []
+    assert exc_info.value.code == "mf_timeline_gate_failed"
+    details = exc_info.value.details
+    gate_summary = details.get("gate_summary", {})
+    timeline_gate = details.get("timeline_gate", {})
+    direct_gate = gate_summary.get("observer_direct_close_exception_gate") or details.get(
+        "observer_direct_close_exception_gate",
+        {},
+    ) or timeline_gate.get("observer_direct_close_exception_gate", {})
+    assert direct_gate["passed"] is False
+    rejected = direct_gate["rejected_exceptions"][0]
+    assert "operator_approval.close_satisfying_shape" in rejected["missing_fields"]
+    approval_shape = rejected["operator_approval_shape"]
+    assert approval_shape["status"] == "legacy_loose_rejected"
+    assert approval_shape["legacy_loose_shape_detected"] is True
+    assert approval_shape["rejected_shapes"][0]["present_fields"] == [
+        "approved_work_type",
+        "ref",
+        "source",
+    ]
 
 
 @patch("agent.governance.server.subprocess.run")

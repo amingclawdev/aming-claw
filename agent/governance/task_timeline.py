@@ -7763,20 +7763,148 @@ def _has_dirty_scope_evidence(event: dict[str, Any]) -> bool:
     return False
 
 
+def _operator_approval_shape(event: dict[str, Any]) -> dict[str, Any]:
+    accepted_fields: list[str] = []
+    rejected_shapes: list[dict[str, Any]] = []
+    legacy_loose_shape_detected = False
+
+    def add_accepted(field: str) -> None:
+        if field not in accepted_fields:
+            accepted_fields.append(field)
+
+    for container in (
+        _mapping(event),
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    ):
+        if str(container.get("approved_by") or "").strip():
+            add_accepted("approved_by")
+        if _truthy(container.get("operator_approved")):
+            add_accepted("operator_approved")
+        for field in ("operator_approval", "approval"):
+            if field not in container:
+                continue
+            value = container.get(field)
+            if isinstance(value, Mapping):
+                present_fields = [
+                    key
+                    for key in (
+                        "approved",
+                        "approved_by",
+                        "operator_approved",
+                        "approved_work_type",
+                        "ref",
+                        "source",
+                    )
+                    if key in value
+                ]
+                present_fields.extend(
+                    sorted(
+                        str(key)
+                        for key in value.keys()
+                        if str(key)
+                        not in {
+                            "approved",
+                            "approved_by",
+                            "operator_approved",
+                            "approved_work_type",
+                            "ref",
+                            "source",
+                        }
+                    )
+                )
+                if str(value.get("approved_by") or "").strip():
+                    add_accepted(f"{field}.approved_by")
+                if _truthy(value.get("operator_approved")):
+                    add_accepted(f"{field}.operator_approved")
+                if _truthy(value.get("approved")):
+                    add_accepted(f"{field}.approved")
+                legacy_loose = (
+                    field == "operator_approval"
+                    and {"approved_work_type", "ref", "source"}.issubset(value.keys())
+                    and not (
+                        str(value.get("approved_by") or "").strip()
+                        or _truthy(value.get("operator_approved"))
+                        or _truthy(value.get("approved"))
+                    )
+                )
+                if legacy_loose:
+                    legacy_loose_shape_detected = True
+                    rejected_shapes.append(
+                        {
+                            "field": field,
+                            "shape": "legacy_loose_operator_approval",
+                            "present_fields": [
+                                key
+                                for key in ("approved_work_type", "ref", "source")
+                                if key in value
+                            ],
+                            "reason": (
+                                "legacy loose operator_approval metadata does not prove "
+                                "operator approval for close authority"
+                            ),
+                        }
+                    )
+                elif not any(
+                    candidate in accepted_fields
+                    for candidate in (
+                        f"{field}.approved",
+                        f"{field}.approved_by",
+                        f"{field}.operator_approved",
+                    )
+                ):
+                    rejected_shapes.append(
+                        {
+                            "field": field,
+                            "shape": "approval_object_without_close_satisfying_field",
+                            "present_fields": present_fields,
+                            "reason": (
+                                "approval object must include approved=true, "
+                                "approved_by, or operator_approved=true"
+                            ),
+                        }
+                    )
+            elif value not in (None, "", [], {}):
+                rejected_shapes.append(
+                    {
+                        "field": field,
+                        "shape": "unsupported_scalar_operator_approval",
+                        "present_fields": [],
+                        "reason": (
+                            "operator approval must be an object with approved=true, "
+                            "approved_by, or operator_approved=true"
+                        ),
+                    }
+                )
+
+    accepted = bool(accepted_fields)
+    if accepted:
+        status = "accepted"
+    elif legacy_loose_shape_detected:
+        status = "legacy_loose_rejected"
+    elif rejected_shapes:
+        status = "unsupported_shape_rejected"
+    else:
+        status = "missing"
+    return {
+        "schema_version": "operator_approval_shape.v1",
+        "accepted": accepted,
+        "status": status,
+        "accepted_fields": accepted_fields,
+        "required_any_of": [
+            "operator_approval.approved=true",
+            "operator_approval.approved_by",
+            "operator_approved=true",
+            "approved_by",
+        ],
+        "legacy_loose_shape_detected": legacy_loose_shape_detected,
+        "rejected_shapes": rejected_shapes,
+    }
+
+
 def _has_operator_approval(event: dict[str, Any]) -> bool:
-    if _first_event_string(event, {"approved_by"}):
-        return True
-    if any(_truthy(value) for value in _event_field_values(event, {"operator_approved"})):
-        return True
-    for value in _event_field_values(event, {"operator_approval", "approval"}):
-        if isinstance(value, dict):
-            if str(value.get("approved_by") or "").strip():
-                return True
-            if _truthy(value.get("operator_approved") or value.get("approved")):
-                return True
-        elif _truthy(value):
-            return True
-    return False
+    return bool(_operator_approval_shape(event).get("accepted"))
 
 
 def _observer_direct_exception_event(
@@ -7819,7 +7947,8 @@ def _observer_direct_exception_event(
         )
     reason = _first_event_string(event, {"reason", "exception_reason", "waiver_reason"})
     has_dirty_scope = _has_dirty_scope_evidence(event)
-    has_operator_approval = _has_operator_approval(event)
+    operator_approval_shape = _operator_approval_shape(event)
+    has_operator_approval = bool(operator_approval_shape.get("accepted"))
 
     missing_fields: list[str] = []
     if not has_route:
@@ -7831,7 +7960,7 @@ def _observer_direct_exception_event(
     if not has_dirty_scope:
         missing_fields.append("dirty_scope_or_dirty_scope_check")
     if not has_operator_approval:
-        missing_fields.append("operator_approval")
+        missing_fields.append("operator_approval.close_satisfying_shape")
 
     accepted = not missing_fields
     return {
@@ -7844,10 +7973,11 @@ def _observer_direct_exception_event(
                 ("route_id_or_route_context_hash", has_route and route_matches),
                 ("reason", bool(reason)),
                 ("dirty_scope_or_dirty_scope_check", has_dirty_scope),
-                ("operator_approval", has_operator_approval),
+                ("operator_approval.close_satisfying_shape", has_operator_approval),
             )
             if present
         ],
+        "operator_approval_shape": operator_approval_shape,
     }
 
 
