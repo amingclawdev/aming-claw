@@ -27997,6 +27997,14 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     graph_gate = direct_main["close_satisfying_evidence_template"]["graph_first_gate"]
     assert graph_gate["required"] is True
     assert graph_gate["query_source"] == "observer"
+    assert graph_gate["required_query_identity"]["task_id"] == parent_execution_id
+    assert graph_gate["required_query_identity"]["db_column"] == (
+        "graph_query_traces.task_id"
+    )
+    assert "route_context_hash" in graph_gate["required_query_identity"][
+        "route_identity_fields"
+    ]
+    assert "graph_query_traces_task_id_mismatch" in graph_gate["rejects"]
     assert "trace_like_ids_without_graph_query_traces_row" in graph_gate["rejects"]
     route_identity = {
         "route_id": "route-parentless-direct-main",
@@ -28661,7 +28669,12 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
     conn,
     monkeypatch,
 ):
-    def build_precheck(suffix: str, graph_trace_ids: list[str]) -> dict:
+    def build_precheck(
+        suffix: str,
+        graph_trace_ids: list[str],
+        *,
+        insert_trace_task_id: str | None = None,
+    ) -> dict:
         backlog_id = f"AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-GRAPH-{suffix}"
         close_commit = hashlib.sha1(suffix.encode("utf-8")).hexdigest()
         route_token_ref = f"rtok-parentless-direct-main-graph-{suffix.lower()}"
@@ -28715,6 +28728,13 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
                 "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
             },
         )
+        if insert_trace_task_id is not None:
+            for trace_id in graph_trace_ids:
+                _insert_observer_graph_query_trace(
+                    conn,
+                    trace_id=trace_id,
+                    task_id=insert_trace_task_id,
+                )
         append_base = {
             "backlog_id": backlog_id,
             "task_id": parent_execution_id,
@@ -28877,6 +28897,46 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
         "graph_trace_ids_db_verified",
     )
     assert graph_gate["db_evidence"]["missing_trace_ids"] == [fake_trace_id]
+
+    missing_task_trace_id = "gqt-20260704-0bad7a51"
+    missing_task_precheck = build_precheck(
+        "MISSINGTASK",
+        [missing_task_trace_id],
+        insert_trace_task_id="",
+    )
+    graph_gate = assert_close_blocked_by_graph_gate(
+        missing_task_precheck,
+        "graph_trace_task_id_db_verified",
+    )
+    assert "graph_trace_ids_db_verified" in graph_gate["missing_requirement_ids"]
+    assert graph_gate["db_evidence"]["identity_mismatches"] == [
+        {
+            "trace_id": missing_task_trace_id,
+            "field": "task_id",
+            "expected": missing_task_precheck["parent_execution_id"],
+            "actual": "",
+        }
+    ]
+
+    wrong_task_trace_id = "gqt-20260704-bad7a512"
+    wrong_task_precheck = build_precheck(
+        "WRONGTASK",
+        [wrong_task_trace_id],
+        insert_trace_task_id="other-contract",
+    )
+    graph_gate = assert_close_blocked_by_graph_gate(
+        wrong_task_precheck,
+        "graph_trace_task_id_db_verified",
+    )
+    assert "graph_trace_ids_db_verified" in graph_gate["missing_requirement_ids"]
+    assert graph_gate["db_evidence"]["identity_mismatches"] == [
+        {
+            "trace_id": wrong_task_trace_id,
+            "field": "task_id",
+            "expected": wrong_task_precheck["parent_execution_id"],
+            "actual": "other-contract",
+        }
+    ]
 
 
 def test_parentless_direct_main_rejects_event_allowed_files_outside_row_scope(

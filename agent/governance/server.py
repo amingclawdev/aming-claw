@@ -42442,8 +42442,9 @@ def _onboard_contract_route_guide(
         ],
         "next_action": (
             "run graph_query first, record observer_direct_mutation_exception "
-            "with DB-verified graph trace ids before mutation, then edit only "
-            "approved row-scoped files and record tests"
+            "with DB-verified graph trace ids bound to this contract task_id "
+            "before mutation, then edit only approved row-scoped files and "
+            "record tests"
         ),
         "close_satisfying_evidence_template": {
             "schema_version": (
@@ -42455,6 +42456,19 @@ def _onboard_contract_route_guide(
                 "required": True,
                 "mcp_tool": "graph_query",
                 "query_source": "observer",
+                "required_query_identity": {
+                    "task_id": contract_execution_id,
+                    "task_id_source": "root_contract_execution_id",
+                    "db_column": "graph_query_traces.task_id",
+                    "route_identity_fields": [
+                        "route_id",
+                        "route_context_hash",
+                        "prompt_contract_id",
+                        "prompt_contract_hash",
+                        "visible_injection_manifest_hash",
+                        "route_token_ref",
+                    ],
+                },
                 "allowed_query_purposes": [
                     "global_architecture_review",
                     "gate_validation",
@@ -42478,6 +42492,7 @@ def _onboard_contract_route_guide(
                     "empty_graph_trace_ids",
                     "placeholder_graph_trace_ids",
                     "trace_like_ids_without_graph_query_traces_row",
+                    "graph_query_traces_task_id_mismatch",
                     "post_hoc_graph_trace_after_implementation",
                 ],
             },
@@ -52574,6 +52589,11 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
         missing.append("graph_trace_ids_plausible")
     if trace_ids and not db_evidence.get("db_verified"):
         missing.append("graph_trace_ids_db_verified")
+        if any(
+            isinstance(item, Mapping) and item.get("field") == "task_id"
+            for item in db_evidence.get("identity_mismatches") or []
+        ):
+            missing.append("graph_trace_task_id_db_verified")
     if post_hoc_trace_ids or post_hoc_graph_trace_marker:
         missing.append("graph_trace_before_direct_main_implementation")
     passed = bool(candidate_events and trace_ids) and not missing
