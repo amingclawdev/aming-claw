@@ -8779,6 +8779,107 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("independent_qa_gate", direct_group["replaced_gate_ids"])
         self.assertIn("cross_ref_gate", direct_group["replaced_gate_ids"])
 
+    def test_observer_direct_exception_allows_backlog_test_files_scope(self):
+        from agent.governance import task_timeline
+
+        close_commit = "abc1234"
+        test_file = "agent/tests/test_task_timeline.py"
+        contract = {
+            "governance_policy": STRICT_GOVERNANCE_POLICY,
+            "close_context": {
+                "close_commit": close_commit,
+                "target_files": ["agent/governance/task_timeline.py"],
+                "test_files": [test_file],
+            },
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        events = [
+            {
+                "id": 7151,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "reason": "operator-supervised direct repair of a close gate",
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    },
+                    "dirty_scope_check": {"dirty_files": []},
+                },
+            },
+            {
+                "id": 7152,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    "changed_files": [test_file],
+                    "dirty_scope_check": {
+                        "changed_files": [test_file],
+                        "unexpected_files": [],
+                    },
+                },
+            },
+            {
+                "id": 7153,
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": "reviewer:observer-direct",
+                "commit_sha": close_commit,
+                "verification": {
+                    "reviewer_role": "qa",
+                    "tests_run": ["pytest -q agent/tests/test_task_timeline.py"],
+                    "diff_check": {"unexpected_files": []},
+                    "live_regression": {"status": "passed"},
+                },
+            },
+            {
+                "id": 7154,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "governance_redeploy": {"status": "passed"},
+                    "runtime_version_sync": True,
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                    "live_regression": {"status": "passed"},
+                },
+            },
+        ]
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        direct_gate = ready["observer_direct_close_exception_gate"]
+        self.assertTrue(ready["passed"], ready)
+        self.assertTrue(direct_gate["passed"], ready)
+        self.assertEqual(direct_gate["changed_file_scope"]["unexpected_changed_files"], [])
+        self.assertIn(test_file, direct_gate["changed_file_scope"]["allowed_files"])
+        self.assertEqual(
+            direct_gate["verification_event"]["actor"],
+            "reviewer:observer-direct",
+        )
+
     def test_observer_direct_exception_rejects_changed_files_outside_scope(self):
         from agent.governance import task_timeline
 
