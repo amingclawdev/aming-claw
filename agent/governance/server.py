@@ -52482,19 +52482,6 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
         )
         marker = _contract_runtime_parentless_direct_main_marker(event)
         event_ref = f"timeline:{event_id}" if event_id else marker
-        if implementation_order and event_order >= implementation_order:
-            post_hoc_trace_ids.extend(ids)
-            post_hoc_graph_trace_marker = True
-            rejected_events.append(
-                {
-                    "event_ref": event_ref,
-                    "event_kind": event.get("event_kind"),
-                    "phase": event.get("phase"),
-                    "reason": "graph_trace_recorded_after_direct_main_implementation",
-                    "graph_trace_ids": ids,
-                }
-            )
-            continue
         if not is_direct_exception_event and "graph" not in marker:
             rejected_events.append(
                 {
@@ -52529,6 +52516,19 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
                     "event_kind": event.get("event_kind"),
                     "phase": event.get("phase"),
                     "reason": "graph_trace_event_missing_route_token_authority",
+                    "graph_trace_ids": ids,
+                }
+            )
+            continue
+        if implementation_order and event_order >= implementation_order:
+            post_hoc_trace_ids.extend(ids)
+            post_hoc_graph_trace_marker = True
+            rejected_events.append(
+                {
+                    "event_ref": event_ref,
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "reason": "graph_trace_recorded_after_direct_main_implementation",
                     "graph_trace_ids": ids,
                 }
             )
@@ -52936,7 +52936,23 @@ def _contract_runtime_close_authority_projection(
                 )
             )
             if parentless_direct_projection:
-                return parentless_direct_projection
+                return {
+                    **parentless_direct_projection,
+                    "authority_selection": {
+                        "schema_version": (
+                            "contract_runtime_close_authority_selection.v1"
+                        ),
+                        "selected_authority": "parentless_direct_main",
+                        "selection_reason": (
+                            "explicit_onboard_service_root_contract_execution_ref_with_"
+                            "source_backed_parentless_direct_main_evidence"
+                        ),
+                        "contract_execution_id": requested_execution_id,
+                        "deferred_authority_sources": [
+                            "active_child_contract_runtime_close_authority"
+                        ],
+                    },
+                }
             if child_lane_projection:
                 return child_lane_projection
         return {}
@@ -52983,6 +52999,52 @@ def _contract_runtime_close_authority_projection(
                 "error": "contract_execution_scope_mismatch",
             },
         )
+
+    if _onboard_service_record(record):
+        current_state = _runtime_current_state_from_record(record)
+        if current_state.get("next_legal_action"):
+            return {
+                **_contract_runtime_close_authority_payload_fields(),
+                "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+                "accepted": False,
+                "status": "incomplete",
+                "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                    source="contract_runtime_close_authority_projection",
+                    contract_execution_id=contract_execution_id,
+                ),
+                "legacy_advisory": True,
+                "authoritative": False,
+                "contract_execution_id": contract_execution_id,
+                "next_legal_action": current_state.get("next_legal_action") or {},
+                "projected_events": [],
+            }
+        parentless_direct_projection = _contract_runtime_parentless_direct_main_projection(
+            conn=conn,
+            project_id=project_id,
+            bug_id=bug_id,
+            requested_execution_id=contract_execution_id,
+            close_commit=close_commit,
+            timeline_events=timeline_events,
+            row_declared_files=_backlog_declared_direct_file_scope(conn, bug_id),
+        )
+        if parentless_direct_projection:
+            return {
+                **parentless_direct_projection,
+                "authority_selection": {
+                    "schema_version": (
+                        "contract_runtime_close_authority_selection.v1"
+                    ),
+                    "selected_authority": "parentless_direct_main",
+                    "selection_reason": (
+                        "explicit_onboard_service_root_contract_execution_id_with_"
+                        "source_backed_parentless_direct_main_evidence"
+                    ),
+                    "contract_execution_id": contract_execution_id,
+                    "deferred_authority_sources": [
+                        "active_child_contract_runtime_close_authority"
+                    ],
+                },
+            }
 
     try:
         record, _runtime_context_projection = (
@@ -58632,6 +58694,27 @@ def _timeline_gate_contract_runtime_projection_body(
 ) -> dict[str, Any]:
     body = dict(query or {})
     if _contract_runtime_close_execution_id(body):
+        return body
+    requested_body_execution_id = _contract_runtime_close_requested_execution_ref(body)
+    if requested_body_execution_id.startswith("onboard-service-"):
+        body["current_contract_execution_id"] = requested_body_execution_id
+        body["contract_runtime_close_authority_required"] = True
+        body["contract_runtime"] = {
+            **(
+                dict(body.get("contract_runtime"))
+                if isinstance(body.get("contract_runtime"), Mapping)
+                else {}
+            ),
+            "contract_execution_id": "",
+            "current_contract_execution_id": requested_body_execution_id,
+            "projection_source": "explicit_onboard_service_root_close_request",
+            "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+                source="explicit_onboard_service_root_close_request",
+                contract_execution_id=requested_body_execution_id,
+            ),
+            "legacy_advisory": True,
+            "authoritative": False,
+        }
         return body
     current: dict[str, Any] = {}
     try:

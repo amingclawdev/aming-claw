@@ -25740,6 +25740,28 @@ def _complete_source_backed_mf_parallel_successor(
         "changed_files": ["agent/governance/server.py"],
         **route_identity,
     }
+    worker_graph_trace_id = "gqt-20260628-feed1234"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=worker_graph_trace_id,
+        parent_task_id=runtime_context.parent_task_id or backlog_id,
+        snapshot_id="scope-mf-parallel-source-backed-complete",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=runtime_context.fence_token,
+        run_id=_mf_sub_run_id(runtime_context.task_id, runtime_context.fence_token),
+    )
+    qa_graph_trace_id = "gqt-20260628-aabb5678"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=qa_graph_trace_id,
+        snapshot_id="scope-mf-parallel-source-backed-qa",
+        actor="qa",
+        query_source="qa",
+        query_purpose="qa_gate_validation",
+        task_id=contract_execution_id,
+    )
     line_specs = [
         (
             "observer",
@@ -25778,7 +25800,11 @@ def _complete_source_backed_mf_parallel_successor(
             "worker_context",
             "worker_graph_context",
             "graph_trace",
-            {**worker_payload, "graph_query_trace_ids": ["gqt-20260628-feed"]},
+            {
+                **worker_payload,
+                "graph_trace_ids": [worker_graph_trace_id],
+                "graph_query_trace_ids": [worker_graph_trace_id],
+            },
             "",
         ),
         (
@@ -25833,6 +25859,19 @@ def _complete_source_backed_mf_parallel_successor(
             "review_ready",
             {**worker_payload, "review_ready": True, "stop_state": "review_ready"},
             worker_commit,
+        ),
+        (
+            "qa",
+            "qa_graph_context",
+            "qa_graph_context",
+            "graph_trace",
+            {
+                **route_identity,
+                "target_project_root": runtime_context.target_project_root,
+                "graph_trace_ids": [qa_graph_trace_id],
+                "graph_query_trace_ids": [qa_graph_trace_id],
+            },
+            "",
         ),
         (
             "qa",
@@ -25896,6 +25935,34 @@ def _complete_source_backed_mf_parallel_successor(
         for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_role"):
             if payload.get(key):
                 write[key] = payload[key]
+        if line_id == "worker_graph_context":
+            write["graph_trace_ids"] = [worker_graph_trace_id]
+            write["db_verified"] = True
+            write["query_source"] = "mf_subagent"
+            write["query_purpose"] = "subagent_context_build"
+            write["graph_trace_evidence"] = {
+                "db_verified": True,
+                "graph_trace_ids": [worker_graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": runtime_context.parent_task_id or backlog_id,
+                "target_project_root": runtime_context.target_project_root,
+                "worker_role": "mf_sub",
+            }
+        if line_id == "qa_graph_context":
+            write["graph_trace_ids"] = [qa_graph_trace_id]
+            write["db_verified"] = True
+            write["query_source"] = "qa"
+            write["query_purpose"] = "qa_gate_validation"
+            write["graph_trace_evidence"] = {
+                "db_verified": True,
+                "graph_trace_ids": [qa_graph_trace_id],
+                "query_source": "qa",
+                "query_purpose": "qa_gate_validation",
+                "target_project_root": runtime_context.target_project_root,
+            }
         if payload.get("worker_id"):
             write["worker_id"] = payload["worker_id"]
         if payload.get("worker_slot_id"):
@@ -25907,7 +25974,14 @@ def _complete_source_backed_mf_parallel_successor(
             write,
             actor_role=actor_role,
         )
-        assert result["ok"] is True
+        decision = result.get("decision") if isinstance(result.get("decision"), dict) else {}
+        assert result["ok"] is True, (
+            line_id,
+            decision.get("errors"),
+            decision.get("missing_proof_fields"),
+            decision.get("graph_status"),
+            decision.get("next_move"),
+        )
         record = result["record"]
     assert record["runtime_guide"]["next_legal_action"] is None
     return record
@@ -27217,7 +27291,7 @@ def test_backlog_close_projects_successor_runtime_lines_when_close_scoped_to_par
         )
     )
     projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
-    assert projection["accepted"] is True, projection
+    assert projection["accepted"] is True
     assert projection["contract_execution_id"] == parent_execution_id
     assert (
         successor["contract_execution_id"]
@@ -28099,6 +28173,472 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         return real_subprocess_run(args, *run_args, **run_kwargs)
 
     monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+
+
+def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_gate(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-ACTIVE-CHILD"
+    close_commit = "df6275118745006c8324dfcbeecea62c39e91936"
+    worker_commit = "e05d49fc962bd91e20b540b8f3ca5f06b27c293e"
+    close_route_token_ref = "rtok-parentless-direct-main-active-child-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-parentless-direct-main-active-child-parent",
+            },
+        )
+    )
+    parent_execution_id = guide["contract_chain_current"][
+        "current_contract_execution_id"
+    ]
+    assert parent_execution_id.startswith("onboard-service-")
+
+    route_identity = {
+        "route_id": "route-parentless-direct-main-active-child",
+        "route_context_hash": _fake_sha("route-parentless-direct-main-active-child"),
+        "prompt_contract_id": "rprompt-parentless-direct-main-active-child",
+        "prompt_contract_hash": _fake_sha(
+            "prompt-parentless-direct-main-active-child"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-parentless-direct-main-active-child"
+        ),
+        "route_token_ref": close_route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=close_route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close", "task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
+        },
+    )
+    graph_trace_id = "gqt-20260705-abcd1234"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        task_id=parent_execution_id,
+    )
+    append_base = {
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+        "route_token_ref": close_route_token_ref,
+    }
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "actor": "observer",
+                "payload": {
+                    **route_identity,
+                    "reason": "operator-supervised parentless direct-main repair",
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    },
+                    "dirty_scope_check": {"dirty_files": []},
+                    "allowed_files": ["agent/governance/server.py"],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            },
+        )
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "observer.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    **route_identity,
+                    "changed_files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                    "dirty_scope_check": {"unexpected_files": []},
+                },
+            },
+        )
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": "qa:direct-main",
+                "commit_sha": close_commit,
+                "verification": {
+                    "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
+                    "diff_check": {"unexpected_files": []},
+                    "live_regression": {"status": "passed"},
+                },
+                "payload": {**route_identity, "independent": True},
+            },
+        )
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "observer.close_ready",
+                "event_kind": "close_ready",
+                "phase": "close_ready",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "governance_redeploy": {"status": "passed"},
+                    "runtime_version_sync": True,
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                    "live_regression": {"status": "passed"},
+                },
+                "payload": {**route_identity, "close_commit": close_commit},
+            },
+        )
+    )
+
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-parentless-direct-main-active-child",
+    )
+    parent_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["mf_parallel_enter", "onboard_route_guide"],
+    )
+    parent_ref = parent_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=parent_ref,
+        token=parent_issue["route_token"],
+    )
+    child = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "reason": "Human approved row-scoped parallel work through onboard service.",
+                "task_id": "parentless-direct-main-active-child-task",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": parent_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    child_execution_id = child["contract_execution_id"]
+    child_route_token_ref = child["route_token_ref"]
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parentless-direct-main-active-child-worker",
+        parent_task_id=child_execution_id,
+        fence_token="fence-parentless-direct-main-active-child",
+        token="token-parentless-direct-main-active-child",
+        target_head_commit=worker_commit,
+        owned_files=("agent/governance/server.py",),
+    )
+    worker_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": child_execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "target_project_root": runtime_context.target_project_root,
+        "owned_files": ["agent/governance/server.py"],
+        "changed_files": ["agent/governance/server.py"],
+        "route_token_ref": child_route_token_ref,
+    }
+    child_graph_trace_id = "gqt-20260705-cafe1234"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=child_graph_trace_id,
+        parent_task_id=child_execution_id,
+        snapshot_id="scope-parentless-direct-main-active-child",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=runtime_context.fence_token,
+        run_id=_mf_sub_run_id(runtime_context.task_id, runtime_context.fence_token),
+    )
+    line_specs = [
+        (
+            "observer",
+            "orchestration",
+            "observer_prefill_child_contracts",
+            "contract_binding",
+            {"route_token_ref": child_route_token_ref},
+            "",
+        ),
+        (
+            "observer",
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "dispatch_bounded_worker",
+            worker_payload,
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_read",
+            "worker_read_runtime_guide",
+            "read_receipt",
+            {**worker_payload, "read_receipt_hash": _fake_sha("active-child-read")},
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_startup",
+            "worker_startup",
+            "mf_subagent_startup",
+            worker_payload,
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_context",
+            "worker_graph_context",
+            "graph_trace",
+            {
+                **worker_payload,
+                "graph_trace_ids": [child_graph_trace_id],
+                "graph_query_trace_ids": [child_graph_trace_id],
+            },
+            "",
+        ),
+        (
+            "mf_sub",
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+            worker_payload,
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+            {
+                **worker_payload,
+                "finish_time_worker_self_attestation": True,
+            },
+            worker_commit,
+        ),
+    ]
+    runtime = server._contract_runtime(conn)
+    for actor_role, stage_id, line_id, evidence_kind, payload, commit_sha in line_specs:
+        runtime.current_guide(child_execution_id, actor_role=actor_role)
+        record = runtime.store.get(child_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        for key in ("runtime_context_id", "task_id", "parent_task_id", "worker_role"):
+            if payload.get(key):
+                write[key] = payload[key]
+        if line_id == "worker_graph_context":
+            write["graph_trace_ids"] = [child_graph_trace_id]
+            write["db_verified"] = True
+            write["query_source"] = "mf_subagent"
+            write["query_purpose"] = "subagent_context_build"
+            write["graph_trace_evidence"] = {
+                "db_verified": True,
+                "graph_trace_ids": [child_graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": child_execution_id,
+                "target_project_root": runtime_context.target_project_root,
+                "worker_role": "mf_sub",
+            }
+        if payload.get("worker_id"):
+            write["worker_id"] = payload["worker_id"]
+        if payload.get("worker_slot_id"):
+            write["worker_slot_id"] = payload["worker_slot_id"]
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            child_execution_id,
+            write,
+            actor_role=actor_role,
+        )
+        decision = result.get("decision") if isinstance(result.get("decision"), dict) else {}
+        assert result["ok"] is True, (
+            line_id,
+            decision.get("errors"),
+            decision.get("missing_proof_fields"),
+            decision.get("graph_status"),
+            decision.get("next_move"),
+        )
+
+    runtime.current_guide(child_execution_id, actor_role="mf_sub")
+    child_record = runtime.store.get(child_execution_id)
+    child_state = child_record["runtime_guide"]["next_legal_action"]
+    assert (
+        child_state.get("id") or child_state.get("line_id")
+    ) == "worker_finish_gate", child_state
+
+    child_close_ref = "rtok-parentless-direct-main-active-child-child-close"
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_close_ref,
+        token={
+            **route_identity,
+            "route_token_ref": child_close_ref,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": child_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"contract_runtime:{child_execution_id}"],
+        },
+    )
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                method="POST",
+                body={
+                    "actor": "observer",
+                    "commit": close_commit,
+                    "contract_execution_id": child_execution_id,
+                    "route_token_ref": child_close_ref,
+                },
+            )
+        )
+    assert exc.value.code == "contract_runtime_close_authority_incomplete"
+    assert "worker_finish_gate" in json.dumps(exc.value.details, sort_keys=True)
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={
+                "close_commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+            },
+        )
+    )
+    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["accepted"] is True, (
+        projection.get("status"),
+        projection.get("missing_requirement_ids"),
+        (
+            projection.get("parentless_direct_main_close_authority_gate") or {}
+        ).get("missing_requirement_ids"),
+        (
+            projection.get("parentless_direct_main_close_authority_gate") or {}
+        ).get("checks"),
+        (
+            projection.get("parentless_direct_main_close_authority_gate") or {}
+        ).get("pre_implementation_graph_trace_gate"),
+        projection.get("authority_selection"),
+        projection.get("mf_parallel_close_authority_gate"),
+    )
+    assert projection["status"] == "projected_parentless_direct_main"
+    assert projection["contract_execution_id"] == parent_execution_id
+    assert projection["authority_selection"]["selected_authority"] == (
+        "parentless_direct_main"
+    )
+    assert projection["authority_selection"]["deferred_authority_sources"] == [
+        "active_child_contract_runtime_close_authority"
+    ]
+    assert "mf_parallel_close_authority_gate" not in projection
+    direct_gate = projection["parentless_direct_main_close_authority_gate"]
+    assert direct_gate["passed"] is True
+    assert precheck["can_close"] is True
+
     closed = server.handle_backlog_close(
         _ctx(
             {"project_id": PID, "bug_id": backlog_id},
