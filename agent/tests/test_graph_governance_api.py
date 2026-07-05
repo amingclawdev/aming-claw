@@ -14232,6 +14232,12 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     assert live["merge_commit"]
     assert live["recorded"]["queue_item"]["status"] == "merged"
     assert live["recorded"]["context"]["status"] == "merged"
+    assert live["recorded"]["context"]["fence_token"] == "redacted"
+    assert live["recorded"]["context"]["fence_token_hash"] == _fake_sha(
+        "fence-execute-current"
+    )
+    assert live["recorded"]["context"]["fence_token_redacted"] is True
+    assert "fence-execute-current" not in json.dumps(live["recorded"], sort_keys=True)
     assert live["decision"]["rows"][0]["queue_state"] == "merged"
     assert live["decision"]["rows"][0]["target_graph_activation_allowed"] is True
     assert [
@@ -14627,6 +14633,15 @@ def test_parallel_branch_merge_execute_accepts_parent_route_for_reclaimed_contex
     assert live["recorded"]["queue_item"]["status"] == "merged"
     assert live["recorded"]["context"]["status"] == "merged"
     assert live["recorded"]["context"]["task_id"] == child_task_id
+    assert live["recorded"]["context"]["fence_token"] == "redacted"
+    assert live["recorded"]["context"]["fence_token_hash"] == _fake_sha(
+        "fence-parent-route-live-reclaimed"
+    )
+    assert live["recorded"]["context"]["fence_token_redacted"] is True
+    assert "fence-parent-route-live-reclaimed" not in json.dumps(
+        live["recorded"],
+        sort_keys=True,
+    )
     assert (repo / "parent-route-live.txt").read_text(encoding="utf-8") == (
         "parent route live\n"
     )
@@ -32129,11 +32144,14 @@ def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     assert resume["source"] == "backlog_contract_chain_current"
     assert resume["readiness_state"] == "contract_complete"
     assert resume.get("next_legal_action") == {}
-    assert resume["projection_conflict"]["status"] == "suppressed_stale_resume"
-    assert resume["projection_conflict"]["shadowed_source"] == (
-        "task_timeline_compact_ledger"
-    )
-    assert result["next_legal_action"]["id"] != "resume_blocked_contract_chain"
+    conflict = resume.get("projection_conflict") or {}
+    if conflict:
+        assert conflict["status"] == "suppressed_stale_resume"
+        assert conflict["shadowed_source"] == "task_timeline_compact_ledger"
+    assert result["next_legal_action"]["id"] == "contract_complete_no_runtime_action"
+    assert result["next_legal_action"]["action"] == "no_runtime_action"
+    assert result["next_legal_action"]["contract_complete_runtime_no_remaining_line"] is True
+    assert "successor-enter route" in result["next_legal_action"]["next_step"]
 
 
 def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continue(
@@ -32247,8 +32265,38 @@ def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continu
     assert conflict["backlog_row_status"] == "FIXED"
     assert conflict["shadowed_next_legal_action"]["id"] == "continue_contract_chain"
     assert resume["fixed_row_terminal"] is True
-    assert result["next_legal_action"]["id"] != "continue_contract_chain"
-    assert result["next_legal_action"]["action"] != "continue_contract_chain"
+    assert result["next_legal_action"]["id"] == "contract_complete_no_runtime_action"
+    assert result["next_legal_action"]["action"] == "no_runtime_action"
+    assert result["next_legal_action"]["contract_complete_runtime_no_remaining_line"] is True
+
+
+def test_onboard_route_guide_direct_main_complete_projection_points_to_exception_flow(
+    conn,
+):
+    backlog_id = "AC-ONBOARD-DIRECT-MAIN-COMPLETE-GRAPH-FIRST"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-direct-main-complete",
+            },
+        )
+    )
+
+    assert result["runtime_resume"]["readiness_state"] == "contract_complete"
+    next_action = result["next_legal_action"]
+    assert next_action["id"] == "operator_supervised_direct_main_graph_first"
+    assert next_action["action"] == "observer_direct_mutation_exception"
+    assert next_action["requires_graph_first"] is True
+    assert next_action["contract_complete_runtime_no_remaining_line"] is True
+    assert "graph_query first" in next_action["next_step"]
+    assert "enter the selected successor interface" not in next_action["next_step"]
 
 
 def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):

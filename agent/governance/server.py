@@ -43956,6 +43956,73 @@ def _onboard_route_guide_service_next_action(
     }
 
 
+def _onboard_route_guide_completed_next_action(
+    *,
+    role: str = "",
+    work_type: str = "",
+    runtime_resume: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_role = str(role or "").strip() or "observer"
+    selected_work_type = str(work_type or "").strip()
+    resume = runtime_resume if isinstance(runtime_resume, Mapping) else {}
+    base = {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "source": "onboard_route_guide_service",
+        "precedence": "contract_complete_projection",
+        "role": selected_role,
+        "work_type": selected_work_type,
+        "runtime_resume_status": str(resume.get("status") or "contract_complete"),
+        "readiness_state": str(resume.get("readiness_state") or "contract_complete"),
+        "current_contract_execution_id": str(
+            resume.get("current_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(resume.get("root_contract_execution_id") or ""),
+        "contract_complete_runtime_no_remaining_line": True,
+        "legacy_onboard_contract_waived": True,
+        "meta_contract_gate_decision_source": False,
+    }
+    if selected_work_type == "operator_supervised_direct_main":
+        return {
+            **base,
+            "id": "operator_supervised_direct_main_graph_first",
+            "action": "observer_direct_mutation_exception",
+            "interface": "observer_direct_mutation_exception",
+            "requires_operator_approval": True,
+            "requires_graph_first": True,
+            "next_step": (
+                "run graph_query first, record observer_direct_mutation_exception "
+                "with DB-verified graph trace ids, then edit only approved files"
+            ),
+        }
+    return {
+        **base,
+        "id": "contract_complete_no_runtime_action",
+        "action": "no_runtime_action",
+        "next_step": (
+            "contract runtime is complete; do not issue a successor-enter route for "
+            "this completed chain. File or select a new backlog row for new work."
+        ),
+    }
+
+
+def _onboard_runtime_resume_is_complete(runtime_resume: Mapping[str, Any]) -> bool:
+    if not isinstance(runtime_resume, Mapping) or not runtime_resume:
+        return False
+    readiness = str(
+        runtime_resume.get("readiness_state") or runtime_resume.get("status") or ""
+    )
+    if readiness != "contract_complete":
+        return False
+    next_action = (
+        runtime_resume.get("next_legal_action")
+        if isinstance(runtime_resume.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return not next_action and not str(
+        runtime_resume.get("active_child_contract_execution_id") or ""
+    ).strip()
+
+
 def _onboard_direct_fix_next_action_from_runtime(
     *,
     project_id: str,
@@ -44418,6 +44485,12 @@ def _onboard_route_guide_service_response(
         resume_next = runtime_resume.get("next_legal_action")
         if isinstance(resume_next, Mapping) and resume_next:
             next_action = dict(resume_next)
+        elif _onboard_runtime_resume_is_complete(runtime_resume):
+            next_action = _onboard_route_guide_completed_next_action(
+                role=role,
+                work_type=work_type,
+                runtime_resume=runtime_resume,
+            )
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,

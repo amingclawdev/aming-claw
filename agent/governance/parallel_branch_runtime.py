@@ -2397,6 +2397,15 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     return payload
 
 
+def public_branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
+    payload = branch_context_to_dict(context)
+    redacted = redact_runtime_context_payload(
+        payload,
+        raw_secrets=(context.fence_token,),
+    )
+    return dict(redacted) if isinstance(redacted, Mapping) else payload
+
+
 def branch_runtime_allocation_evidence(
     context: BranchTaskRuntimeContext,
     *,
@@ -10301,7 +10310,9 @@ def record_merge_queue_result(
 
     return {
         "queue_item": merge_queue_item_to_dict(saved_item),
-        "context": branch_context_to_dict(saved_context) if saved_context is not None else None,
+        "context": public_branch_context_to_dict(saved_context)
+        if saved_context is not None
+        else None,
     }
 
 
