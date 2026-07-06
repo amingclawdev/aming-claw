@@ -43954,6 +43954,8 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     current_projection: dict[str, Any],
     runtime_resume: dict[str, Any],
 ) -> None:
+    if str(next_action.get("action") or "") == "no_runtime_action":
+        return
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
     parent_execution_id = str(record.get("contract_execution_id") or "")
@@ -44229,9 +44231,11 @@ def _onboard_route_guide_completed_next_action(
     role: str = "",
     work_type: str = "",
     runtime_resume: Mapping[str, Any] | None = None,
+    backlog_row_status: str = "",
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
+    normalized_backlog_status = str(backlog_row_status or "").strip().upper()
     resume = runtime_resume if isinstance(runtime_resume, Mapping) else {}
     base = {
         "schema_version": "onboard_route_guide.next_action.v1",
@@ -44239,6 +44243,8 @@ def _onboard_route_guide_completed_next_action(
         "precedence": "contract_complete_projection",
         "role": selected_role,
         "work_type": selected_work_type,
+        "backlog_row_status": normalized_backlog_status,
+        "terminal_backlog_row": normalized_backlog_status in _BACKLOG_CLOSED_STATUSES,
         "runtime_resume_status": str(resume.get("status") or "contract_complete"),
         "readiness_state": str(resume.get("readiness_state") or "contract_complete"),
         "current_contract_execution_id": str(
@@ -44249,6 +44255,16 @@ def _onboard_route_guide_completed_next_action(
         "legacy_onboard_contract_waived": True,
         "meta_contract_gate_decision_source": False,
     }
+    if normalized_backlog_status in _BACKLOG_CLOSED_STATUSES:
+        return {
+            **base,
+            "id": "contract_complete_no_runtime_action",
+            "action": "no_runtime_action",
+            "next_step": (
+                "backlog row is terminal and contract runtime is complete; do not "
+                "issue a successor-enter route or current runtime write requirement."
+            ),
+        }
     if selected_work_type == "operator_supervised_direct_main":
         return {
             **base,
@@ -44262,7 +44278,7 @@ def _onboard_route_guide_completed_next_action(
                 "with DB-verified graph trace ids, then edit only approved files"
             ),
         }
-    if selected_work_type == "multi_backlog_parallel":
+    if selected_work_type in {"multi_backlog_parallel", "mf_batch_parallel"}:
         return {
             **base,
             "id": "mf_batch_parallel_enter",
@@ -44282,7 +44298,7 @@ def _onboard_route_guide_completed_next_action(
                 "mf_parallel.v2 successors"
             ),
         }
-    if selected_work_type == "parallel_worker":
+    if selected_work_type in {"parallel_worker", "mf_parallel"}:
         return {
             **base,
             "id": "mf_parallel_enter",
@@ -44798,6 +44814,7 @@ def _onboard_route_guide_service_response(
                 role=role,
                 work_type=work_type,
                 runtime_resume=runtime_resume,
+                backlog_row_status=backlog_row_status,
             )
     guidance = _onboard_contract_agent_guidance(
         record,
