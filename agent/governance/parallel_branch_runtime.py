@@ -933,6 +933,9 @@ class MergeQueueItem:
     target_head_after_merge: str = ""
     completed_at: str = ""
     failure_reason: str = ""
+    lineage_status: str = ""
+    lineage_source: str = ""
+    governed_recovery_actions: tuple[str, ...] = ()
 
 
 def _stable_plan_id(prefix: str, *parts: object) -> str:
@@ -1294,6 +1297,7 @@ class MergeQueueDecision:
     observed_status: str
     queue_state: str
     action: str
+    merge_queue_id: str = ""
     backlog_id: str = ""
     queue_index: int = 0
     target_ref: str = ""
@@ -1319,10 +1323,14 @@ class MergeQueueDecision:
     target_semantic_activation_allowed: bool = False
     validation_attempt: int = 0
     merge_preview_id: str = ""
+    lineage_status: str = ""
+    lineage_source: str = ""
+    governed_recovery_actions: tuple[str, ...] = ()
 
     def to_dashboard_row(self) -> dict[str, Any]:
         return {
             "queue_item_id": self.queue_item_id,
+            "merge_queue_id": self.merge_queue_id,
             "task_id": self.task_id,
             "branch_ref": self.branch_ref,
             "observed_status": self.observed_status,
@@ -1356,6 +1364,9 @@ class MergeQueueDecision:
             "target_semantic_activation_allowed": self.target_semantic_activation_allowed,
             "validation_attempt": self.validation_attempt,
             "merge_preview_id": self.merge_preview_id,
+            "lineage_status": self.lineage_status,
+            "lineage_source": self.lineage_source,
+            "governed_recovery_actions": list(self.governed_recovery_actions),
         }
 
 
@@ -9253,6 +9264,7 @@ def merge_queue_item_to_dict(item: MergeQueueItem) -> dict[str, Any]:
         "conflicts_with",
         "same_node_or_file_conflicts",
         "requires_graph_epoch",
+        "governed_recovery_actions",
     ):
         payload[key] = list(getattr(item, key))
     return payload
@@ -10364,6 +10376,273 @@ def _context_enriched_merge_queue_items(
         _context_enriched_merge_queue_item(conn, item, target_ref=target_ref)
         for item in items
     ]
+
+
+def _batch_items_by_task_id(
+    batch_runtime: BatchMergeRuntime | None,
+) -> dict[str, BatchMergeItem]:
+    if batch_runtime is None:
+        return {}
+    return {item.task_id: item for item in batch_runtime.items}
+
+
+def _context_by_task_id(
+    contexts: Sequence[BranchTaskRuntimeContext],
+) -> dict[str, BranchTaskRuntimeContext]:
+    return {context.task_id: context for context in contexts}
+
+
+def _lineage_recovery_actions_for_item(item: MergeQueueItem) -> tuple[str, ...]:
+    actions: list[str] = []
+    if not item.backlog_id:
+        actions.append("recover_child_backlog_lineage")
+    if item.lineage_source in {
+        "parallel_branch_batch_items",
+        "parallel_branch_runtime_contexts",
+    }:
+        actions.append("materialize_active_merge_queue_item")
+    return tuple(dict.fromkeys(actions))
+
+
+def _with_read_model_queue_lineage(
+    item: MergeQueueItem,
+    *,
+    lineage_source: str,
+) -> MergeQueueItem:
+    source = str(lineage_source or item.lineage_source or "").strip()
+    status = (
+        "durable_task_queue_dependency_lineage"
+        if item.backlog_id
+        else "governed_recovery_required"
+    )
+    if source in {
+        "parallel_branch_batch_items",
+        "parallel_branch_runtime_contexts",
+    } and item.backlog_id:
+        status = "recovered_task_queue_dependency_lineage"
+    enriched = replace(
+        item,
+        lineage_status=item.lineage_status or status,
+        lineage_source=item.lineage_source or source,
+    )
+    return replace(
+        enriched,
+        governed_recovery_actions=(
+            enriched.governed_recovery_actions
+            or _lineage_recovery_actions_for_item(enriched)
+        ),
+    )
+
+
+def _queue_index_from_task_id(task_id: str) -> int:
+    marker = ":row:"
+    text = str(task_id or "")
+    if marker not in text:
+        return 0
+    suffix = text.rsplit(marker, 1)[1].strip()
+    try:
+        return max(0, int(suffix))
+    except ValueError:
+        return 0
+
+
+def _batch_enriched_merge_queue_item(
+    item: MergeQueueItem,
+    *,
+    batch_item: BatchMergeItem | None,
+    batch_runtime: BatchMergeRuntime | None,
+) -> MergeQueueItem:
+    if batch_item is None:
+        return item
+    target_ref = item.target_ref
+    current_target_head = item.current_target_head
+    if batch_runtime is not None:
+        target_ref = target_ref or batch_runtime.target_ref
+        current_target_head = current_target_head or batch_runtime.current_target_head
+    return replace(
+        item,
+        branch_ref=item.branch_ref or batch_item.branch_ref,
+        queue_index=item.queue_index or batch_item.queue_index,
+        status=item.status or batch_item.status or "planned",
+        depends_on=item.depends_on or batch_item.depends_on,
+        target_ref=target_ref,
+        base_commit=item.base_commit or batch_item.base_commit,
+        branch_head=item.branch_head or batch_item.branch_head,
+        current_target_head=current_target_head,
+        merge_preview_id=item.merge_preview_id or batch_item.merge_preview_id,
+        snapshot_id=item.snapshot_id or batch_item.snapshot_id,
+        projection_id=item.projection_id or batch_item.projection_id,
+        merge_commit=item.merge_commit or batch_item.merge_commit,
+        target_head_before_merge=(
+            item.target_head_before_merge or batch_item.target_head_before_merge
+        ),
+        target_head_after_merge=(
+            item.target_head_after_merge or batch_item.target_head_after_merge
+        ),
+    )
+
+
+def _merge_queue_item_from_context_lineage(
+    context: BranchTaskRuntimeContext,
+    *,
+    merge_queue_id: str,
+    target_ref: str,
+) -> MergeQueueItem:
+    queue_item_id = _stable_plan_id(
+        "mqitem",
+        context.project_id,
+        merge_queue_id,
+        context.task_id,
+        context.backlog_id or context.task_id,
+    )
+    return _with_read_model_queue_lineage(
+        MergeQueueItem(
+            project_id=context.project_id,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            backlog_id=context.backlog_id,
+            task_id=context.task_id,
+            branch_ref=context.branch_ref,
+            queue_index=_queue_index_from_task_id(context.task_id),
+            status=context.status or "planned",
+            depends_on=context.depends_on,
+            target_ref=target_ref or context.ref_name,
+            base_commit=context.base_commit,
+            branch_head=context.head_commit,
+            current_target_head=context.target_head_commit,
+            merge_preview_id=context.merge_preview_id,
+            snapshot_id=context.snapshot_id,
+            projection_id=context.projection_id,
+        ),
+        lineage_source="parallel_branch_runtime_contexts",
+    )
+
+
+def _merge_queue_item_from_batch_lineage(
+    item: BatchMergeItem,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    target_ref: str,
+    current_target_head: str,
+    context: BranchTaskRuntimeContext | None = None,
+) -> MergeQueueItem:
+    backlog_id = context.backlog_id if context is not None else ""
+    queue_item_id = _stable_plan_id(
+        "mqitem",
+        project_id,
+        merge_queue_id,
+        item.task_id,
+        backlog_id or item.task_id,
+    )
+    return _with_read_model_queue_lineage(
+        MergeQueueItem(
+            project_id=project_id,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            backlog_id=backlog_id,
+            task_id=item.task_id,
+            branch_ref=item.branch_ref or (context.branch_ref if context else ""),
+            queue_index=item.queue_index,
+            status=item.status or (context.status if context else "") or "planned",
+            depends_on=item.depends_on or (context.depends_on if context else ()),
+            target_ref=target_ref or (context.ref_name if context else ""),
+            base_commit=item.base_commit or (context.base_commit if context else ""),
+            branch_head=item.branch_head or (context.head_commit if context else ""),
+            current_target_head=(
+                current_target_head
+                or item.target_head_after_merge
+                or (context.target_head_commit if context else "")
+            ),
+            merge_preview_id=item.merge_preview_id
+            or (context.merge_preview_id if context else ""),
+            snapshot_id=item.snapshot_id or (context.snapshot_id if context else ""),
+            projection_id=item.projection_id or (context.projection_id if context else ""),
+            merge_commit=item.merge_commit,
+            target_head_before_merge=item.target_head_before_merge,
+            target_head_after_merge=item.target_head_after_merge,
+        ),
+        lineage_source="parallel_branch_batch_items",
+    )
+
+
+def _recover_read_model_merge_queue_items(
+    items: list[MergeQueueItem],
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    target_ref: str,
+    contexts: Sequence[BranchTaskRuntimeContext],
+    batch_runtime: BatchMergeRuntime | None,
+) -> list[MergeQueueItem]:
+    if not merge_queue_id:
+        return items
+    contexts_by_task = _context_by_task_id(contexts)
+    batch_items_by_task = _batch_items_by_task_id(batch_runtime)
+    recovered: list[MergeQueueItem] = []
+    seen_tasks: set[str] = set()
+
+    for item in items:
+        seen_tasks.add(item.task_id)
+        enriched = _batch_enriched_merge_queue_item(
+            item,
+            batch_item=batch_items_by_task.get(item.task_id),
+            batch_runtime=batch_runtime,
+        )
+        recovered.append(
+            _with_read_model_queue_lineage(
+                enriched,
+                lineage_source="parallel_branch_merge_queue_items",
+            )
+        )
+
+    for batch_item in sorted(
+        batch_items_by_task.values(),
+        key=lambda candidate: (candidate.queue_index, candidate.task_id),
+    ):
+        if batch_item.task_id in seen_tasks:
+            continue
+        if batch_item.merge_queue_id and batch_item.merge_queue_id != merge_queue_id:
+            continue
+        context = contexts_by_task.get(batch_item.task_id)
+        if (
+            context is not None
+            and context.merge_queue_id
+            and context.merge_queue_id != merge_queue_id
+        ):
+            continue
+        recovered.append(
+            _merge_queue_item_from_batch_lineage(
+                batch_item,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                target_ref=target_ref
+                or (batch_runtime.target_ref if batch_runtime is not None else ""),
+                current_target_head=(
+                    batch_runtime.current_target_head
+                    if batch_runtime is not None
+                    else ""
+                ),
+                context=context,
+            )
+        )
+        seen_tasks.add(batch_item.task_id)
+
+    for context in sorted(contexts, key=lambda candidate: candidate.task_id):
+        if context.task_id in seen_tasks:
+            continue
+        if context.merge_queue_id != merge_queue_id:
+            continue
+        recovered.append(
+            _merge_queue_item_from_context_lineage(
+                context,
+                merge_queue_id=merge_queue_id,
+                target_ref=target_ref,
+            )
+        )
+        seen_tasks.add(context.task_id)
+
+    return sorted(recovered, key=lambda item: (item.queue_index, item.queue_item_id))
 
 
 def decide_persisted_merge_queue(
@@ -14667,6 +14946,7 @@ def decide_merge_queue(
                 observed_status=item.status,
                 queue_state=queue_state,
                 action=action,
+                merge_queue_id=item.merge_queue_id,
                 backlog_id=item.backlog_id,
                 queue_index=item.queue_index,
                 target_ref=item.target_ref,
@@ -14692,6 +14972,9 @@ def decide_merge_queue(
                 target_semantic_activation_allowed=semantic_allowed,
                 validation_attempt=item.validation_attempt,
                 merge_preview_id=item.merge_preview_id,
+                lineage_status=item.lineage_status,
+                lineage_source=item.lineage_source,
+                governed_recovery_actions=item.governed_recovery_actions,
             )
         )
 
@@ -15937,6 +16220,18 @@ def _compact_rollback(
     return rollback, len(batch_plan.dashboard_rows), rows_truncated or retained_truncated
 
 
+def _context_matches_read_model_queue(
+    context: BranchTaskRuntimeContext,
+    *,
+    active_merge_queue_id: str,
+) -> bool:
+    queue_id = str(active_merge_queue_id or "").strip()
+    if not queue_id:
+        return True
+    context_queue_id = str(context.merge_queue_id or "").strip()
+    return not context_queue_id or context_queue_id == queue_id
+
+
 def build_parallel_branch_read_model(
     *,
     project_id: str,
@@ -15945,6 +16240,7 @@ def build_parallel_branch_read_model(
     recovery_plan: RecoveryPlan | None = None,
     merge_queue_plan: MergeQueuePlan | None = None,
     batch_plan: BatchRollbackPlan | None = None,
+    active_merge_queue_id: str = "",
     limit: int = 50,
 ) -> ParallelBranchReadModel:
     """Build the bounded PB-010 operator view for dashboard and MCP clients.
@@ -15960,7 +16256,14 @@ def build_parallel_branch_read_model(
             recovery_decision=decisions_by_task.get(context.task_id),
         )
         for context in ordered_contexts
-        if context.project_id == project_id and (not batch_id or context.batch_id == batch_id)
+        if (
+            context.project_id == project_id
+            and (not batch_id or context.batch_id == batch_id)
+            and _context_matches_read_model_queue(
+                context,
+                active_merge_queue_id=active_merge_queue_id,
+            )
+        )
     ]
     branch_lanes, lanes_truncated = _limit_compact_rows(lanes, limit)
     merge_queue, merge_queue_total, merge_queue_truncated = _compact_merge_queue(
@@ -16035,6 +16338,10 @@ def build_parallel_branch_read_model_from_db(
         else None
     )
 
+    batch_runtime: BatchMergeRuntime | None = None
+    if batch_id:
+        batch_runtime = get_batch_merge_runtime(conn, project_id, batch_id)
+
     queue_plan: MergeQueuePlan | None = None
     queue_id = str(merge_queue_id or "").strip()
     if not queue_id:
@@ -16051,6 +16358,14 @@ def build_parallel_branch_read_model_from_db(
             ),
             target_ref=target_ref,
         )
+        queue_items = _recover_read_model_merge_queue_items(
+            queue_items,
+            project_id=project_id,
+            merge_queue_id=queue_id,
+            target_ref=target_ref,
+            contexts=contexts,
+            batch_runtime=batch_runtime,
+        )
         latest_target = str(current_target_head or "").strip()
         if latest_target:
             queue_items = [
@@ -16062,15 +16377,13 @@ def build_parallel_branch_read_model_from_db(
         queue_plan = decide_merge_queue(queue_items, scenario_id=scenario_id) if queue_items else None
 
     batch_plan: BatchRollbackPlan | None = None
-    if batch_id:
-        batch_runtime = get_batch_merge_runtime(conn, project_id, batch_id)
-        if batch_runtime is not None:
-            batch_plan = decide_batch_rollback_replay(
-                batch_runtime,
-                severe_integration_failure=severe_integration_failure,
-                corrected_replay_order=corrected_replay_order,
-                scenario_id=scenario_id,
-            )
+    if batch_runtime is not None:
+        batch_plan = decide_batch_rollback_replay(
+            batch_runtime,
+            severe_integration_failure=severe_integration_failure,
+            corrected_replay_order=corrected_replay_order,
+            scenario_id=scenario_id,
+        )
 
     return build_parallel_branch_read_model(
         project_id=project_id,
@@ -16079,5 +16392,6 @@ def build_parallel_branch_read_model_from_db(
         recovery_plan=recovery_plan,
         merge_queue_plan=queue_plan,
         batch_plan=batch_plan,
+        active_merge_queue_id=queue_id,
         limit=limit,
     )
