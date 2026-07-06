@@ -18,6 +18,7 @@ from agent.tests.fixtures.parallel_project import (
 )
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
 from agent.governance import graph_query_trace
+from agent.governance.contract_state_runtime import build_contract_state_projection
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
     validate_mf_subagent_finish_gate,
@@ -110,6 +111,43 @@ PB001_BRANCH_NAMES = {
     "T4": "codex/PB001-T4-dashboard-read-model",
     "T5": "codex/PB001-T5-chain-adapter",
 }
+
+
+def test_mf_parallel_v2_qa_graph_context_guides_exact_graph_evidence_shape() -> None:
+    projection = build_contract_state_projection(
+        [
+            {"id": 1, "event_kind": "contract_binding"},
+            {"id": 2, "event_kind": "dispatch_bounded_worker"},
+            {"id": 3, "event_kind": "mf_subagent_read_receipt"},
+            {"id": 4, "event_kind": "mf_subagent_startup"},
+            {"id": 5, "event_kind": "graph_trace"},
+            {"id": 6, "event_kind": "implementation"},
+            {"id": 7, "event_kind": "record_finish_time_worker_attestation"},
+            {"id": 8, "event_kind": "mf_subagent_finish_gate"},
+            {"id": 9, "event_kind": "review_ready"},
+        ],
+        contract={
+            "contract": {
+                "contract_id": "mf_parallel.v2",
+                "contract_template_id": "mf_parallel.v2",
+                "contract_revision_id": "rev-mf-v2-defaults",
+                "state": "bound",
+            }
+        },
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-QA-GRAPH"},
+    )
+
+    next_action = projection["next_legal_action"]
+    assert next_action["id"] == "qa_graph_context"
+    detail = next_action["detail"]
+    assert "graph_trace_ids" in detail
+    assert "graph_query_trace_ids" in detail
+    assert "payload.graph_trace_evidence" in detail
+    assert "source=graph_query_traces" in detail
+    assert "db_verified=true" in detail
+    assert "query_source=qa" in detail
+    assert "query_purpose=independent_verification" in detail
+    assert "QA principal/session provenance" in detail
 
 
 def _pb001_branch_ref(
