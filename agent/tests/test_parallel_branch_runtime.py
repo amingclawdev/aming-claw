@@ -3994,10 +3994,10 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert worker_view["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert worker_view["worker_next_moves"] == []
     assert worker_view["done_state_projection"]["status"] == (
-        "validated_without_durable_merge_queue_item"
+        "waiting_for_current_finish_gate"
     )
     assert worker_view["control_plane"]["done_state_projection"]["status"] == (
-        "validated_without_durable_merge_queue_item"
+        "waiting_for_current_finish_gate"
     )
     dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
         "fence_token"
@@ -7491,6 +7491,46 @@ def test_runtime_context_projects_validated_missing_durable_merge_queue_item() -
     }
     assert "fence_token" not in tool_args
     assert context.fence_token not in json.dumps(bootstrap)
+
+
+def test_runtime_context_reopened_revision_waits_for_current_finish_gate() -> None:
+    context = _runtime_projection_context(
+        task_id="mf-sub-reopened-revision",
+        branch_ref="refs/heads/codex/mf-sub-reopened-revision",
+        status=STATE_WORKTREE_READY,
+        checkpoint_id="ckpt-before-revision",
+        replay_source="mf_sub_finish_gate",
+        merge_queue_id="mq-reopened-revision",
+    )
+
+    projection = _finished_qa_runtime_projection(context)
+
+    current_values = projection["views"]["current"]["current_values"]
+    durable_projection = current_values["durable_merge_queue_item_projection"]
+    action_plan = projection["views"]["action_plan"]
+    done_state = action_plan["close_precheck_gap_projection"][
+        "done_state_projection"
+    ]
+    gap_by_code = {
+        item["code"]: item
+        for item in action_plan["close_precheck_gap_projection"]["gaps"]
+    }
+
+    assert durable_projection["status"] == "waiting_for_current_finish_gate"
+    assert durable_projection["finish_gate_merge_ready"] is False
+    assert durable_projection["runtime_context_status"] == STATE_WORKTREE_READY
+    assert durable_projection["next_action"] == "record_finish_gate"
+    assert durable_projection["next_actions"] == [
+        "record_finish_time_worker_attestation",
+        "record_finish_gate",
+    ]
+    assert "copy_safe_bootstrap_payload" not in durable_projection
+    assert action_plan["next_legal_action"] == "record_finish_gate"
+    assert done_state["status"] == "waiting_for_current_finish_gate"
+    assert done_state["handoff_terminal_status"] == "waiting_for_current_finish_gate"
+    assert gap_by_code["current_finish_gate_required"]["next_action"] == (
+        "record_finish_gate"
+    )
 
 
 def test_runtime_context_projects_materialized_durable_merge_queue_item() -> None:

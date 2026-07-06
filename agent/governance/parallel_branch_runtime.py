@@ -5061,6 +5061,67 @@ def _runtime_context_merge_queue_bootstrap_payload(
     }
 
 
+def _runtime_context_finish_checkpoint_materialize_readiness(
+    context: BranchTaskRuntimeContext,
+    *,
+    checkpoint_id: str,
+) -> dict[str, Any]:
+    expected_checkpoint = _runtime_context_text(checkpoint_id)
+    context_checkpoint = _runtime_context_text(context.checkpoint_id)
+    context_status = _normalize_merge_queue_status(context.status)
+    replay_source = _runtime_context_text(context.replay_source)
+    checkpoint_matches = bool(
+        expected_checkpoint and context_checkpoint == expected_checkpoint
+    )
+    replay_source_matches = replay_source == "mf_sub_finish_gate"
+    status_merge_ready = context_status in _FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES
+    blockers: list[dict[str, str]] = []
+    if not checkpoint_matches:
+        blockers.append(
+            {
+                "code": "checkpoint_mismatch",
+                "message": (
+                    "Runtime context checkpoint does not match the finish gate "
+                    "checkpoint."
+                ),
+            }
+        )
+    if not replay_source_matches:
+        blockers.append(
+            {
+                "code": "finish_gate_replay_source_missing",
+                "message": (
+                    "Runtime context has not replayed a validated mf_sub finish "
+                    "gate."
+                ),
+            }
+        )
+    if not status_merge_ready:
+        blockers.append(
+            {
+                "code": "runtime_context_not_merge_ready",
+                "message": (
+                    "Runtime context status is not merge-ready from the current "
+                    "finish gate."
+                ),
+            }
+        )
+    return {
+        "schema_version": "runtime_context.finish_checkpoint_materialize_readiness.v1",
+        "ready": checkpoint_matches and replay_source_matches and status_merge_ready,
+        "checkpoint_matches": checkpoint_matches,
+        "expected_checkpoint_id": expected_checkpoint,
+        "runtime_context_checkpoint_id": context_checkpoint,
+        "replay_source_matches": replay_source_matches,
+        "runtime_context_replay_source": replay_source,
+        "status_merge_ready": status_merge_ready,
+        "runtime_context_status": _runtime_context_text(context.status),
+        "normalized_runtime_context_status": context_status,
+        "allowed_statuses": sorted(_FINISH_CHECKPOINT_MERGE_QUEUE_STATUSES),
+        "blockers": blockers,
+    }
+
+
 def _runtime_context_durable_merge_queue_item_projection(
     *,
     context: BranchTaskRuntimeContext,
@@ -5141,6 +5202,42 @@ def _runtime_context_durable_merge_queue_item_projection(
             "status": "waiting_for_independent_qa",
             "next_action": "handoff_to_independent_qa",
             "next_actions": ["handoff_to_independent_qa"],
+        }
+    materialize_readiness = _runtime_context_finish_checkpoint_materialize_readiness(
+        context,
+        checkpoint_id=checkpoint_id,
+    )
+    if not materialize_readiness.get("ready"):
+        return {
+            **base,
+            "status": "waiting_for_current_finish_gate",
+            "materialization_status": "blocked_until_current_finish_gate",
+            "finish_gate_merge_ready": False,
+            "materialize_readiness": materialize_readiness,
+            "runtime_context_status": materialize_readiness.get(
+                "runtime_context_status",
+                "",
+            ),
+            "runtime_context_replay_source": materialize_readiness.get(
+                "runtime_context_replay_source",
+                "",
+            ),
+            "branch_ref": _runtime_context_text(values.get("branch_ref")),
+            "target_ref": _runtime_context_merge_queue_target_ref(values),
+            "current_target_head": _runtime_context_text(
+                values.get("target_head_commit")
+            ),
+            "merge_preview_id": _runtime_context_text(values.get("merge_preview_id")),
+            "next_action": "record_finish_gate",
+            "next_actions": [
+                "record_finish_time_worker_attestation",
+                "record_finish_gate",
+            ],
+            "message": (
+                "Finish gate and QA refs exist, but the branch runtime context is "
+                "not currently merge-ready; rerun finish-time attestation and the "
+                "mf_subagent finish gate for the current revision before materialize."
+            ),
         }
     return {
         **base,
@@ -7138,6 +7235,7 @@ def _runtime_context_close_precheck_gap_projection(
         durable_merge_queue_item_projection.get("status")
     )
     durable_missing = durable_status == "validated_without_durable_merge_queue_item"
+    current_finish_gate_required = durable_status == "waiting_for_current_finish_gate"
     if durable_missing:
         _add_gap(
             code="durable_merge_queue_item_missing",
@@ -7148,6 +7246,20 @@ def _runtime_context_close_precheck_gap_projection(
             next_action="parallel_branch_merge_queue_materialize",
             field="durable_merge_queue_item",
         )
+    if current_finish_gate_required:
+        _add_gap(
+            code="current_finish_gate_required",
+            message=(
+                "Finish gate and QA refs exist, but the branch runtime context is "
+                "not currently merge-ready; rerun the current revision finish gate "
+                "before materializing the durable merge queue item."
+            ),
+            next_action=_runtime_context_text(
+                durable_merge_queue_item_projection.get("next_action")
+            )
+            or "record_finish_gate",
+            field="finish_gate_ref",
+        )
     done_status = "review_ready" if close_gate_view.get("ready") else "gap_open"
     handoff_terminal_status = (
         "terminal_dispatch_blocked"
@@ -7157,6 +7269,9 @@ def _runtime_context_close_precheck_gap_projection(
     if durable_missing:
         done_status = "validated_without_durable_merge_queue_item"
         handoff_terminal_status = "validated_without_durable_merge_queue_item"
+    if current_finish_gate_required:
+        done_status = "waiting_for_current_finish_gate"
+        handoff_terminal_status = "waiting_for_current_finish_gate"
     return {
         "schema_version": "runtime_context.close_precheck_gap_projection.v1",
         "status": "blocked" if gaps else "clear",
@@ -7256,6 +7371,14 @@ def _runtime_context_next_legal_action(
         == "validated_without_durable_merge_queue_item"
     ):
         return "parallel_branch_merge_queue_materialize"
+    if (
+        _runtime_context_text(durable_merge_queue_item_projection.get("status"))
+        == "waiting_for_current_finish_gate"
+    ):
+        return (
+            _runtime_context_text(durable_merge_queue_item_projection.get("next_action"))
+            or "record_finish_gate"
+        )
     for field, action in (("close_ready_event_ref", "record_close_ready"),):
         if field in missing_fields:
             return action
