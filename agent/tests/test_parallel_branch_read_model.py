@@ -546,6 +546,256 @@ def test_serialized_batch_read_model_keeps_row2_visible_after_row1_merge():
     assert row2["merge_allowed"] is False
 
 
+def test_serialized_batch_read_model_recovers_missing_row2_from_context_lineage():
+    conn = _runtime_conn()
+    batch_id = "mf-batch-parallel-84d4cdf62e77b2c1cc54"
+    queue_id = "mq-9ef3fe376e3d7a196350"
+    row2_backlog = "AC-MF-PARALLEL-MERGE-CLOSE-ROUTE-GUIDE-20260705"
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH-ROW2",
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_head_commit="target-before-row1",
+        snapshot_id="scope-target-before-row1",
+        target_ref=TARGET_REF,
+        mode="strict_ordered",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-ONE",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/one.py"],
+            },
+            {
+                "bug_id": row2_backlog,
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/two.py"],
+            },
+        ],
+    )
+    planned = plan["merge_queue_plan"]["planned_items"]
+    row1_task = planned[0]["task_id"]
+    row2_task = planned[1]["task_id"]
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=queue_id,
+                queue_item_id=str(planned[0]["queue_item_id"]),
+                backlog_id="AC-ROW-ONE",
+                task_id=row1_task,
+                branch_ref="refs/heads/codex/live-row1",
+                queue_index=1,
+                status=pbr.STATE_MERGED,
+                depends_on=(),
+                target_ref=TARGET_REF,
+                base_commit="target-before-row1",
+                branch_head="row1-head",
+                current_target_head="target-after-row1",
+                merge_commit="merge-row1",
+                target_head_after_merge="target-after-row1",
+            )
+        ],
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=row2_task,
+            backlog_id=row2_backlog,
+            branch_ref="",
+            status="planned",
+            depends_on=(row1_task,),
+            target_head_commit="target-after-row1",
+            merge_queue_id=queue_id,
+        ),
+        now_iso=NOW,
+    )
+
+    payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+    rows = {row["task_id"]: row for row in payload["merge_queue"]["rows"]}
+    row2 = rows[row2_task]
+
+    assert [row["task_id"] for row in payload["merge_queue"]["rows"]] == [
+        row1_task,
+        row2_task,
+    ]
+    assert row2["backlog_id"] == row2_backlog
+    assert row2["merge_queue_id"] == queue_id
+    assert row2["queue_item_id"] == planned[1]["queue_item_id"]
+    assert row2["depends_on"] == [row1_task]
+    assert row2["lineage_status"] == "recovered_task_queue_dependency_lineage"
+    assert row2["lineage_source"] == "parallel_branch_runtime_contexts"
+    assert row2["governed_recovery_actions"] == [
+        "materialize_active_merge_queue_item"
+    ]
+    assert row2["action"] == "dispatch_serialized_successor"
+
+
+def test_batch_read_model_surfaces_governed_recovery_for_unbound_row2_lineage():
+    conn = _runtime_conn()
+    batch_id = "batch-row2-batch-lineage-only"
+    queue_id = "mq-row2-batch-lineage-only"
+    row1_task = f"{batch_id}:row:1"
+    row2_task = f"{batch_id}:row:2"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-row1",
+                backlog_id="AC-ROW-ONE",
+                task_id=row1_task,
+                branch_ref="refs/heads/codex/row1",
+                queue_index=1,
+                status=pbr.STATE_MERGED,
+                target_ref=TARGET_REF,
+                merge_commit="merge-row1",
+                current_target_head="target-after-row1",
+            )
+        ],
+        now_iso=NOW,
+    )
+    upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            target_ref=TARGET_REF,
+            batch_base_commit="target-before-row1",
+            current_target_head="target-after-row1",
+            batch_status=BATCH_STATE_OPEN,
+            items=(
+                BatchMergeItem(
+                    task_id=row1_task,
+                    branch_ref="refs/heads/codex/row1",
+                    worktree_path="/tmp/row1",
+                    queue_index=1,
+                    status=pbr.STATE_MERGED,
+                    branch_head="row1-head",
+                    merge_queue_id=queue_id,
+                    merge_commit="merge-row1",
+                    retained=True,
+                ),
+                BatchMergeItem(
+                    task_id=row2_task,
+                    branch_ref="",
+                    worktree_path="",
+                    queue_index=2,
+                    status="planned",
+                    branch_head="",
+                    base_commit="target-after-row1",
+                    merge_queue_id=queue_id,
+                    depends_on=(row1_task,),
+                    retained=True,
+                ),
+            ),
+        ),
+        now_iso=NOW,
+    )
+
+    payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+    rows = {row["task_id"]: row for row in payload["merge_queue"]["rows"]}
+    row2 = rows[row2_task]
+
+    assert row2["merge_queue_id"] == queue_id
+    assert row2["backlog_id"] == ""
+    assert row2["depends_on"] == [row1_task]
+    assert row2["lineage_status"] == "governed_recovery_required"
+    assert row2["lineage_source"] == "parallel_branch_batch_items"
+    assert row2["governed_recovery_actions"] == [
+        "recover_child_backlog_lineage",
+        "materialize_active_merge_queue_item",
+    ]
+
+
+def test_active_batch_read_model_filters_stale_queue_lane_from_current_queue():
+    conn = _runtime_conn()
+    batch_id = "mf-batch-parallel-84d4cdf62e77b2c1cc54"
+    current_queue_id = "mq-9ef3fe376e3d7a196350"
+    stale_queue_id = "mq-65d78059566f39d29dda3307"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=f"{batch_id}:row:1",
+            backlog_id="AC-ROW-ONE",
+            branch_ref="refs/heads/codex/live-row1",
+            status=pbr.STATE_MERGED,
+            merge_queue_id=current_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id="legacy-worker-row1",
+            backlog_id="AC-ROW-ONE",
+            branch_ref="refs/heads/codex/legacy-row1",
+            status=pbr.STATE_WORKTREE_READY,
+            merge_queue_id=stale_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=current_queue_id,
+                queue_item_id="item-row1",
+                backlog_id="AC-ROW-ONE",
+                task_id=f"{batch_id}:row:1",
+                branch_ref="refs/heads/codex/live-row1",
+                queue_index=1,
+                status=pbr.STATE_MERGED,
+                target_ref=TARGET_REF,
+            )
+        ],
+        now_iso=NOW,
+    )
+
+    payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=current_queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+
+    assert [row["task_id"] for row in payload["branch_lanes"]] == [
+        f"{batch_id}:row:1",
+    ]
+    assert payload["branch_lanes"][0]["merge_queue_id"] == current_queue_id
+
+
 def test_mf_batch_parallel_preflight_blocks_missing_target_head_and_files():
     plan = plan_mf_batch_parallel_preflight(
         project_id=PROJECT_ID,
