@@ -32574,6 +32574,29 @@ def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continu
     assert result["next_legal_action"]["id"] == "contract_complete_no_runtime_action"
     assert result["next_legal_action"]["action"] == "no_runtime_action"
     assert result["next_legal_action"]["contract_complete_runtime_no_remaining_line"] is True
+    assert "observer_route_context_issue_payload" not in result["next_legal_action"]
+    assert "copy_safe_route_token_scope" not in result["next_legal_action"]
+
+    alias_result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "mf_parallel",
+                "route_token_ref": "rtok-fixed-complete-mf-parallel",
+            },
+        )
+    )
+
+    alias_next_action = alias_result["next_legal_action"]
+    assert alias_next_action["id"] == "contract_complete_no_runtime_action"
+    assert alias_next_action["action"] == "no_runtime_action"
+    assert alias_next_action["terminal_backlog_row"] is True
+    assert alias_next_action["backlog_row_status"] == "FIXED"
+    assert "observer_route_context_issue_payload" not in alias_next_action
+    assert "copy_safe_route_token_scope" not in alias_next_action
 
 
 def test_onboard_route_guide_direct_main_complete_projection_points_to_exception_flow(
@@ -32609,7 +32632,9 @@ def test_onboard_route_guide_direct_main_complete_projection_points_to_exception
     ("role", "work_type", "expected_interface"),
     [
         ("observer", "multi_backlog_parallel", "mf_batch_parallel_enter"),
+        ("observer", "mf_batch_parallel", "mf_batch_parallel_enter"),
         ("worker", "parallel_worker", "mf_parallel_enter"),
+        ("mf_sub", "mf_parallel", "mf_parallel_enter"),
     ],
 )
 def test_onboard_route_guide_completed_projection_returns_selected_successor_entrypoint(
@@ -32649,7 +32674,7 @@ def test_onboard_route_guide_completed_projection_returns_selected_successor_ent
     ]["id"] == expected_interface
     assert result["next_legal_action"]["id"] != "contract_complete_no_runtime_action"
 
-    if work_type == "multi_backlog_parallel":
+    if work_type in {"multi_backlog_parallel", "mf_batch_parallel"}:
         assert next_action["path"] == "/api/projects/{project_id}/mf-batch-parallel/enter"
         assert next_action["requires_backlog_ids"] is True
         assert next_action["contract_template_id"] == "mf_batch_parallel.v1"
