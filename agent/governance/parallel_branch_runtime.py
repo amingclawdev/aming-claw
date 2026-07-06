@@ -263,6 +263,7 @@ ACTION_RECLAIM_AFTER_DEPENDENCY = "reclaim_after_dependency"
 ACTION_WAIT_FOR_DEPENDENCY = "wait_for_dependency"
 ACTION_NOOP = "noop"
 ACTION_BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"
+ACTION_DISPATCH_SERIALIZED_SUCCESSOR = "dispatch_serialized_successor"
 ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE = "revalidate_after_dependency_merge"
 ACTION_ALLOW_MERGE = "allow_merge"
 ACTION_MERGE_IN_PROGRESS = "merge_in_progress"
@@ -1293,6 +1294,21 @@ class MergeQueueDecision:
     observed_status: str
     queue_state: str
     action: str
+    backlog_id: str = ""
+    queue_index: int = 0
+    target_ref: str = ""
+    base_commit: str = ""
+    branch_head: str = ""
+    validated_target_head: str = ""
+    current_target_head: str = ""
+    depends_on: tuple[str, ...] = ()
+    hard_depends_on: tuple[str, ...] = ()
+    serializes_after: tuple[str, ...] = ()
+    conflicts_with: tuple[str, ...] = ()
+    same_node_or_file_conflicts: tuple[str, ...] = ()
+    requires_graph_epoch: tuple[str, ...] = ()
+    snapshot_id: str = ""
+    projection_id: str = ""
     dependency_blockers: tuple[str, ...] = ()
     dependency_blocker_types: dict[str, tuple[str, ...]] = field(default_factory=dict)
     stale_target_head: bool = False
@@ -1312,6 +1328,21 @@ class MergeQueueDecision:
             "observed_status": self.observed_status,
             "queue_state": self.queue_state,
             "action": self.action,
+            "backlog_id": self.backlog_id,
+            "queue_index": self.queue_index,
+            "target_ref": self.target_ref,
+            "base_commit": self.base_commit,
+            "branch_head": self.branch_head,
+            "validated_target_head": self.validated_target_head,
+            "current_target_head": self.current_target_head,
+            "depends_on": list(self.depends_on),
+            "hard_depends_on": list(self.hard_depends_on),
+            "serializes_after": list(self.serializes_after),
+            "conflicts_with": list(self.conflicts_with),
+            "same_node_or_file_conflicts": list(self.same_node_or_file_conflicts),
+            "requires_graph_epoch": list(self.requires_graph_epoch),
+            "snapshot_id": self.snapshot_id,
+            "projection_id": self.projection_id,
             "dependency_blockers": list(self.dependency_blockers),
             "dependency_blocker_types": {
                 key: list(values)
@@ -14529,6 +14560,12 @@ def _merge_queue_actions_for(action: str) -> tuple[str, ...]:
         return ("wait_for_dependency", "do_not_merge")
     if action == ACTION_BLOCKED_BY_DEPENDENCY:
         return ("resolve_dependency", "do_not_merge")
+    if action == ACTION_DISPATCH_SERIALIZED_SUCCESSOR:
+        return (
+            "dispatch_serialized_successor",
+            "enter_mf_parallel_successor",
+            "do_not_merge",
+        )
     if action == ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE:
         return (
             "rebase_or_sync",
@@ -14607,6 +14644,13 @@ def decide_merge_queue(
             target_mutation_allowed = False
             graph_allowed = False
             semantic_allowed = False
+        elif item.status == "planned":
+            queue_state = item.status
+            action = ACTION_DISPATCH_SERIALIZED_SUCCESSOR
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
         else:
             queue_state = item.status or STATE_WAITING_DEPENDENCY
             action = ACTION_NOOP
@@ -14623,6 +14667,21 @@ def decide_merge_queue(
                 observed_status=item.status,
                 queue_state=queue_state,
                 action=action,
+                backlog_id=item.backlog_id,
+                queue_index=item.queue_index,
+                target_ref=item.target_ref,
+                base_commit=item.base_commit,
+                branch_head=item.branch_head,
+                validated_target_head=item.validated_target_head,
+                current_target_head=item.current_target_head,
+                depends_on=item.depends_on,
+                hard_depends_on=item.hard_depends_on,
+                serializes_after=item.serializes_after,
+                conflicts_with=item.conflicts_with,
+                same_node_or_file_conflicts=item.same_node_or_file_conflicts,
+                requires_graph_epoch=item.requires_graph_epoch,
+                snapshot_id=item.snapshot_id,
+                projection_id=item.projection_id,
                 dependency_blockers=blockers,
                 dependency_blocker_types=blocker_types,
                 stale_target_head=stale_target_head,

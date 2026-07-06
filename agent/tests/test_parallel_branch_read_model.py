@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import sqlite3
 
 from agent.governance import mf_subagent_contract as mf_contract
@@ -412,6 +413,139 @@ def test_mf_batch_parallel_preflight_strict_mode_serializes_every_row():
     assert planned[1]["serializes_after"] == [planned[0]["task_id"]]
 
 
+def test_serialized_batch_read_model_keeps_row2_visible_after_row1_merge():
+    conn = _runtime_conn()
+    batch_id = "batch-row2-recovery"
+    queue_id = "mq-row2-recovery"
+    plan = plan_mf_batch_parallel_preflight(
+        project_id=PROJECT_ID,
+        coordination_backlog_id="AC-BATCH-ROW2",
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_head_commit="target-before-row1",
+        snapshot_id="scope-target-before-row1",
+        target_ref=TARGET_REF,
+        mode="strict_ordered",
+        backlog_rows=[
+            {
+                "bug_id": "AC-ROW-ONE",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/one.py"],
+            },
+            {
+                "bug_id": "AC-ROW-TWO",
+                "status": "OPEN",
+                "priority": "P1",
+                "target_files": ["src/two.py"],
+            },
+        ],
+    )
+    planned = plan["merge_queue_plan"]["planned_items"]
+    row1_task = planned[0]["task_id"]
+    row2_task = planned[1]["task_id"]
+    queue_items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=str(item["merge_queue_id"]),
+            queue_item_id=str(item["queue_item_id"]),
+            backlog_id=str(item["backlog_id"]),
+            task_id=str(item["task_id"]),
+            branch_ref=str(item.get("branch_ref") or ""),
+            queue_index=int(item["queue_index"]),
+            status=str(item["status"]),
+            depends_on=tuple(item.get("depends_on") or ()),
+            hard_depends_on=tuple(item.get("hard_depends_on") or ()),
+            serializes_after=tuple(item.get("serializes_after") or ()),
+            conflicts_with=tuple(item.get("conflicts_with") or ()),
+            same_node_or_file_conflicts=tuple(
+                item.get("same_node_or_file_conflicts") or ()
+            ),
+            requires_graph_epoch=tuple(item.get("requires_graph_epoch") or ()),
+            target_ref=str(item["target_ref"]),
+            base_commit=str(item["target_head_commit"]),
+            validated_target_head=str(item["target_head_commit"]),
+            current_target_head=str(item["target_head_commit"]),
+            snapshot_id=str(item.get("snapshot_id") or ""),
+        )
+        for item in planned
+    ]
+    upsert_merge_queue_items(conn, queue_items, now_iso=NOW)
+
+    before = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+    before_rows = {row["task_id"]: row for row in before["merge_queue"]["rows"]}
+
+    assert [row["backlog_id"] for row in before["merge_queue"]["rows"]] == [
+        "AC-ROW-ONE",
+        "AC-ROW-TWO",
+    ]
+    assert before["merge_queue"]["blocked_task_ids"] == [row2_task]
+    assert before_rows[row2_task]["queue_item_id"] == planned[1]["queue_item_id"]
+    assert before_rows[row2_task]["target_ref"] == TARGET_REF
+    assert before_rows[row2_task]["serializes_after"] == [row1_task]
+    assert before_rows[row2_task]["dependency_blockers"] == [row1_task]
+    assert before_rows[row2_task]["queue_state"] == "waiting_dependency"
+    assert before_rows[row2_task]["action"] == "wait_for_dependency"
+
+    upsert_merge_queue_items(
+        conn,
+        [
+            replace(
+                queue_items[0],
+                status=pbr.STATE_MERGED,
+                merge_commit="merge-row-one",
+                snapshot_id="scope-row-one",
+                projection_id="semproj-row-one",
+                target_head_after_merge="target-after-row1",
+                current_target_head="target-after-row1",
+            )
+        ],
+        now_iso=NOW,
+    )
+
+    after = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+    after_rows = {row["task_id"]: row for row in after["merge_queue"]["rows"]}
+    row2 = after_rows[row2_task]
+
+    assert [row["task_id"] for row in after["merge_queue"]["rows"]] == [
+        row1_task,
+        row2_task,
+    ]
+    assert after["merge_queue"]["blocked_task_ids"] == []
+    assert row2["backlog_id"] == "AC-ROW-TWO"
+    assert row2["queue_item_id"] == planned[1]["queue_item_id"]
+    assert row2["target_ref"] == TARGET_REF
+    assert row2["depends_on"] == [row1_task]
+    assert row2["hard_depends_on"] == [row1_task]
+    assert row2["serializes_after"] == [row1_task]
+    assert row2["dependency_blockers"] == []
+    assert row2["observed_status"] == "planned"
+    assert row2["queue_state"] == "planned"
+    assert row2["action"] == "dispatch_serialized_successor"
+    assert row2["next_actions"] == [
+        "dispatch_serialized_successor",
+        "enter_mf_parallel_successor",
+        "do_not_merge",
+    ]
+    assert row2["merge_allowed"] is False
+
+
 def test_mf_batch_parallel_preflight_blocks_missing_target_head_and_files():
     plan = plan_mf_batch_parallel_preflight(
         project_id=PROJECT_ID,
@@ -818,7 +952,66 @@ def test_pb010_read_model_derives_queue_branch_ref_from_lane_when_target_filter_
 
     assert row["task_id"] == "T-context-ref"
     assert row["branch_ref"] == "refs/heads/codex/PB010-context-ref"
+    assert row["target_ref"] == TARGET_REF
     assert row["queue_state"] == "planned"
+    assert row["action"] == "dispatch_serialized_successor"
+
+
+def test_pb010_read_model_filters_old_target_ref_lanes_from_current_queue() -> None:
+    conn = _runtime_conn()
+    queue_id = "mergeq-PB010-current-target-filter"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-current-target",
+                backlog_id="AC-CURRENT-TARGET",
+                task_id="T-current-target",
+                branch_ref="refs/heads/codex/PB010-current-target",
+                queue_index=1,
+                status="planned",
+                target_ref=TARGET_REF,
+            ),
+        ],
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-old-target",
+                backlog_id="AC-OLD-TARGET",
+                task_id="T-old-target",
+                branch_ref="refs/heads/codex/PB010-old-target",
+                queue_index=2,
+                status="planned",
+                target_ref="refs/heads/old-main",
+            ),
+        ],
+        now_iso=NOW,
+    )
+
+    model = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    )
+    payload = model.to_dict()
+
+    assert [row["task_id"] for row in payload["merge_queue"]["rows"]] == [
+        "T-current-target",
+    ]
+    row = payload["merge_queue"]["rows"][0]
+    assert row["backlog_id"] == "AC-CURRENT-TARGET"
+    assert row["queue_item_id"] == "item-current-target"
+    assert row["target_ref"] == TARGET_REF
 
 
 def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutation(
