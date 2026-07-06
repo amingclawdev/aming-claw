@@ -645,6 +645,9 @@ def test_mcp_stdio_observer_route_context_issue_schema_is_listed():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     route_issue = next(tool for tool in tools if tool["name"] == "observer_route_context_issue")
+    assert "runtime_context.current_values.merge_queue_id" in route_issue[
+        "description"
+    ]
     properties = route_issue["inputSchema"]["properties"]
     assert {
         "caller_role",
@@ -655,6 +658,32 @@ def test_mcp_stdio_observer_route_context_issue_schema_is_listed():
         "evidence_refs",
         "close_commit",
     }.issubset(properties)
+
+
+def test_mcp_stdio_public_safe_batch_close_blocker_schema_guidance():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = responses[0]["result"]["tools"]
+    reconcile = next(
+        tool for tool in tools if tool["name"] == "graph_current_full_reconcile"
+    )
+    assert "route_proof_diagnostics" in reconcile["description"]
+    assert "raw route tokens" in reconcile["description"]
+
+    queue_status = next(
+        tool for tool in tools if tool["name"] == "parallel_branch_merge_queue_status"
+    )
+    properties = queue_status["inputSchema"]["properties"]
+    assert "runtime_context.current_values.merge_queue_id" in properties["flow"][
+        "description"
+    ]
+    assert "freshly issued route-token response" in properties["merge_queue_id"][
+        "description"
+    ]
 
 
 def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():

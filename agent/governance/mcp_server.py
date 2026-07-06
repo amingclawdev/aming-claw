@@ -666,9 +666,19 @@ def _parallel_branch_merge_queue_status_schema_properties() -> dict[str, Any]:
         "flow": {
             "type": "string",
             "enum": _MERGE_QUEUE_FLOW_VALUES,
-            "description": "Client hint; merge_queue_id and persisted queue rows are authoritative.",
+            "description": (
+                "Client hint; runtime_context.current_values.merge_queue_id "
+                "and persisted queue rows are authoritative for mf_batch lanes. "
+                "Ignore route-local merge_queue_id values returned by route issue."
+            ),
         },
-        "merge_queue_id": {"type": "string"},
+        "merge_queue_id": {
+            "type": "string",
+            "description": (
+                "Authoritative batch merge_queue_id from runtime context/current "
+                "queue read model, not a freshly issued route-token response."
+            ),
+        },
         "batch_id": {"type": "string"},
         "target_ref": {"type": "string"},
         "current_target_head": {"type": "string"},
@@ -1811,7 +1821,9 @@ TOOLS: list[dict] = [
             "Run the canonical current-commit full graph reconcile path. "
             "Defaults to current clean HEAD and activate=true; route-proof "
             "calls use observer_session_id with exactly one of "
-            "observer_route_token_ref or route_token_ref."
+            "observer_route_token_ref or route_token_ref plus backlog_id and "
+            "task_id/contract_execution_id; failures return public-safe "
+            "route_proof_diagnostics and never require raw route tokens."
         ),
         "inputSchema": {
             "type": "object",
@@ -2103,7 +2115,9 @@ TOOLS: list[dict] = [
             "child action-scope refs for QA-owned timeline evidence, but blocks "
             "direct file edits. Also returns a consumable route_token_ref + "
             "merge_queue_id and an execute_backlog_row_payload; handoffs should pass "
-            "the ref, not the raw token."
+            "the ref, not the raw token. For mf_batch lanes, any returned "
+            "merge_queue_id is route-issue local diagnostic context; batch merge "
+            "semantics use runtime_context.current_values.merge_queue_id."
         ),
         "inputSchema": {
             "type": "object",

@@ -3641,6 +3641,20 @@ def handle_observer_route_context_issue(ctx: RequestContext):
         "execute_backlog_row_payload": issued["execute_backlog_row_payload"],
         "provider": issued.get("provider", {}),
         "ref_registered": not bool(ref_persist_warning),
+        "merge_queue_id_diagnostics": {
+            "schema_version": (
+                "observer_route_context_issue.merge_queue_id_diagnostics.v1"
+            ),
+            "merge_queue_id": str(issued.get("merge_queue_id") or ""),
+            "merge_queue_id_scope": "route_issue_response_only",
+            "runtime_context_merge_queue_id_authoritative": True,
+            "newly_minted_route_token_merge_queue_id_allowed_for_batch_merge": False,
+            "message": (
+                "If this differs from runtime_context.current_values.merge_queue_id, "
+                "keep the runtime-context merge_queue_id for mf_batch durable merge "
+                "materialization/apply semantics."
+            ),
+        },
     }
     for key, value in route_identity.items():
         response.setdefault(key, value)
@@ -6329,6 +6343,24 @@ def _raise_current_full_route_proof(
     status: int = 403,
     **details: Any,
 ) -> None:
+    route_proof_diagnostics = {
+        "schema_version": "graph_current_full_reconcile.route_proof_diagnostics.v1",
+        "required_role": "observer",
+        "required_action": "graph_current_full_reconcile",
+        "required_fields": [
+            "observer_session_id",
+            "route_token_ref",
+            "backlog_id",
+            "task_id_or_contract_execution_id",
+        ],
+        "accepted_route_token_ref_aliases": [
+            "observer_route_token_ref",
+            "route_token_ref",
+        ],
+        "accepted_task_scope_aliases": ["task_id", "contract_execution_id"],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
     raise GovernanceError(
         "observer_route_token_proof_required",
         message,
@@ -6337,6 +6369,7 @@ def _raise_current_full_route_proof(
             "required_role": "observer",
             "required_action": "graph_current_full_reconcile",
             "proof_error": proof_error,
+            "route_proof_diagnostics": route_proof_diagnostics,
             **details,
         },
     )
@@ -50745,6 +50778,53 @@ _CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS = (
     "prompt_contract_hash",
     "visible_injection_manifest_hash",
 )
+_MF_BATCH_QA_MERGE_GUIDE_DOGFOOD_BACKLOG_ID = (
+    "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705"
+)
+_MF_BATCH_CLOSE_BLOCKERS_FRICTION_BACKLOG_ID = (
+    "AC-MF-BATCH-DOGFOOD-CLOSE-BLOCKERS-FRICTION-20260706"
+)
+
+
+def _contract_runtime_close_authority_public_diagnostics(
+    *,
+    project_id: str = "",
+    backlog_id: str = "",
+    contract_execution_id: str = "",
+    status: str = "",
+) -> dict[str, Any]:
+    rows = [
+        _MF_BATCH_QA_MERGE_GUIDE_DOGFOOD_BACKLOG_ID,
+        backlog_id,
+        _MF_BATCH_CLOSE_BLOCKERS_FRICTION_BACKLOG_ID,
+    ]
+    rows_must_remain_open = [item for item in dict.fromkeys(rows) if item]
+    return {
+        "schema_version": (
+            "contract_runtime.close_authority_public_diagnostics.v1"
+        ),
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "status": status,
+        "rows_must_remain_open": rows_must_remain_open,
+        "post_hoc_close_evidence_allowed": False,
+        "observer_lane_backfill_allowed": False,
+        "forbidden_evidence_kinds": [
+            "worker",
+            "qa",
+            "implementation",
+            "verification",
+            "close_ready",
+        ],
+        "message": (
+            "ContractRuntime close authority failures keep mf_batch rows open; "
+            "observer diagnostics may explain the blocker but must not backfill "
+            "worker, QA, implementation, verification, or close_ready evidence."
+        ),
+    }
 
 
 def _legacy_mf_timeline_precheck_close_authority_notice(
@@ -52699,6 +52779,12 @@ def _contract_runtime_close_authority_failure_details(
         return {}
 
     contract_execution_id = str(runtime_projection.get("contract_execution_id") or "")
+    backlog_id = str(
+        runtime_projection.get("backlog_id")
+        or verification.get("backlog_id")
+        or verification.get("bug_id")
+        or ""
+    )
     projection_summary = {
         key: value
         for key, value in runtime_projection.items()
@@ -52751,6 +52837,16 @@ def _contract_runtime_close_authority_failure_details(
         verification,
         contract_execution_id=contract_execution_id,
     )
+    public_diagnostics = _contract_runtime_close_authority_public_diagnostics(
+        project_id=str(
+            runtime_projection.get("project_id")
+            or verification.get("project_id")
+            or ""
+        ),
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        status=status,
+    )
     return {
         **_contract_runtime_close_authority_payload_fields(runtime_projection),
         "timeline_gate": legacy_diagnostics,
@@ -52760,6 +52856,8 @@ def _contract_runtime_close_authority_failure_details(
         "contract_runtime_close_authority_projection": projection_summary,
         "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
         "legacy_diagnostics": legacy_diagnostics,
+        "public_safe_diagnostics": public_diagnostics,
+        "close_authority_mismatch_diagnostics": public_diagnostics,
     }
 
 
@@ -52787,6 +52885,19 @@ def _missing_contract_runtime_close_authority_details(
         "authoritative": False,
         "missing_requirement_ids": missing_ids,
     }
+    projection["public_safe_diagnostics"] = (
+        _contract_runtime_close_authority_public_diagnostics(
+            project_id=str(verification.get("project_id") or ""),
+            backlog_id=str(
+                verification.get("backlog_id") or verification.get("bug_id") or ""
+            ),
+            contract_execution_id=requested_execution_id,
+            status="missing",
+        )
+    )
+    projection["close_authority_mismatch_diagnostics"] = projection[
+        "public_safe_diagnostics"
+    ]
     legacy_diagnostics = _contract_runtime_legacy_close_diagnostics(
         verification,
         contract_execution_id=requested_execution_id,
@@ -52811,6 +52922,10 @@ def _missing_contract_runtime_close_authority_details(
         "contract_runtime_close_authority_projection": projection,
         "missing_contract_runtime_close_authority_requirement_ids": missing_ids,
         "legacy_diagnostics": legacy_diagnostics,
+        "public_safe_diagnostics": projection["public_safe_diagnostics"],
+        "close_authority_mismatch_diagnostics": projection[
+            "close_authority_mismatch_diagnostics"
+        ],
     }
 
 
@@ -53865,6 +53980,14 @@ def _contract_runtime_close_authority_projection(
                 ),
                 "contract_execution_id": contract_execution_id,
                 "error": str(exc),
+                "public_safe_diagnostics": (
+                    _contract_runtime_close_authority_public_diagnostics(
+                        project_id=project_id,
+                        backlog_id=bug_id,
+                        contract_execution_id=contract_execution_id,
+                        status="runtime_error",
+                    )
+                ),
             },
         ) from exc
 
@@ -53888,6 +54011,14 @@ def _contract_runtime_close_authority_projection(
                 "record_project_id": record_project,
                 "record_backlog_id": record_backlog,
                 "error": "contract_execution_scope_mismatch",
+                "public_safe_diagnostics": (
+                    _contract_runtime_close_authority_public_diagnostics(
+                        project_id=project_id,
+                        backlog_id=bug_id,
+                        contract_execution_id=contract_execution_id,
+                        status="contract_execution_scope_mismatch",
+                    )
+                ),
             },
         )
 
@@ -53908,6 +54039,14 @@ def _contract_runtime_close_authority_projection(
                 "contract_execution_id": contract_execution_id,
                 "next_legal_action": current_state.get("next_legal_action") or {},
                 "projected_events": [],
+                "public_safe_diagnostics": (
+                    _contract_runtime_close_authority_public_diagnostics(
+                        project_id=project_id,
+                        backlog_id=bug_id,
+                        contract_execution_id=contract_execution_id,
+                        status="incomplete",
+                    )
+                ),
             }
         parentless_direct_projection = _contract_runtime_parentless_direct_main_projection(
             conn=conn,
@@ -53960,6 +54099,14 @@ def _contract_runtime_close_authority_projection(
                 ),
                 "contract_execution_id": contract_execution_id,
                 "error": str(exc),
+                "public_safe_diagnostics": (
+                    _contract_runtime_close_authority_public_diagnostics(
+                        project_id=project_id,
+                        backlog_id=bug_id,
+                        contract_execution_id=contract_execution_id,
+                        status="runtime_context_projection_error",
+                    )
+                ),
             },
         ) from exc
 
@@ -53979,6 +54126,14 @@ def _contract_runtime_close_authority_projection(
             "contract_execution_id": contract_execution_id,
             "next_legal_action": current_state.get("next_legal_action") or {},
             "projected_events": [],
+            "public_safe_diagnostics": (
+                _contract_runtime_close_authority_public_diagnostics(
+                    project_id=project_id,
+                    backlog_id=bug_id,
+                    contract_execution_id=contract_execution_id,
+                    status="incomplete",
+                )
+            ),
         }
 
     guide = (
@@ -54070,6 +54225,14 @@ def _contract_runtime_close_authority_projection(
             "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
+            "public_safe_diagnostics": (
+                _contract_runtime_close_authority_public_diagnostics(
+                    project_id=project_id,
+                    backlog_id=bug_id,
+                    contract_execution_id=contract_execution_id,
+                    status="missing_route_identity",
+                )
+            ),
         }
     direct_fix_gate = _contract_runtime_direct_fix_close_authority_gate(
         chain_records,
@@ -54144,6 +54307,14 @@ def _contract_runtime_close_authority_projection(
             "authoritative": False,
             "contract_execution_id": contract_execution_id,
             "projected_events": [],
+            "public_safe_diagnostics": (
+                _contract_runtime_close_authority_public_diagnostics(
+                    project_id=project_id,
+                    backlog_id=bug_id,
+                    contract_execution_id=contract_execution_id,
+                    status="missing_completed_lines",
+                )
+            ),
         }
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,

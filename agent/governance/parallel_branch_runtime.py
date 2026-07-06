@@ -5906,6 +5906,155 @@ def _runtime_context_route_token_action(
     }
 
 
+_MF_BATCH_QA_MERGE_GUIDE_DOGFOOD_BACKLOG_ID = (
+    "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705"
+)
+_MF_BATCH_CLOSE_BLOCKERS_FRICTION_BACKLOG_ID = (
+    "AC-MF-BATCH-DOGFOOD-CLOSE-BLOCKERS-FRICTION-20260706"
+)
+
+
+def _runtime_context_batch_close_blocker_public_diagnostics(
+    values: Mapping[str, Any],
+    *,
+    gaps: Sequence[Mapping[str, Any]] | None = None,
+    next_actions: Sequence[str] | None = None,
+    missing_close_fields: Sequence[str] | None = None,
+    close_gate_ready: bool = False,
+    include_runtime_identity: bool = False,
+) -> dict[str, Any]:
+    current_backlog_id = (
+        _runtime_context_text(values.get("backlog_id"))
+        if include_runtime_identity
+        else ""
+    )
+    task_id = (
+        _runtime_context_text(values.get("task_id"))
+        if include_runtime_identity
+        else ""
+    )
+    parent_task_id = (
+        _runtime_context_text(values.get("parent_task_id"))
+        if include_runtime_identity
+        else ""
+    )
+    runtime_context_id = (
+        _runtime_context_text(values.get("runtime_context_id"))
+        if include_runtime_identity
+        else ""
+    )
+    merge_queue_id = _runtime_context_text(values.get("merge_queue_id"))
+    open_backlog_ids = _runtime_context_dedupe(
+        [
+            _MF_BATCH_QA_MERGE_GUIDE_DOGFOOD_BACKLOG_ID,
+            current_backlog_id,
+            _MF_BATCH_CLOSE_BLOCKERS_FRICTION_BACKLOG_ID,
+        ]
+    )
+    gap_codes = _runtime_context_dedupe(
+        [
+            _runtime_context_text(item.get("code"))
+            for item in gaps or []
+            if isinstance(item, Mapping)
+        ]
+    )
+    return {
+        "schema_version": (
+            "runtime_context.batch_close_blocker_public_diagnostics.v1"
+        ),
+        "status": "keep_open",
+        "close_state_policy": {
+            "rows_must_remain_open": open_backlog_ids,
+            "current_backlog_id": current_backlog_id,
+            "post_hoc_close_evidence_allowed": False,
+            "close_ready_reconstruction_allowed": False,
+            "reason": (
+                "Close-sensitive worker, QA, implementation, verification, "
+                "and close_ready evidence must be produced in legal order by "
+                "the owning lane. Missed ordering keeps the rows open for a "
+                "fresh legal worker/QA/audit contract instead of receiving "
+                "post-hoc close evidence."
+            ),
+        },
+        "evidence_provenance_policy": {
+            "observer_lane_backfill_allowed": False,
+            "forbidden_evidence_sources": [
+                "observer_lane_post_hoc",
+                "historical_reconstruction",
+                "timeline_replay_without_lane_owner",
+            ],
+            "forbidden_evidence_kinds": [
+                "worker",
+                "qa",
+                "implementation",
+                "verification",
+                "close_ready",
+            ],
+            "message": (
+                "Observer diagnostics may explain why the row remains open, "
+                "but they must not satisfy worker, QA, implementation, "
+                "verification, or close_ready evidence requirements."
+            ),
+        },
+        "coordinator_close_precheck": {
+            "source": "runtime_context.close_precheck_gap_projection",
+            "status": "clear" if close_gate_ready and not gap_codes else "blocked",
+            "gap_codes": gap_codes,
+            "missing_close_fields": list(missing_close_fields or []),
+            "next_actions": list(next_actions or []),
+        },
+        "row1_close_authority_mismatch": {
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": (
+                "contract_runtime_close_authority_projection"
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "expected_close_authority": (
+                "current child/runtime lane evidence with matching task and "
+                "contract scope"
+            ),
+            "mismatched_authority_policy": (
+                "Root/onboard or observer-lane diagnostics do not close row1 "
+                "when worker-owned close evidence is missing or out of order."
+            ),
+        },
+        "graph_reconcile_route_proof": {
+            "action": "graph_current_full_reconcile",
+            "required_fields": [
+                "observer_session_id",
+                "route_token_ref",
+                "backlog_id",
+                "task_id_or_contract_execution_id",
+            ],
+            "accepted_route_token_ref_aliases": [
+                "observer_route_token_ref",
+                "route_token_ref",
+            ],
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+            "diagnostic_error": "observer_route_token_proof_required",
+        },
+        "route_issue_merge_queue_id": {
+            "runtime_context_merge_queue_id_authoritative": True,
+            "authoritative_merge_queue_id": merge_queue_id,
+            "route_issue_merge_queue_id_scope": "route_issue_response_only",
+            "newly_minted_route_token_merge_queue_id_allowed_for_batch_merge": False,
+            "message": (
+                "For mf_batch lanes, durable merge materialization/apply uses "
+                "runtime_context.current_values.merge_queue_id; ignore "
+                "route-local merge_queue_id values returned by route issue."
+            ),
+        },
+        "privacy_boundary": {
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        },
+    }
+
+
 def runtime_context_mf_parallel_happy_path_reminders(
     values: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -5928,6 +6077,9 @@ def runtime_context_mf_parallel_happy_path_reminders(
         "merge_queue_id": merge_queue_id,
         "canonical_merge_queue_id_source": (
             "runtime_context.current_values.merge_queue_id"
+        ),
+        "batch_close_blocker_diagnostics": (
+            _runtime_context_batch_close_blocker_public_diagnostics(values)
         ),
         "ordered_worker_happy_path": [
             "read_runtime_context_worker_guide",
@@ -7319,6 +7471,16 @@ def _runtime_context_close_precheck_gap_projection(
         "status": "blocked" if gaps else "clear",
         "gaps": gaps,
         "next_actions": next_actions,
+        "public_safe_diagnostics": (
+            _runtime_context_batch_close_blocker_public_diagnostics(
+                values,
+                gaps=gaps,
+                next_actions=next_actions,
+                missing_close_fields=missing_close_fields,
+                close_gate_ready=bool(close_gate_view.get("ready")),
+                include_runtime_identity=True,
+            )
+        ),
         "done_state_projection": {
             "schema_version": "runtime_context.done_state_projection.v1",
             "status": done_status,
