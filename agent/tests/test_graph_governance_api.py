@@ -936,6 +936,18 @@ def test_current_full_reconcile_route_proof_reports_missing_scope_fields(
         "backlog_id",
         "task_id_or_contract_execution_id",
     ]
+    diagnostics = exc.value.details["route_proof_diagnostics"]
+    assert diagnostics["schema_version"] == (
+        "graph_current_full_reconcile.route_proof_diagnostics.v1"
+    )
+    assert diagnostics["required_fields"] == [
+        "observer_session_id",
+        "route_token_ref",
+        "backlog_id",
+        "task_id_or_contract_execution_id",
+    ]
+    assert diagnostics["raw_route_token_required"] is False
+    assert diagnostics["raw_route_token_exposed"] is False
 
 
 def _write_dashboard_dist(root: Path, asset_name: str) -> Path:
@@ -28131,6 +28143,19 @@ def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory
     assert projection["legacy_mf_timeline_close_gate_advisory_only"] is True
     assert projection["status"] == "incomplete"
     assert projection["contract_execution_id"] == successor["contract_execution_id"]
+    public_diagnostics = details["public_safe_diagnostics"]
+    assert public_diagnostics["post_hoc_close_evidence_allowed"] is False
+    assert public_diagnostics["observer_lane_backfill_allowed"] is False
+    assert "worker" in public_diagnostics["forbidden_evidence_kinds"]
+    assert "qa" in public_diagnostics["forbidden_evidence_kinds"]
+    assert (
+        "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705"
+        in public_diagnostics["rows_must_remain_open"]
+    )
+    assert (
+        "AC-MF-BATCH-DOGFOOD-CLOSE-BLOCKERS-FRICTION-20260706"
+        in public_diagnostics["rows_must_remain_open"]
+    )
     assert projection["next_legal_action"]
     assert details["failed_gates"] == [
         {
@@ -28245,6 +28270,14 @@ def test_backlog_close_contract_runtime_required_without_authority_uses_new_bloc
         == "contract_runtime_close_authority_projection"
     )
     assert projection["contract_execution_id"] == parent_execution_id
+    public_diagnostics = details["public_safe_diagnostics"]
+    assert public_diagnostics["post_hoc_close_evidence_allowed"] is False
+    assert public_diagnostics["observer_lane_backfill_allowed"] is False
+    assert "close_ready" in public_diagnostics["forbidden_evidence_kinds"]
+    assert (
+        projection["public_safe_diagnostics"]["rows_must_remain_open"]
+        == public_diagnostics["rows_must_remain_open"]
+    )
     assert details["failed_gates"] == [
         {
             "gate": "contract_runtime_close_authority_projection",
@@ -28350,6 +28383,13 @@ def test_backlog_close_missing_contract_runtime_close_authority_for_onboard_serv
         == "contract_runtime_close_authority_projection"
     )
     assert projection["contract_execution_id"] == parent_execution_id
+    public_diagnostics = details["public_safe_diagnostics"]
+    assert public_diagnostics["post_hoc_close_evidence_allowed"] is False
+    assert public_diagnostics["observer_lane_backfill_allowed"] is False
+    assert (
+        "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705"
+        in projection["public_safe_diagnostics"]["rows_must_remain_open"]
+    )
     assert details["failed_gates"] == [
         {
             "gate": "contract_runtime_close_authority_projection",

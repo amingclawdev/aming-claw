@@ -1566,6 +1566,51 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         "runtime_context.mf_parallel_happy_path_reminders.v1"
     )
     assert reminders["merge_queue_id"] == "mq-runtime-authoritative"
+    batch_diagnostics = reminders["batch_close_blocker_diagnostics"]
+    assert batch_diagnostics["status"] == "keep_open"
+    assert batch_diagnostics["close_state_policy"]["rows_must_remain_open"] == [
+        "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705",
+        "AC-MF-BATCH-DOGFOOD-CLOSE-BLOCKERS-FRICTION-20260706",
+    ]
+    assert (
+        batch_diagnostics["close_state_policy"]["post_hoc_close_evidence_allowed"]
+        is False
+    )
+    assert (
+        batch_diagnostics["evidence_provenance_policy"][
+            "observer_lane_backfill_allowed"
+        ]
+        is False
+    )
+    assert "close_ready" in batch_diagnostics["evidence_provenance_policy"][
+        "forbidden_evidence_kinds"
+    ]
+    assert batch_diagnostics["graph_reconcile_route_proof"][
+        "raw_route_token_required"
+    ] is False
+    assert batch_diagnostics["route_issue_merge_queue_id"][
+        "authoritative_merge_queue_id"
+    ] == "mq-runtime-authoritative"
+    assert batch_diagnostics["route_issue_merge_queue_id"][
+        "newly_minted_route_token_merge_queue_id_allowed_for_batch_merge"
+    ] is False
+    close_precheck_diagnostics = action_plan["close_precheck_gap_projection"][
+        "public_safe_diagnostics"
+    ]
+    assert close_precheck_diagnostics["close_state_policy"][
+        "rows_must_remain_open"
+    ] == [
+        "AC-MF-BATCH-QA-MERGE-GUIDE-DOGFOOD-20260705",
+        "AC-REMINDERS",
+        "AC-MF-BATCH-DOGFOOD-CLOSE-BLOCKERS-FRICTION-20260706",
+    ]
+    assert (
+        close_precheck_diagnostics["close_state_policy"]["current_backlog_id"]
+        == "AC-REMINDERS"
+    )
+    assert close_precheck_diagnostics["coordinator_close_precheck"][
+        "source"
+    ] == "runtime_context.close_precheck_gap_projection"
     assert reminders["merge_queue_authority"] == {
         "runtime_context_merge_queue_id_authoritative": True,
         "authoritative_merge_queue_id": "mq-runtime-authoritative",
