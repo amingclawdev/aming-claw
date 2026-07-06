@@ -9696,6 +9696,66 @@ def _runtime_context_executable_contract_envelope(
     }
 
 
+def _qa_graph_context_evidence_shape(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+    }
+    trace_placeholder = "<db-verified-qa-graph-query-trace-id>"
+    qa_principal_placeholder = "<qa-principal-or-session-id>"
+    graph_trace_evidence = {
+        "schema_version": "qa_graph_trace_evidence.v1",
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "trace_ids": [trace_placeholder],
+        "graph_trace_ids": [trace_placeholder],
+        "graph_query_trace_ids": [trace_placeholder],
+        "verified_trace_ids": [trace_placeholder],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+        "qa_principal": qa_principal_placeholder,
+        "qa_session_id": qa_principal_placeholder,
+        "route_identity": dict(safe_route_identity),
+    }
+    return {
+        "schema_version": "mf_parallel.qa_graph_context.accepted_shape.v1",
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "graph_trace",
+        "actor_role": "qa",
+        "graph_trace_ids": [trace_placeholder],
+        "graph_query_trace_ids": [trace_placeholder],
+        "db_verified": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "target_project_root": target_project_root,
+        "qa_principal": qa_principal_placeholder,
+        "qa_session_id": qa_principal_placeholder,
+        "payload": {
+            "schema_version": "mf_parallel.qa_graph_context.v1",
+            "graph_trace_ids": [trace_placeholder],
+            "graph_query_trace_ids": [trace_placeholder],
+            "graph_trace_evidence": graph_trace_evidence,
+        },
+    }
+
+
 def _runtime_context_qa_verification_guide(
     *,
     project_id: str,
@@ -9785,6 +9845,14 @@ def _runtime_context_qa_verification_guide(
             "route_owned_source_event_required": True,
         },
     }
+    qa_graph_context_shape = _qa_graph_context_evidence_shape(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        route_identity=safe_route_identity,
+    )
     return {
         "schema_version": "runtime_context.qa_independent_verification_guide.v1",
         "role": "qa",
@@ -9850,8 +9918,28 @@ def _runtime_context_qa_verification_guide(
             "tool": "graph_query",
             "query_source": "qa",
             "query_purpose": "independent_verification",
+            "db_verified_trace_ids_required": True,
+            "required_provenance": [
+                "qa_principal",
+                "qa_session_id",
+                "query_source=qa",
+                "query_purpose=independent_verification",
+                "source=graph_query_traces",
+                "db_verified=true",
+            ],
             "route_identity": dict(safe_route_identity),
             "target_project_root": target_project_root,
+        },
+        "qa_graph_context": {
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "event_kind": "qa_graph_trace",
+            "accepted_evidence_shape": qa_graph_context_shape,
+            "required_top_level_fields": [
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            ],
+            "required_nested_payload_field": "payload.graph_trace_evidence",
         },
         "append_evidence": {
             "tool": "task_timeline_append",
@@ -9865,6 +9953,7 @@ def _runtime_context_qa_verification_guide(
             "qa_child_route_token_ref_body": qa_child_route_ref_body,
             "route_token_ref_body": route_ref_body,
             "source_event_lineage_body": source_lineage_body,
+            "qa_graph_context_body": qa_graph_context_shape,
             "forbidden_authors": [
                 "observer",
                 "hotfix_implementation_actor",

@@ -194,7 +194,7 @@
             "allowed_writer_roles": [
               "qa"
             ],
-            "description": "QA-authored audited graph trace ids produced with query_source=qa or independent_verification and recorded before QA verification.",
+            "description": "QA-authored audited graph trace evidence recorded before QA verification. Accepted shape requires top-level graph_trace_ids and graph_query_trace_ids plus nested payload.graph_trace_evidence containing source=graph_query_traces, db_verified=true, query_source=qa, query_purpose=independent_verification, verified_trace_ids, QA principal/session provenance, target_project_root, and no missing trace ids or identity mismatches.",
             "evidence_kind": "graph_trace",
             "line_id": "qa_graph_context",
             "owner_role": "qa",

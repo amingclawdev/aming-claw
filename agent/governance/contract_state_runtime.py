@@ -2424,8 +2424,13 @@ def _mf_parallel_default_requirements(
                 "id": "qa_graph_context",
                 "action": "record_qa_graph_trace",
                 "detail": (
-                    "QA records graph_trace evidence with QA identity before "
-                    "independent_verification"
+                    "QA records graph_trace evidence before independent_verification "
+                    "using query_source=qa and query_purpose=independent_verification; "
+                    "accepted writes include top-level graph_trace_ids and "
+                    "graph_query_trace_ids plus nested payload.graph_trace_evidence "
+                    "with source=graph_query_traces, db_verified=true, "
+                    "verified_trace_ids, QA principal/session provenance, "
+                    "target_project_root, and no missing trace ids or identity mismatches"
                 ),
                 "accepted_event_kinds": ["qa_graph_trace"],
                 "owner_role": "qa",
