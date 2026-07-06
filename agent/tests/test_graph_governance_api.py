@@ -32395,6 +32395,71 @@ def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     assert "successor-enter route" in result["next_legal_action"]["next_step"]
 
 
+def test_timeline_gate_views_suppress_complete_compact_ledger_stale_action(conn):
+    backlog_id = "AC-TIMELINE-GATE-COMPLETE-COMPACT-SUPPRESSES-STALE-ACTION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    first = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": "rtok-timeline-gate-complete-compact",
+            },
+        )
+    )
+    assert first["contract_chain_current"]["readiness_state"] == "contract_complete"
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (backlog_id,),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="stale-compact-ledger-worker",
+        event_type="mf_subagent.finish_time_worker_attestation",
+        event_kind="worker_progress",
+        phase="finish_time_worker_attestation",
+        status="blocked",
+        payload={
+            "contract_execution_id": "cex-stale-complete-compact-ledger",
+            "blockers": [{"blocker_class": "stale_complete_compact_ledger"}],
+            "next_legal_action": {
+                "id": "worker_read_runtime_guide",
+                "action": "record_read_receipt",
+            },
+        },
+    )
+    conn.commit()
+
+    for view, response_key in (
+        ("full", "timeline_gate"),
+        ("compact", "gate_summary"),
+        ("repair", "repair_summary"),
+    ):
+        result = server.handle_backlog_timeline_gate(
+            _ctx(
+                {"project_id": PID, "bug_id": backlog_id},
+                query={"view": view, "include_compact_ledger": "true"},
+            )
+        )
+
+        assert response_key in result
+        ledger = result["compact_ledger"]
+        assert ledger["row_count"] == 1
+        row = ledger["rows"][0]
+        assert row["readiness_state"] == "contract_complete"
+        assert row["next_legal_action"] == {}
+        assert row["blocker_summary"] == {}
+        assert row["legacy_advisory_blocker_suppressed"] is True
+        assert row["contract_chain_current"]["next_legal_action"] == {}
+        assert "worker_read_runtime_guide" not in json.dumps(result, sort_keys=True)
+
+
 def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continue(
     conn,
     monkeypatch,

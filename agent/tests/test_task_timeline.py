@@ -1908,7 +1908,27 @@ class TestTaskTimeline(unittest.TestCase):
             },
         )
 
-        ledger = task_timeline.build_compact_ledger(self.conn, "proj", [blocked])
+        real_current_reader = task_timeline.read_backlog_contract_chain_current
+
+        def stale_current_next_action(*args, **kwargs):
+            current = real_current_reader(*args, **kwargs)
+            return {
+                **current,
+                "next_legal_action": {
+                    "id": "worker_read_runtime_guide",
+                    "action": "record_read_receipt",
+                    "source": "stale_current_projection",
+                },
+                "blocker_summary": {"kind": "blockers", "count": 1},
+                "close_blocked_by_next_legal_action": True,
+            }
+
+        with mock.patch.object(
+            task_timeline,
+            "read_backlog_contract_chain_current",
+            side_effect=stale_current_next_action,
+        ):
+            ledger = task_timeline.build_compact_ledger(self.conn, "proj", [blocked])
 
         row = ledger["rows"][0]
         self.assertEqual(row["latest_event_id"], blocked["id"])
@@ -1921,6 +1941,79 @@ class TestTaskTimeline(unittest.TestCase):
             row["contract_chain_current"]["readiness_state"],
             "contract_complete",
         )
+        self.assertEqual(row["contract_chain_current"]["next_legal_action"], {})
+        self.assertNotIn("blocker_summary", row["contract_chain_current"])
+        self.assertNotIn("close_blocked_by_next_legal_action", row["contract_chain_current"])
+
+        [projected] = task_timeline.compact_ledger_to_timeline_events(ledger)
+        self.assertEqual(projected["status"], "passed")
+        self.assertFalse(projected["verification"]["blocked"])
+        self.assertEqual(projected["payload"]["next_legal_action"], {})
+        self.assertEqual(projected["payload"]["blocker_summary"], {})
+        self.assertNotIn("worker_read_runtime_guide", json.dumps(projected))
+
+    def test_compact_ledger_merge_complete_projection_clears_stale_action(self):
+        from agent.governance import task_timeline
+
+        stale_event_ledger = {
+            "schema_version": "task_timeline.compact_multi_backlog_ledger.v1",
+            "project_id": "proj",
+            "row_count": 1,
+            "source_event_count": 1,
+            "rows": [
+                {
+                    "backlog_id": "AC-COMPACT-MERGE-COMPLETE-CLEARS-STALE",
+                    "latest_event_id": 10,
+                    "latest_event_kind": "worker_progress",
+                    "latest_event_type": "mf_subagent.worker_read_runtime_guide",
+                    "latest_status": "blocked",
+                    "next_legal_action": {
+                        "id": "worker_read_runtime_guide",
+                        "action": "record_read_receipt",
+                    },
+                    "blocker_summary": {"kind": "blockers", "count": 1},
+                    "readiness_state": "blocked",
+                }
+            ],
+        }
+        complete_current_ledger = {
+            "schema_version": "task_timeline.compact_multi_backlog_ledger.v1",
+            "project_id": "proj",
+            "row_count": 1,
+            "source_event_count": 0,
+            "rows": [
+                {
+                    "backlog_id": "AC-COMPACT-MERGE-COMPLETE-CLEARS-STALE",
+                    "readiness_state": "contract_complete",
+                    "next_legal_action": {},
+                    "blocker_summary": {},
+                    "legacy_advisory_blocker_suppressed": True,
+                    "projection_watermark": 7,
+                    "contract_chain_current": {
+                        "readiness_state": "contract_complete",
+                        "next_legal_action": {},
+                    },
+                }
+            ],
+        }
+
+        merged = task_timeline.merge_compact_ledgers(
+            "proj",
+            stale_event_ledger,
+            complete_current_ledger,
+        )
+
+        [row] = merged["rows"]
+        self.assertEqual(row["readiness_state"], "contract_complete")
+        self.assertEqual(row["latest_status"], "blocked")
+        self.assertEqual(row["next_legal_action"], {})
+        self.assertEqual(row["blocker_summary"], {})
+        self.assertTrue(row["legacy_advisory_blocker_suppressed"])
+
+        [projected] = task_timeline.compact_ledger_to_timeline_events(merged)
+        self.assertEqual(projected["status"], "passed")
+        self.assertFalse(projected["verification"]["blocked"])
+        self.assertEqual(projected["payload"]["next_legal_action"], {})
 
     def _record_route_owned_source_lineage(self, bug_id, *, task_id="", identity=None):
         from agent.governance import task_timeline

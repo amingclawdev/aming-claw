@@ -13504,15 +13504,20 @@ def _apply_compact_contract_chain_current(
     if readiness_state:
         row["readiness_state"] = readiness_state
     current_next_action = _compact_next_legal_action(current.get("next_legal_action"))
-    if current_next_action:
-        row["next_legal_action"] = current_next_action
-    elif readiness_state == "contract_complete":
+    if readiness_state == "contract_complete":
         row["next_legal_action"] = {}
         row["blocker_summary"] = {}
         row["legacy_advisory_blocker_suppressed"] = True
+    elif current_next_action:
+        row["next_legal_action"] = current_next_action
     row["contract_chain_current_authority"] = close_authority
+    contract_chain_current = dict(current)
+    if readiness_state == "contract_complete":
+        contract_chain_current["next_legal_action"] = {}
+        contract_chain_current.pop("blocker_summary", None)
+        contract_chain_current.pop("close_blocked_by_next_legal_action", None)
     row["contract_chain_current"] = {
-        **dict(current),
+        **contract_chain_current,
         "close_authority": close_authority,
         "legacy_advisory": True,
         "authoritative": False,
@@ -13857,6 +13862,13 @@ def merge_compact_ledgers(
                     updated[key] = existing.get(key)
             if existing.get("projection_updated_at") and not item.get("projection_updated_at"):
                 updated["projection_updated_at"] = existing.get("projection_updated_at")
+            if (
+                item.get("legacy_advisory_blocker_suppressed")
+                or str(item.get("readiness_state") or "").strip() == "contract_complete"
+            ):
+                updated["next_legal_action"] = {}
+                updated["blocker_summary"] = {}
+                updated["legacy_advisory_blocker_suppressed"] = True
             merged[row_key] = updated
 
     rows = sorted(
@@ -14022,6 +14034,8 @@ def _compact_ledger_event_status(row: Mapping[str, Any]) -> str:
             " ".join(str(item) for item in blocker.get("keys") or []),
         )
     ).lower()
+    if readiness == "contract_complete" or row.get("legacy_advisory_blocker_suppressed"):
+        return "passed"
     if "block" in readiness or "block" in latest_status or "block" in blocker_text:
         return "blocked"
     if "fail" in readiness or "fail" in latest_status:
