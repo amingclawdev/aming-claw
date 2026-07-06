@@ -9040,6 +9040,13 @@ def _runtime_context_projection_response(
         str(getattr(context, "task_id", "") or ""),
         merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
     )
+    contract_runtime_failed_qa_revision = (
+        _runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=project_id,
+            context=context,
+        )
+    )
     projection = build_runtime_context_projection(
         context,
         contract_revision=latest_revision,
@@ -9057,6 +9064,7 @@ def _runtime_context_projection_response(
             if durable_merge_queue_item is not None
             else {}
         ),
+        contract_runtime_failed_qa_revision=contract_runtime_failed_qa_revision,
     ).to_dict()
     views = projection.get("views") if isinstance(projection.get("views"), dict) else {}
     full_worker_view_for_scope = dict(views.get("worker_view") or {})
@@ -9208,6 +9216,11 @@ def _runtime_context_projection_response(
             "source_policy": projection.get("source_policy") or {},
             "content_address": scoped_content_address,
             "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
+            "contract_runtime_failed_qa_revision": (
+                dict(contract_runtime_failed_qa_revision)
+                if contract_runtime_failed_qa_revision
+                else {}
+            ),
         },
         "access_audit": {
             "schema_version": audit["schema_version"],
@@ -9225,7 +9238,17 @@ def _runtime_context_projection_response(
             ),
             "timeline": timeline_refs,
             "graph_trace": redacted_graph_trace_refs,
+            "contract_runtime_failed_qa_revision": (
+                contract_runtime_failed_qa_revision.get("failed_qa_source_ref", "")
+                if contract_runtime_failed_qa_revision
+                else ""
+            ),
         },
+        "contract_runtime_failed_qa_revision": (
+            dict(contract_runtime_failed_qa_revision)
+            if contract_runtime_failed_qa_revision
+            else {}
+        ),
         "privacy_boundary": {
             "raw_private_context_exposed": False,
             "other_worker_contexts_exposed": False,
@@ -15750,6 +15773,135 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
     return False
 
 
+def _runtime_context_failed_qa_line_matches_context(
+    failed_line: Mapping[str, Any],
+    *,
+    context: Any,
+) -> bool:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    scoped_candidates = []
+    for candidate in _contract_runtime_mapping_candidates(failed_line):
+        if _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+            "task_id",
+            "worker_task_id",
+            "parent_task_id",
+        ):
+            scoped_candidates.append(candidate)
+    if not scoped_candidates:
+        return True
+
+    for candidate in scoped_candidates:
+        candidate_runtime_id = _contract_runtime_mapping_value(
+            candidate,
+            "runtime_context_id",
+        )
+        if candidate_runtime_id and candidate_runtime_id != runtime_context_id:
+            continue
+        task_values = _contract_runtime_mapping_values(
+            candidate,
+            "task_id",
+            "worker_task_id",
+        )
+        if task_values and task_id not in task_values:
+            continue
+        parent_values = _contract_runtime_mapping_values(candidate, "parent_task_id")
+        if parent_values and parent_task_id not in parent_values:
+            continue
+        return True
+    return False
+
+
+def _runtime_context_failed_qa_revision_contract_runtime_evidence(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    from .parallel_branch_runtime import (
+        FAILED_QA_REVISION_REJOIN_STATES,
+        STATE_WORKTREE_READY,
+    )
+
+    context_status = str(getattr(context, "status", "") or "")
+    failed_qa_rejoin_reopened = (
+        context_status == STATE_WORKTREE_READY
+        and str(getattr(context, "last_recovery_action", "") or "")
+        == "mf_subagent_failed_qa_revision_rejoin_issued"
+    )
+    if (
+        context_status not in FAILED_QA_REVISION_REJOIN_STATES
+        and not failed_qa_rejoin_reopened
+    ):
+        return {}
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    if not conn or not backlog_id:
+        return {}
+    try:
+        records = _contract_runtime_store(conn).list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+
+    for record in records:
+        if not _is_mf_parallel_record_contract_id(
+            str((record or {}).get("contract_id") or "")
+        ):
+            continue
+        dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+        if not dispatch_match:
+            continue
+        failed_line = _contract_runtime_latest_failed_qa_line(record)
+        if not failed_line:
+            continue
+        if not _runtime_context_failed_qa_line_matches_context(
+            failed_line,
+            context=context,
+        ):
+            continue
+        contract_execution_id = str(record.get("contract_execution_id") or "")
+        line_index = failed_line.get("_completed_line_index")
+        source_ref = (
+            f"contract_runtime:{contract_execution_id}:completed_lines:{line_index}"
+            if isinstance(line_index, int)
+            else f"contract_runtime:{contract_execution_id}:qa_independent_verification"
+        )
+        payload = (
+            failed_line.get("payload")
+            if isinstance(failed_line.get("payload"), Mapping)
+            else {}
+        )
+        return {
+            "schema_version": (
+                "runtime_context.contract_runtime_failed_qa_revision_evidence.v1"
+            ),
+            "source": "contract_runtime_completed_lines",
+            "status": "revision_required",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "contract_id": str(record.get("contract_id") or ""),
+            "failed_qa_line_id": str(failed_line.get("line_id") or ""),
+            "failed_qa_status": str(
+                failed_line.get("status") or payload.get("status") or ""
+            ),
+            "failed_qa_source_ref": source_ref,
+            "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+            "runtime_context_id": _contract_runtime_context_identity(context)[0],
+            "task_id": str(getattr(context, "task_id", "") or ""),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+            "worker_role": "mf_sub",
+            "raw_tokens_exposed": False,
+            "observer_authored_worker_evidence": False,
+        }
+    return {}
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestContext):
@@ -15884,10 +16036,20 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         selected_route_identity = (
             resolved_route_identity if resolved_route_identity else expected_route_identity
         )
-        reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
+        timeline_reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
             context=context,
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
+        )
+        contract_runtime_failed_qa_revision = (
+            _runtime_context_failed_qa_revision_contract_runtime_evidence(
+                conn,
+                project_id=project_id,
+                context=context,
+            )
+        )
+        reopen_for_revision = bool(
+            timeline_reopen_for_revision or contract_runtime_failed_qa_revision
         )
         try:
             result = rejoin_mf_subagent_runtime_session_token(
@@ -15918,6 +16080,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "parent_task_id": parent_task_id,
                     "context_status": getattr(context, "status", ""),
                     "reopen_for_revision": reopen_for_revision,
+                    "timeline_reopen_for_revision": timeline_reopen_for_revision,
+                    "contract_runtime_failed_qa_revision": (
+                        contract_runtime_failed_qa_revision
+                    ),
                     "reason": str(exc) or "fence_invalidated_or_unknown",
                     "fail_closed": True,
                 },
@@ -15931,6 +16097,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         if safe_route_identity:
             result["route_identity"] = dict(safe_route_identity)
             result["route_identity_source"] = safe_route_source
+        if contract_runtime_failed_qa_revision:
+            result["contract_runtime_failed_qa_revision"] = dict(
+                contract_runtime_failed_qa_revision
+            )
         if resolved_route_identity:
             result["route_identity_rebound"] = True
             result["previous_route_identity"] = _route_identity_public_summary(
@@ -15998,6 +16168,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
                 "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
                 "reopen_for_revision": reopen_for_revision,
+                "timeline_reopen_for_revision": timeline_reopen_for_revision,
+                "contract_runtime_failed_qa_revision": (
+                    contract_runtime_failed_qa_revision
+                ),
                 "runtime_context_id": runtime_context_id_for_branch_context(context),
                 "route_identity_source": safe_route_source,
                 "route_identity_rebound": bool(resolved_route_identity),
@@ -37389,6 +37563,7 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
                 "runtime_context_worker_guide",
                 "runtime_context_current",
                 "runtime_context_session_token_initial_join",
+                "runtime_context_session_token_reissue",
                 "runtime_context_session_token_rejoin",
             ],
             "produces": [

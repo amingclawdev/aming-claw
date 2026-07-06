@@ -102,6 +102,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
         "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
     }.issubset(names)
 
 
@@ -209,6 +210,10 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
             "ttl_seconds": 1200,
         },
     )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_reissue",
+        {**common, "task_id": "worker-demo", "parent_task_id": "AC-DEMO"},
+    )["ok"] is True
 
     assert calls == [
         (
@@ -249,6 +254,17 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "task_id": "worker-demo",
                 "reason": "host adapter needs first worker auth env",
                 "ttl_seconds": 1200,
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/session-token/reissue",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "session_token": "worker-session",
+                "fence_token": "fence-demo",
+                "task_id": "worker-demo",
+                "parent_task_id": "AC-DEMO",
             },
         ),
     ]
@@ -740,6 +756,29 @@ def test_mcp_stdio_initial_join_schema_exposes_actual_host_identity_fields():
     }.issubset(properties)
 
 
+def test_mcp_stdio_reissue_schema_requires_worker_auth_proof():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    schema = tools["runtime_context_session_token_reissue"]["inputSchema"]
+    assert {
+        "project_id",
+        "runtime_context_id",
+        "task_id",
+        "fence_token",
+        "session_token",
+    }.issubset(schema["required"])
+    assert {
+        "parent_task_id",
+        "target_project_root",
+        "ttl_seconds",
+    }.issubset(schema["properties"])
+
+
 def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
@@ -1110,6 +1149,53 @@ def test_mcp_dispatcher_runtime_context_initial_join_posts_canonical_facade():
                 "route_context_hash": "sha256:route-join",
                 "prompt_contract_id": "prompt-join",
                 "reason": "host adapter needs first worker auth env",
+                "ttl_seconds": 1200,
+            },
+        )
+    ]
+
+
+def test_mcp_dispatcher_runtime_context_reissue_posts_canonical_facade():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "status": "session_token_reissued"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "runtime_context_session_token_reissue",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-reissue",
+            "task_id": "worker-reissue",
+            "parent_task_id": "AC-REISSUE",
+            "target_project_root": "/repo/fixture",
+            "session_token": "old-session-token",
+            "fence_token": "fence-reissue",
+            "ttl_seconds": 1200,
+        },
+    )
+
+    assert result == {"ok": True, "status": "session_token_reissued"}
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-reissue/session-token/reissue",
+            {
+                "runtime_context_id": "mfrctx-reissue",
+                "task_id": "worker-reissue",
+                "parent_task_id": "AC-REISSUE",
+                "target_project_root": "/repo/fixture",
+                "session_token": "old-session-token",
+                "fence_token": "fence-reissue",
                 "ttl_seconds": 1200,
             },
         )

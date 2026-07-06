@@ -20034,6 +20034,201 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
     assert action_plan["next_required_evidence"][0]["id"] == "failed_qa_revision"
 
 
+def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_failed_qa(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-RUNTIME-TOKEN-REJOIN-CONTRACT-FAILED-QA"
+    target_root = tmp_path / "runtime-token-rejoin-contract-failed-qa"
+    target_root.mkdir()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-failed-qa-parent",
+        worker_task_id="contract-failed-qa-worker",
+        fence_token="fence-contract-failed-qa",
+        token="lost-contract-failed-qa-token",
+        worktree_path=str(target_root),
+    )
+    _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token="fence-contract-failed-qa",
+        graph_trace_id="gqt-contract-failed-qa-worker",
+        head_commit="head-contract-failed-qa",
+    )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            status=STATE_VALIDATED,
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso="2026-07-06T02:00:00Z",
+    )
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+        )
+    )
+    if current["next_legal_action"]["line_id"] == "qa_graph_context":
+        qa_graph_trace_id = "gqt-contract-failed-qa-qa"
+        _insert_observer_graph_query_trace(
+            conn,
+            trace_id=qa_graph_trace_id,
+            snapshot_id="scope-contract-failed-qa-qa",
+            actor="qa",
+            query_source="qa",
+            query_purpose="independent_verification",
+            task_id=successor["contract_execution_id"],
+            created_at="2026-07-06T02:01:00Z",
+        )
+        qa_graph = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "qa",
+                method="POST",
+                body={
+                    "stage_id": "qa_graph_context",
+                    "line_id": "qa_graph_context",
+                    "evidence_kind": "graph_trace",
+                    "graph_trace_ids": [qa_graph_trace_id],
+                    "db_verified": True,
+                    "query_source": "qa",
+                    "query_purpose": "independent_verification",
+                    "payload": {
+                        "schema_version": "mf_parallel.qa_graph_context.v1",
+                        "graph_trace_ids": [qa_graph_trace_id],
+                        "graph_trace_evidence": {
+                            "db_verified": True,
+                            "graph_trace_ids": [qa_graph_trace_id],
+                            "verified_trace_ids": [qa_graph_trace_id],
+                            "query_source": "qa",
+                            "query_purpose": "independent_verification",
+                            "target_project_root": str(target_root),
+                        },
+                    },
+                },
+            )
+        )
+        assert qa_graph["ok"] is True
+        current = server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "qa",
+            )
+        )
+    assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
+
+    qa_result = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "status": "failed",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "summary": (
+                        "Independent QA failed in ContractRuntime without a "
+                        "failed timeline event."
+                    ),
+                },
+                "verification": {
+                    "result": "failed",
+                    "verdict": "fail",
+                    "acceptance_failed": ["contract_runtime_failed_qa_revision"],
+                },
+            },
+        )
+    )
+    assert qa_result["ok"] is True
+    assert qa_result["contract_runtime_current_state"]["next_legal_action"][
+        "line_id"
+    ] == "worker_read_runtime_guide"
+    assert not task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="independent_verification",
+    )
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": "failed ContractRuntime QA requires worker revision after resume",
+                "now_iso": "2999-01-01T00:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_rejoin_issued"
+    assert result["reopen_for_revision"] is True
+    assert result["contract_runtime_failed_qa_revision"]["contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert result["previous_status"] == STATE_VALIDATED
+    assert result["current_status"] == STATE_WORKTREE_READY
+    saved = get_branch_context(conn, PID, runtime_context.task_id)
+    assert saved is not None
+    assert saved.status == STATE_WORKTREE_READY
+    assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
+
+    runtime_current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "mf_sub",
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": result["fence_token"],
+                "session_token": result["session_token"],
+                "target_project_root": str(target_root),
+                "view": "all",
+            },
+        )
+    )
+    action_plan = runtime_current["executable_contract"]
+    assert action_plan["next_legal_action"] == "revise_after_failed_independent_qa"
+    required = action_plan["next_required_evidence"][0]
+    assert required["id"] == "failed_qa_revision"
+    assert required["expected_source"] == (
+        "contract_runtime.qa_independent_verification.failed"
+    )
+    assert required["evidence_ref"].startswith(
+        f"contract_runtime:{successor['contract_execution_id']}:"
+    )
+    assert runtime_current["contract_runtime_failed_qa_revision"][
+        "raw_tokens_exposed"
+    ] is False
+
+
 def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(
     conn,
     tmp_path,
@@ -32862,6 +33057,9 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert "runtime_context_session_token_initial_join" in bridge_guidance[
         "next_action"
     ]["tools"]
+    assert "runtime_context_session_token_reissue" in bridge_guidance["next_action"][
+        "tools"
+    ]
     assert "runtime_context_session_token_rejoin" in bridge_guidance["next_action"][
         "tools"
     ]
@@ -39134,6 +39332,9 @@ def test_contract_runtime_mf_sub_missing_worker_proof_reports_required_fields(co
     assert "runtime_context_session_token_initial_join" in bridge_guidance[
         "next_action"
     ]["tools"]
+    assert "runtime_context_session_token_reissue" in bridge_guidance["next_action"][
+        "tools"
+    ]
     assert "runtime_context_session_token_rejoin" in bridge_guidance["next_action"][
         "tools"
     ]

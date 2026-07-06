@@ -5176,6 +5176,7 @@ def build_runtime_context_current_view(
     timeline_events: Sequence[Mapping[str, Any]] | None = None,
     lane_required_clauses: Sequence[str | Mapping[str, Any]] | None = None,
     durable_merge_queue_item: Mapping[str, Any] | None = None,
+    contract_runtime_failed_qa_revision: Mapping[str, Any] | None = None,
     generated_at: str = "",
 ) -> dict[str, Any]:
     """Build the canonical current-state projection for runtime-context gates."""
@@ -5339,6 +5340,13 @@ def build_runtime_context_current_view(
     current_values["close_precheck"] = public_contract_revision_payload(
         revision_payload.get("close_precheck")
     )
+    contract_failed_qa_revision = public_contract_revision_payload(
+        contract_runtime_failed_qa_revision or {}
+    )
+    if contract_failed_qa_revision:
+        current_values["contract_runtime_failed_qa_revision"] = (
+            contract_failed_qa_revision
+        )
     evidence_refs = _runtime_context_evidence_refs(
         context,
         runtime_context_id=runtime_context_id,
@@ -5415,6 +5423,7 @@ def build_runtime_context_current_view(
             lane_id=context.task_id,
             generated_at=generated_at,
         ),
+        "contract_runtime_failed_qa_revision": contract_failed_qa_revision,
         "terminal_dispatch_blockers": terminal_dispatch_blockers,
         "startup_gate": startup,
         "finish_gate": finish,
@@ -7261,6 +7270,7 @@ def _runtime_context_failed_qa_revision_projection(
     *,
     lane_plan: Mapping[str, Any],
     values: Mapping[str, Any],
+    contract_runtime_failed_qa_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     owned_files = _runtime_context_dedupe(
         _runtime_context_string_list(values.get("owned_files"))
@@ -7307,6 +7317,58 @@ def _runtime_context_failed_qa_revision_projection(
             ],
             "raw_route_token_exposed": False,
         }
+    contract_evidence = _runtime_context_mapping(
+        contract_runtime_failed_qa_revision
+        or values.get("contract_runtime_failed_qa_revision")
+    )
+    if contract_evidence.get("status") == "revision_required":
+        failed_ref = _runtime_context_text(
+            contract_evidence.get("failed_qa_source_ref")
+            or contract_evidence.get("source_ref")
+            or contract_evidence.get("dispatch_source_ref")
+        )
+        failed_status = _runtime_context_lane_clause_id(
+            contract_evidence.get("failed_qa_status") or "failed"
+        )
+        return {
+            "schema_version": "runtime_context.failed_qa_revision_projection.v1",
+            "status": "revision_required",
+            "source": "contract_runtime_completed_lines",
+            "next_legal_action": "revise_after_failed_independent_qa",
+            "failed_qa_event_ref": "",
+            "failed_qa_source_ref": failed_ref,
+            "failed_qa_event_kind": _runtime_context_text(
+                contract_evidence.get("failed_qa_line_id")
+                or "qa_independent_verification"
+            ),
+            "failed_qa_status": failed_status,
+            "failed_acceptance_items": _runtime_context_string_list(
+                contract_evidence.get("failed_acceptance_items")
+            ),
+            "findings": _runtime_context_public_qa_findings(
+                contract_evidence.get("findings") or []
+            ),
+            "reviewed_events": _runtime_context_public_reviewed_events(
+                contract_evidence.get("reviewed_events") or {}
+            ),
+            "allowed_files": owned_files,
+            "expected_source": "contract_runtime.qa_independent_verification.failed",
+            "contract_runtime_failed_qa_revision": contract_evidence,
+            "required_revision_cycle": [
+                "revise_implementation_in_owned_scope",
+                "record_implementation_evidence",
+                "record_worker_verification",
+                "record_review_ready",
+                "request_independent_qa_again",
+            ],
+            "blocked_generic_actions": [
+                "record_mf_subagent_startup",
+                "record_close_ready",
+                "handoff_review_ready",
+                "backlog_close",
+            ],
+            "raw_route_token_exposed": False,
+        }
     return {
         "schema_version": "runtime_context.failed_qa_revision_projection.v1",
         "status": "not_required",
@@ -7326,8 +7388,14 @@ def _runtime_context_failed_qa_revision_required_item(
         "next_action": "revise_after_failed_independent_qa",
         "producer": "mf_subagent_worker",
         "consumer": "independent_qa",
-        "expected_source": "task_timeline.independent_verification.failed",
-        "evidence_ref": _runtime_context_text(projection.get("failed_qa_event_ref")),
+        "expected_source": _runtime_context_text(
+            projection.get("expected_source")
+            or "task_timeline.independent_verification.failed"
+        ),
+        "evidence_ref": _runtime_context_text(
+            projection.get("failed_qa_event_ref")
+            or projection.get("failed_qa_source_ref")
+        ),
         "runtime_context_id": _runtime_context_text(values.get("runtime_context_id")),
         "task_id": _runtime_context_text(values.get("task_id")),
         "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
@@ -7713,6 +7781,9 @@ def build_runtime_context_action_plan_view(
     failed_qa_revision_projection = _runtime_context_failed_qa_revision_projection(
         lane_plan=lane_plan,
         values=values,
+        contract_runtime_failed_qa_revision=current_view.get(
+            "contract_runtime_failed_qa_revision"
+        ),
     )
     next_legal_action = _runtime_context_next_legal_action(
         route_token_action=route_token_action,
@@ -7769,6 +7840,10 @@ def build_runtime_context_action_plan_view(
                 "event_ref": failed_qa_revision_projection.get(
                     "failed_qa_event_ref", ""
                 ),
+                "source_ref": failed_qa_revision_projection.get(
+                    "failed_qa_source_ref", ""
+                ),
+                "source": failed_qa_revision_projection.get("source", ""),
             }
         )
     if route_token_action.get("status") in {"missing", "stale"}:
@@ -8934,6 +9009,7 @@ def build_runtime_context_projection(
     role: str = RUNTIME_CONTEXT_WORKER_ROLE,
     fence_token: str = "",
     durable_merge_queue_item: Mapping[str, Any] | None = None,
+    contract_runtime_failed_qa_revision: Mapping[str, Any] | None = None,
     generated_at: str = "",
 ) -> RuntimeContextProjection:
     """Build all Runtime Context Service projections for internal consumers."""
@@ -8954,6 +9030,7 @@ def build_runtime_context_projection(
         timeline_events=timeline_events,
         lane_required_clauses=lane_required_clauses,
         durable_merge_queue_item=durable_merge_queue_item,
+        contract_runtime_failed_qa_revision=contract_runtime_failed_qa_revision,
         generated_at=generated_at,
     )
     gate_inputs = build_runtime_context_gate_inputs_view(current)

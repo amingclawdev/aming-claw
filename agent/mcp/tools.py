@@ -2704,6 +2704,21 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "runtime_context_session_token_reissue",
+        "description": "Worker-authenticated Runtime Context session-token rotation facade for expired or near-expired mf_sub leases. Requires matching raw session/fence proof and never persists raw tokens.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": [
+                "project_id",
+                "runtime_context_id",
+                "task_id",
+                "fence_token",
+                "session_token",
+            ],
+        },
+    },
+    {
         "name": "runtime_context_session_token_rejoin",
         "description": "Observer recovery facade that issues an audited worker host envelope when a resumed mf_sub session lost raw worker auth material. Does not authorize ref-only worker writes.",
         "inputSchema": {
@@ -4349,6 +4364,7 @@ class ToolDispatcher:
             "runtime_context_finish_time_worker_attestation",
             "runtime_context_finish_gate",
             "runtime_context_session_token_initial_join",
+            "runtime_context_session_token_reissue",
             "runtime_context_session_token_rejoin",
         }:
             pid = args["project_id"]
@@ -4363,6 +4379,7 @@ class ToolDispatcher:
                 "runtime_context_session_token_initial_join": (
                     "session-token/initial-join"
                 ),
+                "runtime_context_session_token_reissue": "session-token/reissue",
                 "runtime_context_session_token_rejoin": "session-token/rejoin",
             }
             return self._api(
