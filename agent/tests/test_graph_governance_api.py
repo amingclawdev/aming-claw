@@ -19123,6 +19123,37 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert current_qa_guide["graph_query"]["query_purpose"] == (
         "independent_verification"
     )
+    assert current_qa_guide["graph_query"]["db_verified_trace_ids_required"] is True
+    assert current_qa_guide["graph_query"]["required_provenance"] == [
+        "qa_principal",
+        "qa_session_id",
+        "query_source=qa",
+        "query_purpose=independent_verification",
+        "source=graph_query_traces",
+        "db_verified=true",
+    ]
+    current_qa_graph_shape = current_qa_guide["qa_graph_context"][
+        "accepted_evidence_shape"
+    ]
+    assert current_qa_graph_shape["graph_trace_ids"] == [
+        "<db-verified-qa-graph-query-trace-id>"
+    ]
+    assert current_qa_graph_shape["graph_query_trace_ids"] == [
+        "<db-verified-qa-graph-query-trace-id>"
+    ]
+    current_nested_graph = current_qa_graph_shape["payload"]["graph_trace_evidence"]
+    assert current_nested_graph["source"] == "graph_query_traces"
+    assert current_nested_graph["db_verified"] is True
+    assert current_nested_graph["query_source"] == "qa"
+    assert current_nested_graph["query_purpose"] == "independent_verification"
+    assert current_nested_graph["qa_principal"] == "<qa-principal-or-session-id>"
+    assert current_nested_graph["qa_session_id"] == "<qa-principal-or-session-id>"
+    assert current_nested_graph["verified_trace_ids"] == [
+        "<db-verified-qa-graph-query-trace-id>"
+    ]
+    assert current_nested_graph["missing_trace_ids"] == []
+    assert current_nested_graph["identity_mismatches"] == []
+    assert current_nested_graph["target_project_root"] == str(target_root)
     current_prefill = current_qa_guide["observer_prefill_route_token"]
     assert current_prefill["status"] == "ready"
     assert current_prefill["observer_action"] == "observer_route_context_issue"
@@ -19164,6 +19195,21 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         "route_token_ref",
         "accepted_route_owned_source_event_lineage",
     ]
+    assert qa_guide["qa_graph_context"]["required_top_level_fields"] == [
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+    ]
+    assert (
+        qa_guide["qa_graph_context"]["required_nested_payload_field"]
+        == "payload.graph_trace_evidence"
+    )
+    qa_graph_body = qa_guide["append_evidence"]["qa_graph_context_body"]
+    assert qa_graph_body == qa_guide["qa_graph_context"]["accepted_evidence_shape"]
+    assert qa_graph_body["payload"]["graph_trace_evidence"]["query_source"] == "qa"
+    assert (
+        qa_graph_body["payload"]["graph_trace_evidence"]["query_purpose"]
+        == "independent_verification"
+    )
     assert qa_guide["append_evidence"]["qa_child_route_token_ref_body"][
         "route_token_ref"
     ] == "<qa_child_route_token_ref>"

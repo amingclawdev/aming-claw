@@ -18,6 +18,7 @@ from agent.tests.fixtures.parallel_project import (
 )
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
 from agent.governance import graph_query_trace
+from agent.governance.contract_state_runtime import build_contract_state_projection
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
     validate_mf_subagent_finish_gate,
@@ -110,6 +111,43 @@ PB001_BRANCH_NAMES = {
     "T4": "codex/PB001-T4-dashboard-read-model",
     "T5": "codex/PB001-T5-chain-adapter",
 }
+
+
+def test_mf_parallel_v2_qa_graph_context_guides_exact_graph_evidence_shape() -> None:
+    projection = build_contract_state_projection(
+        [
+            {"id": 1, "event_kind": "contract_binding"},
+            {"id": 2, "event_kind": "dispatch_bounded_worker"},
+            {"id": 3, "event_kind": "mf_subagent_read_receipt"},
+            {"id": 4, "event_kind": "mf_subagent_startup"},
+            {"id": 5, "event_kind": "graph_trace"},
+            {"id": 6, "event_kind": "implementation"},
+            {"id": 7, "event_kind": "record_finish_time_worker_attestation"},
+            {"id": 8, "event_kind": "mf_subagent_finish_gate"},
+            {"id": 9, "event_kind": "review_ready"},
+        ],
+        contract={
+            "contract": {
+                "contract_id": "mf_parallel.v2",
+                "contract_template_id": "mf_parallel.v2",
+                "contract_revision_id": "rev-mf-v2-defaults",
+                "state": "bound",
+            }
+        },
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-QA-GRAPH"},
+    )
+
+    next_action = projection["next_legal_action"]
+    assert next_action["id"] == "qa_graph_context"
+    detail = next_action["detail"]
+    assert "graph_trace_ids" in detail
+    assert "graph_query_trace_ids" in detail
+    assert "payload.graph_trace_evidence" in detail
+    assert "source=graph_query_traces" in detail
+    assert "db_verified=true" in detail
+    assert "query_source=qa" in detail
+    assert "query_purpose=independent_verification" in detail
+    assert "QA principal/session provenance" in detail
 
 
 def _pb001_branch_ref(
@@ -3994,10 +4032,10 @@ def test_runtime_context_worker_view_filters_private_context_and_wrong_fence() -
     assert worker_view["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
     assert worker_view["worker_next_moves"] == []
     assert worker_view["done_state_projection"]["status"] == (
-        "validated_without_durable_merge_queue_item"
+        "waiting_for_current_finish_gate"
     )
     assert worker_view["control_plane"]["done_state_projection"]["status"] == (
-        "validated_without_durable_merge_queue_item"
+        "waiting_for_current_finish_gate"
     )
     dispatch_fence = worker_view["gate_inputs"]["gates"]["dispatch"]["fields"][
         "fence_token"
@@ -7491,6 +7529,46 @@ def test_runtime_context_projects_validated_missing_durable_merge_queue_item() -
     }
     assert "fence_token" not in tool_args
     assert context.fence_token not in json.dumps(bootstrap)
+
+
+def test_runtime_context_reopened_revision_waits_for_current_finish_gate() -> None:
+    context = _runtime_projection_context(
+        task_id="mf-sub-reopened-revision",
+        branch_ref="refs/heads/codex/mf-sub-reopened-revision",
+        status=STATE_WORKTREE_READY,
+        checkpoint_id="ckpt-before-revision",
+        replay_source="mf_sub_finish_gate",
+        merge_queue_id="mq-reopened-revision",
+    )
+
+    projection = _finished_qa_runtime_projection(context)
+
+    current_values = projection["views"]["current"]["current_values"]
+    durable_projection = current_values["durable_merge_queue_item_projection"]
+    action_plan = projection["views"]["action_plan"]
+    done_state = action_plan["close_precheck_gap_projection"][
+        "done_state_projection"
+    ]
+    gap_by_code = {
+        item["code"]: item
+        for item in action_plan["close_precheck_gap_projection"]["gaps"]
+    }
+
+    assert durable_projection["status"] == "waiting_for_current_finish_gate"
+    assert durable_projection["finish_gate_merge_ready"] is False
+    assert durable_projection["runtime_context_status"] == STATE_WORKTREE_READY
+    assert durable_projection["next_action"] == "record_finish_gate"
+    assert durable_projection["next_actions"] == [
+        "record_finish_time_worker_attestation",
+        "record_finish_gate",
+    ]
+    assert "copy_safe_bootstrap_payload" not in durable_projection
+    assert action_plan["next_legal_action"] == "record_finish_gate"
+    assert done_state["status"] == "waiting_for_current_finish_gate"
+    assert done_state["handoff_terminal_status"] == "waiting_for_current_finish_gate"
+    assert gap_by_code["current_finish_gate_required"]["next_action"] == (
+        "record_finish_gate"
+    )
 
 
 def test_runtime_context_projects_materialized_durable_merge_queue_item() -> None:
