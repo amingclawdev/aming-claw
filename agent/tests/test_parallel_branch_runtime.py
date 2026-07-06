@@ -376,6 +376,42 @@ def _insert_startup_graph_trace(
     )
 
 
+def test_runtime_context_graph_trace_refs_verifies_all_explicit_ids_over_context_window() -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    runtime_context_id = _startup_runtime_context_id()
+    trace_ids = [f"gqt-startup-overflow-{index:02d}" for index in range(23)]
+    for trace_id in trace_ids:
+        _insert_startup_graph_trace(
+            conn,
+            trace_id=trace_id,
+            task_id="mf-sub-startup",
+            parent_task_id="parent-startup",
+            runtime_context_id=runtime_context_id,
+            fence_token="fence-startup",
+            query_purpose="subagent_context_build",
+        )
+
+    refs = server_module._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=runtime_context_id,
+        task_id="mf-sub-startup",
+        parent_task_id="parent-startup",
+        backlog_id="AC-GRAPH-TRACE-OVERFLOW",
+        fence_token="fence-startup",
+        explicit_trace_ids=trace_ids,
+    )
+
+    assert refs["db_verified"] is True
+    assert refs["requested_trace_ids"] == trace_ids
+    assert refs["missing_trace_ids"] == []
+    assert refs["identity_mismatches"] == []
+    assert len(refs["verified_trace_ids"]) == 23
+    assert set(refs["verified_trace_ids"]) == set(trace_ids)
+
+
 def test_runtime_context_graph_trace_refs_expect_successor_parent_not_root() -> None:
     from agent.governance import server as server_module
 

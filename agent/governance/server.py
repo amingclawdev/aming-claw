@@ -8466,45 +8466,44 @@ def _runtime_context_service_graph_trace_refs(
         if text and text not in seen_requested:
             seen_requested.add(text)
             requested_trace_ids.append(text)
+
+    def _row_trace_id(row: Any) -> str:
+        if isinstance(row, sqlite3.Row):
+            return str(row["trace_id"] or "").strip()
+        return str(row[0] or "").strip()
+
+    rows: list[Any] = []
     try:
-        if requested_trace_ids and strict_explicit_trace_ids:
+        if requested_trace_ids:
             explicit_clause = ",".join("?" for _ in requested_trace_ids)
-            rows = conn.execute(
+            rows.extend(
+                conn.execute(
+                    f"""
+                    SELECT trace_id, query_source, query_purpose, worker_role,
+                           parent_task_id, task_id, runtime_context_id, run_id,
+                           fence_token
+                    FROM graph_query_traces
+                    WHERE project_id = ?
+                      AND trace_id IN ({explicit_clause})
+                    ORDER BY created_at DESC, trace_id DESC
+                    """,
+                    (project_id, *tuple(requested_trace_ids)),
+                ).fetchall()
+            )
+        if not strict_explicit_trace_ids or not requested_trace_ids:
+            current_run_id_like = ""
+            if task_id and fence_token:
+                fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+                current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
+            contextual_rows = conn.execute(
                 f"""
                 SELECT trace_id, query_source, query_purpose, worker_role,
                        parent_task_id, task_id, runtime_context_id, run_id,
                        fence_token
                 FROM graph_query_traces
                 WHERE project_id = ?
-                  AND trace_id IN ({explicit_clause})
-                ORDER BY created_at DESC, trace_id DESC
-                LIMIT 20
-                """,
-                (project_id, *tuple(requested_trace_ids)),
-            ).fetchall()
-        else:
-            current_run_id_like = ""
-            if task_id and fence_token:
-                fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
-                current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
-            explicit_clause = ""
-            explicit_params: tuple[str, ...] = ()
-            if requested_trace_ids:
-                explicit_clause = "OR trace_id IN ({})".format(
-                    ",".join("?" for _ in requested_trace_ids)
-                )
-                explicit_params = tuple(requested_trace_ids)
-            rows = conn.execute(
-                """
-                SELECT trace_id, query_source, query_purpose, worker_role,
-                       parent_task_id, task_id, runtime_context_id, run_id,
-                       fence_token
-                FROM graph_query_traces
-                WHERE project_id = ?
                   AND (
-                    0
-                    {explicit_clause}
-                    OR (? != '' AND runtime_context_id = ?)
+                    (? != '' AND runtime_context_id = ?)
                     OR (? != '' AND task_id = ?)
                     OR (? != '' AND fence_token = ?)
                     OR (
@@ -8515,10 +8514,9 @@ def _runtime_context_service_graph_trace_refs(
                 )
                 ORDER BY created_at DESC, trace_id DESC
                 LIMIT 20
-                """.format(explicit_clause=explicit_clause),
+                """,
                 (
                     project_id,
-                    *explicit_params,
                     runtime_context_id,
                     runtime_context_id,
                     task_id,
@@ -8529,6 +8527,12 @@ def _runtime_context_service_graph_trace_refs(
                     current_run_id_like,
                 ),
             ).fetchall()
+            seen_row_trace_ids = {_row_trace_id(row) for row in rows}
+            for row in contextual_rows:
+                trace_id = _row_trace_id(row)
+                if trace_id and trace_id not in seen_row_trace_ids:
+                    seen_row_trace_ids.add(trace_id)
+                    rows.append(row)
     except sqlite3.OperationalError:
         rows = []
     verified: list[str] = []
@@ -8536,7 +8540,7 @@ def _runtime_context_service_graph_trace_refs(
     row_trace_ids: set[str] = set()
     identity_mismatches: list[dict[str, str]] = []
     for row in rows:
-        trace_id = str(row["trace_id"] if isinstance(row, sqlite3.Row) else row[0])
+        trace_id = _row_trace_id(row)
         if not trace_id:
             continue
         row_trace_ids.add(trace_id)
