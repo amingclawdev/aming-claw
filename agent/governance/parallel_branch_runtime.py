@@ -16240,6 +16240,7 @@ def _context_matches_read_model_queue(
     *,
     active_merge_queue_id: str,
     active_queue_task_ids: Sequence[str] = (),
+    include_unscoped_non_ready: bool = True,
 ) -> bool:
     queue_id = str(active_merge_queue_id or "").strip()
     if not queue_id:
@@ -16247,9 +16248,11 @@ def _context_matches_read_model_queue(
     context_queue_id = str(context.merge_queue_id or "").strip()
     if context_queue_id:
         return context_queue_id == queue_id
+    if context.task_id in active_queue_task_ids:
+        return True
     if context.status == STATE_WORKTREE_READY:
-        return context.task_id in active_queue_task_ids
-    return True
+        return False
+    return include_unscoped_non_ready
 
 
 def build_parallel_branch_read_model(
@@ -16284,6 +16287,7 @@ def build_parallel_branch_read_model(
                 context,
                 active_merge_queue_id=active_merge_queue_id,
                 active_queue_task_ids=active_queue_task_ids,
+                include_unscoped_non_ready=bool(batch_id),
             )
         )
     ]

@@ -862,6 +862,129 @@ def test_active_batch_read_model_filters_stale_queue_lane_with_missing_context_q
     assert payload["summary"]["status_counts"] == {pbr.STATE_MERGED: 1}
 
 
+def test_live_read_model_filters_unbound_stale_queue_lane_from_active_queue():
+    conn = _runtime_conn()
+    current_queue_id = "mq-9ef3fe376e3d7a196350"
+    stale_queue_id = "mq-65d78059566f39d29dda3307"
+    current_task_id = "mf-parallel-branch-lanes-live-filter-worker-20260706"
+    stale_task_id = "mf-batch-qa-graph-evidence-shape-worker-20260705"
+    stale_recovery_task_id = "mf-batch-qa-graph-evidence-shape-worker-row2-20260705"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id=current_task_id,
+            backlog_id="AC-CURRENT",
+            branch_ref="refs/heads/codex/current-lane",
+            status=pbr.STATE_QUEUED_FOR_MERGE,
+            merge_queue_id=current_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id=stale_task_id,
+            backlog_id="AC-STALE",
+            branch_ref="refs/heads/codex/stale-lane",
+            status=pbr.STATE_RUNNING,
+            merge_queue_id="",
+            merge_preview_id=f"{stale_queue_id}:preview",
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id=stale_recovery_task_id,
+            backlog_id="AC-STALE-RECOVERY",
+            branch_ref="refs/heads/codex/stale-recovery-lane",
+            status=pbr.STATE_QUEUED_FOR_MERGE,
+            merge_queue_id=stale_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=current_queue_id,
+                queue_item_id="item-current",
+                backlog_id="AC-CURRENT",
+                task_id=current_task_id,
+                branch_ref="refs/heads/codex/current-lane",
+                queue_index=1,
+                status=pbr.STATE_QUEUED_FOR_MERGE,
+                target_ref=TARGET_REF,
+            ),
+        ],
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=stale_queue_id,
+                queue_item_id="item-stale",
+                backlog_id="AC-STALE",
+                task_id=stale_task_id,
+                branch_ref="refs/heads/codex/stale-lane",
+                queue_index=1,
+                status=pbr.STATE_RUNNING,
+                target_ref=TARGET_REF,
+            ),
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=stale_queue_id,
+                queue_item_id="item-stale-recovery",
+                backlog_id="AC-STALE-RECOVERY",
+                task_id=stale_recovery_task_id,
+                branch_ref="refs/heads/codex/stale-recovery-lane",
+                queue_index=2,
+                status=pbr.STATE_QUEUED_FOR_MERGE,
+                target_ref=TARGET_REF,
+            ),
+        ],
+        now_iso=NOW,
+    )
+
+    active_payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=current_queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+    stale_payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=stale_queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+
+    assert [row["task_id"] for row in active_payload["merge_queue"]["rows"]] == [
+        current_task_id
+    ]
+    assert [row["task_id"] for row in active_payload["branch_lanes"]] == [
+        current_task_id
+    ]
+    assert [row["task_id"] for row in stale_payload["merge_queue"]["rows"]] == [
+        stale_task_id,
+        stale_recovery_task_id,
+    ]
+    assert [row["task_id"] for row in stale_payload["branch_lanes"]] == [
+        stale_task_id,
+        stale_recovery_task_id,
+    ]
+
+
 def test_mf_batch_parallel_preflight_blocks_missing_target_head_and_files():
     plan = plan_mf_batch_parallel_preflight(
         project_id=PROJECT_ID,
@@ -1688,6 +1811,7 @@ def test_worker_execution_safety_blocks_pre_edit_without_verified_graph_trace() 
         "harness_type": "codex",
         "actual_cwd": "/tmp/safety",
         "actual_git_root": "/tmp/safety",
+        "filer_principal": "worker-session-safety",
         "read_receipt_hash": "sha256:read-safety",
         "read_receipt_event_id": "8896",
     }
