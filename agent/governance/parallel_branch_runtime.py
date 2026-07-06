@@ -16220,16 +16220,36 @@ def _compact_rollback(
     return rollback, len(batch_plan.dashboard_rows), rows_truncated or retained_truncated
 
 
+def _read_model_queue_task_ids(
+    merge_queue_plan: MergeQueuePlan | None,
+) -> frozenset[str]:
+    if merge_queue_plan is None:
+        return frozenset()
+    return frozenset(
+        task_id
+        for task_id in (
+            str(row.get("task_id") or "").strip()
+            for row in merge_queue_plan.dashboard_rows
+        )
+        if task_id
+    )
+
+
 def _context_matches_read_model_queue(
     context: BranchTaskRuntimeContext,
     *,
     active_merge_queue_id: str,
+    active_queue_task_ids: Sequence[str] = (),
 ) -> bool:
     queue_id = str(active_merge_queue_id or "").strip()
     if not queue_id:
         return True
     context_queue_id = str(context.merge_queue_id or "").strip()
-    return not context_queue_id or context_queue_id == queue_id
+    if context_queue_id:
+        return context_queue_id == queue_id
+    if context.status == STATE_WORKTREE_READY:
+        return context.task_id in active_queue_task_ids
+    return True
 
 
 def build_parallel_branch_read_model(
@@ -16249,6 +16269,7 @@ def build_parallel_branch_read_model(
     deliberately avoids expanding backlog rows, graph nodes, or semantic payloads.
     """
     decisions_by_task = _recovery_decisions_by_task(recovery_plan)
+    active_queue_task_ids = _read_model_queue_task_ids(merge_queue_plan)
     ordered_contexts = sorted(contexts, key=lambda ctx: (ctx.batch_id, ctx.task_id))
     lanes = [
         _compact_branch_lane(
@@ -16262,6 +16283,7 @@ def build_parallel_branch_read_model(
             and _context_matches_read_model_queue(
                 context,
                 active_merge_queue_id=active_merge_queue_id,
+                active_queue_task_ids=active_queue_task_ids,
             )
         )
     ]

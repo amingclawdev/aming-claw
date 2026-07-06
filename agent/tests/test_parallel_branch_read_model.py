@@ -796,6 +796,72 @@ def test_active_batch_read_model_filters_stale_queue_lane_from_current_queue():
     assert payload["branch_lanes"][0]["merge_queue_id"] == current_queue_id
 
 
+def test_active_batch_read_model_filters_stale_queue_lane_with_missing_context_queue():
+    conn = _runtime_conn()
+    batch_id = "mf-batch-parallel-84d4cdf62e77b2c1cc54"
+    current_queue_id = "mq-9ef3fe376e3d7a196350"
+    stale_queue_id = "mq-65d78059566f39d29dda3307"
+    current_task_id = f"{batch_id}:row:1"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=current_task_id,
+            backlog_id="AC-ROW-ONE",
+            branch_ref="refs/heads/codex/live-row1",
+            status=pbr.STATE_MERGED,
+            merge_queue_id=current_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id="legacy-worker-row1",
+            backlog_id="AC-ROW-ONE",
+            branch_ref="refs/heads/codex/legacy-row1",
+            status=pbr.STATE_WORKTREE_READY,
+            target_head_commit="target-before-row2-recovery",
+            merge_queue_id="",
+            merge_preview_id=f"{stale_queue_id}:preview",
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=current_queue_id,
+                queue_item_id="item-row1",
+                backlog_id="AC-ROW-ONE",
+                task_id=current_task_id,
+                branch_ref="refs/heads/codex/live-row1",
+                queue_index=1,
+                status=pbr.STATE_MERGED,
+                target_ref=TARGET_REF,
+            )
+        ],
+        now_iso=NOW,
+    )
+
+    payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=current_queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+
+    assert [row["task_id"] for row in payload["branch_lanes"]] == [current_task_id]
+    assert payload["summary"]["status_counts"] == {pbr.STATE_MERGED: 1}
+
+
 def test_mf_batch_parallel_preflight_blocks_missing_target_head_and_files():
     plan = plan_mf_batch_parallel_preflight(
         project_id=PROJECT_ID,
