@@ -33260,6 +33260,16 @@ def _require_route_token_mutation_gate(
             str(server_binding.get("binding_source") or "")
             or "observer_route_token_refs"
         )
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        ):
+            value = str(server_binding.get(key) or "").strip()
+            if value:
+                result[key] = value
         for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
             value = server_binding.get(key)
             if isinstance(value, Mapping):
@@ -33366,7 +33376,11 @@ def _body_has_usable_route_token(body: dict | None) -> bool:
             token = {}
     if not isinstance(token, Mapping):
         return False
-    return bool(token.get("route_context_hash") and token.get("prompt_contract_id"))
+    return bool(
+        token.get("route_id")
+        and token.get("route_context_hash")
+        and token.get("prompt_contract_id")
+    )
 
 
 def _body_has_route_token_input(body: dict | None) -> bool:

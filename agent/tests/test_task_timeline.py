@@ -5864,9 +5864,14 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(gate["decision"], "route_token")
         self.assertTrue(gate["server_issued_binding"])
         self.assertEqual(gate["route_token_ref"], issued["route_token_ref"])
+        self.assertEqual(gate["route_id"], issued["route_token"]["route_id"])
         self.assertEqual(
             gate["route_context_hash"],
             issued["route_token"]["route_context_hash"],
+        )
+        self.assertEqual(
+            gate["prompt_contract_id"],
+            issued["route_token"]["prompt_contract_id"],
         )
         self.assertTrue(gate["route_token_hash"].startswith("sha256:"))
 
