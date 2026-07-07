@@ -694,6 +694,26 @@ def source_backed_route_gate_authority(
     return envelope
 
 
+def source_backed_runtime_context_worker_authority(
+    worker_evidence_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    provenance = (
+        dict(worker_evidence_provenance)
+        if isinstance(worker_evidence_provenance, Mapping)
+        else {}
+    )
+    envelope: dict[str, Any] = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_runtime_context_worker_proof",
+        "source_of_authority": "runtime_context_worker_proof",
+        "worker_evidence_provenance": provenance,
+    }
+    envelope["authority_hash"] = _canonical_contract_hash(
+        {key: value for key, value in envelope.items() if key != "authority_hash"}
+    )
+    return envelope
+
+
 def _source_backed_route_gate_authority_valid(authority: Mapping[str, Any]) -> bool:
     if not authority:
         return False
@@ -710,6 +730,51 @@ def _source_backed_route_gate_authority_valid(authority: Mapping[str, Any]) -> b
         {key: value for key, value in dict(authority).items() if key != "authority_hash"}
     )
     return authority_hash == expected_hash
+
+
+def _source_backed_runtime_context_worker_authority_valid(
+    authority: Mapping[str, Any],
+) -> bool:
+    if not authority:
+        return False
+    if _text(authority.get("schema_version")) != "source_backed_contract_gate_authority.v1":
+        return False
+    if _text(authority.get("source")) != "server_runtime_context_worker_proof":
+        return False
+    if _text(authority.get("source_of_authority")) != "runtime_context_worker_proof":
+        return False
+    authority_hash = _text(authority.get("authority_hash"))
+    if not authority_hash:
+        return False
+    expected_hash = _canonical_contract_hash(
+        {key: value for key, value in dict(authority).items() if key != "authority_hash"}
+    )
+    if authority_hash != expected_hash:
+        return False
+    provenance = _mapping(authority.get("worker_evidence_provenance"))
+    if _text(provenance.get("source")) != "runtime_context_copy_safe_worker_proof":
+        return False
+    if not _truthy(provenance.get("verified")) or not _truthy(
+        provenance.get("worker_owned")
+    ):
+        return False
+    if provenance.get("observer_impersonation") is not False:
+        return False
+    if _text(provenance.get("worker_role")) != "mf_sub":
+        return False
+    required_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "session_token_ref",
+        "fence_token_hash",
+    )
+    if any(not _text(provenance.get(field)) for field in required_fields):
+        return False
+    return bool(
+        _text(provenance.get("worker_slot_id")) or _text(provenance.get("worker_id"))
+    )
 
 
 def _source_backed_timeline_authority_source(
@@ -729,6 +794,14 @@ def _source_backed_timeline_authority_source(
             and _truthy(runtime_gate.get("primary_decision_source"))
         ):
             return "contract_runtime"
+
+    for source in (payload, verification, artifact_refs):
+        authority = _first_deep_mapping(
+            source,
+            "source_backed_contract_gate_authority",
+        )
+        if _source_backed_runtime_context_worker_authority_valid(authority):
+            return "runtime_context_worker_proof"
 
     for source in (payload, verification, artifact_refs):
         route_lineage = _first_deep_mapping(source, "route_action_scope_lineage")

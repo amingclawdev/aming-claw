@@ -17527,6 +17527,10 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
     raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
     raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    session_token_ref = (
+        _runtime_context_request_value(ctx, "session_token_ref")
+        or _runtime_context_request_value(ctx, "worker_session_token_ref")
+    )
     submitted_actor = str(body.get("actor") or "").strip()
     fence_token_hash = _runtime_context_implementation_fence_hash(
         ctx,
@@ -17556,6 +17560,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         str(body.get("parent_task_id") or "").strip()
         or _runtime_context_mf_sub_parent_task_id(context)
     )
+    target_project_root = _runtime_context_effective_target_project_root(context)
     graph_trace_db_evidence: dict[str, Any] = {}
     graph_trace_conn = get_connection(project_id)
     try:
@@ -17608,16 +17613,27 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         "observer_command_id": observer_command_id,
         "fence_token_hash": fence_token_hash,
         "fence_token_redacted": bool(fence_token_hash),
+        "session_token_ref": session_token_ref,
+        "session_token_ref_present": bool(session_token_ref),
+        "session_token_evidence_type": (
+            "server_verified_ref" if session_token_ref else "server_verified"
+        ),
         "raw_fence_token_persisted": False,
         "raw_session_token_persisted": False,
         "worker_role": "mf_sub",
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id or context.worker_id,
         "actor_session_principal": context.worker_slot_id or context.worker_id,
+        "authorization_source": "runtime_context_copy_safe_worker_proof",
+        "evidence_owner_actor": context.worker_slot_id or context.worker_id,
+        "evidence_owner_role": "mf_sub",
+        "evidence_owner_session_ref": session_token_ref,
+        "submitter_principal": context.worker_slot_id or context.worker_id,
+        "submitter_session": session_token_ref,
         "submitted_actor": submitted_actor,
         "governance_project_id": context.governance_project_id or project_id,
         "target_project_id": context.target_project_id or project_id,
-        "target_project_root": context.target_project_root,
+        "target_project_root": target_project_root,
         "finish_gate_event_ref": body.get("finish_gate_event_ref") or "",
     }.items():
         if value:
@@ -17625,6 +17641,23 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     payload["raw_fence_token_persisted"] = False
     payload["raw_session_token_persisted"] = False
     payload["fence_token_redacted"] = bool(fence_token_hash)
+    payload["observer_impersonation"] = False
+    from .runtime_context import worker_proof_line_provenance
+
+    worker_provenance = worker_proof_line_provenance(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "target_project_root": target_project_root,
+            "session_token_ref": session_token_ref,
+            "fence_token_hash": fence_token_hash,
+        }
+    )
+    if worker_provenance:
+        payload["worker_evidence_provenance"] = worker_provenance
     for key in (
         "route_id",
         "route_context_hash",
@@ -17713,6 +17746,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             ctx,
             body=event_body,
             trusted_route_gate=trusted_route_gate,
+            trusted_runtime_context_worker_proof=bool(worker_provenance),
         )
     )
     response = _runtime_context_write_response(
@@ -17727,6 +17761,11 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     )
     if isinstance(result, Mapping) and isinstance(result.get("route_token_gate"), Mapping):
         response["route_token_gate"] = result.get("route_token_gate")
+    if isinstance(result, Mapping) and isinstance(
+        result.get("contract_gate_decision"),
+        Mapping,
+    ):
+        response["contract_gate_decision"] = result.get("contract_gate_decision")
     return response
 
 
@@ -55100,6 +55139,9 @@ def handle_task_timeline_append(ctx: RequestContext):
         "phase": ctx.body.get("phase", ""),
         "event_kind": ctx.body.get("event_kind", ""),
     }
+    trusted_runtime_context_worker_context = bool(
+        getattr(ctx, "_trusted_runtime_context_worker_proof", False)
+    )
     trusted_route_gate = getattr(ctx, "_trusted_route_token_gate", {})
     route_gate = dict(trusted_route_gate) if isinstance(trusted_route_gate, Mapping) else {}
 
@@ -55140,36 +55182,42 @@ def handle_task_timeline_append(ctx: RequestContext):
                 )
             )
             if not contract_runtime_completed_projection_gate:
-                route_gate, source_block = _timeline_no_token_source_event_gate_or_block(
-                    conn,
-                    project_id,
-                    ctx.body or {},
-                    event,
-                )
-                if source_block:
-                    raise GovernanceError(
-                        "route_token_required",
-                        str(source_block.get("reason") or "route_token required"),
-                        422,
-                        source_block,
+                if not trusted_runtime_context_worker_context:
+                    route_gate, source_block = (
+                        _timeline_no_token_source_event_gate_or_block(
+                            conn,
+                            project_id,
+                            ctx.body or {},
+                            event,
+                        )
                     )
-                if not route_gate:
-                    waiver_block = _timeline_route_waiver_block_for_high_risk(
-                        conn, project_id, ctx.body or {}, event
-                    )
-                    if waiver_block:
+                    if source_block:
                         raise GovernanceError(
                             "route_token_required",
-                            str(waiver_block.get("reason") or "route_token required"),
+                            str(source_block.get("reason") or "route_token required"),
                             422,
-                            waiver_block,
+                            source_block,
                         )
-                    route_gate = _require_route_token_mutation_gate(
-                        ctx,
-                        action="task_timeline_append",
-                        backlog_id=ctx.body.get("backlog_id", ""),
-                        task_id="",
-                    )
+                    if not route_gate:
+                        waiver_block = _timeline_route_waiver_block_for_high_risk(
+                            conn, project_id, ctx.body or {}, event
+                        )
+                        if waiver_block:
+                            raise GovernanceError(
+                                "route_token_required",
+                                str(
+                                    waiver_block.get("reason")
+                                    or "route_token required"
+                                ),
+                                422,
+                                waiver_block,
+                            )
+                        route_gate = _require_route_token_mutation_gate(
+                            ctx,
+                            action="task_timeline_append",
+                            backlog_id=ctx.body.get("backlog_id", ""),
+                            task_id="",
+                        )
         if not route_gate and not contract_runtime_completed_projection_gate and (
             ctx.body.get("route_token_ref") or ctx.body.get("route_token")
         ):
@@ -55217,6 +55265,34 @@ def handle_task_timeline_append(ctx: RequestContext):
         validation_payload = dict(norm_payload)
         validation_payload.pop("meta_contract_gate", None)
         validation_payload.pop("contract_gate_decision", None)
+        trusted_runtime_context_worker_proof = (
+            _timeline_trusted_runtime_context_worker_proof(
+                ctx,
+                conn,
+                validation_payload,
+            )
+        )
+        if (
+            trusted_runtime_context_worker_context
+            and not trusted_runtime_context_worker_proof
+            and task_timeline.is_protected_close_evidence(event)
+            and not route_gate
+            and not contract_runtime_completed_projection_gate
+        ):
+            raise GovernanceError(
+                "runtime_context_worker_proof_required",
+                (
+                    "runtime-context timeline append requires server-verified "
+                    "worker provenance when route-token authority is absent"
+                ),
+                422,
+                {
+                    "required_authority": "runtime_context_worker_proof",
+                    "event_kind": norm_event_kind,
+                    "task_id": ctx.body.get("task_id", ""),
+                    "backlog_id": ctx.body.get("backlog_id", ""),
+                },
+            )
         contract_runtime_close_evidence_requested = bool(
             _contract_runtime_close_execution_id(ctx.body or {})
             and _contract_runtime_close_event_kind_supported(norm_event_kind)
@@ -55228,6 +55304,16 @@ def handle_task_timeline_append(ctx: RequestContext):
                 ctx.body.get("artifact_refs") or {},
             )
         )
+        if trusted_runtime_context_worker_proof:
+            worker_authority = task_timeline.source_backed_runtime_context_worker_authority(
+                validation_payload.get("worker_evidence_provenance") or {},
+            )
+            validation_payload["source_backed_contract_gate_authority"] = (
+                worker_authority
+            )
+            norm_payload = dict(norm_payload) if isinstance(norm_payload, dict) else {}
+            norm_payload["source_backed_contract_gate_authority"] = worker_authority
+            source_authority_before_runtime = "runtime_context_worker_proof"
         if (
             not source_authority_before_runtime
             and task_timeline._source_backed_route_gate_accepted(
@@ -55250,13 +55336,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "backlog_id": ctx.body.get("backlog_id", ""),
                     "task_id": ctx.body.get("task_id", ""),
                 },
-                trusted_runtime_context_worker_proof=(
-                    _timeline_trusted_runtime_context_worker_proof(
-                        ctx,
-                        conn,
-                        validation_payload,
-                    )
-                ),
+                trusted_runtime_context_worker_proof=trusted_runtime_context_worker_proof,
             )
         except MfSubagentContractError as exc:
             meta_contract_error_message = str(exc)
@@ -55338,6 +55418,11 @@ def handle_task_timeline_append(ctx: RequestContext):
             meta_contract_gate = _contract_runtime_close_audit_meta_gate(
                 meta_contract_gate,
                 authority_source="route_action_scope_lineage",
+            )
+        elif trusted_runtime_context_worker_proof:
+            meta_contract_gate = _contract_runtime_close_audit_meta_gate(
+                meta_contract_gate,
+                authority_source="runtime_context_worker_proof",
             )
         elif route_gate:
             meta_contract_gate = _contract_runtime_close_audit_meta_gate(

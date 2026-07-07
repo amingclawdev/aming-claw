@@ -4910,7 +4910,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
         backlog_id=backlog_id,
         task_id=parent_task_id,
         target_files=["agent/governance/server.py"],
-        allowed_actions=["task_timeline_append"],
+        allowed_actions=["dispatch_bounded_lane"],
         evidence_refs=["timeline:parent-bound-route-ref"],
     )
     observer_route_context.persist_route_token_ref(
@@ -4943,6 +4943,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
         actor="observer",
         now_iso="2026-06-28T00:00:00Z",
     )
+    session_token_ref = runtime_context_session_token_ref(context)
 
     response = server.handle_graph_governance_runtime_context_implementation_evidence(
         _ctx_with_role(
@@ -4953,6 +4954,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
                 "parent_task_id": parent_task_id,
                 "fence_token": "fence-runtime-parent-bound",
                 "session_token": session_token,
+                "session_token_ref": session_token_ref,
                 "target_project_root": str(worktree),
                 **parent_route_identity,
                 "changed_files": ["agent/governance/server.py"],
@@ -4972,6 +4974,9 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
     assert gate["decision"] == "route_token_ref_resolved"
     assert gate["route_token_ref"] == parent_issue["route_token_ref"]
     assert gate["scope"]["task_id"] == parent_task_id
+    assert response["contract_gate_decision"]["source_of_authority"] == (
+        "runtime_context_worker_proof"
+    )
     stored = conn.execute(
         "SELECT payload_json FROM task_timeline_events WHERE id = ?",
         (response["timeline_event"]["id"],),
@@ -4981,9 +4986,21 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
         parent_issue["route_token_ref"]
     )
     assert payload["route_token_gate"]["scope"]["task_id"] == parent_task_id
+    assert payload["worker_evidence_provenance"]["session_token_ref"] == (
+        session_token_ref
+    )
     assert payload["source_backed_contract_gate_authority"][
         "source_of_authority"
-    ] == "route_token_gate"
+    ] == "runtime_context_worker_proof"
+    assert payload["source_backed_contract_gate_authority"][
+        "worker_evidence_provenance"
+    ]["source"] == "runtime_context_copy_safe_worker_proof"
+    assert payload["contract_gate_decision"]["gate_id"] == (
+        "task_timeline_append:runtime_context_worker_proof"
+    )
+    assert payload["contract_gate_decision"]["source_of_authority"] == (
+        "runtime_context_worker_proof"
+    )
 
 
 def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_trace_ids(
