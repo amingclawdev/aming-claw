@@ -19127,6 +19127,13 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     ]
     assert current_qa_guide["role"] == "qa"
     assert current_qa_guide["raw_route_token_required"] is False
+    current_plan = current_qa_guide["verification_plan"]
+    assert current_plan["default_strategy"] == (
+        "focused_then_guarded_full_suite_if_required"
+    )
+    assert current_plan["focused"]["required"] is True
+    assert current_plan["full_suite"]["required_by_default"] is False
+    assert current_plan["full_suite"]["single_process_agent_tests_default"] is False
     assert current_qa_guide["read_current_state"]["tool"] == "runtime_context_current"
     assert current_qa_guide["read_worker_guide"]["tool"] == (
         "runtime_context_worker_guide"
@@ -19196,6 +19203,13 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     qa_guide = guide["worker_guide"]["independent_verification_runtime"]
     assert qa_guide["observer_or_hotfix_actor_must_not_author_evidence"] is True
     assert qa_guide["observer_prefill_route_token"]["status"] == "ready"
+    assert (
+        qa_guide["verification_plan"]["full_suite"]["default_hard_close_gate"]
+        is False
+    )
+    assert qa_guide["verification_plan"]["full_suite"]["sharded_plan"][
+        "preferred"
+    ] is True
     assert qa_guide["observer_prefill_route_token"]["issue_route_token_request"][
         "target_files"
     ] == ["agent/governance/server.py"]
@@ -19244,6 +19258,95 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert reissue["facade_status"] == "available"
     assert reissue["ttl_policy"]["raw_session_token_persisted"] is False
     assert "wrong-token" in reissue["failure_policy"]
+
+
+def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() -> None:
+    target_files = [
+        "agent/governance/server.py",
+        "agent/governance/contract_state_runtime.py",
+        "agent/governance/mcp_server.py",
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_parallel_branch_runtime.py",
+        "agent/tests/test_mcp_server_stdio.py",
+    ]
+    expected_test_files = [
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_parallel_branch_runtime.py",
+        "agent/tests/test_mcp_server_stdio.py",
+    ]
+    expected_focused_command = (
+        "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+        + " ".join(expected_test_files)
+    )
+
+    guide = server._runtime_context_qa_verification_guide(
+        project_id=PID,
+        runtime_context_id="mfrctx-qa-scoped",
+        task_id="mf-batch:row:2",
+        backlog_id="AC-QA-SCOPED-VERIFICATION-FULL-SUITE-GUIDE-20260706",
+        parent_task_id="mf-batch-parent",
+        target_project_root="/tmp/qa-scoped",
+        route_identity={
+            "route_id": "route-qa-scoped",
+            "route_context_hash": "sha256:qa-scoped",
+            "prompt_contract_id": "rprompt-qa-scoped",
+            "prompt_contract_hash": "sha256:qa-scoped-prompt",
+            "route_token_ref": "rtok-qa-scoped",
+            "visible_injection_manifest_hash": "sha256:qa-scoped-visible",
+        },
+        target_files=target_files,
+    )
+
+    plan = guide["verification_plan"]
+    assert plan["schema_version"] == "runtime_context.qa_scoped_verification_plan.v1"
+    assert plan["target_files"] == target_files
+    assert plan["scoped_test_files"] == expected_test_files
+    assert plan["focused"]["commands"] == [expected_focused_command]
+    assert plan["focused"]["commands"] != [plan["full_suite"]["command"]]
+    assert plan["full_suite"]["required_by_default"] is False
+    assert plan["full_suite"]["default_hard_close_gate"] is False
+    assert plan["full_suite"]["single_process_agent_tests_default"] is False
+    assert plan["full_suite"]["sharded_plan"]["preferred"] is True
+    assert plan["full_suite"]["sharded_plan"]["shard_count"] == 4
+    assert all(
+        "<agent/tests shard " in command
+        for command in plan["full_suite"]["sharded_plan"]["commands"]
+    )
+    assert plan["full_suite"]["guardrails"]["timeout_seconds_per_shard"] == 900
+    assert (
+        plan["full_suite"]["guardrails"][
+            "stop_on_runaway_without_marking_source_failure"
+        ]
+        is True
+    )
+
+    append_evidence = guide["append_evidence"]
+    assert append_evidence["route_token_ref_body"]["verification"][
+        "verification_plan"
+    ]["focused_commands"] == [expected_focused_command]
+    assert append_evidence["qa_child_route_token_ref_body"]["verification"][
+        "verification_plan"
+    ]["full_suite_required_by_default"] is False
+
+    caveat_body = append_evidence["focused_pass_with_full_suite_caveat_body"]
+    assert caveat_body["status"] == "passed"
+    assert caveat_body["payload"]["focused_verification"]["commands"] == [
+        expected_focused_command
+    ]
+    caveat = caveat_body["verification"]["full_suite_caveat"]
+    assert caveat["schema_version"] == (
+        "runtime_context.qa_full_suite_environment_caveat.v1"
+    )
+    assert caveat["classifies_source_row_failure"] is False
+    assert caveat["focused_pass_remains_valid"] is True
+    assert {
+        "attempted_command",
+        "shard_id_or_full_suite",
+        "elapsed_seconds",
+        "last_progress_at",
+        "resource_observation",
+        "focused_tests_passed",
+    }.issubset(set(caveat["required_fields"]))
 
 
 def test_runtime_context_session_token_reissue_endpoint_audits_and_rotates(
