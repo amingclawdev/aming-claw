@@ -52072,6 +52072,49 @@ def _contract_runtime_authority_commit_matches(left: str, right: str) -> bool:
     return short_len >= 7 and left_commit[:short_len] == right_commit[:short_len]
 
 
+def _contract_runtime_mf_parallel_merge_commit_bridge(
+    *,
+    close_commit: str,
+    merge_line: Mapping[str, Any],
+    close_ready_line: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not close_ready_line:
+        return {}
+    merge_commit = _contract_runtime_close_authority_explicit_commit(merge_line)
+    close_ready_commit = _contract_runtime_close_authority_explicit_commit(
+        close_ready_line
+    )
+    if not merge_commit or not _contract_runtime_authority_commit_matches(
+        close_commit,
+        close_ready_commit,
+    ):
+        return {}
+    close_ready_payload = _contract_runtime_close_authority_line_payload(
+        close_ready_line
+    )
+    row_merge_commit = (
+        _timeline_first_deep_text(close_ready_payload, "row_live_merge_commit")
+        or _timeline_first_deep_text(close_ready_payload, "row_merge_commit")
+        or _timeline_first_deep_text(close_ready_payload, "lane_live_merge_commit")
+        or _timeline_first_deep_text(close_ready_payload, "lane_merge_commit")
+    )
+    if not _contract_runtime_authority_commit_matches(
+        merge_commit,
+        row_merge_commit,
+    ):
+        return {}
+    return {
+        "requirement_id": "observer_merge",
+        "bridge": "observer_close_ready_batch_final_commit",
+        "merge_line_commit": merge_commit,
+        "close_ready_commit": close_ready_commit,
+        "row_live_merge_commit": row_merge_commit,
+        "expected_close_commit": close_commit,
+        "merge_source_ref": str(merge_line.get("_source_ref") or ""),
+        "close_ready_source_ref": str(close_ready_line.get("_source_ref") or ""),
+    }
+
+
 def _contract_runtime_close_authority_explicit_commit(
     line: Mapping[str, Any],
 ) -> str:
@@ -52399,6 +52442,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             missing.append(missing_id)
 
     commit_mismatches: list[dict[str, Any]] = []
+    commit_bridge_diagnostics: list[dict[str, Any]] = []
     if close_commit:
         for requirement_id in (
             "observer_merge",
@@ -52422,6 +52466,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
                 })
                 continue
             if not _contract_runtime_authority_commit_matches(close_commit, actual_commit):
+                if requirement_id == "observer_merge":
+                    bridge = _contract_runtime_mf_parallel_merge_commit_bridge(
+                        close_commit=close_commit,
+                        merge_line=line,
+                        close_ready_line=found.get("observer_close_ready"),
+                    )
+                    if bridge:
+                        commit_bridge_diagnostics.append(bridge)
+                        continue
                 missing.append(close_commit_id)
                 commit_mismatches.append({
                     "requirement_id": requirement_id,
@@ -52460,6 +52513,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             key: value for key, value in rejected_by_requirement.items() if value
         },
         "commit_mismatches": commit_mismatches,
+        "commit_bridge_diagnostics": commit_bridge_diagnostics,
         "checks": {
             "has_worker_implementation": "worker_implementation" in found,
             "has_worker_finish_gate": "worker_finish_gate" in found,
@@ -52467,6 +52521,9 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "has_observer_merge": "observer_merge" in found,
             "has_observer_reconcile": "observer_reconcile" in found,
             "has_observer_close_ready": "observer_close_ready" in found,
+            "observer_merge_close_commit_bridged_by_close_ready": bool(
+                commit_bridge_diagnostics
+            ),
             "observer_close_commit_matches": not commit_mismatches,
         },
     }
