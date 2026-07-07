@@ -9793,6 +9793,111 @@ def _qa_graph_context_evidence_shape(
     }
 
 
+def _runtime_context_qa_scoped_verification_plan(
+    *,
+    target_files: Sequence[str],
+) -> dict[str, Any]:
+    scoped_files = [
+        str(item).strip()
+        for item in target_files
+        if str(item or "").strip()
+    ]
+    scoped_test_files = [
+        item
+        for item in scoped_files
+        if item.startswith("agent/tests/") and item.endswith(".py")
+    ]
+    focused_targets = (
+        scoped_test_files
+        if scoped_test_files
+        else ["<focused-test-targets-derived-from-graph-query>"]
+    )
+    focused_command = (
+        "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+        + " ".join(focused_targets)
+    )
+    full_suite_command = (
+        "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider agent/tests"
+    )
+    shard_command_template = (
+        "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+        "--maxfail=1 --durations=25 <agent/tests shard {shard_index}/{shard_count}>"
+    )
+    full_suite_caveat_shape = {
+        "schema_version": "runtime_context.qa_full_suite_environment_caveat.v1",
+        "status": "<environment_blocked|runaway_guardrail_exhausted>",
+        "classification": "environment_or_runaway_caveat",
+        "classifies_source_row_failure": False,
+        "focused_pass_remains_valid": True,
+        "accepted_reasons": [
+            "timeout_with_progress_guardrail_exhausted",
+            "memory_guardrail_exceeded",
+            "environment_unavailable",
+            "dependency_service_unavailable",
+        ],
+        "required_fields": [
+            "attempted_command",
+            "shard_id_or_full_suite",
+            "elapsed_seconds",
+            "last_progress_at",
+            "resource_observation",
+            "focused_tests_passed",
+        ],
+    }
+    return {
+        "schema_version": "runtime_context.qa_scoped_verification_plan.v1",
+        "plan_id": "scoped_focused_then_guarded_full_suite",
+        "default_strategy": "focused_then_guarded_full_suite_if_required",
+        "scope_source": "runtime_context.worker_scope.target_files",
+        "target_files": scoped_files,
+        "scoped_test_files": scoped_test_files,
+        "focused": {
+            "required": True,
+            "commands": [focused_command],
+            "uses_contract_scope": True,
+            "fallback_when_no_scoped_test_files": (
+                "run graph_query as qa and choose focused tests covering changed "
+                "symbols/files; record no-test decision only when justified"
+            ),
+            "evidence_shape": {
+                "schema_version": "runtime_context.qa_focused_verification.v1",
+                "status": "passed",
+                "commands": [focused_command],
+                "target_files": scoped_files,
+                "scoped_test_files": scoped_test_files,
+            },
+        },
+        "full_suite": {
+            "required_by_default": False,
+            "default_hard_close_gate": False,
+            "single_process_agent_tests_default": False,
+            "command": full_suite_command,
+            "run_only_when": [
+                "contract_explicitly_requires_full_suite",
+                "backlog_acceptance_criteria_explicitly_requires_full_suite",
+                "qa_risk_assessment_requests_broader_regression_after_focused_pass",
+            ],
+            "sharded_plan": {
+                "preferred": True,
+                "shard_count": 4,
+                "commands": [
+                    shard_command_template.format(shard_index=index, shard_count=4)
+                    for index in range(1, 5)
+                ],
+            },
+            "guardrails": {
+                "timeout_seconds_per_shard": 900,
+                "progress_heartbeat_seconds": 60,
+                "maxfail": 1,
+                "record_last_progress_at": True,
+                "record_peak_memory_mb_if_available": True,
+                "stop_on_runaway_without_marking_source_failure": True,
+            },
+            "runaway_or_environment_caveat": full_suite_caveat_shape,
+        },
+    }
+
+
 def _runtime_context_qa_verification_guide(
     *,
     project_id: str,
@@ -9842,6 +9947,9 @@ def _runtime_context_qa_verification_guide(
     }
     if route_token_ref:
         issue_qa_route_token_request["parent_route_token_ref"] = route_token_ref
+    verification_plan = _runtime_context_qa_scoped_verification_plan(
+        target_files=qa_target_files
+    )
     base_append_body = {
         "backlog_id": backlog_id or parent_task_id,
         "task_id": task_id,
@@ -9853,10 +9961,16 @@ def _runtime_context_qa_verification_guide(
         "payload": {
             "reviewer_role": "independent_qa",
             "requirement_id": "independent_verification_lane",
+            "verification_plan_id": verification_plan["plan_id"],
         },
         "verification": {
             "requirement_id": "independent_verification_lane",
             "route_identity": dict(safe_route_identity),
+            "verification_plan": {
+                "plan_id": verification_plan["plan_id"],
+                "focused_commands": verification_plan["focused"]["commands"],
+                "full_suite_required_by_default": False,
+            },
         },
     }
     route_ref_body = dict(base_append_body)
@@ -9870,7 +9984,7 @@ def _runtime_context_qa_verification_guide(
             "route_token_ownership": "qa_child_action_scope",
         },
         "verification": {
-            "requirement_id": "independent_verification_lane",
+            **dict(base_append_body["verification"]),
             "route_identity": "<server-derived-from-qa_child_route_token_ref>",
         },
     }
@@ -9880,6 +9994,25 @@ def _runtime_context_qa_verification_guide(
         "source_event_lineage": {
             "accepted_source_event_refs": ["timeline:<accepted-source-event-id>"],
             "route_owned_source_event_required": True,
+        },
+    }
+    focused_pass_with_full_suite_caveat_body = {
+        **base_append_body,
+        "status": "passed",
+        "payload": {
+            **dict(base_append_body["payload"]),
+            "verification_outcome": "focused_pass_with_full_suite_caveat",
+            "focused_verification": verification_plan["focused"]["evidence_shape"],
+            "full_suite_caveat": verification_plan["full_suite"][
+                "runaway_or_environment_caveat"
+            ],
+        },
+        "verification": {
+            **dict(base_append_body["verification"]),
+            "focused_verification": verification_plan["focused"]["evidence_shape"],
+            "full_suite_caveat": verification_plan["full_suite"][
+                "runaway_or_environment_caveat"
+            ],
         },
     }
     qa_graph_context_shape = _qa_graph_context_evidence_shape(
@@ -9896,6 +10029,7 @@ def _runtime_context_qa_verification_guide(
         "purpose": "independent_verification",
         "observer_or_hotfix_actor_must_not_author_evidence": True,
         "raw_route_token_required": False,
+        "verification_plan": verification_plan,
         "observer_prefill_route_token": {
             "schema_version": "runtime_context.qa_route_token_prefill.v1",
             "role": "observer",
@@ -9991,6 +10125,9 @@ def _runtime_context_qa_verification_guide(
             "route_token_ref_body": route_ref_body,
             "source_event_lineage_body": source_lineage_body,
             "qa_graph_context_body": qa_graph_context_shape,
+            "focused_pass_with_full_suite_caveat_body": (
+                focused_pass_with_full_suite_caveat_body
+            ),
             "forbidden_authors": [
                 "observer",
                 "hotfix_implementation_actor",
