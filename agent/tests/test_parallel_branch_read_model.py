@@ -862,6 +862,75 @@ def test_active_batch_read_model_filters_stale_queue_lane_with_missing_context_q
     assert payload["summary"]["status_counts"] == {pbr.STATE_MERGED: 1}
 
 
+def test_active_batch_read_model_filters_unscoped_stale_running_lane_from_current_queue():
+    conn = _runtime_conn()
+    batch_id = "mf-batch-parallel-84d4cdf62e77b2c1cc54"
+    current_queue_id = "mq-9ef3fe376e3d7a196350"
+    stale_queue_id = "mq-65d78059566f39d29dda3307"
+    current_task_id = f"{batch_id}:row:1"
+    stale_task_id = "legacy-row2-recovery-worker"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=current_task_id,
+            backlog_id="AC-ROW-ONE",
+            branch_ref="refs/heads/codex/live-row1",
+            status=pbr.STATE_MERGED,
+            merge_queue_id=current_queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=stale_task_id,
+            backlog_id="AC-STALE-ROW-TWO",
+            branch_ref="refs/heads/codex/stale-row2-recovery",
+            status=pbr.STATE_RUNNING,
+            target_head_commit="target-before-row2-recovery",
+            merge_queue_id="",
+            merge_preview_id=f"{stale_queue_id}:preview",
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=current_queue_id,
+                queue_item_id="item-row1",
+                backlog_id="AC-ROW-ONE",
+                task_id=current_task_id,
+                branch_ref="refs/heads/codex/live-row1",
+                queue_index=1,
+                status=pbr.STATE_MERGED,
+                target_ref=TARGET_REF,
+            )
+        ],
+        now_iso=NOW,
+    )
+
+    payload = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=current_queue_id,
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+
+    assert [row["task_id"] for row in payload["branch_lanes"]] == [current_task_id]
+    assert stale_task_id not in {
+        row["task_id"] for row in payload["branch_lanes"]
+    }
+
+
 def test_live_read_model_filters_unbound_stale_queue_lane_from_active_queue():
     conn = _runtime_conn()
     current_queue_id = "mq-9ef3fe376e3d7a196350"
@@ -1399,6 +1468,30 @@ def test_pb010_read_model_derives_queue_branch_ref_from_lane_when_target_filter_
 def test_pb010_read_model_filters_old_target_ref_lanes_from_current_queue() -> None:
     conn = _runtime_conn()
     queue_id = "mergeq-PB010-current-target-filter"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-current-target",
+            branch_ref="refs/heads/codex/PB010-current-target",
+            ref_name=TARGET_REF,
+            status="planned",
+            merge_queue_id=queue_id,
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-old-target",
+            branch_ref="refs/heads/codex/PB010-old-target",
+            ref_name="refs/heads/old-main",
+            status="planned",
+            merge_queue_id=queue_id,
+        ),
+        now_iso=NOW,
+    )
     upsert_merge_queue_items(
         conn,
         [
@@ -1451,6 +1544,9 @@ def test_pb010_read_model_filters_old_target_ref_lanes_from_current_queue() -> N
     assert row["backlog_id"] == "AC-CURRENT-TARGET"
     assert row["queue_item_id"] == "item-current-target"
     assert row["target_ref"] == TARGET_REF
+    assert [row["task_id"] for row in payload["branch_lanes"]] == [
+        "T-current-target",
+    ]
 
 
 def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutation(
