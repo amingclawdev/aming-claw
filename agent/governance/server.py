@@ -52689,6 +52689,14 @@ def _contract_runtime_authoritative_close_verification(
     verification: Mapping[str, Any],
     runtime_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
+    mf_batch_parent_gate = (
+        runtime_projection.get("mf_batch_parent_close_authority_gate")
+        if isinstance(
+            runtime_projection.get("mf_batch_parent_close_authority_gate"),
+            Mapping,
+        )
+        else {}
+    )
     parentless_direct_gate = (
         runtime_projection.get("parentless_direct_main_close_authority_gate")
         if isinstance(
@@ -52708,7 +52716,9 @@ def _contract_runtime_authoritative_close_verification(
         else {}
     )
     authority_gate = (
-        parentless_direct_gate
+        mf_batch_parent_gate
+        if bool(mf_batch_parent_gate.get("passed"))
+        else parentless_direct_gate
         if bool(parentless_direct_gate.get("passed"))
         else direct_fix_gate
         if bool(direct_fix_gate.get("passed"))
@@ -52717,7 +52727,10 @@ def _contract_runtime_authoritative_close_verification(
     if not bool(authority_gate.get("passed")):
         failed_authority_kind = ""
         failed_authority_gate: Mapping[str, Any] = {}
-        if parentless_direct_gate:
+        if mf_batch_parent_gate:
+            failed_authority_kind = "mf_batch_parent"
+            failed_authority_gate = mf_batch_parent_gate
+        elif parentless_direct_gate:
             failed_authority_kind = "parentless_direct_main"
             failed_authority_gate = parentless_direct_gate
         elif direct_fix_gate:
@@ -52745,21 +52758,32 @@ def _contract_runtime_authoritative_close_verification(
             groups_root = dict(result.get("missing_evidence_groups") or {})
             groups = dict(groups_root.get("groups") or {})
             group_key = f"contract_runtime_{failed_authority_kind}_close_authority"
-            next_action = (
-                "complete parentless operator-supervised direct-main exception, "
-                "implementation, verification, close-ready, redeploy, and reconcile evidence"
-                if failed_authority_kind == "parentless_direct_main"
-                else "complete direct_fix repair, independent QA, return-to-parent, "
-                "and parent acknowledgement evidence in ContractRuntime"
-                if failed_authority_kind == "direct_fix"
-                else (
+            if failed_authority_kind == "mf_batch_parent":
+                next_action = (
+                    "complete mf_batch parent children, merge queue, and close commit "
+                    "evidence before closing the coordination row"
+                )
+            elif failed_authority_kind == "parentless_direct_main":
+                next_action = (
+                    "complete parentless operator-supervised direct-main exception, "
+                    "implementation, verification, close-ready, redeploy, and "
+                    "reconcile evidence"
+                )
+            elif failed_authority_kind == "direct_fix":
+                next_action = (
+                    "complete direct_fix repair, independent QA, return-to-parent, "
+                    "and parent acknowledgement evidence in ContractRuntime"
+                )
+            else:
+                next_action = (
                     "complete source-backed mf_parallel worker, QA, observer "
                     "merge/reconcile/close-ready evidence in ContractRuntime"
                 )
-            )
             groups[group_key] = {
                 "label": (
-                    "ContractRuntime parentless direct-main close authority"
+                    "ContractRuntime mf_batch parent close authority"
+                    if failed_authority_kind == "mf_batch_parent"
+                    else "ContractRuntime parentless direct-main close authority"
                     if failed_authority_kind == "parentless_direct_main"
                     else "ContractRuntime direct_fix close authority"
                     if failed_authority_kind == "direct_fix"
@@ -52780,21 +52804,28 @@ def _contract_runtime_authoritative_close_verification(
             return result
         return dict(verification)
     authority_kind = (
-        "parentless_direct_main"
+        "mf_batch_parent"
+        if authority_gate is mf_batch_parent_gate
+        else "parentless_direct_main"
         if authority_gate is parentless_direct_gate
         else "direct_fix"
         if authority_gate is direct_fix_gate
         else "mf_parallel"
     )
     source = (
-        "contract_runtime_parentless_direct_main_timeline"
+        "contract_runtime_mf_batch_parent_timeline_and_merge_queue"
+        if authority_kind == "mf_batch_parent"
+        else "contract_runtime_parentless_direct_main_timeline"
         if authority_kind == "parentless_direct_main"
         else "contract_runtime_completed_direct_fix_chain"
         if authority_kind == "direct_fix"
         else "contract_runtime_completed_mf_parallel_chain"
     )
     message = (
-        "backlog_close accepted server-derived parentless operator-supervised "
+        "backlog_close accepted server-derived mf_batch parent close authority "
+        "with all child rows fixed and durable merge queue items merged."
+        if authority_kind == "mf_batch_parent"
+        else "backlog_close accepted server-derived parentless operator-supervised "
         "direct-main close authority."
         if authority_kind == "parentless_direct_main"
         else "backlog_close accepted server-derived completed ContractRuntime "
@@ -52813,7 +52844,11 @@ def _contract_runtime_authoritative_close_verification(
     result["status"] = "passed"
     result["missing_event_kinds"] = []
     result["ignored_required_events"] = []
-    if authority_kind == "parentless_direct_main":
+    if authority_kind == "mf_batch_parent":
+        result["contract_runtime_mf_batch_parent_close_authority_gate"] = dict(
+            authority_gate
+        )
+    elif authority_kind == "parentless_direct_main":
         result["contract_runtime_parentless_direct_main_close_authority_gate"] = dict(
             authority_gate
         )
@@ -52884,6 +52919,9 @@ def _contract_runtime_authoritative_close_verification(
         "has_verification": True,
         "has_close_ready": True,
         "has_independent_qa": True,
+        "contract_runtime_mf_batch_parent_close_authority": (
+            authority_kind == "mf_batch_parent"
+        ),
         "contract_runtime_parentless_direct_main_close_authority": (
             authority_kind == "parentless_direct_main"
         ),
@@ -53002,6 +53040,7 @@ def _contract_runtime_close_authority_failure_details(
         missing_ids.append("contract_runtime_completed_lines")
 
     for gate_key in (
+        "mf_batch_parent_close_authority_gate",
         "parentless_direct_main_close_authority_gate",
         "direct_fix_close_authority_gate",
         "mf_parallel_close_authority_gate",
@@ -54081,6 +54120,371 @@ def _contract_runtime_parentless_direct_main_projection(
     }
 
 
+_MF_BATCH_PARENT_MERGE_DONE_STATES = {
+    "applied",
+    "complete",
+    "completed",
+    "merged",
+}
+
+
+def _contract_runtime_mf_batch_parent_event_payload(
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    if payload:
+        return dict(payload)
+    parsed = backlog_runtime.parse_json_object(event.get("payload"))
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _contract_runtime_mf_batch_parent_child_ids(
+    payload: Mapping[str, Any],
+) -> list[str]:
+    child_ids = [
+        str(item or "").strip()
+        for item in payload.get("backlog_ids") or []
+        if str(item or "").strip()
+    ]
+    if child_ids:
+        return _runtime_context_service_dedupe(child_ids)
+    preflight_gate = (
+        payload.get("preflight_gate")
+        if isinstance(payload.get("preflight_gate"), Mapping)
+        else {}
+    )
+    merge_queue_plan = (
+        payload.get("merge_queue_plan")
+        if isinstance(payload.get("merge_queue_plan"), Mapping)
+        else preflight_gate.get("merge_queue_plan")
+        if isinstance(preflight_gate.get("merge_queue_plan"), Mapping)
+        else {}
+    )
+    planned_items = merge_queue_plan.get("planned_items") or []
+    return _runtime_context_service_dedupe(
+        [
+            str(item.get("backlog_id") or "").strip()
+            for item in planned_items
+            if isinstance(item, Mapping) and str(item.get("backlog_id") or "").strip()
+        ]
+    )
+
+
+def _contract_runtime_mf_batch_parent_merge_queue_id(
+    payload: Mapping[str, Any],
+) -> str:
+    containers: list[Mapping[str, Any]] = [payload]
+    for key in ("merge_queue_plan", "preflight_gate", "fanout_policy"):
+        child = payload.get(key)
+        if isinstance(child, Mapping):
+            containers.append(child)
+            nested = child.get("merge_queue_plan")
+            if isinstance(nested, Mapping):
+                containers.append(nested)
+    for container in containers:
+        merge_queue_id = str(container.get("merge_queue_id") or "").strip()
+        if merge_queue_id:
+            return merge_queue_id
+    return ""
+
+
+def _contract_runtime_mf_batch_parent_event_ref(
+    event: Mapping[str, Any],
+) -> str:
+    event_id = str(event.get("id") or event.get("event_id") or "").strip()
+    return f"timeline:{event_id}" if event_id else ""
+
+
+def _contract_runtime_mf_batch_parent_close_authority_gate(
+    *,
+    conn,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Project mf_batch parent close authority from timeline and merge queue state."""
+
+    if not requested_execution_id.startswith("onboard-service-"):
+        return {}
+
+    candidate_events: list[dict[str, Any]] = []
+    for event in timeline_events or []:
+        if not isinstance(event, Mapping):
+            continue
+        if str(event.get("project_id") or "").strip() != project_id:
+            continue
+        if str(event.get("backlog_id") or "").strip() != bug_id:
+            continue
+        event_type = str(event.get("event_type") or "").strip()
+        event_kind = str(event.get("event_kind") or "").strip()
+        if event_type != "mf_batch_parallel.entered" or event_kind != "contract_binding":
+            continue
+        if str(event.get("status") or "").strip().lower() not in {
+            "accepted",
+            "ok",
+            "passed",
+            "succeeded",
+        }:
+            continue
+        payload = _contract_runtime_mf_batch_parent_event_payload(event)
+        if str(payload.get("contract_id") or "").strip() not in {
+            "",
+            MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+        }:
+            continue
+        parent_ids = {
+            str(payload.get("parent_contract_execution_id") or "").strip(),
+            str(payload.get("root_contract_execution_id") or "").strip(),
+        }
+        if requested_execution_id not in parent_ids:
+            continue
+        candidate_events.append({"event": dict(event), "payload": payload})
+
+    if not candidate_events:
+        return {}
+
+    candidate_events.sort(
+        key=lambda item: int(str(item["event"].get("id") or "0").strip() or 0)
+        if str(item["event"].get("id") or "").strip().isdigit()
+        else 0,
+        reverse=True,
+    )
+
+    rejected_candidates: list[dict[str, Any]] = []
+    for candidate in candidate_events:
+        event = candidate["event"]
+        payload = candidate["payload"]
+        batch_id = str(payload.get("batch_id") or "").strip()
+        merge_queue_id = _contract_runtime_mf_batch_parent_merge_queue_id(payload)
+        child_ids = _contract_runtime_mf_batch_parent_child_ids(payload)
+        missing: list[str] = []
+        if len(child_ids) < 2:
+            missing.append("batch_child_backlog_ids")
+        if not merge_queue_id:
+            missing.append("merge_queue_id")
+        if not close_commit:
+            missing.append("close_commit")
+
+        rows_by_id: dict[str, Mapping[str, Any]] = {}
+        missing_child_ids: list[str] = []
+        if child_ids:
+            placeholders = ",".join("?" for _ in child_ids)
+            rows = conn.execute(
+                f"""
+                SELECT bug_id, status, "commit"
+                FROM backlog_bugs
+                WHERE bug_id IN ({placeholders})
+                """,
+                tuple(child_ids),
+            ).fetchall()
+            rows_by_id = {str(_row_get(row, "bug_id", "")): row for row in rows}
+            missing_child_ids = [item for item in child_ids if item not in rows_by_id]
+            if missing_child_ids:
+                missing.append("child_backlogs_present")
+        child_statuses = {
+            child_id: str(_row_get(rows_by_id.get(child_id), "status", "")).strip()
+            for child_id in child_ids
+        }
+        unclosed_child_ids = [
+            child_id
+            for child_id, status in child_statuses.items()
+            if status != "FIXED"
+        ]
+        if unclosed_child_ids:
+            missing.append("child_backlogs_fixed")
+
+        queue_rows: list[Mapping[str, Any]] = []
+        queue_query_error = ""
+        if merge_queue_id:
+            try:
+                from .parallel_branch_runtime import ensure_branch_runtime_schema
+
+                ensure_branch_runtime_schema(conn)
+                queue_rows = conn.execute(
+                    """
+                    SELECT backlog_id, task_id, queue_item_id, queue_index, status,
+                           merge_commit, current_target_head, target_head_after_merge
+                    FROM parallel_branch_merge_queue_items
+                    WHERE project_id = ? AND merge_queue_id = ?
+                    ORDER BY queue_index, queue_item_id
+                    """,
+                    (project_id, merge_queue_id),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                queue_query_error = str(exc)
+                missing.append("merge_queue_items_queryable")
+        queue_by_child: dict[str, Mapping[str, Any]] = {}
+        for row in queue_rows:
+            backlog_id = str(_row_get(row, "backlog_id", "")).strip()
+            if backlog_id in child_ids and backlog_id not in queue_by_child:
+                queue_by_child[backlog_id] = row
+        missing_queue_child_ids = [
+            child_id for child_id in child_ids if child_id not in queue_by_child
+        ]
+        if missing_queue_child_ids:
+            missing.append("merge_queue_items_present")
+        unmerged_queue_child_ids = [
+            child_id
+            for child_id, row in queue_by_child.items()
+            if str(_row_get(row, "status", "")).strip().lower()
+            not in _MF_BATCH_PARENT_MERGE_DONE_STATES
+        ]
+        if unmerged_queue_child_ids:
+            missing.append("merge_queue_items_merged")
+
+        commit_match_sources: list[str] = []
+        if close_commit:
+            for child_id, row in rows_by_id.items():
+                child_commit = str(_row_get(row, "commit", "")).strip()
+                if _contract_runtime_authority_commit_matches(
+                    close_commit,
+                    child_commit,
+                ):
+                    commit_match_sources.append(f"backlog:{child_id}:commit")
+            for child_id, row in queue_by_child.items():
+                for field in (
+                    "merge_commit",
+                    "target_head_after_merge",
+                    "current_target_head",
+                ):
+                    value = str(_row_get(row, field, "")).strip()
+                    if _contract_runtime_authority_commit_matches(
+                        close_commit,
+                        value,
+                    ):
+                        commit_match_sources.append(
+                            f"merge_queue:{child_id}:{field}"
+                        )
+        if close_commit and not commit_match_sources:
+            missing.append("close_commit_matches_batch_result")
+
+        missing = list(dict.fromkeys(item for item in missing if item))
+        queue_item_summaries = [
+            {
+                "backlog_id": str(_row_get(row, "backlog_id", "")).strip(),
+                "task_id": str(_row_get(row, "task_id", "")).strip(),
+                "queue_item_id": str(_row_get(row, "queue_item_id", "")).strip(),
+                "queue_index": int(_row_get(row, "queue_index", 0) or 0),
+                "status": str(_row_get(row, "status", "")).strip(),
+                "merge_commit": str(_row_get(row, "merge_commit", "")).strip(),
+                "current_target_head": str(
+                    _row_get(row, "current_target_head", "")
+                ).strip(),
+                "target_head_after_merge": str(
+                    _row_get(row, "target_head_after_merge", "")
+                ).strip(),
+            }
+            for row in queue_rows
+            if str(_row_get(row, "backlog_id", "")).strip() in child_ids
+        ]
+        source_refs = [
+            ref
+            for ref in (
+                f"contract_runtime:{requested_execution_id}",
+                _contract_runtime_mf_batch_parent_event_ref(event),
+                *[
+                    f"merge_queue_item:{merge_queue_id}:{summary['queue_item_id']}"
+                    for summary in queue_item_summaries
+                    if summary.get("queue_item_id")
+                ],
+                *[f"backlog:{child_id}" for child_id in child_ids],
+            )
+            if ref
+        ]
+        gate = {
+            "schema_version": "contract_runtime_mf_batch_parent_close_authority_gate.v1",
+            "accepted": not missing,
+            "passed": not missing,
+            "status": "passed" if not missing else "failed",
+            "source": "server_derived_mf_batch_parent_timeline_and_merge_queue",
+            "primary_decision_source": not missing,
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": requested_execution_id,
+            "close_commit": close_commit,
+            "batch_id": batch_id,
+            "merge_queue_id": merge_queue_id,
+            "child_backlog_ids": child_ids,
+            "missing_requirement_ids": missing,
+            "source_refs": list(dict.fromkeys(source_refs)),
+            "checks": {
+                "has_mf_batch_parent_contract_binding": True,
+                "child_backlogs_present": not missing_child_ids,
+                "child_backlogs_fixed": not unclosed_child_ids,
+                "merge_queue_items_present": not missing_queue_child_ids,
+                "merge_queue_items_merged": not unmerged_queue_child_ids,
+                "close_commit_matches_batch_result": bool(commit_match_sources),
+                "rejects_stale_contract_state_lane": True,
+            },
+            "child_statuses": child_statuses,
+            "missing_child_backlog_ids": missing_child_ids,
+            "unfixed_child_backlog_ids": unclosed_child_ids,
+            "merge_queue_items": queue_item_summaries,
+            "missing_merge_queue_item_backlog_ids": missing_queue_child_ids,
+            "unmerged_merge_queue_item_backlog_ids": unmerged_queue_child_ids,
+            "close_commit_match_sources": list(dict.fromkeys(commit_match_sources)),
+        }
+        if queue_query_error:
+            gate["merge_queue_query_error"] = queue_query_error
+        if not missing:
+            return gate
+        rejected_candidates.append(
+            {
+                "event_ref": _contract_runtime_mf_batch_parent_event_ref(event),
+                "batch_id": batch_id,
+                "merge_queue_id": merge_queue_id,
+                "missing_requirement_ids": missing,
+            }
+        )
+
+    failure_gate = dict(gate)
+    failure_gate["rejected_candidates"] = rejected_candidates
+    return failure_gate
+
+
+def _contract_runtime_mf_batch_parent_projection(
+    *,
+    conn,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    gate = _contract_runtime_mf_batch_parent_close_authority_gate(
+        conn=conn,
+        project_id=project_id,
+        bug_id=bug_id,
+        requested_execution_id=requested_execution_id,
+        close_commit=close_commit,
+        timeline_events=timeline_events,
+    )
+    if not gate:
+        return {}
+    accepted = bool(gate.get("passed"))
+    return {
+        **_contract_runtime_close_authority_payload_fields(),
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": accepted,
+        "status": "projected_mf_batch_parent" if accepted else "incomplete",
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=requested_execution_id,
+        ),
+        "legacy_advisory": not accepted,
+        "authoritative": accepted,
+        "projection_authoritative": accepted,
+        "contract_execution_id": requested_execution_id,
+        "contract_id": MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+        "mf_batch_parent_close_authority_gate": gate,
+        "source_contract_execution_ids": [requested_execution_id],
+        "projected_events": list(timeline_events or []),
+    }
+
+
 def _contract_runtime_close_authority_projected_events_for_gate(
     runtime_projection: Mapping[str, Any],
     timeline_events: list[dict[str, Any]] | None,
@@ -54119,8 +54523,6 @@ def _contract_runtime_close_authority_projection(
                 close_commit=close_commit,
                 timeline_events=timeline_events,
             )
-            if child_lane_projection and bool(child_lane_projection.get("accepted")):
-                return child_lane_projection
             parentless_direct_projection = (
                 _contract_runtime_parentless_direct_main_projection(
                     conn=conn,
@@ -54150,6 +54552,33 @@ def _contract_runtime_close_authority_projection(
                         "contract_execution_id": requested_execution_id,
                         "deferred_authority_sources": [
                             "active_child_contract_runtime_close_authority"
+                        ],
+                    },
+                }
+            mf_batch_parent_projection = _contract_runtime_mf_batch_parent_projection(
+                conn=conn,
+                project_id=project_id,
+                bug_id=bug_id,
+                requested_execution_id=requested_execution_id,
+                close_commit=close_commit,
+                timeline_events=timeline_events,
+            )
+            if mf_batch_parent_projection:
+                return {
+                    **mf_batch_parent_projection,
+                    "authority_selection": {
+                        "schema_version": (
+                            "contract_runtime_close_authority_selection.v1"
+                        ),
+                        "selected_authority": "mf_batch_parent",
+                        "selection_reason": (
+                            "explicit_onboard_service_root_contract_execution_ref_with_"
+                            "source_backed_mf_batch_parent_merge_queue_evidence"
+                        ),
+                        "contract_execution_id": requested_execution_id,
+                        "deferred_authority_sources": [
+                            "active_child_contract_runtime_close_authority",
+                            "parentless_direct_main",
                         ],
                     },
                 }
@@ -54266,6 +54695,33 @@ def _contract_runtime_close_authority_projection(
                     "contract_execution_id": contract_execution_id,
                     "deferred_authority_sources": [
                         "active_child_contract_runtime_close_authority"
+                    ],
+                },
+            }
+        mf_batch_parent_projection = _contract_runtime_mf_batch_parent_projection(
+            conn=conn,
+            project_id=project_id,
+            bug_id=bug_id,
+            requested_execution_id=contract_execution_id,
+            close_commit=close_commit,
+            timeline_events=timeline_events,
+        )
+        if mf_batch_parent_projection:
+            return {
+                **mf_batch_parent_projection,
+                "authority_selection": {
+                    "schema_version": (
+                        "contract_runtime_close_authority_selection.v1"
+                    ),
+                    "selected_authority": "mf_batch_parent",
+                    "selection_reason": (
+                        "explicit_onboard_service_root_contract_execution_id_with_"
+                        "source_backed_mf_batch_parent_merge_queue_evidence"
+                    ),
+                    "contract_execution_id": contract_execution_id,
+                    "deferred_authority_sources": [
+                        "active_child_contract_runtime_close_authority",
+                        "parentless_direct_main",
                     ],
                 },
             }

@@ -28669,6 +28669,188 @@ def test_backlog_close_missing_contract_runtime_close_authority_for_onboard_serv
     assert row["status"] == "MF_IN_PROGRESS"
 
 
+def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-BACKLOG-CLOSE-MF-BATCH-PARENT"
+    child_a = "AC-BACKLOG-CLOSE-MF-BATCH-CHILD-A"
+    child_b = "AC-BACKLOG-CLOSE-MF-BATCH-CHILD-B"
+    close_commit = "fa6275118745006c8324dfcbeecea62c39e91936"
+    parent_route_token_ref = "rtok-mf-batch-parent-enter"
+    close_route_token_ref = "rtok-mf-batch-parent-close"
+    for row_id in (backlog_id, child_a, child_b):
+        _insert_simple_mf_close_backlog(conn, row_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            "P1",
+            child_a,
+        ),
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, priority = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/parallel_branch_runtime.py"]),
+            json.dumps(["agent/tests/test_parallel_branch_runtime.py"]),
+            "P0",
+            child_b,
+        ),
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-batch-parent-close",
+    )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=parent_route_token_ref,
+        allowed_actions=["mf_batch_parallel_enter"],
+    )
+
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "backlog_ids": [child_a, child_b],
+                "reason": "Human approved multi-row fan-out through onboard service.",
+                "task_id": "mf-batch-parent-close",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": parent_route_token_ref,
+                "onboard_service_waiver": True,
+                "target_head_commit": "target-head-batch-parent",
+                "graph_snapshot_id": "snapshot-batch-parent",
+            },
+        )
+    )
+    parent_execution_id = entered["parent_contract_execution_id"]
+    assert parent_execution_id.startswith("onboard-service-")
+    merge_queue_id = entered["merge_queue_plan"]["merge_queue_id"]
+    items = list_merge_queue_items(conn, PID, merge_queue_id)
+    assert {item.backlog_id for item in items} == {child_a, child_b}
+    upsert_merge_queue_items(
+        conn,
+        [
+            replace(
+                item,
+                status="merged",
+                merge_commit=close_commit,
+                target_head_after_merge=close_commit,
+                current_target_head=close_commit,
+            )
+            for item in items
+        ],
+    )
+    now = "2026-07-07T00:00:00Z"
+    for child_id in (child_a, child_b):
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'FIXED', "commit" = ?, fixed_at = ?, updated_at = ?
+               WHERE bug_id = ?""",
+            (close_commit, now, now, child_id),
+        )
+    conn.commit()
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[
+            f"contract_runtime:{parent_execution_id}",
+            f"timeline:{entered['event']['id']}",
+        ],
+    )
+    wrong_kind_event = {**entered["event"], "event_kind": "implementation"}
+    assert (
+        server._contract_runtime_mf_batch_parent_close_authority_gate(
+            conn=conn,
+            project_id=PID,
+            bug_id=backlog_id,
+            requested_execution_id=parent_execution_id,
+            close_commit=close_commit,
+            timeline_events=[wrong_kind_event],
+        )
+        == {}
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_child_lane_close_authority_projection",
+        lambda **_kwargs: {
+            **server._contract_runtime_close_authority_payload_fields(),
+            "schema_version": server._CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": True,
+            "status": "projected_runtime_context_child_lane",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
+            "contract_execution_id": parent_execution_id,
+            "missing_requirement_ids": [],
+        },
+    )
+
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={
+                "close_commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+            },
+        )
+    )
+    projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    assert projection["status"] == "projected_mf_batch_parent"
+    assert projection["accepted"] is True
+    assert projection["authority_selection"]["selected_authority"] == "mf_batch_parent"
+    gate = projection["mf_batch_parent_close_authority_gate"]
+    assert gate["passed"] is True
+    assert gate["merge_queue_id"] == merge_queue_id
+    assert gate["child_backlog_ids"] == [child_a, child_b]
+    assert gate["checks"]["child_backlogs_fixed"] is True
+    assert gate["checks"]["merge_queue_items_merged"] is True
+    assert gate["checks"]["close_commit_matches_batch_result"] is True
+    assert gate["checks"]["rejects_stale_contract_state_lane"] is True
+    assert precheck["can_close"] is True
+    assert precheck["timeline_gate"][
+        "contract_runtime_mf_batch_parent_close_authority_gate"
+    ]["passed"] is True
+
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": parent_execution_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    row = conn.execute(
+        "SELECT status, \"commit\" FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    assert row["status"] == "FIXED"
+    assert row["commit"] == close_commit
+
+
 def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     conn,
     monkeypatch,
