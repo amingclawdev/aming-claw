@@ -52174,12 +52174,20 @@ def _contract_runtime_mf_parallel_merge_commit_bridge(
     close_ready_payload = _contract_runtime_close_authority_line_payload(
         close_ready_line
     )
-    row_merge_commit = (
-        _timeline_first_deep_text(close_ready_payload, "row_live_merge_commit")
-        or _timeline_first_deep_text(close_ready_payload, "row_merge_commit")
-        or _timeline_first_deep_text(close_ready_payload, "lane_live_merge_commit")
-        or _timeline_first_deep_text(close_ready_payload, "lane_merge_commit")
-    )
+    row_merge_commit = ""
+    row_merge_commit_source = ""
+    for key in (
+        "row_live_merge_commit",
+        "row_merge_commit",
+        "lane_live_merge_commit",
+        "lane_merge_commit",
+        "merge_commit",
+        "target_head_after_merge",
+    ):
+        row_merge_commit = _timeline_first_deep_text(close_ready_payload, key)
+        if row_merge_commit:
+            row_merge_commit_source = key
+            break
     if not _contract_runtime_authority_commit_matches(
         merge_commit,
         row_merge_commit,
@@ -52191,6 +52199,7 @@ def _contract_runtime_mf_parallel_merge_commit_bridge(
         "merge_line_commit": merge_commit,
         "close_ready_commit": close_ready_commit,
         "row_live_merge_commit": row_merge_commit,
+        "row_merge_commit_source": row_merge_commit_source,
         "expected_close_commit": close_commit,
         "merge_source_ref": str(merge_line.get("_source_ref") or ""),
         "close_ready_source_ref": str(close_ready_line.get("_source_ref") or ""),

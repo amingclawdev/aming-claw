@@ -27037,6 +27037,86 @@ def test_mf_parallel_close_authority_accepts_batch_final_commit_bridge():
     )
 
 
+def test_mf_parallel_close_authority_accepts_close_ready_merge_commit_batch_bridge():
+    contract_execution_id = "cex-mf-parallel-close-ready-merge-commit-bridge"
+    close_commit = "ef11752d00c30b2212ff357bb7ade4ebce6acdca"
+    row_merge_commit = "3aab5a35912d118315ea81c2569e676bb45e40e8"
+    worker_commit = "9bb036bff2c43a39dbda178776b03e53ec410982"
+    lines = [
+        _mf_parallel_close_authority_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            source_ref="timeline:10110",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            source_ref="timeline:10111",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "qa_independent_verification",
+            "independent_verification",
+            "qa",
+            source_ref="timeline:10112",
+            commit_sha=worker_commit,
+            payload={"verified_commit": worker_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            source_ref="timeline:10119",
+            commit_sha=row_merge_commit[:8],
+            payload={"merge_commit": row_merge_commit[:8]},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_reconcile",
+            "reconcile",
+            "observer",
+            source_ref="timeline:10140",
+            commit_sha=close_commit,
+            payload={"batch_final_commit": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_close_ready",
+            "close_ready",
+            "observer",
+            source_ref="timeline:10141",
+            commit_sha=close_commit,
+            payload={
+                "final_batch_commit": close_commit,
+                "merge_commit": row_merge_commit,
+                "merge_timeline_refs": ["timeline:10119"],
+            },
+        ),
+    ]
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        _mf_parallel_close_authority_record(contract_execution_id, lines),
+        chain_projection=_mf_parallel_close_authority_chain_projection(
+            contract_execution_id
+        ),
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is True, gate
+    assert "contract_runtime.observer_merge_close_commit" not in gate[
+        "missing_requirement_ids"
+    ]
+    assert gate["commit_mismatches"] == []
+    assert gate["checks"]["observer_merge_close_commit_bridged_by_close_ready"] is True
+    assert gate["commit_bridge_diagnostics"][0]["row_live_merge_commit"] == (
+        row_merge_commit
+    )
+    assert gate["commit_bridge_diagnostics"][0]["row_merge_commit_source"] == (
+        "merge_commit"
+    )
+
+
 def test_mf_parallel_close_authority_rejects_wrong_batch_final_commit_bridge():
     contract_execution_id = "cex-mf-parallel-batch-final-bridge-fail"
     close_commit = "ef11752d00c30b2212ff357bb7ade4ebce6acdca"
