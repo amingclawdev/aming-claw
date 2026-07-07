@@ -27693,6 +27693,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         ]["projected_completed_lines"]
     }
     assert "worker_graph_context" in projected_ids
+    assert "qa_graph_context" in projected_ids
     merge_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -27766,12 +27767,23 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         ]["projected_completed_lines"]
     }
     assert {
+        "qa_graph_context",
         "qa_independent_verification",
         "observer_merge",
         "observer_reconcile",
         "observer_close_ready",
     }.issubset(projected_after_ids)
     assert not projected_after_timeline["next_legal_action"]
+    projected_submit_guidance = projected_after_timeline["submit_line_guidance"]
+    assert projected_submit_guidance["completed_lines_projection_present"] is True
+    assert projected_submit_guidance[
+        "re_read_contract_runtime_current_after_projection"
+    ] is True
+    assert projected_submit_guidance[
+        "skip_duplicate_submit_line_when_projected_or_complete"
+    ] is True
+    assert projected_submit_guidance["duplicate_submit_line_required"] is False
+    assert "observer_close_ready" in projected_submit_guidance["projected_line_ids"]
     projected_refs = {
         item["line_id"]: item["source_ref"]
         for item in projected_after_timeline["runtime_guide"][
@@ -40251,8 +40263,34 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     ]
     assert fallback_issue_shape["task_id"] == result["root_contract_execution_id"]
     assert merge_route_scope["copy_safe_route_token_ref_only"] is True
+    assert merge_route_scope["copy_safe_primary_route_token_ref_field"] == (
+        "route_token_ref"
+    )
+    assert merge_route_scope["raw_route_token_copy_allowed"] is False
+    assert merge_route_scope["raw_route_token_persisted"] is False
+    assert merge_route_scope["merge_materialize_apply_route_scope_source"] == (
+        "successor_contract_execution_id"
+    )
+    assert merge_route_scope[
+        "merge_materialize_apply_merge_queue_id_source"
+    ] == "runtime_context.current_values.merge_queue_id"
+    assert (
+        merge_route_scope["newly_issued_route_token_merge_queue_id_allowed"]
+        is False
+    )
+    assert (
+        merge_route_scope["do_not_copy_merge_queue_id_from_route_token_issue_payload"]
+        is True
+    )
+    assert merge_route_scope["root_contract_scope_fallback_only"] is True
     assert merge_route_scope["copy_safe_route_token_scope"]["scope"]["task_id"] == (
         result["successor_contract_execution_id"]
+    )
+    assert (
+        merge_route_scope["copy_safe_route_token_scope"][
+            "raw_route_token_copy_allowed"
+        ]
+        is False
     )
     assert merge_route_scope["copy_safe_route_token_scope"][
         "observer_route_context_issue_payload"
@@ -40917,10 +40955,70 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "qa",
         )
     )
+    assert current["next_legal_action"]["line_id"] == "qa_graph_context"
+    qa_graph_trace_id = "gqt-runtime-context-projection-qa"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=qa_graph_trace_id,
+        snapshot_id="scope-runtime-context-projection-qa",
+        actor="qa",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id=successor["contract_execution_id"],
+        created_at="2026-06-29T01:01:00Z",
+    )
+    qa_graph = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "evidence_kind": "graph_trace",
+                "graph_trace_ids": [qa_graph_trace_id],
+                "graph_query_trace_ids": [qa_graph_trace_id],
+                "db_verified": True,
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "target_project_root": runtime_context.target_project_root,
+                "payload": {
+                    "schema_version": "mf_parallel.qa_graph_context.v1",
+                    "graph_trace_ids": [qa_graph_trace_id],
+                    "graph_query_trace_ids": [qa_graph_trace_id],
+                    "graph_trace_evidence": {
+                        "db_verified": True,
+                        "graph_trace_ids": [qa_graph_trace_id],
+                        "verified_trace_ids": [qa_graph_trace_id],
+                        "query_source": "qa",
+                        "query_purpose": "independent_verification",
+                        "target_project_root": runtime_context.target_project_root,
+                    },
+                },
+            },
+        )
+    )
+    assert qa_graph["ok"] is True
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+        )
+    )
     assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
     projection = current["runtime_guide"]["completed_lines_projection"]
     assert projection["source"] == "runtime_context_worker_evidence"
     assert projection["projected_line_count"] >= 7
+    submit_guidance = current["submit_line_guidance"]
+    assert submit_guidance["completed_lines_projection_present"] is True
+    assert submit_guidance[
+        "re_read_contract_runtime_current_after_projection"
+    ] is True
+    assert submit_guidance[
+        "skip_duplicate_submit_line_when_projected_or_complete"
+    ] is True
+    assert submit_guidance["duplicate_submit_line_required"] is False
+    assert "worker_implementation" in submit_guidance["projected_line_ids"]
     assert "fence-runtime-context-projection" not in json.dumps(current)
 
     stored_before_qa = server._contract_runtime_store(conn).get(
@@ -40932,6 +41030,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stored_line_ids_before_qa == {
         "observer_prefill_child_contracts",
         "observer_dispatch_bounded_workers",
+        "qa_graph_context",
     }
 
     precheck = server.handle_project_contract_runtime_line_write_precheck(
@@ -40990,6 +41089,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     )
     stored_lines_after_qa = stored_after_qa["completed_lines"]
     stored_line_ids_after_qa = {line["line_id"] for line in stored_lines_after_qa}
+    assert "qa_graph_context" in stored_line_ids_after_qa
     assert "qa_independent_verification" in stored_line_ids_after_qa
     assert "worker_read_runtime_guide" not in stored_line_ids_after_qa
     assert "worker_startup" not in stored_line_ids_after_qa
@@ -41000,6 +41100,49 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         if line["line_id"] == "qa_independent_verification"
     ][0]
     assert qa_line["actor_role"] == "qa"
+
+    duplicate_result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": runtime_context.task_id,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "qa",
+                "actor": "qa:fake",
+                "status": "passed",
+                "payload": {
+                    "contract_execution_id": successor["contract_execution_id"],
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+                },
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=runtime_context.task_id,
+                ),
+            },
+        )
+    )
+    duplicate_gate = duplicate_result["contract_runtime_close_evidence_gate"]
+    assert duplicate_gate["accepted"] is True
+    assert duplicate_gate["line_id"] == "qa_independent_verification"
+    assert duplicate_gate["completed_line_already_recorded"] is True
+    assert duplicate_gate["contract_runtime_line_mutated"] is False
+    assert duplicate_gate["timeline_append_required"] is False
+    assert duplicate_gate["timeline_append_authoritative"] is False
+    assert (
+        duplicate_gate["actor_role_unresolved_timeline_append_non_authoritative"]
+        is True
+    )
+    stored_after_duplicate = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert len(stored_after_duplicate["completed_lines"]) == len(
+        stored_lines_after_qa
+    )
 
     after = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(

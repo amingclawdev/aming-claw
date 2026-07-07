@@ -28,6 +28,7 @@ from .execution_state import (
     _line_instance_id_from_mapping,
     build_execution_state,
 )
+from .gate_decision import make_gate_decision
 from .gate_kernel import ContractGateKernel
 from .guide_compiler import attach_writer_role_safe_copy_payload, compile_runtime_guide
 from .hash import stable_sha256
@@ -1304,6 +1305,92 @@ def _contract_runtime_features(definition: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _contract_runtime_features_for_record(
+    record: Mapping[str, Any],
+    definition: Mapping[str, Any],
+) -> dict[str, Any]:
+    features = record.get("contract_runtime_features")
+    if isinstance(features, Mapping):
+        return dict(features)
+    return _contract_runtime_features(definition)
+
+
+_LEGACY_WORKER_GRAPH_CONTEXT_COMPAT_ERRORS = {
+    "worker_graph_context requires non-empty graph_trace_ids",
+    "worker_graph_context requires db_verified graph_trace_evidence",
+    "worker_graph_context requires graph query_source",
+    "worker_graph_context requires graph query_purpose",
+    "worker_graph_context requires worker_role=mf_sub",
+    "worker_graph_context requires runtime_context_id",
+    "worker_graph_context requires task_id",
+    "worker_graph_context requires parent_task_id",
+    "worker_graph_context requires target_project_root",
+}
+
+
+def _direct_fix_worker_graph_context_compat_decision(
+    *,
+    definition: Mapping[str, Any],
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    gate_decision: Any,
+) -> Any | None:
+    if getattr(gate_decision, "ok", False):
+        return None
+    if str(write.get("line_id") or "").strip() != "worker_graph_context":
+        return None
+    if _record_contract_id(record) not in {"mf_parallel", "mf_parallel.v2"}:
+        return None
+    if str(write.get("actor_role") or "").strip() != "mf_sub":
+        return None
+    features = _contract_runtime_features_for_record(record, definition)
+    if features.get("direct_fix_graph_query_gate") is not False:
+        return None
+    errors = tuple(str(item) for item in getattr(gate_decision, "errors", ()) if str(item))
+    if not errors or not set(errors).issubset(_LEGACY_WORKER_GRAPH_CONTEXT_COMPAT_ERRORS):
+        return None
+    imported_checks: list[dict[str, Any]] = []
+    for item in getattr(gate_decision, "imported_legacy_checks", ()) or ():
+        imported = dict(item)
+        if str(imported.get("adapter_id") or "") == "contract_write_gate.v1":
+            imported["decision"] = "warn"
+            imported["ok"] = True
+            imported["errors"] = []
+            imported["warnings"] = [
+                *list(imported.get("warnings") or []),
+                "legacy_worker_graph_context_graph_gate_disabled",
+            ]
+            imported["legacy_authoritative"] = False
+        imported_checks.append(imported)
+    return make_gate_decision(
+        action=str(getattr(gate_decision, "action", "") or "submit_line"),
+        gate_id=str(getattr(gate_decision, "gate_id", "") or ""),
+        warnings=(
+            *tuple(str(item) for item in getattr(gate_decision, "warnings", ()) if str(item)),
+            "legacy_worker_graph_context_graph_gate_disabled",
+        ),
+        next_move=getattr(gate_decision, "next_move", {}) or {},
+        gate_type=str(getattr(gate_decision, "gate_type", "") or ""),
+        stage_id=str(getattr(gate_decision, "stage_id", "") or ""),
+        line_id=str(getattr(gate_decision, "line_id", "") or ""),
+        required_role=str(getattr(gate_decision, "required_role", "") or ""),
+        actor_role=str(getattr(gate_decision, "actor_role", "") or ""),
+        hash_status=getattr(gate_decision, "hash_status", {}) or {},
+        graph_status=getattr(gate_decision, "graph_status", {}) or {},
+        dirty_scope_status=getattr(gate_decision, "dirty_scope_status", {}) or {},
+        imported_legacy_checks=tuple(imported_checks),
+        projection_actions=getattr(gate_decision, "projection_actions", ()) or (),
+        policy_hash=str(getattr(gate_decision, "policy_hash", "") or ""),
+        contract_definition_hash=str(
+            getattr(gate_decision, "contract_definition_hash", "") or ""
+        ),
+        execution_state_revision=int(
+            getattr(gate_decision, "execution_state_revision", 0) or 0
+        ),
+        runtime_guide_hash=str(getattr(gate_decision, "runtime_guide_hash", "") or ""),
+    )
+
+
 def _record_is_complete(record: Mapping[str, Any]) -> bool:
     guide = (
         record.get("runtime_guide")
@@ -1619,6 +1706,118 @@ def _contract_completion_satisfying_lines(
             continue
         satisfying.append(line)
     return satisfying
+
+
+def _line_id_present(
+    lines: Sequence[Mapping[str, Any]],
+    line_id: str,
+) -> bool:
+    return any(
+        isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == line_id
+        for line in lines
+    )
+
+
+def _first_deep_contract_value(value: Any, key: str) -> Any:
+    if isinstance(value, Mapping):
+        if key in value:
+            return value.get(key)
+        for item in value.values():
+            found = _first_deep_contract_value(item, key)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            found = _first_deep_contract_value(item, key)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _contract_graph_line_db_verified(line: Mapping[str, Any]) -> bool:
+    value = _first_deep_contract_value(line, "db_verified")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _latest_line_by_id(
+    lines: Sequence[Mapping[str, Any]],
+    line_id: str,
+) -> Mapping[str, Any]:
+    for line in reversed(list(lines)):
+        if (
+            isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip() == line_id
+        ):
+            return line
+    return {}
+
+
+def _synthetic_graph_skip_line(
+    *,
+    stage_id: str,
+    line_id: str,
+    actor_role: str,
+) -> dict[str, Any]:
+    return {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "actor_role": actor_role,
+        "evidence_kind": "graph_trace",
+        "status": "compat_skipped",
+        "payload": {
+            "schema_version": "contract_runtime.graph_context_compat_skip.v1",
+            "source": "contract_runtime_feature_compatibility",
+            "db_verified": False,
+            "runtime_graph_gate_disabled": True,
+        },
+    }
+
+
+def _compat_completion_lines_for_record(
+    record: Mapping[str, Any],
+    definition: Mapping[str, Any],
+    line_items: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    features = _contract_runtime_features_for_record(record, definition)
+    additions: list[Mapping[str, Any]] = []
+    contract_id = _record_contract_id(record)
+    if (
+        contract_id == "direct_fix"
+        and features.get("direct_fix_graph_query_gate") is False
+    ):
+        for stage_id, line_id, actor_role in (
+            ("observer_graph_scope", "direct_fix_observer_graph_scope", "observer"),
+            ("worker_graph_context", "direct_fix_worker_graph_context", "mf_sub"),
+            ("qa_graph_context", "direct_fix_qa_graph_context", "qa"),
+        ):
+            if not _line_id_present(line_items, line_id):
+                additions.append(
+                    _synthetic_graph_skip_line(
+                        stage_id=stage_id,
+                        line_id=line_id,
+                        actor_role=actor_role,
+                    )
+                )
+    if contract_id in {"mf_parallel", "mf_parallel.v2"}:
+        worker_graph = _latest_line_by_id(line_items, "worker_graph_context")
+        if (
+            worker_graph
+            and not _line_id_present(line_items, "qa_graph_context")
+            and not _contract_graph_line_db_verified(worker_graph)
+        ):
+            additions.append(
+                _synthetic_graph_skip_line(
+                    stage_id="qa_graph_context",
+                    line_id="qa_graph_context",
+                    actor_role="qa",
+                )
+            )
+    if not additions:
+        return list(line_items)
+    return [*list(line_items), *additions]
 
 
 def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
@@ -2385,6 +2584,70 @@ def _gate_decision_payload(decision: Any) -> dict[str, Any]:
     return payload
 
 
+_POST_PROJECTION_LINE_IDS = {
+    "qa_independent_verification",
+    "observer_merge",
+    "observer_reconcile",
+    "observer_close_ready",
+}
+
+
+def _completed_lines_projection_submit_guidance(
+    projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected_lines = projection.get("projected_completed_lines")
+    if not isinstance(projected_lines, list):
+        projected_lines = []
+    projected_line_ids = [
+        str(line.get("line_id") or "").strip()
+        for line in projected_lines
+        if isinstance(line, Mapping) and str(line.get("line_id") or "").strip()
+    ]
+    return {
+        "schema_version": "contract_runtime.post_projection_submit_line_guidance.v1",
+        "projection_present": True,
+        "source": str(projection.get("source") or "").strip(),
+        "projected_completed_lines_count": len(projected_lines),
+        "projected_line_ids": projected_line_ids,
+        "post_worker_line_ids": [
+            line_id
+            for line_id in projected_line_ids
+            if line_id in _POST_PROJECTION_LINE_IDS
+        ],
+        "re_read_contract_runtime_current_required": True,
+        "skip_duplicate_submit_line_when_projected_or_complete": True,
+        "skip_duplicate_submit_line_when_target_line_projected_or_complete": True,
+        "duplicate_submit_line_required": False,
+        "raw_session_token_required": False,
+        "raw_route_token_required": False,
+        "raw_session_token_persisted": False,
+        "raw_route_token_persisted": False,
+        "message": (
+            "After merge/reconcile auto-projection, re-read ContractRuntime "
+            "current. If the target line is projected or complete, do not "
+            "submit a duplicate line; only use no_mutation_expected precheck "
+            "as a probe."
+        ),
+    }
+
+
+def _attach_completed_lines_projection_guidance(
+    guide: dict[str, Any],
+    projection: Mapping[str, Any],
+) -> None:
+    guide["completed_lines_projection"] = dict(projection)
+    guide["post_projection_submit_line_guidance"] = (
+        _completed_lines_projection_submit_guidance(projection)
+    )
+    guide["runtime_guide_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in guide.items()
+            if key != "runtime_guide_hash"
+        }
+    )
+
+
 class ContractRuntime:
     """Runtime facade that compiles guides and validates writes from state."""
 
@@ -2592,9 +2855,16 @@ class ContractRuntime:
             definition=definition,
         )
         line_items = list(completed_lines or [])
-        completion_satisfying_lines = _contract_completion_satisfying_lines(line_items)
         effective_actor_role = actor_role or str(
             record["execution_state"].get("actor_role") or ""
+        )
+        completion_input_lines = _compat_completion_lines_for_record(
+            record,
+            definition,
+            line_items,
+        )
+        completion_satisfying_lines = _contract_completion_satisfying_lines(
+            completion_input_lines
         )
         state = build_execution_state(
             definition,
@@ -2620,13 +2890,9 @@ class ContractRuntime:
             sanitized = _sanitize_line_evidence_value(projection)
             if isinstance(sanitized, Mapping):
                 sanitized_projection = dict(sanitized)
-                guide["completed_lines_projection"] = sanitized_projection
-                guide["runtime_guide_hash"] = stable_sha256(
-                    {
-                        key: value
-                        for key, value in guide.items()
-                        if key != "runtime_guide_hash"
-                    }
+                _attach_completed_lines_projection_guidance(
+                    guide,
+                    sanitized_projection,
                 )
         _attach_writer_role_safe_submit_payload(
             guide,
@@ -2705,6 +2971,15 @@ class ContractRuntime:
             execution_state=gate_record["execution_state"],
             runtime_guide=guide,
             write=effective_write,
+        )
+        gate_decision = (
+            _direct_fix_worker_graph_context_compat_decision(
+                definition=definition,
+                record=gate_record,
+                write=effective_write,
+                gate_decision=gate_decision,
+            )
+            or gate_decision
         )
         if _line_write_declares_no_mutation_expected(effective_write):
             return {
@@ -2810,6 +3085,15 @@ class ContractRuntime:
             execution_state=gate_record["execution_state"],
             runtime_guide=guide,
             write=effective_write,
+        )
+        gate_decision = (
+            _direct_fix_worker_graph_context_compat_decision(
+                definition=definition,
+                record=gate_record,
+                write=effective_write,
+                gate_decision=gate_decision,
+            )
+            or gate_decision
         )
         return {
             "schema_version": "contract_runtime_line_write_precheck_result.v1",
@@ -2991,6 +3275,16 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "verification",
     "artifact_refs",
     "trace_id",
+    "graph_trace_id",
+    "graph_trace_ids",
+    "graph_query_trace_id",
+    "graph_query_trace_ids",
+    "trace_ids",
+    "db_verified",
+    "query_source",
+    "query_purpose",
+    "graph_trace_evidence",
+    "target_project_root",
     "commit_sha",
     "actor_session_principal",
     "evidence_owner_actor",
@@ -3276,13 +3570,9 @@ def _runtime_guide_hash_for_role(
     )
     _attach_completed_line_evidence(role_guide, completed_lines)
     if sanitized_projection:
-        role_guide["completed_lines_projection"] = dict(sanitized_projection)
-        role_guide["runtime_guide_hash"] = stable_sha256(
-            {
-                key: value
-                for key, value in role_guide.items()
-                if key != "runtime_guide_hash"
-            }
+        _attach_completed_lines_projection_guidance(
+            role_guide,
+            sanitized_projection,
         )
     return str(role_guide.get("runtime_guide_hash") or "")
 
