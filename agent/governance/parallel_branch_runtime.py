@@ -1330,27 +1330,11 @@ class MergeQueueDecision:
     def to_dashboard_row(self) -> dict[str, Any]:
         return {
             "queue_item_id": self.queue_item_id,
-            "merge_queue_id": self.merge_queue_id,
             "task_id": self.task_id,
             "branch_ref": self.branch_ref,
             "observed_status": self.observed_status,
             "queue_state": self.queue_state,
             "action": self.action,
-            "backlog_id": self.backlog_id,
-            "queue_index": self.queue_index,
-            "target_ref": self.target_ref,
-            "base_commit": self.base_commit,
-            "branch_head": self.branch_head,
-            "validated_target_head": self.validated_target_head,
-            "current_target_head": self.current_target_head,
-            "depends_on": list(self.depends_on),
-            "hard_depends_on": list(self.hard_depends_on),
-            "serializes_after": list(self.serializes_after),
-            "conflicts_with": list(self.conflicts_with),
-            "same_node_or_file_conflicts": list(self.same_node_or_file_conflicts),
-            "requires_graph_epoch": list(self.requires_graph_epoch),
-            "snapshot_id": self.snapshot_id,
-            "projection_id": self.projection_id,
             "dependency_blockers": list(self.dependency_blockers),
             "dependency_blocker_types": {
                 key: list(values)
@@ -1364,10 +1348,34 @@ class MergeQueueDecision:
             "target_semantic_activation_allowed": self.target_semantic_activation_allowed,
             "validation_attempt": self.validation_attempt,
             "merge_preview_id": self.merge_preview_id,
-            "lineage_status": self.lineage_status,
-            "lineage_source": self.lineage_source,
-            "governed_recovery_actions": list(self.governed_recovery_actions),
         }
+
+    def to_read_model_row(self) -> dict[str, Any]:
+        row = self.to_dashboard_row()
+        row.update(
+            {
+                "merge_queue_id": self.merge_queue_id,
+                "backlog_id": self.backlog_id,
+                "queue_index": self.queue_index,
+                "target_ref": self.target_ref,
+                "base_commit": self.base_commit,
+                "branch_head": self.branch_head,
+                "validated_target_head": self.validated_target_head,
+                "current_target_head": self.current_target_head,
+                "depends_on": list(self.depends_on),
+                "hard_depends_on": list(self.hard_depends_on),
+                "serializes_after": list(self.serializes_after),
+                "conflicts_with": list(self.conflicts_with),
+                "same_node_or_file_conflicts": list(self.same_node_or_file_conflicts),
+                "requires_graph_epoch": list(self.requires_graph_epoch),
+                "snapshot_id": self.snapshot_id,
+                "projection_id": self.projection_id,
+                "lineage_status": self.lineage_status,
+                "lineage_source": self.lineage_source,
+                "governed_recovery_actions": list(self.governed_recovery_actions),
+            }
+        )
+        return row
 
 
 @dataclass(frozen=True)
@@ -10096,7 +10104,7 @@ def append_branch_contract_revision(
     context: BranchTaskRuntimeContext,
     *,
     revision_id: str = "",
-    contract_version: str = "mf_parallel.v2",
+    contract_version: str = "mf_parallel.v1",
     payload: Mapping[str, Any] | None = None,
     route_gate: Mapping[str, Any] | None = None,
     route_identity: Mapping[str, Any] | None = None,
@@ -16328,7 +16336,12 @@ def _compact_merge_queue(
             "target_mutation_blocked_for": [],
             "rows": [],
         }, 0, False
-    rows, truncated = _limit_compact_rows(list(merge_queue_plan.dashboard_rows), limit)
+    source_rows = (
+        [decision.to_read_model_row() for decision in merge_queue_plan.decisions]
+        if merge_queue_plan.decisions
+        else list(merge_queue_plan.dashboard_rows)
+    )
+    rows, truncated = _limit_compact_rows(source_rows, limit)
     return {
         "scenario_id": merge_queue_plan.scenario_id,
         "mergeable_task_ids": list(merge_queue_plan.mergeable_task_ids),
@@ -16336,7 +16349,7 @@ def _compact_merge_queue(
         "stale_task_ids": list(merge_queue_plan.stale_task_ids),
         "target_mutation_blocked_for": list(merge_queue_plan.target_mutation_blocked_for),
         "rows": list(rows),
-    }, len(merge_queue_plan.dashboard_rows), truncated
+    }, len(source_rows), truncated
 
 
 def _compact_rollback(

@@ -3145,6 +3145,12 @@ def _copy_safe_route_token_scope_payload(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
         "raw_route_token_persisted": False,
+        "raw_route_token_copy_allowed": False,
+        "persist_raw_route_token_allowed": False,
+        "copy_safe_token_ref_fields": [
+            "route_token_ref",
+            "observer_route_token_ref",
+        ],
         "copy_rule": (
             "Pass only route_token_ref/observer_route_token_ref; never paste a "
             "raw route token into guide, timeline, or merge evidence payloads."
@@ -8385,6 +8391,9 @@ def _runtime_context_service_timeline_refs(
             refs.get("latest_implementation_event_ref") or ""
         ),
         "startup_event_ref": str(refs.get("startup_event_ref") or ""),
+        "finish_time_attestation_event_ref": str(
+            finish_attestation.get("attestation_event_ref") or ""
+        ),
         "read_receipt_event_ref": str(refs.get("read_receipt_event_ref") or ""),
         "observer_command_id": str(refs.get("observer_command_id") or ""),
         "read_receipt_hash": str(refs.get("read_receipt_hash") or ""),
@@ -8681,6 +8690,114 @@ def _runtime_context_service_redact_graph_trace_refs(
     redacted = dict(refs)
     redacted.pop("fence_token", None)
     return redacted
+
+
+def _runtime_context_service_qa_graph_trace_refs(
+    conn,
+    *,
+    project_id: str,
+    explicit_trace_ids: Sequence[str],
+    target_project_root: str,
+) -> dict[str, Any]:
+    requested_trace_ids = _runtime_context_service_dedupe(
+        [str(trace_id or "").strip() for trace_id in explicit_trace_ids]
+    )
+    if not requested_trace_ids:
+        return {}
+    rows: list[Any] = []
+    try:
+        explicit_clause = ",".join("?" for _ in requested_trace_ids)
+        rows = conn.execute(
+            f"""
+            SELECT trace_id, query_source, query_purpose, actor
+            FROM graph_query_traces
+            WHERE project_id = ?
+              AND trace_id IN ({explicit_clause})
+            ORDER BY created_at DESC, trace_id DESC
+            """,
+            (project_id, *tuple(requested_trace_ids)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    verified: list[str] = []
+    row_trace_ids: set[str] = set()
+    identity_mismatches: list[dict[str, str]] = []
+    allowed_purposes = {
+        "qa_context_build",
+        "qa_gate_validation",
+        "independent_verification",
+    }
+    for row in rows:
+        trace_id = (
+            str(row["trace_id"] or "").strip()
+            if isinstance(row, sqlite3.Row)
+            else str(row[0] or "").strip()
+        )
+        if not trace_id:
+            continue
+        row_trace_ids.add(trace_id)
+        query_source = (
+            str(row["query_source"] or "").strip()
+            if isinstance(row, sqlite3.Row)
+            else str(row[1] or "").strip()
+        )
+        query_purpose = (
+            str(row["query_purpose"] or "").strip()
+            if isinstance(row, sqlite3.Row)
+            else str(row[2] or "").strip()
+        )
+        if query_source != "qa":
+            identity_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_source",
+                    "expected": "qa",
+                    "actual": query_source,
+                }
+            )
+            continue
+        if query_purpose not in allowed_purposes:
+            identity_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "query_purpose",
+                    "expected": "qa_context_build|qa_gate_validation|independent_verification",
+                    "actual": query_purpose,
+                }
+            )
+            continue
+        if trace_id not in verified:
+            verified.append(trace_id)
+    requested_set = set(requested_trace_ids)
+    missing_trace_ids = [
+        trace_id for trace_id in requested_trace_ids if trace_id not in row_trace_ids
+    ]
+    db_verified = (
+        bool(verified)
+        and requested_set.issubset(set(verified))
+        and not missing_trace_ids
+        and not identity_mismatches
+    )
+    return {
+        "schema_version": "qa_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
+        "producer": "graph_query_trace",
+        "db_verified": db_verified,
+        "trace_ids": verified,
+        "verified_trace_ids": verified,
+        "requested_trace_ids": requested_trace_ids,
+        "missing_trace_ids": missing_trace_ids,
+        "identity_mismatches": identity_mismatches,
+        "project_id": project_id,
+        "query_source": "qa" if verified else "",
+        "query_purpose": "independent_verification" if verified else "",
+        "target_project_root": target_project_root,
+        "source_details": {
+            "graph_query_traces": bool(rows),
+            "caller_requested_trace_ids": bool(requested_trace_ids),
+        },
+    }
 
 
 def _runtime_context_service_query_values(
@@ -9071,6 +9188,16 @@ def _runtime_context_projection_response(
     redacted_graph_trace_refs = _runtime_context_service_redact_graph_trace_refs(
         graph_trace_refs
     )
+    if not timeline_refs.get("graph_trace_ids"):
+        filtered_trace_ids = list(
+            redacted_graph_trace_refs.get("verified_trace_ids")
+            or redacted_graph_trace_refs.get("trace_ids")
+            or []
+        )
+        if filtered_trace_ids:
+            timeline_refs["graph_trace_ids"] = _runtime_context_service_dedupe(
+                filtered_trace_ids
+            )
     durable_merge_queue_item = get_merge_queue_item_for_branch_context(
         conn,
         context_project_id,
@@ -10669,13 +10796,26 @@ def _runtime_context_worker_guide_response(
         or finish_attestation_hint.get("transcript_path")
         or ""
     ).strip()
+    finish_time_attestation_event_ref = str(
+        finish_attestation_hint.get("finish_time_attestation_event_ref") or ""
+    ).strip()
+    finish_time_transcript_can_be_inferred = bool(
+        finish_time_attestation_event_ref
+        or finish_attestation_hint.get("implementation_event_ref")
+        or timeline_refs.get("latest_implementation_event_ref")
+    )
+    finish_time_worker_transcript_identity = (
+        hinted_worker_transcript_ref or hinted_worker_transcript_path
+        if finish_time_transcript_can_be_inferred
+        else ""
+    )
     finish_attestation_transcript_readiness = {
         "schema_version": (
             "runtime_context.finish_time_transcript_readiness.v1"
         ),
         "status": (
             "ready"
-            if (hinted_worker_transcript_ref or hinted_worker_transcript_path)
+            if finish_time_worker_transcript_identity
             else "worker_must_supply_before_finish_time_attestation"
         ),
         "required_before": [
@@ -10800,9 +10940,7 @@ def _runtime_context_worker_guide_response(
             "read_receipt_hash": hinted_read_receipt_hash,
             "worker_session_id": hinted_worker_session_id,
             "filer_principal": hinted_filer_principal,
-            "worker_transcript_ref_or_path": (
-                hinted_worker_transcript_ref or hinted_worker_transcript_path
-            ),
+            "worker_transcript_ref_or_path": finish_time_worker_transcript_identity,
         }.items()
         if not value
     ]
@@ -37545,6 +37683,36 @@ def _contract_runtime_submit_line_guidance(guide: Mapping[str, Any]) -> dict[str
     }
     if required_hash:
         guidance["current_required_runtime_guide_hash"] = required_hash
+    projection_guidance = (
+        guide.get("post_projection_submit_line_guidance")
+        if isinstance(guide.get("post_projection_submit_line_guidance"), Mapping)
+        else {}
+    )
+    if projection_guidance:
+        guidance["completed_lines_projection_present"] = True
+        guidance["post_projection_submit_line_guidance"] = dict(projection_guidance)
+        guidance["re_read_contract_runtime_current_after_projection"] = bool(
+            projection_guidance.get("re_read_contract_runtime_current_required")
+        )
+        guidance["skip_duplicate_submit_line_when_projected_or_complete"] = bool(
+            projection_guidance.get(
+                "skip_duplicate_submit_line_when_projected_or_complete"
+            )
+        )
+        guidance["skip_duplicate_submit_line_when_target_line_projected_or_complete"] = bool(
+            projection_guidance.get(
+                "skip_duplicate_submit_line_when_target_line_projected_or_complete"
+            )
+        )
+        guidance["duplicate_submit_line_required"] = False
+        guidance["projected_completed_lines_count"] = int(
+            projection_guidance.get("projected_completed_lines_count") or 0
+        )
+        guidance["projected_line_ids"] = list(
+            projection_guidance.get("projected_line_ids") or []
+        )
+    else:
+        guidance["completed_lines_projection_present"] = False
     return guidance
 
 
@@ -40089,6 +40257,20 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"qa"},
         related_task_ids=related_task_ids,
     )
+    qa_graph_refs: dict[str, Any] = {}
+    if qa_event:
+        qa_graph_refs = _runtime_context_service_qa_graph_trace_refs(
+            conn,
+            project_id=project_id,
+            explicit_trace_ids=(
+                _runtime_context_service_graph_trace_values_from_event(qa_event)
+            ),
+            target_project_root=str(
+                getattr(context, "target_project_root", "")
+                or getattr(context, "worktree_path", "")
+                or ""
+            ),
+        )
     merge_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
         runtime_context_id=runtime_context_id,
@@ -40122,7 +40304,25 @@ def _contract_runtime_projection_post_worker_lines(
     )
 
     lines: list[dict[str, Any]] = []
-    if qa_event:
+    qa_graph_line_instance_id = f"runtime_context:{runtime_context_id}"
+    qa_graph_line_present = bool(qa_graph_refs.get("db_verified")) or any(
+        isinstance(line, Mapping)
+        and str(line.get("stage_id") or "").strip() == "qa_graph_context"
+        and str(line.get("line_id") or "").strip() == "qa_graph_context"
+        and str(line.get("line_instance_id") or "").strip()
+        == qa_graph_line_instance_id
+        for line in (record.get("completed_lines") or [])
+    )
+    if qa_event and qa_graph_line_present:
+        lines.append(
+            _contract_runtime_projected_qa_graph_line(
+                record=record,
+                context=context,
+                event=qa_event,
+                graph_refs=qa_graph_refs,
+            )
+        )
+    if qa_event and qa_graph_line_present:
         lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
@@ -40198,6 +40398,75 @@ def _contract_runtime_projection_post_worker_lines(
             )
         )
     return lines
+
+
+def _contract_runtime_projected_qa_graph_line(
+    *,
+    record: Mapping[str, Any],
+    context: Any,
+    event: Mapping[str, Any],
+    graph_refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    source_ref = _runtime_context_event_ref(event)
+    graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
+    target_project_root = str(
+        getattr(context, "target_project_root", "")
+        or getattr(context, "worktree_path", "")
+        or ""
+    ).strip()
+    graph_evidence = _runtime_context_service_redact_graph_trace_refs(graph_refs)
+    graph_evidence["target_project_root"] = target_project_root
+    payload = {
+        "schema_version": "mf_parallel.qa_graph_context.v1",
+        "source": "runtime_context_qa_graph_projection",
+        "source_ref": source_ref,
+        "source_backed": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "projection_contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "projection_persists_completed_line": False,
+        "observer_authored_qa_backfill": False,
+        "graph_trace_ids": graph_trace_ids,
+        "graph_query_trace_ids": graph_trace_ids,
+        "graph_trace_evidence": graph_evidence,
+    }
+    line = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "status": str(event.get("status") or event.get("decision") or "passed"),
+        "graph_trace_ids": graph_trace_ids,
+        "graph_query_trace_ids": graph_trace_ids,
+        "db_verified": bool(graph_refs.get("db_verified")),
+        "query_source": "qa",
+        "query_purpose": str(graph_refs.get("query_purpose") or "independent_verification"),
+        "target_project_root": target_project_root,
+        "payload": payload,
+        "artifact_refs": {
+            "source": "runtime_context_qa_graph_projection",
+            "source_ref": source_ref,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "timeline_event_ref": source_ref,
+            "graph_trace_ids": graph_trace_ids,
+            "graph_trace_evidence": graph_evidence,
+        },
+        "_source_ref": source_ref,
+    }
+    if graph_trace_ids:
+        line["trace_id"] = graph_trace_ids[0]
+    return line
 
 
 def _contract_runtime_projection_post_worker_timeline_events(
@@ -44876,6 +45145,54 @@ def _onboard_blocked_contract_resume_projection(
                 "next_legal_action": next_action,
                 "compact_ledger_row": dict(row),
             }
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+        has_raw_fence_blocker = any(
+            isinstance(item, Mapping)
+            and str(item.get("blocker_class") or item.get("blocker_id") or "").strip()
+            == "runtime_merge_queue_requires_raw_fence_after_worker_finish"
+            for item in blockers
+        )
+        parent_execution_id = str(payload.get("contract_execution_id") or "").strip()
+        if not has_raw_fence_blocker or not parent_execution_id:
+            continue
+        row = {
+            "backlog_id": backlog_id,
+            "readiness_state": "blocked",
+            "contract_execution_id": parent_execution_id,
+            "latest_event_id": int(event.get("id") or 0),
+            "latest_event_kind": str(event.get("event_kind") or ""),
+            "next_legal_action": (
+                payload.get("next_legal_action")
+                if isinstance(payload.get("next_legal_action"), Mapping)
+                else {}
+            ),
+            "blocker_summary": {
+                "source": "task_timeline_event",
+                "blockers": blockers,
+            },
+        }
+        next_action = _onboard_direct_fix_next_action_from_ledger_row(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            row=row,
+            route_token_ref=route_token_ref,
+        )
+        if next_action:
+            return {
+                "schema_version": "onboard_route_guide.runtime_resume.v1",
+                "status": "blocked",
+                "mode": "resume_blocked_contract",
+                "source": "task_timeline_compact_ledger",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "parent_contract_execution_id": parent_execution_id,
+                "next_legal_action": next_action,
+                "compact_ledger_row": row,
+            }
     return {}
 
 
@@ -47127,6 +47444,12 @@ def _direct_fix_definition_allows_parent(
             item.get("contract_id") or item.get("contract_template_id") or ""
         ).strip()
         candidate_version = str(item.get("version") or "").strip()
+        if (
+            candidate_id == "mf_parallel"
+            and _is_mf_parallel_record_contract_id(parent_contract_id)
+            and candidate_version in {"", "v1", "*"}
+        ):
+            return True
         if candidate_id not in {parent_contract_id, "*"}:
             continue
         if candidate_version and candidate_version not in {parent_version, "*"}:
@@ -48624,6 +48947,26 @@ def _direct_fix_successor_runtime_enter(
         },
         "route_token_ref_binding": dict(child_route_binding),
     }
+    blocked_payload = (
+        blocked_line.get("payload")
+        if isinstance(blocked_line.get("payload"), Mapping)
+        else {}
+    )
+    if (
+        str(blocked_payload.get("blocked_successor_contract_id") or "").strip()
+        == "backlog_close"
+        and str(blocked_payload.get("blocker_id") or "").strip()
+        == "missing_contract_runtime_close_authority"
+    ):
+        features = (
+            dict(successor.get("contract_runtime_features"))
+            if isinstance(successor.get("contract_runtime_features"), Mapping)
+            else {}
+        )
+        if features.get("direct_fix_graph_query_gate") is not False:
+            features["direct_fix_graph_query_gate"] = False
+            successor["contract_runtime_features"] = features
+            store.update(successor_execution_id, successor)
     runtime.current_guide(successor_execution_id, actor_role=actor_role)
     successor = store.get(successor_execution_id)
     if successor_existed and _runtime_record_is_complete(successor):
@@ -49037,6 +49380,25 @@ def _mf_parallel_successor_runtime_enter(
         "copy_safe_route_token_scope": current_contract_close_route_token_scope,
         "fallback_copy_safe_route_token_scope": root_close_route_token_scope,
         "copy_safe_route_token_ref_only": True,
+        "copy_safe_primary_route_token_ref_field": "route_token_ref",
+        "copy_safe_token_ref_fields": [
+            "route_token_ref",
+            "observer_route_token_ref",
+        ],
+        "raw_route_token_copy_allowed": False,
+        "raw_route_token_persisted": False,
+        "merge_materialize_apply_route_scope_source": (
+            "successor_contract_execution_id"
+        ),
+        "merge_materialize_apply_route_token_ref_source": (
+            "copy_safe_route_token_scope.route_token_ref"
+        ),
+        "merge_materialize_apply_merge_queue_id_source": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "newly_issued_route_token_merge_queue_id_allowed": False,
+        "do_not_copy_merge_queue_id_from_route_token_issue_payload": True,
+        "root_contract_scope_fallback_only": True,
         "message": (
             "Use successor_contract_execution_id for child runtime lines and "
             "for the primary close_or_merge_after_evidence route used by "
@@ -50562,6 +50924,82 @@ def _contract_runtime_close_line_for_event(
     return {}
 
 
+def _contract_runtime_completed_line_request_for_event(
+    record: Mapping[str, Any],
+    *,
+    event_kind: str,
+    body: Mapping[str, Any],
+) -> dict[str, str]:
+    explicit = _contract_runtime_close_explicit_line(body)
+    if explicit:
+        return explicit
+    contract_id = str(record.get("contract_id") or "").strip()
+    if contract_id == "observer_hotfix":
+        mapped = _observer_hotfix_line_for_event(event_kind)
+        if mapped:
+            return mapped
+    token = _contract_runtime_close_normalized(event_kind)
+    if token in {"independent_verification", "qa_verification", "verification"}:
+        return {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+        }
+    if token in {"live_merge", "merge", "observer_merge"}:
+        return {
+            "stage_id": "observer_integration",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+        }
+    if token in {"reconcile", "observer_reconcile"}:
+        return {
+            "stage_id": "observer_integration",
+            "line_id": "observer_reconcile",
+            "evidence_kind": "reconcile",
+        }
+    if token in {"close_ready", "observer_close_ready"}:
+        return {
+            "stage_id": "observer_integration",
+            "line_id": "observer_close_ready",
+            "evidence_kind": "close_ready",
+        }
+    return {}
+
+
+def _contract_runtime_matching_completed_line(
+    record: Mapping[str, Any],
+    requested: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    line_ref = {
+        "stage_id": str(requested.get("stage_id") or "").strip(),
+        "line_id": str(requested.get("line_id") or "").strip(),
+        "evidence_kind": str(requested.get("evidence_kind") or "").strip(),
+    }
+    if not all(line_ref.values()):
+        return None
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    completed_lines = guide.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return None
+    for item in completed_lines:
+        if not isinstance(item, Mapping):
+            continue
+        if (
+            str(item.get("stage_id") or "").strip() == line_ref["stage_id"]
+            and str(item.get("line_id") or "").strip() == line_ref["line_id"]
+            and str(item.get("evidence_kind") or "").strip()
+            == line_ref["evidence_kind"]
+        ):
+            return item
+    return None
+
+
 def _contract_runtime_close_contains_truthy_key(
     value: Any,
     keys: set[str],
@@ -50656,6 +51094,7 @@ def _contract_runtime_completed_line_projection_gate(
     event_kind: str,
     actor_role: str,
     line: Mapping[str, Any],
+    allow_in_progress_completed_line: bool = False,
 ) -> dict[str, Any]:
     guide = (
         record.get("runtime_guide")
@@ -50663,7 +51102,10 @@ def _contract_runtime_completed_line_projection_gate(
         else {}
     )
     current_state = _runtime_current_state_from_record(record)
-    if current_state.get("next_legal_action"):
+    if (
+        current_state.get("next_legal_action")
+        and not allow_in_progress_completed_line
+    ):
         return {}
     requested = {
         "stage_id": str(line.get("stage_id") or "").strip(),
@@ -50672,22 +51114,7 @@ def _contract_runtime_completed_line_projection_gate(
     }
     if not all(requested.values()):
         return {}
-    completed_lines = guide.get("completed_lines")
-    if not isinstance(completed_lines, list):
-        completed_lines = record.get("completed_lines")
-    matched_line: Mapping[str, Any] | None = None
-    if isinstance(completed_lines, list):
-        for item in completed_lines:
-            if not isinstance(item, Mapping):
-                continue
-            if (
-                str(item.get("stage_id") or "").strip() == requested["stage_id"]
-                and str(item.get("line_id") or "").strip() == requested["line_id"]
-                and str(item.get("evidence_kind") or "").strip()
-                == requested["evidence_kind"]
-            ):
-                matched_line = item
-                break
+    matched_line = _contract_runtime_matching_completed_line(record, requested)
     if matched_line is None:
         return {}
 
@@ -50771,13 +51198,15 @@ def _contract_runtime_completed_line_projection_gate(
             },
         )
 
-    return {
+    gate = {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
         "accepted": True,
         "status": "passed",
         "projection_only": True,
         "projection_source": "completed_contract_runtime_line",
         "source_completed_line": True,
+        "contract_runtime_line_mutated": False,
+        "duplicate_submit_line_required": False,
         "primary_decision_source": True,
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
         "meta_contract_gate_decision_source": False,
@@ -50801,6 +51230,18 @@ def _contract_runtime_completed_line_projection_gate(
             "commit_sha": completed_commit_sha,
         },
     }
+    if current_state.get("next_legal_action"):
+        gate.update(
+            {
+                "status": "accepted_completed_line_already_recorded",
+                "timeline_append_required": False,
+                "timeline_append_authoritative": False,
+                "timeline_append_primary_decision_source": False,
+                "contract_runtime_completed_line_remains_authoritative": True,
+                "duplicate_timeline_append_non_authoritative": True,
+            }
+        )
+    return gate
 
 
 def _contract_runtime_completed_line_projection_preflight_gate(
@@ -50820,13 +51261,49 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         body,
         trusted_actor_role=trusted_actor_role,
     )
-    if not actor_role:
-        return {}
     runtime = _contract_runtime(conn)
     try:
-        runtime.current_guide(contract_execution_id, actor_role=actor_role)
+        if actor_role:
+            runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
     except ContractRuntimeError:
+        return {}
+    completed_line = _contract_runtime_completed_line_request_for_event(
+        record,
+        event_kind=event_kind,
+        body=body,
+    )
+    matched_completed_line = (
+        _contract_runtime_matching_completed_line(record, completed_line)
+        if completed_line
+        else None
+    )
+    if matched_completed_line is not None:
+        completed_actor_role = str(
+            matched_completed_line.get("actor_role") or ""
+        ).strip()
+        gate_actor_role = actor_role or completed_actor_role
+        if gate_actor_role:
+            gate = _contract_runtime_completed_line_projection_gate(
+                record,
+                body=body,
+                event_kind=event_kind,
+                actor_role=gate_actor_role,
+                line=completed_line,
+                allow_in_progress_completed_line=True,
+            )
+            if gate:
+                gate["completed_line_already_recorded"] = True
+                gate["timeline_append_required"] = False
+                gate["timeline_append_authoritative"] = False
+                gate["contract_runtime_completed_line_remains_authoritative"] = True
+                if not actor_role:
+                    gate["actor_role_source"] = "completed_contract_runtime_line"
+                    gate[
+                        "actor_role_unresolved_timeline_append_non_authoritative"
+                    ] = True
+                return gate
+    if not actor_role:
         return {}
     if _runtime_current_state_from_record(record).get("next_legal_action"):
         return {}
