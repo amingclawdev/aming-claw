@@ -25,7 +25,7 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from utils import tasks_root
-from .db import get_connection, _governance_root
+from .db import get_connection, _governance_root, _resolve_project_dir
 from .graph import AcceptanceGraph
 from . import state_service
 from . import role_service
@@ -246,6 +246,27 @@ def _progress_with_elapsed(progress: object) -> object:
         except ValueError:
             pass
     return out
+
+
+def _active_snapshot_id_from_graph_ref(project_id: str) -> str | None:
+    """Return the active graph ref snapshot id when graph state already exists."""
+    pid = _normalize_project_id(project_id or "")
+    if not pid:
+        return None
+    try:
+        db_path = _resolve_project_dir(pid) / "governance.db"
+        if not db_path.exists():
+            return None
+        from .graph_snapshot_store import get_active_graph_snapshot
+
+        conn = get_connection(pid)
+        try:
+            active = get_active_graph_snapshot(conn, pid) or {}
+        finally:
+            conn.close()
+        return str(active.get("snapshot_id") or "")
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -508,10 +529,61 @@ def list_projects() -> list[dict]:
     for p in projects["projects"].values():
         # Never expose password_hash
         safe = {k: v for k, v in p.items() if k != "password_hash"}
+        live_active_snapshot_id = _active_snapshot_id_from_graph_ref(
+            str(safe.get("project_id") or "")
+        )
+        if live_active_snapshot_id is not None:
+            safe["active_snapshot_id"] = live_active_snapshot_id
         if "bootstrap_progress" in safe:
             safe["bootstrap_progress"] = _progress_with_elapsed(safe["bootstrap_progress"])
         result.append(safe)
     return result
+
+
+def update_project_active_snapshot_metadata(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    node_count: int | None = None,
+) -> dict:
+    """Persist the active graph snapshot summary in the project registry."""
+    project_id = _normalize_project_id(project_id)
+    snapshot_id = str(snapshot_id or "").strip()
+    projects = _load_projects()
+    entry = projects["projects"].get(project_id)
+    if not entry:
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "active_snapshot_id": snapshot_id,
+            "reason": "project_not_registered",
+        }
+
+    changed = False
+    if str(entry.get("active_snapshot_id") or "") != snapshot_id:
+        entry["active_snapshot_id"] = snapshot_id
+        changed = True
+
+    normalized_node_count: int | None = None
+    if node_count is not None:
+        try:
+            normalized_node_count = max(0, int(node_count))
+        except (TypeError, ValueError):
+            normalized_node_count = None
+    if normalized_node_count is not None and entry.get("node_count") != normalized_node_count:
+        entry["node_count"] = normalized_node_count
+        changed = True
+
+    if changed:
+        _save_projects(projects)
+
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "active_snapshot_id": snapshot_id,
+        "node_count": entry.get("node_count", 0),
+        "changed": changed,
+    }
 
 
 def update_project_metadata(project_id: str, updates: dict) -> dict:
