@@ -10835,6 +10835,14 @@ def _runtime_context_worker_guide_response(
         "target_project_root": target_project_root,
         "body": finish_attestation_body,
         "copy_safe_body": dict(finish_attestation_body),
+        "body_source": "copy_safe_body",
+        "copy_rule": (
+            "POST exactly copy_safe_body to runtime_context.finish_time_worker_attestation; "
+            "do not hand-build this body or omit literal fields."
+        ),
+        "required_literal_fields": {
+            "harness_type": "codex",
+        },
         "missing_required_fields": finish_attestation_missing,
         "source_refs": {
             "implementation_event_ref": str(
@@ -10868,6 +10876,14 @@ def _runtime_context_worker_guide_response(
                 "Keep these lineage fields at the POST body top level. Nested "
                 "self_attestation/artifact_refs copies are tolerated only as a "
                 "recovery source, not the preferred happy-path shape."
+            ),
+            "harness_type_literal": (
+                "Codex workers must keep top-level harness_type='codex' exactly "
+                "as supplied in copy_safe_body."
+            ),
+            "do_not_hand_build_body": (
+                "Copy finish_time_worker_attestation_submission.copy_safe_body "
+                "and fill only worker-owned evidence placeholders."
             ),
             "head_scope": (
                 "Use row_scoped_finish_head_projection.submission_head_commit "
@@ -17133,6 +17149,18 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             raise ValidationError(
                 "finish-time worker attestation cannot use startup attestation_phase"
             )
+        harness_type = _runtime_context_finish_attestation_text(
+            body,
+            "harness_type",
+            "worker_harness_type",
+        )
+        if not harness_type:
+            raise ValidationError(
+                "finish-time worker attestation requires top-level "
+                "harness_type=codex for Codex workers; copy "
+                "finish_time_worker_attestation_submission.copy_safe_body instead "
+                "of hand-building the body"
+            )
 
         attestation_payload = {
             **body,
@@ -17146,6 +17174,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "worker_slot_id": context.worker_slot_id or context.worker_id,
             "worker_session_id": worker_session_id,
             "filer_principal": filer_principal,
+            "harness_type": harness_type,
             "actor": filer_principal,
             "fence_token": _runtime_context_request_value(ctx, "fence_token"),
             "worktree_path": worktree_path,
