@@ -123,6 +123,39 @@ else:
     _RECONCILE_PARALLEL_IMPORT_ERROR = None
 
 
+def _sync_project_registry_active_snapshot(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    node_count: int | None = None,
+    ref_name: str = "active",
+) -> dict[str, Any]:
+    """Best-effort sync from graph ref activation into projects.json metadata."""
+    if str(ref_name or "active").strip() != "active":
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "active_snapshot_id": str(snapshot_id or ""),
+            "skipped": True,
+            "reason": "non_active_ref",
+        }
+    try:
+        from agent.governance import project_service
+
+        return project_service.update_project_active_snapshot_metadata(
+            project_id,
+            str(snapshot_id or ""),
+            node_count=node_count,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "active_snapshot_id": str(snapshot_id or ""),
+            "error": str(exc),
+        }
+
+
 def _git_commit(project_root: str | Path, ref: str = "HEAD") -> str:
     root = Path(project_root).resolve()
     try:
@@ -3291,6 +3324,7 @@ def run_state_only_full_reconcile(
         output_payload=semantic_enrichment,
     )
     activation = None
+    project_registry_activation: dict[str, Any] = {}
     pending_scope_waiver = {
         "project_id": project_id,
         "waived_count": 0,
@@ -3347,6 +3381,12 @@ def run_state_only_full_reconcile(
                     },
                 )
             conn.commit()
+        project_registry_activation = _sync_project_registry_active_snapshot(
+            project_id,
+            sid,
+            node_count=len(nodes),
+            ref_name=activation_ref_name,
+        )
         trace.step(
             "activate-snapshot",
             input_payload={
@@ -3358,6 +3398,7 @@ def run_state_only_full_reconcile(
             output_payload={
                 "activation": activation,
                 "pending_scope_waiver": pending_scope_waiver,
+                "project_registry": project_registry_activation,
             },
         )
     else:
@@ -3391,6 +3432,7 @@ def run_state_only_full_reconcile(
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
         "snapshot": snapshot,
         "activation": activation,
+        "project_registry_activation": project_registry_activation,
         "pending_scope_waiver": pending_scope_waiver,
     }
 
@@ -4078,6 +4120,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
     )
     notes["semantic_enrichment"] = semantic_enrichment
     activation = None
+    project_registry_activation: dict[str, Any] = {}
     if activate:
         with sqlite_write_lock():
             activation = activate_graph_snapshot(
@@ -4089,6 +4132,12 @@ def _run_incremental_metadata_scope_reconcile_candidate(
                 branch_ref=identity["branch_ref"],
             )
             conn.commit()
+        project_registry_activation = _sync_project_registry_active_snapshot(
+            project_id,
+            sid,
+            node_count=len(nodes),
+            ref_name=identity["ref_name"],
+        )
         trace.step(
             "activate-snapshot",
             input_payload={
@@ -4097,7 +4146,10 @@ def _run_incremental_metadata_scope_reconcile_candidate(
                 "ref_name": identity["ref_name"],
                 "branch_ref": identity["branch_ref"],
             },
-            output_payload={"activation": activation},
+            output_payload={
+                "activation": activation,
+                "project_registry": project_registry_activation,
+            },
         )
     else:
         trace.step(
@@ -4132,6 +4184,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         "feature_cluster_count": governance_index_summary.get("feature_count", 0),
         "snapshot": snapshot,
         "activation": activation,
+        "project_registry_activation": project_registry_activation,
         "incremental_eligibility": eligibility,
     }
 
@@ -4773,10 +4826,19 @@ def run_backfill_escape_hatch(
             evidence={"source": "backfill_escape_hatch"},
         )
         conn.commit()
+    graph_stats = (
+        result.get("graph_stats") if isinstance(result.get("graph_stats"), dict) else {}
+    )
+    project_registry_activation = _sync_project_registry_active_snapshot(
+        project_id,
+        result["snapshot_id"],
+        node_count=int(graph_stats.get("nodes") or 0),
+    )
     return {
         **result,
         "snapshot_status": "active",
         "activation": finalize,
+        "project_registry_activation": project_registry_activation,
         "pending_scope_commits": pending_commits,
         "pending_scope_count": len(pending_commits),
         "pending_scope_waiver": waiver,
