@@ -9920,23 +9920,58 @@ def _qa_graph_context_evidence_shape(
     }
 
 
+_RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS = {
+    "agent/tests/test_contract_runtime.py": (
+        "agent/tests/test_contract_runtime_min_path.py"
+    ),
+}
+
+_RUNTIME_CONTEXT_QA_SOURCE_TEST_HINTS = {
+    "agent/governance/contracts/runtime.py": [
+        "agent/tests/test_contract_runtime_min_path.py",
+    ],
+}
+
+
 def _runtime_context_qa_scoped_verification_plan(
     *,
     target_files: Sequence[str],
 ) -> dict[str, Any]:
-    scoped_files = [
+    raw_scoped_files = [
         str(item).strip()
         for item in target_files
         if str(item or "").strip()
     ]
+    scoped_files = [
+        _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS.get(item, item)
+        for item in raw_scoped_files
+    ]
+    scoped_files = list(dict.fromkeys(scoped_files))
+    replacement_test_files = [
+        _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS[item]
+        for item in raw_scoped_files
+        if item in _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS
+    ]
+    replacement_test_files = list(dict.fromkeys(replacement_test_files))
+    suggested_test_files: list[str] = []
+    for item in scoped_files:
+        current = _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS.get(item)
+        if current:
+            suggested_test_files.append(current)
+        for hinted in _RUNTIME_CONTEXT_QA_SOURCE_TEST_HINTS.get(item, []):
+            suggested_test_files.append(hinted)
+    suggested_test_files = list(dict.fromkeys(suggested_test_files))
     scoped_test_files = [
-        item
+        _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS.get(item, item)
         for item in scoped_files
         if item.startswith("agent/tests/") and item.endswith(".py")
     ]
+    scoped_test_files = list(dict.fromkeys(scoped_test_files))
     focused_targets = (
         scoped_test_files
         if scoped_test_files
+        else suggested_test_files
+        if suggested_test_files
         else ["<focused-test-targets-derived-from-graph-query>"]
     )
     focused_command = (
@@ -9978,6 +10013,8 @@ def _runtime_context_qa_scoped_verification_plan(
         "scope_source": "runtime_context.worker_scope.target_files",
         "target_files": scoped_files,
         "scoped_test_files": scoped_test_files,
+        "suggested_test_files": suggested_test_files,
+        "replacement_test_files": replacement_test_files,
         "focused": {
             "required": True,
             "commands": [focused_command],
@@ -10037,11 +10074,17 @@ def _runtime_context_qa_verification_guide(
     target_files: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
-    qa_target_files = [
+    raw_qa_target_files = [
         str(item).strip()
         for item in (target_files or [])
         if str(item or "").strip()
     ]
+    qa_target_files = list(
+        dict.fromkeys(
+            _RUNTIME_CONTEXT_QA_TEST_FILE_REPLACEMENTS.get(item, item)
+            for item in raw_qa_target_files
+        )
+    )
     safe_route_identity = {
         field: str(route_identity.get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -10075,7 +10118,7 @@ def _runtime_context_qa_verification_guide(
     if route_token_ref:
         issue_qa_route_token_request["parent_route_token_ref"] = route_token_ref
     verification_plan = _runtime_context_qa_scoped_verification_plan(
-        target_files=qa_target_files
+        target_files=raw_qa_target_files
     )
     base_append_body = {
         "backlog_id": backlog_id or parent_task_id,
