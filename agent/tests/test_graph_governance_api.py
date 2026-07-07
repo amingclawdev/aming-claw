@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -19709,6 +19710,189 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
     assert rejoin_without_lineage.value.code == (
         "runtime_context_rejoin_requires_existing_worker_lineage"
     )
+
+
+def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_ref(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-initial-join-renewed"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-runtime-initial-join-renewed",
+            root_task_id="parent-runtime-initial-join-renewed",
+            backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+            stage_task_id="worker-runtime-initial-join-renewed",
+            worker_id="worker-runtime-initial-join-renewed",
+            worker_slot_id="slot-runtime-initial-join-renewed",
+            branch_ref="refs/heads/codex/worker-runtime-initial-join-renewed",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-initial-join-renewed",
+        ),
+    )
+    old_issue = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+        task_id="worker-runtime-initial-join-renewed",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        now=datetime(2026, 7, 7, 18, 0, tzinfo=timezone.utc),
+        evidence_refs=["test:original-route-token-ref"],
+    )
+    old_ref = old_issue["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+        token=old_issue["route_token"],
+    )
+    old_token = old_issue["route_token"]
+    route_identity = {
+        "route_id": old_token["route_id"],
+        "route_context_hash": old_token["route_context_hash"],
+        "prompt_contract_id": old_token["prompt_contract_id"],
+        "prompt_contract_hash": old_token["prompt_contract_hash"],
+        "route_token_ref": old_ref,
+        "visible_injection_manifest_hash": old_token[
+            "visible_injection_manifest_hash"
+        ],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-initial-join-renewed",
+        route_identity=route_identity,
+        payload={"route_identity": route_identity},
+    )
+    fake_ref_identity = {
+        **route_identity,
+        "route_token_ref": "rtok-runtime-initial-join-forged-renewal-marker",
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=fake_ref_identity["route_token_ref"],
+        token={
+            **fake_ref_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": "AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+                "task_id": "worker-runtime-initial-join-renewed",
+            },
+            "target_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                "test:forged-renewal-marker",
+                f"renewed_from:{old_ref}",
+            ],
+        },
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+        backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+        task_id="worker-runtime-initial-join-renewed",
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        now=datetime(2026, 7, 7, 18, 10, tzinfo=timezone.utc),
+        evidence_refs=["test:real-renewal"],
+    )
+    renewed_ref = renewed["route_token_ref"]
+    renewed_identity = {
+        **{
+            field: renewed["route_identity"][field]
+            for field in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+            )
+        },
+        "route_token_ref": renewed_ref,
+    }
+
+    with pytest.raises(GovernanceError) as unrelated_ref:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-initial-join-renewed",
+                    "parent_task_id": "parent-runtime-initial-join-renewed",
+                    "target_project_root": str(target_root),
+                    **fake_ref_identity,
+                    "reason": "host adapter retries with unrelated active ref",
+                },
+            )
+        )
+    assert unrelated_ref.value.code == (
+        "runtime_context_initial_join_route_token_ref_not_renewed_from_active_contract"
+    )
+
+    result = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": "worker-runtime-initial-join-renewed",
+                "parent_task_id": "parent-runtime-initial-join-renewed",
+                "target_project_root": str(target_root),
+                **renewed_identity,
+                "reason": "host adapter needs first worker auth env after observer renewal",
+                "ttl_seconds": 1200,
+                "now_iso": "2026-07-07T18:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_initial_join_issued"
+    assert result["route_identity"] == renewed_identity
+    assert result["route_identity_source"] == "resolved_renewed_route_token_ref"
+    assert result["route_lineage"]["renewed_route_token_ref"] == {
+        "route_token_ref": renewed_identity["route_token_ref"],
+        "renewed_from": route_identity["route_token_ref"],
+        "registry_verified": True,
+        "raw_route_token_exposed": False,
+    }
+    renewal_proof = result["route_lineage"]["route_lineage"]["renewal_proof"]
+    assert renewal_proof["schema_version"] == "route_token_ref_renewal_proof.v1"
+    assert renewal_proof["source"] == "renew_route_token_ref"
+    assert renewal_proof["previous_route_token_ref"] == old_ref
+    assert renewal_proof["route_token_ref"] == renewed_ref
+    host_envelope = result["host_envelope"]
+    assert host_envelope["route_identity"] == renewed_identity
+    assert host_envelope["route_identity_source"] == "resolved_renewed_route_token_ref"
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+        event_kind="observer_command",
+    )
+    initial_join_events = [
+        event
+        for event in events
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_initial_join"
+    ]
+    assert len(initial_join_events) == 1
+    payload = initial_join_events[0]["payload"]
+    assert payload["route_identity"] == renewed_identity
+    assert payload["route_identity_source"] == "resolved_renewed_route_token_ref"
+    assert result["session_token"] not in json.dumps(initial_join_events[0])
 
 
 def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_only_write(

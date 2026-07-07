@@ -14616,6 +14616,180 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
     return resolved_identity, lineage_payload
 
 
+def _runtime_context_initial_join_resolved_ref_route_identity(
+    body: Mapping[str, Any],
+    supplied_route_identity: Mapping[str, Any],
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    context,
+    expected_route_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve renewed route refs before first worker lineage exists."""
+
+    route_token_ref = str(
+        body.get("route_token_ref")
+        or supplied_route_identity.get("route_token_ref")
+        or ""
+    ).strip()
+    expected_ref = str(expected_route_identity.get("route_token_ref") or "").strip()
+    if not route_token_ref or not expected_ref or route_token_ref == expected_ref:
+        return {}, {}
+
+    resolution_body = dict(body)
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(supplied_route_identity.get(field) or "").strip()
+        if supplied and not str(resolution_body.get(field) or "").strip():
+            resolution_body[field] = supplied
+    resolution_body["route_token_ref"] = route_token_ref
+
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _runtime_context_resolve_implementation_route_token_ref(
+            resolution_body,
+            project_id=project_id,
+            context=context,
+        )
+    except _orc.RouteTokenRefError as exc:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_token_ref_invalid",
+            "runtime-context initial join route_token_ref is not active for the runtime route scope",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "route_token_ref_error_code": exc.code,
+                "route_token_ref_error": str(exc),
+                "route_token_ref_details": dict(exc.details or {}),
+                "next_legal_action": (
+                    "issue_or_renew_same_scope_route_token_ref_and_retry_runtime_context_session_token_initial_join"
+                ),
+                "fail_closed": True,
+            },
+        ) from exc
+    if not resolved:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_token_ref_invalid",
+            "runtime-context initial join route_token_ref could not be resolved from the server registry",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "next_legal_action": (
+                    "issue_or_renew_same_scope_route_token_ref_and_retry_runtime_context_session_token_initial_join"
+                ),
+                "fail_closed": True,
+            },
+        )
+
+    route_lineage = (
+        resolved.get("route_lineage") if isinstance(resolved.get("route_lineage"), Mapping)
+        else {}
+    )
+    renewal_proof = (
+        route_lineage.get("renewal_proof")
+        if isinstance(route_lineage, Mapping)
+        and isinstance(route_lineage.get("renewal_proof"), Mapping)
+        else {}
+    )
+    proof_scope = (
+        renewal_proof.get("scope")
+        if isinstance(renewal_proof.get("scope"), Mapping)
+        else {}
+    )
+    proof_errors: list[str] = []
+    if renewal_proof.get("schema_version") != _orc.REF_RENEWAL_PROOF_SCHEMA_VERSION:
+        proof_errors.append("missing_or_invalid_schema_version")
+    if renewal_proof.get("status") != "renewed":
+        proof_errors.append("status_not_renewed")
+    if renewal_proof.get("source") != "renew_route_token_ref":
+        proof_errors.append("source_not_renew_route_token_ref")
+    if str(renewal_proof.get("previous_route_token_ref") or "").strip() != expected_ref:
+        proof_errors.append("previous_route_token_ref_mismatch")
+    if str(renewal_proof.get("route_token_ref") or "").strip() != route_token_ref:
+        proof_errors.append("route_token_ref_mismatch")
+    expected_scope = {
+        "project_id": project_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "task_id": str(getattr(context, "task_id", "") or ""),
+    }
+    for key, expected_value in expected_scope.items():
+        actual_value = str(proof_scope.get(key) or "").strip()
+        if expected_value and actual_value != expected_value:
+            proof_errors.append(f"scope_{key}_mismatch")
+    if proof_errors:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_token_ref_not_renewed_from_active_contract",
+            "runtime-context initial join route_token_ref must carry server-recorded renewal proof for the active runtime contract ref",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_token_ref": route_token_ref,
+                "expected_route_token_ref": expected_ref,
+                "required_registry_proof": "route_lineage.renewal_proof",
+                "renewal_proof_errors": proof_errors,
+                "registry_verified": True,
+                "fail_closed": True,
+            },
+        )
+
+    resolved_identity, lineage_payload = (
+        _runtime_context_implementation_resolved_ref_route_identity(
+            resolved,
+            route_token_ref=route_token_ref,
+            runtime_context_id=runtime_context_id,
+            context=context,
+            parent_route_identity=expected_route_identity,
+        )
+    )
+    if route_lineage:
+        lineage_payload = dict(lineage_payload)
+        lineage_payload.setdefault("route_lineage", dict(route_lineage))
+    supplied_mismatches = []
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        supplied = str(supplied_route_identity.get(field) or "").strip()
+        if not supplied:
+            continue
+        authoritative = str(resolved_identity.get(field) or "").strip()
+        if authoritative and supplied != authoritative:
+            supplied_mismatches.append(
+                {
+                    "field": field,
+                    "expected": authoritative,
+                    "actual": supplied,
+                }
+            )
+    if supplied_mismatches:
+        raise GovernanceError(
+            "runtime_context_initial_join_route_identity_mismatch",
+            "runtime-context initial join supplied route identity does not match the resolved renewed route token ref",
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": getattr(context, "task_id", ""),
+                "route_identity_mismatch_fields": supplied_mismatches,
+                "next_legal_action": (
+                    "retry_runtime_context_session_token_initial_join_with_resolved_route_identity"
+                ),
+                "fail_closed": True,
+            },
+        )
+
+    lineage_payload = dict(lineage_payload)
+    lineage_payload["_runtime_context_initial_join_route_ref_resolved"] = True
+    lineage_payload["renewed_route_token_ref"] = {
+        "route_token_ref": route_token_ref,
+        "renewed_from": expected_ref,
+        "registry_verified": True,
+        "raw_route_token_exposed": False,
+    }
+    return resolved_identity, lineage_payload
+
+
 def _runtime_context_timeline_route_gate(
     *,
     project_id: str,
@@ -15978,10 +16152,21 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         supplied_route_identity = dict(
             _runtime_context_request_route_identity_shapes(ctx).get("supplied") or {}
         )
+        initial_join_route_lineage_payload: dict[str, Any] = {}
+        resolved_route_identity, initial_join_route_lineage_payload = (
+            _runtime_context_initial_join_resolved_ref_route_identity(
+                body,
+                supplied_route_identity,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                expected_route_identity=expected_route_identity,
+            )
+        )
         if expected_route_identity and any(
             str(supplied_route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        ):
+        ) and not resolved_route_identity:
             mismatches = _runtime_context_route_identity_mismatch_fields(
                 expected_route_identity,
                 supplied_route_identity,
@@ -16046,16 +16231,29 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 },
             ) from exc
 
+        selected_route_identity = (
+            resolved_route_identity if resolved_route_identity else expected_route_identity
+        )
         safe_route_identity = {
-            field: str(expected_route_identity.get(field) or "").strip()
+            field: str(selected_route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-            if str(expected_route_identity.get(field) or "").strip()
+            if str(selected_route_identity.get(field) or "").strip()
         }
         if safe_route_identity:
             result["route_identity"] = dict(safe_route_identity)
+            if initial_join_route_lineage_payload:
+                result["route_lineage"] = dict(initial_join_route_lineage_payload)
+                result["route_identity_source"] = "resolved_renewed_route_token_ref"
             host_envelope = result.get("host_envelope")
             if isinstance(host_envelope, dict):
                 host_envelope["route_identity"] = dict(safe_route_identity)
+                if initial_join_route_lineage_payload:
+                    host_envelope["route_lineage"] = dict(
+                        initial_join_route_lineage_payload
+                    )
+                    host_envelope["route_identity_source"] = (
+                        "resolved_renewed_route_token_ref"
+                    )
                 result["host_envelope"] = host_envelope
         audit_payload = {
             key: value

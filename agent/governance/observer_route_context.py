@@ -979,6 +979,7 @@ def issue_observer_write_route_context(
 
 REF_REGISTRY_SCHEMA_VERSION = "route_token_ref_registry.v1"
 REF_RENEWAL_SCHEMA_VERSION = "route_token_ref_renewal.v1"
+REF_RENEWAL_PROOF_SCHEMA_VERSION = "route_token_ref_renewal_proof.v1"
 REF_EXPIRY_STATUS_SCHEMA_VERSION = "route_token_ref_expiry_status.v1"
 REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_renewal_next_action.v1"
 REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_same_scope_issue_next_action.v1"
@@ -2543,6 +2544,46 @@ def renew_route_token_ref(
                 details={"route_token_ref": old_ref},
             )
         token["owned_files"] = list(renewed_owned_files)
+        previous_route_identity = {
+            "route_id": _string(row_dict.get("route_id")),
+            "route_context_hash": _string(row_dict.get("route_context_hash")),
+            "prompt_contract_id": _string(row_dict.get("prompt_contract_id")),
+            "prompt_contract_hash": _string(row_dict.get("prompt_contract_hash")),
+            "visible_injection_manifest_hash": _string(
+                row_dict.get("visible_injection_manifest_hash")
+            ),
+            "route_token_ref": old_ref,
+        }
+        renewed_route_identity = {
+            "route_id": _string(token.get("route_id")),
+            "route_context_hash": _string(token.get("route_context_hash")),
+            "prompt_contract_id": _string(token.get("prompt_contract_id")),
+            "prompt_contract_hash": _string(token.get("prompt_contract_hash")),
+            "visible_injection_manifest_hash": _string(
+                token.get("visible_injection_manifest_hash")
+            ),
+            "route_token_ref": new_ref,
+        }
+        route_lineage = _public_mapping(token.get("route_lineage"))
+        route_lineage.setdefault("schema_version", ROUTE_LINEAGE_SCHEMA_VERSION)
+        route_lineage["route_token_ref_renewed"] = True
+        route_lineage["renewal_proof"] = {
+            "schema_version": REF_RENEWAL_PROOF_SCHEMA_VERSION,
+            "status": "renewed",
+            "source": "renew_route_token_ref",
+            "previous_route_token_ref": old_ref,
+            "route_token_ref": new_ref,
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": stored_backlog,
+                "task_id": stored_task,
+            },
+            "previous_route_identity": previous_route_identity,
+            "route_identity": renewed_route_identity,
+            "raw_route_token_persisted": False,
+            "raw_session_token_persisted": False,
+        }
+        token["route_lineage"] = route_lineage
         persist_route_token_ref(
             conn,
             project_id=project_id,
