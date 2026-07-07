@@ -7811,10 +7811,22 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     assert finish_attestation_submission["action"] == (
         "record_finish_time_worker_attestation"
     )
+    assert finish_attestation_submission["body_source"] == "copy_safe_body"
+    assert finish_attestation_submission["copy_rule"].startswith(
+        "POST exactly copy_safe_body"
+    )
+    assert finish_attestation_submission["required_literal_fields"] == {
+        "harness_type": "codex",
+    }
     assert finish_attestation_submission["missing_required_fields"] == []
+    assert finish_attestation_submission["copy_safe_body"]["harness_type"] == "codex"
     assert finish_attestation_submission["body"]["observer_command_id"] == (
         "cmd-facade"
     )
+    assert finish_attestation_submission["body"]["harness_type"] == "codex"
+    assert "copy_safe_body" in finish_attestation_submission["reminders"][
+        "do_not_hand_build_body"
+    ]
     assert finish_attestation_submission["body"]["test_results"] == {
         "status": "passed",
         "passed": True,
@@ -7943,6 +7955,23 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
                 "mf_sub",
                 method="POST",
                 body={**finish_attestation_body, "attestation_phase": "startup"},
+            )
+        )
+    missing_harness_body = {
+        key: value
+        for key, value in finish_attestation_body.items()
+        if key != "harness_type"
+    }
+    with pytest.raises(ValidationError, match="harness_type=codex"):
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=missing_harness_body,
             )
         )
     with pytest.raises(GovernanceError) as stale_fence_exc:

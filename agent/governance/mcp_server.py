@@ -400,7 +400,15 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "filer_principal": {"type": "string"},
             "worker_transcript_ref": {"type": "string"},
             "worker_transcript_path": {"type": "string"},
-            "harness_type": {"type": "string"},
+            "harness_type": {
+                "type": "string",
+                "description": (
+                    "Worker harness type. Required for "
+                    "runtime_context_finish_time_worker_attestation; use 'codex' "
+                    "for Codex app/CLI workers and copy it from the worker guide "
+                    "copy_safe_body instead of hand-building the body."
+                ),
+            },
             "launch_text_hash": {"type": "string"},
             "receipt_hash": {"type": "string"},
             "context_hash": {"type": "string"},
@@ -1906,11 +1914,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_finish_time_worker_attestation",
-        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Must run before the worker git commit; runtime-context lanes block if the assigned row head already moved and no committed-branch evidence lane exists.",
+        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Must run before the worker git commit; runtime-context lanes block if the assigned row head already moved and no committed-branch evidence lane exists. Requires harness_type; Codex workers must send harness_type='codex' from the worker-guide copy_safe_body.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
-            "required": ["project_id", "runtime_context_id"],
+            "required": ["project_id", "runtime_context_id", "harness_type"],
         },
     },
     {

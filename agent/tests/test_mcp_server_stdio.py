@@ -106,6 +106,23 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     }.issubset(names)
 
 
+def test_runtime_context_finish_time_worker_attestation_schema_requires_harness_type():
+    finish_attestation = next(
+        tool
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "runtime_context_finish_time_worker_attestation"
+    )
+    schema = finish_attestation["inputSchema"]
+    assert {"project_id", "runtime_context_id", "harness_type"}.issubset(
+        schema["required"]
+    )
+    harness_type = schema["properties"]["harness_type"]
+    assert "Required for runtime_context_finish_time_worker_attestation" in (
+        harness_type["description"]
+    )
+    assert "copy_safe_body" in harness_type["description"]
+
+
 def test_observer_hotfix_enter_schemas_require_backlog_scope():
     for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
         hotfix_enter = next(
