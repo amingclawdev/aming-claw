@@ -4,6 +4,7 @@ import type {
   DemoEnvironment,
   DemoEnvironmentCreateResponse,
   DemoEnvironmentsResponse,
+  DemoLaunchPrompt,
   DemoTemplate,
 } from "../lib/api";
 
@@ -59,6 +60,19 @@ export function demoEnvironmentLinks(env: DemoEnvironment): DemoEnvironmentLink[
     { key: "planner", label: "Planner preview", href: env.planner_preview_url },
   ];
   return links.filter((link) => Boolean(link.href));
+}
+
+export function demoLaunchPrompts(env: DemoEnvironment): DemoLaunchPrompt[] {
+  const prompts = (env.launch_prompts ?? []).filter((prompt) => prompt.prompt.trim());
+  if (prompts.length) return prompts;
+  if (env.launch_prompt.trim()) {
+    return [{
+      id: "legacy",
+      label: "Launch prompt",
+      prompt: env.launch_prompt,
+    }];
+  }
+  return [];
 }
 
 export function demoEnvironmentStatus(env: DemoEnvironment): {
@@ -136,7 +150,7 @@ export default function DemoLaunchView({ projectId }: Props) {
   const [actionError, setActionError] = useState("");
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState("");
-  const [copiedId, setCopiedId] = useState("");
+  const [copiedPromptKey, setCopiedPromptKey] = useState("");
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -201,12 +215,13 @@ export default function DemoLaunchView({ projectId }: Props) {
     }
   }, [projectId, template]);
 
-  const copyPrompt = useCallback(async (env: DemoEnvironment) => {
+  const copyPrompt = useCallback(async (env: DemoEnvironment, prompt: DemoLaunchPrompt) => {
     setActionError("");
+    const promptKey = `${env.id}:${prompt.id}`;
     try {
-      await copyText(env.launch_prompt);
-      setCopiedId(env.id);
-      window.setTimeout(() => setCopiedId((current) => (current === env.id ? "" : current)), 1800);
+      await copyText(prompt.prompt);
+      setCopiedPromptKey(promptKey);
+      window.setTimeout(() => setCopiedPromptKey((current) => (current === promptKey ? "" : current)), 1800);
     } catch (error) {
       setActionError(demoErrorMessage(error));
     }
@@ -283,7 +298,7 @@ export default function DemoLaunchView({ projectId }: Props) {
                 key={env.id}
                 env={env}
                 deleting={deletingId === env.id}
-                copied={copiedId === env.id}
+                copiedPromptKey={copiedPromptKey}
                 onCopyPrompt={copyPrompt}
                 onDelete={deleteEnvironment}
               />
@@ -298,13 +313,14 @@ export default function DemoLaunchView({ projectId }: Props) {
 function DemoEnvironmentCard(props: {
   env: DemoEnvironment;
   deleting: boolean;
-  copied: boolean;
-  onCopyPrompt(env: DemoEnvironment): void;
+  copiedPromptKey: string;
+  onCopyPrompt(env: DemoEnvironment, prompt: DemoLaunchPrompt): void;
   onDelete(env: DemoEnvironment): void;
 }) {
-  const { env, deleting, copied } = props;
+  const { env, deleting } = props;
   const status = demoEnvironmentStatus(env);
   const links = demoEnvironmentLinks(env);
+  const prompts = demoLaunchPrompts(env);
   const createdAt = formatDateTime(env.created_at);
 
   return (
@@ -362,20 +378,32 @@ function DemoEnvironmentCard(props: {
           <div className="demo-code-head">Preview command</div>
           <code className="demo-command-line">{env.planner_preview_command || "No preview command"}</code>
         </section>
-        <section className="demo-code-panel demo-prompt-panel">
-          <div className="demo-code-head">
-            <span>Launch prompt</span>
-            <button
-              type="button"
-              className="action-btn"
-              onClick={() => props.onCopyPrompt(env)}
-              disabled={!env.launch_prompt}
-            >
-              {copied ? "Copied" : "Copy"}
-            </button>
-          </div>
-          <pre className="demo-prompt-block"><code>{env.launch_prompt || "No launch prompt"}</code></pre>
-        </section>
+        {prompts.length ? prompts.map((prompt) => {
+          const promptKey = `${env.id}:${prompt.id}`;
+          const copied = props.copiedPromptKey === promptKey;
+          return (
+            <section key={prompt.id} className="demo-code-panel demo-prompt-panel">
+              <div className="demo-code-head">
+                <span>{prompt.label || "Launch prompt"}</span>
+                <button
+                  type="button"
+                  className="action-btn"
+                  onClick={() => props.onCopyPrompt(env, prompt)}
+                  disabled={!prompt.prompt}
+                >
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              {prompt.description ? <p className="demo-prompt-description">{prompt.description}</p> : null}
+              <pre className="demo-prompt-block"><code>{prompt.prompt}</code></pre>
+            </section>
+          );
+        }) : (
+          <section className="demo-code-panel demo-prompt-panel">
+            <div className="demo-code-head">Launch prompt</div>
+            <pre className="demo-prompt-block"><code>No launch prompt</code></pre>
+          </section>
+        )}
       </div>
     </article>
   );

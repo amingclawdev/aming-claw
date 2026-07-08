@@ -1855,7 +1855,7 @@ def _demo_dashboard_url(target_project_id: str, view: str) -> str:
     )
 
 
-def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
+def _demo_launch_prompt_target_lines(environment: Mapping[str, Any]) -> list[str]:
     project_id = str(environment.get("project_id") or "")
     fixture_root = str(environment.get("fixture_root") or "")
     baseline_commit = str(environment.get("baseline_commit") or "")
@@ -1865,9 +1865,7 @@ def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
     graph_url = str(environment.get("graph_url") or "")
     planner_preview_url = str(environment.get("planner_preview_url") or "")
     planner_preview_command = str(environment.get("planner_preview_command") or "")
-    return "\n".join([
-        "Run the Aming Claw Daily Planner Lite visual happy-path demo from start to finish.",
-        "",
+    return [
         "Target project:",
         f"project_id: {project_id}",
         f"fixture_root: {fixture_root}",
@@ -1878,16 +1876,29 @@ def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
         f"graph_url: {graph_url}",
         f"planner_preview_url: {planner_preview_url}",
         f"planner_preview_command: {planner_preview_command}",
+    ]
+
+
+def _demo_launch_prompt_common_lines() -> list[str]:
+    return [
         "",
         "Intent:",
         "Implement one concrete user-facing requirement in this fixture, not just the setup flow:",
         "Today Focus and reminder visual planner board.",
         "",
-        "Parallel implementation shape:",
-        "Create exactly one backlog row for that requirement, then use bounded mf_sub worker lanes where safe:",
-        "- Focus/UI lane: src/app.js, index.html, styles.css, tests/planner.test.mjs",
-        "- Reminder/domain lane: src/reminders.js, tests/reminders.test.mjs",
-        "- If shared-file or dependency conflicts appear, record the observer decision and keep the row single-scope.",
+        "Mandatory Aming Claw entry:",
+        "1. Start through onboard_route_guide; archived skills or pasted memory are not authority.",
+        "2. Check runtime_status, graph_status, and graph_operations_queue for the target project before implementation work.",
+        "3. Use the dashboard, graph, backlog, and timeline URLs above as the source of truth.",
+        "4. Before every protected write, re-read the latest gate, runtime context, or onboard response.",
+        "5. If a gate rejects an action, follow its next legal action or stop and report the blocker; do not invent bridge evidence.",
+        "",
+        "Graph-first rule:",
+        "1. The observer scopes by running rg first to locate exact fixture files/symbols, then graph_query with allowed purpose prompt_context_build or backlog_filing.",
+        "2. Query exact symbols/files through function_index, function_callers, function_callees, find_node_by_path, and get_tests where available.",
+        "3. Preserve graph query trace ids in observer evidence before dispatch or mutation.",
+        "4. Each worker must repeat graph_query with its runtime identity before implementation evidence.",
+        "5. Independent QA must repeat graph_query with query_source=qa and query_purpose=independent_verification before verdict.",
         "",
         "Visible demo impact:",
         "- The first screen shows a prominent Today Focus area above the normal task list.",
@@ -1897,34 +1908,105 @@ def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
         "- Each task has a visible reminder toggle; reminders default off.",
         "- The page should look clearly different after implementation, not just pass tests.",
         "",
-        "Governance source of truth:",
-        "1. Load Aming Claw current context and MF SOP before acting.",
-        "2. Check runtime_status, graph_status, and graph_operations_queue for the target project.",
-        "3. Use the dashboard, graph, backlog, and timeline URLs above as the source of truth.",
-        "4. Treat fixture setup as setup evidence only; do not claim worker completion from it.",
-        "",
-        "Look then act:",
-        "1. Before every protected write, read the latest gate or runtime-context response.",
-        "2. If a gate rejects an action, treat its returned next legal action as the next step.",
-        "3. Do not re-shape evidence, add bridges, or retry close until the rejection reason is understood.",
-        "4. If observer_command status is failed, report the demo as blocked or non-clean; do not call it clean FIXED.",
-        "",
         "Worker and QA evidence:",
-        "1. Each mf_sub worker must read runtime_context_worker_guide and follow its next legal action.",
-        "2. The normal worker sequence is guide -> read receipt -> real startup -> implementation -> finish gate.",
-        "3. Keep startup and implementation in the same live worker session. If a startup-only worker exits, spawn a fresh implementation worker and record fresh read/startup evidence; do not use send_input on a completed startup worker as the implementation path.",
-        "4. Before worker implementation evidence, verify the live worker has the raw host envelope env values AMING_WORKER_SESSION_TOKEN and AMING_WORKER_FENCE_TOKEN. If they are missing after startup, request the runtime-context rejoin host envelope and inject it into the real mf_sub worker before protected writes.",
-        "5. Run independent QA from a distinct verifier lane/session where possible.",
-        "6. Observer-authored visual smoke may be useful evidence, but do not present it as independent QA.",
-        "",
-        "Demo work:",
-        "Do not stop after planning. Run the full governed happy path unless a real governance gate returns a blocker.",
+        "1. Worker evidence belongs to the worker, not the observer.",
+        "2. A bounded mf_sub worker must read runtime_context_worker_guide, submit read receipt, prove startup, query graph, implement, run tests, and submit implementation/finish evidence from the same live worker session.",
+        "3. If worker raw host envelope env values are missing, use the runtime-context rejoin host envelope flow; never paste or persist raw session/fence tokens.",
+        "4. Run independent QA from a distinct verifier lane/session where possible.",
+        "5. Observer-authored visual smoke may supplement evidence, but do not present it as independent QA.",
         "",
         "Tests and visual smoke:",
         "Run the planner tests plus a dashboard or browser visual smoke against the preview URL before reporting done.",
         "",
         "Evidence summary:",
-        "Return a compact summary with backlog id, changed files, tests, visual smoke result, commit, reconcile/graph status, and any risks.",
+        "After the round, summarize the path, backlog id(s), graph trace ids by role, changed files, tests, visual smoke result, commit, reconcile/graph status, and friction.",
+    ]
+
+
+def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str, str]]:
+    target_lines = _demo_launch_prompt_target_lines(environment)
+    common_lines = _demo_launch_prompt_common_lines()
+    variants = [
+        {
+            "id": "direct_main",
+            "label": "Direct Main",
+            "description": "Observer-supervised direct_main path for one tiny deterministic planner change.",
+            "path_lines": [
+                "Path-specific route:",
+                "Use operator_supervised_direct_main for a tiny deterministic implementation.",
+                "Create or select exactly one backlog row for the planner requirement, then call onboard_route_guide with work_type=operator_supervised_direct_main.",
+                "The observer must run rg and graph_query before mutation, record observer_direct_implementation_exception evidence with DB-verified graph trace ids, and edit only approved row-scoped files.",
+                "Do not write mf_sub implementation evidence in this path. Use independent QA/verifier evidence before merge, reconcile, or close.",
+                "If direct_main guide or close gate demands worker-owned evidence, stop and report that route friction instead of backfilling fake worker evidence.",
+            ],
+        },
+        {
+            "id": "mf_parallel",
+            "label": "MF Parallel",
+            "description": "Single-backlog mf_parallel path with bounded worker lane(s).",
+            "path_lines": [
+                "Path-specific route:",
+                "Use mf_parallel for exactly one backlog row covering the Today Focus and reminder visual planner board.",
+                "",
+                "Parallel implementation shape:",
+                "Create exactly one backlog row for that requirement, then use bounded mf_sub worker lanes where safe:",
+                "- Focus/UI lane: src/app.js, index.html, styles.css, tests/planner.test.mjs",
+                "- Reminder/domain lane: src/reminders.js, tests/reminders.test.mjs",
+                "- If shared-file or dependency conflicts appear, record the observer decision and keep the row single-scope.",
+                "",
+                "Observer starts the mf_parallel contract through onboard_route_guide/mf_parallel_enter, scopes with rg + graph, dispatches the bounded worker, then waits for worker-owned read/startup/graph/implementation/finish evidence.",
+                "Use the merge materialize/apply route exactly as the current guide states. If token scope, merge queue, or finish gate rejects, stop and summarize friction.",
+            ],
+        },
+        {
+            "id": "mf_batch_parallel",
+            "label": "MF Batch Parallel",
+            "description": "Two-backlog mf_batch_parallel path proving row-scoped fanout and serial merge.",
+            "path_lines": [
+                "Path-specific route:",
+                "Use mf_batch_parallel for two compatible backlog rows, then let the batch fan out into row-scoped mf_parallel successors.",
+                "",
+                "Batch rows:",
+                "- Row A: Today Focus area, default focused demo task, and focused-task sorting.",
+                "- Row B: per-task reminder toggle defaulting off and reminder tests.",
+                "",
+                "The batch observer must run rg + graph before selecting row scopes. Each row observer/worker repeats graph queries with its own identity before implementation.",
+                "Land row commits through the batch merge queue in the order returned by runtime guidance; do not bypass merge materialize/apply when gates are healthy.",
+                "If a shared test file or merge queue mismatch appears, record the batch friction and stop rather than silently converting the work into a single-row or direct_main flow.",
+            ],
+        },
+    ]
+    prompts: list[dict[str, str]] = []
+    for variant in variants:
+        lines = [
+            f"Run the Aming Claw Daily Planner Lite {variant['label']} happy-path demo from start to finish.",
+            "",
+            *target_lines,
+            "",
+            *variant["path_lines"],
+            *common_lines,
+            "",
+            "Demo work:",
+            "Do not stop after planning. Run the full governed happy path unless a real governance gate returns a blocker.",
+        ]
+        prompts.append({
+            "id": str(variant["id"]),
+            "label": str(variant["label"]),
+            "description": str(variant["description"]),
+            "prompt": "\n".join(lines),
+        })
+    return prompts
+
+
+def _build_demo_launch_prompt(environment: Mapping[str, Any]) -> str:
+    prompts = _build_demo_launch_prompts(environment)
+    for prompt in prompts:
+        if prompt.get("id") == "mf_parallel":
+            return str(prompt.get("prompt") or "")
+    return "\n".join([
+        "Run the Aming Claw Daily Planner Lite visual happy-path demo from start to finish.",
+        "",
+        *_demo_launch_prompt_target_lines(environment),
     ])
 
 
@@ -2033,6 +2115,7 @@ def _demo_environment_from_fixture(
         "planner_preview_command": str(fixture_result.get("planner_preview_command") or ""),
         "status": "ready",
     }
+    environment["launch_prompts"] = _build_demo_launch_prompts(environment)
     environment["launch_prompt"] = _build_demo_launch_prompt(environment)
     return environment
 
@@ -2044,6 +2127,7 @@ def _visible_demo_environments(project_id: str) -> list[dict[str, Any]]:
         if ok:
             environment = dict(row)
             environment["status"] = environment.get("status") or "ready"
+            environment["launch_prompts"] = _build_demo_launch_prompts(environment)
             environment["launch_prompt"] = _build_demo_launch_prompt(environment)
             visible.append(environment)
     visible.sort(key=_demo_environment_sort_key, reverse=True)

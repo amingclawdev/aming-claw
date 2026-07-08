@@ -1090,6 +1090,16 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert environment["planner_preview_url"] == "http://127.0.0.1:4173/"
     assert observed["preview_port"] == 4173
     prompt = environment["launch_prompt"]
+    launch_prompts = {
+        item["id"]: item["prompt"]
+        for item in environment["launch_prompts"]
+    }
+    assert set(launch_prompts) == {
+        "direct_main",
+        "mf_parallel",
+        "mf_batch_parallel",
+    }
+    assert prompt == launch_prompts["mf_parallel"]
     assert prompt.count("Create exactly one backlog row") == 1
     assert "Intent:" in prompt
     assert "Today Focus and reminder visual planner board" in prompt
@@ -1097,13 +1107,26 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert "Focus/UI lane" in prompt
     assert "Reminder/domain lane" in prompt
     assert "Do not stop after planning" in prompt
-    assert "project_id: " in prompt
-    assert "runtime_status" in prompt
-    assert "graph_status" in prompt
-    assert "graph_operations_queue" in prompt
-    assert "Look then act:" in prompt
-    assert "next legal action" in prompt
-    assert "observer_command status is failed" in prompt
+    for path_prompt in launch_prompts.values():
+        assert "project_id: " in path_prompt
+        assert "onboard_route_guide" in path_prompt
+        assert "runtime_status" in path_prompt
+        assert "graph_status" in path_prompt
+        assert "graph_operations_queue" in path_prompt
+        assert "rg first" in path_prompt
+        assert "function_index" in path_prompt
+        assert "function_callers" in path_prompt
+        assert "function_callees" in path_prompt
+        assert "query_source=qa" in path_prompt
+        assert "Do not stop after planning" in path_prompt
+        assert "friction" in path_prompt
+    assert "operator_supervised_direct_main" in launch_prompts["direct_main"]
+    assert "observer_direct_implementation_exception" in launch_prompts["direct_main"]
+    assert "mf_parallel" in launch_prompts["mf_parallel"]
+    assert "runtime_context_worker_guide" in launch_prompts["mf_parallel"]
+    assert "mf_batch_parallel" in launch_prompts["mf_batch_parallel"]
+    assert "Row A: Today Focus" in launch_prompts["mf_batch_parallel"]
+    assert "Row B: per-task reminder toggle" in launch_prompts["mf_batch_parallel"]
     assert "runtime_context_worker_guide" in prompt
     assert "distinct verifier lane/session" in prompt
     assert "Observer-authored visual smoke" in prompt

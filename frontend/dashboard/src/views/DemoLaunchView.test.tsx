@@ -4,6 +4,7 @@ import {
   dailyPlannerTemplateFrom,
   demoEnvironmentLinks,
   demoEnvironmentStatus,
+  demoLaunchPrompts,
   environmentFromCreateResponse,
   shortCommit,
 } from "./DemoLaunchView";
@@ -34,6 +35,41 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
     "- Focus/UI lane: src/app.js, index.html, styles.css, tests/planner.test.mjs",
     "- Reminder/domain lane: src/reminders.js, tests/reminders.test.mjs",
   ].join("\n"),
+  launch_prompts: [
+    {
+      id: "direct_main",
+      label: "Direct Main",
+      description: "Observer-supervised direct_main path.",
+      prompt: [
+        "Run the Aming Claw Daily Planner Lite Direct Main happy-path demo from start to finish.",
+        "Use operator_supervised_direct_main for a tiny deterministic implementation.",
+        "Start through onboard_route_guide and run rg then graph_query.",
+      ].join("\n"),
+    },
+    {
+      id: "mf_parallel",
+      label: "MF Parallel",
+      description: "Single-backlog mf_parallel path.",
+      prompt: [
+        "Run the Aming Claw Daily Planner Lite MF Parallel happy-path demo from start to finish.",
+        "Use mf_parallel for exactly one backlog row.",
+        "Parallel implementation shape:",
+        "Focus/UI lane",
+        "Reminder/domain lane",
+      ].join("\n"),
+    },
+    {
+      id: "mf_batch_parallel",
+      label: "MF Batch Parallel",
+      description: "Two-backlog mf_batch_parallel path.",
+      prompt: [
+        "Run the Aming Claw Daily Planner Lite MF Batch Parallel happy-path demo from start to finish.",
+        "Use mf_batch_parallel for two compatible backlog rows.",
+        "Row A: Today Focus",
+        "Row B: reminder toggle",
+      ].join("\n"),
+    },
+  ],
   status: "ready",
 };
 
@@ -55,6 +91,7 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   const template = dailyPlannerTemplateFrom(demoLaunchFixtureResponse.templates);
   const created = environmentFromCreateResponse(demoLaunchFixtureEnvironment);
   const links = demoEnvironmentLinks(created);
+  const prompts = demoLaunchPrompts(created);
   const status = demoEnvironmentStatus(created);
   const shortBaseline = shortCommit(created.baseline_commit);
 
@@ -68,6 +105,10 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!created.launch_prompt.includes("Parallel implementation shape:")) throw new Error("launch prompt must require parallel implementation shape");
   if (!created.launch_prompt.includes("Focus/UI lane")) throw new Error("launch prompt must name the Focus/UI lane");
   if (!created.launch_prompt.includes("Reminder/domain lane")) throw new Error("launch prompt must name the Reminder/domain lane");
+  if (prompts.length !== 3) throw new Error("daily planner demo should surface three launch prompts");
+  if (!prompts.some((prompt) => prompt.id === "direct_main" && prompt.prompt.includes("operator_supervised_direct_main"))) throw new Error("direct_main prompt must be available");
+  if (!prompts.some((prompt) => prompt.id === "mf_parallel" && prompt.prompt.includes("mf_parallel"))) throw new Error("mf_parallel prompt must be available");
+  if (!prompts.some((prompt) => prompt.id === "mf_batch_parallel" && prompt.prompt.includes("mf_batch_parallel"))) throw new Error("mf_batch_parallel prompt must be available");
 
   return links.map((link) => link.label);
 }

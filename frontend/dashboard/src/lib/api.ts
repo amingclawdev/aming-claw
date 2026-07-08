@@ -1054,6 +1054,13 @@ export interface DemoTemplate {
   status?: string;
 }
 
+export interface DemoLaunchPrompt {
+  id: string;
+  label: string;
+  description?: string;
+  prompt: string;
+}
+
 export interface DemoEnvironment {
   id: string;
   template_id: string;
@@ -1069,6 +1076,7 @@ export interface DemoEnvironment {
   planner_preview_url: string;
   planner_preview_command: string;
   launch_prompt: string;
+  launch_prompts?: DemoLaunchPrompt[];
   status?: string;
   error?: string;
 }
