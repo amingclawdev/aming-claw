@@ -867,6 +867,9 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     assert properties["route_identity"]["type"] == "object"
     assert properties["canonical_route_identity"]["type"] == "object"
     assert properties["parent_route_identity"]["type"] == "object"
+    assert "runtime_context.current_values.merge_queue_id" in properties[
+        "merge_queue_id"
+    ]["description"]
     assert properties["route_token_ref"]["type"] == "string"
     assert (
         properties["route_token_ref"]["description"]

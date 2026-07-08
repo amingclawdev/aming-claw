@@ -7266,6 +7266,144 @@ def test_parallel_branch_allocate_handler_persists_requested_file_scope(monkeypa
     assert persisted.target_files == tuple(target_files)
 
 
+def test_parallel_branch_allocate_handler_generates_missing_merge_queue_id(monkeypatch) -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    dispatch_calls: list[dict] = []
+
+    class NoCloseConnection:
+        def __init__(self, wrapped: sqlite3.Connection):
+            self._wrapped = wrapped
+
+        def close(self) -> None:
+            pass
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+    monkeypatch.setattr(
+        server_module,
+        "get_connection",
+        lambda project_id: NoCloseConnection(conn),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_require_graph_governance_operator",
+        lambda ctx, conn, action: None,
+    )
+
+    def _record_dispatch(*args, **kwargs):
+        dispatch_calls.append(dict(kwargs["body"]))
+        return {"ok": True, "event_id": "evt-dispatch-generated-mq"}
+
+    monkeypatch.setattr(
+        server_module,
+        "_record_bounded_worker_dispatch_event",
+        _record_dispatch,
+    )
+
+    ctx = server_module.RequestContext(
+        handler=None,
+        method="POST",
+        path_params={"project_id": PROJECT_ID},
+        query={},
+        body={
+            "task_id": "mf-handler-generated-mq",
+            "workspace_root": "/repo",
+            "backlog_id": "AC-GENERATE-MERGE-QUEUE-ID",
+            "parent_task_id": "cex-generated-parent",
+            "root_task_id": "cex-generated-root",
+            "stage_task_id": "mf-handler-generated-mq",
+            "worker_id": "worker-generated-mq",
+            "agent_id": "observer",
+            "owned_files": ["agent/governance/server.py"],
+            "target_files": ["agent/governance/server.py"],
+            "base_commit": "base-generated",
+            "target_head_commit": "target-generated",
+            "fence_token": "fence-generated",
+            "create_worktree": False,
+            "issue_same_owner_session_token": False,
+            "now_iso": NOW,
+        },
+        request_id="req-handler-generated-mq",
+        token="",
+        idem_key="",
+    )
+
+    status, response = server_module.handle_graph_governance_parallel_branch_allocate(ctx)
+
+    assert status == 201
+    generated_mq = response["merge_queue_id"]
+    assert generated_mq.startswith("mq-")
+    assert response["merge_queue_id_source"] == "allocation_identity"
+    assert response["context"]["merge_queue_id"] == generated_mq
+    assert response["branch_runtime_evidence"]["merge_queue_id"] == generated_mq
+    assert dispatch_calls[0]["merge_queue_id"] == generated_mq
+    assert dispatch_calls[0]["merge_queue_id_source"] == "allocation_identity"
+
+    persisted = get_branch_context(conn, PROJECT_ID, "mf-handler-generated-mq")
+    assert persisted is not None
+    assert persisted.merge_queue_id == generated_mq
+
+    from dataclasses import replace as _replace
+
+    ready_context = _replace(
+        persisted,
+        status=STATE_WORKTREE_READY,
+        session_token_hash=mf_subagent_session_token_hash("session-generated"),
+    )
+    upsert_branch_context(conn, ready_context, now_iso=NOW)
+    route_identity = {
+        "route_id": "route-generated-mq",
+        "route_context_hash": "sha256:route-generated-mq",
+        "prompt_contract_id": "rprompt-generated-mq",
+        "prompt_contract_hash": "sha256:prompt-generated-mq",
+        "route_token_ref": "rtok-generated-mq",
+        "visible_injection_manifest_hash": "sha256:visible-generated-mq",
+    }
+    append_branch_contract_revision(
+        conn,
+        ready_context,
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+
+    startup = record_mf_subagent_startup(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="mf-handler-generated-mq",
+        payload={
+            "task_id": "mf-handler-generated-mq",
+            "parent_task_id": "cex-generated-parent",
+            "worker_role": "mf_sub",
+            "worker_id": "worker-generated-mq",
+            "worker_slot_id": "worker-generated-mq",
+            "actual_host_worker_id": "worker-generated-mq",
+            "agent_id": "observer",
+            "session_token": "session-generated",
+            "runtime_context_id": ready_context.runtime_context_id,
+            "fence_token": "fence-generated",
+            "actual_cwd": ready_context.worktree_path,
+            "actual_git_root": ready_context.worktree_path,
+            "branch": ready_context.branch_ref,
+            "head_commit": "target-generated",
+            "base_commit": "base-generated",
+            "target_head_commit": "target-generated",
+            "merge_queue_id": generated_mq,
+            "owned_files": ["agent/governance/server.py"],
+            "observer_command_id": "cmd-generated-mq",
+            "read_receipt_hash": "sha256:read-generated-mq",
+            "read_receipt_event_id": "timeline:generated-mq",
+            "governance_project_id": PROJECT_ID,
+            "target_project_id": PROJECT_ID,
+            **route_identity,
+        },
+        now_iso=NOW,
+    )
+    assert startup["ok"] is True, startup
+
+
 def test_mf_branch_worktree_materialization_uses_planned_identity(tmp_path) -> None:
     fixture = create_parallel_fixture_project(tmp_path)
     repo = fixture.root

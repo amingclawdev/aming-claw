@@ -7745,6 +7745,29 @@ def _parallel_branch_allocate_merge_queue_id(body: Mapping[str, Any]) -> str:
     return _runtime_context_public_text(*candidates)
 
 
+def _parallel_branch_allocate_canonical_merge_queue_id(
+    project_id: str,
+    body: Mapping[str, Any],
+) -> tuple[str, str]:
+    requested = _parallel_branch_allocate_merge_queue_id(body)
+    if requested:
+        return requested, "request_payload"
+    return (
+        _contract_runtime_stable_id(
+            "mq",
+            project_id,
+            body.get("task_id"),
+            body.get("backlog_id"),
+            body.get("parent_task_id"),
+            body.get("root_task_id"),
+            body.get("batch_id"),
+            body.get("target_project_id") or body.get("graph_project_id"),
+            body.get("target_head_commit") or body.get("base_commit"),
+        ),
+        "allocation_identity",
+    )
+
+
 def _parallel_branch_allocate_row_test_files(
     project_id: str,
     backlog_id: str,
@@ -7872,7 +7895,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             [*request_target_files, *backlog_test_files]
         )
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
-    normalized_merge_queue_id = _parallel_branch_allocate_merge_queue_id(ctx.body or {})
+    normalized_merge_queue_id, merge_queue_id_source = (
+        _parallel_branch_allocate_canonical_merge_queue_id(project_id, ctx.body or {})
+    )
     context = plan_branch_runtime_context(
         project_id=project_id,
         task_id=task_id,
@@ -8030,6 +8055,14 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         response = {
             "ok": True,
             "project_id": project_id,
+            "merge_queue_id": saved.merge_queue_id,
+            "merge_queue_id_source": merge_queue_id_source,
+            "merge_queue_id_authority": {
+                "schema_version": "parallel_branch_allocate.merge_queue_id_authority.v1",
+                "source": "branch_runtime.context.merge_queue_id",
+                "runtime_context_merge_queue_id_authoritative": True,
+                "route_issue_merge_queue_id_scope": "route_issue_response_only",
+            },
             "context": branch_context_to_dict(saved),
             "branch_runtime_evidence": branch_runtime_allocation_evidence(
                 saved,
@@ -8044,6 +8077,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         try:
             dispatch_body = {
                 **dict(ctx.body or {}),
+                "merge_queue_id": saved.merge_queue_id,
+                "merge_queue_id_source": merge_queue_id_source,
                 "target_files": list(saved.target_files),
                 "owned_files": list(saved.owned_files),
             }

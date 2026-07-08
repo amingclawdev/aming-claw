@@ -2479,6 +2479,7 @@ def branch_runtime_allocation_evidence(
         "allocation_source_ref": source_ref,
         "registration_source": registration_source,
         "runtime_context_id": runtime_context_id,
+        "merge_queue_id": context_payload.get("merge_queue_id", ""),
         "target_project_root": context_payload.get("target_project_root", ""),
         "project_root": context_payload.get("project_root", ""),
         "repo_root": context_payload.get("repo_root", ""),

@@ -569,7 +569,14 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         "target_branch": {"type": "string"},
         "base_commit": {"type": "string"},
         "target_head_commit": {"type": "string"},
-        "merge_queue_id": {"type": "string"},
+        "merge_queue_id": {
+            "type": "string",
+            "description": (
+                "Optional durable merge queue id. When omitted, "
+                "parallel_branch_allocate generates and persists a canonical "
+                "runtime_context.current_values.merge_queue_id before worker startup."
+            ),
+        },
         "fence_token": {"type": "string"},
         "observer_command_id": {
             "type": "string",
