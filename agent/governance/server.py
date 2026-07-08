@@ -124,6 +124,17 @@ def get_server_version():
     return _version_cache["value"]
 
 
+def get_governance_runtime_version(default: str = "unknown") -> str:
+    """Return the governance code version frozen when this process loaded."""
+    try:
+        from .chain_trailer import get_runtime_version
+
+        runtime_version = get_runtime_version()
+        return runtime_version or default
+    except Exception:
+        return default
+
+
 # Backward compatibility alias
 SERVER_VERSION = get_server_version()
 SERVER_PID = os.getpid()
@@ -58927,8 +58938,18 @@ def handle_task_recover(ctx: RequestContext):
 
 @route("GET", "/api/health")
 def handle_health(ctx: RequestContext):
-    return {"status": "ok", "service": "governance", "port": PORT,
-            "version": get_server_version(), "pid": SERVER_PID}
+    health_version = get_server_version()
+    gov_runtime_version = get_governance_runtime_version()
+    return {
+        "status": "ok",
+        "service": "governance",
+        "port": PORT,
+        "version": health_version,
+        "health_version": health_version,
+        "gov_runtime_version": gov_runtime_version,
+        "governance_runtime_version": gov_runtime_version,
+        "pid": SERVER_PID,
+    }
 
 
 def _branch_service_port_open(host: str, port: int) -> bool:
@@ -59244,14 +59265,11 @@ def handle_version_check(ctx: RequestContext):
     row_chain_for_runtime = (row["chain_version"] or "") if row else ""
 
     # Runtime version baking — detect stale-process-after-deploy
+    health_version = get_server_version()
     gov_runtime = ""
     sm_runtime = ""
     runtime_match = False
-    try:
-        from .chain_trailer import get_runtime_version
-        gov_runtime = get_runtime_version()
-    except Exception as e:
-        log.debug("version-check: gov runtime_version unavailable: %s", e)
+    gov_runtime = get_governance_runtime_version(default="")
     try:
         import urllib.request
         req = urllib.request.Request("http://127.0.0.1:40101/api/manager/health", method="GET")
@@ -59271,7 +59289,7 @@ def handle_version_check(ctx: RequestContext):
         (governance_state or {}).get("chain_sha")
         or (governance_state or {}).get("version")
         or (row_chain_for_runtime if target_root == self_root else "")
-        or get_server_version()
+        or health_version
     )
 
     if not row:
@@ -59372,6 +59390,7 @@ def handle_version_check(ctx: RequestContext):
     }
     governance_runtime = {
         "project_root": str(self_root),
+        "health_version": health_version,
         "chain_version": governance_chain_version,
         "gov_runtime_version": gov_runtime,
         "sm_runtime_version": sm_runtime,
@@ -59404,6 +59423,7 @@ def handle_version_check(ctx: RequestContext):
         "generated_at": _utc_now(),
         "project_version": chain_ver,
         "legacy_project_version": legacy_project_version,
+        "health_version": health_version,
         "governance_chain_version": governance_chain_version,
         "gov_runtime_version": gov_runtime,
         "sm_runtime_version": sm_runtime,
