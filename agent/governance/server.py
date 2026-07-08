@@ -12834,6 +12834,45 @@ def _runtime_context_worker_recovery_payloads(
             "task_timeline_append",
         ],
     )
+    merge_queue_route_issue_payload = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": normalized_backlog_id or "<current worker backlog_id>",
+        "task_id": task_id,
+        "allowed_actions": ["close_or_merge_after_evidence"],
+        "owned_files": ["<worker owned files from runtime context>"],
+        "target_files": ["<worker owned files from runtime context>"],
+        "evidence_refs": [
+            ref
+            for ref in (
+                f"runtime_context:{runtime_context_id}" if runtime_context_id else "",
+                f"parallel_branch_task:{task_id}" if task_id else "",
+                f"contract_runtime:{successor_contract_execution_id}"
+                if successor_contract_execution_id
+                else "",
+                f"backlog:{normalized_backlog_id}" if normalized_backlog_id else "",
+            )
+            if ref
+        ],
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    merge_queue_route_token_scope = _copy_safe_route_token_scope_payload(
+        schema_version="runtime_context.merge_queue_copy_safe_route_token_scope.v1",
+        project_id=project_id,
+        backlog_id=normalized_backlog_id or "<current worker backlog_id>",
+        task_id=task_id,
+        route_token_ref="",
+        status="issue_required_for_worker_task_close_or_merge",
+        purpose=(
+            "parallel_branch_merge_queue_materialize/apply "
+            "close_or_merge_after_evidence route authorization"
+        ),
+        task_id_source="worker_task_id",
+        aliases=["route_token_ref"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        issue_payload=merge_queue_route_issue_payload,
+    )
     canonical_context_receipt_template = {
         "schema_version": "contract_context_read_receipt.v1",
         "event_kind": "contract_context_read_receipt",
@@ -13144,9 +13183,16 @@ def _runtime_context_worker_recovery_payloads(
         "worker_role": "mf_sub",
         "status": "review_ready",
         "fence_token": fence_token_placeholder,
-        "route_token_ref": safe_route_identity.get(
-            "route_token_ref",
-            "<current child-contract close_or_merge_after_evidence route_token_ref>",
+        "route_token_ref": (
+            "<worker_task_id close_or_merge_after_evidence route_token_ref>"
+        ),
+        "route_token_task_id_scope": (
+            "worker_task_id; runtime_context_root_task_id fallback only when it is "
+            "not a ContractRuntime execution id"
+        ),
+        "route_token_scope_source": (
+            "merge_gate_evidence_payloads.merge_queue_route_refs."
+            "copy_safe_route_token_scope"
         ),
     }
     merge_apply_body = {
@@ -13161,9 +13207,16 @@ def _runtime_context_worker_recovery_payloads(
         "dry_run": True,
         "allow_target_ref_mutation": False,
         "fence_token": fence_token_placeholder,
-        "route_token_ref": safe_route_identity.get(
-            "route_token_ref",
-            "<current child-contract close_or_merge_after_evidence route_token_ref>",
+        "route_token_ref": (
+            "<worker_task_id close_or_merge_after_evidence route_token_ref>"
+        ),
+        "route_token_task_id_scope": (
+            "worker_task_id; runtime_context_root_task_id fallback only when it is "
+            "not a ContractRuntime execution id"
+        ),
+        "route_token_scope_source": (
+            "merge_gate_evidence_payloads.merge_queue_route_refs."
+            "copy_safe_route_token_scope"
         ),
         "evidence": {
             "schema_version": "runtime_context.merge_gate_evidence.v1",
@@ -13180,7 +13233,8 @@ def _runtime_context_worker_recovery_payloads(
             "verification_event_refs": ["<independent QA timeline ref>"],
             "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
             "route_token_scope_source": (
-                "mf_parallel.merge_route_scope_guidance.copy_safe_route_token_scope"
+                "mf_parallel.merge_route_scope_guidance."
+                "merge_queue_route_refs.copy_safe_route_token_scope"
             ),
             "source_contract_execution_id": successor_contract_execution_id
             or contract_execution_id
@@ -13196,6 +13250,50 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_merge_queue_id_authoritative": True,
         "merge_queue_id": normalized_merge_queue_id,
         "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
+        "contract_runtime_route_refs": {
+            "schema_version": (
+                "runtime_context.contract_runtime_route_refs_guidance.v1"
+            ),
+            "purpose": (
+                "ContractRuntime guide/current/submit-line reads and closes use "
+                "contract-scoped route refs."
+            ),
+            "scope": "contract_execution_id or successor_contract_execution_id",
+            "route_token_ref": safe_route_identity.get(
+                "route_token_ref",
+                "<contract_runtime route_token_ref>",
+            ),
+            "valid_for": [
+                "contract_runtime_current",
+                "contract_runtime_guide",
+                "contract_runtime_submit_line",
+            ],
+            "not_valid_for": [
+                "parallel_branch_merge_queue_materialize",
+                "parallel_branch_merge_queue_apply",
+            ],
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "merge_queue_route_refs": {
+            "schema_version": "runtime_context.merge_queue_route_refs_guidance.v1",
+            "purpose": (
+                "Durable merge queue materialize/apply gates validate the queue "
+                "item worker task_id before mutating merge state."
+            ),
+            "primary_task_scope": "worker_task_id",
+            "worker_task_id": task_id,
+            "fallback_task_scope": (
+                "runtime_context_root_task_id only when it is not a "
+                "ContractRuntime execution id"
+            ),
+            "contract_execution_scope_allowed": False,
+            "contract_execution_scope_prefixes": ["cex-"],
+            "copy_safe_route_token_scope": merge_queue_route_token_scope,
+            "copy_safe_route_token_ref_only": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
         "required_order": [
             "mf_sub finish_time_worker_attestation",
             "mf_sub finish_gate",
@@ -13203,7 +13301,7 @@ def _runtime_context_worker_recovery_payloads(
             "parallel_branch_merge_queue_materialize",
             "parallel_branch_merge_queue_apply",
         ],
-        "route_token_scope": dict(copy_safe_route_token_scope),
+        "route_token_scope": dict(merge_queue_route_token_scope),
         "materialize_merge_queue_item": {
             "mcp_tool": "parallel_branch_merge_queue_materialize",
             "method": "POST",
@@ -13237,7 +13335,10 @@ def _runtime_context_worker_recovery_payloads(
             "live_mutation_requirements": [
                 "dry_run=false",
                 "allow_target_ref_mutation=true",
-                "current child-contract close_or_merge_after_evidence route_token_ref",
+                (
+                    "worker_task_id close_or_merge_after_evidence "
+                    "route_token_ref"
+                ),
                 "finish_gate_ref",
                 "independent QA verification_event_refs",
             ],
@@ -19650,6 +19751,155 @@ _PARALLEL_BRANCH_MERGE_RESULT_FENCE_BYPASS_DECISIONS = frozenset(
 )
 
 
+def _parallel_branch_route_scope_is_contract_execution(task_id: str) -> bool:
+    return str(task_id or "").strip().startswith("cex-")
+
+
+def _parallel_branch_merge_route_ref_scope(
+    conn,
+    *,
+    project_id: str,
+    route_token_ref: str,
+) -> dict[str, str]:
+    ref = str(route_token_ref or "").strip()
+    if not ref:
+        return {}
+    from . import observer_route_context as _orc
+
+    try:
+        resolved = _orc.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=ref,
+        )
+    except _orc.RouteTokenRefError:
+        return {}
+    if not isinstance(resolved, Mapping):
+        return {}
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    return {
+        "project_id": str(scope.get("project_id") or "").strip(),
+        "backlog_id": str(scope.get("backlog_id") or "").strip(),
+        "task_id": str(scope.get("task_id") or "").strip(),
+    }
+
+
+def _parallel_branch_merge_route_scope_mismatch_details(
+    body: Mapping[str, Any],
+    *,
+    project_id: str,
+    action: str,
+    backlog_id: str,
+    lane_task_id: str,
+    contract_task_id: str,
+    route_token_ref: str = "",
+    child_scope_error: str = "",
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    queue_id = str(body.get("merge_queue_id") or "").strip()
+    item_id = str(body.get("queue_item_id") or "").strip()
+    route_scope = _copy_safe_route_token_scope_payload(
+        schema_version="parallel_branch.merge_queue_route_scope_recovery.v1",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=lane_task_id,
+        route_token_ref="",
+        status="issue_required_for_worker_task_close_or_merge",
+        purpose=(
+            "Recover merge materialize/apply by issuing "
+            "close_or_merge_after_evidence at the worker queue item task_id."
+        ),
+        task_id_source="worker_task_id",
+        aliases=["route_token_ref"],
+        allowed_actions=[_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION],
+        issue_payload={
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": lane_task_id,
+            "allowed_actions": [_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION],
+            "evidence_refs": [
+                ref
+                for ref in (
+                    f"parallel_branch_task:{lane_task_id}" if lane_task_id else "",
+                    f"contract_runtime:{contract_task_id}" if contract_task_id else "",
+                    f"backlog:{backlog_id}" if backlog_id else "",
+                )
+                if ref
+            ],
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+    )
+    recovery_body = {
+        "project_id": project_id,
+        "merge_queue_id": queue_id or "<runtime_context.current_values.merge_queue_id>",
+        "queue_item_id": item_id or "<runtime merge queue item id>",
+        "task_id": lane_task_id or "<worker_task_id>",
+        "route_token_ref": (
+            "<worker_task_id close_or_merge_after_evidence route_token_ref>"
+        ),
+        "route_token_task_id_scope": "worker_task_id",
+        "route_token_scope_source": "copy_safe_recovery.copy_safe_route_token_scope",
+        "raw_route_token_persisted": False,
+    }
+    if action == "merge_execute":
+        recovery_body.update(
+            {
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "target_ref": str(body.get("target_ref") or "refs/heads/main"),
+            }
+        )
+    else:
+        recovery_body.update(
+            {
+                "checkpoint_id": str(body.get("checkpoint_id") or ""),
+                "require_finish_gate": _query_bool(body, "require_finish_gate", True),
+                "worker_role": "mf_sub",
+                "status": str(body.get("status") or "review_ready"),
+            }
+        )
+    return {
+        "schema_version": "parallel_branch.merge_route_scope_mismatch.v1",
+        "status": "blocked_before_protected_mutation",
+        "reason_code": "contract_scoped_route_ref_for_worker_merge_queue_item",
+        "message": (
+            "Merge materialize/apply route refs must be scoped to the worker "
+            "queue item task_id; ContractRuntime execution ids are only valid "
+            "for ContractRuntime reads/submits."
+        ),
+        "protected_action": action,
+        "route_token_ref": str(route_token_ref or "").strip(),
+        "expected_route_scope": {
+            "task_id": lane_task_id,
+            "task_id_source": "worker_task_id",
+            "allowed_actions": [_PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION],
+        },
+        "rejected_route_scope": {
+            "task_id": contract_task_id,
+            "task_id_source": "contract_execution_id",
+            "contract_execution_scope": True,
+        },
+        "copy_safe_recovery": {
+            "schema_version": "parallel_branch.merge_route_scope_recovery.v1",
+            "copy_safe": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+            "raw_route_token_persisted": False,
+            "next_action": "issue_worker_task_close_or_merge_route_ref_and_retry",
+            "copy_safe_route_token_scope": route_scope,
+            "tool_args": {
+                key: value
+                for key, value in recovery_body.items()
+                if value not in ("", [], {}, None)
+            },
+        },
+        "child_scope_error": child_scope_error,
+        "fallback_reason": fallback_reason,
+    }
+
+
 def _body_has_route_token_reference(body: Mapping[str, Any] | None) -> bool:
     payload = body or {}
     return bool(payload.get("route_token") or str(payload.get("route_token_ref") or "").strip())
@@ -19727,6 +19977,52 @@ def _require_parallel_branch_merge_route_gate(
             gate["backlog_id"] = backlog_id
             gate["fallback_reason"] = str(exc.message or exc)
             return gate
+
+        route_token_ref = str(ctx.body.get("route_token_ref") or "").strip()
+        route_token_payload = (
+            ctx.body.get("route_token")
+            if isinstance(ctx.body.get("route_token"), Mapping)
+            else {}
+        )
+        route_token_scope = (
+            route_token_payload.get("scope")
+            if isinstance(route_token_payload.get("scope"), Mapping)
+            else {}
+        )
+        supplied_task_id = str(route_token_scope.get("task_id") or "").strip()
+        if not supplied_task_id and route_token_ref:
+            supplied_task_id = _parallel_branch_merge_route_ref_scope(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+            ).get("task_id", "")
+        contract_scope_task_id = (
+            supplied_task_id
+            if _parallel_branch_route_scope_is_contract_execution(supplied_task_id)
+            else (
+                root_task_id
+                if _parallel_branch_route_scope_is_contract_execution(root_task_id)
+                else ""
+            )
+        )
+        if contract_scope_task_id and contract_scope_task_id != lane_task_id:
+            details = _parallel_branch_merge_route_scope_mismatch_details(
+                ctx.body,
+                project_id=project_id,
+                action=concrete_action,
+                backlog_id=backlog_id,
+                lane_task_id=lane_task_id,
+                contract_task_id=contract_scope_task_id,
+                route_token_ref=route_token_ref,
+                child_scope_error=child_scope_error,
+                fallback_reason=str(exc.message or exc),
+            )
+            raise GovernanceError(
+                "route_token_required",
+                details["message"],
+                422,
+                details,
+            ) from exc
 
         gate = _require_route_token_mutation_gate(
             ctx,

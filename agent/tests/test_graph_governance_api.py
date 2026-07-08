@@ -41246,6 +41246,171 @@ def test_mf_parallel_merge_route_guidance_scope_materializes_queue(conn):
     )
 
 
+def test_mf_parallel_merge_route_scope_mismatch_blocks_contract_ref_before_materialize(conn):
+    backlog_id = "AC-MF-PARALLEL-GUIDED-MERGE-SCOPE-MISMATCH"
+    task_id = "parallel-guided-merge-scope-mismatch"
+    worker_task_id = task_id
+    merge_queue_id = "mq-guided-merge-scope-mismatch"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-guided-merge-root-mismatch",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "reason": "Human approved guided merge scope repair.",
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": "rtok-guided-merge-root-mismatch",
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    contract_task_id = result["successor_contract_execution_id"]
+    issued_contract_ref = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=contract_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["close_or_merge_after_evidence"],
+        evidence_refs=["contract_runtime:child-close"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued_contract_ref["route_token_ref"],
+        token=issued_contract_ref["route_token"],
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-guided-merge-scope-mismatch",
+            backlog_id=backlog_id,
+            root_task_id=contract_task_id,
+            task_id=worker_task_id,
+            branch_ref="refs/heads/codex/guided-merge-scope-mismatch",
+            status=STATE_VALIDATED,
+            fence_token="fence-guided-merge-scope-mismatch",
+            base_commit="base-guided-merge-mismatch",
+            head_commit="head-guided-merge-mismatch",
+            target_head_commit="target-guided-merge-mismatch",
+            checkpoint_id="ckpt-guided-merge-scope-mismatch",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-07-05T16:50:00Z",
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": worker_task_id,
+                    "merge_queue_id": merge_queue_id,
+                    "queue_index": 1,
+                    "checkpoint_id": "ckpt-guided-merge-scope-mismatch",
+                    "require_finish_gate": True,
+                    "route_token_ref": issued_contract_ref["route_token_ref"],
+                    "now_iso": "2026-07-05T16:51:00Z",
+                },
+            )
+        )
+
+    assert exc_info.value.code == "route_token_required"
+    details = exc_info.value.details
+    assert details["schema_version"] == (
+        "parallel_branch.merge_route_scope_mismatch.v1"
+    )
+    assert details["status"] == "blocked_before_protected_mutation"
+    assert details["reason_code"] == (
+        "contract_scoped_route_ref_for_worker_merge_queue_item"
+    )
+    assert details["expected_route_scope"]["task_id"] == worker_task_id
+    assert details["rejected_route_scope"]["task_id"] == contract_task_id
+    recovery = details["copy_safe_recovery"]
+    assert recovery["raw_route_token_required"] is False
+    assert recovery["raw_route_token_exposed"] is False
+    assert recovery["tool_args"]["task_id"] == worker_task_id
+    assert recovery["tool_args"]["merge_queue_id"] == merge_queue_id
+    assert recovery["copy_safe_route_token_scope"]["scope"]["task_id"] == (
+        worker_task_id
+    )
+    assert recovery["copy_safe_route_token_scope"][
+        "observer_route_context_issue_payload"
+    ]["task_id"] == worker_task_id
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM parallel_branch_merge_queue_items "
+            "WHERE project_id = ? AND merge_queue_id = ?",
+            (PID, merge_queue_id),
+        ).fetchone()["count"]
+        == 0
+    )
+
+
+def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs():
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id="mfrctx-guide-scope",
+        task_id="worker-guide-scope-task",
+        parent_task_id="cex-guide-scope-contract",
+        worker_id="worker-guide-scope",
+        worker_slot_id="worker-guide-scope",
+        target_project_root="/tmp/worker-guide-scope",
+        backlog_id="AC-GUIDE-SCOPE",
+        merge_queue_id="mq-guide-scope",
+        route_identity={
+            "route_id": "route-guide-scope",
+            "route_context_hash": "sha256:guide-scope",
+            "prompt_contract_id": "rprompt-guide-scope",
+            "prompt_contract_hash": "sha256:prompt-guide-scope",
+            "route_token_ref": "rtok-contract-runtime-guide-scope",
+            "visible_injection_manifest_hash": "sha256:visible-guide-scope",
+        },
+        successor_contract_execution_id="cex-guide-scope-contract",
+    )
+
+    merge_payloads = payloads["merge_gate_evidence_payloads"]
+    contract_refs = merge_payloads["contract_runtime_route_refs"]
+    merge_refs = merge_payloads["merge_queue_route_refs"]
+    materialize_body = merge_payloads["materialize_merge_queue_item"][
+        "copy_safe_body"
+    ]
+    apply_body = merge_payloads["apply_merge_queue_item"]["copy_safe_body"]
+
+    assert contract_refs["route_token_ref"] == "rtok-contract-runtime-guide-scope"
+    assert "parallel_branch_merge_queue_materialize" in contract_refs["not_valid_for"]
+    assert merge_refs["worker_task_id"] == "worker-guide-scope-task"
+    assert merge_refs["contract_execution_scope_allowed"] is False
+    assert merge_refs["copy_safe_route_token_scope"]["scope"]["task_id"] == (
+        "worker-guide-scope-task"
+    )
+    assert materialize_body["task_id"] == "worker-guide-scope-task"
+    assert apply_body["task_id"] == "worker-guide-scope-task"
+    assert materialize_body["route_token_ref"] != contract_refs["route_token_ref"]
+    assert apply_body["route_token_ref"] != contract_refs["route_token_ref"]
+    assert materialize_body["route_token_task_id_scope"].startswith(
+        "worker_task_id"
+    )
+    assert apply_body["route_token_task_id_scope"].startswith("worker_task_id")
+
+
 def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_command(
     conn,
     tmp_path,
