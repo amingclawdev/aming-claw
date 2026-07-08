@@ -2846,6 +2846,47 @@ def test_route_token_mutation_gate_accepts_bounded_token() -> None:
     assert gate["route_token_hash"].startswith("sha256:")
 
 
+def test_observer_route_context_implementation_merge_actions_keep_worker_lanes() -> None:
+    from datetime import datetime, timezone
+
+    from agent.governance import observer_route_context
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id="BUG-MERGE",
+        task_id="cex-merge",
+        target_files=["agent/governance/observer_route_context.py"],
+        allowed_actions=[
+            "task_timeline_append",
+            "parallel_branch_allocate",
+            "backlog_close",
+        ],
+        now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    token = issued["route_token"]
+    scope = token["route_action_scope"]
+    lane_ids = {lane["id"] for lane in token["required_lanes"]}
+    assert issued["requires_mf_sub_implementation_lane"] is True
+    assert scope["classification"] == "bounded_worker_implementation_or_merge"
+    assert scope["requires_mf_sub_implementation_lane"] is True
+    assert "parallel_branch_allocate" in scope["implementation_or_merge_actions"]
+    assert "backlog_close" in scope["implementation_or_merge_actions"]
+    assert "bounded_implementation_subagent" in lane_ids
+    assert "independent_verification_subagent" in lane_ids
+    assert "bounded_implementation_subagent_id" in token["required_evidence"]
+    assert "independent_verification_subagent_id" in token["required_evidence"]
+
+    gate = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="backlog_close",
+        project_id="aming-claw",
+        backlog_id="BUG-MERGE",
+        task_id="cex-merge",
+    )
+    assert gate["allowed"] is True
+
+
 def test_route_token_mutation_gate_rejects_missing_token_for_protected_action() -> None:
     with pytest.raises(MfSubagentContractError, match="route_token is required"):
         validate_route_token_mutation_gate(

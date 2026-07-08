@@ -143,6 +143,62 @@ REQUIRED_EVIDENCE: tuple[str, ...] = (
     "dirty_scope_check",
 )
 
+ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v1"
+
+# These observer-owned actions are governance/evidence/reconcile operations. A
+# route token scoped only to these actions must be copy-safe for direct-main
+# observer work and must not advertise that an mf_sub implementation lane exists
+# or is legally required.
+OBSERVER_DIRECT_MAIN_ACTIONS: tuple[str, ...] = (
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+    "contract_runtime_current",
+    "contract_runtime_guide",
+    "contract_runtime_submit_line",
+    "runtime_context_read_receipt",
+    "capture_intent",
+    "run_route_precheck",
+    "verify_evidence",
+)
+
+# Any action in this set either dispatches implementation work, enters a worker
+# topology, or performs merge/close materialization. Those paths keep the
+# bounded worker and independent verification lane guidance intact.
+IMPLEMENTATION_OR_MERGE_ACTIONS: tuple[str, ...] = (
+    "parallel_branch_allocate",
+    "dispatch_bounded_lane",
+    "execute_backlog_row",
+    "close_or_merge_after_evidence",
+    "backlog_close",
+    "direct_fix_enter",
+    "mf_parallel_enter",
+    "mf_batch_parallel_enter",
+    "parallel_branch_merge_queue_materialize",
+    "merge",
+)
+
+OBSERVER_DIRECT_MAIN_REQUIRED_LANES: tuple[dict[str, str], ...] = (
+    {
+        "id": "observer_direct_main_action",
+        "role": "observer",
+        "purpose": (
+            "perform scoped non-implementation governance, evidence, or graph "
+            "reconcile work without implying an mf_sub implementation lane"
+        ),
+    },
+)
+
+OBSERVER_DIRECT_MAIN_REQUIRED_EVIDENCE: tuple[str, ...] = (
+    "route_context_hash",
+    "prompt_contract_id",
+    "visible_injection_manifest_or_hash",
+    "caller_role",
+    "allowed_actions",
+    "blocked_actions",
+    "route_token_ref",
+    "observer_session_id_or_route_owned_source_event",
+)
+
 PARENT_ROUTE_LINEAGE_SCHEMA_VERSION = "parent_route_lineage.v1"
 CHILD_ROUTE_LINEAGE_SCHEMA_VERSION = "child_route_lineage.v1"
 ROUTE_LINEAGE_SCHEMA_VERSION = "observer_route_parent_child_lineage.v1"
@@ -352,6 +408,65 @@ def _sanitize_allowed_actions(
     return normalized_actions
 
 
+def _route_lane_requirements_for_actions(
+    allowed_actions: Sequence[str],
+) -> dict[str, Any]:
+    """Return copy-safe route guidance for the token's allowed action scope."""
+
+    actions = _normalized_action_list(allowed_actions)
+    action_set = set(actions)
+    direct_main_actions = {
+        _gate_normalized_action(action) for action in OBSERVER_DIRECT_MAIN_ACTIONS
+    }
+    implementation_or_merge_actions = {
+        _gate_normalized_action(action)
+        for action in IMPLEMENTATION_OR_MERGE_ACTIONS
+    }
+    unknown_actions = sorted(
+        action_set - direct_main_actions - implementation_or_merge_actions
+    )
+    implementation_markers = sorted(action_set & implementation_or_merge_actions)
+    requires_worker_lane = bool(implementation_markers or unknown_actions)
+
+    if requires_worker_lane:
+        classification = "bounded_worker_implementation_or_merge"
+        required_lanes = [dict(lane) for lane in REQUIRED_LANES]
+        required_evidence = list(REQUIRED_EVIDENCE)
+        copy_safe_guidance = (
+            "This route action scope can dispatch implementation or merge/close "
+            "work; bounded mf_sub implementation and independent verification "
+            "lane requirements remain in force."
+        )
+    else:
+        classification = "observer_direct_non_implementation"
+        required_lanes = [dict(lane) for lane in OBSERVER_DIRECT_MAIN_REQUIRED_LANES]
+        required_evidence = list(OBSERVER_DIRECT_MAIN_REQUIRED_EVIDENCE)
+        copy_safe_guidance = (
+            "This route action scope is limited to observer-owned evidence, "
+            "contract-runtime, or graph reconcile work and does not require or "
+            "imply an mf_sub implementation lane."
+        )
+
+    return {
+        "required_lanes": required_lanes,
+        "required_evidence": required_evidence,
+        "route_action_scope": {
+            "schema_version": ROUTE_ACTION_SCOPE_SCHEMA_VERSION,
+            "classification": classification,
+            "allowed_actions": actions,
+            "direct_main_or_reconcile_actions": sorted(
+                action_set & direct_main_actions
+            ),
+            "implementation_or_merge_actions": implementation_markers,
+            "unknown_actions": unknown_actions,
+            "requires_mf_sub_implementation_lane": requires_worker_lane,
+            "requires_bounded_worker_implementation": requires_worker_lane,
+            "copy_safe": True,
+            "copy_safe_guidance": copy_safe_guidance,
+        },
+    }
+
+
 def build_observer_write_route_token(
     *,
     project_id: str,
@@ -398,6 +513,10 @@ def build_observer_write_route_token(
         raise ValueError("target_files must be a non-empty list of file paths")
 
     actions_list = _sanitize_allowed_actions(allowed_actions)
+    lane_requirements = _route_lane_requirements_for_actions(actions_list)
+    required_lanes = lane_requirements["required_lanes"]
+    required_evidence = lane_requirements["required_evidence"]
+    route_action_scope = lane_requirements["route_action_scope"]
 
     # Reject oversized / non-positive TTL explicitly (do not silently clamp).
     ttl_hours = float(ttl_hours)
@@ -458,8 +577,9 @@ def build_observer_write_route_token(
     manifest_base = {
         **identity_base,
         "kind": "visible_injection_manifest",
-        "required_lanes": [dict(lane) for lane in REQUIRED_LANES],
-        "required_evidence": list(REQUIRED_EVIDENCE),
+        "required_lanes": required_lanes,
+        "required_evidence": required_evidence,
+        "route_action_scope": route_action_scope,
     }
     visible_injection_manifest_hash = _sha256(manifest_base)
 
@@ -483,8 +603,12 @@ def build_observer_write_route_token(
         "caller_role": CALLER_ROLE,
         "allowed_actions": actions_list,
         "blocked_actions": list(BLOCKED_ACTIONS),
-        "required_lanes": [dict(lane) for lane in REQUIRED_LANES],
-        "required_evidence": list(REQUIRED_EVIDENCE),
+        "required_lanes": required_lanes,
+        "required_evidence": required_evidence,
+        "route_action_scope": route_action_scope,
+        "requires_mf_sub_implementation_lane": route_action_scope[
+            "requires_mf_sub_implementation_lane"
+        ],
         "evidence_refs": evidence_refs_list,
         "expires_at": expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scope": {
@@ -956,6 +1080,10 @@ def issue_observer_write_route_context(
         "prompt_contract_id": token.get("prompt_contract_id", ""),
         "visible_injection_manifest_hash": token.get(
             "visible_injection_manifest_hash", ""
+        ),
+        "route_action_scope": dict(token.get("route_action_scope") or {}),
+        "requires_mf_sub_implementation_lane": bool(
+            token.get("requires_mf_sub_implementation_lane")
         ),
         "expires_at": token.get("expires_at", ""),
     }
