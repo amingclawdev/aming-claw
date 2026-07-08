@@ -1625,6 +1625,44 @@ def _route_waiver(action="task_timeline_append", bug_id="BUG-ROUTE", task_id="",
     }
 
 
+def test_observer_route_context_direct_main_reconcile_actions_are_copy_safe():
+    from agent.governance import observer_route_context
+    from agent.governance.mf_subagent_contract import (
+        validate_route_token_mutation_gate,
+    )
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="proj",
+        backlog_id="BUG-DIRECT-MAIN",
+        task_id="cex-direct-main",
+        target_files=["agent/governance/task_timeline.py"],
+        allowed_actions=["graph_current_full_reconcile", "task_timeline_append"],
+        now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    token = issued["route_token"]
+    scope = token["route_action_scope"]
+    assert issued["requires_mf_sub_implementation_lane"] is False
+    assert scope["classification"] == "observer_direct_non_implementation"
+    assert scope["requires_mf_sub_implementation_lane"] is False
+    assert (
+        "graph_current_full_reconcile"
+        in scope["direct_main_or_reconcile_actions"]
+    )
+    assert all(lane["role"] != "mf_sub" for lane in token["required_lanes"])
+    assert "bounded_implementation_subagent_id" not in token["required_evidence"]
+    assert "independent_verification_subagent_id" not in token["required_evidence"]
+
+    gate = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="graph_current_full_reconcile",
+        project_id="proj",
+        backlog_id="BUG-DIRECT-MAIN",
+        task_id="cex-direct-main",
+    )
+    assert gate["allowed"] is True
+
+
 class TestTaskTimeline(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
