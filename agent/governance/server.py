@@ -15123,15 +15123,32 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         proof_errors.append("previous_route_token_ref_mismatch")
     if str(renewal_proof.get("route_token_ref") or "").strip() != route_token_ref:
         proof_errors.append("route_token_ref_mismatch")
+    expected_backlog_id = str(getattr(context, "backlog_id", "") or "")
+    expected_task_scope_candidates = _runtime_context_service_dedupe(
+        [
+            str(getattr(context, "task_id", "") or ""),
+            str(body.get("parent_task_id") or ""),
+            str(getattr(context, "root_task_id", "") or ""),
+            expected_backlog_id,
+        ]
+    )
+    if not expected_task_scope_candidates:
+        expected_task_scope_candidates = [""]
     expected_scope = {
         "project_id": project_id,
-        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
-        "task_id": str(getattr(context, "task_id", "") or ""),
+        "backlog_id": expected_backlog_id,
     }
     for key, expected_value in expected_scope.items():
         actual_value = str(proof_scope.get(key) or "").strip()
         if expected_value and actual_value != expected_value:
             proof_errors.append(f"scope_{key}_mismatch")
+    actual_task_scope = str(proof_scope.get("task_id") or "").strip()
+    if (
+        actual_task_scope
+        and expected_task_scope_candidates
+        and actual_task_scope not in expected_task_scope_candidates
+    ):
+        proof_errors.append("scope_task_id_mismatch")
     if proof_errors:
         raise GovernanceError(
             "runtime_context_initial_join_route_token_ref_not_renewed_from_active_contract",
@@ -15144,6 +15161,33 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
                 "expected_route_token_ref": expected_ref,
                 "required_registry_proof": "route_lineage.renewal_proof",
                 "renewal_proof_errors": proof_errors,
+                "expected_scope": {
+                    "project_id": project_id,
+                    "backlog_id": expected_backlog_id,
+                    "task_id": str(getattr(context, "task_id", "") or ""),
+                    "accepted_task_id_candidates": list(
+                        expected_task_scope_candidates
+                    ),
+                },
+                "proof_scope": dict(proof_scope),
+                "next_legal_action": (
+                    "renew_the_active_runtime_route_token_ref_at_one_of_the_accepted_task_scopes_and_retry_initial_join"
+                ),
+                "copy_safe_recovery": {
+                    "schema_version": (
+                        "runtime_context.initial_join_route_ref_recovery.v1"
+                    ),
+                    "mcp_tool": "observer_route_context_renew",
+                    "retry_tool": "runtime_context_session_token_initial_join",
+                    "runtime_context_id": runtime_context_id,
+                    "backlog_id": expected_backlog_id,
+                    "expected_route_token_ref": expected_ref,
+                    "accepted_task_id_candidates": list(
+                        expected_task_scope_candidates
+                    ),
+                    "raw_route_token_required": False,
+                    "raw_route_token_exposed": False,
+                },
                 "registry_verified": True,
                 "fail_closed": True,
             },
@@ -15199,6 +15243,9 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         "registry_verified": True,
         "raw_route_token_exposed": False,
     }
+    lineage_payload["accepted_renewal_task_id_candidates"] = list(
+        expected_task_scope_candidates
+    )
     return resolved_identity, lineage_payload
 
 
