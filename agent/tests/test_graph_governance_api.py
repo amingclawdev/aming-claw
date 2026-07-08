@@ -756,6 +756,89 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
+def test_health_and_version_check_distinguish_head_from_loaded_runtime(conn, tmp_path, monkeypatch):
+    new_head = "bbbbbbb"
+    new_head_full = "bbbbbbb000000000000000000000000000000000"
+    loaded_runtime = "aaaaaaa"
+
+    conn.execute(
+        "INSERT OR REPLACE INTO project_version "
+        "(project_id, chain_version, updated_at, updated_by, git_head, dirty_files, git_synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            PID,
+            new_head,
+            "2026-07-08T00:00:00Z",
+            "test",
+            new_head_full,
+            "[]",
+            "2026-07-08T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    def fake_git_output(root: Path, args: list[str]) -> str:
+        if args == ["rev-parse", "HEAD"]:
+            return new_head_full
+        if args == ["rev-parse", "--short", "HEAD"]:
+            return new_head
+        if args == ["status", "--porcelain"]:
+            return ""
+        return ""
+
+    def fake_chain_state(cwd: str | None = None) -> dict[str, Any]:
+        return {
+            "chain_sha": new_head,
+            "version": new_head,
+            "source": "head",
+            "dirty": False,
+            "dirty_files": [],
+        }
+
+    class FakeManagerHealthResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"runtime_version": loaded_runtime}).encode("utf-8")
+
+    monkeypatch.setattr(server, "get_server_version", lambda: new_head)
+    monkeypatch.setattr(
+        server,
+        "get_governance_runtime_version",
+        lambda default="unknown": loaded_runtime,
+    )
+    monkeypatch.setattr(server, "_git_output", fake_git_output)
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.get_chain_state",
+        fake_chain_state,
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=2: FakeManagerHealthResponse(),
+    )
+
+    health = server.handle_health(_ctx({"project_id": PID}))
+    assert health["version"] == new_head
+    assert health["health_version"] == new_head
+    assert health["gov_runtime_version"] == loaded_runtime
+    assert health["governance_runtime_version"] == loaded_runtime
+    assert health["version"] != health["gov_runtime_version"]
+
+    version = server.handle_version_check(
+        _ctx({"project_id": PID}, body={"project_root": str(tmp_path)})
+    )
+    assert version["health_version"] == new_head
+    assert version["gov_runtime_version"] == loaded_runtime
+    assert version["runtime_match"] is False
+    assert version["governance_runtime"]["health_version"] == new_head
+    assert version["governance_runtime"]["gov_runtime_version"] == loaded_runtime
+    assert version["governance_runtime"]["runtime_match"] is False
+
+
 def _graph(node_id: str = "L7.1") -> dict:
     return {
         "deps_graph": {
