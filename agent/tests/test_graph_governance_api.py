@@ -1246,15 +1246,25 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert environment["planner_preview_url"] == "http://127.0.0.1:4173/"
     assert observed["preview_port"] == 4173
     prompt = environment["launch_prompt"]
-    launch_prompts = {
-        item["id"]: item["prompt"]
+    launch_prompt_items = {
+        item["id"]: item
         for item in environment["launch_prompts"]
+    }
+    launch_prompts = {
+        key: item["prompt"]
+        for key, item in launch_prompt_items.items()
     }
     assert set(launch_prompts) == {
         "direct_main",
         "mf_parallel",
         "mf_batch_parallel",
     }
+    assert launch_prompt_items["direct_main"]["label"] == "Direct Main"
+    assert launch_prompt_items["mf_parallel"]["label"] == "MF Parallel"
+    assert launch_prompt_items["mf_batch_parallel"]["label"] == "MF Batch Parallel"
+    assert launch_prompt_items["direct_main"]["description"]
+    assert launch_prompt_items["mf_parallel"]["description"]
+    assert launch_prompt_items["mf_batch_parallel"]["description"]
     assert prompt == launch_prompts["mf_parallel"]
     assert prompt.count("Create exactly one backlog row") == 1
     assert "Intent:" in prompt
@@ -1273,7 +1283,14 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
         assert "function_index" in path_prompt
         assert "function_callers" in path_prompt
         assert "function_callees" in path_prompt
+        assert "Copy-safe prompt rule:" in path_prompt
+        assert "safe to copy into a fresh lane" in path_prompt
+        assert "never paste or persist raw session, fence, or route tokens" in path_prompt
         assert "query_source=qa" in path_prompt
+        assert "query_purpose=independent_verification" in path_prompt
+        assert "its own rg + graph_query" in path_prompt
+        assert "system CLI agent service or a host-created bounded worker/subagent" in path_prompt
+        assert "do not act as the worker from the observer session" in path_prompt
         assert "Do not stop after planning" in path_prompt
         assert "friction" in path_prompt
     assert "operator_supervised_direct_main" in launch_prompts["direct_main"]
