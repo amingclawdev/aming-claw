@@ -19324,13 +19324,26 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
 def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() -> None:
     target_files = [
         "agent/governance/server.py",
+        "agent/governance/contracts/runtime.py",
         "agent/governance/contract_state_runtime.py",
         "agent/governance/mcp_server.py",
+        "agent/tests/test_contract_runtime.py",
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_parallel_branch_runtime.py",
+        "agent/tests/test_mcp_server_stdio.py",
+    ]
+    expected_target_files = [
+        "agent/governance/server.py",
+        "agent/governance/contracts/runtime.py",
+        "agent/governance/contract_state_runtime.py",
+        "agent/governance/mcp_server.py",
+        "agent/tests/test_contract_runtime_min_path.py",
         "agent/tests/test_graph_governance_api.py",
         "agent/tests/test_parallel_branch_runtime.py",
         "agent/tests/test_mcp_server_stdio.py",
     ]
     expected_test_files = [
+        "agent/tests/test_contract_runtime_min_path.py",
         "agent/tests/test_graph_governance_api.py",
         "agent/tests/test_parallel_branch_runtime.py",
         "agent/tests/test_mcp_server_stdio.py",
@@ -19360,8 +19373,14 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
 
     plan = guide["verification_plan"]
     assert plan["schema_version"] == "runtime_context.qa_scoped_verification_plan.v1"
-    assert plan["target_files"] == target_files
+    assert plan["target_files"] == expected_target_files
     assert plan["scoped_test_files"] == expected_test_files
+    assert plan["suggested_test_files"] == [
+        "agent/tests/test_contract_runtime_min_path.py"
+    ]
+    assert plan["replacement_test_files"] == [
+        "agent/tests/test_contract_runtime_min_path.py"
+    ]
     assert plan["focused"]["commands"] == [expected_focused_command]
     assert plan["focused"]["commands"] != [plan["full_suite"]["command"]]
     assert plan["full_suite"]["required_by_default"] is False
@@ -19388,6 +19407,7 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
     assert append_evidence["qa_child_route_token_ref_body"]["verification"][
         "verification_plan"
     ]["full_suite_required_by_default"] is False
+    assert "test_contract_runtime.py" not in json.dumps(guide, sort_keys=True)
 
     caveat_body = append_evidence["focused_pass_with_full_suite_caveat_body"]
     assert caveat_body["status"] == "passed"
