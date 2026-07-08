@@ -1280,10 +1280,16 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
     assert "observer_direct_implementation_exception" in launch_prompts["direct_main"]
     assert "mf_parallel" in launch_prompts["mf_parallel"]
     assert "runtime_context_worker_guide" in launch_prompts["mf_parallel"]
+    assert "separate CLI agent or host-created subagent" in launch_prompts["mf_parallel"]
+    assert "observer session must not act as that worker" in launch_prompts["mf_parallel"]
     assert "mf_batch_parallel" in launch_prompts["mf_batch_parallel"]
     assert "Row A: Today Focus" in launch_prompts["mf_batch_parallel"]
     assert "Row B: per-task reminder toggle" in launch_prompts["mf_batch_parallel"]
+    assert "separate CLI agent or host-created subagent" in launch_prompts["mf_batch_parallel"]
+    assert "observer session must not edit the worker worktree" in launch_prompts["mf_batch_parallel"]
     assert "runtime_context_worker_guide" in prompt
+    assert "must not edit the worker worktree" in prompt
+    assert "record capacity friction" in prompt
     assert "distinct verifier lane/session" in prompt
     assert "Observer-authored visual smoke" in prompt
     assert "visual smoke" in prompt
