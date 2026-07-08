@@ -8163,6 +8163,35 @@ def _runtime_context_event_payload(event: Mapping[str, Any] | None) -> dict:
     }
 
 
+def _runtime_context_is_finish_time_worker_attestation_event(
+    event: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    if str(event.get("status") or "").strip().lower() in {
+        "failed",
+        "rejected",
+        "blocked",
+    }:
+        return False
+    event_type = str(event.get("event_type") or "").strip().lower().replace("-", "_")
+    event_kind = str(event.get("event_kind") or "").strip().lower().replace("-", "_")
+    phase = str(event.get("phase") or "").strip().lower().replace("-", "_")
+    return (
+        event_type
+        in {
+            "mf_subagent.finish_time_worker_attestation",
+            "runtime_context.finish_time_worker_attestation",
+        }
+        or event_kind
+        in {
+            "finish_time_worker_attestation",
+            "record_finish_time_worker_attestation",
+        }
+        or phase == "finish_time_worker_attestation"
+    )
+
+
 def _runtime_context_service_timeline_refs(
     conn,
     *,
@@ -8278,10 +8307,7 @@ def _runtime_context_service_timeline_refs(
             refs["finish_event_ref"] = ref
             finish_event = dict(event)
         is_finish_time_worker_attestation = (
-            action_normalized == "record_finish_time_worker_attestation"
-            or "finish_time_worker_attestation" in haystack
-            or str(payload.get("schema_version") or "").strip().lower()
-            == "runtime_context.finish_time_worker_attestation.v1"
+            _runtime_context_is_finish_time_worker_attestation_event(event)
         )
         if is_finish_time_worker_attestation and not finish_attestation:
             from .parallel_branch_runtime import public_contract_revision_payload
@@ -41160,16 +41186,25 @@ def _contract_runtime_projection_source_map(
 ) -> dict[str, dict[str, Any]]:
     graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
     implementation_refs = list(timeline_refs.get("implementation_event_refs") or [])
-    attestation_ref = str(
-        finish_payload.get("attestation_event_ref")
-        if isinstance(finish_payload, Mapping)
-        else ""
-    ).strip()
+    finish_time_hint = timeline_refs.get("finish_time_worker_attestation_hint")
+    if isinstance(finish_time_hint, Mapping):
+        attestation_ref = str(
+            finish_time_hint.get("finish_time_attestation_event_ref")
+            or finish_time_hint.get("attestation_event_ref")
+            or ""
+        ).strip()
+    else:
+        attestation_ref = str(
+            timeline_refs.get("finish_time_attestation_event_ref")
+            or timeline_refs.get("finish_time_worker_attestation_event_ref")
+            or ""
+        ).strip()
     if not attestation_ref:
-        attestation_ref = _contract_runtime_timeline_ref_for_token(
-            timeline_events,
-            "finish_time_worker_attestation",
+        attestation_ref = _contract_runtime_finish_time_worker_attestation_ref(
+            timeline_events
         )
+    if not attestation_ref and isinstance(finish_payload, Mapping):
+        attestation_ref = str(finish_payload.get("attestation_event_ref") or "").strip()
     review_ready_ref = _contract_runtime_timeline_ref_for_token(
         timeline_events,
         "review_ready",
@@ -41215,6 +41250,15 @@ def _contract_runtime_projection_source_map(
             "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
         },
     }
+
+
+def _contract_runtime_finish_time_worker_attestation_ref(
+    timeline_events: list[dict[str, Any]],
+) -> str:
+    for event in timeline_events:
+        if _runtime_context_is_finish_time_worker_attestation_event(event):
+            return _runtime_context_event_ref(event)
+    return ""
 
 
 def _contract_runtime_timeline_ref_for_token(

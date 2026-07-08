@@ -9770,6 +9770,102 @@ def test_runtime_context_service_refs_accept_legacy_implementation_evidence_kind
     assert not close_event.get("event_id")
 
 
+def test_runtime_context_service_refs_use_canonical_finish_time_attestation_event(
+    conn,
+):
+    task_id = "runtime-service-canonical-finish-attestation-task"
+    backlog_id = "AC-RUNTIME-SERVICE-CANONICAL-FINISH-ATTESTATION"
+    finish_gate = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.finish_gate",
+        event_kind="mf_subagent_finish_gate",
+        phase="finish_gate",
+        actor="mf_sub:runtime-service-canonical-finish",
+        status="passed",
+        payload={
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": "mfrctx-runtime-service-canonical-finish",
+            "worker_role": "mf_sub",
+        },
+    )
+    attestation = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="runtime_context.finish_time_worker_attestation",
+        event_kind="finish_time_worker_attestation",
+        phase="worker_attestation",
+        actor="mf_sub:runtime-service-canonical-finish",
+        status="passed",
+        payload={
+            "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+            "action": "record_finish_time_worker_attestation",
+            "runtime_context_id": "mfrctx-runtime-service-canonical-finish",
+            "worker_role": "mf_sub",
+            "finish_time_worker_self_attestation": {
+                "status": "passed",
+                "passed": True,
+                "blockers": [],
+            },
+        },
+    )
+
+    refs, _, finish_payload, _ = server._runtime_context_service_timeline_refs(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+
+    assert refs["finish_event_ref"] == f"timeline:{finish_gate['id']}"
+    assert refs["finish_time_worker_attestation_hint"][
+        "finish_time_attestation_event_ref"
+    ] == f"timeline:{attestation['id']}"
+    assert finish_payload["event_id"] == f"timeline:{finish_gate['id']}"
+
+
+def test_contract_runtime_projection_source_map_uses_canonical_finish_time_attestation_ref():
+    timeline_events = [
+        {
+            "id": "100",
+            "event_type": "mf_subagent.finish_gate",
+            "event_kind": "mf_subagent_finish_gate",
+            "phase": "finish_gate",
+            "status": "passed",
+            "payload": {
+                "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+                "action": "record_finish_time_worker_attestation",
+            },
+        },
+        {
+            "id": "101",
+            "event_type": "mf_subagent.finish_time_worker_attestation",
+            "event_kind": "finish_time_worker_attestation",
+            "phase": "worker_attestation",
+            "status": "passed",
+            "payload": {
+                "schema_version": "runtime_context.finish_time_worker_attestation.v1",
+                "action": "record_finish_time_worker_attestation",
+            },
+        },
+    ]
+
+    source_map = server._contract_runtime_projection_source_map(
+        timeline_events=timeline_events,
+        timeline_refs={"finish_event_ref": "timeline:100"},
+        graph_refs={},
+        finish_payload={},
+    )
+
+    assert source_map["finish_time_worker_attestation"]["source_ref"] == "timeline:101"
+    assert source_map["finish_gate"]["source_ref"] == "timeline:100"
+
+
 def test_runtime_context_implementation_evidence_rejects_unrelated_child_route_lineage(
     conn,
     tmp_path,
