@@ -25539,7 +25539,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "target_commit_sha": target_commit,
                 "head_commit": head_commit,
             }
-        dirty_paths = _git_dirty_paths(root) if bool(body.get("require_clean", True)) else []
+        dirty_paths = (
+            filter_dirty_files(_git_dirty_paths(root))
+            if bool(body.get("require_clean", True))
+            else []
+        )
         if dirty_paths:
             return 409, {
                 "ok": False,

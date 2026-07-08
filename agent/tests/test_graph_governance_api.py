@@ -900,6 +900,79 @@ def test_current_full_reconcile_operator_token_path_unchanged(
     assert calls[0]["commit_sha"] == head
 
 
+def test_current_full_reconcile_ignores_demo_environment_marker_dirty_state(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_git_dirty_paths",
+        lambda _root: [".aming-claw-demo-environment.json"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "target_commit_sha": head,
+            "activate": False,
+            "semantic_enrich": False,
+        },
+    )
+    ctx.token = "operator-token"
+
+    status, result = server.handle_graph_governance_current_full_reconcile(ctx)
+
+    assert status == 201
+    assert result["current_full_reconcile"] is True
+    assert calls[0]["commit_sha"] == head
+
+
+def test_current_full_reconcile_blocks_governed_dirty_file_after_filtering(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_git_dirty_paths",
+        lambda _root: [
+            ".aming-claw-demo-environment.json",
+            "agent/governance/server.py",
+        ],
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "target_commit_sha": head,
+            "activate": False,
+            "semantic_enrich": False,
+        },
+    )
+    ctx.token = "operator-token"
+
+    status, result = server.handle_graph_governance_current_full_reconcile(ctx)
+
+    assert status == 409
+    assert result["error"] == "dirty_worktree"
+    assert result["dirty_files"] == ["agent/governance/server.py"]
+    assert result["dirty_file_count"] == 1
+    assert calls == []
+
+
 def test_current_full_reconcile_route_proof_reports_missing_scope_fields(
     conn,
     monkeypatch,
