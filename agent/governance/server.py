@@ -3005,6 +3005,8 @@ _OBSERVER_ROUTE_CONTEXT_APPEND_DEPENDENT_ACTIONS = {
 
 _OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES = {
     "observer_hotfix_enter": ("hotfix_enter",),
+    "parallel_branch_merge_queue_materialize": ("merge_queue",),
+    "parallel_branch_merge_queue_apply": ("merge_execute",),
 }
 
 
@@ -3013,7 +3015,8 @@ def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
         return allowed_actions
     expanded = list(allowed_actions)
     normalized = {str(item or "").strip() for item in allowed_actions}
-    for action in list(normalized):
+    for item in allowed_actions:
+        action = str(item or "").strip()
         for alias in _OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES.get(action, ()):
             if alias not in normalized:
                 expanded.append(alias)

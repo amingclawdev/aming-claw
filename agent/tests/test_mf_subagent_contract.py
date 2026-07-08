@@ -2860,6 +2860,8 @@ def test_observer_route_context_implementation_merge_actions_keep_worker_lanes()
             "task_timeline_append",
             "parallel_branch_allocate",
             "backlog_close",
+            "parallel_branch_merge_queue_materialize",
+            "parallel_branch_merge_queue_apply",
         ],
         now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
     )
@@ -2871,7 +2873,10 @@ def test_observer_route_context_implementation_merge_actions_keep_worker_lanes()
     assert scope["classification"] == "bounded_worker_implementation_or_merge"
     assert scope["requires_mf_sub_implementation_lane"] is True
     assert "parallel_branch_allocate" in scope["implementation_or_merge_actions"]
-    assert "backlog_close" in scope["implementation_or_merge_actions"]
+    assert "parallel_branch_merge_queue_materialize" in scope["implementation_or_merge_actions"]
+    assert "parallel_branch_merge_queue_apply" in scope["implementation_or_merge_actions"]
+    assert "backlog_close" in scope["admin_close_or_evidence_actions"]
+    assert "backlog_close" not in scope["implementation_or_merge_actions"]
     assert "bounded_implementation_subagent" in lane_ids
     assert "independent_verification_subagent" in lane_ids
     assert "bounded_implementation_subagent_id" in token["required_evidence"]
@@ -2885,6 +2890,62 @@ def test_observer_route_context_implementation_merge_actions_keep_worker_lanes()
         task_id="cex-merge",
     )
     assert gate["allowed"] is True
+
+
+def test_observer_route_context_close_only_scope_is_admin_copy_safe() -> None:
+    from datetime import datetime, timezone
+
+    from agent.governance import observer_route_context
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id="BUG-CLOSE-ONLY",
+        task_id="cex-close-only",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["backlog_close"],
+        now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    token = issued["route_token"]
+    scope = token["route_action_scope"]
+    lane_ids = {lane["id"] for lane in token["required_lanes"]}
+    assert issued["requires_mf_sub_implementation_lane"] is False
+    assert scope["classification"] == "observer_admin_close_evidence_only"
+    assert scope["requires_bounded_worker_implementation"] is False
+    assert scope["implementation_or_merge_actions"] == []
+    assert scope["unknown_actions"] == []
+    assert scope["admin_close_or_evidence_actions"] == ["backlog_close"]
+    assert "bounded_implementation_subagent" not in lane_ids
+    assert "independent_verification_subagent" not in lane_ids
+    assert "bounded_implementation_subagent_id" not in token["required_evidence"]
+    assert "independent_verification_subagent_id" not in token["required_evidence"]
+
+    gate = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="backlog_close",
+        project_id="aming-claw",
+        backlog_id="BUG-CLOSE-ONLY",
+        task_id="cex-close-only",
+    )
+    assert gate["allowed"] is True
+
+
+def test_observer_route_context_merge_tool_actions_expand_to_concrete_gate_actions() -> None:
+    from agent.governance import server
+
+    expanded = server._observer_route_context_issue_allowed_actions(
+        [
+            "parallel_branch_merge_queue_materialize",
+            "parallel_branch_merge_queue_apply",
+        ]
+    )
+
+    assert expanded == [
+        "parallel_branch_merge_queue_materialize",
+        "parallel_branch_merge_queue_apply",
+        "merge_queue",
+        "merge_execute",
+    ]
 
 
 def test_route_token_mutation_gate_rejects_missing_token_for_protected_action() -> None:

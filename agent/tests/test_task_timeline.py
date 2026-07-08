@@ -1643,7 +1643,7 @@ def test_observer_route_context_direct_main_reconcile_actions_are_copy_safe():
     token = issued["route_token"]
     scope = token["route_action_scope"]
     assert issued["requires_mf_sub_implementation_lane"] is False
-    assert scope["classification"] == "observer_direct_non_implementation"
+    assert scope["classification"] == "observer_admin_close_evidence_only"
     assert scope["requires_mf_sub_implementation_lane"] is False
     assert (
         "graph_current_full_reconcile"
@@ -1659,6 +1659,43 @@ def test_observer_route_context_direct_main_reconcile_actions_are_copy_safe():
         project_id="proj",
         backlog_id="BUG-DIRECT-MAIN",
         task_id="cex-direct-main",
+    )
+    assert gate["allowed"] is True
+
+
+def test_observer_route_context_backlog_upsert_only_is_admin_copy_safe():
+    from agent.governance import observer_route_context
+    from agent.governance.mf_subagent_contract import (
+        validate_route_token_mutation_gate,
+    )
+
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="proj",
+        backlog_id="BUG-BACKLOG-UPSERT-ONLY",
+        task_id="cex-backlog-upsert-only",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["backlog_upsert"],
+        now=datetime(2099, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    token = issued["route_token"]
+    scope = token["route_action_scope"]
+    assert issued["requires_mf_sub_implementation_lane"] is False
+    assert scope["classification"] == "observer_admin_close_evidence_only"
+    assert scope["requires_bounded_worker_implementation"] is False
+    assert scope["implementation_or_merge_actions"] == []
+    assert scope["unknown_actions"] == []
+    assert scope["admin_close_or_evidence_actions"] == ["backlog_upsert"]
+    assert all(lane["role"] != "mf_sub" for lane in token["required_lanes"])
+    assert "bounded_implementation_subagent_id" not in token["required_evidence"]
+    assert "independent_verification_subagent_id" not in token["required_evidence"]
+
+    gate = validate_route_token_mutation_gate(
+        {"route_token": token},
+        action="backlog_upsert",
+        project_id="proj",
+        backlog_id="BUG-BACKLOG-UPSERT-ONLY",
+        task_id="cex-backlog-upsert-only",
     )
     assert gate["allowed"] is True
 
