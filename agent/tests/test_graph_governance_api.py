@@ -40553,24 +40553,29 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert merge_route_scope["root_contract_execution_id"] == (
         result["root_contract_execution_id"]
     )
+    assert merge_route_scope["worker_task_id"] == task_id
+    assert merge_route_scope["worker_task_id_role"] == (
+        "primary merge materialize/apply close_or_merge_after_evidence "
+        "route authorization"
+    )
+    assert merge_route_scope["successor_contract_execution_id_role"] == (
+        "current child mf_parallel contract runtime writes only"
+    )
     current_contract_issue_shape = merge_route_scope[
         "close_or_merge_after_evidence_route_issue_shape"
     ]
-    assert current_contract_issue_shape["task_id"] == (
-        result["successor_contract_execution_id"]
-    )
+    assert current_contract_issue_shape["task_id"] == task_id
     assert current_contract_issue_shape["allowed_actions"] == [
         "close_or_merge_after_evidence"
     ]
     assert current_contract_issue_shape["raw_route_token_required"] is False
     assert current_contract_issue_shape["raw_route_token_exposed"] is False
     assert merge_route_scope["primary_close_or_merge_route_scope"] == (
-        "successor_contract_execution_id"
+        "worker_task_id"
     )
     assert merge_route_scope["accepted_route_scope_order"] == [
-        "worker_task_id_if_explicitly_minted",
-        "successor_contract_execution_id",
-        "root_contract_execution_id_fallback",
+        "worker_task_id",
+        "runtime_context_root_task_id_fallback",
     ]
     fallback_issue_shape = merge_route_scope[
         "fallback_close_or_merge_after_evidence_route_issue_shape"
@@ -40583,7 +40588,7 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     assert merge_route_scope["raw_route_token_copy_allowed"] is False
     assert merge_route_scope["raw_route_token_persisted"] is False
     assert merge_route_scope["merge_materialize_apply_route_scope_source"] == (
-        "successor_contract_execution_id"
+        "runtime_context.current_values.task_id"
     )
     assert merge_route_scope[
         "merge_materialize_apply_merge_queue_id_source"
@@ -40597,9 +40602,11 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
         is True
     )
     assert merge_route_scope["root_contract_scope_fallback_only"] is True
-    assert merge_route_scope["copy_safe_route_token_scope"]["scope"]["task_id"] == (
-        result["successor_contract_execution_id"]
+    assert (
+        merge_route_scope["successor_contract_scope_for_merge_materialize_apply"]
+        is False
     )
+    assert merge_route_scope["copy_safe_route_token_scope"]["scope"]["task_id"] == task_id
     assert (
         merge_route_scope["copy_safe_route_token_scope"][
             "raw_route_token_copy_allowed"
@@ -40608,7 +40615,7 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
     )
     assert merge_route_scope["copy_safe_route_token_scope"][
         "observer_route_context_issue_payload"
-    ]["task_id"] == result["successor_contract_execution_id"]
+    ]["task_id"] == task_id
     assert result["event"]["payload"]["successor_contract"][
         "merge_route_scope_guidance"
     ] == merge_route_scope
@@ -40821,7 +40828,7 @@ def test_mf_parallel_enter_source_backed_returns_successor_runtime_shape(conn):
 def test_mf_parallel_merge_route_guidance_scope_materializes_queue(conn):
     backlog_id = "AC-MF-PARALLEL-GUIDED-MERGE-SCOPE"
     task_id = "parallel-guided-merge-scope"
-    worker_task_id = f"{task_id}:worker"
+    worker_task_id = task_id
     merge_queue_id = "mq-guided-merge-scope"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -40909,7 +40916,7 @@ def test_mf_parallel_merge_route_guidance_scope_materializes_queue(conn):
     assert queued["ok"] is True
     assert queued["queue_item"]["task_id"] == worker_task_id
     assert gate["authorized_action"] == "close_or_merge_after_evidence"
-    assert gate["accepted_task_scope"] == "parent"
+    assert gate["accepted_task_scope"] == "child"
     assert gate["parent_task_id"] == result["successor_contract_execution_id"]
     assert gate["child_task_id"] == worker_task_id
     assert queued["timeline_event_recorded"]["event_kind"] == (

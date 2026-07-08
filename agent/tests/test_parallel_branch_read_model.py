@@ -1807,18 +1807,25 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
         "observer_command_id",
     ]
     route_scope = reminders["merge_route_scope_guidance"]
+    assert route_scope["worker_task_id_role"] == (
+        "primary merge close_or_merge_after_evidence route scope"
+    )
     assert route_scope["successor_contract_execution_id_role"] == (
-        "current child mf_parallel contract runtime writes and primary merge "
-        "close_or_merge_after_evidence route scope"
+        "current child mf_parallel contract runtime writes only"
     )
     assert route_scope["root_contract_execution_id_role"] == (
-        "fallback root/onboard route authorization only"
+        "fallback root/onboard route authorization when runtime context "
+        "root_task_id resolves to this id"
     )
     assert route_scope["primary_close_or_merge_route_scope"] == (
-        "successor_contract_execution_id"
+        "worker_task_id"
     )
+    assert route_scope["accepted_route_scope_order"] == [
+        "worker_task_id",
+        "runtime_context_root_task_id_fallback",
+    ]
     assert route_scope["close_or_merge_after_evidence_route_issue_shape"] == {
-        "task_id": "<successor_contract_execution_id>",
+        "task_id": "<worker_task_id>",
         "allowed_actions": ["close_or_merge_after_evidence"],
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,

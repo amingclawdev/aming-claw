@@ -6324,21 +6324,23 @@ def runtime_context_mf_parallel_happy_path_reminders(
             ),
         },
         "merge_route_scope_guidance": {
-            "successor_contract_execution_id_role": (
-                "current child mf_parallel contract runtime writes and "
+            "worker_task_id_role": (
                 "primary merge close_or_merge_after_evidence route scope"
             ),
-            "root_contract_execution_id_role": (
-                "fallback root/onboard route authorization only"
+            "successor_contract_execution_id_role": (
+                "current child mf_parallel contract runtime writes only"
             ),
-            "primary_close_or_merge_route_scope": "successor_contract_execution_id",
+            "root_contract_execution_id_role": (
+                "fallback root/onboard route authorization when runtime "
+                "context root_task_id resolves to this id"
+            ),
+            "primary_close_or_merge_route_scope": "worker_task_id",
             "accepted_route_scope_order": [
-                "worker_task_id_if_explicitly_minted",
-                "successor_contract_execution_id",
-                "root_contract_execution_id_fallback",
+                "worker_task_id",
+                "runtime_context_root_task_id_fallback",
             ],
             "close_or_merge_after_evidence_route_issue_shape": {
-                "task_id": "<successor_contract_execution_id>",
+                "task_id": "<worker_task_id>",
                 "allowed_actions": ["close_or_merge_after_evidence"],
                 "raw_route_token_required": False,
                 "raw_route_token_exposed": False,
@@ -6351,9 +6353,11 @@ def runtime_context_mf_parallel_happy_path_reminders(
             },
             "message": (
                 "Issue close_or_merge_after_evidence authority at "
-                "successor_contract_execution_id scope for merge materialize/apply; "
-                "use root_contract_execution_id only as an explicit fallback and "
-                "pass only route_token_ref."
+                "worker_task_id scope for merge materialize/apply; use "
+                "runtime context root_task_id only as an explicit fallback and "
+                "pass only route_token_ref. Use successor_contract_execution_id "
+                "for child contract runtime lines, not for primary merge route "
+                "authorization."
             ),
         },
         "live_merge_fence_guidance": {
