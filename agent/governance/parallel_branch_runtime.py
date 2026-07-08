@@ -14809,7 +14809,7 @@ def queue_merge_item_for_branch_context(
     )
     saved_context = upsert_branch_context(conn, updated_context, now_iso=now_iso)
     return {
-        "context": branch_context_to_dict(saved_context),
+        "context": public_branch_context_to_dict(saved_context),
         "queue_item": merge_queue_item_to_dict(saved_item),
     }
 

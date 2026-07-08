@@ -11403,6 +11403,7 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
     root_task_id = "root-route-materialize-task"
     child_task_id = f"{root_task_id}-focus-ui"
     queue_id = "mergeq-api-materialize-route-ref"
+    raw_fence_token = "fence-root-route-materialize-child"
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id=root_task_id,
@@ -11427,7 +11428,7 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
             task_id=child_task_id,
             branch_ref="refs/heads/codex/root-route-materialize-child",
             status=STATE_VALIDATED,
-            fence_token="fence-root-route-materialize-child",
+            fence_token=raw_fence_token,
             base_commit="base-root-route",
             head_commit="head-root-route",
             target_head_commit="target-root-route",
@@ -11456,6 +11457,10 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
 
     assert queued["ok"] is True
     assert queued["context"]["status"] == "validated"
+    assert queued["context"]["fence_token"] == "redacted"
+    assert queued["context"]["fence_token_hash"] == _fake_sha(raw_fence_token)
+    assert queued["context"]["fence_token_redacted"] is True
+    assert raw_fence_token not in json.dumps(queued, sort_keys=True)
     assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["queue_item"]["task_id"] == child_task_id
     assert queued["timeline_event_recorded"]["event_kind"] == (
@@ -11475,12 +11480,17 @@ def test_parallel_branch_merge_queue_materialize_records_contract_event_after_fi
     payload = stored_events[0]["payload"]
     assert payload["child_task_id"] == child_task_id
     assert payload["checkpoint_id"] == "ckpt-root-route-materialize-child"
+    assert payload["context"]["fence_token"] == "redacted"
+    assert payload["context"]["fence_token_hash"] == _fake_sha(raw_fence_token)
+    assert payload["context"]["fence_token_redacted"] is True
+    assert raw_fence_token not in json.dumps(payload, sort_keys=True)
 
 
 def test_parallel_branch_merge_queue_materialize_accepts_child_route_token_ref_after_finish_gate(conn):
     root_task_id = "root-route-materialize-child-token-task"
     child_task_id = f"{root_task_id}-focus-ui"
     queue_id = "mergeq-api-materialize-child-route-ref"
+    raw_fence_token = "fence-child-route-materialize-child"
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id=root_task_id,
@@ -11505,7 +11515,7 @@ def test_parallel_branch_merge_queue_materialize_accepts_child_route_token_ref_a
             task_id=child_task_id,
             branch_ref="refs/heads/codex/child-route-materialize-child",
             status=STATE_VALIDATED,
-            fence_token="fence-child-route-materialize-child",
+            fence_token=raw_fence_token,
             base_commit="base-child-route",
             head_commit="head-child-route",
             target_head_commit="target-child-route",
@@ -11535,6 +11545,10 @@ def test_parallel_branch_merge_queue_materialize_accepts_child_route_token_ref_a
     gate = queued["route_token_gate"]
     assert queued["ok"] is True
     assert queued["context"]["status"] == "validated"
+    assert queued["context"]["fence_token"] == "redacted"
+    assert queued["context"]["fence_token_hash"] == _fake_sha(raw_fence_token)
+    assert queued["context"]["fence_token_redacted"] is True
+    assert raw_fence_token not in json.dumps(queued, sort_keys=True)
     assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["queue_item"]["task_id"] == child_task_id
     assert gate["action"] == "merge_queue"
