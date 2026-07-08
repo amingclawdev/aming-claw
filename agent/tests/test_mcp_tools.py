@@ -2005,6 +2005,8 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     for key in (
         "workspace_root",
         "repo_root_path",
+        "target_project_root",
+        "target_graph_root",
         "backlog_id",
         "parent_task_id",
         "root_task_id",
@@ -2028,6 +2030,14 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         assert key in allocate_props
 
     assert allocate_props["route_token_ref"]["type"] == "string"
+    assert (
+        "Canonical target project/worktree root"
+        in allocate_props["target_project_root"]["description"]
+    )
+    assert (
+        "Alias for target_project_root"
+        in allocate_props["target_graph_root"]["description"]
+    )
     assert (
         allocate_props["route_token_ref"]["description"]
         == "Opaque server-registered route token reference accepted by protected HTTP facades."
@@ -2144,6 +2154,8 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
             "task_id": "mf-sub-1",
             "workspace_root": "/repo",
             "repo_root_path": "/repo",
+            "target_project_root": "/repo/.worktrees/mf-sub-1",
+            "target_graph_root": "/repo/.worktrees/mf-sub-1",
             "backlog_id": "BUG-1",
             "parent_task_id": "observer-1",
             "root_task_id": "observer-1",
@@ -2237,6 +2249,8 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "task_id": "mf-sub-1",
                 "workspace_root": "/repo",
                 "repo_root_path": "/repo",
+                "target_project_root": "/repo/.worktrees/mf-sub-1",
+                "target_graph_root": "/repo/.worktrees/mf-sub-1",
                 "backlog_id": "BUG-1",
                 "parent_task_id": "observer-1",
                 "root_task_id": "observer-1",

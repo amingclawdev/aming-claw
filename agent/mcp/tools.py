@@ -522,6 +522,21 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         "task_id": {"type": "string"},
         "workspace_root": {"type": "string"},
         "repo_root_path": {"type": "string"},
+        "target_project_root": {
+            "type": "string",
+            "description": (
+                "Canonical target project/worktree root for runtime-context "
+                "worker identity; copy this value into worker-guide, "
+                "graph-query, and runtime-context write facades."
+            ),
+        },
+        "target_graph_root": {
+            "type": "string",
+            "description": (
+                "Alias for target_project_root accepted by "
+                "allocation/runtime context."
+            ),
+        },
         "batch_id": {"type": "string"},
         "backlog_id": {"type": "string"},
         "chain_id": {"type": "string"},

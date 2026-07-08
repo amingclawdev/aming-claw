@@ -310,6 +310,13 @@ The guide is the worker-facing map for safe route context, graph-query
 identity, read/write evidence facades, startup, implementation evidence,
 finish-time attestation, finish gate, and close-gate gaps.
 
+When allocating bounded parallel workers, pass the canonical
+`target_project_root` (or its `target_graph_root` alias) for runtime-context
+identity and carry that exact value into worker-guide reads, graph queries, and
+runtime-context write facades. Use `worktree_path` and its aliases only for the
+final materialized worker worktree path. Pass route token refs, never raw route
+tokens.
+
 Route context is not satisfied by reading this onboarding document or by
 searching source files. Workers and observers must consume the runtime-projected
 route context and record the required evidence through the current facade for
