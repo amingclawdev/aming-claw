@@ -9014,6 +9014,129 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("independent_qa_gate", direct_group["replaced_gate_ids"])
         self.assertIn("cross_ref_gate", direct_group["replaced_gate_ids"])
 
+    def test_observer_direct_exception_accepts_qa_commands_run_test_evidence(self):
+        from agent.governance import task_timeline
+
+        close_commit = "abc1234"
+        contract = {
+            "governance_policy": STRICT_GOVERNANCE_POLICY,
+            "close_context": {
+                "close_commit": close_commit,
+                "target_files": ["agent/governance/task_timeline.py"],
+            },
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+            "route_topology_policy": {
+                "selected_topology": "observer_led_parallel_lanes",
+                "recommended_topology": "mf_parallel.v1",
+                "required_lanes": [
+                    "observer_coordinator",
+                    "bounded_implementation_worker",
+                    "independent_verification_lane",
+                    "observer_merge_close_gate",
+                ],
+                "independent_verification_required": True,
+            },
+        }
+        events = [
+            {
+                "id": 7111,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "payload": {
+                    **ROUTE_IDENTITY,
+                    "reason": "operator-supervised direct repair of a close gate",
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    },
+                    "dirty_scope_check": {"dirty_files": []},
+                },
+            },
+            {
+                "id": 7112,
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                    "dirty_scope_check": {
+                        "changed_files": ["agent/governance/task_timeline.py"],
+                        "unexpected_files": [],
+                    },
+                    "tests_run": [
+                        {
+                            "cmd": "python3 -m pytest agent/tests/test_task_timeline.py",
+                            "status": "passed",
+                        }
+                    ],
+                },
+            },
+            {
+                "id": 7113,
+                "event_type": "mf.observer_direct_verification",
+                "event_kind": "verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": "qa:observer-direct",
+                "commit_sha": close_commit,
+                "payload": {
+                    "schema_version": "independent_qa_verification.v1",
+                    "commands_run": [
+                        {"cmd": "git diff --check", "status": "passed"},
+                        {
+                            "cmd": "python3 -m pytest agent/tests/test_task_timeline.py",
+                            "status": "passed",
+                        },
+                    ],
+                    "diff_check": {"unexpected_files": []},
+                    "live_regression": {"status": "passed"},
+                },
+            },
+            {
+                "id": 7114,
+                "event_kind": "close_ready",
+                "phase": "close",
+                "status": "accepted",
+                "actor": "codex_observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "governance_redeploy": {"status": "passed"},
+                    "runtime_version_sync": True,
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                    "live_regression": {"status": "passed"},
+                },
+            },
+        ]
+
+        blocked_events = copy.deepcopy(events)
+        blocked_events[2]["payload"]["commands_run"] = [
+            {"cmd": "git diff --check", "status": "passed"},
+        ]
+        blocked = task_timeline.mf_close_gate_verification(
+            blocked_events,
+            contract=contract,
+        )
+        blocked_direct_gate = blocked["observer_direct_close_exception_gate"]
+        self.assertFalse(blocked_direct_gate["passed"], blocked)
+        self.assertIn(
+            "tests_or_test_results",
+            blocked_direct_gate["missing_requirement_ids"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(events, contract=contract)
+
+        direct_gate = ready["observer_direct_close_exception_gate"]
+        self.assertTrue(ready["passed"], ready)
+        self.assertTrue(direct_gate["passed"], ready)
+        self.assertNotIn("tests_or_test_results", direct_gate["missing_requirement_ids"])
+        self.assertEqual(direct_gate["verification_event"]["id"], 7113)
+
     def test_observer_direct_exception_rejects_loose_operator_approval_shape(self):
         from agent.governance import task_timeline
 

@@ -1784,7 +1784,11 @@ def _independent_qa_meta_gate_matches(event: dict[str, Any]) -> bool:
 
 def _independent_qa_schema_matches(event: dict[str, Any]) -> bool:
     for schema in _event_field_values(event, {"schema_version"}):
-        if "qa_canonical_verification" in _normalize_token(schema):
+        token = _normalize_token(schema)
+        if (
+            "qa_canonical_verification" in token
+            or "independent_qa_verification" in token
+        ):
             return True
     return False
 
@@ -8170,6 +8174,59 @@ def _event_has_evidence(event: dict[str, Any], keys: set[str]) -> bool:
     return bool(_event_deep_string_list(event, keys)) or _event_deep_truthy(event, keys)
 
 
+def _event_has_test_command_evidence(event: dict[str, Any]) -> bool:
+    test_markers = (
+        "pytest",
+        "python -m unittest",
+        "python3 -m unittest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "vitest",
+        "jest",
+        "playwright test",
+        "go test",
+        "cargo test",
+        "mvn test",
+        "gradle test",
+        "tox",
+    )
+    failing_statuses = {"blocked", "error", "failed", "fail", "red"}
+    for value in _event_field_values(event, {"commands_run"}):
+        commands = value if isinstance(value, list) else [value]
+        for command in commands:
+            command_map = _mapping(command)
+            status = _normalize_token(command_map.get("status")) if command_map else ""
+            if status in failing_statuses:
+                continue
+            parts = []
+            if command_map:
+                parts.extend(
+                    str(command_map.get(key) or "")
+                    for key in ("cmd", "command", "tool", "name")
+                )
+            else:
+                parts.append(str(command or ""))
+            text = " ".join(part.strip().lower() for part in parts if part.strip())
+            if text and any(marker in text for marker in test_markers):
+                return True
+    return False
+
+
+def _event_has_test_evidence(event: dict[str, Any]) -> bool:
+    return _event_has_evidence(
+        event,
+        {
+            "tests",
+            "tests_run",
+            "test_results",
+            "test_commands",
+            "focused_tests",
+            "pytest",
+        },
+    ) or _event_has_test_command_evidence(event)
+
+
 def _observer_direct_independent_verification_event(event: dict[str, Any]) -> bool:
     return (
         _independent_qa_event_kind_matches(event)
@@ -8247,17 +8304,7 @@ def _observer_direct_close_exception_gate(
         missing.append("changed_files_within_allowed_scope")
     if not verification:
         missing.append("independent_verification_after_implementation")
-    if not _event_has_evidence(
-        verification,
-        {
-            "tests",
-            "tests_run",
-            "test_results",
-            "test_commands",
-            "focused_tests",
-            "pytest",
-        },
-    ):
+    if not _event_has_test_evidence(verification):
         missing.append("tests_or_test_results")
     if not (
         _event_has_evidence(
