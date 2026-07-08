@@ -7266,6 +7266,107 @@ def test_parallel_branch_allocate_handler_persists_requested_file_scope(monkeypa
     assert persisted.target_files == tuple(target_files)
 
 
+def test_parallel_branch_allocate_handler_uses_successor_contract_as_worker_parent(
+    monkeypatch,
+) -> None:
+    from agent.governance import server as server_module
+
+    conn = _runtime_conn()
+    dispatch_calls: list[dict] = []
+
+    class NoCloseConnection:
+        def __init__(self, wrapped: sqlite3.Connection):
+            self._wrapped = wrapped
+
+        def close(self) -> None:
+            pass
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+    monkeypatch.setattr(
+        server_module,
+        "get_connection",
+        lambda project_id: NoCloseConnection(conn),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_require_graph_governance_operator",
+        lambda ctx, conn, action: None,
+    )
+
+    def _record_dispatch(*args, **kwargs):
+        dispatch_calls.append(
+            {
+                "body": dict(kwargs["body"]),
+                "prepared": dict(kwargs["prepared"]),
+            }
+        )
+        return {"ok": True, "event_id": "evt-dispatch-contract-parent"}
+
+    monkeypatch.setattr(
+        server_module,
+        "_record_bounded_worker_dispatch_event",
+        _record_dispatch,
+    )
+
+    ctx = server_module.RequestContext(
+        handler=None,
+        method="POST",
+        path_params={"project_id": PROJECT_ID},
+        query={},
+        body={
+            "task_id": "demo-launch-three-path-panels-worker",
+            "workspace_root": "/repo",
+            "backlog_id": "AC-DEMO-LAUNCH-PROMPT-THREE-PATH-PANELS-20260708",
+            "contract_execution_id": "cex-mf-parallel-307c47359d50d00cd128",
+            "parent_task_id": "onboard-service-d0af65af5807ab1e0cd4",
+            "root_task_id": "onboard-service-d0af65af5807ab1e0cd4",
+            "stage_task_id": "demo-launch-three-path-panels-worker",
+            "worker_id": "demo-launch-three-path-panels-worker",
+            "agent_id": "demo-launch-three-path-panels-worker",
+            "owned_files": ["frontend/dashboard/src/views/DemoLaunchView.tsx"],
+            "target_files": ["frontend/dashboard/src/views/DemoLaunchView.tsx"],
+            "base_commit": "base-demo",
+            "target_head_commit": "target-demo",
+            "merge_queue_id": "mq-demo",
+            "fence_token": "fence-demo",
+            "create_worktree": False,
+            "issue_same_owner_session_token": False,
+            "now_iso": NOW,
+        },
+        request_id="req-demo-parent-lineage",
+        token="",
+        idem_key="",
+    )
+
+    status, response = server_module.handle_graph_governance_parallel_branch_allocate(ctx)
+
+    assert status == 201
+    assert response["context"]["parent_task_id"] == (
+        "cex-mf-parallel-307c47359d50d00cd128"
+    )
+    assert response["context"]["root_task_id"] == "onboard-service-d0af65af5807ab1e0cd4"
+    assert dispatch_calls[0]["prepared"]["parent_task_id"] == (
+        "cex-mf-parallel-307c47359d50d00cd128"
+    )
+    assert dispatch_calls[0]["body"]["contract_parent_lineage"]["lineage_repaired"] == (
+        "true"
+    )
+    assert dispatch_calls[0]["body"]["contract_parent_lineage"]["requested_parent_task_id"] == (
+        "onboard-service-d0af65af5807ab1e0cd4"
+    )
+
+    persisted = get_branch_context(
+        conn,
+        PROJECT_ID,
+        "demo-launch-three-path-panels-worker",
+    )
+    assert persisted is not None
+    assert persisted.parent_task_id == "cex-mf-parallel-307c47359d50d00cd128"
+    assert persisted.root_task_id == "onboard-service-d0af65af5807ab1e0cd4"
+
+
 def test_parallel_branch_allocate_handler_generates_missing_merge_queue_id(monkeypatch) -> None:
     from agent.governance import server as server_module
 

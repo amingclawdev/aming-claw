@@ -7768,6 +7768,79 @@ def _parallel_branch_allocate_canonical_merge_queue_id(
     )
 
 
+def _parallel_branch_allocate_contract_parent_lineage(
+    body: Mapping[str, Any],
+) -> dict[str, str]:
+    successor_contract = (
+        body.get("successor_contract")
+        if isinstance(body.get("successor_contract"), Mapping)
+        else {}
+    )
+    merge_route_scope = (
+        successor_contract.get("merge_route_scope_guidance")
+        if isinstance(successor_contract.get("merge_route_scope_guidance"), Mapping)
+        else {}
+    )
+    successor_contract_execution_id = _runtime_context_public_text(
+        body.get("successor_contract_execution_id"),
+        body.get("contract_execution_id"),
+        body.get("current_contract_execution_id"),
+        successor_contract.get("successor_contract_execution_id"),
+        merge_route_scope.get("successor_contract_execution_id"),
+    )
+    root_contract_execution_id = _runtime_context_public_text(
+        body.get("root_task_id"),
+        body.get("root_contract_execution_id"),
+        body.get("parent_contract_execution_id"),
+        successor_contract.get("root_contract_execution_id"),
+        successor_contract.get("parent_contract_execution_id"),
+        merge_route_scope.get("root_contract_execution_id"),
+    )
+    requested_parent_task_id = _runtime_context_public_text(
+        body.get("parent_task_id")
+    )
+    parent_task_id = requested_parent_task_id
+    parent_task_id_source = "request_parent_task_id" if parent_task_id else ""
+
+    root_aliases = {
+        value
+        for value in (
+            root_contract_execution_id,
+            body.get("root_task_id"),
+            body.get("root_contract_execution_id"),
+            body.get("parent_contract_execution_id"),
+            successor_contract.get("root_contract_execution_id"),
+            successor_contract.get("parent_contract_execution_id"),
+            merge_route_scope.get("root_contract_execution_id"),
+        )
+        if _runtime_context_public_text(value)
+    }
+    root_aliases = {_runtime_context_public_text(value) for value in root_aliases}
+
+    if (
+        successor_contract_execution_id
+        and successor_contract_execution_id != root_contract_execution_id
+        and (not parent_task_id or parent_task_id in root_aliases)
+    ):
+        parent_task_id = successor_contract_execution_id
+        parent_task_id_source = "successor_contract_execution_id"
+
+    return {
+        "parent_task_id": parent_task_id,
+        "root_task_id": root_contract_execution_id,
+        "successor_contract_execution_id": successor_contract_execution_id,
+        "requested_parent_task_id": requested_parent_task_id,
+        "parent_task_id_source": parent_task_id_source,
+        "lineage_repaired": (
+            "true"
+            if parent_task_id
+            and requested_parent_task_id
+            and parent_task_id != requested_parent_task_id
+            else "false"
+        ),
+    }
+
+
 def _parallel_branch_allocate_row_test_files(
     project_id: str,
     backlog_id: str,
@@ -7895,8 +7968,25 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             [*request_target_files, *backlog_test_files]
         )
     worktree_root = str(ctx.body.get("worktree_root") or ".worktrees")
+    contract_parent_lineage = _parallel_branch_allocate_contract_parent_lineage(
+        ctx.body or {}
+    )
+    allocation_identity_body = {
+        **dict(ctx.body or {}),
+        "parent_task_id": (
+            contract_parent_lineage["parent_task_id"]
+            or str(ctx.body.get("parent_task_id") or "")
+        ),
+        "root_task_id": (
+            contract_parent_lineage["root_task_id"]
+            or str(ctx.body.get("root_task_id") or "")
+        ),
+    }
     normalized_merge_queue_id, merge_queue_id_source = (
-        _parallel_branch_allocate_canonical_merge_queue_id(project_id, ctx.body or {})
+        _parallel_branch_allocate_canonical_merge_queue_id(
+            project_id,
+            allocation_identity_body,
+        )
     )
     context = plan_branch_runtime_context(
         project_id=project_id,
@@ -7904,9 +7994,12 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         workspace_root=workspace_root,
         batch_id=str(ctx.body.get("batch_id") or ""),
         backlog_id=str(ctx.body.get("backlog_id") or ""),
-        parent_task_id=str(ctx.body.get("parent_task_id") or ""),
+        parent_task_id=contract_parent_lineage["parent_task_id"],
         chain_id=str(ctx.body.get("chain_id") or ""),
-        root_task_id=str(ctx.body.get("root_task_id") or ctx.body.get("parent_task_id") or ""),
+        root_task_id=(
+            contract_parent_lineage["root_task_id"]
+            or str(ctx.body.get("root_task_id") or ctx.body.get("parent_task_id") or "")
+        ),
         stage_task_id=str(ctx.body.get("stage_task_id") or task_id),
         stage_type=str(ctx.body.get("stage_type") or "mf_sub"),
         agent_id=allocation_owner,
@@ -8079,6 +8172,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 **dict(ctx.body or {}),
                 "merge_queue_id": saved.merge_queue_id,
                 "merge_queue_id_source": merge_queue_id_source,
+                "contract_parent_lineage": {
+                    key: value
+                    for key, value in contract_parent_lineage.items()
+                    if value
+                },
                 "target_files": list(saved.target_files),
                 "owned_files": list(saved.owned_files),
             }
@@ -8090,7 +8188,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     "runtime_context_id": saved.runtime_context_id,
                     "task_id": saved.task_id,
                     "backlog_id": saved.backlog_id,
-                    "parent_task_id": saved.root_task_id or saved.backlog_id,
+                    "parent_task_id": saved.parent_task_id
+                    or saved.root_task_id
+                    or saved.backlog_id,
                 },
                 branch_runtime_evidence=response["branch_runtime_evidence"],
                 source="parallel_branch_allocate",
@@ -57653,6 +57753,8 @@ def _record_bounded_worker_dispatch_event(
         prepared.get("parent_task_id"),
         startup_recording.get("parent_task_id"),
         dispatch_gate.get("parent_task_id"),
+        context.get("parent_task_id"),
+        prepared_runtime_context.get("parent_task_id"),
         context.get("root_task_id"),
         prepared_runtime_context.get("root_task_id"),
         context.get("chain_id"),
@@ -57669,6 +57771,23 @@ def _record_bounded_worker_dispatch_event(
         "contract_execution_id",
         "successor_contract_execution_id",
     )
+    contract_runtime_root_id = _first_field(
+        "root_task_id",
+        "root_contract_execution_id",
+        "parent_contract_execution_id",
+    )
+    if (
+        contract_runtime_execution_id
+        and contract_runtime_execution_id != contract_runtime_root_id
+        and (
+            not parent_task_id
+            or (
+                contract_runtime_root_id
+                and parent_task_id == contract_runtime_root_id
+            )
+        )
+    ):
+        parent_task_id = contract_runtime_execution_id
     if not observer_command_id and contract_runtime_execution_id:
         observer_command_id = contract_runtime_execution_id
         dispatch_identity_bridge = {
