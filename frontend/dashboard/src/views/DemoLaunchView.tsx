@@ -384,7 +384,10 @@ function DemoEnvironmentCard(props: {
           return (
             <section key={prompt.id} className="demo-code-panel demo-prompt-panel">
               <div className="demo-code-head">
-                <span>{prompt.label || "Launch prompt"}</span>
+                <span className="demo-prompt-title">
+                  <span>{prompt.label || "Launch prompt"}</span>
+                  <span className="demo-prompt-kicker">Copy-safe prompt</span>
+                </span>
                 <button
                   type="button"
                   className="action-btn"

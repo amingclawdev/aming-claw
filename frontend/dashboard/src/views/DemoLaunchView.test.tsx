@@ -44,6 +44,8 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
         "Run the Aming Claw Daily Planner Lite Direct Main happy-path demo from start to finish.",
         "Use operator_supervised_direct_main for a tiny deterministic implementation.",
         "Start through onboard_route_guide and run rg then graph_query.",
+        "Copy-safe prompt rule:",
+        "Never paste or persist raw session, fence, or route tokens.",
       ].join("\n"),
     },
     {
@@ -56,6 +58,8 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
         "Parallel implementation shape:",
         "Focus/UI lane",
         "Reminder/domain lane",
+        "The observer must use the system CLI agent service or a host-created bounded worker/subagent.",
+        "Do not act as the worker from the observer session.",
       ].join("\n"),
     },
     {
@@ -67,6 +71,8 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
         "Use mf_batch_parallel for two compatible backlog rows.",
         "Row A: Today Focus",
         "Row B: reminder toggle",
+        "Independent QA must run from a distinct verifier lane/session where possible.",
+        "QA runs its own rg + graph_query with query_source=qa and query_purpose=independent_verification.",
       ].join("\n"),
     },
   ],
@@ -92,13 +98,18 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   const created = environmentFromCreateResponse(demoLaunchFixtureEnvironment);
   const links = demoEnvironmentLinks(created);
   const prompts = demoLaunchPrompts(created);
+  const legacyPrompts = demoLaunchPrompts({
+    ...created,
+    launch_prompt: "Legacy launch prompt",
+    launch_prompts: [],
+  });
   const status = demoEnvironmentStatus(created);
   const shortBaseline = shortCommit(created.baseline_commit);
 
   if (template.id !== DAILY_PLANNER_TEMPLATE_ID) throw new Error("daily planner template was not selected");
   if (links.length !== 5) throw new Error("all operational demo links should be present");
   if (status.label !== "Ready") throw new Error("ready environment should render with ready status");
-  if (shortBaseline !== "881326a51cb") throw new Error("baseline commit should be shortened for compact panels");
+  if (shortBaseline !== "881326a51cb4") throw new Error("baseline commit should be shortened for compact panels");
   if (!created.launch_prompt.includes("Daily Planner Lite")) throw new Error("launch prompt must be surfaced");
   if (!created.launch_prompt.includes("Intent:")) throw new Error("launch prompt must include explicit intent");
   if (!created.launch_prompt.includes("Today Focus and reminder visual planner board")) throw new Error("launch prompt must name the demo requirement");
@@ -109,6 +120,11 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!prompts.some((prompt) => prompt.id === "direct_main" && prompt.prompt.includes("operator_supervised_direct_main"))) throw new Error("direct_main prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_parallel" && prompt.prompt.includes("mf_parallel"))) throw new Error("mf_parallel prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_batch_parallel" && prompt.prompt.includes("mf_batch_parallel"))) throw new Error("mf_batch_parallel prompt must be available");
+  if (!prompts.some((prompt) => prompt.prompt.includes("Copy-safe prompt rule:"))) throw new Error("copy-safe prompt rule must be surfaced");
+  if (!prompts.some((prompt) => prompt.prompt.includes("system CLI agent service or a host-created bounded worker/subagent"))) throw new Error("worker prompt must force a host-created worker lane");
+  if (!prompts.some((prompt) => prompt.prompt.includes("Do not act as the worker from the observer session"))) throw new Error("observer must not impersonate worker");
+  if (!prompts.some((prompt) => prompt.prompt.includes("query_source=qa") && prompt.prompt.includes("query_purpose=independent_verification"))) throw new Error("QA graph query identity must be explicit");
+  if (legacyPrompts.length !== 1 || legacyPrompts[0]?.id !== "legacy") throw new Error("legacy launch_prompt fallback must be preserved");
 
   return links.map((link) => link.label);
 }
