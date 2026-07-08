@@ -10749,6 +10749,9 @@ def _recover_read_model_merge_queue_items(
         return items
     contexts_by_task = _context_by_task_id(contexts)
     batch_items_by_task = _batch_items_by_task_id(batch_runtime)
+    active_target_ref = target_ref or (
+        batch_runtime.target_ref if batch_runtime is not None else ""
+    )
     recovered: list[MergeQueueItem] = []
     seen_tasks: set[str] = set()
 
@@ -10775,6 +10778,16 @@ def _recover_read_model_merge_queue_items(
         if batch_item.merge_queue_id and batch_item.merge_queue_id != merge_queue_id:
             continue
         context = contexts_by_task.get(batch_item.task_id)
+        if context is not None and not _context_matches_read_model_target_ref(
+            context,
+            active_target_ref=active_target_ref,
+        ):
+            continue
+        if context is not None and not _context_matches_read_model_preview_queue(
+            context,
+            active_merge_queue_id=merge_queue_id,
+        ):
+            continue
         if (
             context is not None
             and context.merge_queue_id
@@ -10802,6 +10815,16 @@ def _recover_read_model_merge_queue_items(
         if context.task_id in seen_tasks:
             continue
         if context.merge_queue_id != merge_queue_id:
+            continue
+        if not _context_matches_read_model_target_ref(
+            context,
+            active_target_ref=active_target_ref,
+        ):
+            continue
+        if not _context_matches_read_model_preview_queue(
+            context,
+            active_merge_queue_id=merge_queue_id,
+        ):
             continue
         recovered.append(
             _merge_queue_item_from_context_lineage(
@@ -16410,21 +16433,82 @@ def _read_model_queue_task_ids(
     )
 
 
+def _read_model_normalized_target_ref(value: str) -> str:
+    ref = str(value or "").strip()
+    if not ref:
+        return ""
+    if ref.startswith("refs/"):
+        return ref
+    return f"refs/heads/{ref}"
+
+
+def _context_matches_read_model_target_ref(
+    context: BranchTaskRuntimeContext,
+    *,
+    active_target_ref: str,
+) -> bool:
+    target_ref = _read_model_normalized_target_ref(active_target_ref)
+    if not target_ref:
+        return True
+    context_ref = _read_model_normalized_target_ref(context.ref_name)
+    return not context_ref or context_ref == target_ref
+
+
+def _context_matches_read_model_preview_queue(
+    context: BranchTaskRuntimeContext,
+    *,
+    active_merge_queue_id: str,
+) -> bool:
+    queue_id = str(active_merge_queue_id or "").strip()
+    preview_id = str(context.merge_preview_id or "").strip()
+    if not queue_id or not preview_id or ":" not in preview_id:
+        return True
+    preview_queue_id = preview_id.split(":", 1)[0].strip()
+    return not preview_queue_id or preview_queue_id == queue_id
+
+
 def _context_matches_read_model_queue(
     context: BranchTaskRuntimeContext,
     *,
     active_merge_queue_id: str,
     active_queue_task_ids: Sequence[str] = (),
+    active_target_ref: str = "",
     include_unscoped_non_ready: bool = True,
 ) -> bool:
     queue_id = str(active_merge_queue_id or "").strip()
     if not queue_id:
-        return True
+        return _context_matches_read_model_target_ref(
+            context,
+            active_target_ref=active_target_ref,
+        )
     context_queue_id = str(context.merge_queue_id or "").strip()
     if context_queue_id:
-        return context_queue_id == queue_id
+        return (
+            context_queue_id == queue_id
+            and _context_matches_read_model_target_ref(
+                context,
+                active_target_ref=active_target_ref,
+            )
+            and _context_matches_read_model_preview_queue(
+                context,
+                active_merge_queue_id=queue_id,
+            )
+        )
     if context.task_id in active_queue_task_ids:
-        return True
+        return _context_matches_read_model_target_ref(
+            context,
+            active_target_ref=active_target_ref,
+        )
+    if not _context_matches_read_model_target_ref(
+        context,
+        active_target_ref=active_target_ref,
+    ):
+        return False
+    if not _context_matches_read_model_preview_queue(
+        context,
+        active_merge_queue_id=queue_id,
+    ):
+        return False
     if context.status == STATE_WORKTREE_READY:
         return False
     return include_unscoped_non_ready
@@ -16439,6 +16523,7 @@ def build_parallel_branch_read_model(
     merge_queue_plan: MergeQueuePlan | None = None,
     batch_plan: BatchRollbackPlan | None = None,
     active_merge_queue_id: str = "",
+    target_ref: str = "",
     limit: int = 50,
 ) -> ParallelBranchReadModel:
     """Build the bounded PB-010 operator view for dashboard and MCP clients.
@@ -16462,6 +16547,7 @@ def build_parallel_branch_read_model(
                 context,
                 active_merge_queue_id=active_merge_queue_id,
                 active_queue_task_ids=active_queue_task_ids,
+                active_target_ref=target_ref,
                 include_unscoped_non_ready=bool(batch_id),
             )
         )
@@ -16594,5 +16680,6 @@ def build_parallel_branch_read_model_from_db(
         merge_queue_plan=queue_plan,
         batch_plan=batch_plan,
         active_merge_queue_id=queue_id,
+        target_ref=target_ref,
         limit=limit,
     )
