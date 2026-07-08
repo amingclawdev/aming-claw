@@ -145,17 +145,32 @@ REQUIRED_EVIDENCE: tuple[str, ...] = (
 
 ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v1"
 
-# These observer-owned actions are governance/evidence/reconcile operations. A
-# route token scoped only to these actions must be copy-safe for direct-main
-# observer work and must not advertise that an mf_sub implementation lane exists
-# or is legally required.
-OBSERVER_DIRECT_MAIN_ACTIONS: tuple[str, ...] = (
+# These observer-owned actions are governance/evidence/reconcile/close-control
+# operations. A route token scoped only to these actions must be copy-safe for
+# observer work and must not advertise that a fresh mf_sub implementation lane
+# exists or is legally required.
+OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS: tuple[str, ...] = (
+    "backlog_upsert",
+    "backlog_close",
     "task_timeline_append",
     "graph_current_full_reconcile",
     "contract_runtime_current",
     "contract_runtime_guide",
     "contract_runtime_submit_line",
     "runtime_context_read_receipt",
+    "submit_mf_subagent_read_receipt",
+    "record_mf_subagent_startup",
+    "record_implementation_evidence",
+    "runtime_context_implementation_evidence",
+    "record_finish_time_worker_attestation",
+    "runtime_context_finish_time_worker_attestation",
+    "record_finish_gate",
+    "runtime_context_finish_gate",
+    "observer_route_context_current",
+    "observer_route_context_renew",
+    "renew_route_token_ref",
+    "route_token_ref_renewal_next_action",
+    "resolve_route_token_ref",
     "capture_intent",
     "run_route_precheck",
     "verify_evidence",
@@ -169,11 +184,16 @@ IMPLEMENTATION_OR_MERGE_ACTIONS: tuple[str, ...] = (
     "dispatch_bounded_lane",
     "execute_backlog_row",
     "close_or_merge_after_evidence",
-    "backlog_close",
     "direct_fix_enter",
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
+    "mf_parallel_merge",
+    "mf_batch_merge",
     "parallel_branch_merge_queue_materialize",
+    "parallel_branch_merge_queue_apply",
+    "merge_queue",
+    "merge_execute",
+    "merge_result",
     "merge",
 )
 
@@ -415,17 +435,21 @@ def _route_lane_requirements_for_actions(
 
     actions = _normalized_action_list(allowed_actions)
     action_set = set(actions)
-    direct_main_actions = {
-        _gate_normalized_action(action) for action in OBSERVER_DIRECT_MAIN_ACTIONS
+    admin_close_evidence_actions = {
+        _gate_normalized_action(action)
+        for action in OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS
     }
     implementation_or_merge_actions = {
         _gate_normalized_action(action)
         for action in IMPLEMENTATION_OR_MERGE_ACTIONS
     }
     unknown_actions = sorted(
-        action_set - direct_main_actions - implementation_or_merge_actions
+        action_set - admin_close_evidence_actions - implementation_or_merge_actions
     )
     implementation_markers = sorted(action_set & implementation_or_merge_actions)
+    admin_close_evidence_markers = sorted(
+        action_set & admin_close_evidence_actions
+    )
     requires_worker_lane = bool(implementation_markers or unknown_actions)
 
     if requires_worker_lane:
@@ -438,13 +462,14 @@ def _route_lane_requirements_for_actions(
             "lane requirements remain in force."
         )
     else:
-        classification = "observer_direct_non_implementation"
+        classification = "observer_admin_close_evidence_only"
         required_lanes = [dict(lane) for lane in OBSERVER_DIRECT_MAIN_REQUIRED_LANES]
         required_evidence = list(OBSERVER_DIRECT_MAIN_REQUIRED_EVIDENCE)
         copy_safe_guidance = (
-            "This route action scope is limited to observer-owned evidence, "
-            "contract-runtime, or graph reconcile work and does not require or "
-            "imply an mf_sub implementation lane."
+            "This route action scope is limited to observer-owned admin, "
+            "close-control, evidence, contract-runtime, route-token, or graph "
+            "reconcile work and does not require or imply a fresh mf_sub "
+            "implementation lane."
         )
 
     return {
@@ -454,9 +479,8 @@ def _route_lane_requirements_for_actions(
             "schema_version": ROUTE_ACTION_SCOPE_SCHEMA_VERSION,
             "classification": classification,
             "allowed_actions": actions,
-            "direct_main_or_reconcile_actions": sorted(
-                action_set & direct_main_actions
-            ),
+            "direct_main_or_reconcile_actions": admin_close_evidence_markers,
+            "admin_close_or_evidence_actions": admin_close_evidence_markers,
             "implementation_or_merge_actions": implementation_markers,
             "unknown_actions": unknown_actions,
             "requires_mf_sub_implementation_lane": requires_worker_lane,
