@@ -41372,6 +41372,68 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert "fence-runtime-context-projection" not in json.dumps(after)
 
 
+def test_contract_runtime_current_blocks_stale_dispatch_runtime_context_mismatch(conn):
+    backlog_id = "AC-MF-PARALLEL-STALE-DISPATCH-RUNTIME-CONTEXT"
+    successor, stale_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="stale-dispatch-parent",
+        worker_task_id="stale-dispatch-worker",
+        fence_token="fence-stale-dispatch",
+        token="stale-dispatch-worker-token",
+    )
+    replacement_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="stale-dispatch-worker-r2",
+        parent_task_id=backlog_id,
+        fence_token="fence-stale-dispatch-r2",
+        token="stale-dispatch-worker-token-r2",
+        target_head_commit="head-stale-dispatch-r2",
+        merge_queue_id="mq-stale-dispatch-r2",
+        owned_files=("agent/governance/server.py",),
+    )
+    _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        replacement_context,
+        backlog_id=backlog_id,
+        fence_token="fence-stale-dispatch-r2",
+        graph_trace_id="gqt-stale-dispatch-r2",
+        head_commit="head-stale-dispatch-r2",
+    )
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "observer",
+        )
+    )
+
+    assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+    projection = current["runtime_guide"]["completed_lines_projection"]
+    assert projection["status"] == "stale_dispatch_identity_mismatch"
+    assert projection["projected_line_count"] == 0
+    mismatch = projection["dispatch_identity_mismatch"]
+    assert mismatch["blocked"] is True
+    assert mismatch["blocker"] == "stale_dispatch_runtime_context_identity_mismatch"
+    assert mismatch["expected_dispatch_contexts"][0]["runtime_context_id"] == (
+        stale_context.runtime_context_id
+    )
+    assert mismatch["evidence_contexts"][0]["runtime_context_id"] == (
+        replacement_context.runtime_context_id
+    )
+    assert mismatch["guidance"]["observer_must_not_backfill_mf_sub_evidence"] is True
+    assert (
+        mismatch["guidance"]["next_action"]
+        == "redispatch_rebind_or_start_fresh_child_runtime_context"
+    )
+    serialized_projection = json.dumps(projection, sort_keys=True)
+    assert "fence-stale-dispatch" not in serialized_projection
+    assert "worker_read_runtime_guide" in mismatch["evidence_contexts"][0][
+        "worker_projected_line_ids"
+    ]
+
+
 def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(conn):
     backlog_id = "AC-MF-PARALLEL-DISPATCH-LIST-RUNTIME-CONTEXT"
     task_id = "parallel-list-dispatch-task"

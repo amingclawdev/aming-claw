@@ -40182,6 +40182,7 @@ def _contract_runtime_mf_parallel_context_projection(
     projected_refs: list[dict[str, Any]] = []
     source_refs: list[str] = []
     existing_keys = _contract_runtime_projection_line_keys(completed_lines)
+    expected_context_summaries: list[dict[str, Any]] = []
     for dispatch_line in dispatch_lines:
         for context in _contract_runtime_contexts_for_dispatch_line(
             conn,
@@ -40195,6 +40196,12 @@ def _contract_runtime_mf_parallel_context_projection(
                 record=record,
                 context=context,
                 existing_keys=existing_keys,
+            )
+            expected_context_summaries.append(
+                _contract_runtime_projection_context_summary(
+                    context,
+                    projection=context_projection,
+                )
             )
             for line in context_projection.get("projected_lines", []):
                 if not isinstance(line, Mapping):
@@ -40211,14 +40218,28 @@ def _contract_runtime_mf_parallel_context_projection(
                 if text and text not in source_refs:
                     source_refs.append(text)
 
-    if not projected_lines:
-        return {}
-    projected_completed_lines = _contract_runtime_merge_projected_completed_lines(
-        completed_lines,
-        projected_lines,
+    identity_mismatch = _contract_runtime_mf_parallel_dispatch_identity_mismatch(
+        conn,
+        project_id=project_id,
+        record=record,
+        expected_context_summaries=expected_context_summaries,
+        existing_keys=existing_keys,
     )
-    return {
+    if not projected_lines and not identity_mismatch:
+        return {}
+    projected_completed_lines = (
+        _contract_runtime_merge_projected_completed_lines(
+            completed_lines,
+            projected_lines,
+        )
+        if projected_lines
+        else completed_lines
+    )
+    projection = {
         "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
+        "status": (
+            "projected" if projected_lines else "stale_dispatch_identity_mismatch"
+        ),
         "source": "runtime_context_worker_evidence",
         "source_of_authority": "branch_runtime_context+task_timeline+graph_query_traces",
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
@@ -40234,6 +40255,9 @@ def _contract_runtime_mf_parallel_context_projection(
             "observer_authored_worker_backfill": False,
         },
     }
+    if identity_mismatch:
+        projection["dispatch_identity_mismatch"] = identity_mismatch
+    return projection
 
 
 def _contract_runtime_merge_projected_completed_lines(
@@ -40460,6 +40484,204 @@ def _contract_runtime_projection_for_context(
         "projected_line_refs": projected_line_refs,
         "source_refs": source_refs,
     }
+
+
+_MF_PARALLEL_CONTEXT_WORKER_LINE_IDS = {
+    line_id for _stage_id, line_id, _evidence_kind, _source_key in (
+        _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES
+    )
+}
+
+
+def _contract_runtime_projection_context_summary(
+    context: Any,
+    *,
+    projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    lines = (
+        projection.get("projected_lines")
+        if isinstance(projection, Mapping)
+        and isinstance(projection.get("projected_lines"), list)
+        else []
+    )
+    line_ids: list[str] = []
+    for line in lines:
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id and line_id not in line_ids:
+            line_ids.append(line_id)
+    worker_line_ids = [
+        line_id for line_id in line_ids if line_id in _MF_PARALLEL_CONTEXT_WORKER_LINE_IDS
+    ]
+    source_refs = []
+    if isinstance(projection, Mapping):
+        source_refs = [
+            str(ref or "").strip()
+            for ref in projection.get("source_refs") or []
+            if str(ref or "").strip()
+        ]
+    return {
+        "schema_version": "contract_runtime.context_projection_summary.v1",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "projected_line_count": len(line_ids),
+        "worker_projected_line_count": len(worker_line_ids),
+        "projected_line_ids": line_ids,
+        "worker_projected_line_ids": worker_line_ids,
+        "source_refs": source_refs,
+    }
+
+
+def _contract_runtime_mf_parallel_dispatch_identity_mismatch(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    expected_context_summaries: Sequence[Mapping[str, Any]],
+    existing_keys: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    if conn is None or not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "")
+    ):
+        return {}
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    contract_execution_id = str(record.get("contract_execution_id") or "").strip()
+    parent_contract_execution_id = str(
+        record.get("parent_contract_execution_id")
+        or record.get("root_contract_execution_id")
+        or ""
+    ).strip()
+    valid_parent_ids = {
+        value
+        for value in (
+            backlog_id,
+            contract_execution_id,
+            parent_contract_execution_id,
+        )
+        if value
+    }
+    expected_runtime_context_ids = {
+        str(summary.get("runtime_context_id") or "").strip()
+        for summary in expected_context_summaries
+        if str(summary.get("runtime_context_id") or "").strip()
+    }
+    expected_task_ids = {
+        str(summary.get("task_id") or "").strip()
+        for summary in expected_context_summaries
+        if str(summary.get("task_id") or "").strip()
+    }
+    best_expected_worker_line_count = max(
+        [
+            int(summary.get("worker_projected_line_count") or 0)
+            for summary in expected_context_summaries
+        ]
+        or [0]
+    )
+
+    try:
+        from .parallel_branch_runtime import list_branch_contexts
+
+        contexts = list_branch_contexts(conn, project_id)
+    except Exception:
+        return {}
+
+    evidence_contexts: list[dict[str, Any]] = []
+    for context in contexts:
+        runtime_context_id, task_id, parent_task_id = (
+            _contract_runtime_context_identity(context)
+        )
+        if not runtime_context_id or runtime_context_id in expected_runtime_context_ids:
+            continue
+        if task_id and task_id in expected_task_ids:
+            continue
+        context_backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+        if backlog_id and context_backlog_id and context_backlog_id != backlog_id:
+            continue
+        root_task_id = str(getattr(context, "root_task_id", "") or "").strip()
+        if valid_parent_ids and not (
+            parent_task_id in valid_parent_ids or root_task_id in valid_parent_ids
+        ):
+            continue
+        projection = _contract_runtime_projection_for_context(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            existing_keys=set(existing_keys),
+        )
+        summary = _contract_runtime_projection_context_summary(
+            context,
+            projection=projection,
+        )
+        if (
+            int(summary.get("worker_projected_line_count") or 0)
+            <= best_expected_worker_line_count
+        ):
+            continue
+        if not summary.get("worker_projected_line_ids"):
+            continue
+        evidence_contexts.append(summary)
+
+    if not evidence_contexts:
+        return {}
+    evidence_contexts.sort(
+        key=lambda item: (
+            int(item.get("worker_projected_line_count") or 0),
+            int(item.get("projected_line_count") or 0),
+            str(item.get("task_id") or ""),
+        ),
+        reverse=True,
+    )
+    return {
+        "schema_version": (
+            "contract_runtime.mf_parallel.dispatch_identity_mismatch.v1"
+        ),
+        "status": "blocked",
+        "blocked": True,
+        "blocker": "stale_dispatch_runtime_context_identity_mismatch",
+        "contract_execution_id": contract_execution_id,
+        "backlog_id": backlog_id,
+        "expected_dispatch_contexts": [
+            dict(summary) for summary in expected_context_summaries
+        ],
+        "evidence_contexts": [dict(item) for item in evidence_contexts[:3]],
+        "guidance": {
+            "next_action": (
+                "redispatch_rebind_or_start_fresh_child_runtime_context"
+            ),
+            "legal_recovery": [
+                "re-read ContractRuntime current before merge/close",
+                "if a retry or replacement worker uses a new runtime_context_id, "
+                "create a legal ContractRuntime dispatch binding for that context",
+                "do not project task_timeline-only worker evidence across a stale "
+                "dispatch identity",
+            ],
+            "observer_must_not_backfill_mf_sub_evidence": True,
+            "raw_session_token_required": False,
+            "raw_fence_token_required": False,
+        },
+        "message": (
+            "Worker evidence exists under a different runtime_context/task_id "
+            "than the child ContractRuntime dispatch line; re-dispatch or rebind "
+            "the child runtime before merge/close can become authoritative."
+        ),
+    }
+
+
+def _contract_runtime_projection_dispatch_identity_mismatch(
+    projection: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(projection, Mapping):
+        return {}
+    mismatch = projection.get("dispatch_identity_mismatch")
+    if isinstance(mismatch, Mapping) and mismatch.get("blocked"):
+        return dict(mismatch)
+    return {}
 
 
 def _contract_runtime_projection_post_worker_lines(
@@ -51655,25 +51877,33 @@ def _contract_runtime_close_gate(
         projection=projection,
     )
     if not result.get("ok"):
+        diagnostics = {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+            "accepted": False,
+            "primary_decision_source": True,
+            "agent_facing_decision_source": (
+                "contract_runtime_first_missing_line"
+            ),
+            "contract_execution_id": contract_execution_id,
+            "actor_role": actor_role,
+            "requested_event_kind": event_kind,
+            "stage_id": line.get("stage_id", ""),
+            "line_id": line.get("line_id", ""),
+            "evidence_kind": line.get("evidence_kind", ""),
+            "decision": result.get("decision") or {},
+        }
+        identity_mismatch = _contract_runtime_projection_dispatch_identity_mismatch(
+            projection
+        )
+        if identity_mismatch:
+            diagnostics["runtime_context_dispatch_identity_mismatch"] = (
+                identity_mismatch
+            )
         raise GovernanceError(
             "contract_runtime_close_evidence_rejected",
             "ContractRuntime rejected protected close evidence line write",
             422,
-            {
-                "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
-                "accepted": False,
-                "primary_decision_source": True,
-                "agent_facing_decision_source": (
-                    "contract_runtime_first_missing_line"
-                ),
-                "contract_execution_id": contract_execution_id,
-                "actor_role": actor_role,
-                "requested_event_kind": event_kind,
-                "stage_id": line.get("stage_id", ""),
-                "line_id": line.get("line_id", ""),
-                "evidence_kind": line.get("evidence_kind", ""),
-                "decision": result.get("decision") or {},
-            },
+            diagnostics,
         )
     updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     guide = updated.get("runtime_guide") if isinstance(updated.get("runtime_guide"), Mapping) else {}
@@ -55571,6 +55801,21 @@ def _contract_runtime_close_authority_projection(
 
     current_state = _runtime_current_state_from_record(record)
     if current_state.get("next_legal_action"):
+        public_safe_diagnostics = (
+            _contract_runtime_close_authority_public_diagnostics(
+                project_id=project_id,
+                backlog_id=bug_id,
+                contract_execution_id=contract_execution_id,
+                status="incomplete",
+            )
+        )
+        identity_mismatch = _contract_runtime_projection_dispatch_identity_mismatch(
+            _runtime_context_projection
+        )
+        if identity_mismatch:
+            public_safe_diagnostics[
+                "runtime_context_dispatch_identity_mismatch"
+            ] = identity_mismatch
         return {
             **_contract_runtime_close_authority_payload_fields(),
             "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
@@ -55585,14 +55830,7 @@ def _contract_runtime_close_authority_projection(
             "contract_execution_id": contract_execution_id,
             "next_legal_action": current_state.get("next_legal_action") or {},
             "projected_events": [],
-            "public_safe_diagnostics": (
-                _contract_runtime_close_authority_public_diagnostics(
-                    project_id=project_id,
-                    backlog_id=bug_id,
-                    contract_execution_id=contract_execution_id,
-                    status="incomplete",
-                )
-            ),
+            "public_safe_diagnostics": public_safe_diagnostics,
         }
 
     guide = (
