@@ -351,6 +351,10 @@ MERGE_READY_INPUT_STATES = {
     STATE_VALIDATED,
     STATE_MERGE_READY,
 }
+DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES = (
+    STATE_QUEUED_FOR_MERGE,
+    STATE_MERGE_READY,
+)
 _MERGE_QUEUE_STATUS_ALIASES = {
     "queued": STATE_QUEUED_FOR_MERGE,
     "ready_for_merge": STATE_QUEUED_FOR_MERGE,
@@ -362,6 +366,161 @@ def _normalize_merge_queue_status(status: str) -> str:
     if not value:
         return STATE_QUEUED_FOR_MERGE
     return _MERGE_QUEUE_STATUS_ALIASES.get(value, value)
+
+
+def _durable_merge_queue_status_ready_for_live_apply(status: str) -> bool:
+    return _normalize_merge_queue_status(status) in DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+
+
+def _durable_merge_queue_status_policy(status: str) -> dict[str, Any]:
+    observed = str(status or "").strip()
+    normalized = _normalize_merge_queue_status(observed)
+    live_apply_ready = normalized in DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+    return {
+        "schema_version": "merge_queue.durable_status_policy.v1",
+        "required_statuses_before_live_apply": list(
+            DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+        ),
+        "observed_status": observed,
+        "normalized_status": normalized,
+        "live_apply_ready": live_apply_ready,
+        "close_satisfying": live_apply_ready,
+        "materialized_noop_close_satisfying": False,
+        "message": (
+            "Durable merge queue live apply requires queued_for_merge or "
+            "merge_ready; materialized/noop only means no live apply can "
+            "proceed and is not close-satisfying."
+        ),
+    }
+
+
+def _route_local_merge_queue_id_diagnostics(merge_queue_id: str) -> dict[str, Any]:
+    authoritative_id = str(merge_queue_id or "").strip()
+    return {
+        "schema_version": "merge_queue.route_local_id_diagnostics.v1",
+        "runtime_context_merge_queue_id_authoritative": True,
+        "authoritative_merge_queue_id": authoritative_id,
+        "authoritative_merge_queue_id_source": (
+            "runtime_context.current_values.merge_queue_id"
+        ),
+        "route_local_merge_queue_id_scope": "route_issue_response_only",
+        "route_local_merge_queue_id_allowed_for_materialize": False,
+        "message": (
+            "Use runtime_context.current_values.merge_queue_id for durable "
+            "materialize/apply; route-local merge_queue_id values are diagnostics "
+            "from route issue only."
+        ),
+    }
+
+
+def _merge_queue_status_copy_safe_recovery_payload(
+    *,
+    project_id: str,
+    task_id: str,
+    backlog_id: str = "",
+    merge_queue_id: str,
+    queue_item_id: str,
+    target_ref: str = "",
+    current_target_head: str = "",
+    validated_target_head: str = "",
+    merge_preview_id: str = "",
+    checkpoint_id: str = "",
+    finish_gate_ref: str = "",
+    verification_event_refs: Sequence[str] = (),
+    graph_trace_ids: Sequence[str] = (),
+    route_action_precheck_event_ref: str = "",
+    close_ready_event_ref: str = "",
+    route_token_ref: str = "",
+    observed_status: str = "",
+    reason_code: str = "durable_queue_status_not_live_apply_ready",
+) -> dict[str, Any]:
+    queue_id = str(merge_queue_id or "").strip()
+    item_id = str(queue_item_id or "").strip()
+    lane_task_id = str(task_id or "").strip()
+    validated_head = str(validated_target_head or current_target_head or "").strip()
+    preview_id = str(merge_preview_id or "").strip()
+    merge_evidence = {
+        "schema_version": "merge_queue.materialize_recovery_evidence.v1",
+        "checkpoint_id": str(checkpoint_id or "").strip(),
+        "finish_gate_ref": str(finish_gate_ref or "").strip(),
+        "verification_event_refs": [str(ref) for ref in verification_event_refs if str(ref)],
+        "graph_trace_ids": [str(ref) for ref in graph_trace_ids if str(ref)],
+        "route_action_precheck_event_ref": str(
+            route_action_precheck_event_ref or ""
+        ).strip(),
+        "close_ready_event_ref": str(close_ready_event_ref or "").strip(),
+    }
+    tool_args = {
+        "project_id": str(project_id or "").strip(),
+        "task_id": lane_task_id,
+        "backlog_id": str(backlog_id or "").strip(),
+        "merge_queue_id": queue_id,
+        "queue_item_id": item_id or (f"{queue_id}:{lane_task_id}" if queue_id else ""),
+        "target_ref": str(target_ref or "").strip(),
+        "current_target_head": str(current_target_head or "").strip(),
+        "validated_target_head": validated_head,
+        "merge_preview_id": preview_id,
+        "checkpoint_id": merge_evidence["checkpoint_id"],
+        "finish_gate_ref": merge_evidence["finish_gate_ref"],
+        "verification_event_refs": merge_evidence["verification_event_refs"],
+        "graph_trace_ids": merge_evidence["graph_trace_ids"],
+        "route_action_precheck_event_ref": merge_evidence[
+            "route_action_precheck_event_ref"
+        ],
+        "close_ready_event_ref": merge_evidence["close_ready_event_ref"],
+        "require_finish_gate": True,
+        "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
+        "status": STATE_MERGE_READY,
+        "route_token_ref": str(route_token_ref or "").strip(),
+    }
+    required_fields = {
+        "merge_queue_id": queue_id,
+        "queue_item_id": tool_args["queue_item_id"],
+        "validated_target_head": validated_head,
+        "merge_preview_id": preview_id,
+        "merge_evidence": any(
+            value for key, value in merge_evidence.items() if key != "schema_version"
+        ),
+    }
+    missing_fields = [
+        field
+        for field, value in required_fields.items()
+        if not _runtime_context_value_present(value)
+    ]
+    return {
+        "schema_version": "merge_queue.status_recovery_payload.v1",
+        "status": "rematerialize_required",
+        "reason_code": reason_code,
+        "observed_status": str(observed_status or "").strip(),
+        "required_status": STATE_MERGE_READY,
+        "required_statuses_before_live_apply": list(
+            DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+        ),
+        "close_satisfying_by_itself": False,
+        "copy_safe": True,
+        "raw_session_token_included": False,
+        "raw_fence_token_included": False,
+        "raw_route_token_included": False,
+        "authoritative_runtime_merge_queue_id": queue_id,
+        "authoritative_runtime_queue_item_id": tool_args["queue_item_id"],
+        "route_local_merge_queue_id_diagnostics": (
+            _route_local_merge_queue_id_diagnostics(queue_id)
+        ),
+        "recovery_text": (
+            "Re-materialize the authoritative runtime queue item to merge_ready "
+            "with validated_target_head, merge_preview_id, and merge evidence "
+            "before any live apply attempt."
+        ),
+        "tool": "parallel_branch_merge_queue_materialize",
+        "protected_action": "parallel_branch_merge_queue_materialize",
+        "tool_args": {
+            key: value
+            for key, value in tool_args.items()
+            if value not in ("", [], {}, None)
+        },
+        "merge_evidence": merge_evidence,
+        "missing_recovery_fields": missing_fields,
+    }
 
 
 RUNTIME_CONTEXT_DEFAULT_LANE_CLAUSES = (
@@ -1297,6 +1456,7 @@ class MergeQueueDecision:
     observed_status: str
     queue_state: str
     action: str
+    project_id: str = ""
     merge_queue_id: str = ""
     backlog_id: str = ""
     queue_index: int = 0
@@ -1328,10 +1488,17 @@ class MergeQueueDecision:
     governed_recovery_actions: tuple[str, ...] = ()
 
     def to_dashboard_row(self) -> dict[str, Any]:
-        return {
+        status_policy = _durable_merge_queue_status_policy(self.observed_status)
+        live_apply_ready = (
+            bool(status_policy.get("live_apply_ready"))
+            and self.merge_allowed
+            and self.target_branch_mutation_allowed
+        )
+        row = {
             "queue_item_id": self.queue_item_id,
             "task_id": self.task_id,
             "branch_ref": self.branch_ref,
+            "status": self.observed_status,
             "observed_status": self.observed_status,
             "queue_state": self.queue_state,
             "action": self.action,
@@ -1348,7 +1515,26 @@ class MergeQueueDecision:
             "target_semantic_activation_allowed": self.target_semantic_activation_allowed,
             "validation_attempt": self.validation_attempt,
             "merge_preview_id": self.merge_preview_id,
+            "durable_status_policy": status_policy,
+            "live_apply_ready": live_apply_ready,
+            "required_statuses_before_live_apply": list(
+                DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+            ),
         }
+        if not status_policy.get("live_apply_ready"):
+            row["copy_safe_recovery"] = _merge_queue_status_copy_safe_recovery_payload(
+                project_id=self.project_id,
+                task_id=self.task_id,
+                backlog_id=self.backlog_id,
+                merge_queue_id=self.merge_queue_id,
+                queue_item_id=self.queue_item_id,
+                target_ref=self.target_ref,
+                current_target_head=self.current_target_head,
+                validated_target_head=self.validated_target_head,
+                merge_preview_id=self.merge_preview_id,
+                observed_status=self.observed_status,
+            )
+        return row
 
     def to_read_model_row(self) -> dict[str, Any]:
         row = self.to_dashboard_row()
@@ -5060,27 +5246,76 @@ def _runtime_context_merge_queue_bootstrap_payload(
     *,
     values: Mapping[str, Any],
     merge_queue_id: str,
+    queue_item_id: str = "",
+    status: str = STATE_QUEUED_FOR_MERGE,
+    validated_target_head: str = "",
+    merge_preview_id: str = "",
 ) -> dict[str, Any]:
     task_id = _runtime_context_text(values.get("task_id"))
+    runtime_queue_item_id = (
+        _runtime_context_text(queue_item_id)
+        or (f"{merge_queue_id}:{task_id}" if merge_queue_id else "")
+    )
+    target_head = _runtime_context_text(values.get("target_head_commit"))
+    validated_head = _runtime_context_text(validated_target_head) or target_head
+    preview_id = _runtime_context_text(merge_preview_id) or _runtime_context_text(
+        values.get("merge_preview_id")
+    )
     tool_args = {
         "project_id": _runtime_context_text(values.get("project_id")),
         "task_id": task_id,
         "backlog_id": _runtime_context_text(values.get("backlog_id")),
         "merge_queue_id": merge_queue_id,
-        "queue_item_id": f"{merge_queue_id}:{task_id}",
+        "queue_item_id": runtime_queue_item_id,
         "target_ref": _runtime_context_merge_queue_target_ref(values),
-        "current_target_head": _runtime_context_text(values.get("target_head_commit")),
+        "current_target_head": target_head,
+        "validated_target_head": validated_head,
+        "merge_preview_id": preview_id,
         "checkpoint_id": _runtime_context_text(values.get("checkpoint_id")),
+        "finish_gate_ref": _runtime_context_text(values.get("finish_gate_ref")),
+        "verification_event_refs": _runtime_context_string_list(
+            values.get("verification_event_refs")
+        ),
+        "graph_trace_ids": _runtime_context_string_list(values.get("graph_trace_ids")),
+        "route_action_precheck_event_ref": _runtime_context_text(
+            values.get("route_action_precheck_event_ref")
+        ),
+        "close_ready_event_ref": _runtime_context_text(values.get("close_ready_event_ref")),
         "require_finish_gate": True,
         "worker_role": RUNTIME_CONTEXT_WORKER_ROLE,
-        "status": STATE_QUEUED_FOR_MERGE,
+        "status": _normalize_merge_queue_status(status),
         "route_token_ref": _runtime_context_text(values.get("route_token_ref")),
     }
+    recovery = _merge_queue_status_copy_safe_recovery_payload(
+        project_id=tool_args["project_id"],
+        task_id=task_id,
+        backlog_id=tool_args["backlog_id"],
+        merge_queue_id=merge_queue_id,
+        queue_item_id=runtime_queue_item_id,
+        target_ref=tool_args["target_ref"],
+        current_target_head=target_head,
+        validated_target_head=validated_head,
+        merge_preview_id=preview_id,
+        checkpoint_id=tool_args["checkpoint_id"],
+        finish_gate_ref=tool_args["finish_gate_ref"],
+        verification_event_refs=tool_args["verification_event_refs"],
+        graph_trace_ids=tool_args["graph_trace_ids"],
+        route_action_precheck_event_ref=tool_args["route_action_precheck_event_ref"],
+        close_ready_event_ref=tool_args["close_ready_event_ref"],
+        route_token_ref=tool_args["route_token_ref"],
+        observed_status=status,
+        reason_code="durable_queue_item_re_materialize_recovery",
+    )
     return {
         "schema_version": "runtime_context.merge_queue_materialize_bootstrap_payload.v1",
         "tool": "parallel_branch_merge_queue_materialize",
         "protected_action": "parallel_branch_merge_queue_materialize",
         "tool_args": {key: value for key, value in tool_args.items() if value != ""},
+        "merge_evidence": recovery["merge_evidence"],
+        "copy_safe_recovery": recovery,
+        "route_local_merge_queue_id_diagnostics": (
+            _route_local_merge_queue_id_diagnostics(merge_queue_id)
+        ),
         "context": {
             "runtime_context_id": _runtime_context_text(
                 values.get("runtime_context_id")
@@ -5206,14 +5441,51 @@ def _runtime_context_durable_merge_queue_item_projection(
         "durable_queue_item_present": False,
         "raw_fence_token_exposed": False,
         "raw_session_token_exposed": False,
+        "required_statuses_before_live_apply": list(
+            DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+        ),
+        "route_local_merge_queue_id_diagnostics": (
+            _route_local_merge_queue_id_diagnostics(merge_queue_id)
+        ),
     }
     if queue_item_id:
         status = _runtime_context_text(item.get("status") or STATE_QUEUED_FOR_MERGE)
+        normalized_status = _normalize_merge_queue_status(status)
+        status_policy = _durable_merge_queue_status_policy(status)
+        live_apply_ready = bool(status_policy.get("live_apply_ready"))
+        bootstrap_payload = (
+            {}
+            if live_apply_ready
+            else _runtime_context_merge_queue_bootstrap_payload(
+                values=values,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                status=STATE_MERGE_READY,
+                validated_target_head=_runtime_context_text(
+                    item.get("validated_target_head")
+                    or item.get("current_target_head")
+                    or values.get("target_head_commit")
+                ),
+                merge_preview_id=_runtime_context_text(
+                    item.get("merge_preview_id") or values.get("merge_preview_id")
+                ),
+            )
+        )
         return {
             **base,
             "status": status,
+            "normalized_status": normalized_status,
             "materialization_status": "durable_merge_queue_item_materialized",
+            "projection_status": (
+                "live_apply_ready"
+                if live_apply_ready
+                else "durable_queue_status_not_live_apply_ready"
+            ),
             "queue_state": status,
+            "durable_status_policy": status_policy,
+            "live_apply_ready": live_apply_ready,
+            "close_satisfying": live_apply_ready,
+            "materialized_noop_close_satisfying": False,
             "durable_queue_item_present": True,
             "queue_item_id": queue_item_id,
             "branch_ref": _runtime_context_text(
@@ -5230,8 +5502,29 @@ def _runtime_context_durable_merge_queue_item_projection(
                 item.get("merge_preview_id") or values.get("merge_preview_id")
             ),
             "queue_item": item,
-            "next_action": "none",
-            "next_actions": [],
+            "next_action": (
+                "none" if live_apply_ready else "parallel_branch_merge_queue_materialize"
+            ),
+            "next_actions": (
+                [] if live_apply_ready else ["parallel_branch_merge_queue_materialize"]
+            ),
+            "copy_safe_bootstrap_payload": public_contract_revision_payload(
+                bootstrap_payload
+            ),
+            "copy_safe_recovery": public_contract_revision_payload(
+                bootstrap_payload.get("copy_safe_recovery")
+                if isinstance(bootstrap_payload, Mapping)
+                else {}
+            ),
+            "message": (
+                ""
+                if live_apply_ready
+                else (
+                    "Durable queue item exists but is not live-apply-ready; "
+                    "materialized/noop is not close-satisfying. Re-materialize "
+                    "the authoritative runtime queue item to merge_ready."
+                )
+            ),
         }
     if not merge_queue_id:
         return {
@@ -7228,6 +7521,12 @@ def _runtime_context_merge_dependency_projection(
         "durable_materialization_status": _runtime_context_text(
             durable_queue_projection.get("status")
         ),
+        "durable_live_apply_ready": bool(
+            durable_queue_projection.get("live_apply_ready")
+        ),
+        "durable_status_policy": public_contract_revision_payload(
+            durable_queue_projection.get("durable_status_policy")
+        ),
         "task_id": _runtime_context_text(
             queue_projection.get("task_id") or values.get("task_id")
         ),
@@ -7443,6 +7742,10 @@ def _runtime_context_close_precheck_gap_projection(
     )
     durable_missing = durable_status == "validated_without_durable_merge_queue_item"
     current_finish_gate_required = durable_status == "waiting_for_current_finish_gate"
+    durable_status_not_live_apply_ready = bool(
+        durable_merge_queue_item_projection.get("durable_queue_item_present")
+        and durable_merge_queue_item_projection.get("live_apply_ready") is False
+    )
     if durable_missing:
         _add_gap(
             code="durable_merge_queue_item_missing",
@@ -7467,6 +7770,20 @@ def _runtime_context_close_precheck_gap_projection(
             or "record_finish_gate",
             field="finish_gate_ref",
         )
+    if durable_status_not_live_apply_ready:
+        _add_gap(
+            code="durable_merge_queue_status_not_live_apply_ready",
+            message=(
+                "Durable merge queue item exists, but its status is not "
+                "queued_for_merge or merge_ready; materialized/noop is not "
+                "close-satisfying and must be re-materialized before live apply."
+            ),
+            next_action=_runtime_context_text(
+                durable_merge_queue_item_projection.get("next_action")
+            )
+            or "parallel_branch_merge_queue_materialize",
+            field="durable_merge_queue_status",
+        )
     done_status = "review_ready" if close_gate_view.get("ready") else "gap_open"
     handoff_terminal_status = (
         "terminal_dispatch_blocked"
@@ -7479,6 +7796,9 @@ def _runtime_context_close_precheck_gap_projection(
     if current_finish_gate_required:
         done_status = "waiting_for_current_finish_gate"
         handoff_terminal_status = "waiting_for_current_finish_gate"
+    if durable_status_not_live_apply_ready:
+        done_status = "durable_queue_status_not_live_apply_ready"
+        handoff_terminal_status = "durable_queue_status_not_live_apply_ready"
     return {
         "schema_version": "runtime_context.close_precheck_gap_projection.v1",
         "status": "blocked" if gaps else "clear",
@@ -7595,6 +7915,14 @@ def _runtime_context_next_legal_action(
         return (
             _runtime_context_text(durable_merge_queue_item_projection.get("next_action"))
             or "record_finish_gate"
+        )
+    if (
+        durable_merge_queue_item_projection.get("durable_queue_item_present")
+        and durable_merge_queue_item_projection.get("live_apply_ready") is False
+    ):
+        return (
+            _runtime_context_text(durable_merge_queue_item_projection.get("next_action"))
+            or "parallel_branch_merge_queue_materialize"
         )
     for field, action in (("close_ready_event_ref", "record_close_ready"),):
         if field in missing_fields:
@@ -15144,6 +15472,7 @@ def decide_merge_queue(
                 observed_status=item.status,
                 queue_state=queue_state,
                 action=action,
+                project_id=item.project_id,
                 merge_queue_id=item.merge_queue_id,
                 backlog_id=item.backlog_id,
                 queue_index=item.queue_index,
@@ -16362,6 +16691,16 @@ def _compact_merge_queue(
             "blocked_task_ids": [],
             "stale_task_ids": [],
             "target_mutation_blocked_for": [],
+            "durable_status_policy": {
+                "schema_version": "merge_queue.durable_status_policy.summary.v1",
+                "required_statuses_before_live_apply": list(
+                    DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+                ),
+                "materialized_noop_close_satisfying": False,
+                "authoritative_merge_queue_id_source": (
+                    "runtime_context.current_values.merge_queue_id"
+                ),
+            },
             "rows": [],
         }, 0, False
     source_rows = (
@@ -16376,6 +16715,18 @@ def _compact_merge_queue(
         "blocked_task_ids": list(merge_queue_plan.blocked_task_ids),
         "stale_task_ids": list(merge_queue_plan.stale_task_ids),
         "target_mutation_blocked_for": list(merge_queue_plan.target_mutation_blocked_for),
+        "durable_status_policy": {
+            "schema_version": "merge_queue.durable_status_policy.summary.v1",
+            "required_statuses_before_live_apply": list(
+                DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+            ),
+            "materialized_noop_close_satisfying": False,
+            "authoritative_merge_queue_id_source": (
+                "runtime_context.current_values.merge_queue_id"
+            ),
+            "route_local_merge_queue_id_scope": "route_issue_response_only",
+            "route_local_merge_queue_id_allowed_for_materialize": False,
+        },
         "rows": list(rows),
     }, len(source_rows), truncated
 

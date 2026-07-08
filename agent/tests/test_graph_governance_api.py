@@ -11599,6 +11599,125 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
 
 
+def test_materialized_noop_durable_queue_status_projects_recovery(conn):
+    task_id = "materialized-noop-current-task"
+    queue_id = "mergeq-api-materialized-noop"
+    queue_item_id = "mqitem-materialized-noop"
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-materialized-noop",
+            backlog_id="FEAT-MATERIALIZED-NOOP",
+            root_task_id="FEAT-MATERIALIZED-NOOP",
+            task_id=task_id,
+            branch_ref="refs/heads/codex/materialized-noop-current",
+            status=STATE_VALIDATED,
+            fence_token="fence-materialized-noop-current",
+            base_commit="base-materialized-noop",
+            head_commit="head-materialized-noop",
+            target_head_commit="target-materialized-noop",
+            merge_queue_id=queue_id,
+            merge_preview_id="preview-materialized-noop",
+            checkpoint_id="ckpt-materialized-noop",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso="2026-05-17T08:40:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                branch_ref="refs/heads/codex/materialized-noop-current",
+                queue_index=1,
+                status="materialized",
+                target_ref="refs/heads/main",
+                base_commit="base-materialized-noop",
+                branch_head="head-materialized-noop",
+                validated_target_head="target-materialized-noop",
+                current_target_head="target-materialized-noop",
+                merge_preview_id="preview-materialized-noop",
+            )
+        ],
+        now_iso="2026-05-17T08:41:00Z",
+    )
+    conn.commit()
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    views = current_state["runtime_context_service"]["views"]
+    current = views["current"]
+    projection = current["current_values"]["durable_merge_queue_item_projection"]
+    assert projection["status"] == "materialized"
+    assert projection["normalized_status"] == "materialized"
+    assert projection["projection_status"] == "durable_queue_status_not_live_apply_ready"
+    assert projection["live_apply_ready"] is False
+    assert projection["close_satisfying"] is False
+    assert projection["next_action"] == "parallel_branch_merge_queue_materialize"
+    assert projection["durable_status_policy"]["materialized_noop_close_satisfying"] is False
+    assert projection["required_statuses_before_live_apply"] == [
+        "queued_for_merge",
+        "merge_ready",
+    ]
+    recovery = projection["copy_safe_recovery"]
+    assert recovery["tool"] == "parallel_branch_merge_queue_materialize"
+    assert recovery["tool_args"]["merge_queue_id"] == queue_id
+    assert recovery["tool_args"]["queue_item_id"] == queue_item_id
+    assert recovery["tool_args"]["status"] == "merge_ready"
+    assert recovery["tool_args"]["validated_target_head"] == "target-materialized-noop"
+    assert recovery["tool_args"]["merge_preview_id"] == "preview-materialized-noop"
+    assert recovery["merge_evidence"]["checkpoint_id"] == "ckpt-materialized-noop"
+    assert recovery["route_local_merge_queue_id_diagnostics"][
+        "authoritative_merge_queue_id_source"
+    ] == "runtime_context.current_values.merge_queue_id"
+
+    gap_by_code = {
+        gap["code"]: gap
+        for gap in views["action_plan"]["close_precheck_gap_projection"]["gaps"]
+    }
+    assert gap_by_code[
+        "durable_merge_queue_status_not_live_apply_ready"
+    ]["next_action"] == (
+        "parallel_branch_merge_queue_materialize"
+    )
+
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": "PB-api-materialized-noop",
+                "merge_queue_id": queue_id,
+                "limit": "5",
+            },
+        )
+    )
+    merge_queue = read["read_model"]["merge_queue"]
+    assert merge_queue["durable_status_policy"][
+        "required_statuses_before_live_apply"
+    ] == ["queued_for_merge", "merge_ready"]
+    row = merge_queue["rows"][0]
+    assert row["status"] == "materialized"
+    assert row["live_apply_ready"] is False
+    assert row["durable_status_policy"]["close_satisfying"] is False
+    assert row["copy_safe_recovery"]["tool_args"]["queue_item_id"] == queue_item_id
+    assert row["copy_safe_recovery"]["route_local_merge_queue_id_diagnostics"][
+        "route_local_merge_queue_id_allowed_for_materialize"
+    ] is False
+
+
 def test_parallel_branch_merge_queue_requires_route_token_or_waiver(conn):
     queue_id = "mergeq-api-route-token"
     upsert_branch_context(
@@ -20136,6 +20255,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
         task_id="worker-runtime-initial-join-renewed",
         allowed_actions=["task_timeline_append"],
         target_files=["agent/governance/server.py"],
+        ttl_hours=48.0,
         now=datetime(2026, 7, 7, 18, 10, tzinfo=timezone.utc),
         evidence_refs=["test:real-renewal"],
     )
@@ -44800,7 +44920,7 @@ def test_finish_gate_derives_parent_lineage_from_runtime_contract_route_ref(conn
         backlog_id=backlog_id,
         task_id=task_id,
         target_files=["agent/governance/server.py"],
-        allowed_actions=["task_timeline_append"],
+        allowed_actions=["close_or_merge_after_evidence"],
         evidence_refs=["timeline:5258", "timeline:5264"],
     )
     observer_route_context.persist_route_token_ref(

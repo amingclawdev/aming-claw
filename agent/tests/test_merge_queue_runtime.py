@@ -9,6 +9,7 @@ from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_p
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
     ACTION_BLOCKED_BY_DEPENDENCY,
+    ACTION_NOOP,
     ACTION_OPERATOR_APPROVE_LIVE_MERGE,
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
     ACTION_WAIT_FOR_DEPENDENCY,
@@ -119,6 +120,47 @@ def test_pb002_downstream_merge_waits_for_unmerged_foundation_dependency() -> No
     assert decisions["T2"].target_branch_mutation_allowed is False
     assert decisions["T2"].target_graph_activation_allowed is False
     assert decisions["T2"].target_semantic_activation_allowed is False
+
+
+def test_materialized_noop_queue_status_is_not_live_apply_ready() -> None:
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-materialized-noop",
+        queue_item_id="mqitem-materialized-noop",
+        task_id="T-materialized-noop",
+        branch_ref="refs/heads/codex/materialized-noop",
+        queue_index=1,
+        status="materialized",
+        target_ref=TARGET_REF,
+        base_commit="target-base",
+        branch_head="head-materialized-noop",
+        validated_target_head="target-base",
+        current_target_head="target-base",
+        merge_preview_id="preview-materialized-noop",
+    )
+
+    plan = decide_merge_queue([item], scenario_id="PB-materialized-noop")
+    decision = plan.decisions[0]
+    row = decision.to_read_model_row()
+
+    assert decision.action == ACTION_NOOP
+    assert decision.merge_allowed is False
+    assert row["live_apply_ready"] is False
+    assert row["durable_status_policy"]["close_satisfying"] is False
+    assert row["required_statuses_before_live_apply"] == [
+        "queued_for_merge",
+        "merge_ready",
+    ]
+    recovery = row["copy_safe_recovery"]
+    assert recovery["tool"] == "parallel_branch_merge_queue_materialize"
+    assert recovery["tool_args"]["merge_queue_id"] == "mergeq-materialized-noop"
+    assert recovery["tool_args"]["queue_item_id"] == "mqitem-materialized-noop"
+    assert recovery["tool_args"]["status"] == "merge_ready"
+    assert recovery["tool_args"]["validated_target_head"] == "target-base"
+    assert recovery["tool_args"]["merge_preview_id"] == "preview-materialized-noop"
+    assert recovery["route_local_merge_queue_id_diagnostics"][
+        "route_local_merge_queue_id_allowed_for_materialize"
+    ] is False
 
 
 def test_pb002_persisted_merge_queue_replays_dependency_blockers_after_restart(tmp_path) -> None:
@@ -405,10 +447,12 @@ def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
     plan = decide_merge_queue(items, scenario_id="PB-002")
 
     assert [row["task_id"] for row in plan.dashboard_rows] == ["T1", "T2"]
-    assert plan.dashboard_rows[1] == {
+    row = plan.dashboard_rows[1]
+    expected = {
         "queue_item_id": "item-T2",
         "task_id": "T2",
         "branch_ref": "refs/heads/codex/PB002-T2-dashboard-read-model",
+        "status": STATE_MERGE_READY,
         "observed_status": STATE_MERGE_READY,
         "queue_state": STATE_WAITING_DEPENDENCY,
         "action": ACTION_WAIT_FOR_DEPENDENCY,
@@ -423,6 +467,16 @@ def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
         "validation_attempt": 0,
         "merge_preview_id": "",
     }
+    for key, value in expected.items():
+        assert row[key] == value
+    assert row["durable_status_policy"]["live_apply_ready"] is True
+    assert row["durable_status_policy"]["close_satisfying"] is True
+    assert row["live_apply_ready"] is False
+    assert row["required_statuses_before_live_apply"] == [
+        "queued_for_merge",
+        "merge_ready",
+    ]
+    assert "copy_safe_recovery" not in row
 
 
 def test_typed_dependency_blockers_are_compact_and_merge_blocking() -> None:

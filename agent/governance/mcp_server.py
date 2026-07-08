@@ -1999,7 +1999,9 @@ TOOLS: list[dict] = [
         "description": (
             "Copy-safe merge queue status for direct-fix, hotfix, mf_parallel, "
             "and mf_batch_parallel flows. Returns the durable ordered queue "
-            "read model without mutating refs."
+            "read model without mutating refs. Durable rows must be "
+            "queued_for_merge or merge_ready before live apply; materialized/noop "
+            "status is not close-satisfying."
         ),
         "inputSchema": {
             "type": "object",
