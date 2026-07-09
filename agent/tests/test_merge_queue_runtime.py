@@ -33,6 +33,7 @@ from agent.governance.parallel_branch_runtime import (
     git_merge_preview_evidence,
     list_merge_queue_items,
     merge_gate_plan_to_dict,
+    record_merge_queue_graph_epoch_after_reconcile,
     record_merge_queue_result,
     upsert_branch_context,
     upsert_merge_queue_items,
@@ -529,6 +530,116 @@ def test_typed_dependency_blockers_are_compact_and_merge_blocking() -> None:
     assert decisions["T3"].queue_state == STATE_MERGE_READY
     assert decisions["T3"].merge_allowed is True
     assert plan.mergeable_task_ids == ("T3",)
+
+
+def test_graph_epoch_auto_record_unblocks_merged_dependency_after_reconcile() -> None:
+    conn = _runtime_conn()
+    merge_head = "merge-head-T1"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id="PB-graph-epoch",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB-graph-epoch-T1",
+            status=STATE_MERGED,
+            target_head_commit=merge_head,
+            merge_queue_id=QUEUE_ID,
+        ),
+        now_iso="2026-05-17T06:10:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB-graph-epoch-T1",
+                queue_index=1,
+                status=STATE_MERGED,
+                target_ref=TARGET_REF,
+                current_target_head=merge_head,
+                merge_commit=merge_head,
+                target_head_after_merge=merge_head,
+            ),
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB-graph-epoch-T2",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+                validated_target_head=merge_head,
+                current_target_head=merge_head,
+                requires_graph_epoch=("T1",),
+                merge_preview_id="preview-T2",
+            ),
+        ],
+        now_iso="2026-05-17T06:10:00Z",
+    )
+
+    before = _by_task(
+        decide_persisted_merge_queue(
+            conn,
+            PROJECT_ID,
+            QUEUE_ID,
+            target_ref=TARGET_REF,
+            scenario_id="PB-graph-epoch",
+        )
+    )
+    row = before["T2"].to_read_model_row()
+    assert before["T2"].dependency_blocker_types == {
+        "T1": ("requires_graph_epoch",)
+    }
+    recovery = row["graph_epoch_recovery"]
+    assert recovery["tool"] == "graph_current_full_reconcile"
+    assert recovery["authoritative_runtime_merge_queue_id"] == QUEUE_ID
+    assert recovery["authoritative_runtime_queue_item_id"] == "item-T1"
+    assert recovery["tool_args"]["merge_queue_id"] == QUEUE_ID
+    assert recovery["tool_args"]["queue_item_id"] == "item-T1"
+    assert recovery["raw_route_token_included"] is False
+
+    recorded = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=merge_head,
+        snapshot_id="full-merge-head-T1",
+        projection_id="semproj-merge-head-T1",
+        merge_queue_id=QUEUE_ID,
+        queue_item_id="item-T1",
+        now_iso="2026-05-17T06:11:00Z",
+    )
+
+    assert recorded["status"] == "recorded"
+    assert recorded["updated_count"] == 1
+    assert recorded["context_updated_count"] == 1
+    persisted = {
+        item.task_id: item
+        for item in list_merge_queue_items(conn, PROJECT_ID, QUEUE_ID, target_ref=TARGET_REF)
+    }
+    assert persisted["T1"].snapshot_id == "full-merge-head-T1"
+    assert persisted["T1"].projection_id == "semproj-merge-head-T1"
+    context = get_branch_context(conn, PROJECT_ID, "T1")
+    assert context is not None
+    assert context.snapshot_id == "full-merge-head-T1"
+    assert context.projection_id == "semproj-merge-head-T1"
+
+    after = _by_task(
+        decide_persisted_merge_queue(
+            conn,
+            PROJECT_ID,
+            QUEUE_ID,
+            target_ref=TARGET_REF,
+            scenario_id="PB-graph-epoch",
+        )
+    )
+    assert after["T2"].dependency_blockers == ()
+    assert after["T2"].queue_state == STATE_MERGE_READY
+    assert after["T2"].merge_allowed is True
 
 
 def test_conflict_dependencies_require_operator_resolution() -> None:

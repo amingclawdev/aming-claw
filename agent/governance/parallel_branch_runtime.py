@@ -523,6 +523,60 @@ def _merge_queue_status_copy_safe_recovery_payload(
     }
 
 
+def _merge_queue_graph_epoch_recovery_payload(
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
+    dependency_task_id: str,
+    target_ref: str = "",
+    target_head_after_merge: str = "",
+    merge_commit: str = "",
+    current_target_head: str = "",
+) -> dict[str, Any]:
+    queue_id = str(merge_queue_id or "").strip()
+    item_id = str(queue_item_id or "").strip()
+    dependency = str(dependency_task_id or "").strip()
+    target_head = str(
+        target_head_after_merge or merge_commit or current_target_head or ""
+    ).strip()
+    tool_args = {
+        "project_id": str(project_id or "").strip(),
+        "target_commit_sha": target_head,
+        "merge_queue_id": queue_id,
+        "queue_item_id": item_id or (f"{queue_id}:{dependency}" if queue_id else ""),
+        "task_id": dependency,
+        "target_ref": str(target_ref or "").strip(),
+        "activate": True,
+        "require_clean": True,
+    }
+    return {
+        "schema_version": "merge_queue.graph_epoch_recovery_payload.v1",
+        "status": "graph_epoch_reconcile_required",
+        "reason_code": "merged_dependency_missing_graph_epoch",
+        "copy_safe": True,
+        "raw_session_token_included": False,
+        "raw_fence_token_included": False,
+        "raw_route_token_included": False,
+        "authoritative_runtime_merge_queue_id": queue_id,
+        "authoritative_runtime_queue_item_id": tool_args["queue_item_id"],
+        "dependency_task_id": dependency,
+        "recovery_text": (
+            "Run graph_current_full_reconcile for the authoritative batch queue "
+            "item after the dependency merge. Current-full reconcile auto-records "
+            "snapshot_id and projection_id on matching merged durable queue rows."
+        ),
+        "tool": "graph_current_full_reconcile",
+        "protected_action": "graph_current_full_reconcile",
+        "follow_up_status_tool": "parallel_branch_merge_queue_status",
+        "tool_args": {
+            key: value
+            for key, value in tool_args.items()
+            if value not in ("", [], {}, None)
+        },
+    }
+
+
 RUNTIME_CONTEXT_DEFAULT_LANE_CLAUSES = (
     "route_context",
     "route_action_precheck",
@@ -1475,6 +1529,7 @@ class MergeQueueDecision:
     projection_id: str = ""
     dependency_blockers: tuple[str, ...] = ()
     dependency_blocker_types: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    dependency_graph_epoch_recoveries: tuple[dict[str, Any], ...] = ()
     stale_target_head: bool = False
     next_actions: tuple[str, ...] = ()
     merge_allowed: bool = False
@@ -1534,6 +1589,11 @@ class MergeQueueDecision:
                 merge_preview_id=self.merge_preview_id,
                 observed_status=self.observed_status,
             )
+        if self.dependency_graph_epoch_recoveries:
+            recoveries = [dict(recovery) for recovery in self.dependency_graph_epoch_recoveries]
+            row["graph_epoch_recoveries"] = recoveries
+            if len(recoveries) == 1:
+                row["graph_epoch_recovery"] = recoveries[0]
         return row
 
     def to_read_model_row(self) -> dict[str, Any]:
@@ -11352,6 +11412,173 @@ def record_merge_queue_result(
     }
 
 
+def _merge_queue_item_matches_reconciled_head(
+    item: MergeQueueItem,
+    target_head_commit: str,
+    *,
+    explicit_queue_item: bool = False,
+) -> bool:
+    target = str(target_head_commit or "").strip()
+    if not target:
+        return False
+    refs = {
+        str(item.target_head_after_merge or "").strip(),
+        str(item.merge_commit or "").strip(),
+        str(item.current_target_head or "").strip(),
+    }
+    refs.discard("")
+    if target in refs:
+        return True
+    return explicit_queue_item and not refs
+
+
+def record_merge_queue_graph_epoch_after_reconcile(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    target_head_commit: str,
+    snapshot_id: str,
+    projection_id: str,
+    merge_queue_id: str = "",
+    queue_item_id: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Fill missing graph epoch refs on merged queue rows after current-full reconcile."""
+    ensure_branch_runtime_schema(conn)
+    project = str(project_id or "").strip()
+    target = str(target_head_commit or "").strip()
+    snapshot = str(snapshot_id or "").strip()
+    projection = str(projection_id or "").strip()
+    queue_id = str(merge_queue_id or "").strip()
+    item_id = str(queue_item_id or "").strip()
+    result: dict[str, Any] = {
+        "schema_version": "merge_queue.graph_epoch_auto_record.v1",
+        "status": "skipped",
+        "project_id": project,
+        "target_head_commit": target,
+        "snapshot_id": snapshot,
+        "projection_id": projection,
+        "merge_queue_id": queue_id,
+        "queue_item_id": item_id,
+        "updated_count": 0,
+        "context_updated_count": 0,
+        "queue_items": [],
+        "contexts": [],
+        "copy_safe": True,
+        "raw_session_token_included": False,
+        "raw_fence_token_included": False,
+        "raw_route_token_included": False,
+    }
+    missing = [
+        name
+        for name, value in (
+            ("project_id", project),
+            ("target_head_commit", target),
+            ("snapshot_id", snapshot),
+            ("projection_id", projection),
+        )
+        if not value
+    ]
+    if missing:
+        result["skipped_reason"] = "missing_required_graph_epoch_input"
+        result["missing_fields"] = missing
+        return result
+
+    clauses = [
+        "project_id = ?",
+        "status = ?",
+        "(snapshot_id = '' OR projection_id = '')",
+    ]
+    params: list[Any] = [project, STATE_MERGED]
+    if queue_id:
+        clauses.append("merge_queue_id = ?")
+        params.append(queue_id)
+    if item_id:
+        clauses.append("queue_item_id = ?")
+        params.append(item_id)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM parallel_branch_merge_queue_items
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC, merge_queue_id, queue_index, queue_item_id
+        """,
+        params,
+    ).fetchall()
+
+    now = now_iso or utc_now()
+    updated_items: list[dict[str, str]] = []
+    updated_contexts: list[dict[str, str]] = []
+    explicit_item = bool(item_id)
+    for row in rows:
+        item = _merge_queue_item_from_row(row)
+        if not _merge_queue_item_matches_reconciled_head(
+            item,
+            target,
+            explicit_queue_item=explicit_item,
+        ):
+            continue
+        next_snapshot = item.snapshot_id or snapshot
+        next_projection = item.projection_id or projection
+        if next_snapshot == item.snapshot_id and next_projection == item.projection_id:
+            continue
+        saved_item = upsert_merge_queue_item(
+            conn,
+            replace(
+                item,
+                current_target_head=item.current_target_head or target,
+                target_head_after_merge=item.target_head_after_merge or target,
+                snapshot_id=next_snapshot,
+                projection_id=next_projection,
+            ),
+            now_iso=now,
+        )
+        updated_items.append(
+            {
+                "merge_queue_id": saved_item.merge_queue_id,
+                "queue_item_id": saved_item.queue_item_id,
+                "task_id": saved_item.task_id,
+                "snapshot_id": saved_item.snapshot_id,
+                "projection_id": saved_item.projection_id,
+            }
+        )
+
+        context = get_branch_context(conn, project, saved_item.task_id)
+        if context is None:
+            continue
+        if context.snapshot_id and context.projection_id:
+            continue
+        if context.target_head_commit and context.target_head_commit != target:
+            continue
+        saved_context = upsert_branch_context(
+            conn,
+            replace(
+                context,
+                target_head_commit=context.target_head_commit or target,
+                snapshot_id=context.snapshot_id or snapshot,
+                projection_id=context.projection_id or projection,
+                merge_queue_id=saved_item.merge_queue_id,
+                merge_preview_id=saved_item.merge_preview_id or context.merge_preview_id,
+            ),
+            now_iso=now,
+        )
+        updated_contexts.append(
+            {
+                "task_id": saved_context.task_id,
+                "snapshot_id": saved_context.snapshot_id,
+                "projection_id": saved_context.projection_id,
+            }
+        )
+
+    result["updated_count"] = len(updated_items)
+    result["context_updated_count"] = len(updated_contexts)
+    result["queue_items"] = updated_items
+    result["contexts"] = updated_contexts
+    result["status"] = "recorded" if updated_items else "skipped"
+    if not updated_items:
+        result["skipped_reason"] = "no_matching_merged_queue_item_missing_graph_epoch"
+    return result
+
+
 def _merge_queue_result_has_route_gated_reclaimed_fence_authority(
     *,
     result_status: str,
@@ -15352,6 +15579,37 @@ def _has_conflict_dependency_blocker(blocker_types: dict[str, tuple[str, ...]]) 
     )
 
 
+def _merge_queue_graph_epoch_dependency_recoveries(
+    item: MergeQueueItem,
+    *,
+    blockers: tuple[str, ...],
+    blocker_types: dict[str, tuple[str, ...]],
+    items_by_task: dict[str, MergeQueueItem],
+) -> tuple[dict[str, Any], ...]:
+    recoveries: list[dict[str, Any]] = []
+    for dep in blockers:
+        if "requires_graph_epoch" not in blocker_types.get(dep, ()):
+            continue
+        dep_item = items_by_task.get(dep)
+        if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
+            continue
+        if dep_item.snapshot_id and dep_item.projection_id:
+            continue
+        recoveries.append(
+            _merge_queue_graph_epoch_recovery_payload(
+                project_id=dep_item.project_id or item.project_id,
+                merge_queue_id=dep_item.merge_queue_id or item.merge_queue_id,
+                queue_item_id=dep_item.queue_item_id,
+                dependency_task_id=dep_item.task_id or dep,
+                target_ref=dep_item.target_ref or item.target_ref,
+                target_head_after_merge=dep_item.target_head_after_merge,
+                merge_commit=dep_item.merge_commit,
+                current_target_head=dep_item.current_target_head,
+            )
+        )
+    return tuple(recoveries)
+
+
 def _target_head_moved_after_validation(item: MergeQueueItem) -> bool:
     return bool(
         item.validated_target_head
@@ -15398,6 +15656,12 @@ def decide_merge_queue(
 
     for item in ordered_items:
         blockers, blocker_types = _merge_dependency_blockers(item, items_by_task=items_by_task)
+        graph_epoch_recoveries = _merge_queue_graph_epoch_dependency_recoveries(
+            item,
+            blockers=blockers,
+            blocker_types=blocker_types,
+            items_by_task=items_by_task,
+        )
         terminal_blocker = _has_terminal_dependency_blocker(
             blockers,
             items_by_task=items_by_task,
@@ -15491,6 +15755,7 @@ def decide_merge_queue(
                 projection_id=item.projection_id,
                 dependency_blockers=blockers,
                 dependency_blocker_types=blocker_types,
+                dependency_graph_epoch_recoveries=graph_epoch_recoveries,
                 stale_target_head=stale_target_head,
                 next_actions=_merge_queue_actions_for(action),
                 merge_allowed=merge_allowed,
