@@ -3368,6 +3368,13 @@ def test_build_input_carries_branch_runtime_identity() -> None:
     assert "runtime_context:" in " ".join(invocation["evidence_refs"])
     assert invocation["raw_prompt_output_stored"] is False
     assert "Implement the isolated change." not in json.dumps(invocation)
+    assert payload["invocation_contract"] == {
+        "request_field": "invocation_request",
+        "request_schema_version": "ai_invocation_request.v1",
+        "result_field": "invocation_result",
+        "result_schema_version": "ai_invocation_result.v1",
+        "result_validation": "strict_when_present",
+    }
     assert payload["agent_task_contract"]["schema_version"] == (
         AGENT_TASK_CONTRACT_SCHEMA_VERSION
     )
@@ -3392,6 +3399,110 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         "checkpoint_id",
         "fence_token",
     ]
+
+
+def test_build_input_does_not_guess_invocation_routing_from_backend_name() -> None:
+    payload = build_mf_subagent_input(
+        _context(),
+        prompt="Use the explicit provider-neutral invocation lane.",
+        backend="claude_subagent",
+    )
+
+    invocation = payload["invocation_request"]
+    assert invocation["requested_backend"] == "claude_subagent"
+    assert invocation["provider"] == "openai"
+    assert invocation["backend_mode"] == "codex_cli"
+    assert invocation["auth_mode"] == "cli_auth"
+
+
+def test_build_input_rejects_contradictory_explicit_invocation_routing() -> None:
+    with pytest.raises(MfSubagentContractError, match="routing is invalid"):
+        build_mf_subagent_input(
+            _context(),
+            prompt="Do not launch.",
+            invocation_routing={
+                "provider": "anthropic",
+                "model": "gpt-4o",
+                "backend_mode": "codex_cli",
+                "auth_mode": "cli_auth",
+            },
+        )
+
+
+def _mf_invocation_result(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "ai_invocation_result.v1",
+        "request_schema_version": "ai_invocation_request.v1",
+        "status": "completed",
+        "role": MF_SUB_ROLE,
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "backend_mode": "codex_cli",
+        "auth_mode": "cli_auth",
+        "auth_status": "host_auth_reused",
+        "output_policy": "hash_and_summary_only",
+        "provider_backed": True,
+        "calls_models": True,
+        "raw_output_stored": False,
+        "no_raw_prompt_output": True,
+        "raw_error_stored": False,
+        "error": "",
+        "error_present": False,
+        "error_sha256": "",
+        "command": ["codex", "exec"],
+        "output_path": "",
+        "prompt_sha256": "sha256:prompt",
+        "output_sha256": "sha256:output",
+        "evidence_refs": ["task:task-mf-sub-1", "runtime_context:mfrctx-test"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_normalize_result_validates_and_preserves_invocation_result() -> None:
+    invocation_result = _mf_invocation_result()
+    normalized = normalize_mf_subagent_result(
+        {
+            "status": "review_ready",
+            "changed_files": ["x.py"],
+            "test_results": {"status": "passed"},
+            "checkpoint_id": "ckpt-new",
+            "fence_token": "fence-2",
+            "invocation_result": invocation_result,
+        },
+        expected_fence_token="fence-2",
+    )
+
+    assert normalized["invocation_result"] == invocation_result
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"provider": "anthropic"}, "routing is invalid"),
+        ({"raw_output_stored": True}, "raw_output_stored=false"),
+        ({"error": "raw provider output"}, "raw error text"),
+        ({"output_path": "/tmp/raw-provider-output.txt"}, "raw output path"),
+        ({"evidence_refs": ["credential:secret"]}, "evidence_refs"),
+        ({"blocker_id": "sk-secretcredential"}, "credential-like"),
+    ],
+)
+def test_normalize_result_rejects_unsafe_or_contradictory_invocation_result(
+    override: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(MfSubagentContractError, match=message):
+        normalize_mf_subagent_result(
+            {
+                "status": "review_ready",
+                "changed_files": ["x.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-new",
+                "fence_token": "fence-2",
+                "invocation_result": _mf_invocation_result(**override),
+            },
+            expected_fence_token="fence-2",
+        )
 
 
 def test_build_input_carries_parent_and_child_route_lineage() -> None:

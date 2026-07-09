@@ -745,9 +745,95 @@ def _observer_poll_public_session(
     return public
 
 
+def _observer_poll_invocation_fields(plan: dict) -> dict:
+    """Keep request and result contracts distinct; retain result-only legacy alias."""
+    request = (
+        plan.get("invocation_request")
+        if isinstance(plan.get("invocation_request"), dict)
+        else {}
+    )
+    result = (
+        plan.get("invocation_result")
+        if isinstance(plan.get("invocation_result"), dict)
+        else {}
+    )
+    legacy = plan.get("invocation") if isinstance(plan.get("invocation"), dict) else {}
+    if legacy.get("schema_version") == "ai_invocation_request.v1":
+        request = request or legacy
+    elif legacy:
+        result = result or legacy
+
+    if result:
+        import hashlib
+
+        result = dict(result)
+        had_error = "error" in result
+        raw_error = str(result.pop("error", "") or "")
+        for field in (
+            "authorization",
+            "command",
+            "credential",
+            "credentials",
+            "env",
+            "output_text",
+            "password",
+            "prompt",
+            "raw_output",
+            "result",
+            "secret",
+            "stderr",
+            "stdout",
+            "system_prompt",
+        ):
+            result.pop(field, None)
+        if had_error:
+            result["error"] = ""
+            result["error_present"] = bool(raw_error)
+            result["error_sha256"] = (
+                "sha256:" + hashlib.sha256(raw_error.encode("utf-8")).hexdigest()
+                if raw_error
+                else ""
+            )
+            result["raw_error_stored"] = False
+        if "evidence_refs" in result:
+            from agent.ai_lifecycle import sanitize_evidence_refs
+
+            result["evidence_refs"] = sanitize_evidence_refs(result["evidence_refs"])
+
+    fields = {}
+    if request:
+        fields["invocation_request"] = request
+    if result:
+        fields["invocation_result"] = result
+        fields["invocation"] = result
+    return fields
+
+
+def _validate_cli_invocation_routing(provider: str, model: str, backend_mode: str) -> None:
+    from agent.pipeline_config import validate_invocation_routing
+
+    backend = str(backend_mode or "").strip().lower()
+    auth_mode = (
+        "cli_auth"
+        if backend.endswith("_cli")
+        else "api_key_env"
+        if backend.endswith("_api")
+        else "external_harness"
+        if backend == "docker_live_ai"
+        else "not_required"
+    )
+    errors = validate_invocation_routing(
+        provider=provider,
+        model=model,
+        backend_mode=backend,
+        auth_mode=auth_mode,
+    )
+    if errors:
+        raise click.ClickException("invalid AI invocation routing: " + "; ".join(errors))
+
+
 def _observer_poll_completion_result(plan: dict) -> dict:
     route_identity = plan.get("route_identity") if isinstance(plan.get("route_identity"), dict) else {}
-    invocation = plan.get("invocation") or plan.get("invocation_request") or {}
     return {
         "ok": bool(plan.get("ok")),
         "status": str(plan.get("status") or ""),
@@ -763,7 +849,7 @@ def _observer_poll_completion_result(plan: dict) -> dict:
             route_identity.get("visible_injection_manifest_hash") or ""
         ),
         "calls_models": bool(plan.get("calls_models")),
-        "invocation": invocation if isinstance(invocation, dict) else {},
+        **_observer_poll_invocation_fields(plan),
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
@@ -785,7 +871,6 @@ def _observer_poll_failure_result(plan: dict) -> dict:
         if isinstance(plan.get("terminal_contract_projection"), dict)
         else {}
     )
-    invocation = plan.get("invocation") or plan.get("invocation_request") or {}
     return {
         "ok": False,
         "status": str(plan.get("status") or "blocked"),
@@ -831,7 +916,7 @@ def _observer_poll_failure_result(plan: dict) -> dict:
             or "blocked"
         ),
         "calls_models": bool(plan.get("calls_models")),
-        "invocation": invocation if isinstance(invocation, dict) else {},
+        **_observer_poll_invocation_fields(plan),
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
@@ -1072,6 +1157,7 @@ def observer_poll(
         observer_poll_timeline_payload,
     )
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     base_url = governance_url.rstrip("/")
     encoded_project = urllib.parse.quote(project_id, safe="")
     cwd = workspace or os.getcwd()
@@ -1536,6 +1622,7 @@ def observer_run(
     from agent.observer_runtime import ObserverRunRequest, run_observer
     from agent.ai_invocation import RoutePromptContract
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else ""
     dispatch_gate = {}
     if dispatch_gate_file:
@@ -1566,11 +1653,17 @@ def observer_run(
         main_worktree=main_worktree or os.getcwd(),
     )
     result = run_observer(request, execute=execute)
+    result.update(_observer_poll_invocation_fields(result))
     if json_output:
         click.echo(json.dumps(result, indent=2, sort_keys=True))
     else:
         click.echo(f"observer run: {result.get('status')} project={project_id} backlog={backlog_id}")
-        invocation = result.get("invocation") or result.get("invocation_request") or {}
+        invocation = (
+            result.get("invocation_result")
+            or result.get("invocation")
+            or result.get("invocation_request")
+            or {}
+        )
         click.echo(f"backend: {invocation.get('backend_mode', backend_mode)} execute={execute}")
         click.echo(f"route: {route_context_hash}")
         if not result.get("ok"):
@@ -1678,6 +1771,7 @@ def observer_dogfood(
         build_dogfood_observer_run_plan,
     )
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     branch_runtime_evidence: dict[str, Any] = {}
     if branch_runtime_evidence_file:
         try:

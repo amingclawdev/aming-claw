@@ -40,6 +40,142 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
         self.assertEqual(resolved["auth_mode"], "api_key_env")
         self.assertEqual(resolved["output_policy"], "hash_and_summary_only")
 
+    def test_loaded_role_without_output_policy_inherits_default(self):
+        from pipeline_config import load_pipeline_config, resolve_role_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "pipeline_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "pipeline": {
+                            "default": {
+                                "provider": "openai",
+                                "model": "gpt-4o",
+                                "backend_mode": "openai_api",
+                                "auth_mode": "api_key_env",
+                                "output_policy": "redact_all",
+                            },
+                            "roles": {"dev": {"model": "gpt-5.4-codex"}},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            resolved = resolve_role_config("dev", load_pipeline_config(str(config_path)))
+
+        self.assertEqual(resolved["output_policy"], "redact_all")
+
+    def test_contradictory_provider_model_backend_auth_fails_closed(self):
+        from pipeline_config import validate_invocation_routing, validate_pipeline_config
+
+        self.assertTrue(
+            validate_invocation_routing(
+                provider="openai",
+                model="claude-sonnet-4-6",
+                backend_mode="codex_cli",
+                auth_mode="api_key_env",
+            )
+        )
+        errors = validate_pipeline_config(
+            {
+                "default": {
+                    "provider": "openai",
+                    "model": "claude-sonnet-4-6",
+                    "backend_mode": "claude_cli",
+                    "auth_mode": "cli_auth",
+                }
+            }
+        )
+        self.assertTrue(any("conflicts" in error or "belongs" in error for error in errors))
+
+    def test_prebuilt_contradictory_request_is_rejected_before_launch(self):
+        from ai_invocation import AIInvocationRequest
+        from ai_lifecycle import AILifecycleManager
+
+        request = AIInvocationRequest(
+            role="dev",
+            provider="anthropic",
+            model="gpt-4o",
+            backend_mode="codex_cli",
+            auth_mode="cli_auth",
+            cwd=tempfile.gettempdir(),
+            prompt="must never launch",
+        )
+        manager = AILifecycleManager()
+        with patch("ai_lifecycle.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "Invalid AI invocation request"):
+                manager.create_session(
+                    role="dev",
+                    prompt="ignored",
+                    context={},
+                    project_id="test-proj",
+                    workspace=tempfile.gettempdir(),
+                    invocation_request=request,
+                )
+        popen.assert_not_called()
+
+    def test_persisted_evidence_drops_raw_refs_and_error_text(self):
+        from ai_invocation import AIInvocationRequest, AIInvocationResult
+        from ai_lifecycle import AILifecycleManager
+
+        request = AIInvocationRequest(
+            role="dev",
+            provider="openai",
+            model="gpt-4o",
+            backend_mode="openai_api",
+            auth_mode="api_key_env",
+            cwd=tempfile.gettempdir(),
+            prompt="private raw prompt",
+            metadata={
+                "evidence_refs": [
+                    "trace:graph-1",
+                    "prompt:private-raw-prompt",
+                    "credential:secret-value",
+                    "trace:sk-secretcredential",
+                    "not free form evidence",
+                ]
+            },
+        )
+        result = AIInvocationResult(
+            request=request,
+            status="failed",
+            error="raw provider output with sk-secretcredential",
+            returncode=1,
+            raw_output_stored=False,
+        )
+
+        evidence = AILifecycleManager.invocation_result_evidence(result)
+        serialized = json.dumps(evidence, sort_keys=True)
+
+        self.assertEqual(evidence["evidence_refs"], ["trace:graph-1"])
+        self.assertEqual(evidence["error"], "")
+        self.assertTrue(evidence["error_present"])
+        self.assertTrue(evidence["error_sha256"].startswith("sha256:"))
+        self.assertFalse(evidence["raw_error_stored"])
+        self.assertFalse(evidence["raw_output_stored"])
+        self.assertNotIn("private raw prompt", serialized)
+        self.assertNotIn("secretcredential", serialized)
+
+    def test_api_backend_rejects_unknown_or_model_mismatched_provider(self):
+        from backends import run_via_api
+
+        with self.assertRaisesRegex(ValueError, "explicit openai or anthropic"):
+            run_via_api(
+                {"role": "dev"},
+                provider_override="provider-from-backend-name",
+                model_override="gpt-4o",
+                prompt_override="do not invoke",
+            )
+        with self.assertRaisesRegex(ValueError, "Invalid API invocation routing"):
+            run_via_api(
+                {"role": "dev"},
+                provider_override="anthropic",
+                model_override="gpt-4o",
+                prompt_override="do not invoke",
+            )
+
     def test_claude_command_for_anthropic(self):
         from ai_lifecycle import AILifecycleManager
 

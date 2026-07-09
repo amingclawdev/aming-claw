@@ -911,10 +911,25 @@ def run_via_api(
     model = (model_override or get_claude_model()).strip()
     provider = (provider_override or get_model_provider()).strip().lower()
     prompt = prompt_override if prompt_override is not None else build_claude_prompt(task)
-    provider = provider if provider in {"openai", "anthropic"} else "anthropic"
+    if provider not in {"openai", "anthropic"}:
+        raise ValueError(
+            "API invocation requires an explicit openai or anthropic provider"
+        )
     if not model:
         model = "gpt-4o" if provider == "openai" else "claude-sonnet-4-6"
     backend_mode = BACKEND_OPENAI_API if provider == "openai" else BACKEND_ANTHROPIC_API
+    try:
+        from pipeline_config import validate_invocation_routing
+    except ImportError:  # pragma: no cover - package import path
+        from agent.pipeline_config import validate_invocation_routing
+    routing_errors = validate_invocation_routing(
+        provider=provider,
+        model=model,
+        backend_mode=backend_mode,
+        auth_mode="api_key_env",
+    )
+    if routing_errors:
+        raise ValueError("Invalid API invocation routing: " + "; ".join(routing_errors))
     workspace = resolve_workspace()
     evidence_refs = []
     raw_evidence_refs = task.get("evidence_refs", []) or []
@@ -930,7 +945,11 @@ def run_via_api(
     ):
         if value:
             evidence_refs.append("{}:{}".format(kind, value))
-    evidence_refs = list(dict.fromkeys(evidence_refs))
+    try:
+        from ai_lifecycle import AILifecycleManager, sanitize_evidence_refs
+    except ImportError:  # pragma: no cover - package import path
+        from agent.ai_lifecycle import AILifecycleManager, sanitize_evidence_refs
+    evidence_refs = sanitize_evidence_refs(evidence_refs)
     request = AIInvocationRequest(
         role=str(task.get("role") or task.get("type") or "task"),
         provider=provider,
@@ -949,14 +968,15 @@ def run_via_api(
     )
     result = invoke_ai(request)
     completed = result.status == "completed" and result.returncode == 0
-    invocation_evidence = result.to_evidence()
-    invocation_evidence["cwd"] = request.cwd
-    invocation_evidence["worktree"] = request.metadata["worktree"]
-    invocation_evidence["output_policy"] = request.output_policy
-    invocation_evidence["evidence_refs"] = evidence_refs
+    invocation_evidence = AILifecycleManager.invocation_result_evidence(result)
+    persisted_error = (
+        "AI invocation failed ({})".format(result.auth_status or "unknown")
+        if not completed
+        else ""
+    )
     return {
         "stdout": result.output_text if completed else "",
-        "stderr": "" if completed else result.error,
+        "stderr": persisted_error,
         "last_message": result.output_text if completed else "",
         "returncode": 0 if completed else int(result.returncode or 1),
         "elapsed_ms": result.elapsed_ms,
@@ -1123,7 +1143,7 @@ def _load_pipeline_provider_config() -> Dict:
         return config
     except ValueError as exc:
         logger.error("[Pipeline] %s", t("log.pipeline_config_failed", err=exc))
-        return {}
+        raise
     except Exception as exc:
         logger.debug("[Pipeline] %s", t("log.pipeline_config_debug", err=exc))
         return {}

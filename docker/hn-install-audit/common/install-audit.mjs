@@ -1065,7 +1065,14 @@ Confirm they prefer the current Claude Code or Codex session as observer, with s
 Record whether the demos produced server-verifiable evidence and why you rate the run that way.`;
 }
 
-function buildLiveObserverRoutePrompt({ routeContextHash, promptContractHash, finalDriftPromptHash }) {
+function buildLiveObserverRoutePrompt({
+  routeId,
+  routeContextHash,
+  promptContractHash,
+  routeTokenRef,
+  visibleInjectionManifestHash,
+  finalDriftPromptHash,
+}) {
   return `You are the observer in the Docker live-AI route proof for Aming Claw.
 
 You have received this route context alert:
@@ -1087,13 +1094,15 @@ The JSON object must use this exact shape:
   "source": "docker_live_ai_observer_route",
   "provider_runtime": "${HOST}",
   "route_context": {
+    "route_id": "${routeId}",
     "service_id": "observer.docker_live_ai_route_demo",
     "role": "observer",
     "stage": "verification",
     "route_context_hash": "${routeContextHash}",
     "prompt_contract_id": "rprompt-docker-live-observer-route-v1",
     "prompt_contract_hash": "${promptContractHash}",
-    "route_token_ref": "docker-proof:${RUN_ID}",
+    "route_token_ref": "${routeTokenRef}",
+    "visible_injection_manifest_hash": "${visibleInjectionManifestHash}",
     "raw_context_exposed": false
   },
   "live_ai": {
@@ -1163,6 +1172,7 @@ function compactLiveObserverEvidence(payload) {
     source: payload?.source || "",
     provider_runtime: payload?.provider_runtime || "",
     route_context: {
+      route_id: payload?.route_context?.route_id || "",
       service_id: payload?.route_context?.service_id || "",
       role: payload?.route_context?.role || "",
       stage: payload?.route_context?.stage || "",
@@ -1170,6 +1180,7 @@ function compactLiveObserverEvidence(payload) {
       prompt_contract_id: payload?.route_context?.prompt_contract_id || "",
       prompt_contract_hash: payload?.route_context?.prompt_contract_hash || "",
       route_token_ref: payload?.route_context?.route_token_ref || "",
+      visible_injection_manifest_hash: payload?.route_context?.visible_injection_manifest_hash || "",
       raw_context_exposed: payload?.route_context?.raw_context_exposed,
     },
     live_ai: {
@@ -1184,6 +1195,10 @@ function compactLiveObserverEvidence(payload) {
     },
     ordered_step_count: steps.length,
     ordered_step_ids: steps.map((step) => String(step?.step_id || "")),
+    ordered_steps: steps.map((step) => ({
+      step_id: String(step?.step_id || ""),
+      status: String(step?.status || ""),
+    })),
     final_drift_prompt: {
       status: evidence.final_drift_prompt?.status || "",
       prompt_hash: evidence.final_drift_prompt?.prompt_hash || "",
@@ -1205,14 +1220,23 @@ function validateLiveObserverRoutePayload(payload, expected) {
   if (compact.route_context.route_context_hash !== expected.routeContextHash) {
     errors.push("route_context_hash mismatch");
   }
+  if (compact.route_context.route_id !== expected.routeId) {
+    errors.push("route_id mismatch");
+  }
   if (compact.route_context.prompt_contract_hash !== expected.promptContractHash) {
     errors.push("prompt_contract_hash mismatch");
   }
   if (compact.route_context.prompt_contract_id !== "rprompt-docker-live-observer-route-v1") {
     errors.push("prompt_contract_id mismatch");
   }
-  if (!compact.route_context.route_token_ref) {
-    errors.push("route_token_ref is required");
+  if (compact.route_context.route_token_ref !== expected.routeTokenRef) {
+    errors.push("route_token_ref mismatch");
+  }
+  if (
+    compact.route_context.visible_injection_manifest_hash
+    !== expected.visibleInjectionManifestHash
+  ) {
+    errors.push("visible_injection_manifest_hash mismatch");
   }
   if (compact.route_context.raw_context_exposed !== false) {
     errors.push("raw_context_exposed must be false");
@@ -1228,6 +1252,9 @@ function validateLiveObserverRoutePayload(payload, expected) {
   }
   if (compact.ordered_step_count < 3) {
     errors.push("ordered_step_outputs must contain at least 3 steps");
+  }
+  if (compact.ordered_steps.some((step) => !step.step_id || step.status !== "passed")) {
+    errors.push("ordered_step_outputs must preserve passing step ids and statuses");
   }
   if (compact.final_drift_prompt.status !== "shown") {
     errors.push("final_drift_prompt.status must be shown");
@@ -1274,12 +1301,18 @@ function runLiveObserverRoutePrompt() {
     };
   }
 
+  const routeId = "route-docker-live-observer-route-v1";
   const routeContextHash = `sha256:${sha256("observer.docker_live_ai_route_demo:route-context:v1")}`;
   const promptContractHash = `sha256:${sha256("observer.docker_live_ai_route_demo:prompt-contract:v1")}`;
+  const routeTokenRef = `docker-proof:${RUN_ID}`;
+  const visibleInjectionManifestHash = `sha256:${sha256("observer.docker_live_ai_route_demo:visible-manifest:v1")}`;
   const finalDriftPromptHash = `sha256:${sha256("observer.docker_live_ai_route_demo:final-drift-prompt:v1")}`;
   const prompt = buildLiveObserverRoutePrompt({
+    routeId,
     routeContextHash,
     promptContractHash,
+    routeTokenRef,
+    visibleInjectionManifestHash,
     finalDriftPromptHash,
   });
   rmSync(LIVE_OBSERVER_ROUTE_REPORT_PATH, { force: true });
@@ -1292,17 +1325,26 @@ function runLiveObserverRoutePrompt() {
   }
   const parsed = parseJsonObject(outputText);
   const validationErrors = parsed
-    ? validateLiveObserverRoutePayload(parsed, { routeContextHash, promptContractHash })
+    ? validateLiveObserverRoutePayload(parsed, {
+      routeId,
+      routeContextHash,
+      promptContractHash,
+      routeTokenRef,
+      visibleInjectionManifestHash,
+    })
     : ["AI did not write parseable Docker live observer route JSON evidence"];
   const compactEvidence = parsed ? compactLiveObserverEvidence(parsed) : {};
+  rmSync(LIVE_OBSERVER_ROUTE_REPORT_PATH, { force: true });
   const ok = Boolean(result.ok && parsed && validationErrors.length === 0);
   const provider = HOST === "codex" ? "openai" : "anthropic";
   const backendMode = HOST === "codex" ? "codex_cli" : "claude_cli";
   const routePromptContract = {
+    route_id: routeId,
     route_context_hash: routeContextHash,
     prompt_contract_id: "rprompt-docker-live-observer-route-v1",
     prompt_contract_hash: promptContractHash,
-    route_token_ref: `docker-proof:${RUN_ID}`,
+    route_token_ref: routeTokenRef,
+    visible_injection_manifest_hash: visibleInjectionManifestHash,
     raw_context_exposed: false,
   };
   const evidenceRefs = [
@@ -1328,10 +1370,7 @@ function runLiveObserverRoutePrompt() {
     elapsed_ms: result.elapsed_ms,
     route_prompt_contract: routePromptContract,
     route_alert_ack: compactEvidence.route_alert_ack || { status: "missing" },
-    ordered_step_outputs: (compactEvidence.ordered_step_ids || []).map((stepId) => ({
-      step_id: stepId,
-      status: "passed",
-    })),
+    ordered_step_outputs: compactEvidence.ordered_steps || [],
     prompt_sha256: `sha256:${sha256(prompt)}`,
     output_sha256: `sha256:${sha256(outputText || "")}`,
     raw_output_stored: false,
@@ -1352,7 +1391,7 @@ function runLiveObserverRoutePrompt() {
     stdout_sha256: sha256(result.stdout || ""),
     stderr_sha256: sha256(result.stderr || ""),
     output_sha256: sha256(outputText || ""),
-    output_path: LIVE_OBSERVER_ROUTE_REPORT_PATH,
+    output_path: "",
     raw_output_stored: false,
     no_raw_prompt_output: true,
     invocation_request: {

@@ -57,6 +57,21 @@ VALID_BACKEND_MODES = {
 }
 VALID_AUTH_MODES = {"api_key_env", "cli_auth", "external_harness", "not_required"}
 
+BACKEND_PROVIDER = {
+    "anthropic_api": "anthropic",
+    "claude_cli": "anthropic",
+    "codex_cli": "openai",
+    "openai_api": "openai",
+}
+BACKEND_AUTH_MODE = {
+    "anthropic_api": "api_key_env",
+    "claude_cli": "cli_auth",
+    "codex_cli": "cli_auth",
+    "docker_live_ai": "external_harness",
+    "fixture": "not_required",
+    "openai_api": "api_key_env",
+}
+
 
 def _default_backend_mode(provider: str) -> str:
     return "codex_cli" if provider == "openai" else "claude_cli"
@@ -72,14 +87,15 @@ def _default_auth_mode(backend_mode: str) -> str:
     return "not_required"
 
 
-def _routing_fields(value: Dict) -> Dict[str, str]:
+def _routing_fields(value: Dict, *, inherit_output_policy: bool = False) -> Dict[str, str]:
     return {
         "provider": _normalize_provider(value.get("provider", "")),
         "model": (value.get("model") or "").strip(),
         "backend_mode": (value.get("backend_mode") or "").strip().lower(),
         "auth_mode": (value.get("auth_mode") or "").strip().lower(),
         "output_policy": (
-            value.get("output_policy") or "hash_and_summary_only"
+            value.get("output_policy")
+            or ("" if inherit_output_policy else "hash_and_summary_only")
         ).strip(),
     }
 
@@ -88,6 +104,74 @@ def _normalize_provider(raw: str) -> str:
     """Normalize a provider name using aliases. Returns canonical name or raw."""
     key = (raw or "").strip().lower()
     return PROVIDER_ALIASES.get(key, key)
+
+
+def infer_model_provider(model: str) -> str:
+    """Return a provider only when the model id is unambiguous."""
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return ""
+    if "claude" in normalized:
+        return "anthropic"
+    if (
+        "gpt" in normalized
+        or "codex" in normalized
+        or normalized.startswith(("o1", "o3", "o4"))
+    ):
+        return "openai"
+    return ""
+
+
+def validate_invocation_routing(
+    *,
+    provider: str,
+    model: str,
+    backend_mode: str,
+    auth_mode: str,
+) -> List[str]:
+    """Validate the provider-neutral routing tuple without guessing intent."""
+    provider = _normalize_provider(provider)
+    model = (model or "").strip()
+    backend_mode = (backend_mode or "").strip().lower()
+    auth_mode = (auth_mode or "").strip().lower()
+    errors: List[str] = []
+
+    if backend_mode not in VALID_BACKEND_MODES:
+        errors.append("backend_mode '{}' is invalid".format(backend_mode or "(missing)"))
+        return errors
+    if auth_mode not in VALID_AUTH_MODES:
+        errors.append("auth_mode '{}' is invalid".format(auth_mode or "(missing)"))
+
+    if backend_mode == "fixture":
+        if provider not in {"", "fixture"}:
+            errors.append("fixture backend cannot claim provider '{}'".format(provider))
+    elif provider not in VALID_PROVIDERS:
+        errors.append("provider '{}' is invalid".format(provider or "(missing)"))
+
+    required_provider = BACKEND_PROVIDER.get(backend_mode, "")
+    if required_provider and provider != required_provider:
+        errors.append(
+            "provider '{}' conflicts with backend_mode '{}' (requires '{}')".format(
+                provider or "(missing)", backend_mode, required_provider
+            )
+        )
+
+    required_auth = BACKEND_AUTH_MODE.get(backend_mode, "")
+    if required_auth and auth_mode != required_auth:
+        errors.append(
+            "auth_mode '{}' conflicts with backend_mode '{}' (requires '{}')".format(
+                auth_mode or "(missing)", backend_mode, required_auth
+            )
+        )
+
+    model_provider = infer_model_provider(model)
+    if model_provider and provider not in {"", "fixture", model_provider}:
+        errors.append(
+            "model '{}' belongs to provider '{}' but provider is '{}'".format(
+                model, model_provider, provider
+            )
+        )
+    return errors
 
 
 def _find_config_file() -> Optional[Path]:
@@ -151,7 +235,10 @@ def load_pipeline_config(path: Optional[str] = None) -> Dict:
         roles = {}
         for role_name, role_cfg in roles_raw.items():
             if isinstance(role_cfg, dict):
-                roles[role_name.lower().strip()] = _routing_fields(role_cfg)
+                roles[role_name.lower().strip()] = _routing_fields(
+                    role_cfg,
+                    inherit_output_policy=True,
+                )
         if roles:
             result["roles"] = roles
 
@@ -279,8 +366,7 @@ def validate_pipeline_config(config: Dict) -> List[str]:
         if model and not provider:
             # Try to infer
             # Infer provider from model name
-            inferred = ("anthropic" if "claude" in model.lower()
-                        else "openai" if "gpt" in model.lower() else "")
+            inferred = infer_model_provider(model)
             if not inferred:
                 errors.append("Default config model '{}' cannot infer provider, "
                               "please specify provider explicitly".format(model))
@@ -310,8 +396,7 @@ def validate_pipeline_config(config: Dict) -> List[str]:
                 role_name, provider))
         if model and not provider:
             # Infer provider from model name
-            inferred = ("anthropic" if "claude" in model.lower()
-                        else "openai" if "gpt" in model.lower() else "")
+            inferred = infer_model_provider(model)
             if not inferred:
                 errors.append("Role '{}' model '{}' cannot infer provider, "
                               "please specify provider explicitly".format(role_name, model))
@@ -319,6 +404,28 @@ def validate_pipeline_config(config: Dict) -> List[str]:
             errors.append("Role '{}' backend_mode '{}' is invalid".format(role_name, backend_mode))
         if auth_mode and auth_mode not in VALID_AUTH_MODES:
             errors.append("Role '{}' auth_mode '{}' is invalid".format(role_name, auth_mode))
+
+    effective_entries = [("Default config", resolve_role_config("", config))]
+    effective_entries.extend(
+        ("Role '{}'".format(role_name), resolve_role_config(role_name, config))
+        for role_name in roles
+        if role_name in ROLE_PIPELINE_ORDER
+    )
+    for label, entry in effective_entries:
+        if not any(entry.get(field) for field in ("provider", "model", "backend_mode", "auth_mode")):
+            continue
+        provider = entry.get("provider", "")
+        backend_mode = entry.get("backend_mode", "") or _default_backend_mode(provider)
+        auth_mode = entry.get("auth_mode", "") or _default_auth_mode(backend_mode)
+        for error in validate_invocation_routing(
+            provider=provider,
+            model=entry.get("model", ""),
+            backend_mode=backend_mode,
+            auth_mode=auth_mode,
+        ):
+            rendered = "{} {}".format(label, error)
+            if rendered not in errors:
+                errors.append(rendered)
 
     return errors
 

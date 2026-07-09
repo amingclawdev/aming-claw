@@ -74,6 +74,11 @@ const ALLOWED_AUTH_MODES = [
   "CONTAINER_PERSISTED_LOGIN",
 ];
 
+const PROVIDER_BACKENDS = {
+  anthropic: "claude_cli",
+  openai: "codex_cli",
+};
+
 function usage() {
   console.error("Usage: node docker/hn-install-audit/validate-report.mjs [--require-live-observer-route] <report.json>|--self-test");
   process.exit(2);
@@ -153,12 +158,39 @@ function validateLiveObserverRoute(report, { requireRequested = false } = {}) {
   if (!Array.isArray(invocation.evidence_refs) || invocation.evidence_refs.length < 3) {
     errors.push("Docker live observer route invocation requires evidence refs");
   }
+  for (const field of ["provider", "model", "backend_mode", "auth_mode", "output_policy"]) {
+    if (!String(invocationRequest[field] || "").trim()) {
+      errors.push(`Docker live observer route invocation request requires ${field}`);
+    }
+    if (invocation[field] !== invocationRequest[field]) {
+      errors.push(`Docker live observer route request/result ${field} mismatch`);
+    }
+  }
+  if (PROVIDER_BACKENDS[invocation.provider] !== invocation.backend_mode) {
+    errors.push("Docker live observer route provider/backend mismatch");
+  }
+  if (liveObserverRoute.host === "codex" && invocation.provider !== "openai") {
+    errors.push("Docker live observer route codex host must use openai provider");
+  }
+  if (liveObserverRoute.host === "claude" && invocation.provider !== "anthropic") {
+    errors.push("Docker live observer route claude host must use anthropic provider");
+  }
   const invocationRoute = invocation.route_prompt_contract || {};
-  if (
-    invocationRoute.route_context_hash !== invocationRequest.route_prompt_contract?.route_context_hash
-    || invocationRoute.prompt_contract_hash !== invocationRequest.route_prompt_contract?.prompt_contract_hash
-  ) {
-    errors.push("Docker live observer route request/result route identity mismatch");
+  const requestRoute = invocationRequest.route_prompt_contract || {};
+  for (const field of [
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+  ]) {
+    if (!String(requestRoute[field] || "").trim()) {
+      errors.push(`Docker live observer route invocation request requires route ${field}`);
+    }
+    if (invocationRoute[field] !== requestRoute[field]) {
+      errors.push(`Docker live observer route request/result route ${field} mismatch`);
+    }
   }
   const evidence = liveObserverRoute.evidence || {};
   if (evidence.schema_version !== "docker_live_observer_route_evidence.v1") {
@@ -176,6 +208,32 @@ function validateLiveObserverRoute(report, { requireRequested = false } = {}) {
   if (Number(evidence.ordered_step_count || 0) < 3) {
     errors.push("Docker live observer route requires at least three ordered steps");
   }
+  const evidenceSteps = Array.isArray(evidence.ordered_steps) ? evidence.ordered_steps : [];
+  const invocationSteps = Array.isArray(invocation.ordered_step_outputs)
+    ? invocation.ordered_step_outputs
+    : [];
+  if (
+    evidenceSteps.length !== invocationSteps.length
+    || JSON.stringify(evidenceSteps) !== JSON.stringify(invocationSteps)
+  ) {
+    errors.push("Docker live observer route invocation steps must preserve validated input statuses");
+  }
+  if (invocationSteps.some((step) => step?.status !== "passed" || !String(step?.step_id || "").trim())) {
+    errors.push("Docker live observer route invocation contains a failed or unidentified step");
+  }
+  const evidenceRoute = evidence.route_context || {};
+  for (const field of [
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+  ]) {
+    if (evidenceRoute[field] !== requestRoute[field]) {
+      errors.push(`Docker live observer route evidence/request route ${field} mismatch`);
+    }
+  }
   if (evidence.final_drift_prompt?.status !== "shown") {
     errors.push("Docker live observer route missing final drift prompt");
   }
@@ -190,6 +248,91 @@ function validateLiveObserverRoute(report, { requireRequested = false } = {}) {
     errors.push("Docker live observer route feature smoke is missing or failed");
   }
   return errors;
+}
+
+function runInvocationContractSelfTest() {
+  const route = {
+    route_id: "route-self-test",
+    route_context_hash: "sha256:route",
+    prompt_contract_id: "rprompt-self-test",
+    prompt_contract_hash: "sha256:prompt",
+    route_token_ref: "docker-proof:self-test",
+    visible_injection_manifest_hash: "sha256:visible",
+  };
+  const steps = ["01_route", "02_order", "03_sanitize"].map((step_id) => ({
+    step_id,
+    status: "passed",
+  }));
+  const report = {
+    host: "codex",
+    feature_smoke_results: [{ name: "live_observer_route", ok: true }],
+    live_observer_route_result: {
+      requested: true,
+      ok: true,
+      provider_backed: true,
+      host: "codex",
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
+      prompt_sha256: "sha256:prompt",
+      output_sha256: "sha256:output",
+      invocation_request: {
+        schema_version: "ai_invocation_request.v1",
+        role: "observer",
+        provider: "openai",
+        model: "host-configured",
+        backend_mode: "codex_cli",
+        auth_mode: "cli_auth",
+        output_policy: "hash_and_summary_only",
+        route_prompt_contract: route,
+      },
+      invocation: {
+        schema_version: "ai_invocation_result.v1",
+        request_schema_version: "ai_invocation_request.v1",
+        role: "observer",
+        provider: "openai",
+        model: "host-configured",
+        backend_mode: "codex_cli",
+        auth_mode: "cli_auth",
+        output_policy: "hash_and_summary_only",
+        provider_backed: true,
+        raw_output_stored: false,
+        no_raw_prompt_output: true,
+        evidence_refs: ["project:self", "route:self", "prompt_contract:self"],
+        route_prompt_contract: route,
+        ordered_step_outputs: steps,
+      },
+      evidence: {
+        schema_version: "docker_live_observer_route_evidence.v1",
+        live_ai: { provider_backed: true, calls_models: true, container_runtime: "docker" },
+        route_alert_ack: { status: "acknowledged" },
+        route_context: route,
+        ordered_step_count: steps.length,
+        ordered_steps: steps,
+        final_drift_prompt: { status: "shown" },
+        no_raw_prompt_output: true,
+      },
+    },
+  };
+  const assertions = [];
+  const cloneReport = () => JSON.parse(JSON.stringify(report));
+  const expect = (condition, message) => {
+    if (!condition) throw new Error(`invocation contract self-test failed: ${message}`);
+    assertions.push(message);
+  };
+  expect(validateLiveObserverRoute(report).length === 0, "valid contract accepted");
+
+  const providerMismatch = cloneReport();
+  providerMismatch.live_observer_route_result.invocation.provider = "anthropic";
+  expect(validateLiveObserverRoute(providerMismatch).length > 0, "provider mismatch rejected");
+
+  const routeMismatch = cloneReport();
+  routeMismatch.live_observer_route_result.invocation.route_prompt_contract.route_token_ref = "other";
+  expect(validateLiveObserverRoute(routeMismatch).length > 0, "route mismatch rejected");
+
+  const failedStep = cloneReport();
+  failedStep.live_observer_route_result.evidence.ordered_steps[1].status = "failed";
+  expect(validateLiveObserverRoute(failedStep).length > 0, "failed input step rejected");
+  return { assertions: assertions.length };
 }
 
 function validate(report) {
@@ -262,7 +405,6 @@ function validate(report) {
         }
       }
     }
-    errors.push(...validateLiveObserverRoute(report));
     if (!report.demo_fixture_result || report.demo_fixture_result.ok !== true) {
       errors.push("PASS report must include demo_fixture_result.ok=true");
     }
@@ -285,6 +427,7 @@ function validate(report) {
   if (report.status === "LOGIN_REQUIRED" && !String(report.skip_reason || "").trim()) {
     errors.push("LOGIN_REQUIRED report requires skip_reason");
   }
+  errors.push(...validateLiveObserverRoute(report));
 
   return errors;
 }
@@ -293,7 +436,8 @@ const args = process.argv.slice(2);
 if (!args.length) usage();
 if (args.includes("--self-test")) {
   const result = runStateManagerSelfTest();
-  console.log(`INSTALL AUDIT STATE MANAGER SELF TEST OK: ${result.assertions} assertions`);
+  const invocationResult = runInvocationContractSelfTest();
+  console.log(`INSTALL AUDIT STATE MANAGER SELF TEST OK: ${result.assertions} assertions; invocation contract: ${invocationResult.assertions} assertions`);
   process.exit(0);
 }
 

@@ -221,7 +221,7 @@ class TaskOrchestrator:
 
         if raw_output.get("status") != "completed":
             return {
-                "reply": f"Coordinator execution failed: {raw_output.get('status')} - {raw_output.get('stderr', '')[:200]}",
+                "reply": f"Coordinator execution failed: {raw_output.get('status')}",
                 "actions_executed": 0,
                 "actions_rejected": 0,
             }

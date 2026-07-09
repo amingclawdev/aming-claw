@@ -16,6 +16,7 @@ Usage:
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -90,6 +91,38 @@ _IN_PROCESS_BACKENDS = {
     BACKEND_FIXTURE,
     BACKEND_DOCKER_LIVE_AI,
 }
+_EVIDENCE_REF_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_.-]{0,63}:[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+)
+_SENSITIVE_REF_RE = re.compile(
+    r"(?:^|[_.-])(api[_-]?key|authorization|credential|password|prompt|secret|session[_-]?token|token)(?:$|[_.-])",
+    re.IGNORECASE,
+)
+_SECRET_REF_VALUE_RE = re.compile(
+    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_evidence_refs(values) -> list[str]:
+    """Keep opaque evidence identifiers and drop free-form or secret-bearing text."""
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    sanitized: list[str] = []
+    for value in values:
+        ref = str(value or "").strip()
+        kind = ref.partition(":")[0]
+        if (
+            ref
+            and _EVIDENCE_REF_RE.fullmatch(ref)
+            and not _SENSITIVE_REF_RE.search(kind)
+            and not _SECRET_REF_VALUE_RE.search(ref)
+            and ref not in sanitized
+        ):
+            sanitized.append(ref)
+    return sanitized
 
 
 def _build_turn_caps():
@@ -193,34 +226,59 @@ class AILifecycleManager:
     def _resolve_invocation_routing(role: str) -> dict[str, str]:
         """Resolve provider, backend, auth, and output policy for a role."""
         try:
-            from pipeline_config import get_effective_pipeline_config, resolve_role_config
-            config = get_effective_pipeline_config()
-            resolved = resolve_role_config(role, config)
-            provider = (resolved.get("provider") or "anthropic").strip().lower()
-            model = (resolved.get("model") or "").strip()
-            backend_mode = (resolved.get("backend_mode") or "").strip().lower()
-            if not backend_mode:
-                backend_mode = BACKEND_CODEX_CLI if provider == "openai" else BACKEND_CLAUDE_CLI
-            auth_mode = (resolved.get("auth_mode") or "").strip().lower()
-            if not auth_mode:
-                auth_mode = "api_key_env" if backend_mode.endswith("_api") else "cli_auth"
-            return {
-                "provider": provider or "anthropic",
-                "model": model,
-                "backend_mode": backend_mode,
-                "auth_mode": auth_mode,
-                "output_policy": (
-                    resolved.get("output_policy") or "hash_and_summary_only"
-                ).strip(),
-            }
-        except Exception:
-            return {
-                "provider": "anthropic",
-                "model": "",
-                "backend_mode": BACKEND_CLAUDE_CLI,
-                "auth_mode": "cli_auth",
-                "output_policy": "hash_and_summary_only",
-            }
+            from pipeline_config import (
+                get_effective_pipeline_config,
+                resolve_role_config,
+                validate_invocation_routing,
+            )
+        except ImportError:  # pragma: no cover - package import path
+            from agent.pipeline_config import (
+                get_effective_pipeline_config,
+                resolve_role_config,
+                validate_invocation_routing,
+            )
+        config = get_effective_pipeline_config()
+        resolved = resolve_role_config(role, config)
+        provider = (resolved.get("provider") or "anthropic").strip().lower()
+        model = (resolved.get("model") or "").strip()
+        backend_mode = (resolved.get("backend_mode") or "").strip().lower()
+        if not backend_mode:
+            backend_mode = BACKEND_CODEX_CLI if provider == "openai" else BACKEND_CLAUDE_CLI
+        auth_mode = (resolved.get("auth_mode") or "").strip().lower()
+        if not auth_mode:
+            auth_mode = "api_key_env" if backend_mode.endswith("_api") else "cli_auth"
+        errors = validate_invocation_routing(
+            provider=provider,
+            model=model,
+            backend_mode=backend_mode,
+            auth_mode=auth_mode,
+        )
+        if errors:
+            raise ValueError("Invalid AI invocation routing: " + "; ".join(errors))
+        return {
+            "provider": provider,
+            "model": model,
+            "backend_mode": backend_mode,
+            "auth_mode": auth_mode,
+            "output_policy": (
+                resolved.get("output_policy") or "hash_and_summary_only"
+            ).strip(),
+        }
+
+    @staticmethod
+    def _validate_invocation_request(request: AIInvocationRequest) -> None:
+        try:
+            from pipeline_config import validate_invocation_routing
+        except ImportError:  # pragma: no cover - package import path
+            from agent.pipeline_config import validate_invocation_routing
+        errors = validate_invocation_routing(
+            provider=request.provider,
+            model=request.model,
+            backend_mode=request.resolved_backend(),
+            auth_mode=request.auth_mode,
+        )
+        if errors:
+            raise ValueError("Invalid AI invocation request: " + "; ".join(errors))
 
     @staticmethod
     def _evidence_refs(context: dict, project_id: str) -> list[str]:
@@ -228,10 +286,7 @@ class AILifecycleManager:
         metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
         refs: list[str] = []
         for source in (context.get("evidence_refs"), metadata.get("evidence_refs")):
-            if isinstance(source, (list, tuple, set)):
-                refs.extend(str(value).strip() for value in source if str(value).strip())
-            elif isinstance(source, str) and source.strip():
-                refs.append(source.strip())
+            refs.extend(sanitize_evidence_refs(source))
         identities = (
             ("project", project_id),
             ("backlog", context.get("backlog_id") or metadata.get("backlog_id")),
@@ -244,7 +299,7 @@ class AILifecycleManager:
             ("graph_projection", context.get("projection_id") or metadata.get("projection_id")),
         )
         refs.extend(f"{kind}:{value}" for kind, value in identities if value)
-        return list(dict.fromkeys(refs))
+        return sanitize_evidence_refs(refs)
 
     @classmethod
     def build_invocation_request(
@@ -290,12 +345,13 @@ class AILifecycleManager:
     @staticmethod
     def invocation_request_evidence(request: AIInvocationRequest) -> dict:
         """Return persistent request evidence without raw prompts or credentials."""
+        AILifecycleManager._validate_invocation_request(request)
         evidence = request.to_evidence()
         metadata = request.metadata if isinstance(request.metadata, dict) else {}
         evidence["worktree"] = str(metadata.get("worktree") or request.cwd)
-        evidence["evidence_refs"] = [
-            str(value) for value in metadata.get("evidence_refs", []) if str(value)
-        ]
+        evidence["evidence_refs"] = sanitize_evidence_refs(
+            metadata.get("evidence_refs", [])
+        )
         evidence["raw_prompt_output_stored"] = False
         return evidence
 
@@ -303,10 +359,16 @@ class AILifecycleManager:
     def invocation_result_evidence(cls, result: AIInvocationResult) -> dict:
         evidence = result.to_evidence()
         request_evidence = cls.invocation_request_evidence(result.request)
+        raw_error = str(result.error or "")
         evidence["cwd"] = result.request.cwd
         evidence["worktree"] = request_evidence["worktree"]
         evidence["output_policy"] = result.request.output_policy
         evidence["evidence_refs"] = request_evidence["evidence_refs"]
+        evidence["error"] = ""
+        evidence["error_present"] = bool(raw_error)
+        evidence["error_sha256"] = sha256_text(raw_error) if raw_error else ""
+        evidence["raw_error_stored"] = False
+        evidence["output_path"] = ""
         return evidence
 
     @staticmethod
@@ -462,6 +524,7 @@ class AILifecycleManager:
                 workspace=cwd,
                 output_path=output_last,
             )
+        self._validate_invocation_request(invocation_request)
         request_evidence = self.invocation_request_evidence(invocation_request)
         provider = invocation_request.provider
         model = invocation_request.model
@@ -1019,8 +1082,12 @@ class AILifecycleManager:
                 "auth_status": str(invocation.get("auth_status") or "unknown"),
                 "provider_backed": str(bool(invocation.get("provider_backed"))).lower(),
                 "calls_models": str(bool(invocation.get("calls_models"))).lower(),
-                "raw_output_stored": "false",
-                "no_raw_prompt_output": "true",
+                "raw_output_stored": str(
+                    bool(invocation.get("raw_output_stored"))
+                ).lower(),
+                "no_raw_prompt_output": str(
+                    bool(invocation.get("no_raw_prompt_output", True))
+                ).lower(),
                 "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, maxlen=5000)
         except Exception as e:
