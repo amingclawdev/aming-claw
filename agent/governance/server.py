@@ -25997,6 +25997,47 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
         conn.close()
 
 
+def _current_full_reconcile_snapshot_id(result: Mapping[str, Any]) -> str:
+    return str(
+        result.get("snapshot_id")
+        or result.get("active_snapshot_id")
+        or result.get("candidate_snapshot_id")
+        or ""
+    ).strip()
+
+
+def _current_full_reconcile_projection_id(
+    conn,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    result: Mapping[str, Any],
+) -> str:
+    candidates = [
+        result.get("projection_id"),
+        result.get("semantic_projection_id"),
+    ]
+    for key in ("semantic_projection", "semantic_snapshot", "semantic", "projection"):
+        value = result.get(key)
+        if isinstance(value, Mapping):
+            candidates.extend(
+                [
+                    value.get("projection_id"),
+                    value.get("semantic_projection_id"),
+                ]
+            )
+    for candidate in candidates:
+        projection_id = str(candidate or "").strip()
+        if projection_id:
+            return projection_id
+    if not snapshot_id:
+        return ""
+    from . import graph_events
+
+    projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+    return str(projection.get("projection_id") or "").strip()
+
+
 @route("POST", "/api/graph-governance/{project_id}/reconcile/current-full")
 def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     """Rebuild and activate a full graph snapshot for the current clean HEAD."""
@@ -26161,6 +26202,29 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             else:
                 result["activated"] = False
                 result.setdefault("candidate_only", True)
+            from .parallel_branch_runtime import (
+                record_merge_queue_graph_epoch_after_reconcile,
+            )
+
+            graph_epoch_snapshot_id = _current_full_reconcile_snapshot_id(result)
+            graph_epoch_projection_id = _current_full_reconcile_projection_id(
+                conn,
+                project_id=project_id,
+                snapshot_id=graph_epoch_snapshot_id,
+                result=result,
+            )
+            result["merge_queue_graph_epoch_auto_record"] = (
+                record_merge_queue_graph_epoch_after_reconcile(
+                    conn,
+                    project_id=project_id,
+                    target_head_commit=target_commit,
+                    snapshot_id=graph_epoch_snapshot_id,
+                    projection_id=graph_epoch_projection_id,
+                    merge_queue_id=str(body.get("merge_queue_id") or ""),
+                    queue_item_id=str(body.get("queue_item_id") or ""),
+                    now_iso=_utc_now(),
+                )
+            )
             timeline_event = _record_pending_scope_reconcile_contract_event(
                 conn,
                 project_id=project_id,

@@ -883,6 +883,7 @@ def _stub_current_full_reconcile(monkeypatch, tmp_path):
         return {
             "ok": True,
             "snapshot_id": "full-current",
+            "projection_id": "semproj-current",
             "snapshot_status": "candidate",
             "run_id": kwargs.get("run_id", ""),
             "elapsed_ms": 1,
@@ -981,6 +982,81 @@ def test_current_full_reconcile_operator_token_path_unchanged(
     assert result["current_full_reconcile"] is True
     assert auth_calls == [("graph-governance.reconcile.current-full", "operator-token")]
     assert calls[0]["commit_sha"] == head
+
+
+def test_current_full_reconcile_auto_records_merge_queue_graph_epoch(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    queue_id = "mergeq-current-full-epoch"
+    queue_item_id = "mqitem-current-full-epoch"
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-current-full-epoch",
+            task_id="epoch-task",
+            branch_ref="refs/heads/codex/epoch-task",
+            status="merged",
+            target_head_commit=head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T08:40:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=queue_item_id,
+                task_id="epoch-task",
+                branch_ref="refs/heads/codex/epoch-task",
+                queue_index=1,
+                status="merged",
+                target_ref="refs/heads/main",
+                current_target_head=head,
+                merge_commit=head,
+                target_head_after_merge=head,
+            )
+        ],
+        now_iso="2026-05-17T08:40:00Z",
+    )
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "target_commit_sha": head,
+            "activate": False,
+            "semantic_enrich": False,
+            "merge_queue_id": queue_id,
+            "queue_item_id": queue_item_id,
+        },
+    )
+    ctx.token = "operator-token"
+
+    status, result = server.handle_graph_governance_current_full_reconcile(ctx)
+
+    assert status == 201
+    assert calls[0]["commit_sha"] == head
+    auto_record = result["merge_queue_graph_epoch_auto_record"]
+    assert auto_record["status"] == "recorded"
+    assert auto_record["updated_count"] == 1
+    assert auto_record["queue_items"][0]["queue_item_id"] == queue_item_id
+    items = list_merge_queue_items(conn, PID, queue_id, target_ref="refs/heads/main")
+    assert items[0].snapshot_id == "full-current"
+    assert items[0].projection_id == "semproj-current"
+    context = get_branch_context(conn, PID, "epoch-task")
+    assert context is not None
+    assert context.snapshot_id == "full-current"
+    assert context.projection_id == "semproj-current"
 
 
 def test_current_full_reconcile_ignores_demo_environment_marker_dirty_state(

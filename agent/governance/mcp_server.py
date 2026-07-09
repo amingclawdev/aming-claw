@@ -706,7 +706,9 @@ def _parallel_branch_merge_queue_status_schema_properties() -> dict[str, Any]:
             "type": "string",
             "description": (
                 "Authoritative batch merge_queue_id from runtime context/current "
-                "queue read model, not a freshly issued route-token response."
+                "queue read model, not a freshly issued route-token response. "
+                "Rows blocked by a merged dependency missing graph epoch include "
+                "copy-safe graph_epoch_recovery tool_args with this queue id."
             ),
         },
         "batch_id": {"type": "string"},
@@ -1853,7 +1855,11 @@ TOOLS: list[dict] = [
             "calls use observer_session_id with exactly one of "
             "observer_route_token_ref or route_token_ref plus backlog_id and "
             "task_id/contract_execution_id; failures return public-safe "
-            "route_proof_diagnostics and never require raw route tokens."
+            "route_proof_diagnostics and never require raw route tokens. If "
+            "parallel_branch_merge_queue_status reports graph_epoch_recovery, "
+            "pass its authoritative merge_queue_id and queue_item_id here; a "
+            "successful current-full reconcile auto-records snapshot_id and "
+            "projection_id on the matching merged durable queue item."
         ),
         "inputSchema": {
             "type": "object",
@@ -1869,6 +1875,20 @@ TOOLS: list[dict] = [
                 "bug_id": {"type": "string", "description": "Alias for backlog_id."},
                 "task_id": {"type": "string"},
                 "contract_execution_id": {"type": "string", "description": "Alias for task_id."},
+                "merge_queue_id": {
+                    "type": "string",
+                    "description": (
+                        "Authoritative batch merge_queue_id for graph-epoch recovery; "
+                        "used to narrow auto-recording after reconcile."
+                    ),
+                },
+                "queue_item_id": {
+                    "type": "string",
+                    "description": (
+                        "Authoritative durable queue_item_id for graph-epoch recovery; "
+                        "used to narrow auto-recording after reconcile."
+                    ),
+                },
                 "observer_session_id": {
                     "type": "string",
                     "description": "Opaque active observer session id used with observer_route_token_ref.",
@@ -2001,7 +2021,9 @@ TOOLS: list[dict] = [
             "and mf_batch_parallel flows. Returns the durable ordered queue "
             "read model without mutating refs. Durable rows must be "
             "queued_for_merge or merge_ready before live apply; materialized/noop "
-            "status is not close-satisfying."
+            "status is not close-satisfying. If a merged dependency lacks graph "
+            "epoch refs, rows include graph_epoch_recovery with copy-safe "
+            "graph_current_full_reconcile arguments."
         ),
         "inputSchema": {
             "type": "object",
