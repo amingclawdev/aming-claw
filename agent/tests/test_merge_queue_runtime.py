@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
+
 import pytest
 
 from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_project
@@ -24,6 +26,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
     STATE_WAITING_DEPENDENCY,
     MergeQueueItem,
+    _merge_queue_item_matches_reconciled_head,
     decide_merge_gate,
     decide_merge_queue,
     decide_persisted_merge_gate,
@@ -1088,3 +1091,156 @@ def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None
                 target_ref="refs/heads/release",
             ),
         ], scenario_id="PB-012")
+
+
+# Dogfood shape: live merge apply stored a SHORT merge commit ref
+# (e.g. "37c4ac33") while graph current-full reconcile supplies the FULL SHA
+# ("37c4ac3319c74e...").
+_FULL_TARGET_HEAD = "37c4ac3319c74e7360829e93df95b5d895cb2d10"
+_SHORT_TARGET_HEAD = "37c4ac33"
+
+
+def test_graph_epoch_auto_record_matches_short_merge_commit_against_full_reconcile_head() -> None:
+    """Short stored merge-commit ref must match the full reconcile target head."""
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id="PB-short-sha",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB-short-sha-T1",
+            status=STATE_MERGED,
+            target_head_commit=_SHORT_TARGET_HEAD,
+            merge_queue_id=QUEUE_ID,
+        ),
+        now_iso="2026-07-09T02:00:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB-short-sha-T1",
+                queue_index=1,
+                status=STATE_MERGED,
+                target_ref=TARGET_REF,
+                # live apply persisted SHORT refs only
+                current_target_head=_SHORT_TARGET_HEAD,
+                merge_commit=_SHORT_TARGET_HEAD,
+            ),
+        ],
+        now_iso="2026-07-09T02:00:00Z",
+    )
+
+    recorded = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        # reconcile supplies the FULL target head
+        target_head_commit=_FULL_TARGET_HEAD,
+        snapshot_id="full-short-sha",
+        projection_id="semproj-short-sha",
+        merge_queue_id=QUEUE_ID,
+        queue_item_id="item-T1",
+        now_iso="2026-07-09T02:01:00Z",
+    )
+
+    assert recorded["status"] == "recorded"
+    assert recorded["updated_count"] == 1
+    persisted = {
+        item.task_id: item
+        for item in list_merge_queue_items(conn, PROJECT_ID, QUEUE_ID, target_ref=TARGET_REF)
+    }
+    assert persisted["T1"].snapshot_id == "full-short-sha"
+    assert persisted["T1"].projection_id == "semproj-short-sha"
+    context = get_branch_context(conn, PROJECT_ID, "T1")
+    assert context is not None
+    assert context.snapshot_id == "full-short-sha"
+    assert context.projection_id == "semproj-short-sha"
+
+
+def test_graph_epoch_auto_record_skips_unrelated_short_ref() -> None:
+    """An unrelated short ref must not spuriously match the reconcile target."""
+    conn = _runtime_conn()
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-unrelated",
+                task_id="T9",
+                branch_ref="refs/heads/codex/PB-short-sha-T9",
+                queue_index=1,
+                status=STATE_MERGED,
+                target_ref=TARGET_REF,
+                current_target_head="deadbee",
+                merge_commit="deadbee",
+            ),
+        ],
+        now_iso="2026-07-09T02:00:00Z",
+    )
+
+    recorded = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=_FULL_TARGET_HEAD,
+        snapshot_id="full-short-sha",
+        projection_id="semproj-short-sha",
+        merge_queue_id=QUEUE_ID,
+        queue_item_id="item-unrelated",
+        now_iso="2026-07-09T02:01:00Z",
+    )
+
+    assert recorded["status"] == "skipped"
+    assert recorded["updated_count"] == 0
+    assert recorded["skipped_reason"] == "no_matching_merged_queue_item_missing_graph_epoch"
+    persisted = {
+        item.task_id: item
+        for item in list_merge_queue_items(conn, PROJECT_ID, QUEUE_ID, target_ref=TARGET_REF)
+    }
+    assert persisted["T9"].snapshot_id == ""
+    assert persisted["T9"].projection_id == ""
+
+
+def test_merge_queue_item_matches_reconciled_head_prefix_rules() -> None:
+    """Ambiguity-safe matching: short hex prefix matches; unrelated/too-short do not."""
+    short_item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=QUEUE_ID,
+        queue_item_id="item-short",
+        task_id="T1",
+        branch_ref="refs/heads/codex/PB-short-sha-T1",
+        queue_index=1,
+        status=STATE_MERGED,
+        target_ref=TARGET_REF,
+        current_target_head=_SHORT_TARGET_HEAD,
+        merge_commit=_SHORT_TARGET_HEAD,
+    )
+    # short (>=7 char) hex prefix of the full reconcile head matches
+    assert _merge_queue_item_matches_reconciled_head(short_item, _FULL_TARGET_HEAD) is True
+    # exact full-vs-full still matches
+    full_item = replace(short_item, current_target_head=_FULL_TARGET_HEAD, merge_commit=_FULL_TARGET_HEAD)
+    assert _merge_queue_item_matches_reconciled_head(full_item, _FULL_TARGET_HEAD) is True
+    # unrelated ref does not match
+    unrelated_item = replace(short_item, current_target_head="deadbee", merge_commit="deadbee")
+    assert _merge_queue_item_matches_reconciled_head(unrelated_item, _FULL_TARGET_HEAD) is False
+    # a different full sha (full-vs-full) requires equality
+    other_full = "a" * 40
+    other_item = replace(short_item, current_target_head=other_full, merge_commit=other_full)
+    assert _merge_queue_item_matches_reconciled_head(other_item, _FULL_TARGET_HEAD) is False
+    # too-short (<7) shared prefix must not match
+    tiny_item = replace(short_item, current_target_head="37c4a", merge_commit="37c4a")
+    assert _merge_queue_item_matches_reconciled_head(tiny_item, _FULL_TARGET_HEAD) is False
+    # empty refs keep explicit-queue-item behavior
+    empty_item = replace(short_item, current_target_head="", merge_commit="", target_head_after_merge="")
+    assert _merge_queue_item_matches_reconciled_head(empty_item, _FULL_TARGET_HEAD) is False
+    assert (
+        _merge_queue_item_matches_reconciled_head(
+            empty_item, _FULL_TARGET_HEAD, explicit_queue_item=True
+        )
+        is True
+    )

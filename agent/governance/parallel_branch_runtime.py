@@ -11412,6 +11412,35 @@ def record_merge_queue_result(
     }
 
 
+_GIT_MIN_ABBREV_LEN = 7
+
+
+def _looks_like_commit_sha(value: str) -> bool:
+    return bool(value) and all(char in "0123456789abcdef" for char in value)
+
+
+def _commit_ref_unambiguously_matches(ref: str, target_head_commit: str) -> bool:
+    """Return True when a queue-item commit ref denotes the reconciled target.
+
+    Exact equality always matches (full-vs-full still requires equality). When
+    one ref is a git-length (>= 7 char) abbreviation of the other, treat them as
+    the same commit only when the shorter is an unambiguous hex prefix of the
+    longer, so an unrelated short ref cannot spuriously match.
+    """
+    left = str(ref or "").strip().lower()
+    right = str(target_head_commit or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    if len(shorter) < _GIT_MIN_ABBREV_LEN:
+        return False
+    if not (_looks_like_commit_sha(shorter) and _looks_like_commit_sha(longer)):
+        return False
+    return longer.startswith(shorter)
+
+
 def _merge_queue_item_matches_reconciled_head(
     item: MergeQueueItem,
     target_head_commit: str,
@@ -11427,9 +11456,9 @@ def _merge_queue_item_matches_reconciled_head(
         str(item.current_target_head or "").strip(),
     }
     refs.discard("")
-    if target in refs:
-        return True
-    return explicit_queue_item and not refs
+    if not refs:
+        return explicit_queue_item
+    return any(_commit_ref_unambiguously_matches(ref, target) for ref in refs)
 
 
 def record_merge_queue_graph_epoch_after_reconcile(
@@ -11547,7 +11576,9 @@ def record_merge_queue_graph_epoch_after_reconcile(
             continue
         if context.snapshot_id and context.projection_id:
             continue
-        if context.target_head_commit and context.target_head_commit != target:
+        if context.target_head_commit and not _commit_ref_unambiguously_matches(
+            context.target_head_commit, target
+        ):
             continue
         saved_context = upsert_branch_context(
             conn,
