@@ -11,7 +11,6 @@ const DEFAULT_ROLE = "tester";
 const DEFAULT_FETCH_TIMEOUT_MS = 5000;
 const DEFAULT_VERSION_TIMEOUT_MS = 3000;
 const DEFAULT_LIVE_TIMEOUT_MS = 15000;
-const OUTPUT_TAIL_CHARS = 2000;
 const SECRET_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
   "CLAUDECODE",
@@ -124,12 +123,6 @@ function sanitizeUrl(url) {
   }
 }
 
-function tailText(text, maxChars = OUTPUT_TAIL_CHARS) {
-  const sanitized = sanitizeText(text);
-  if (sanitized.length <= maxChars) return sanitized;
-  return sanitized.slice(sanitized.length - maxChars);
-}
-
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
@@ -188,9 +181,15 @@ function baseReport(options) {
     },
     checks: [],
     invocation: {
+      schema_version: "ai_invocation_result.v1",
+      request_schema_version: "ai_invocation_request.v1",
       allowed: Boolean(options.allowLiveAi),
       attempted: false,
+      role: options.role,
       provider: "",
+      model: "",
+      backend_mode: "",
+      cwd: options.cwd,
       adapter: "",
       status: "not_requested",
       command: [],
@@ -199,9 +198,17 @@ function baseReport(options) {
       exit_code: null,
       signal: "",
       auth_status: "unknown",
+      auth_mode: "cli_auth",
+      output_policy: "hash_and_summary_only",
+      provider_backed: false,
+      calls_models: false,
       prompt_sha256: "",
-      stdout_tail: "",
-      stderr_tail: "",
+      output_sha256: "",
+      stdout_sha256: "",
+      stderr_sha256: "",
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
+      evidence_refs: [`project:${options.projectId}`, `role:${options.role}`],
       error: "",
     },
     http: {
@@ -443,8 +450,7 @@ function adapterForProvider(provider) {
 
 function providerEnv(_provider) {
   // Preserve the user's real AI runtime environment for the child process.
-  // Secrets are never serialized into the report; stdout/stderr/args are
-  // sanitized at the capture boundary instead.
+  // Secrets and raw provider output are never serialized into the report.
   return { ...process.env };
 }
 
@@ -455,8 +461,9 @@ function spawnCapture(command, args, options) {
     duration_ms: 0,
     exit_code: null,
     signal: "",
-    stdout_tail: "",
-    stderr_tail: "",
+    stdout_sha256: "",
+    stderr_sha256: "",
+    output_sha256: "",
     status: "running",
     error: "",
   };
@@ -496,8 +503,9 @@ function spawnCapture(command, args, options) {
       summary.signal = signal || "";
       if (!timedOut) summary.status = code === 0 ? "passed" : "failed";
       summary.duration_ms = Date.now() - started;
-      summary.stdout_tail = tailText(stdout);
-      summary.stderr_tail = tailText(stderr);
+      summary.stdout_sha256 = `sha256:${sha256(stdout)}`;
+      summary.stderr_sha256 = `sha256:${sha256(stderr)}`;
+      summary.output_sha256 = summary.stdout_sha256;
       resolvePromise(summary);
     });
     if (options.input) child.stdin.end(options.input);
@@ -554,14 +562,17 @@ const openaiCodexAdapter = {
       } catch {
         lastMessage = "";
       }
-      const stdoutTail = tailText(lastMessage || result.stdout_tail);
+      const outputSha256 = lastMessage
+        ? `sha256:${sha256(lastMessage)}`
+        : result.output_sha256;
       return {
         ...result,
-        stdout_tail: stdoutTail,
+        output_sha256: outputSha256,
         adapter: openaiCodexAdapter.name,
         provider: openaiCodexAdapter.provider,
+        backend_mode: "codex_cli",
         auth_status: result.status === "passed" ? "live_ok" : "live_failed",
-        prompt_sha256: sha256(prompt),
+        prompt_sha256: `sha256:${sha256(prompt)}`,
       };
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
@@ -597,8 +608,9 @@ const anthropicClaudeAdapter = {
       ...result,
       adapter: anthropicClaudeAdapter.name,
       provider: anthropicClaudeAdapter.provider,
+      backend_mode: "claude_cli",
       auth_status: result.status === "passed" ? "live_ok" : "live_failed",
-      prompt_sha256: sha256(prompt),
+      prompt_sha256: `sha256:${sha256(prompt)}`,
     };
   },
 };
@@ -606,7 +618,9 @@ const anthropicClaudeAdapter = {
 async function maybeInvoke(report, options) {
   const adapter = adapterForProvider(report.expected.provider);
   report.invocation.provider = report.expected.provider;
+  report.invocation.model = report.expected.model;
   report.invocation.adapter = adapter?.name || "";
+  report.invocation.backend_mode = report.expected.provider === "openai" ? "codex_cli" : "claude_cli";
   report.invocation.timeout_ms = options.timeoutMs;
 
   const blockingChecks = report.checks.filter((item) => item.status !== "passed");
@@ -645,6 +659,9 @@ async function maybeInvoke(report, options) {
     attempted: true,
     provider: result.provider,
     adapter: result.adapter,
+    role: options.role,
+    model: report.expected.model,
+    backend_mode: result.backend_mode,
     status: result.status,
     command: result.command,
     timeout_ms: result.timeout_ms,
@@ -652,9 +669,16 @@ async function maybeInvoke(report, options) {
     exit_code: result.exit_code,
     signal: result.signal,
     auth_status: result.auth_status,
+    auth_mode: "cli_auth",
+    output_policy: "hash_and_summary_only",
+    provider_backed: true,
+    calls_models: result.status === "passed",
     prompt_sha256: result.prompt_sha256,
-    stdout_tail: result.stdout_tail,
-    stderr_tail: result.stderr_tail,
+    output_sha256: result.output_sha256,
+    stdout_sha256: result.stdout_sha256,
+    stderr_sha256: result.stderr_sha256,
+    raw_output_stored: false,
+    no_raw_prompt_output: true,
     error: result.error,
   };
   report.observed.auth_status = result.auth_status;

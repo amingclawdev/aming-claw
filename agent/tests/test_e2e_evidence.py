@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -353,3 +354,28 @@ def test_e2e_impact_classifies_live_ai_environment_as_manual_not_autorun(conn):
         "expected_model": "gpt-5.4",
         "expected_role": "tester",
     }
+
+
+def test_docker_live_ai_proof_uses_sanitized_invocation_contract() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    harness = (
+        repo_root / "docker" / "hn-install-audit" / "common" / "install-audit.mjs"
+    ).read_text(encoding="utf-8")
+    validator = (
+        repo_root / "docker" / "hn-install-audit" / "validate-report.mjs"
+    ).read_text(encoding="utf-8")
+
+    for required in (
+        'schema_version: "ai_invocation_result.v1"',
+        'schema_version: "ai_invocation_request.v1"',
+        'output_policy: "hash_and_summary_only"',
+        "route_prompt_contract: routePromptContract",
+        "raw_output_stored: false",
+        "no_raw_prompt_output: true",
+        "evidence_refs: evidenceRefs",
+    ):
+        assert required in harness
+    assert 'invocation.schema_version !== "ai_invocation_result.v1"' in validator
+    assert 'invocationRequest.schema_version !== "ai_invocation_request.v1"' in validator
+    assert "invocation.raw_output_stored !== false" in validator
+    assert "invocation.no_raw_prompt_output !== true" in validator

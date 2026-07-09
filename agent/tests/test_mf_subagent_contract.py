@@ -3353,6 +3353,21 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
     }
+    invocation = payload["invocation_request"]
+    assert invocation["schema_version"] == "ai_invocation_request.v1"
+    assert invocation["role"] == MF_SUB_ROLE
+    assert invocation["provider"] == "openai"
+    assert invocation["backend_mode"] == "codex_cli"
+    assert invocation["cwd"] == "/tmp/aming-claw-wt/task-mf-sub-1"
+    assert invocation["worktree"] == "/tmp/aming-claw-wt/task-mf-sub-1"
+    assert invocation["output_policy"] == "hash_and_summary_only"
+    assert invocation["route_prompt_contract"]["route_context_hash"] == (
+        "sha256:route-context"
+    )
+    assert invocation["route_prompt_contract"]["prompt_contract_id"] == "rprompt-1"
+    assert "runtime_context:" in " ".join(invocation["evidence_refs"])
+    assert invocation["raw_prompt_output_stored"] is False
+    assert "Implement the isolated change." not in json.dumps(invocation)
     assert payload["agent_task_contract"]["schema_version"] == (
         AGENT_TASK_CONTRACT_SCHEMA_VERSION
     )

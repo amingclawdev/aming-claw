@@ -1091,7 +1091,9 @@ The JSON object must use this exact shape:
     "role": "observer",
     "stage": "verification",
     "route_context_hash": "${routeContextHash}",
+    "prompt_contract_id": "rprompt-docker-live-observer-route-v1",
     "prompt_contract_hash": "${promptContractHash}",
+    "route_token_ref": "docker-proof:${RUN_ID}",
     "raw_context_exposed": false
   },
   "live_ai": {
@@ -1165,7 +1167,9 @@ function compactLiveObserverEvidence(payload) {
       role: payload?.route_context?.role || "",
       stage: payload?.route_context?.stage || "",
       route_context_hash: payload?.route_context?.route_context_hash || "",
+      prompt_contract_id: payload?.route_context?.prompt_contract_id || "",
       prompt_contract_hash: payload?.route_context?.prompt_contract_hash || "",
+      route_token_ref: payload?.route_context?.route_token_ref || "",
       raw_context_exposed: payload?.route_context?.raw_context_exposed,
     },
     live_ai: {
@@ -1203,6 +1207,12 @@ function validateLiveObserverRoutePayload(payload, expected) {
   }
   if (compact.route_context.prompt_contract_hash !== expected.promptContractHash) {
     errors.push("prompt_contract_hash mismatch");
+  }
+  if (compact.route_context.prompt_contract_id !== "rprompt-docker-live-observer-route-v1") {
+    errors.push("prompt_contract_id mismatch");
+  }
+  if (!compact.route_context.route_token_ref) {
+    errors.push("route_token_ref is required");
   }
   if (compact.route_context.raw_context_exposed !== false) {
     errors.push("raw_context_exposed must be false");
@@ -1286,6 +1296,48 @@ function runLiveObserverRoutePrompt() {
     : ["AI did not write parseable Docker live observer route JSON evidence"];
   const compactEvidence = parsed ? compactLiveObserverEvidence(parsed) : {};
   const ok = Boolean(result.ok && parsed && validationErrors.length === 0);
+  const provider = HOST === "codex" ? "openai" : "anthropic";
+  const backendMode = HOST === "codex" ? "codex_cli" : "claude_cli";
+  const routePromptContract = {
+    route_context_hash: routeContextHash,
+    prompt_contract_id: "rprompt-docker-live-observer-route-v1",
+    prompt_contract_hash: promptContractHash,
+    route_token_ref: `docker-proof:${RUN_ID}`,
+    raw_context_exposed: false,
+  };
+  const evidenceRefs = [
+    `docker_install_audit:${RUN_ID}`,
+    `route_context:${routeContextHash}`,
+    `prompt_contract:${promptContractHash}`,
+  ];
+  const invocation = {
+    schema_version: "ai_invocation_result.v1",
+    request_schema_version: "ai_invocation_request.v1",
+    status: ok ? "completed" : "failed",
+    role: "observer",
+    provider,
+    model: "host-configured",
+    backend_mode: backendMode,
+    cwd: WORK_ROOT,
+    auth_mode: "cli_auth",
+    auth_status: result.ok ? "host_auth_reused" : "cli_failed",
+    output_policy: "hash_and_summary_only",
+    provider_backed: true,
+    calls_models: result.ok,
+    returncode: Number(result.status ?? (result.ok ? 0 : 1)),
+    elapsed_ms: result.elapsed_ms,
+    route_prompt_contract: routePromptContract,
+    route_alert_ack: compactEvidence.route_alert_ack || { status: "missing" },
+    ordered_step_outputs: (compactEvidence.ordered_step_ids || []).map((stepId) => ({
+      step_id: stepId,
+      status: "passed",
+    })),
+    prompt_sha256: `sha256:${sha256(prompt)}`,
+    output_sha256: `sha256:${sha256(outputText || "")}`,
+    raw_output_stored: false,
+    no_raw_prompt_output: compactEvidence.no_raw_prompt_output === true,
+    evidence_refs: evidenceRefs,
+  };
   return sanitizeEvidence({
     name: "live_observer_route",
     requested: true,
@@ -1302,6 +1354,24 @@ function runLiveObserverRoutePrompt() {
     output_sha256: sha256(outputText || ""),
     output_path: LIVE_OBSERVER_ROUTE_REPORT_PATH,
     raw_output_stored: false,
+    no_raw_prompt_output: true,
+    invocation_request: {
+      schema_version: "ai_invocation_request.v1",
+      role: "observer",
+      provider,
+      model: "host-configured",
+      backend_mode: backendMode,
+      cwd: WORK_ROOT,
+      timeout_sec: Math.floor(PROMPT_TIMEOUT_MS / 1000),
+      auth_mode: "cli_auth",
+      output_policy: "hash_and_summary_only",
+      prompt_sha256: `sha256:${sha256(prompt)}`,
+      route_prompt_contract: routePromptContract,
+      evidence_refs: evidenceRefs,
+      raw_prompt_exposed: false,
+      raw_prompt_output_stored: false,
+    },
+    invocation,
     evidence: compactEvidence,
     validation_errors: validationErrors,
   });

@@ -124,6 +124,42 @@ function validateLiveObserverRoute(report, { requireRequested = false } = {}) {
   if (!String(liveObserverRoute.output_sha256 || "").trim()) {
     errors.push("Docker live observer route requires output_sha256");
   }
+  if (liveObserverRoute.no_raw_prompt_output !== true) {
+    errors.push("Docker live observer route must set no_raw_prompt_output=true");
+  }
+  const invocationRequest = liveObserverRoute.invocation_request || {};
+  const invocation = liveObserverRoute.invocation || {};
+  if (invocationRequest.schema_version !== "ai_invocation_request.v1") {
+    errors.push("Docker live observer route invocation request schema mismatch");
+  }
+  if (invocation.schema_version !== "ai_invocation_result.v1") {
+    errors.push("Docker live observer route invocation result schema mismatch");
+  }
+  if (invocation.request_schema_version !== "ai_invocation_request.v1") {
+    errors.push("Docker live observer route invocation result request schema mismatch");
+  }
+  if (invocation.role !== "observer" || invocation.provider_backed !== true) {
+    errors.push("Docker live observer route invocation must be provider-backed observer work");
+  }
+  if (!["codex_cli", "claude_cli"].includes(String(invocation.backend_mode || ""))) {
+    errors.push("Docker live observer route invocation backend must be a supported CLI");
+  }
+  if (invocation.auth_mode !== "cli_auth") {
+    errors.push("Docker live observer route invocation auth_mode must be cli_auth");
+  }
+  if (invocation.raw_output_stored !== false || invocation.no_raw_prompt_output !== true) {
+    errors.push("Docker live observer route invocation must retain hash-only prompt/output evidence");
+  }
+  if (!Array.isArray(invocation.evidence_refs) || invocation.evidence_refs.length < 3) {
+    errors.push("Docker live observer route invocation requires evidence refs");
+  }
+  const invocationRoute = invocation.route_prompt_contract || {};
+  if (
+    invocationRoute.route_context_hash !== invocationRequest.route_prompt_contract?.route_context_hash
+    || invocationRoute.prompt_contract_hash !== invocationRequest.route_prompt_contract?.prompt_contract_hash
+  ) {
+    errors.push("Docker live observer route request/result route identity mismatch");
+  }
   const evidence = liveObserverRoute.evidence || {};
   if (evidence.schema_version !== "docker_live_observer_route_evidence.v1") {
     errors.push("Docker live observer route evidence schema mismatch");

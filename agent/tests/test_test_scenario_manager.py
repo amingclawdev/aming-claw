@@ -711,6 +711,7 @@ def test_gated_live_ai_observer_route_blocks_then_runs_deterministic_timeline(tm
     assert evidence["source"] == "deterministic_test_harness"
     assert evidence["live_ai"]["approval"] == "operator-approved/manual"
     assert evidence["live_ai"]["execution_mode"] == "deterministic_test_harness"
+    assert evidence["live_ai"]["provider_backed"] is False
     assert evidence["live_ai"]["calls_models"] is False
     assert evidence["live_ai"]["silent_quota_use"] is False
     assert evidence["observer_evidence"]["route_alert_ack"]["status"] == "acknowledged"
@@ -723,6 +724,19 @@ def test_gated_live_ai_observer_route_blocks_then_runs_deterministic_timeline(tm
     ]
     assert evidence["observer_evidence"]["final_drift_prompt"]["status"] == "shown"
     assert evidence["observer_evidence"]["no_raw_prompt_output"] is True
+    invocation = evidence["invocation"]
+    assert invocation["schema_version"] == "ai_invocation_result.v1"
+    assert invocation["request_schema_version"] == "ai_invocation_request.v1"
+    assert invocation["backend_mode"] == "fixture"
+    assert invocation["provider_backed"] is False
+    assert invocation["calls_models"] is False
+    assert invocation["raw_output_stored"] is False
+    assert invocation["no_raw_prompt_output"] is True
+    assert invocation["route_prompt_contract"]["route_context_hash"] == (
+        evidence["route_context"]["route_context_hash"]
+    )
+    assert invocation["prompt_sha256"].startswith("sha256:")
+    assert invocation["output_sha256"].startswith("sha256:")
     assert [event["seq"] for event in evidence["timeline"]] == [1, 2, 3, 4, 5]
     assert evidence["timeline"][0]["event_type"] == "route_alert_ack"
     assert evidence["timeline"][-1]["event_type"] == "final_drift_prompt"

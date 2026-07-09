@@ -747,6 +747,7 @@ def _observer_poll_public_session(
 
 def _observer_poll_completion_result(plan: dict) -> dict:
     route_identity = plan.get("route_identity") if isinstance(plan.get("route_identity"), dict) else {}
+    invocation = plan.get("invocation") or plan.get("invocation_request") or {}
     return {
         "ok": bool(plan.get("ok")),
         "status": str(plan.get("status") or ""),
@@ -756,10 +757,13 @@ def _observer_poll_completion_result(plan: dict) -> dict:
         "route_id": str(route_identity.get("route_id") or ""),
         "route_context_hash": str(route_identity.get("route_context_hash") or ""),
         "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(route_identity.get("prompt_contract_hash") or ""),
+        "route_token_ref": str(route_identity.get("route_token_ref") or ""),
         "visible_injection_manifest_hash": str(
             route_identity.get("visible_injection_manifest_hash") or ""
         ),
         "calls_models": bool(plan.get("calls_models")),
+        "invocation": invocation if isinstance(invocation, dict) else {},
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
@@ -781,6 +785,7 @@ def _observer_poll_failure_result(plan: dict) -> dict:
         if isinstance(plan.get("terminal_contract_projection"), dict)
         else {}
     )
+    invocation = plan.get("invocation") or plan.get("invocation_request") or {}
     return {
         "ok": False,
         "status": str(plan.get("status") or "blocked"),
@@ -796,6 +801,16 @@ def _observer_poll_failure_result(plan: dict) -> dict:
         "prompt_contract_id": str(
             route_identity.get("prompt_contract_id")
             or failure.get("prompt_contract_id")
+            or ""
+        ),
+        "prompt_contract_hash": str(
+            route_identity.get("prompt_contract_hash")
+            or failure.get("prompt_contract_hash")
+            or ""
+        ),
+        "route_token_ref": str(
+            route_identity.get("route_token_ref")
+            or failure.get("route_token_ref")
             or ""
         ),
         "visible_injection_manifest_hash": str(
@@ -816,6 +831,7 @@ def _observer_poll_failure_result(plan: dict) -> dict:
             or "blocked"
         ),
         "calls_models": bool(plan.get("calls_models")),
+        "invocation": invocation if isinstance(invocation, dict) else {},
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,

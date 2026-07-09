@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent.ai_invocation import AIInvocationRequest, RoutePromptContract
 from agent.governance.asset_binding_proposals import (
     PRECHECK_SCHEMA_VERSION as ASSET_BINDING_PRECHECK_SCHEMA_VERSION,
     PROPOSAL_SCHEMA_VERSION as ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
@@ -6834,6 +6835,55 @@ def _require_context(context: BranchTaskRuntimeContext) -> None:
         )
 
 
+def _mf_subagent_invocation_request_evidence(
+    context: BranchTaskRuntimeContext,
+    *,
+    prompt: str,
+    backend: str,
+    route_prompt_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    backend_name = str(backend or "codex_subagent").strip().lower()
+    provider = "anthropic" if "claude" in backend_name else "openai"
+    backend_mode = "claude_cli" if provider == "anthropic" else "codex_cli"
+    runtime_context_id = mf_subagent_runtime_context_id(context)
+    evidence_refs = [
+        f"backlog:{context.backlog_id}",
+        f"task:{context.task_id}",
+        f"runtime_context:{runtime_context_id}",
+        f"merge_queue:{context.merge_queue_id}",
+    ]
+    if context.snapshot_id:
+        evidence_refs.append(f"graph_snapshot:{context.snapshot_id}")
+    if context.projection_id:
+        evidence_refs.append(f"graph_projection:{context.projection_id}")
+    request = AIInvocationRequest(
+        role=MF_SUB_ROLE,
+        provider=provider,
+        backend_mode=backend_mode,
+        cwd=context.worktree_path,
+        prompt=prompt,
+        auth_mode="cli_auth",
+        output_policy="hash_and_summary_only",
+        route=RoutePromptContract.from_mapping(route_prompt_contract),
+        metadata={
+            "worktree": context.worktree_path,
+            "runtime_context_id": runtime_context_id,
+            "evidence_refs": evidence_refs,
+            "requested_backend": backend_name,
+        },
+    )
+    evidence = request.to_evidence()
+    evidence.update(
+        {
+            "worktree": context.worktree_path,
+            "requested_backend": backend_name,
+            "evidence_refs": evidence_refs,
+            "raw_prompt_output_stored": False,
+        }
+    )
+    return evidence
+
+
 def build_mf_subagent_input(
     context: BranchTaskRuntimeContext,
     *,
@@ -6882,6 +6932,12 @@ def build_mf_subagent_input(
     )
     happy_path_reminders = dict(
         agent_task_contract.get("mf_parallel_happy_path_reminders") or {}
+    )
+    invocation_request = _mf_subagent_invocation_request_evidence(
+        context,
+        prompt=prompt,
+        backend=backend,
+        route_prompt_contract=child_route_prompt_contract,
     )
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
@@ -6966,6 +7022,7 @@ def build_mf_subagent_input(
             parent_route_lineage=normalized_parent_route_lineage,
             child_route_prompt_contract=child_route_prompt_contract,
         ),
+        "invocation_request": invocation_request,
         "agent_task_contract": agent_task_contract,
         "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
         "mf_parallel_happy_path_reminders": happy_path_reminders,
