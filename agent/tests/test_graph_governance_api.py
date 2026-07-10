@@ -9414,6 +9414,7 @@ def test_runtime_context_finish_attestation_accepts_uncommitted_owned_diff(
             "route_token_ref": issued_route["route_token_ref"],
         },
     )
+    graph_query_trace.ensure_schema(conn)
     conn.commit()
 
     response = server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
@@ -23055,6 +23056,91 @@ def test_mf_sub_graph_query_accepts_target_project_with_governance_fence(conn, t
     assert trace["query_source"] == "mf_subagent"
     assert trace["parent_task_id"] == "parent-target-project"
     assert trace["run_id"].startswith("mf_subagent:worker-target-project:")
+
+
+def test_mf_sub_cross_project_graph_query_fails_before_trace_for_unbridged_contract(
+    conn,
+    tmp_path,
+):
+    target_project_id = "target-contract-graph-project"
+    target_root = tmp_path / target_project_id
+    target_root.mkdir()
+    _activate_basic_graph(
+        conn,
+        "full-query-mf-sub-target-contract-project",
+        project_id=target_project_id,
+    )
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=target_project_id,
+            target_project_root=str(target_root),
+            task_id="worker-target-contract-project",
+            root_task_id="parent-target-contract-project",
+            stage_task_id="worker-target-contract-project",
+            worker_id="worker-target-contract-project",
+            worker_slot_id="worker-target-contract-project",
+            branch_ref="refs/heads/codex/worker-target-contract-project",
+            status="worktree_ready",
+            fence_token="fence-target-contract-project",
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-target-contract-project",
+        payload={
+            "contract_execution_id": "cex-target-contract-project",
+            "successor_contract_execution_id": "cex-target-contract-project",
+            "runtime_context_id": context.runtime_context_id,
+        },
+        route_identity={
+            "route_id": "route-target-contract-project",
+            "route_context_hash": "sha256:target-contract-project",
+            "prompt_contract_id": "rprompt-target-contract-project",
+            "prompt_contract_hash": "sha256:prompt-target-contract-project",
+            "route_token_ref": "rtok-target-contract-project",
+        },
+    )
+    graph_query_trace.ensure_schema(conn)
+    conn.commit()
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (target_project_id,),
+    ).fetchone()[0]
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": target_project_id},
+                "mf_sub",
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "task_id": context.task_id,
+                    "parent_task_id": context.root_task_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": context.fence_token,
+                    "governance_project_id": PID,
+                    "target_project_id": target_project_id,
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+
+    assert exc_info.value.code == "cross_project_contract_runtime_unavailable"
+    assert exc_info.value.details["fail_closed"] is True
+    assert exc_info.value.details["timeline_evidence_backfill_allowed"] is False
+    trace_count_after = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (target_project_id,),
+    ).fetchone()[0]
+    assert trace_count_after == trace_count_before
 
 
 def test_mf_sub_graph_query_accepts_context_allocated_by_parallel_branch_api(conn):
@@ -41682,6 +41768,543 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     )
     assert dispatch["ok"] is True
     return successor, runtime_context
+
+
+def test_parallel_branch_allocation_revision_persists_contract_execution_identity():
+    payload = server._parallel_branch_allocate_contract_revision_payload(
+        {
+            "observer_command_id": "cex-mf-parallel-canonical-bridge",
+            "parent_contract_execution_id": "onboard-service-canonical-bridge",
+            "root_contract_execution_id": "onboard-service-canonical-bridge",
+            "contract_chain_id": "cchain-canonical-bridge",
+        },
+        {
+            "runtime_context_id": "mfrctx-canonical-bridge",
+            "merge_queue_id": "mq-canonical-bridge",
+        },
+        {
+            "route_id": "route-canonical-bridge",
+            "route_context_hash": "sha256:route-canonical-bridge",
+            "prompt_contract_id": "rprompt-canonical-bridge",
+            "prompt_contract_hash": "sha256:prompt-canonical-bridge",
+            "route_token_ref": "rtok-canonical-bridge",
+        },
+        ["agent/governance/server.py"],
+    )
+
+    assert payload["contract_execution_id"] == (
+        "cex-mf-parallel-canonical-bridge"
+    )
+    assert payload["successor_contract_execution_id"] == (
+        "cex-mf-parallel-canonical-bridge"
+    )
+    assert payload["parent_contract_execution_id"] == (
+        "onboard-service-canonical-bridge"
+    )
+    assert payload["root_contract_execution_id"] == (
+        "onboard-service-canonical-bridge"
+    )
+    assert payload["contract_chain_id"] == "cchain-canonical-bridge"
+
+
+def test_contract_runtime_schema_initialization_preserves_caller_transaction():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE transaction_marker (value TEXT NOT NULL)")
+        conn.commit()
+        conn.execute(
+            "INSERT INTO transaction_marker (value) VALUES (?)",
+            ("must-rollback",),
+        )
+        assert conn.in_transaction is True
+
+        server._contract_runtime_store(conn)
+
+        assert conn.in_transaction is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM contract_runtime_executions"
+        ).fetchone()[0] == 0
+        conn.rollback()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM transaction_marker"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'contract_runtime_executions'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_runtime_context_read_receipt_atomically_advances_canonical_contract(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-CANONICAL-READ-BRIDGE"
+    worker_task_id = "contract-canonical-read-worker"
+    worker_token = "contract-canonical-read-token"
+    worker_root = tmp_path / "contract-canonical-read-worker"
+    worker_root.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="contract-canonical-read-parent",
+            worker_task_id=worker_task_id,
+            fence_token="fence-contract-canonical-read",
+            token=worker_token,
+            worktree_path=str(worker_root),
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": "route-contract-canonical-read",
+        "route_context_hash": "sha256:route-contract-canonical-read",
+        "prompt_contract_id": "rprompt-contract-canonical-read",
+        "prompt_contract_hash": "sha256:prompt-contract-canonical-read",
+        "route_token_ref": "rtok-contract-canonical-read",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-contract-canonical-read"
+        ),
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-canonical-read",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "parent_contract_execution_id": successor[
+                "parent_contract_execution_id"
+            ],
+            "root_contract_execution_id": successor[
+                "root_contract_execution_id"
+            ],
+            "contract_chain_id": successor["contract_chain_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            method="POST",
+            body={
+                "contract_execution_id": contract_execution_id,
+                "parent_task_id": backlog_id,
+                "fence_token": "fence-contract-canonical-read",
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worker_root),
+                "actor": runtime_context.worker_slot_id,
+                "read_receipt_hash": "sha256:contract-canonical-read",
+                "launch_text_hash": "sha256:contract-canonical-launch",
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    contract_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_record["execution_state_revision"] == 4
+    assert contract_record["completed_lines"][-1]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert contract_record["completed_lines"][-1]["payload"][
+        "runtime_context_id"
+    ] == runtime_context.runtime_context_id
+    read_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_read_receipt",
+    )
+    assert len(read_events) == 1
+    canonical_line = read_events[0]["payload"][
+        "contract_runtime_canonical_line"
+    ]
+    assert canonical_line["accepted"] is True
+    assert canonical_line["status"] == "completed"
+    assert canonical_line["contract_execution_id"] == contract_execution_id
+    assert canonical_line["line_id"] == "worker_read_runtime_guide"
+    assert canonical_line["timeline_projection_authoritative"] is False
+
+
+def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fails(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-CONTRACT-CANONICAL-READ-ROLLBACK"
+    worker_task_id = "contract-canonical-read-rollback-worker"
+    worker_token = "contract-canonical-read-rollback-token"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="contract-canonical-read-rollback-parent",
+            worker_task_id=worker_task_id,
+            fence_token="fence-contract-canonical-read-rollback",
+            token=worker_token,
+            worktree_path=str(worker_root),
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-canonical-read-rollback",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "parent_contract_execution_id": successor[
+                "parent_contract_execution_id"
+            ],
+            "root_contract_execution_id": successor[
+                "root_contract_execution_id"
+            ],
+            "contract_chain_id": successor["contract_chain_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-canonical-read-rollback",
+            "route_context_hash": "sha256:contract-canonical-read-rollback",
+            "prompt_contract_id": "rprompt-contract-canonical-read-rollback",
+            "prompt_contract_hash": (
+                "sha256:prompt-contract-canonical-read-rollback"
+            ),
+            "route_token_ref": "rtok-contract-canonical-read-rollback",
+        },
+    )
+    conn.commit()
+    original_record_event = task_timeline.record_event
+
+    def fail_read_receipt_timeline(*args, **kwargs):
+        if kwargs.get("event_kind") == "mf_subagent_read_receipt":
+            raise RuntimeError("synthetic timeline write failure")
+        return original_record_event(*args, **kwargs)
+
+    monkeypatch.setattr(
+        task_timeline,
+        "record_event",
+        fail_read_receipt_timeline,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic timeline write failure"):
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": "fence-contract-canonical-read-rollback",
+                    "session_token": worker_token,
+                    "session_token_ref": runtime_context_session_token_ref(
+                        runtime_context
+                    ),
+                    "target_project_root": str(worker_root),
+                    "actor": runtime_context.worker_slot_id,
+                    "read_receipt_hash": (
+                        "sha256:contract-canonical-read-rollback"
+                    ),
+                    "launch_text_hash": (
+                        "sha256:contract-canonical-read-rollback-launch"
+                    ),
+                },
+            )
+        )
+
+    contract_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_record["execution_state_revision"] == 3
+    assert contract_record["completed_lines"][-1]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_read_receipt",
+    ) == []
+
+
+def test_runtime_context_startup_and_implementation_advance_canonical_contract(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-CANONICAL-WORKER-BRIDGE"
+    worker_task_id = "contract-canonical-worker-bridge"
+    worker_token = "contract-canonical-worker-token"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="contract-canonical-worker-parent",
+            worker_task_id=worker_task_id,
+            fence_token="fence-contract-canonical-worker",
+            token=worker_token,
+            worktree_path=str(worker_root),
+        )
+    )
+    actual_worker_id = runtime_context.worker_slot_id
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            agent_id=actual_worker_id,
+            allocation_owner=actual_worker_id,
+            base_commit="base-contract-canonical-worker",
+            target_head_commit="target-contract-canonical-worker",
+            merge_queue_id="mq-contract-canonical-worker",
+            owned_files=("agent/governance/server.py",),
+            target_files=("agent/governance/server.py",),
+        ),
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    route_identity = {
+        "route_id": "route-contract-canonical-worker",
+        "route_context_hash": "sha256:route-contract-canonical-worker",
+        "prompt_contract_id": "rprompt-contract-canonical-worker",
+        "prompt_contract_hash": "sha256:prompt-contract-canonical-worker",
+        "route_token_ref": "rtok-contract-canonical-worker",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-contract-canonical-worker"
+        ),
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-canonical-worker",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "parent_contract_execution_id": successor[
+                "parent_contract_execution_id"
+            ],
+            "root_contract_execution_id": successor[
+                "root_contract_execution_id"
+            ],
+            "contract_chain_id": successor["contract_chain_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "observer_command_id": contract_execution_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+    )
+    conn.commit()
+    session_ref = runtime_context_session_token_ref(runtime_context)
+    read_response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": "fence-contract-canonical-worker",
+                "session_token": worker_token,
+                "session_token_ref": session_ref,
+                "target_project_root": str(worker_root),
+                "actor": actual_worker_id,
+                "read_receipt_hash": "sha256:contract-canonical-worker-read",
+                "launch_text_hash": "sha256:contract-canonical-worker-launch",
+            },
+        )
+    )
+    assert read_response["ok"] is True
+    read_event = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_read_receipt",
+    )[-1]
+
+    startup_response = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": worker_task_id,
+                "parent_task_id": backlog_id,
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "session_token": worker_token,
+                "session_token_ref": session_ref,
+                "fence_token": "fence-contract-canonical-worker",
+                "agent_id": actual_worker_id,
+                "actual_host_worker_id": actual_worker_id,
+                "worker_session_id": actual_worker_id,
+                "worker_transcript_ref": f"codex:{actual_worker_id}",
+                "harness_type": "codex",
+                "filer_principal": actual_worker_id,
+                "observer_command_id": contract_execution_id,
+                "actual_cwd": str(worker_root),
+                "actual_git_root": str(worker_root),
+                "branch": runtime_context.branch_ref,
+                "branch_ref": runtime_context.branch_ref,
+                "head_commit": "base-contract-canonical-worker",
+                "base_commit": "base-contract-canonical-worker",
+                "target_head_commit": "target-contract-canonical-worker",
+                "merge_queue_id": "mq-contract-canonical-worker",
+                "owned_files": ["agent/governance/server.py"],
+                "read_receipt_hash": (
+                    "sha256:contract-canonical-worker-read"
+                ),
+                "read_receipt_event_id": str(read_event["id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+    assert startup_response["ok"] is True
+    contract_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_record["execution_state_revision"] == 5
+    assert contract_record["completed_lines"][-1]["line_id"] == (
+        "worker_startup"
+    )
+
+    graph_trace_id = "gqt-contract-canonical-worker"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=backlog_id,
+        snapshot_id="scope-contract-canonical-worker",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=worker_task_id,
+        worker_role="mf_sub",
+        fence_token="fence-contract-canonical-worker",
+        run_id=_mf_sub_run_id(
+            worker_task_id,
+            "fence-contract-canonical-worker",
+        ),
+    )
+    graph_line = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": worker_task_id,
+            "parent_task_id": backlog_id,
+            "worker_role": "mf_sub",
+            "worker_id": runtime_context.worker_id,
+            "worker_slot_id": runtime_context.worker_slot_id,
+            "target_project_root": str(worker_root),
+            "graph_trace_ids": [graph_trace_id],
+            "graph_query_trace_ids": [graph_trace_id],
+            "graph_trace_evidence": {
+                "db_verified": True,
+                "graph_trace_ids": [graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            },
+            "db_verified": True,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+    )
+    assert graph_line["accepted"] is True
+
+    child_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        parent_route_identity={
+            **route_identity,
+            "selected_project": PID,
+            "selected_backlog_id": backlog_id,
+        },
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_route["route_token_ref"],
+        token=child_route["route_token"],
+    )
+    conn.commit()
+    child_route_identity = {
+        field: child_route["route_token"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+
+    implementation_response = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "session_token": worker_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": "fence-contract-canonical-worker",
+                    "target_project_root": str(worker_root),
+                    "actor": actual_worker_id,
+                    "changed_files": ["agent/governance/server.py"],
+                    "graph_trace_ids": [graph_trace_id],
+                    "test_results": {"passed": True},
+                    "summary": "canonical worker bridge implementation",
+                    "route_token_ref": child_route["route_token_ref"],
+                    **child_route_identity,
+                },
+            )
+        )
+    )
+    assert implementation_response["ok"] is True
+    contract_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_record["execution_state_revision"] == 7
+    assert contract_record["completed_lines"][-1]["line_id"] == (
+        "worker_implementation"
+    )
+    implementation_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="implementation",
+    )
+    assert implementation_events[-1]["payload"][
+        "contract_runtime_canonical_line"
+    ]["line_id"] == "worker_implementation"
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):

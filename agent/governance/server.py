@@ -7662,12 +7662,42 @@ def _parallel_branch_allocate_contract_revision_payload(
     owned_files: Sequence[str],
     test_files: Sequence[str] = (),
 ) -> dict[str, Any]:
+    observer_command_id = str(body.get("observer_command_id") or "").strip()
+    contract_execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+        observer_command_id if observer_command_id.startswith("cex-") else "",
+    )
+    contract_identity = {
+        "contract_execution_id": contract_execution_id,
+        "successor_contract_execution_id": _runtime_context_public_text(
+            body.get("successor_contract_execution_id"),
+            contract_execution_id,
+        ),
+        "parent_contract_execution_id": _runtime_context_public_text(
+            body.get("parent_contract_execution_id"),
+        ),
+        "root_contract_execution_id": _runtime_context_public_text(
+            body.get("root_contract_execution_id"),
+            body.get("root_task_id"),
+        ),
+        "contract_chain_id": _runtime_context_public_text(
+            body.get("contract_chain_id"),
+            body.get("chain_id"),
+        ),
+    }
     return {
         "schema_version": "parallel_branch_allocate_contract_revision.v1",
         "source": "parallel_branch_allocate",
         "source_of_truth": "Contract/Revision/Event",
         "runtime_context_id": str(saved_context.get("runtime_context_id") or ""),
-        "observer_command_id": str(body.get("observer_command_id") or ""),
+        "observer_command_id": observer_command_id,
+        **{
+            key: value
+            for key, value in contract_identity.items()
+            if value
+        },
         "merge_queue_id": str(
             body.get("merge_queue_id") or saved_context.get("merge_queue_id") or ""
         ),
@@ -17482,6 +17512,9 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
             action="graph-governance.runtime-context.read-receipts",
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
+        contract_execution_identity = _runtime_context_contract_execution_identity(
+            _runtime_context_latest_contract_revision_payload(conn, context)
+        )
     finally:
         conn.close()
 
@@ -17605,6 +17638,15 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
     event_body = {
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_identity.get(
+            "contract_execution_id",
+            "",
+        ),
+        "contract_runtime_line": {
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "evidence_kind": "read_receipt",
+        },
         "event_type": body.get("event_type") or "mf_subagent_read_receipt",
         "event_kind": body.get("event_kind") or "mf_subagent_read_receipt",
         "phase": body.get("phase") or "startup_read_receipt",
@@ -17645,6 +17687,10 @@ def handle_graph_governance_runtime_context_read_receipt(ctx: RequestContext):
         "read_receipt_hash": str(payload.get("read_receipt_hash") or ""),
         "launch_text_hash": str(payload.get("launch_text_hash") or ""),
     }
+    if isinstance(result.get("contract_runtime_canonical_line"), Mapping):
+        response["contract_runtime_canonical_line"] = result.get(
+            "contract_runtime_canonical_line"
+        )
     return response
 
 
@@ -18020,6 +18066,353 @@ def _runtime_context_contract_requires_worker_commit(
                 "source_of_authority": "ContractRuntime.pinned_definition",
             },
         ) from exc
+
+
+def _runtime_context_submit_canonical_contract_line(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    payload: Mapping[str, Any],
+    contract_execution_id: str = "",
+) -> dict[str, Any]:
+    """Advance a runtime-context Contract line without timeline projection.
+
+    Callers must invoke this inside the same SQLite transaction as the runtime
+    state and timeline log write. A rejected Contract line therefore rolls the
+    whole facade operation back instead of leaving evidence for later backfill.
+    """
+
+    revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    contract_identity = _runtime_context_contract_execution_identity(
+        revision_payload,
+    )
+    execution_id = str(
+        contract_execution_id
+        or contract_identity.get("contract_execution_id")
+        or ""
+    ).strip()
+    if not execution_id:
+        return {
+            "schema_version": "runtime_context.canonical_contract_line.v1",
+            "accepted": False,
+            "status": "compatibility_no_contract_execution",
+            "canonical": False,
+            "line_id": line_id,
+        }
+
+    runtime = _contract_runtime(conn)
+    try:
+        if not runtime.pinned_definition_has_line(execution_id, line_id):
+            return {
+                "schema_version": "runtime_context.canonical_contract_line.v1",
+                "accepted": False,
+                "status": "compatibility_line_not_pinned",
+                "canonical": False,
+                "contract_execution_id": execution_id,
+                "line_id": line_id,
+            }
+        runtime.current_guide(execution_id, actor_role="mf_sub")
+        record = runtime.store.get(execution_id)
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_runtime_canonical_line_unavailable",
+            str(exc),
+            422,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": str(
+                    getattr(context, "runtime_context_id", "") or ""
+                ),
+                "line_id": line_id,
+            },
+        ) from exc
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    for completed in record.get("completed_lines") or []:
+        if not isinstance(completed, Mapping):
+            continue
+        if str(completed.get("line_id") or "").strip() != line_id:
+            continue
+        completed_payload = (
+            completed.get("payload")
+            if isinstance(completed.get("payload"), Mapping)
+            else {}
+        )
+        completed_runtime = _timeline_first_deep_text(
+            {"line": completed, "payload": completed_payload},
+            "runtime_context_id",
+        )
+        completed_task = _timeline_first_deep_text(
+            {"line": completed, "payload": completed_payload},
+            "task_id",
+        )
+        if completed_runtime == runtime_context_id and completed_task == task_id:
+            return {
+                "schema_version": "runtime_context.canonical_contract_line.v1",
+                "accepted": True,
+                "status": "already_completed",
+                "canonical": True,
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "evidence_kind": evidence_kind,
+                "line_instance_id": str(
+                    completed.get("line_instance_id") or ""
+                ),
+            }
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if str(next_line.get("line_id") or "").strip() != line_id:
+        raise GovernanceError(
+            "contract_runtime_canonical_line_out_of_order",
+            "runtime-context facade cannot advance a non-current Contract line",
+            422,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "requested_line_id": line_id,
+                "next_legal_action": dict(next_line),
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
+
+    write = _contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id=stage_id,
+        line_id=line_id,
+        evidence_kind=evidence_kind,
+    )
+    canonical_payload = dict(payload)
+    write["payload"] = canonical_payload
+    protected_write_fields = {
+        "actor_role",
+        "definition_hash",
+        "evidence_kind",
+        "execution_state_revision",
+        "instruction_bundle_hash",
+        "line_id",
+        "runtime_guide_hash",
+        "stage_id",
+    }
+    for key, value in canonical_payload.items():
+        if key not in protected_write_fields:
+            write[key] = value
+    result = runtime.submit_line_write(
+        execution_id,
+        write,
+        actor_role="mf_sub",
+    )
+    if not result.get("ok"):
+        raise GovernanceError(
+            "contract_runtime_canonical_line_rejected",
+            "ContractRuntime rejected the canonical runtime-context line",
+            422,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "evidence_kind": evidence_kind,
+                "decision": result.get("decision") or {},
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
+    updated = (
+        result.get("record")
+        if isinstance(result.get("record"), Mapping)
+        else {}
+    )
+    current_state = _runtime_current_state_from_record(updated) if updated else {}
+    completed_line = next(
+        (
+            item
+            for item in reversed(list(updated.get("completed_lines") or []))
+            if isinstance(item, Mapping)
+            and str(item.get("line_id") or "").strip() == line_id
+        ),
+        {},
+    )
+    return {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": "completed",
+        "canonical": True,
+        "source_of_authority": "ContractRuntime.completed_lines",
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "line_instance_id": str(
+            completed_line.get("line_instance_id") or ""
+        ),
+        "execution_state_revision": current_state.get(
+            "execution_state_revision",
+            0,
+        ),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "timeline_projection_authoritative": False,
+    }
+
+
+def _runtime_context_cross_project_graph_contract_preflight(
+    *,
+    target_project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    governance_project_id = str(
+        body.get("governance_project_id") or target_project_id
+    ).strip()
+    if (
+        str(body.get("query_source") or "").strip() != "mf_subagent"
+        or governance_project_id == target_project_id
+    ):
+        return {}
+
+    runtime_context_id = str(body.get("runtime_context_id") or "").strip()
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    governance_conn = get_connection(governance_project_id)
+    try:
+        context = get_branch_context_by_runtime_context_id(
+            governance_conn,
+            governance_project_id,
+            runtime_context_id,
+        )
+        if context is None:
+            return {
+                "schema_version": "runtime_context.canonical_contract_line.v1",
+                "accepted": False,
+                "status": "compatibility_no_governance_runtime_context",
+                "canonical": False,
+                "governance_project_id": governance_project_id,
+                "target_project_id": target_project_id,
+            }
+        revision_payload = _runtime_context_latest_contract_revision_payload(
+            governance_conn,
+            context,
+        )
+        contract_identity = _runtime_context_contract_execution_identity(
+            revision_payload
+        )
+        contract_execution_id = str(
+            contract_identity.get("contract_execution_id") or ""
+        ).strip()
+        if not contract_execution_id:
+            return {
+                "schema_version": "runtime_context.canonical_contract_line.v1",
+                "accepted": False,
+                "status": "compatibility_no_contract_execution",
+                "canonical": False,
+                "governance_project_id": governance_project_id,
+                "target_project_id": target_project_id,
+            }
+
+        runtime = _contract_runtime(governance_conn)
+        try:
+            if not runtime.pinned_definition_has_line(
+                contract_execution_id,
+                "worker_graph_context",
+            ):
+                return {
+                    "schema_version": "runtime_context.canonical_contract_line.v1",
+                    "accepted": False,
+                    "status": "compatibility_line_not_pinned",
+                    "canonical": False,
+                    "contract_execution_id": contract_execution_id,
+                    "line_id": "worker_graph_context",
+                    "governance_project_id": governance_project_id,
+                    "target_project_id": target_project_id,
+                }
+            record = runtime.store.get(contract_execution_id)
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "cross_project_contract_runtime_unavailable",
+                str(exc),
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "governance_project_id": governance_project_id,
+                    "target_project_id": target_project_id,
+                    "fail_closed": True,
+                    "timeline_evidence_backfill_allowed": False,
+                },
+            ) from exc
+
+        task_id = str(getattr(context, "task_id", "") or "").strip()
+        for completed in record.get("completed_lines") or []:
+            if not isinstance(completed, Mapping):
+                continue
+            if str(completed.get("line_id") or "").strip() != "worker_graph_context":
+                continue
+            completed_runtime = _timeline_first_deep_text(
+                completed,
+                "runtime_context_id",
+            )
+            completed_task = _timeline_first_deep_text(completed, "task_id")
+            if completed_runtime == runtime_context_id and completed_task == task_id:
+                return {
+                    "schema_version": "runtime_context.canonical_contract_line.v1",
+                    "accepted": True,
+                    "status": "already_completed",
+                    "canonical": True,
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "line_id": "worker_graph_context",
+                    "governance_project_id": governance_project_id,
+                    "target_project_id": target_project_id,
+                }
+
+        raise GovernanceError(
+            "cross_project_contract_atomicity_required",
+            (
+                "source-backed cross-project worker graph queries require an "
+                "atomic cross-database Contract bridge before the graph trace "
+                "may be persisted"
+            ),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "governance_project_id": governance_project_id,
+                "target_project_id": target_project_id,
+                "requested_line_id": "worker_graph_context",
+                "fail_closed": True,
+                "timeline_evidence_backfill_allowed": False,
+                "next_legal_action": "stop_and_file_cross_project_atomic_bridge",
+            },
+        )
+    finally:
+        governance_conn.close()
 
 
 def _runtime_context_contract_worker_commit_projection(
@@ -18488,6 +18881,9 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
         revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        contract_execution_identity = _runtime_context_contract_execution_identity(
+            revision_payload
+        )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
             route_identity,
@@ -18804,6 +19200,22 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         for key, value in route_lineage_payload.items():
             if value:
                 payload[key] = value
+        canonical_contract_line = _runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=project_id,
+            context=context,
+            contract_execution_id=str(
+                contract_execution_identity.get("contract_execution_id") or ""
+            ),
+            stage_id="worker_attestation",
+            line_id="worker_finish_time_attestation",
+            evidence_kind="record_finish_time_worker_attestation",
+            payload=payload,
+        )
+        if canonical_contract_line.get("canonical"):
+            payload["contract_runtime_canonical_line"] = dict(
+                canonical_contract_line
+            )
         event = task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -18833,6 +19245,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
     )
     response["finish_time_worker_self_attestation"] = public_attestation
     response["finish_order_projection"] = finish_order_projection
+    response["contract_runtime_canonical_line"] = canonical_contract_line
     response["next_legal_action"] = "record_finish_gate"
     response["next_action"] = {
         "action": "record_finish_gate",
@@ -19089,6 +19502,20 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
     )
     if result_status is not None and result_status >= 400:
         return result_status, response
+    if isinstance(
+        result_payload.get("contract_runtime_canonical_line"),
+        Mapping,
+    ):
+        response["contract_runtime_canonical_line"] = result_payload.get(
+            "contract_runtime_canonical_line"
+        )
+    if isinstance(
+        result_payload.get("contract_runtime_canonical_handoff_line"),
+        Mapping,
+    ):
+        response["contract_runtime_canonical_handoff_line"] = result_payload.get(
+            "contract_runtime_canonical_handoff_line"
+        )
     return response
 
 
@@ -19108,6 +19535,9 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         )
         route_identity = _runtime_context_latest_route_identity(conn, context)
         revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        contract_execution_identity = _runtime_context_contract_execution_identity(
+            revision_payload
+        )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
             route_identity,
@@ -19297,6 +19727,15 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     event_body = {
         "task_id": context.task_id,
         "backlog_id": context.backlog_id,
+        "contract_execution_id": contract_execution_identity.get(
+            "contract_execution_id",
+            "",
+        ),
+        "contract_runtime_line": {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+        },
         "route_id": event_route_identity.get("route_id") or "",
         "route_context_hash": event_route_identity.get("route_context_hash") or "",
         "prompt_contract_id": event_route_identity.get("prompt_contract_id") or "",
@@ -19377,6 +19816,13 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         Mapping,
     ):
         response["contract_gate_decision"] = result.get("contract_gate_decision")
+    if isinstance(result, Mapping) and isinstance(
+        result.get("contract_runtime_canonical_line"),
+        Mapping,
+    ):
+        response["contract_runtime_canonical_line"] = result.get(
+            "contract_runtime_canonical_line"
+        )
     return response
 
 
@@ -20479,6 +20925,60 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             except Exception:
                 pass
             safe_gate_payload = public_contract_revision_payload(gate)
+            finish_event_payload = {
+                "mf_subagent_finish_gate": safe_gate_payload,
+                **safe_gate_payload,
+                "checkpoint_id": saved.checkpoint_id,
+                "validated_head_commit": saved.head_commit,
+                "head_commit": saved.head_commit,
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    saved
+                ),
+                "task_id": task_id,
+                "parent_task_id": _runtime_context_mf_sub_parent_task_id(
+                    saved
+                ),
+                "backlog_id": saved.backlog_id,
+                "worker_role": "mf_sub",
+            }
+            canonical_finish_line: dict[str, Any] = {}
+            canonical_handoff_line: dict[str, Any] = {}
+            if runtime_context_lane:
+                canonical_finish_line = (
+                    _runtime_context_submit_canonical_contract_line(
+                        conn,
+                        project_id=project_id,
+                        context=saved,
+                        stage_id="worker_finish",
+                        line_id="worker_finish_gate",
+                        evidence_kind="mf_subagent_finish_gate",
+                        payload=finish_event_payload,
+                    )
+                )
+                handoff_payload = {
+                    **finish_event_payload,
+                    "action": "record_worker_review_ready_handoff",
+                    "review_ready": True,
+                    "finish_gate_checkpoint_id": saved.checkpoint_id,
+                    "finish_gate_contract_line": canonical_finish_line,
+                }
+                canonical_handoff_line = (
+                    _runtime_context_submit_canonical_contract_line(
+                        conn,
+                        project_id=project_id,
+                        context=saved,
+                        stage_id="qa_handoff",
+                        line_id="worker_review_ready_handoff",
+                        evidence_kind="review_ready",
+                        payload=handoff_payload,
+                    )
+                )
+                finish_event_payload["contract_runtime_canonical_line"] = dict(
+                    canonical_finish_line
+                )
+                finish_event_payload[
+                    "contract_runtime_canonical_handoff_line"
+                ] = dict(canonical_handoff_line)
             finish_event = _task_timeline.record_event(
                 conn,
                 project_id=project_id,
@@ -20495,14 +20995,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     or ctx.body.get("actor")
                     or "mf_subagent"
                 ),
-                payload={
-                    "mf_subagent_finish_gate": safe_gate_payload,
-                    "checkpoint_id": saved.checkpoint_id,
-                    "validated_head_commit": saved.head_commit,
-                    "runtime_context_id": runtime_context_id_for_branch_context(saved),
-                    "task_id": task_id,
-                    "backlog_id": saved.backlog_id,
-                },
+                payload=finish_event_payload,
                 commit_sha=saved.head_commit,
             )
             conn.commit()
@@ -20512,6 +21005,8 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             "gate": gate,
             "context": branch_context_to_dict(saved),
             "timeline_event_recorded": finish_event,
+            "contract_runtime_canonical_line": canonical_finish_line,
+            "contract_runtime_canonical_handoff_line": canonical_handoff_line,
         }
     finally:
         conn.close()
@@ -20558,6 +21053,71 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
             )
             event = result.get("timeline_event") if isinstance(result.get("timeline_event"), dict) else {}
             if event:
+                event_payload = (
+                    dict(event.get("payload"))
+                    if isinstance(event.get("payload"), Mapping)
+                    else {}
+                )
+                canonical_contract_line: dict[str, Any] = {}
+                if result.get("ok"):
+                    from .parallel_branch_runtime import get_branch_context
+
+                    runtime_context = get_branch_context(
+                        conn,
+                        project_id,
+                        task_id,
+                    )
+                    if runtime_context is None:
+                        raise GovernanceError(
+                            "runtime_context_not_found",
+                            "startup Contract bridge requires an active runtime context",
+                            404,
+                            {"task_id": task_id},
+                        )
+                    startup_gate_payload = (
+                        event_payload.get("mf_subagent_startup_gate")
+                        if isinstance(
+                            event_payload.get("mf_subagent_startup_gate"),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    canonical_contract_line = (
+                        _runtime_context_submit_canonical_contract_line(
+                            conn,
+                            project_id=project_id,
+                            context=runtime_context,
+                            contract_execution_id=str(
+                                dispatch_identity_bridge.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            stage_id="worker_startup",
+                            line_id="worker_startup",
+                            evidence_kind="mf_subagent_startup",
+                            payload={
+                                **event_payload,
+                                **dict(startup_gate_payload),
+                                "runtime_context_id": (
+                                    runtime_context.runtime_context_id
+                                ),
+                                "task_id": runtime_context.task_id,
+                                "parent_task_id": str(
+                                    startup_gate_payload.get("parent_task_id")
+                                    or runtime_context.parent_task_id
+                                    or runtime_context.root_task_id
+                                    or runtime_context.backlog_id
+                                    or ""
+                                ),
+                                "worker_role": "mf_sub",
+                            },
+                        )
+                    )
+                    if canonical_contract_line.get("canonical"):
+                        event_payload["contract_runtime_canonical_line"] = dict(
+                            canonical_contract_line
+                        )
                 recorded = task_timeline.record_event(
                     conn,
                     project_id=project_id,
@@ -20578,15 +21138,16 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                         or "mf_sub"
                     ),
                     status=str(event.get("status") or "passed"),
-                    payload=event.get("payload")
-                    if isinstance(event.get("payload"), dict)
-                    else {},
+                    payload=event_payload,
                     artifact_refs=event.get("artifact_refs")
                     if isinstance(event.get("artifact_refs"), dict)
                     else {},
                     commit_sha=str(event.get("commit_sha") or ""),
                 )
                 result["timeline_event_recorded"] = recorded
+                result["contract_runtime_canonical_line"] = (
+                    canonical_contract_line
+                )
             if not result.get("ok"):
                 conn.commit()
                 return result
@@ -26142,6 +26703,12 @@ def handle_graph_governance_query(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query")
+        cross_project_contract_line = (
+            _runtime_context_cross_project_graph_contract_preflight(
+                target_project_id=project_id,
+                body=body,
+            )
+        )
         if root is None and (
             body.get("project_root")
             or body.get("target_project_root")
@@ -26172,6 +26739,138 @@ def handle_graph_governance_query(ctx: RequestContext):
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )
+                if str(body.get("query_source") or "") == "mf_subagent":
+                    governance_project_id = str(
+                        body.get("governance_project_id") or project_id
+                    ).strip()
+                    if governance_project_id != project_id:
+                        result["contract_runtime_canonical_line"] = (
+                            cross_project_contract_line
+                        )
+                        conn.commit()
+                        return result
+                    from .parallel_branch_runtime import (
+                        get_branch_context_by_runtime_context_id,
+                        runtime_context_secret_hash,
+                        runtime_context_session_token_ref,
+                    )
+                    from .runtime_context import worker_proof_line_provenance
+
+                    runtime_context_id = str(
+                        body.get("runtime_context_id") or ""
+                    ).strip()
+                    runtime_context = get_branch_context_by_runtime_context_id(
+                        conn,
+                        project_id,
+                        runtime_context_id,
+                    )
+                    if runtime_context is None:
+                        raise GovernanceError(
+                            "runtime_context_not_found",
+                            "worker graph query requires an active runtime context",
+                            404,
+                            {"runtime_context_id": runtime_context_id},
+                        )
+                    trace_payload = (
+                        result.get("trace")
+                        if isinstance(result.get("trace"), Mapping)
+                        else {}
+                    )
+                    graph_trace_id = str(
+                        result.get("trace_id")
+                        or trace_payload.get("trace_id")
+                        or ""
+                    ).strip()
+                    parent_task_id = str(
+                        body.get("parent_task_id")
+                        or runtime_context.parent_task_id
+                        or runtime_context.root_task_id
+                        or runtime_context.backlog_id
+                        or ""
+                    ).strip()
+                    target_project_root = (
+                        _runtime_context_effective_target_project_root(
+                            runtime_context
+                        )
+                    )
+                    route_identity = _runtime_context_latest_route_identity(
+                        conn,
+                        runtime_context,
+                    )
+                    session_token_ref = runtime_context_session_token_ref(
+                        runtime_context
+                    )
+                    fence_token_hash = runtime_context_secret_hash(
+                        runtime_context.fence_token
+                    )
+                    worker_provenance = worker_proof_line_provenance(
+                        {
+                            "runtime_context_id": runtime_context_id,
+                            "task_id": runtime_context.task_id,
+                            "parent_task_id": parent_task_id,
+                            "worker_id": runtime_context.worker_id,
+                            "worker_slot_id": (
+                                runtime_context.worker_slot_id
+                                or runtime_context.worker_id
+                            ),
+                            "target_project_root": target_project_root,
+                            "session_token_ref": session_token_ref,
+                            "fence_token_hash": fence_token_hash,
+                        }
+                    )
+                    canonical_payload = {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": runtime_context.task_id,
+                        "parent_task_id": parent_task_id,
+                        "worker_role": "mf_sub",
+                        "worker_id": runtime_context.worker_id,
+                        "worker_slot_id": (
+                            runtime_context.worker_slot_id
+                            or runtime_context.worker_id
+                        ),
+                        "target_project_root": target_project_root,
+                        "session_token_ref": session_token_ref,
+                        "fence_token_hash": fence_token_hash,
+                        "graph_trace_ids": [graph_trace_id],
+                        "graph_query_trace_ids": [graph_trace_id],
+                        "graph_trace_evidence": {
+                            "db_verified": True,
+                            "graph_trace_ids": [graph_trace_id],
+                            "query_source": "mf_subagent",
+                            "query_purpose": str(
+                                body.get("query_purpose") or ""
+                            ),
+                            "runtime_context_id": runtime_context_id,
+                            "task_id": runtime_context.task_id,
+                            "parent_task_id": parent_task_id,
+                        },
+                        "db_verified": True,
+                        "query_source": "mf_subagent",
+                        "query_purpose": str(
+                            body.get("query_purpose") or ""
+                        ),
+                        "worker_evidence_provenance": worker_provenance,
+                        "observer_impersonation": False,
+                        "raw_session_token_persisted": False,
+                        "raw_fence_token_persisted": False,
+                        **{
+                            key: value
+                            for key, value in route_identity.items()
+                            if value
+                        },
+                    }
+                    canonical_line = (
+                        _runtime_context_submit_canonical_contract_line(
+                            conn,
+                            project_id=project_id,
+                            context=runtime_context,
+                            stage_id="worker_context",
+                            line_id="worker_graph_context",
+                            evidence_kind="graph_trace",
+                            payload=canonical_payload,
+                        )
+                    )
+                    result["contract_runtime_canonical_line"] = canonical_line
                 conn.commit()
             return result
         except (KeyError, ValueError) as exc:
@@ -58175,6 +58874,56 @@ def handle_task_timeline_append(ctx: RequestContext):
                 task_id=ctx.body.get("task_id", ""),
                 commit_sha=ctx.body.get("commit_sha", ""),
             )
+        canonical_contract_line: dict[str, Any] = {}
+        requested_contract_line = (
+            ctx.body.get("contract_runtime_line")
+            if isinstance(ctx.body.get("contract_runtime_line"), Mapping)
+            else {}
+        )
+        if trusted_runtime_context_worker_proof and requested_contract_line:
+            from .parallel_branch_runtime import (
+                get_branch_context_by_runtime_context_id,
+            )
+
+            runtime_context_id = str(
+                norm_payload.get("runtime_context_id") or ""
+            ).strip()
+            runtime_context = get_branch_context_by_runtime_context_id(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            if runtime_context is None:
+                raise GovernanceError(
+                    "runtime_context_not_found",
+                    "canonical Contract line requires an active runtime context",
+                    404,
+                    {"runtime_context_id": runtime_context_id},
+                )
+            canonical_contract_line = (
+                _runtime_context_submit_canonical_contract_line(
+                    conn,
+                    project_id=project_id,
+                    context=runtime_context,
+                    contract_execution_id=str(
+                        ctx.body.get("contract_execution_id") or ""
+                    ),
+                    stage_id=str(
+                        requested_contract_line.get("stage_id") or ""
+                    ),
+                    line_id=str(
+                        requested_contract_line.get("line_id") or ""
+                    ),
+                    evidence_kind=str(
+                        requested_contract_line.get("evidence_kind") or ""
+                    ),
+                    payload=norm_payload,
+                )
+            )
+            if canonical_contract_line.get("canonical"):
+                norm_payload["contract_runtime_canonical_line"] = dict(
+                    canonical_contract_line
+                )
         result = task_timeline.record_event(
             conn,
             project_id=project_id,
@@ -58232,6 +58981,8 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "contract_runtime_first_missing_line"
                 )
             result["meta_contract_gate_decision_source"] = False
+        if canonical_contract_line:
+            result["contract_runtime_canonical_line"] = canonical_contract_line
         return result
 
 

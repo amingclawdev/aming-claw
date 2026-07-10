@@ -201,6 +201,58 @@ class InMemoryContractExecutionStore:
         return deepcopy(stored)
 
 
+def _ensure_sqlite_schema_without_implicit_commit(
+    conn: sqlite3.Connection,
+    schema_sql: str,
+    *,
+    required_tables: Sequence[str],
+) -> None:
+    """Create schema without letting executescript split a caller transaction.
+
+    sqlite3.Connection.executescript() commits an active transaction before it
+    runs. ContractRuntime stores participate in larger facade transactions, so
+    schema refresh during a write executes complete statements individually.
+    SQLite DDL is then committed or rolled back with the paired Contract,
+    runtime, and timeline evidence.
+    """
+
+    if not conn.in_transaction:
+        conn.executescript(schema_sql)
+        return
+
+    statement = ""
+    for line in schema_sql.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip()
+        statement = ""
+        if sql:
+            conn.execute(sql)
+    if statement.strip():
+        raise ContractRuntimeError("incomplete contract runtime schema statement")
+
+    placeholders = ", ".join("?" for _ in required_tables)
+    rows = conn.execute(
+        f"""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name IN ({placeholders})
+        """,
+        tuple(required_tables),
+    ).fetchall()
+    present = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
+        for row in rows
+    }
+    missing = sorted(set(required_tables) - present)
+    if missing:
+        raise ContractRuntimeError(
+            "contract runtime schema must be initialized before transactional "
+            f"writes; missing tables: {', '.join(missing)}"
+        )
+
+
 class SQLiteContractExecutionStore:
     """SQLite-backed contract execution store with CAS revision writes."""
 
@@ -231,7 +283,11 @@ CREATE INDEX IF NOT EXISTS idx_contract_runtime_chain
         self.ensure_schema()
 
     def ensure_schema(self) -> None:
-        self.conn.executescript(self.SCHEMA_SQL)
+        _ensure_sqlite_schema_without_implicit_commit(
+            self.conn,
+            self.SCHEMA_SQL,
+            required_tables=("contract_runtime_executions",),
+        )
         ensure_contract_chain_mapping_schema(self.conn)
 
     def create(self, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -461,7 +517,15 @@ DIRECT_FIX_QA_EVIDENCE_KINDS = frozenset(
 def ensure_contract_chain_mapping_schema(conn: sqlite3.Connection) -> None:
     """Create durable backlog-to-contract-chain mapping tables."""
 
-    conn.executescript(CONTRACT_CHAIN_MAPPING_SCHEMA_SQL)
+    _ensure_sqlite_schema_without_implicit_commit(
+        conn,
+        CONTRACT_CHAIN_MAPPING_SCHEMA_SQL,
+        required_tables=(
+            "backlog_contract_chain_bindings",
+            "contract_chain_edges",
+            "backlog_contract_chain_current",
+        ),
+    )
 
 
 def refresh_contract_chain_projection_for_record(
