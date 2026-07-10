@@ -10650,8 +10650,8 @@ def _runtime_context_worker_guide_response(
         or target_project_root
     )
     current_branch_head_commit = _runtime_context_git_head_commit(
-        target_project_root,
         worktree_path,
+        target_project_root,
     )
     row_scoped_finish_head_projection = (
         _runtime_context_row_scoped_finish_head_projection(
@@ -15986,8 +15986,8 @@ def _runtime_context_finish_gate_submission_payload(
         getattr(context, "worktree_path", "") or target_project_root
     ).strip()
     current_branch_head_commit = _runtime_context_git_head_commit(
-        target_project_root,
         worktree_path,
+        target_project_root,
     )
     row_scoped_finish_head_projection = (
         _runtime_context_row_scoped_finish_head_projection(

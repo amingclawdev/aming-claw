@@ -73,6 +73,128 @@ from agent.governance.parallel_branch_runtime import (
 PID = "graph-api-test"
 
 
+def test_runtime_context_head_projection_prefers_assigned_worktree(
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="runtime-context-distinct-project-and-worktree",
+    )
+    project_root = fixture.root
+    worktree = tmp_path / "runtime-context-worker"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "codex/runtime-context-worker",
+            str(worktree),
+            fixture.main_head,
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changed_path = worktree / "agent/governance/server.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text("# worker-only commit\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "worker head"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    worker_head = batch_jobs.git_commit(worktree)
+
+    assert batch_jobs.git_commit(project_root) == fixture.main_head
+    assert worker_head != fixture.main_head
+
+    current_state = {
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-distinct-worktree",
+        "task_id": "runtime-context-worker-task",
+        "target_project_root": str(project_root),
+        "worktree_path": str(worktree),
+        "runtime_context_service": {
+            "views": {
+                "worker_view": {
+                    "task": {
+                        "task_id": "runtime-context-worker-task",
+                        "backlog_id": "AC-RUNTIME-CONTEXT-WORKTREE-HEAD",
+                        "target_project_root": str(project_root),
+                    },
+                    "branch": {
+                        "worktree_path": str(worktree),
+                        "head_commit": worker_head,
+                        "base_commit": fixture.main_head,
+                        "target_head_commit": fixture.main_head,
+                    },
+                    "graph_query_identity": {
+                        "target_project_root": str(project_root),
+                        "project_root": str(project_root),
+                        "repo_root": str(project_root),
+                        "base_commit": fixture.main_head,
+                        "target_head_commit": fixture.main_head,
+                    },
+                }
+            }
+        },
+        "source_refs": {
+            "timeline": {
+                "finish_time_worker_attestation_hint": {
+                    "head_commit": worker_head,
+                    "implementation_event_ref": "timeline:worker-implementation",
+                }
+            }
+        },
+    }
+    worker_guide = server._runtime_context_worker_guide_response(current_state)
+    guide_projection = worker_guide["row_scoped_finish_head_projection"]
+    assert guide_projection["status"] == "in_sync"
+    assert guide_projection["current_branch_head_commit"] == worker_head
+    assert guide_projection["row_scoped_implementation_head_commit"] == worker_head
+
+    context = SimpleNamespace(
+        task_id="runtime-context-worker-task",
+        backlog_id="AC-RUNTIME-CONTEXT-WORKTREE-HEAD",
+        target_project_root=str(project_root),
+        worktree_path=str(worktree),
+        head_commit=worker_head,
+        base_commit=fixture.main_head,
+        target_head_commit=fixture.main_head,
+        checkpoint_id="",
+    )
+    finish_submission = server._runtime_context_finish_gate_submission_payload(
+        project_id=PID,
+        runtime_context_id="mfrctx-distinct-worktree",
+        context=context,
+        parent_task_id="runtime-context-parent",
+        route_identity={},
+        finish_time_worker_self_attestation={},
+        head_commit=worker_head,
+        changed_files=["agent/governance/server.py"],
+        test_results={"status": "passed", "passed": True},
+        graph_trace_ids=[],
+        read_receipt_event_id="",
+        read_receipt_hash="",
+        request_body={"target_project_root": str(project_root)},
+    )
+    finish_projection = finish_submission["row_scoped_finish_head_projection"]
+    assert finish_projection["status"] == "in_sync"
+    assert finish_projection["current_branch_head_commit"] == worker_head
+    assert finish_projection["row_scoped_implementation_head_commit"] == worker_head
+
+
 def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
     parent_identity = {
         "route_id": "route-superseded-parent",
