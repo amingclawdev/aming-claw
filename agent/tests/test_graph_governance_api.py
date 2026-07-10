@@ -20937,6 +20937,7 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
     parent_task_id = "parent-runtime-initial-join-parent-scope"
     worker_task_id = "worker-runtime-initial-join-parent-scope"
     backlog_id = "AC-RUNTIME-TOKEN-INITIAL-JOIN-PARENT-SCOPE"
+    request_now = datetime.now(timezone.utc)
     context = upsert_branch_context(
         conn,
         BranchTaskRuntimeContext(
@@ -20961,7 +20962,7 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
         task_id=parent_task_id,
         target_files=["agent/governance/server.py"],
         allowed_actions=["task_timeline_append"],
-        now=datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc),
+        now=request_now,
         evidence_refs=["test:parent-scope-original-route-token-ref"],
     )
     old_ref = old_issue["route_token_ref"]
@@ -20999,7 +21000,7 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
         allowed_actions=["task_timeline_append"],
         target_files=["agent/governance/server.py"],
         ttl_hours=48.0,
-        now=datetime(2026, 7, 8, 15, 10, tzinfo=timezone.utc),
+        now=request_now,
         evidence_refs=["test:parent-scope-real-renewal"],
     )
     renewed_ref = renewed["route_token_ref"]
@@ -21029,7 +21030,7 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
                 **renewed_identity,
                 "reason": "host adapter needs first worker auth env after parent-scope observer renewal",
                 "ttl_seconds": 1200,
-                "now_iso": "2026-07-08T15:00:00Z",
+                "now_iso": request_now.isoformat().replace("+00:00", "Z"),
             },
         )
     )
