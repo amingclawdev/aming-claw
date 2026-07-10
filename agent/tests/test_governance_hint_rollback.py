@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 from agent.governance.governance_hints import (
     diff_governance_hint_bindings,
+    mutate_governance_hint_text,
     parse_governance_hint_bindings,
 )
 
@@ -79,3 +82,50 @@ def test_pb006_rollback_restored_delta_records_epoch() -> None:
     assert delta["rollback_epoch"] == "rollback-001"
     assert delta["current"]["target_node_id"] == "L7.service"
     assert delta["inverse_action"] == "remove_restored_binding"
+
+
+def test_json_envelope_rollback_preserves_business_and_projects_restored_delta() -> None:
+    source_path = "config/service.json"
+    anchor_envelope = {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": "bind",
+            "path": ".",
+            "role": "config",
+            "target_module": "service.registry",
+        }],
+    }
+    changed = json.dumps({
+        "business_value": "current",
+        "governance_hints": {
+            "schema_version": "governance_hints.v1",
+            "asset_binding_events": [{
+                **anchor_envelope["asset_binding_events"][0],
+                "operation": "unbind",
+            }],
+        },
+    }) + "\n"
+
+    rollback = mutate_governance_hint_text(
+        changed,
+        source_path=source_path,
+        action="rollback",
+        rollback_envelope=anchor_envelope,
+    )
+    restored_payload = json.loads(rollback["text"])
+    current_hints = parse_governance_hint_bindings(changed, source_path=source_path)
+    restored_hints = parse_governance_hint_bindings(rollback["text"], source_path=source_path)
+    projection = diff_governance_hint_bindings(
+        current_hints,
+        restored_hints,
+        rollback_epoch="rollback-json-001",
+        source_commit="H2",
+        target_commit="H1",
+    )
+
+    assert rollback["changed"] is True
+    assert restored_payload["business_value"] == "current"
+    assert projection["by_type"] == {"hint_rollback_restored": 1}
+    assert projection["deltas"][0]["previous"]["operation"] == "unbind"
+    assert projection["deltas"][0]["current"]["operation"] == "bind"

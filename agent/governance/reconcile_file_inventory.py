@@ -519,6 +519,10 @@ def build_file_inventory_with_observability(
             decision = "attach_to_index_wrapper"
             graph_status = "index_asset"
             reason = "index/navigation documentation; attach to project feature index"
+        elif kind == "config" and Path(rel).suffix.lower() == ".json":
+            scan_status = "orphan"
+            graph_status = "unmapped"
+            reason = "unattached JSON config is eligible for governance-hint attachment"
         elif kind in {"source", "test", "doc"}:
             scan_status = "orphan"
             graph_status = "unmapped"

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+
 from agent.governance.governance_hints import (
+    GovernanceHintCASMismatch,
     apply_binding_hints_to_graph_nodes,
     audit_governance_hint_bindings,
+    governance_hint_source_sha256,
+    governance_hints_envelope_sha256,
+    mutate_governance_hint_file,
+    mutate_governance_hint_text,
     parse_governance_hint_bindings,
     render_governance_hint_comment,
     rewrite_governance_hint_text,
@@ -113,9 +121,166 @@ def test_governance_hint_replays_bind_then_unbind_deterministically(tmp_path):
 
     summary = apply_binding_hints_to_graph_nodes(project, nodes)
 
-    assert summary["applied_count"] == 1
-    assert summary["removed_count"] == 1
+    assert summary["hint_count"] == 2
+    assert summary["effective_hint_count"] == 1
+    assert summary["applied_count"] == 0
+    assert summary["removed_count"] == 0
     assert nodes[0]["secondary"] == []
+
+
+def test_json_governance_hints_parse_only_reserved_versioned_root():
+    event = {
+        "schema_version": "asset_binding_event.v1",
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "target_module": "agent.governance.contracts.registry",
+    }
+    valid = json.dumps({
+        "schema_version": "contract_definition.v1",
+        "governance_hints": {
+            "schema_version": "governance_hints.v1",
+            "asset_binding_events": [event],
+        },
+    })
+
+    hints = parse_governance_hint_bindings(
+        valid,
+        source_path="agent/governance/contract_definitions/demo.json",
+    )
+
+    assert len(hints) == 1
+    assert hints[0].path == "agent/governance/contract_definitions/demo.json"
+    assert hints[0].field == "config"
+    assert hints[0].target_module == "agent.governance.contracts.registry"
+    assert parse_governance_hint_bindings(
+        json.dumps({"asset_binding_events": [event]}),
+        source_path="demo.json",
+    ) == []
+    assert parse_governance_hint_bindings(
+        json.dumps({"governanceHints": {"asset_binding_events": [event]}}),
+        source_path="demo.json",
+    ) == []
+    assert parse_governance_hint_bindings(
+        json.dumps({"metadata": {"governance_hints": {"asset_binding_events": [event]}}}),
+        source_path="demo.json",
+    ) == []
+    assert parse_governance_hint_bindings("{not-json", source_path="demo.json") == []
+
+
+def test_json_governance_hint_mutation_is_deterministic_idempotent_and_cas_bound():
+    source_path = "config/service.json"
+    original = '{"business":{"governance_hints":{"mode":"business"}},"enabled":true}\n'
+    event = {
+        "path": source_path,
+        "role": "config",
+        "target_module": "agent.governance.contracts.registry",
+    }
+
+    first = mutate_governance_hint_text(
+        original,
+        source_path=source_path,
+        action="attach",
+        event=event,
+        expected_source_sha256=governance_hint_source_sha256(original),
+        expected_envelope_sha256=governance_hints_envelope_sha256({}),
+    )
+    payload = json.loads(first["text"])
+
+    assert first["changed"] is True
+    assert first["text"].endswith("\n")
+    assert not first["text"].endswith("\n\n")
+    assert payload["enabled"] is True
+    assert payload["business"] == {"governance_hints": {"mode": "business"}}
+    assert payload["governance_hints"]["asset_binding_events"][0]["path"] == "."
+
+    second = mutate_governance_hint_text(
+        first["text"],
+        source_path=source_path,
+        action="attach",
+        event=event,
+        expected_envelope_sha256=first["envelope_sha256_after"],
+    )
+    assert second["changed"] is False
+    assert second["text"] == first["text"]
+
+    with pytest.raises(GovernanceHintCASMismatch, match="expected_source_sha256"):
+        mutate_governance_hint_text(
+            first["text"],
+            source_path=source_path,
+            action="unbind",
+            event=event,
+            expected_source_sha256=governance_hint_source_sha256(original),
+        )
+    with pytest.raises(GovernanceHintCASMismatch, match="expected_envelope_sha256"):
+        mutate_governance_hint_text(
+            first["text"],
+            source_path=source_path,
+            action="unbind",
+            event=event,
+            expected_envelope_sha256=governance_hints_envelope_sha256({}),
+        )
+
+
+def test_json_governance_hint_order_is_explicit_last_event_wins(tmp_path):
+    project = tmp_path / "project"
+    source_path = "config/service.json"
+    event = {
+        "path": ".",
+        "role": "config",
+        "target_module": "service.config",
+    }
+    attached = mutate_governance_hint_text(
+        '{"enabled":true}\n',
+        source_path=source_path,
+        action="attach",
+        event=event,
+    )
+    unbound = mutate_governance_hint_text(
+        attached["text"],
+        source_path=source_path,
+        action="unbind",
+        event=event,
+    )
+    _write(project / source_path, unbound["text"])
+    nodes = [{
+        "id": "L7.config",
+        "title": "Config",
+        "config": [source_path],
+        "metadata": {"module": "service.config"},
+    }]
+
+    summary = apply_binding_hints_to_graph_nodes(project, nodes)
+
+    assert [hint.operation for hint in parse_governance_hint_bindings(
+        unbound["text"], source_path=source_path
+    )] == ["bind", "unbind"]
+    assert summary["effective_hint_count"] == 1
+    assert summary["removed_count"] == 1
+    assert nodes[0]["config"] == []
+
+
+def test_json_governance_hint_file_dry_run_uses_same_plan_without_writing(tmp_path):
+    source = tmp_path / "config.json"
+    original = '{"enabled":true}\n'
+    source.write_text(original, encoding="utf-8")
+
+    result = mutate_governance_hint_file(
+        source,
+        source_path="config.json",
+        action="attach",
+        event={
+            "path": ".",
+            "role": "config",
+            "target_module": "service.registry",
+        },
+        dry_run=True,
+    )
+
+    assert result["changed"] is True
+    assert result["written"] is False
+    assert result["dry_run"] is True
+    assert source.read_text(encoding="utf-8") == original
 
 
 def test_governance_hint_defers_index_doc_container_binding(tmp_path):

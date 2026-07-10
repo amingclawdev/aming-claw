@@ -399,6 +399,51 @@ def test_crud_service_lists_reads_and_validates_definitions(tmp_path: Path):
     assert by_alias["data"]["definition"]["contract_id"] == "observer_hotfix"
 
 
+def test_crud_service_preserves_graph_only_envelope_across_all_lifecycle_reads(
+    tmp_path: Path,
+):
+    service = ContractCrudService(tmp_path)
+    envelope = {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": "bind",
+            "path": ".",
+            "role": "config",
+            "target_module": "agent.governance.contracts.registry",
+        }],
+    }
+    created = service.create(_definition(governance_hints=envelope))
+    definition_hash = created["data"]["definition"]["definition_hash"]
+    updated_envelope = {
+        **envelope,
+        "asset_binding_events": [{
+            **envelope["asset_binding_events"][0],
+            "operation": "unbind",
+        }],
+    }
+
+    updated = service.update(
+        _definition(governance_hints=updated_envelope),
+        expected_previous_hash=definition_hash,
+    )
+    read = service.read("observer_hotfix")
+    listed = service.list()
+    deprecated = service.deprecate(
+        "observer_hotfix",
+        version="v1",
+        revision="rev1",
+        reason="lifecycle preservation",
+    )
+
+    assert updated["ok"] is True
+    assert updated["data"]["definition"]["definition_hash"] == definition_hash
+    assert read["data"]["definition"]["governance_hints"] == updated_envelope
+    assert listed["data"]["definitions"][0]["governance_hints"] == updated_envelope
+    assert deprecated["data"]["definition"]["governance_hints"] == updated_envelope
+    assert "governance_hints" not in read["data"]["definition"]["read_model"]
+
+
 def test_crud_service_preserves_registry_lifecycle_rules(tmp_path: Path):
     service = ContractCrudService(tmp_path)
     created = service.create(_definition())
@@ -547,6 +592,57 @@ def test_registry_resolves_latest_active_revision_and_runtime_pins_source_hash(
     assert exc.value.field == "definition_source_sha256"
 
 
+def test_envelope_only_source_change_keeps_active_runtime_projection_current(
+    tmp_path: Path,
+):
+    envelope = {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": "bind",
+            "path": ".",
+            "role": "config",
+            "target_module": "agent.governance.contracts.registry",
+        }],
+    }
+    service = ContractCrudService(tmp_path)
+    created = service.create(_definition(governance_hints=envelope))
+    runtime = ContractRuntime(service.registry)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-ENVELOPE-ONLY-RUNTIME",
+        contract_execution_id="cex-envelope-only-runtime",
+        actor_role="observer",
+        route_token_ref="rtok-envelope-only-runtime",
+    )
+    original_guide = record["runtime_guide"]
+    source_path = Path(created["data"]["path"])
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    payload["governance_hints"]["asset_binding_events"].append({
+        **envelope["asset_binding_events"][0],
+        "operation": "unbind",
+    })
+    source_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    refreshed_guide = runtime.current_guide(
+        "cex-envelope-only-runtime",
+        actor_role="observer",
+    )
+    refreshed_definition = service.registry.get("observer_hotfix")
+
+    assert record["definition_source_sha256"] != refreshed_definition["source_sha256"]
+    assert record["definition_governance_hints_sha256"] != (
+        refreshed_definition["governance_hints_sha256"]
+    )
+    assert refreshed_definition["definition_hash"] == record["definition_hash"]
+    assert refreshed_guide["runtime_guide_hash"] == original_guide["runtime_guide_hash"]
+    assert refreshed_guide["next_legal_action"] == original_guide["next_legal_action"]
+
+
 def test_direct_source_edit_warns_without_blocking_runtime_until_contract_update(
     tmp_path: Path,
 ):
@@ -620,6 +716,57 @@ def test_direct_source_edit_warns_without_blocking_runtime_until_contract_update
     )
     assert record["contract_execution_id"] == "cex-source-drift-warn-only"
     assert record["definition_source_sha256"] == definition["source_sha256"]
+
+
+def test_envelope_only_source_drift_routes_to_graph_reconcile_not_contract_update(
+    tmp_path: Path,
+):
+    envelope = {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": "bind",
+            "path": ".",
+            "role": "config",
+            "target_module": "agent.governance.contracts.registry",
+        }],
+    }
+    service = ContractCrudService(tmp_path)
+    created = service.create(_definition(governance_hints=envelope))
+    source_path = Path(created["data"]["path"])
+    for args in (
+        ["git", "init"],
+        ["git", "config", "user.email", "contracts@example.test"],
+        ["git", "config", "user.name", "Contract Tests"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "baseline contract source"],
+    ):
+        subprocess.run(
+            args,
+            cwd=tmp_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    payload["governance_hints"]["asset_binding_events"].append({
+        **envelope["asset_binding_events"][0],
+        "operation": "unbind",
+    })
+    source_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    definition = service.read("observer_hotfix")["data"]["definition"]
+    integrity = definition["source_control_integrity"]
+
+    assert integrity["status"] == "governance_hints_changed"
+    assert integrity["drift_status"] == "graph_source_metadata_changed"
+    assert integrity["requires_contract_update"] is False
+    assert integrity["legal_status"] == "legal"
+    assert integrity["blocks_runtime"] is False
+    assert integrity["next_operator_action"] == "run_graph_reconcile"
 
 
 def test_crud_service_returns_structured_failure_results(tmp_path: Path):

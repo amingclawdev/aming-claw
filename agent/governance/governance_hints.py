@@ -6,8 +6,13 @@ during reconcile instead of mutating graph DB state directly.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
+import hashlib
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,6 +25,10 @@ _LINE_HINT_RE = re.compile(
     r"(?m)^\s*(?:#|//)\s*governance-hint\s+({.*})\s*$",
     re.IGNORECASE,
 )
+
+GOVERNANCE_HINTS_ROOT_KEY = "governance_hints"
+GOVERNANCE_HINTS_SCHEMA_VERSION = "governance_hints.v1"
+ASSET_BINDING_EVENT_SCHEMA_VERSION = "asset_binding_event.v1"
 
 _ROLE_TO_FIELD = {
     "doc": "secondary",
@@ -61,6 +70,14 @@ class _HintCommentMatch:
     end: int
     raw_json: str
     style: str
+
+
+class GovernanceHintMutationError(ValueError):
+    """Raised when a source-backed governance-hint mutation is invalid."""
+
+
+class GovernanceHintCASMismatch(GovernanceHintMutationError):
+    """Raised when source or envelope compare-and-swap evidence is stale."""
 
 
 def binding_hint_to_dict(hint: BindingHint) -> dict[str, str]:
@@ -153,7 +170,21 @@ def normalize_relpath(project_root: str | Path, path: str) -> str:
 
 
 def parse_governance_hint_bindings(markdown: str, *, source_path: str = "") -> list[BindingHint]:
-    """Return binding hints from governance-hint HTML comments."""
+    """Return binding hints from a reserved JSON envelope or legacy comments."""
+    source_suffix = Path(str(source_path or "")).suffix.lower()
+    if source_suffix == ".json":
+        try:
+            payload = json.loads(markdown or "")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        envelope = payload.get(GOVERNANCE_HINTS_ROOT_KEY)
+        return _bindings_from_governance_hints_envelope(
+            envelope,
+            source_path=source_path,
+        )
+
     hints: list[BindingHint] = []
     for match in _HINT_RE.finditer(markdown or ""):
         raw = match.group(1).strip()
@@ -203,6 +234,456 @@ def render_governance_hint_comment(path: str, payload: dict[str, Any]) -> str:
     if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
         return f"// {body}"
     return ""
+
+
+def normalize_governance_hints_envelope(value: Any) -> dict[str, Any]:
+    """Validate and copy the reserved versioned JSON source-metadata envelope."""
+    if not isinstance(value, Mapping):
+        raise GovernanceHintMutationError("governance_hints must be an object")
+    schema_version = str(value.get("schema_version") or "")
+    if schema_version != GOVERNANCE_HINTS_SCHEMA_VERSION:
+        raise GovernanceHintMutationError(
+            f"governance_hints.schema_version must be {GOVERNANCE_HINTS_SCHEMA_VERSION!r}"
+        )
+    events = value.get("asset_binding_events")
+    if not isinstance(events, list):
+        raise GovernanceHintMutationError(
+            "governance_hints.asset_binding_events must be an ordered list"
+        )
+    for index, event in enumerate(events):
+        if not isinstance(event, Mapping):
+            raise GovernanceHintMutationError(
+                f"governance_hints.asset_binding_events[{index}] must be an object"
+            )
+        event_schema = str(event.get("schema_version") or "")
+        if event_schema != ASSET_BINDING_EVENT_SCHEMA_VERSION:
+            raise GovernanceHintMutationError(
+                "governance_hints.asset_binding_events"
+                f"[{index}].schema_version must be {ASSET_BINDING_EVENT_SCHEMA_VERSION!r}"
+            )
+    return deepcopy(dict(value))
+
+
+def governance_hints_envelope_sha256(value: Any) -> str:
+    """Hash only the reserved root envelope for source-metadata CAS/audit."""
+    envelope = value if isinstance(value, Mapping) else {}
+    raw = json.dumps(
+        envelope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def governance_hint_source_sha256(text: str) -> str:
+    return "sha256:" + hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def mutate_governance_hint_text(
+    text: str,
+    *,
+    source_path: str,
+    action: str,
+    event: Mapping[str, Any] | None = None,
+    nodes: Iterable[dict[str, Any]] = (),
+    path: str = "",
+    role: str = "",
+    target_node_id: str = "",
+    target_module: str = "",
+    expected_source_sha256: str = "",
+    expected_envelope_sha256: str = "",
+    rollback_envelope: Mapping[str, Any] | None = None,
+    rollback_text: str | None = None,
+) -> dict[str, Any]:
+    """Plan one deterministic governance-hint source mutation.
+
+    JSON sources are changed only through the reserved top-level envelope.
+    Every operation preserves all non-reserved root values and emits stable
+    sorted/indented JSON with one trailing newline.
+    """
+    source = normalize_relpath("", source_path)
+    op = str(action or "").strip().lower()
+    if op == "repair":
+        op = "stabilize"
+    if op not in {"attach", "unbind", "stabilize", "withdraw", "rollback"}:
+        raise GovernanceHintMutationError(
+            "action must be attach, unbind, stabilize, withdraw, or rollback"
+        )
+
+    before = text or ""
+    source_hash_before = governance_hint_source_sha256(before)
+    _assert_expected_hash(
+        "expected_source_sha256",
+        expected_source_sha256,
+        source_hash_before,
+    )
+    if Path(source).suffix.lower() == ".json":
+        result = _mutate_json_governance_hint_text(
+            before,
+            source_path=source,
+            action=op,
+            event=event,
+            nodes=nodes,
+            path=path,
+            role=role,
+            target_node_id=target_node_id,
+            target_module=target_module,
+            expected_envelope_sha256=expected_envelope_sha256,
+            rollback_envelope=rollback_envelope,
+            rollback_text=rollback_text,
+        )
+    else:
+        if expected_envelope_sha256:
+            _assert_expected_hash(
+                "expected_envelope_sha256",
+                expected_envelope_sha256,
+                governance_hints_envelope_sha256({}),
+            )
+        result = _mutate_legacy_governance_hint_text(
+            before,
+            source_path=source,
+            action=op,
+            event=event,
+            nodes=nodes,
+            path=path,
+            role=role,
+            target_node_id=target_node_id,
+            target_module=target_module,
+            rollback_text=rollback_text,
+        )
+
+    after = str(result.get("text") or "")
+    result.update(
+        {
+            "schema_version": "governance_hint_mutation.v1",
+            "action": op,
+            "source_path": source,
+            "changed": after != before,
+            "source_sha256_before": source_hash_before,
+            "source_sha256_after": governance_hint_source_sha256(after),
+        }
+    )
+    return result
+
+
+def mutate_governance_hint_file(
+    source_file: str | Path,
+    *,
+    source_path: str,
+    action: str,
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Apply the shared mutation plan with one same-directory atomic replace."""
+    file_path = Path(source_file)
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise GovernanceHintMutationError(
+            f"file is not utf-8 text: {source_path}"
+        ) from exc
+    result = mutate_governance_hint_text(
+        text,
+        source_path=source_path,
+        action=action,
+        **kwargs,
+    )
+    result["dry_run"] = bool(dry_run)
+    result["written"] = bool(result["changed"] and not dry_run)
+    if result["written"]:
+        _atomic_write_text(file_path, str(result["text"]))
+    return result
+
+
+def _mutate_json_governance_hint_text(
+    text: str,
+    *,
+    source_path: str,
+    action: str,
+    event: Mapping[str, Any] | None,
+    nodes: Iterable[dict[str, Any]],
+    path: str,
+    role: str,
+    target_node_id: str,
+    target_module: str,
+    expected_envelope_sha256: str,
+    rollback_envelope: Mapping[str, Any] | None,
+    rollback_text: str | None,
+) -> dict[str, Any]:
+    try:
+        root = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise GovernanceHintMutationError("invalid JSON source; no hints were mutated") from exc
+    if not isinstance(root, dict):
+        raise GovernanceHintMutationError("JSON source root must be an object")
+
+    original_envelope = root.get(GOVERNANCE_HINTS_ROOT_KEY)
+    envelope_hash_before = governance_hints_envelope_sha256(original_envelope)
+    _assert_expected_hash(
+        "expected_envelope_sha256",
+        expected_envelope_sha256,
+        envelope_hash_before,
+    )
+
+    repaired_count = 0
+    withdrawn_count = 0
+    unchanged_count = 0
+    errors: list[dict[str, str]] = []
+    mutated = False
+    out = deepcopy(root)
+    if action in {"attach", "unbind"}:
+        if original_envelope is None:
+            envelope: dict[str, Any] = {
+                "schema_version": GOVERNANCE_HINTS_SCHEMA_VERSION,
+                "asset_binding_events": [],
+            }
+        else:
+            envelope = normalize_governance_hints_envelope(original_envelope)
+        proposed = _canonical_binding_event(
+            event or {},
+            source_path=source_path,
+            operation="bind" if action == "attach" else "unbind",
+        )
+        events = list(envelope.get("asset_binding_events") or [])
+        if _last_matching_event_is_equivalent(
+            events,
+            proposed,
+            source_path=source_path,
+        ):
+            unchanged_count = 1
+        else:
+            events.append(proposed)
+            envelope["asset_binding_events"] = events
+            mutated = True
+        out[GOVERNANCE_HINTS_ROOT_KEY] = envelope
+    elif action in {"stabilize", "withdraw"}:
+        if original_envelope is None:
+            unchanged_count = 1
+        else:
+            envelope = normalize_governance_hints_envelope(original_envelope)
+            by_id, by_module, by_title, all_nodes = _node_indexes(nodes)
+            matcher = {
+                "path": _filter_path(source_path, path),
+                "field": _ROLE_TO_FIELD.get(str(role or "").strip().lower(), ""),
+                "target_node_id": str(target_node_id or "").strip(),
+                "target_module": str(target_module or "").strip(),
+            }
+            rewritten, stats = _rewrite_hint_payload(
+                envelope,
+                source_path=source_path,
+                by_id=by_id,
+                by_module=by_module,
+                by_title=by_title,
+                nodes=all_nodes,
+                action=action,
+                matcher=matcher,
+            )
+            repaired_count = int(stats.get("repaired") or 0)
+            withdrawn_count = int(stats.get("withdrawn") or 0)
+            unchanged_count = int(stats.get("unchanged") or 0)
+            errors = list(stats.get("errors") or [])
+            mutated = bool(repaired_count or withdrawn_count)
+            next_envelope = rewritten or {
+                "schema_version": GOVERNANCE_HINTS_SCHEMA_VERSION,
+            }
+            next_envelope.setdefault("asset_binding_events", [])
+            out[GOVERNANCE_HINTS_ROOT_KEY] = next_envelope
+    else:
+        restored = rollback_envelope
+        if rollback_text is not None:
+            try:
+                rollback_root = json.loads(rollback_text)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise GovernanceHintMutationError("rollback_text must be valid JSON") from exc
+            if not isinstance(rollback_root, dict):
+                raise GovernanceHintMutationError("rollback_text root must be an object")
+            candidate = rollback_root.get(GOVERNANCE_HINTS_ROOT_KEY)
+            restored = candidate if isinstance(candidate, Mapping) else None
+        previous = out.get(GOVERNANCE_HINTS_ROOT_KEY)
+        if restored is None:
+            out.pop(GOVERNANCE_HINTS_ROOT_KEY, None)
+        else:
+            out[GOVERNANCE_HINTS_ROOT_KEY] = normalize_governance_hints_envelope(restored)
+        mutated = previous != out.get(GOVERNANCE_HINTS_ROOT_KEY)
+
+    rendered = (
+        json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        if mutated
+        else text
+    )
+    envelope_after = out.get(GOVERNANCE_HINTS_ROOT_KEY)
+    return {
+        "text": rendered,
+        "repaired_count": repaired_count,
+        "withdrawn_count": withdrawn_count,
+        "unchanged_count": unchanged_count,
+        "error_count": len(errors),
+        "errors": errors,
+        "envelope_sha256_before": envelope_hash_before,
+        "envelope_sha256_after": governance_hints_envelope_sha256(envelope_after),
+    }
+
+
+def _mutate_legacy_governance_hint_text(
+    text: str,
+    *,
+    source_path: str,
+    action: str,
+    event: Mapping[str, Any] | None,
+    nodes: Iterable[dict[str, Any]],
+    path: str,
+    role: str,
+    target_node_id: str,
+    target_module: str,
+    rollback_text: str | None,
+) -> dict[str, Any]:
+    if action in {"stabilize", "withdraw"}:
+        return rewrite_governance_hint_text(
+            text,
+            source_path=source_path,
+            nodes=nodes,
+            action=action,
+            path=path,
+            role=role,
+            target_node_id=target_node_id,
+            target_module=target_module,
+        )
+    if action == "rollback":
+        if rollback_text is None:
+            raise GovernanceHintMutationError("rollback_text is required for legacy sources")
+        return _rewrite_result(
+            rollback_text,
+            action=action,
+            changed=rollback_text != text,
+        )
+
+    proposed = _canonical_binding_event(
+        event or {},
+        source_path=source_path,
+        operation="bind" if action == "attach" else "unbind",
+    )
+    if proposed.get("path") == ".":
+        proposed["path"] = source_path
+    existing = parse_governance_hint_bindings(text, source_path=source_path)
+    proposed_hint = _binding_hint_from_item(proposed, source_path=source_path)
+    if proposed_hint:
+        for existing_hint in reversed(existing):
+            if _effective_binding_key(existing_hint) != _effective_binding_key(proposed_hint):
+                continue
+            if _same_effective_binding(existing_hint, proposed_hint):
+                return _rewrite_result(text, action=action, unchanged_count=1)
+            break
+    comment = render_governance_hint_comment(
+        source_path,
+        {"asset_binding_event": proposed},
+    )
+    if not comment:
+        raise GovernanceHintMutationError(
+            f"file type does not support direct governance-hint comments: {source_path}"
+        )
+    if action == "attach":
+        rendered = comment.rstrip() + "\n\n" + text
+    else:
+        prefix = text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        if prefix and not prefix.endswith("\n\n"):
+            prefix += "\n"
+        rendered = prefix + comment.rstrip() + "\n"
+    result = _rewrite_result(rendered, action=action, changed=rendered != text)
+    result["rendered_hint"] = comment
+    return result
+
+
+def _canonical_binding_event(
+    event: Mapping[str, Any],
+    *,
+    source_path: str,
+    operation: str,
+) -> dict[str, Any]:
+    out = deepcopy(dict(event))
+    out["schema_version"] = ASSET_BINDING_EVENT_SCHEMA_VERSION
+    out["operation"] = operation
+    raw_path = str(out.get("path") or out.get("file") or out.get("file_path") or "").strip()
+    resolved = _resolve_binding_path(raw_path, source_path=source_path)
+    out.pop("file", None)
+    out.pop("file_path", None)
+    out["path"] = "." if resolved == normalize_relpath("", source_path) else resolved
+    return out
+
+
+def _last_matching_event_is_equivalent(
+    events: Iterable[Any],
+    proposed: Mapping[str, Any],
+    *,
+    source_path: str,
+) -> bool:
+    proposed_hint = _binding_hint_from_item(dict(proposed), source_path=source_path)
+    if proposed_hint is None:
+        raise GovernanceHintMutationError("asset binding event is incomplete")
+    for item in reversed(list(events)):
+        if not isinstance(item, Mapping):
+            continue
+        hint = _binding_hint_from_item(dict(item), source_path=source_path)
+        if hint is None or _effective_binding_key(hint) != _effective_binding_key(proposed_hint):
+            continue
+        return _same_effective_binding(hint, proposed_hint)
+    return False
+
+
+def _same_effective_binding(left: BindingHint, right: BindingHint) -> bool:
+    return _binding_hint_signature(left) == _binding_hint_signature(right)
+
+
+def _effective_binding_key(hint: BindingHint) -> tuple[str, str]:
+    return (normalize_relpath("", hint.path or hint.source_path), hint.field)
+
+
+def _resolve_binding_path(raw_path: str, *, source_path: str) -> str:
+    token = str(raw_path or "").replace("\\", "/").strip()
+    if token in {"", ".", "./", "self", "$self"}:
+        return normalize_relpath("", source_path)
+    return normalize_relpath("", token)
+
+
+def _filter_path(source_path: str, path: str) -> str:
+    if not str(path or "").strip():
+        return ""
+    return _resolve_binding_path(str(path), source_path=source_path)
+
+
+def _assert_expected_hash(field: str, expected: str, actual: str) -> None:
+    token = str(expected or "").strip().lower()
+    if not token:
+        return
+    if not token.startswith("sha256:"):
+        token = "sha256:" + token
+    if token != str(actual or "").strip().lower():
+        raise GovernanceHintCASMismatch(f"{field} mismatch")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    mode = path.stat().st_mode
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 def audit_governance_hint_bindings(
@@ -414,13 +895,14 @@ def apply_binding_hints_to_graph_nodes(
     """
     root = Path(project_root).resolve()
     binding_hints = list(hints) if hints is not None else load_governance_hint_bindings(root)
+    effective_hints = _last_event_wins(binding_hints)
     by_id, by_module, by_title, all_nodes = _node_indexes(nodes)
     already_bound = _bound_paths(nodes)
     applied: list[dict[str, str]] = []
     removed: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
 
-    for hint in binding_hints:
+    for hint in effective_hints:
         rel = normalize_relpath(root, hint.path or hint.source_path)
         if not rel:
             skipped.append({"path": rel, "reason": "missing_path", "source_path": hint.source_path})
@@ -509,6 +991,7 @@ def apply_binding_hints_to_graph_nodes(
 
     return {
         "hint_count": len(binding_hints),
+        "effective_hint_count": len(effective_hints),
         "applied_count": len(applied),
         "removed_count": len(removed),
         "skipped_count": len(skipped),
@@ -540,6 +1023,45 @@ def _binding_hint_signature(hint: BindingHint) -> tuple[str, str, str, str, str,
 
 def _binding_hints_by_key(hints: Iterable[BindingHint]) -> dict[tuple[str, str], BindingHint]:
     return {_binding_hint_key(hint): hint for hint in hints}
+
+
+def _last_event_wins(hints: Iterable[BindingHint]) -> list[BindingHint]:
+    """Return effective binding events while preserving each last-event position."""
+    ordered = list(hints)
+    last_indexes: dict[tuple[str, str], int] = {}
+    for index, hint in enumerate(ordered):
+        last_indexes[_effective_binding_key(hint)] = index
+    return [
+        hint
+        for index, hint in enumerate(ordered)
+        if last_indexes[_effective_binding_key(hint)] == index
+    ]
+
+
+def normalized_governance_binding_hints(
+    project_root: str | Path,
+) -> list[dict[str, str]]:
+    """Return deterministic normalized source hints for graph fingerprinting."""
+    return [binding_hint_to_dict(hint) for hint in load_governance_hint_bindings(project_root)]
+
+
+def _bindings_from_governance_hints_envelope(
+    envelope: Any,
+    *,
+    source_path: str,
+) -> list[BindingHint]:
+    try:
+        normalized = normalize_governance_hints_envelope(envelope)
+    except GovernanceHintMutationError:
+        return []
+    hints: list[BindingHint] = []
+    for item in normalized.get("asset_binding_events") or []:
+        if not isinstance(item, dict):
+            continue
+        hint = _binding_hint_from_item(item, source_path=source_path)
+        if hint:
+            hints.append(hint)
+    return hints
 
 
 def _bindings_from_payload(payload: Any, *, source_path: str) -> list[BindingHint]:
@@ -877,9 +1399,9 @@ def _binding_hint_from_item(item: dict[str, Any], *, source_path: str) -> Bindin
         item.get("role") or item.get("binding") or item.get("attachment_role") or "doc"
     ).strip().lower()
     field = _ROLE_TO_FIELD.get(role, "")
-    path = normalize_relpath(
-        "",
-        str(item.get("path") or item.get("file") or item.get("file_path") or source_path),
+    path = _resolve_binding_path(
+        str(item.get("path") or item.get("file") or item.get("file_path") or ""),
+        source_path=source_path,
     )
     target_node_id = str(
         item.get("node_id") or item.get("target_node_id") or item.get("target") or ""

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent.governance.graph_structure_hints import load_graph_structure_hints
+from agent.governance.governance_hints import normalized_governance_binding_hints
 from agent.governance.reconcile_semantic_config import DEFAULT_CONFIG_PATH, PROJECT_OVERRIDE_PATH
 
 
@@ -25,6 +26,7 @@ ALGORITHM_INPUT_PATHS: tuple[str, ...] = (
     "agent/governance/graph_hint_projection.py",
     "agent/governance/graph_structure_hints.py",
     "agent/governance/semantic_graph_structure_bridge.py",
+    "agent/governance/governance_hints.py",
 )
 
 
@@ -124,6 +126,23 @@ def _hint_component(project_root: Path, hint_index: Mapping[str, Any] | None) ->
     }
 
 
+def _governance_binding_hint_component(project_root: Path) -> dict[str, Any]:
+    try:
+        hints = normalized_governance_binding_hints(project_root)
+    except Exception as exc:
+        return {
+            "fingerprint": _json_hash({"error": type(exc).__name__}),
+            "hint_count": 0,
+            "hints": [],
+            "error": type(exc).__name__,
+        }
+    return {
+        "fingerprint": _json_hash(hints),
+        "hint_count": len(hints),
+        "hints": hints,
+    }
+
+
 def build_graph_rule_fingerprint(
     project_root: str | Path,
     *,
@@ -140,8 +159,16 @@ def build_graph_rule_fingerprint(
     }
     if include_source_hints:
         components["source_hints"] = _hint_component(root, hint_index)
+        components["governance_binding_hints"] = _governance_binding_hint_component(root)
     else:
         components["source_hints"] = {
+            "fingerprint": "",
+            "hint_count": 0,
+            "hints": [],
+            "skipped": True,
+            "skip_reason": "commit_drift_covers_source_hint_changes",
+        }
+        components["governance_binding_hints"] = {
             "fingerprint": "",
             "hint_count": 0,
             "hints": [],

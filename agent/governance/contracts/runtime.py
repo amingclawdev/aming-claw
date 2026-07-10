@@ -90,6 +90,12 @@ class StalePinnedContractExecutionError(ContractRuntimeError):
             "current_definition_source_sha256": str(
                 self.definition.get("source_sha256") or ""
             ),
+            "pinned_definition_governance_hints_sha256": str(
+                self.record.get("definition_governance_hints_sha256") or ""
+            ),
+            "current_definition_governance_hints_sha256": str(
+                self.definition.get("governance_hints_sha256") or ""
+            ),
         }
 
 
@@ -2766,6 +2772,10 @@ class ContractRuntime:
             "revision": definition["revision"],
             "definition_hash": definition["definition_hash"],
             "definition_source_sha256": str(definition.get("source_sha256") or ""),
+            "definition_raw_source_sha256": str(definition.get("source_sha256") or ""),
+            "definition_governance_hints_sha256": str(
+                definition.get("governance_hints_sha256") or ""
+            ),
             "instruction_bundle_hash": instruction_bundle["instruction_bundle_hash"],
             "route_token_ref": route_token_ref,
             "completed_lines": [],
@@ -3125,7 +3135,7 @@ class ContractRuntime:
             definition=definition,
         )
         pinned_source_sha256 = str(record.get("definition_source_sha256") or "")
-        if pinned_source_sha256 and not _is_lifecycle_only_source_mismatch(
+        if pinned_source_sha256 and not _is_non_runtime_source_mismatch(
             record,
             definition,
         ):
@@ -3139,14 +3149,25 @@ class ContractRuntime:
         return definition
 
 
-def _is_lifecycle_only_source_mismatch(
+def _is_non_runtime_source_mismatch(
     record: Mapping[str, Any],
     definition: Mapping[str, Any],
 ) -> bool:
-    if str(definition.get("status") or "") != "deprecated":
-        return False
-    return str(record.get("definition_hash") or "") == str(
+    definition_hash_matches = str(record.get("definition_hash") or "") == str(
         definition.get("definition_hash") or ""
+    )
+    if not definition_hash_matches:
+        return False
+    if str(definition.get("status") or "") == "deprecated":
+        return True
+    pinned_hints_sha256 = str(
+        record.get("definition_governance_hints_sha256") or ""
+    )
+    current_hints_sha256 = str(definition.get("governance_hints_sha256") or "")
+    return bool(
+        pinned_hints_sha256
+        and current_hints_sha256
+        and pinned_hints_sha256 != current_hints_sha256
     )
 
 

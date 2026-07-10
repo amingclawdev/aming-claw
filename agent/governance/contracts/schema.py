@@ -7,6 +7,11 @@ import re
 from pathlib import PurePosixPath
 from typing import Any
 
+from ..governance_hints import (
+    GOVERNANCE_HINTS_ROOT_KEY,
+    GovernanceHintMutationError,
+    normalize_governance_hints_envelope,
+)
 from .hash import definition_hash
 
 
@@ -66,6 +71,13 @@ def normalize_definition(
     }
     if isinstance(payload.get("metadata"), Mapping):
         normalized["metadata"] = dict(payload["metadata"])
+    if GOVERNANCE_HINTS_ROOT_KEY in payload:
+        try:
+            normalized[GOVERNANCE_HINTS_ROOT_KEY] = normalize_governance_hints_envelope(
+                payload.get(GOVERNANCE_HINTS_ROOT_KEY)
+            )
+        except GovernanceHintMutationError as exc:
+            raise ContractDefinitionError(str(exc)) from exc
     normalized["definition_hash"] = definition_hash(normalized)
     normalized["read_model"] = _build_read_model(normalized)
     if source_path:

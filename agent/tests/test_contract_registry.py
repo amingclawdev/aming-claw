@@ -79,6 +79,19 @@ def _write_definition(root, payload, name="observer_hotfix.v1.rev1.json"):
     return path
 
 
+def _governance_hints(*, operation="bind"):
+    return {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": operation,
+            "path": ".",
+            "role": "config",
+            "target_module": "agent.governance.contracts.registry",
+        }],
+    }
+
+
 def test_registry_loads_definition_with_hash_and_alias(tmp_path):
     _write_definition(tmp_path, _definition())
     (tmp_path / "legacy-template.v1.json").write_text(
@@ -242,6 +255,52 @@ def test_registry_exposes_source_sha_and_load_record(tmp_path):
     listed_load_record = registry.list_definitions()[0]["definition_load_record"]
     assert listed_load_record["load_record_id"] == load_record["load_record_id"]
     assert listed_load_record["loaded_at"] == load_record["loaded_at"]
+
+
+def test_registry_preserves_only_reserved_root_envelope_and_hashes_nested_business_field():
+    registry = ContractDefinitionRegistry()
+    payload = _definition(
+        governance_hints=_governance_hints(),
+        metadata={"governance_hints": {"business_rule": "one"}},
+        unrelated_root={"drop": True},
+    )
+
+    normalized = registry.validate_payload(payload)
+    envelope_hash = normalized["definition_hash"]
+    envelope_changed = registry.validate_payload({
+        **payload,
+        "governance_hints": _governance_hints(operation="unbind"),
+    })
+    nested_changed = registry.validate_payload({
+        **payload,
+        "metadata": {"governance_hints": {"business_rule": "two"}},
+    })
+
+    assert normalized["governance_hints"] == _governance_hints()
+    assert "unrelated_root" not in normalized
+    assert "governance_hints" not in normalized["read_model"]
+    assert envelope_changed["definition_hash"] == envelope_hash
+    assert nested_changed["definition_hash"] != envelope_hash
+
+
+def test_registry_crud_lifecycle_preserves_governance_hints_envelope(tmp_path):
+    registry = ContractDefinitionRegistry(tmp_path)
+    registry.create_definition(_definition(governance_hints=_governance_hints()))
+
+    created = registry.get("observer_hotfix")
+    deprecated_path = registry.deprecate_definition(
+        "observer_hotfix",
+        version="v1",
+        revision="rev1",
+        reason="test lifecycle",
+    )
+    deprecated_payload = json.loads(deprecated_path.read_text(encoding="utf-8"))
+    deprecated = registry.get("observer_hotfix", version="v1", revision="rev1")
+
+    assert created["governance_hints"] == _governance_hints()
+    assert deprecated_payload["governance_hints"] == _governance_hints()
+    assert deprecated["governance_hints"] == _governance_hints()
+    assert deprecated["definition_hash"] == created["definition_hash"]
 
 
 def test_registry_rejects_unsafe_instruction_ref_path(tmp_path):

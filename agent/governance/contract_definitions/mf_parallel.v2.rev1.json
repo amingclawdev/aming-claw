@@ -5,6 +5,18 @@
   ],
   "contract_id": "mf_parallel.v2",
   "contract_type": "parallel_worker",
+  "governance_hints": {
+    "asset_binding_events": [
+      {
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "schema_version": "asset_binding_event.v1",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ],
+    "schema_version": "governance_hints.v1"
+  },
   "instruction_layer": {
     "inline": [
       "The compiled runtime guide is authoritative for the next legal action.",

@@ -24699,7 +24699,10 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
     body = ctx.body
     from . import graph_snapshot_store as store
     from .errors import ValidationError
-    from .governance_hints import parse_governance_hint_bindings, render_governance_hint_comment
+    from .governance_hints import (
+        GovernanceHintMutationError,
+        mutate_governance_hint_file,
+    )
     from . import reconcile_feedback
 
     conn = get_connection(project_id)
@@ -24709,6 +24712,7 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
         root = _graph_governance_project_root(project_id, body)
         path = str(body.get("path") or body.get("file_path") or "").strip().replace("\\", "/").strip("/")
         node_id = str(body.get("node_id") or body.get("target_node_id") or "").strip()
+        dry_run = bool(body.get("dry_run")) if body.get("dry_run") is not None else False
         if not node_id:
             raise ValidationError("target_node_id is required")
 
@@ -24741,68 +24745,27 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
         abs_path = _resolve_project_child(root, path)
         if not abs_path.exists() or not abs_path.is_file():
             raise ValidationError(f"file does not exist: {path}")
-        payload = {
-            "attach_to_node": {
-                "path": path,
-                "role": role,
-                "target_node_id": node_id,
-                **_snapshot_node_stable_hint_fields(target_node),
-            }
+        event = {
+            "path": path,
+            "role": role,
+            "target_node_id": node_id,
+            **_snapshot_node_stable_hint_fields(target_node),
         }
-        comment = render_governance_hint_comment(path, payload)
-        if not comment:
-            raise ValidationError(f"file type does not support direct governance-hint comments: {path}")
-        text = abs_path.read_text(encoding="utf-8")
-        existing = parse_governance_hint_bindings(text, source_path=path)
-        for hint in existing:
-            if (
-                hint.path == path
-                and hint.field in {"secondary", "test", "config"}
-                and hint.target_node_id == node_id
-            ):
-                feedback = reconcile_feedback.submit_feedback_item(
-                    project_id,
-                    snapshot_id,
-                    feedback_kind=reconcile_feedback.KIND_GRAPH_CORRECTION,
-                    issue={
-                        "type": "governance_hint_attach",
-                        "reason": str(body.get("reason") or "Governance hint already present for asset binding."),
-                        "summary": "Governance hint asset binding is waiting for commit/apply and Update Graph.",
-                        "target": node_id,
-                        "target_type": role,
-                        "paths": [path],
-                        "intent": str(body.get("intent") or body.get("operator_intent") or "attach_asset_to_node"),
-                        "priority": "P2",
-                    },
-                    actor=str(body.get("actor") or "dashboard_user"),
-                    source_round="graph_structure_lifecycle",
-                )
-                conn.commit()
-                return {
-                    "ok": True,
-                    "project_id": project_id,
-                    "snapshot_id": snapshot_id,
-                    "path": path,
-                    "target_node_id": node_id,
-                    "role": role,
-                    "state": "written_uncommitted",
-                    "hint_written": False,
-                    "already_present": True,
-                    "requires_commit": True,
-                    "update_graph_after_commit": True,
-                    "message": "Governance hint already exists. Commit the file, then run Update graph.",
-                    "review_queue": {
-                        "queued": True,
-                        "feedback": (feedback.get("items") or [{}])[0],
-                        "operation_type": "graph_structure",
-                        "subtype": "governance_hint",
-                    },
-                    "file": row,
-                    "target_node": target_node,
-                }
-
-        prefix = comment.rstrip() + "\n\n"
-        abs_path.write_text(prefix + text, encoding="utf-8")
+        try:
+            mutation = mutate_governance_hint_file(
+                abs_path,
+                source_path=path,
+                action="attach",
+                event=event,
+                dry_run=dry_run,
+                expected_source_sha256=str(body.get("expected_source_sha256") or ""),
+                expected_envelope_sha256=str(body.get("expected_envelope_sha256") or ""),
+            )
+        except GovernanceHintMutationError as exc:
+            raise ValidationError(str(exc)) from exc
+        changed = bool(mutation["changed"])
+        written = bool(mutation["written"])
+        already_present = not changed
         feedback = reconcile_feedback.submit_feedback_item(
             project_id,
             snapshot_id,
@@ -24814,7 +24777,7 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
                 "target": node_id,
                 "target_type": role,
                 "paths": [path],
-                "changed_files": [path],
+                "changed_files": [path] if written else [],
                 "intent": str(body.get("intent") or body.get("operator_intent") or "attach_asset_to_node"),
                 "priority": "P2",
             },
@@ -24829,13 +24792,24 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
             "path": path,
             "target_node_id": node_id,
             "role": role,
-            "state": "written_uncommitted",
-            "hint_written": True,
-            "already_present": False,
-            "requires_commit": True,
-            "update_graph_after_commit": True,
-            "message": "Governance hint written. Commit the file, then run Update graph.",
-            "hint": comment,
+            "state": "planned" if dry_run else "written_uncommitted",
+            "dry_run": dry_run,
+            "hint_written": written,
+            "already_present": already_present,
+            "requires_commit": written,
+            "update_graph_after_commit": written,
+            "message": (
+                "Governance hint written. Commit the file, then run Update graph."
+                if written
+                else "Governance hint planned; no source file was changed."
+                if dry_run and changed
+                else "Governance hint already exists."
+            ),
+            "hint": mutation.get("rendered_hint") or event,
+            "source_sha256_before": mutation["source_sha256_before"],
+            "source_sha256_after": mutation["source_sha256_after"],
+            "envelope_sha256_before": mutation.get("envelope_sha256_before", ""),
+            "envelope_sha256_after": mutation.get("envelope_sha256_after", ""),
             "review_queue": {
                 "queued": True,
                 "feedback": (feedback.get("items") or [{}])[0],
@@ -24863,7 +24837,10 @@ def handle_graph_governance_snapshot_file_hygiene_hint_unbind(ctx: RequestContex
     from . import graph_snapshot_store as store
     from . import reconcile_feedback
     from .errors import ValidationError
-    from .governance_hints import parse_governance_hint_bindings, render_governance_hint_comment
+    from .governance_hints import (
+        GovernanceHintMutationError,
+        mutate_governance_hint_file,
+    )
 
     conn = get_connection(project_id)
     try:
@@ -24918,38 +24895,31 @@ def handle_graph_governance_snapshot_file_hygiene_hint_unbind(ctx: RequestContex
         abs_path = _resolve_project_child(root, path)
         if not abs_path.exists() or not abs_path.is_file():
             raise ValidationError(f"file does not exist: {path}")
-        try:
-            text = abs_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValidationError(f"file is not utf-8 text: {path}") from exc
-
-        payload = {
-            "asset_binding_event": {
-                "schema_version": "asset_binding_event.v1",
-                "operation": "unbind",
-                "path": path,
-                "role": role,
-                "target_node_id": node_id,
-                "reason": reason,
-                "actor": actor,
-                **_snapshot_node_stable_hint_fields(target_node),
-            }
+        event = {
+            "schema_version": "asset_binding_event.v1",
+            "operation": "unbind",
+            "path": path,
+            "role": role,
+            "target_node_id": node_id,
+            "reason": reason,
+            "actor": actor,
+            **_snapshot_node_stable_hint_fields(target_node),
         }
-        comment = render_governance_hint_comment(path, payload)
-        if not comment:
-            raise ValidationError(f"file type does not support direct governance-hint comments: {path}")
-        already_present = any(
-            hint.operation == "unbind"
-            and hint.path == path
-            and hint.target_node_id == node_id
-            and hint.field in {"secondary", "test", "config"}
-            for hint in parse_governance_hint_bindings(text, source_path=path)
-        )
-        changed = not already_present
-        if changed and not dry_run:
-            separator = "\n\n" if text and not text.endswith("\n\n") else ""
-            newline = "" if text.endswith("\n") else "\n"
-            abs_path.write_text(text + newline + separator + comment.rstrip() + "\n", encoding="utf-8")
+        try:
+            mutation = mutate_governance_hint_file(
+                abs_path,
+                source_path=path,
+                action="unbind",
+                event=event,
+                dry_run=dry_run,
+                expected_source_sha256=str(body.get("expected_source_sha256") or ""),
+                expected_envelope_sha256=str(body.get("expected_envelope_sha256") or ""),
+            )
+        except GovernanceHintMutationError as exc:
+            raise ValidationError(str(exc)) from exc
+        changed = bool(mutation["changed"])
+        written = bool(mutation["written"])
+        already_present = not changed
 
         feedback = reconcile_feedback.submit_feedback_item(
             project_id,
@@ -24963,7 +24933,7 @@ def handle_graph_governance_snapshot_file_hygiene_hint_unbind(ctx: RequestContex
                 "target": node_id,
                 "target_type": role,
                 "paths": [path],
-                "changed_files": [path] if changed and not dry_run else [],
+                "changed_files": [path] if written else [],
                 "intent": str(body.get("intent") or body.get("operator_intent") or "unbind_asset_from_node"),
                 "operation_type": "graph_structure",
                 "subtype": "governance_hint",
@@ -25000,18 +24970,22 @@ def handle_graph_governance_snapshot_file_hygiene_hint_unbind(ctx: RequestContex
             "role": role,
             "state": "planned" if dry_run else "written_uncommitted",
             "dry_run": dry_run,
-            "hint_written": bool(changed and not dry_run),
+            "hint_written": written,
             "already_present": already_present,
-            "requires_commit": bool(changed and not dry_run),
-            "update_graph_after_commit": bool(changed and not dry_run),
+            "requires_commit": written,
+            "update_graph_after_commit": written,
             "message": (
                 "Governance unbind hint written. Commit the file, then run Update graph."
-                if changed and not dry_run
+                if written
                 else "Governance unbind hint planned; no source file was changed."
                 if dry_run
                 else "Governance unbind hint already exists. Commit the file, then run Update graph."
             ),
-            "hint": comment,
+            "hint": mutation.get("rendered_hint") or event,
+            "source_sha256_before": mutation["source_sha256_before"],
+            "source_sha256_after": mutation["source_sha256_after"],
+            "envelope_sha256_before": mutation.get("envelope_sha256_before", ""),
+            "envelope_sha256_after": mutation.get("envelope_sha256_after", ""),
             "review_queue": {
                 "queued": True,
                 "feedback": (feedback.get("items") or [{}])[0],
@@ -25037,7 +25011,10 @@ def handle_graph_governance_snapshot_file_hygiene_hint_repair(ctx: RequestContex
     body = ctx.body
     from . import graph_snapshot_store as store
     from .errors import ValidationError
-    from .governance_hints import rewrite_governance_hint_text
+    from .governance_hints import (
+        GovernanceHintMutationError,
+        mutate_governance_hint_file,
+    )
 
     conn = get_connection(project_id)
     try:
@@ -25048,15 +25025,11 @@ def handle_graph_governance_snapshot_file_hygiene_hint_repair(ctx: RequestContex
         if not path:
             raise ValidationError("path is required")
         action = str(body.get("action") or "").strip().lower()
-        if action not in {"stabilize", "withdraw"}:
-            raise ValidationError("action must be stabilize or withdraw")
+        if action not in {"stabilize", "withdraw", "rollback"}:
+            raise ValidationError("action must be stabilize, withdraw, or rollback")
         abs_path = _resolve_project_child(root, path)
         if not abs_path.exists() or not abs_path.is_file():
             raise ValidationError(f"file does not exist: {path}")
-        try:
-            text = abs_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValidationError(f"file is not utf-8 text: {path}") from exc
         nodes = store.list_graph_snapshot_nodes(
             conn,
             project_id,
@@ -25064,19 +25037,33 @@ def handle_graph_governance_snapshot_file_hygiene_hint_repair(ctx: RequestContex
             limit=2000,
             include_semantic=False,
         )
-        rewrite = rewrite_governance_hint_text(
-            text,
-            source_path=path,
-            nodes=[dict(node) for node in nodes],
-            action=action,
-            path=str(body.get("hint_path") or body.get("target_path") or path),
-            role=str(body.get("role") or ""),
-            target_node_id=str(body.get("target_node_id") or body.get("node_id") or ""),
-            target_module=str(body.get("target_module") or ""),
-        )
         dry_run = bool(body.get("dry_run")) if body.get("dry_run") is not None else False
-        if rewrite["changed"] and not dry_run:
-            abs_path.write_text(str(rewrite["text"]), encoding="utf-8")
+        try:
+            rewrite = mutate_governance_hint_file(
+                abs_path,
+                source_path=path,
+                nodes=[dict(node) for node in nodes],
+                action=action,
+                path=str(body.get("hint_path") or body.get("target_path") or path),
+                role=str(body.get("role") or ""),
+                target_node_id=str(body.get("target_node_id") or body.get("node_id") or ""),
+                target_module=str(body.get("target_module") or ""),
+                rollback_envelope=(
+                    body.get("rollback_envelope")
+                    if isinstance(body.get("rollback_envelope"), Mapping)
+                    else None
+                ),
+                rollback_text=(
+                    str(body.get("rollback_text"))
+                    if body.get("rollback_text") is not None
+                    else None
+                ),
+                expected_source_sha256=str(body.get("expected_source_sha256") or ""),
+                expected_envelope_sha256=str(body.get("expected_envelope_sha256") or ""),
+                dry_run=dry_run,
+            )
+        except GovernanceHintMutationError as exc:
+            raise ValidationError(str(exc)) from exc
         audit_service.record(
             conn,
             project_id,
@@ -25109,6 +25096,10 @@ def handle_graph_governance_snapshot_file_hygiene_hint_repair(ctx: RequestContex
             "unchanged_count": rewrite["unchanged_count"],
             "error_count": rewrite["error_count"],
             "errors": rewrite["errors"],
+            "source_sha256_before": rewrite["source_sha256_before"],
+            "source_sha256_after": rewrite["source_sha256_after"],
+            "envelope_sha256_before": rewrite.get("envelope_sha256_before", ""),
+            "envelope_sha256_after": rewrite.get("envelope_sha256_after", ""),
             "requires_commit": bool(rewrite["changed"] and not dry_run),
             "update_graph_after_commit": bool(rewrite["changed"] and not dry_run),
             "message": (

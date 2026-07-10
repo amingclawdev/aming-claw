@@ -59,9 +59,14 @@ def stable_sha256(value: Any) -> str:
 
 
 def definition_hash(definition: Mapping[str, Any]) -> str:
-    """Hash the semantic contract definition, excluding lifecycle state."""
+    """Hash contract business semantics, excluding only the root hint envelope."""
 
-    return stable_sha256(strip_derived_hash_fields(definition))
+    business_definition = {
+        str(key): value
+        for key, value in definition.items()
+        if str(key) != "governance_hints"
+    }
+    return stable_sha256(strip_derived_hash_fields(business_definition))
 
 
 def file_sha256(path: str | Path) -> str:

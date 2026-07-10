@@ -5,6 +5,18 @@
   ],
   "contract_id": "onboard_contract",
   "contract_type": "observer_onboarding",
+  "governance_hints": {
+    "asset_binding_events": [
+      {
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "schema_version": "asset_binding_event.v1",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ],
+    "schema_version": "governance_hints.v1"
+  },
   "instruction_layer": {
     "inline": [
       "The compiled ContractRuntime guide is the source of the observer-facing next legal action.",

@@ -11,6 +11,7 @@ import re
 import subprocess
 from typing import Any
 
+from ..governance_hints import governance_hints_envelope_sha256
 from .hash import canonical_json, file_sha256, stable_sha256
 from .schema import (
     CONTRACT_DEFINITION_SCHEMA_VERSION,
@@ -269,6 +270,7 @@ def _without_private_fields(definition: Mapping[str, Any]) -> dict[str, Any]:
         and key not in {
             "definition_hash",
             "definition_load_record",
+            "governance_hints_sha256",
             "read_model",
             "source_control_integrity",
             "source_sha256",
@@ -296,6 +298,9 @@ def _attach_source_load_record(
     loaded_at: str,
 ) -> None:
     source_sha256 = file_sha256(path)
+    governance_hints_sha256 = governance_hints_envelope_sha256(
+        definition.get("governance_hints")
+    )
     source_path = str(path)
     source_control_integrity = _source_control_integrity(
         path,
@@ -308,6 +313,7 @@ def _attach_source_load_record(
         "version": definition.get("version", ""),
         "revision": definition.get("revision", ""),
         "source_sha256": source_sha256,
+        "governance_hints_sha256": governance_hints_sha256,
         "definition_hash": definition.get("definition_hash", ""),
     }
     load_record_id = "cdlr-" + stable_sha256(load_record_identity).split(":", 1)[1][:24]
@@ -321,6 +327,7 @@ def _attach_source_load_record(
         "status": "loaded",
         "contract_status": definition.get("status", ""),
         "source_sha256": source_sha256,
+        "governance_hints_sha256": governance_hints_sha256,
         "definition_hash": definition.get("definition_hash", ""),
         "loaded_at": loaded_at,
         "runtime_version": CONTRACT_REGISTRY_RUNTIME_VERSION,
@@ -329,6 +336,7 @@ def _attach_source_load_record(
         "next_operator_action": source_control_integrity["next_operator_action"],
     }
     definition["source_sha256"] = source_sha256
+    definition["governance_hints_sha256"] = governance_hints_sha256
     definition["source_control_integrity"] = dict(source_control_integrity)
     definition["definition_load_record"] = load_record
     read_model = definition.get("read_model")
@@ -385,8 +393,42 @@ def _source_control_integrity(path: Path, *, source_sha256: str) -> dict[str, An
     head_sha256 = "sha256:" + hashlib.sha256(head_blob).hexdigest()
     integrity["git_head_source_sha256"] = head_sha256
     if head_sha256 != source_sha256:
-        integrity.update(_warning_integrity_fields("changed_since_head"))
+        try:
+            current_blob = path.read_bytes()
+        except OSError:
+            current_blob = b""
+        if _governance_hints_only_source_change(head_blob, current_blob):
+            integrity.update(_governance_hints_integrity_fields())
+        else:
+            integrity.update(_warning_integrity_fields("changed_since_head"))
     return integrity
+
+
+def _governance_hints_only_source_change(previous: bytes, current: bytes) -> bool:
+    try:
+        previous_payload = json.loads(previous.decode("utf-8"))
+        current_payload = json.loads(current.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(previous_payload, dict) or not isinstance(current_payload, dict):
+        return False
+    previous_envelope = previous_payload.pop("governance_hints", None)
+    current_envelope = current_payload.pop("governance_hints", None)
+    return previous_payload == current_payload and previous_envelope != current_envelope
+
+
+def _governance_hints_integrity_fields() -> dict[str, Any]:
+    return {
+        "status": "governance_hints_changed",
+        "drift_status": "graph_source_metadata_changed",
+        "severity": "none",
+        "changed_since_head": True,
+        "requires_contract_update": False,
+        "legal_status": "legal",
+        "gate_enforcement": "graph_projection_only",
+        "blocks_runtime": False,
+        "next_operator_action": "run_graph_reconcile",
+    }
 
 
 def _warning_integrity_fields(status: str) -> dict[str, Any]:

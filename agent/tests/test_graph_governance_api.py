@@ -18923,6 +18923,121 @@ def test_graph_governance_file_hygiene_hint_attach_writes_source_hint(conn, monk
     assert doc.read_text(encoding="utf-8").count("governance-hint") == 1
 
 
+def test_graph_governance_json_config_hint_uses_reserved_atomic_envelope(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    project = tmp_path / "project"
+    config = project / "config" / "service.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        '{"business":{"asset_binding_events":"business"},"enabled":true}\n',
+        encoding="utf-8",
+    )
+    graph = _graph()
+    graph["deps_graph"]["nodes"][0]["metadata"]["module"] = (
+        "agent.governance.contracts.registry"
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-json-config-hint-attach",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json=graph,
+        file_inventory=[{
+            "path": "config/service.json",
+            "file_kind": "config",
+            "scan_status": "orphan",
+            "graph_status": "unmapped",
+            "decision": "pending",
+            "attached_node_ids": [],
+            "size_bytes": 123,
+        }],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_snapshot_file_hygiene_hint_attach(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "config/service.json",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    event = payload["governance_hints"]["asset_binding_events"][0]
+
+    assert result["hint_written"] is True
+    assert result["envelope_sha256_after"].startswith("sha256:")
+    assert payload["enabled"] is True
+    assert payload["business"] == {"asset_binding_events": "business"}
+    assert event["path"] == "."
+    assert event["role"] == "config"
+    assert event["target_module"] == "agent.governance.contracts.registry"
+    assert "target_node_id" in event
+    assert config.read_text(encoding="utf-8").endswith("\n")
+
+    second = server.handle_graph_governance_snapshot_file_hygiene_hint_attach(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "config/service.json",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+                "expected_envelope_sha256": result["envelope_sha256_after"],
+            },
+        )
+    )
+    assert second["already_present"] is True
+    assert len(json.loads(config.read_text(encoding="utf-8"))[
+        "governance_hints"
+    ]["asset_binding_events"]) == 1
+
+    withdrawn = server.handle_graph_governance_snapshot_file_hygiene_hint_repair(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "config/service.json",
+                "action": "withdraw",
+                "role": "config",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    withdrawn_payload = json.loads(config.read_text(encoding="utf-8"))
+
+    assert withdrawn["withdrawn_count"] == 1
+    assert withdrawn_payload["business"] == {"asset_binding_events": "business"}
+    assert withdrawn_payload["governance_hints"]["asset_binding_events"] == []
+
+
 def test_graph_governance_file_hygiene_hint_unbind_appends_source_event(conn, monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,
