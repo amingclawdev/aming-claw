@@ -48673,6 +48673,9 @@ _CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS = frozenset(
 _CONTRACT_RUNTIME_QA_FAILURE_STATUSES = frozenset(
     {"fail", "failed", "failure", "rejected", "blocked"}
 )
+_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS = frozenset(
+    {"failed", "failures", "failed_count", "failure_count", "error_count"}
+)
 _CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS = frozenset(
     {
         "summary",
@@ -48727,6 +48730,11 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
             ):
                 return True
             if (
+                key in _CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS
+                and _contract_runtime_truthy_failure_count(item)
+            ):
+                return True
+            if (
                 key in _CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS
                 and _contract_runtime_qa_failure_text_signal(item)
             ):
@@ -48737,6 +48745,17 @@ def _contract_runtime_value_reports_failed_qa(value: Any) -> bool:
     if isinstance(value, list):
         return any(_contract_runtime_value_reports_failed_qa(item) for item in value)
     return False
+
+
+def _contract_runtime_truthy_failure_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value > 0
+    try:
+        return int(str(value or "").strip()) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _contract_runtime_latest_failed_qa_line(
