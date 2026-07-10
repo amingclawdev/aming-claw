@@ -9885,6 +9885,10 @@ def _runtime_context_contract_execution_identity(
             payload.get("parent_contract_execution_id"),
             contract.get("parent_contract_execution_id"),
         ),
+        "root_contract_execution_id": _runtime_context_public_text(
+            payload.get("root_contract_execution_id"),
+            contract.get("root_contract_execution_id"),
+        ),
         "successor_contract_execution_id": _runtime_context_public_text(
             payload.get("successor_contract_execution_id"),
             contract.get("successor_contract_execution_id"),
@@ -9967,6 +9971,7 @@ def _runtime_context_executable_contract_envelope(
         "contract_execution_id",
         "contract_chain_id",
         "parent_contract_execution_id",
+        "root_contract_execution_id",
         "successor_contract_execution_id",
         "contract_revision_id",
         "contract_hash",
@@ -60920,6 +60925,7 @@ def _persist_observer_runtime_text_contract_revision(
             "contract_execution_id",
             "successor_contract_execution_id",
             "parent_contract_execution_id",
+            "root_contract_execution_id",
             "contract_chain_id",
         ):
             if previous_contract_identity.get(field) and not revision_payload.get(field):

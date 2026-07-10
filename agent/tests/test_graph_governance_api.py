@@ -41890,6 +41890,9 @@ def test_observer_runtime_text_revision_carries_forward_contract_identity(conn):
     assert persisted["payload"]["parent_contract_execution_id"] == (
         "onboard-service-runtime-text"
     )
+    assert persisted["payload"]["root_contract_execution_id"] == (
+        "onboard-service-runtime-text"
+    )
     assert persisted["payload"]["contract_chain_id"] == "cchain-runtime-text"
     latest_identity = server._runtime_context_contract_execution_identity(
         server._runtime_context_latest_contract_revision_payload(
@@ -41899,6 +41902,9 @@ def test_observer_runtime_text_revision_carries_forward_contract_identity(conn):
     )
     assert latest_identity["contract_execution_id"] == (
         "cex-mf-parallel-runtime-text"
+    )
+    assert latest_identity["root_contract_execution_id"] == (
+        "onboard-service-runtime-text"
     )
     assert latest_identity["contract_chain_id"] == "cchain-runtime-text"
 
