@@ -10027,9 +10027,55 @@ def _runtime_context_projection_response(
         latest_revision_payload,
         contract_revision_id=str(source_refs.get("contract_revision_id") or ""),
     )
+    contract_identity, contract_execution_resolution = (
+        _runtime_context_resolve_contract_execution_identity(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            contract_identity=contract_identity,
+        )
+    )
+    response["contract_runtime_execution_resolution"] = (
+        contract_execution_resolution
+    )
+    response["runtime_context_service"][
+        "contract_runtime_execution_resolution"
+    ] = contract_execution_resolution
     contract_execution_id = str(
         contract_identity.get("contract_execution_id") or ""
     ).strip()
+    contract_runtime_projection = _runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+    )
+    if contract_runtime_projection:
+        response["contract_runtime_current_state"] = dict(
+            contract_runtime_projection.get("contract_runtime_current_state") or {}
+        )
+        response["contract_runtime_next_legal_action"] = dict(
+            contract_runtime_projection.get("contract_runtime_next_legal_action")
+            or {}
+        )
+        response["contract_runtime_authority_decision_source"] = (
+            "contract_runtime_current_state"
+        )
+        response["runtime_context_service"]["contract_runtime_current_state"] = dict(
+            response["contract_runtime_current_state"]
+        )
+        response["runtime_context_service"][
+            "contract_runtime_next_legal_action"
+        ] = dict(response["contract_runtime_next_legal_action"])
+        response["runtime_context_service"][
+            "contract_runtime_authority_decision_source"
+        ] = "contract_runtime_current_state"
+        _runtime_context_project_contract_runtime_into_worker_views(
+            exposed_views,
+            contract_runtime_projection,
+        )
     try:
         contract_worker_commit_required = bool(
             contract_execution_id
@@ -10040,6 +10086,24 @@ def _runtime_context_projection_response(
         )
     except ContractRuntimeError:
         contract_worker_commit_required = False
+    if contract_worker_commit_required:
+        for container in (
+            (
+                exposed_views.get("worker_view")
+                if isinstance(exposed_views, Mapping)
+                else {}
+            ),
+            (
+                (exposed_views.get("worker_view") or {}).get("task")
+                if isinstance(exposed_views.get("worker_view"), Mapping)
+                else {}
+            ),
+        ):
+            if isinstance(container, dict):
+                container["contract_worker_commit_required"] = True
+                container["contract_worker_commit_authority"] = (
+                    "ContractRuntime.pinned_definition"
+                )
     response["contract_worker_commit_required"] = (
         contract_worker_commit_required
     )
@@ -10181,6 +10245,351 @@ def _runtime_context_contract_execution_identity(
         ),
         "contract_hash": contract_hash,
     }
+
+
+def _runtime_context_contract_line_matches_worker(
+    line: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> bool:
+    if not isinstance(line, Mapping):
+        return False
+    if not runtime_context_id or not task_id:
+        return False
+    if (
+        _timeline_first_deep_text(line, "runtime_context_id")
+        != runtime_context_id
+    ):
+        return False
+    if _timeline_first_deep_text(line, "task_id") != task_id:
+        return False
+    return True
+
+
+def _runtime_context_contract_next_action_is_mf_sub_owned(
+    next_action: Mapping[str, Any],
+) -> bool:
+    if not isinstance(next_action, Mapping):
+        return False
+    owner_role = str(next_action.get("owner_role") or "").strip()
+    raw_allowed_roles = next_action.get("allowed_writer_roles") or []
+    if isinstance(raw_allowed_roles, str):
+        allowed_roles = {raw_allowed_roles.strip()}
+    else:
+        allowed_roles = {
+            str(role or "").strip()
+            for role in raw_allowed_roles
+            if str(role or "").strip()
+        }
+    return owner_role == "mf_sub" and "mf_sub" in allowed_roles
+
+
+def _runtime_context_contract_next_action_matches_worker(
+    next_action: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> bool:
+    if not _runtime_context_contract_next_action_is_mf_sub_owned(next_action):
+        return False
+    return (
+        str(next_action.get("runtime_context_id") or "").strip()
+        == str(runtime_context_id or "").strip()
+        and str(next_action.get("task_id") or "").strip()
+        == str(task_id or "").strip()
+    )
+
+
+def _runtime_context_contract_next_action_override_eligible(
+    next_action: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    current_next_legal_action: str = "",
+    row_scoped_finish_head_projection: Mapping[str, Any] | None = None,
+) -> bool:
+    if not _runtime_context_contract_next_action_matches_worker(
+        next_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    ):
+        return False
+    current_action = str(current_next_legal_action or "").strip()
+    if current_action.startswith(("stop_", "block_")):
+        return False
+    row_scope = (
+        row_scoped_finish_head_projection
+        if isinstance(row_scoped_finish_head_projection, Mapping)
+        else {}
+    )
+    if str(row_scope.get("status") or "").strip() == "branch_head_scope_mismatch":
+        return False
+    row_scope_action = str(row_scope.get("next_legal_action") or "").strip()
+    if row_scope_action.startswith(("stop_", "block_")):
+        return False
+    return True
+
+
+def _runtime_context_contract_identity_from_record(
+    record: Mapping[str, Any],
+) -> dict[str, str]:
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    return {
+        "contract_execution_id": execution_id,
+        "successor_contract_execution_id": execution_id,
+        "parent_contract_execution_id": str(
+            record.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(
+            record.get("root_contract_execution_id") or ""
+        ),
+        "contract_chain_id": str(record.get("contract_chain_id") or ""),
+    }
+
+
+def _runtime_context_contract_runtime_worker_projection(
+    conn,
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id:
+        return {}
+    runtime = _contract_runtime(conn)
+    try:
+        guide = runtime.current_guide(execution_id, actor_role="mf_sub")
+        record = runtime.store.get(execution_id)
+    except ContractRuntimeError:
+        return {}
+    current_state = _runtime_current_state_from_record(record)
+    next_action = _runtime_next_action_from_guide(
+        guide,
+        source="contract_runtime_current_state",
+    )
+    if next_action:
+        next_action["source_of_authority"] = "contract_runtime_current_state"
+        next_action["authority_decision_source"] = (
+            "contract_runtime_current_state"
+        )
+        if _runtime_context_contract_next_action_is_mf_sub_owned(next_action):
+            if not str(next_action.get("runtime_context_id") or "").strip():
+                next_action["runtime_context_id"] = runtime_context_id
+            if not str(next_action.get("task_id") or "").strip():
+                next_action["task_id"] = task_id
+        current_state["next_legal_action"] = dict(next_action)
+    return {
+        "schema_version": "runtime_context.contract_runtime_projection.v1",
+        "source_of_authority": "contract_runtime_current_state",
+        "authority_decision_source": "contract_runtime_current_state",
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "contract_runtime_current_state": current_state,
+        "contract_runtime_next_legal_action": next_action,
+    }
+
+
+def _runtime_context_project_contract_runtime_into_worker_views(
+    exposed_views: Mapping[str, Any],
+    projection: Mapping[str, Any],
+) -> None:
+    if not isinstance(exposed_views, Mapping) or not projection:
+        return
+    worker_view = exposed_views.get("worker_view")
+    if not isinstance(worker_view, dict):
+        return
+    current_state = dict(projection.get("contract_runtime_current_state") or {})
+    next_action = dict(
+        projection.get("contract_runtime_next_legal_action") or {}
+    )
+    fields = {
+        "contract_runtime_current_state": current_state,
+        "contract_runtime_next_legal_action": next_action,
+        "contract_runtime_authority_decision_source": (
+            "contract_runtime_current_state"
+        ),
+        "contract_runtime_source_of_authority": (
+            "contract_runtime_current_state"
+        ),
+    }
+    for container in (
+        worker_view,
+        worker_view.get("task") if isinstance(worker_view.get("task"), dict) else {},
+        (
+            worker_view.get("control_plane")
+            if isinstance(worker_view.get("control_plane"), dict)
+            else {}
+        ),
+        (
+            worker_view.get("action_plan")
+            if isinstance(worker_view.get("action_plan"), dict)
+            else {}
+        ),
+    ):
+        if isinstance(container, dict):
+            container.update(fields)
+
+
+def _runtime_context_source_backed_contract_identity(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Find the active mf_parallel ContractRuntime record bound to this worker.
+
+    This is a compatibility lookup for older branch contract revisions that do
+    not carry the successor contract_execution_id, while their source-backed
+    ContractRuntime dispatch/read/startup lines already carry the worker runtime
+    identity.
+    """
+
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    diagnostic: dict[str, Any] = {
+        "schema_version": "runtime_context.contract_execution_resolution.v1",
+        "source": "source_backed_contract_runtime_worker_lineage",
+        "status": "not_attempted",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "candidate_count": 0,
+        "candidate_contract_execution_ids": [],
+        "ignored_counts": {
+            "non_mf_parallel": 0,
+            "missing_execution_id": 0,
+            "missing_worker_commit_definition": 0,
+            "missing_exact_worker_lineage": 0,
+            "terminal_or_nonactive": 0,
+            "stale_or_unavailable": 0,
+        },
+    }
+    if not backlog_id:
+        diagnostic["status"] = "missing_backlog_id"
+        return {}, diagnostic
+    try:
+        records = _contract_runtime(conn).store.list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except ContractRuntimeError as exc:
+        diagnostic["status"] = "lookup_unavailable"
+        diagnostic["error"] = str(exc)
+        return {}, diagnostic
+    runtime = _contract_runtime(conn)
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        contract_id = str(record.get("contract_id") or "").strip()
+        if not _is_mf_parallel_record_contract_id(contract_id):
+            diagnostic["ignored_counts"]["non_mf_parallel"] += 1
+            continue
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        if not execution_id:
+            diagnostic["ignored_counts"]["missing_execution_id"] += 1
+            continue
+        try:
+            if not runtime.pinned_definition_has_line(execution_id, "worker_commit"):
+                diagnostic["ignored_counts"][
+                    "missing_worker_commit_definition"
+                ] += 1
+                continue
+        except ContractRuntimeError:
+            diagnostic["ignored_counts"]["stale_or_unavailable"] += 1
+            continue
+        if not any(
+            _runtime_context_contract_line_matches_worker(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+            for line in record.get("completed_lines") or []
+            if isinstance(line, Mapping)
+        ):
+            diagnostic["ignored_counts"]["missing_exact_worker_lineage"] += 1
+            continue
+        try:
+            guide = runtime.current_guide(execution_id, actor_role="mf_sub")
+            refreshed = runtime.store.get(execution_id)
+        except ContractRuntimeError:
+            diagnostic["ignored_counts"]["stale_or_unavailable"] += 1
+            continue
+        next_line = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        if not next_line:
+            diagnostic["ignored_counts"]["terminal_or_nonactive"] += 1
+            continue
+        candidates.append(refreshed)
+    candidate_ids = [
+        str(record.get("contract_execution_id") or "")
+        for record in candidates
+        if str(record.get("contract_execution_id") or "")
+    ]
+    diagnostic["candidate_count"] = len(candidate_ids)
+    diagnostic["candidate_contract_execution_ids"] = candidate_ids
+    if len(candidates) == 1:
+        diagnostic["status"] = "resolved_source_backed_worker_lineage"
+        return _runtime_context_contract_identity_from_record(candidates[0]), diagnostic
+    if len(candidates) > 1:
+        diagnostic["status"] = "ambiguous_active_source_backed_worker_lineage"
+        diagnostic["fail_closed"] = True
+        return {}, diagnostic
+    diagnostic["status"] = "no_active_source_backed_worker_lineage"
+    diagnostic["fail_closed"] = True
+    return {}, diagnostic
+
+
+def _runtime_context_resolve_contract_execution_identity(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+    contract_identity: Mapping[str, Any],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    resolved = {
+        key: str(contract_identity.get(key) or "").strip()
+        for key in (
+            "contract_execution_id",
+            "contract_chain_id",
+            "parent_contract_execution_id",
+            "root_contract_execution_id",
+            "successor_contract_execution_id",
+            "contract_revision_id",
+            "contract_hash",
+        )
+    }
+    if resolved.get("contract_execution_id"):
+        return resolved, {
+            "schema_version": "runtime_context.contract_execution_resolution.v1",
+            "source": "branch_contract_revision",
+            "status": "resolved_revision_contract_execution_id",
+            "contract_execution_id": resolved["contract_execution_id"],
+            "fallback_attempted": False,
+            "fail_closed": False,
+        }
+    fallback, diagnostic = _runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=project_id,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    for key, value in fallback.items():
+        if value and not resolved.get(key):
+            resolved[key] = value
+    if resolved.get("contract_execution_id"):
+        diagnostic["contract_execution_id"] = resolved["contract_execution_id"]
+        diagnostic["fail_closed"] = False
+    return resolved, diagnostic
 
 
 def _runtime_context_executable_contract_envelope(
@@ -11107,6 +11516,19 @@ def _runtime_context_worker_guide_response(
     runtime_context_id = str(current_state_response.get("runtime_context_id") or "")
     project_id = str(current_state_response.get("project_id") or "")
     task_id = str(current_state_response.get("task_id") or task.get("task_id") or "")
+    contract_runtime_current_state = dict(
+        current_state_response.get("contract_runtime_current_state") or {}
+    )
+    contract_runtime_next_legal_action = dict(
+        current_state_response.get("contract_runtime_next_legal_action") or {}
+    )
+    contract_runtime_authority_decision_source = str(
+        current_state_response.get("contract_runtime_authority_decision_source")
+        or contract_runtime_next_legal_action.get("authority_decision_source")
+        or ""
+    ).strip()
+    contract_runtime_next_action_took_precedence = False
+    next_legal_action_decision_source = "runtime_context_timeline_projection"
     parent_task_id = str(graph_identity.get("parent_task_id") or task.get("parent_task_id") or "")
     session_token_ref_value = str(worker_view.get("session_token_ref") or "").strip()
     session_token_ref_placeholder = (
@@ -11188,6 +11610,7 @@ def _runtime_context_worker_guide_response(
     scope_blocking_reasons: list[str] = []
     if branch_head_scope_mismatch:
         next_legal_action = "stop_for_row_scope_reconciliation"
+        next_legal_action_decision_source = "runtime_context_row_scope_gate"
         next_required_evidence = [
             {
                 "id": "row_scoped_finish_head_resolution",
@@ -11202,6 +11625,20 @@ def _runtime_context_worker_guide_response(
             *next_required_evidence,
         ]
         scope_blocking_reasons.append("branch_head_scope_mismatch")
+    if _runtime_context_contract_next_action_override_eligible(
+        contract_runtime_next_legal_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        current_next_legal_action=next_legal_action,
+        row_scoped_finish_head_projection=row_scoped_finish_head_projection,
+    ):
+        canonical_next_action = str(
+            contract_runtime_next_legal_action.get("action") or ""
+        ).strip()
+        if canonical_next_action:
+            next_legal_action = canonical_next_action
+            next_legal_action_decision_source = "contract_runtime_current_state"
+            contract_runtime_next_action_took_precedence = True
     missing_evidence = list(
         control_plane.get("missing_evidence")
         or action_plan.get("missing_evidence")
@@ -12410,6 +12847,18 @@ def _runtime_context_worker_guide_response(
         "session_token_ref_present": bool(worker_view.get("session_token_ref")),
         "raw_session_token_exposed": False,
         "contract_worker_commit_required": contract_worker_commit_required,
+        "contract_runtime_execution_resolution": current_state_response.get(
+            "contract_runtime_execution_resolution",
+            {},
+        ),
+        "contract_runtime_current_state": contract_runtime_current_state,
+        "contract_runtime_next_legal_action": contract_runtime_next_legal_action,
+        "contract_runtime_authority_decision_source": (
+            contract_runtime_authority_decision_source
+        ),
+        "contract_runtime_next_action_took_precedence": (
+            contract_runtime_next_action_took_precedence
+        ),
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
         "capacity_fallback_guidance": actionable_payloads.get(
@@ -12429,6 +12878,7 @@ def _runtime_context_worker_guide_response(
             {},
         ),
         "next_legal_action": next_legal_action,
+        "next_legal_action_decision_source": next_legal_action_decision_source,
         "next_required_evidence": next_required_evidence,
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
@@ -12477,7 +12927,22 @@ def _runtime_context_worker_guide_response(
             "target_files": list(worker_scope_files),
             "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "next_legal_action": next_legal_action,
+            "next_legal_action_decision_source": (
+                next_legal_action_decision_source
+            ),
             "next_required_evidence": next_required_evidence,
+            "contract_runtime_execution_resolution": current_state_response.get(
+                "contract_runtime_execution_resolution",
+                {},
+            ),
+            "contract_runtime_current_state": contract_runtime_current_state,
+            "contract_runtime_next_legal_action": contract_runtime_next_legal_action,
+            "contract_runtime_authority_decision_source": (
+                contract_runtime_authority_decision_source
+            ),
+            "contract_runtime_next_action_took_precedence": (
+                contract_runtime_next_action_took_precedence
+            ),
             "missing_evidence": missing_evidence,
             "blocking_reasons": blocking_reasons,
             "read_endpoints": read_endpoints,

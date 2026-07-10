@@ -41917,6 +41917,7 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
     graph_trace_id: str,
     head_commit: str,
     implementation_event_ref: str,
+    include_worker_commit: bool = True,
 ) -> None:
     implementation, worker_commit = _mf_parallel_worker_proof_payloads(
         runtime_context,
@@ -41937,8 +41938,17 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
             implementation,
             head_commit,
         ),
-        ("worker_commit", "worker_commit", "worker_commit", worker_commit, head_commit),
     ]
+    if include_worker_commit:
+        specs.append(
+            (
+                "worker_commit",
+                "worker_commit",
+                "worker_commit",
+                worker_commit,
+                head_commit,
+            )
+        )
     runtime = server._contract_runtime(conn)
     for stage_id, line_id, evidence_kind, payload, commit_sha in specs:
         runtime.current_guide(contract_execution_id, actor_role="mf_sub")
@@ -41986,6 +41996,7 @@ def _record_mf_parallel_runtime_context_worker_evidence(
     fence_token: str,
     graph_trace_id: str,
     head_commit: str,
+    include_finish_evidence: bool = True,
 ) -> dict[str, int]:
     parent_task_id = runtime_context.parent_task_id or backlog_id
     _insert_mf_sub_graph_query_trace(
@@ -42075,6 +42086,12 @@ def _record_mf_parallel_runtime_context_worker_evidence(
             },
         },
     )
+    if not include_finish_evidence:
+        return {
+            "read_receipt": read_receipt["id"],
+            "startup": startup["id"],
+            "implementation": implementation["id"],
+        }
     attestation = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -42230,6 +42247,619 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     )
     assert dispatch["ok"] is True
     return successor, runtime_context
+
+
+def _clone_contract_runtime_record_for_resolution_test(
+    conn,
+    *,
+    source_contract_execution_id: str,
+    clone_contract_execution_id: str,
+    stale_definition_hash: bool = False,
+) -> dict[str, Any]:
+    runtime = server._contract_runtime(conn)
+    source = runtime.store.get(source_contract_execution_id)
+    cloned = json.loads(json.dumps(source))
+    cloned["contract_execution_id"] = clone_contract_execution_id
+    if stale_definition_hash:
+        cloned["definition_hash"] = "sha256:stale-resolution-test-definition"
+    return runtime.store.create(cloned)
+
+
+def test_runtime_context_source_backed_resolver_accepts_unique_active_candidate(conn):
+    backlog_id = "AC-CONTRACT-RESOLUTION-UNIQUE"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-resolution-unique-parent",
+        worker_task_id="contract-resolution-unique-worker",
+        fence_token="fence-contract-resolution-unique",
+        token="contract-resolution-unique-token",
+    )
+
+    identity, diagnostic = server._runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )
+
+    assert identity["contract_execution_id"] == successor["contract_execution_id"]
+    assert identity["successor_contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert diagnostic["status"] == "resolved_source_backed_worker_lineage"
+    assert diagnostic["candidate_count"] == 1
+    assert diagnostic["candidate_contract_execution_ids"] == [
+        successor["contract_execution_id"]
+    ]
+
+
+def test_runtime_context_source_backed_resolver_ignores_stale_history(conn):
+    backlog_id = "AC-CONTRACT-RESOLUTION-STALE"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-resolution-stale-parent",
+        worker_task_id="contract-resolution-stale-worker",
+        fence_token="fence-contract-resolution-stale",
+        token="contract-resolution-stale-token",
+    )
+    _clone_contract_runtime_record_for_resolution_test(
+        conn,
+        source_contract_execution_id=successor["contract_execution_id"],
+        clone_contract_execution_id="cex-contract-resolution-stale-history",
+        stale_definition_hash=True,
+    )
+
+    identity, diagnostic = server._runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )
+
+    assert identity["contract_execution_id"] == successor["contract_execution_id"]
+    assert diagnostic["status"] == "resolved_source_backed_worker_lineage"
+    assert diagnostic["candidate_count"] == 1
+    assert diagnostic["candidate_contract_execution_ids"] == [
+        successor["contract_execution_id"]
+    ]
+    assert diagnostic["ignored_counts"]["stale_or_unavailable"] == 1
+
+
+def test_runtime_context_source_backed_resolver_rejects_ambiguous_active_candidates(conn):
+    backlog_id = "AC-CONTRACT-RESOLUTION-AMBIGUOUS"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-resolution-ambiguous-parent",
+        worker_task_id="contract-resolution-ambiguous-worker",
+        fence_token="fence-contract-resolution-ambiguous",
+        token="contract-resolution-ambiguous-token",
+    )
+    clone_id = "cex-contract-resolution-ambiguous-active"
+    _clone_contract_runtime_record_for_resolution_test(
+        conn,
+        source_contract_execution_id=successor["contract_execution_id"],
+        clone_contract_execution_id=clone_id,
+    )
+
+    identity, diagnostic = server._runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )
+
+    assert identity == {}
+    assert diagnostic["status"] == "ambiguous_active_source_backed_worker_lineage"
+    assert diagnostic["fail_closed"] is True
+    assert diagnostic["candidate_count"] == 2
+    assert set(diagnostic["candidate_contract_execution_ids"]) == {
+        successor["contract_execution_id"],
+        clone_id,
+    }
+
+
+def test_runtime_context_current_projects_contract_runtime_state_for_unique_fallback(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-PROJECTION-CURRENT"
+    worker_task_id = "contract-projection-current-worker"
+    worker_token = "contract-projection-current-token"
+    worker_fence = "fence-contract-projection-current"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-projection-current-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-projection-current-missing-id",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-projection-current",
+            "route_context_hash": "sha256:route-contract-projection-current",
+            "prompt_contract_id": "rprompt-contract-projection-current",
+            "prompt_contract_hash": "sha256:prompt-contract-projection-current",
+            "route_token_ref": "rtok-contract-projection-current",
+            "visible_injection_manifest_hash": (
+                "sha256:visible-contract-projection-current"
+            ),
+        },
+    )
+    conn.commit()
+
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worker_root),
+                "view": "all",
+            },
+        )
+    )
+    current_next = current["contract_runtime_next_legal_action"]
+    assert current["contract_runtime_execution_resolution"]["status"] == (
+        "resolved_source_backed_worker_lineage"
+    )
+    assert current["contract_runtime_current_state"]["contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert current["contract_runtime_authority_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert current_next["contract_execution_id"] == successor["contract_execution_id"]
+    assert current_next["line_id"] == "worker_read_runtime_guide"
+    assert current_next["source_of_authority"] == "contract_runtime_current_state"
+    assert current_next["authority_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert current_next["runtime_context_id"] == runtime_context.runtime_context_id
+    assert current_next["task_id"] == runtime_context.task_id
+    service = current["runtime_context_service"]
+    assert service["contract_runtime_current_state"] == (
+        current["contract_runtime_current_state"]
+    )
+    assert service["contract_runtime_next_legal_action"] == current_next
+    worker_view = current["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["contract_runtime_current_state"] == (
+        current["contract_runtime_current_state"]
+    )
+    assert worker_view["contract_runtime_next_legal_action"] == current_next
+
+
+def _worker_guide_state_with_contract_next_action(
+    next_action: dict[str, Any],
+    *,
+    runtime_context_id: str = "mfrctx-b2a-worker-guide",
+    task_id: str = "task-b2a-worker-guide",
+) -> dict[str, Any]:
+    return {
+        "project_id": PID,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "target_project_root": "",
+        "worktree_path": "",
+        "contract_worker_commit_required": True,
+        "contract_runtime_current_state": {
+            "schema_version": "contract_runtime_current_state.v1",
+            "contract_execution_id": "cex-b2a-worker-guide",
+        },
+        "contract_runtime_next_legal_action": next_action,
+        "contract_runtime_authority_decision_source": (
+            "contract_runtime_current_state"
+        ),
+        "runtime_context_service": {
+            "views": {
+                "worker_view": {
+                    "task": {
+                        "task_id": task_id,
+                        "parent_task_id": "parent-b2a-worker-guide",
+                        "backlog_id": "AC-B2A-WORKER-GUIDE",
+                    },
+                    "control_plane": {
+                        "next_legal_action": (
+                            "record_finish_time_worker_attestation"
+                        ),
+                        "next_required_evidence": [
+                            {"id": "finish_time_worker_attestation"}
+                        ],
+                    },
+                    "action_plan": {
+                        "next_legal_action": (
+                            "record_finish_time_worker_attestation"
+                        ),
+                        "next_required_evidence": [
+                            {"id": "finish_time_worker_attestation"}
+                        ],
+                    },
+                }
+            }
+        },
+    }
+
+
+def test_runtime_context_worker_guide_uses_matching_mf_sub_contract_next_action():
+    runtime_context_id = "mfrctx-b2a-worker-guide-match"
+    task_id = "task-b2a-worker-guide-match"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "action": "record_worker_commit",
+        "line_id": "worker_commit",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "authority_decision_source": "contract_runtime_current_state",
+        "source_of_authority": "contract_runtime_current_state",
+    }
+
+    assert server._runtime_context_contract_next_action_matches_worker(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    response = server._runtime_context_worker_guide_response(
+        _worker_guide_state_with_contract_next_action(
+            canonical_next,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    )
+
+    assert response["next_legal_action"] == "record_worker_commit"
+    assert response["next_legal_action_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is True
+    assert response["contract_runtime_next_legal_action"] == canonical_next
+    assert response["contract_runtime_current_state"]["contract_execution_id"] == (
+        "cex-b2a-worker-guide"
+    )
+    assert response["contract_runtime_authority_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    worker_guide = response["worker_guide"]
+    assert worker_guide["next_legal_action"] == "record_worker_commit"
+    assert worker_guide["next_legal_action_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert worker_guide["contract_runtime_next_legal_action"] == canonical_next
+    assert worker_guide["contract_runtime_current_state"] == (
+        response["contract_runtime_current_state"]
+    )
+
+
+def test_runtime_context_worker_guide_keeps_row_scope_stop_over_matching_contract_next_action(
+    monkeypatch,
+):
+    runtime_context_id = "mfrctx-b2b-row-scope-stop"
+    task_id = "task-b2b-row-scope-stop"
+    canonical_next = {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "action": "record_worker_commit",
+        "line_id": "worker_commit",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "authority_decision_source": "contract_runtime_current_state",
+        "source_of_authority": "contract_runtime_current_state",
+    }
+    state = _worker_guide_state_with_contract_next_action(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    state["contract_worker_commit_required"] = False
+    state["source_refs"] = {
+        "timeline": {
+            "finish_time_worker_attestation_hint": {
+                "head_commit": "a" * 40,
+                "implementation_event_ref": "timeline:b2b-row-scope-impl",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_git_head_commit",
+        lambda *paths: "b" * 40,
+    )
+
+    response = server._runtime_context_worker_guide_response(state)
+
+    assert response["row_scoped_finish_head_projection"]["status"] == (
+        "branch_head_scope_mismatch"
+    )
+    assert response["next_legal_action"] == "stop_for_row_scope_reconciliation"
+    assert response["next_legal_action_decision_source"] == (
+        "runtime_context_row_scope_gate"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is False
+    assert response["contract_runtime_next_legal_action"] == canonical_next
+    assert response["next_required_evidence"][0]["id"] == (
+        "row_scoped_finish_head_resolution"
+    )
+    worker_guide = response["worker_guide"]
+    assert worker_guide["next_legal_action"] == (
+        "stop_for_row_scope_reconciliation"
+    )
+    assert worker_guide["contract_runtime_next_action_took_precedence"] is False
+
+
+@pytest.mark.parametrize(
+    "canonical_next",
+    [
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "action": "record_observer_review",
+            "line_id": "observer_review",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "runtime_context_id": "mfrctx-b2a-worker-guide-no-override",
+            "task_id": "task-b2a-worker-guide-no-override",
+            "authority_decision_source": "contract_runtime_current_state",
+        },
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "action": "record_worker_commit",
+            "line_id": "worker_commit",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "runtime_context_id": "mfrctx-b2a-other-worker",
+            "task_id": "task-b2a-worker-guide-no-override",
+            "authority_decision_source": "contract_runtime_current_state",
+        },
+    ],
+)
+def test_runtime_context_worker_guide_keeps_timeline_action_for_observer_or_mismatch(
+    canonical_next,
+):
+    runtime_context_id = "mfrctx-b2a-worker-guide-no-override"
+    task_id = "task-b2a-worker-guide-no-override"
+
+    assert not server._runtime_context_contract_next_action_matches_worker(
+        canonical_next,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    response = server._runtime_context_worker_guide_response(
+        _worker_guide_state_with_contract_next_action(
+            canonical_next,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+    )
+
+    assert response["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert response["next_legal_action_decision_source"] == (
+        "runtime_context_timeline_projection"
+    )
+    assert response["contract_runtime_next_action_took_precedence"] is False
+    assert response["contract_runtime_next_legal_action"] == canonical_next
+    worker_guide = response["worker_guide"]
+    assert worker_guide["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert worker_guide["contract_runtime_next_legal_action"] == canonical_next
+    assert worker_guide["contract_runtime_next_action_took_precedence"] is False
+
+
+def test_runtime_context_worker_guide_projects_canonical_worker_commit_after_implementation(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-PROJECTION-WORKER-COMMIT"
+    worker_task_id = "contract-projection-worker-commit-worker"
+    worker_token = "contract-projection-worker-commit-token"
+    worker_fence = "fence-contract-projection-worker-commit"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    head_commit = hashlib.sha1(b"contract-projection-worker-commit").hexdigest()
+    graph_trace_id = "gqt-contract-projection-worker-commit"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-projection-worker-commit-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-projection-worker-commit-missing-id",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-projection-worker-commit",
+            "route_context_hash": "sha256:route-contract-projection-worker-commit",
+            "prompt_contract_id": "rprompt-contract-projection-worker-commit",
+            "prompt_contract_hash": "sha256:prompt-contract-projection-worker-commit",
+            "route_token_ref": "rtok-contract-projection-worker-commit",
+            "visible_injection_manifest_hash": (
+                "sha256:visible-contract-projection-worker-commit"
+            ),
+        },
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=worker_fence,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        include_finish_evidence=False,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        include_worker_commit=False,
+    )
+    conn.commit()
+    query = {
+        "parent_task_id": backlog_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+    current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            query={**query, "view": "all"},
+        )
+    )
+    current_worker_view = current["runtime_context_service"]["views"]["worker_view"]
+    current_control_plane = current_worker_view.get("control_plane") or {}
+    current_action_plan = current_worker_view.get("action_plan") or {}
+    expected_next_required_evidence = list(
+        current_control_plane.get("next_required_evidence")
+        or current_action_plan.get("next_required_evidence")
+        or []
+    )
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            query=query,
+        )
+    )
+
+    canonical_next = guide["contract_runtime_next_legal_action"]
+    assert guide["contract_runtime_execution_resolution"]["status"] == (
+        "resolved_source_backed_worker_lineage"
+    )
+    assert canonical_next["contract_execution_id"] == successor["contract_execution_id"]
+    assert canonical_next["line_id"] == "worker_commit"
+    assert canonical_next["action"] == "record_worker_commit"
+    assert canonical_next["owner_role"] == "mf_sub"
+    assert "mf_sub" in canonical_next["allowed_writer_roles"]
+    assert canonical_next["runtime_context_id"] == runtime_context.runtime_context_id
+    assert canonical_next["task_id"] == runtime_context.task_id
+    assert canonical_next["authority_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert guide["contract_runtime_current_state"]["next_legal_action"] == (
+        canonical_next
+    )
+    assert guide["next_legal_action"] == "record_worker_commit"
+    assert guide["next_legal_action_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert guide["contract_runtime_next_action_took_precedence"] is True
+    assert guide["next_required_evidence"] == expected_next_required_evidence
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["contract_runtime_next_legal_action"] == canonical_next
+    assert worker_guide["next_legal_action"] == "record_worker_commit"
+    assert worker_guide["next_required_evidence"] == expected_next_required_evidence
+
+
+def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-PROJECTION-AMBIGUOUS-GUIDE"
+    worker_task_id = "contract-projection-ambiguous-guide-worker"
+    worker_token = "contract-projection-ambiguous-guide-token"
+    worker_fence = "fence-contract-projection-ambiguous-guide"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-projection-ambiguous-guide-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    clone_id = "cex-contract-projection-ambiguous-guide-active"
+    _clone_contract_runtime_record_for_resolution_test(
+        conn,
+        source_contract_execution_id=successor["contract_execution_id"],
+        clone_contract_execution_id=clone_id,
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-projection-ambiguous-guide-missing-id",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-projection-ambiguous-guide",
+            "route_context_hash": "sha256:route-contract-projection-ambiguous-guide",
+            "prompt_contract_id": "rprompt-contract-projection-ambiguous-guide",
+            "prompt_contract_hash": (
+                "sha256:prompt-contract-projection-ambiguous-guide"
+            ),
+            "route_token_ref": "rtok-contract-projection-ambiguous-guide",
+        },
+    )
+    conn.commit()
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            query={
+                "parent_task_id": backlog_id,
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worker_root),
+            },
+        )
+    )
+
+    resolution = guide["contract_runtime_execution_resolution"]
+    assert resolution["status"] == "ambiguous_active_source_backed_worker_lineage"
+    assert resolution["fail_closed"] is True
+    assert set(resolution["candidate_contract_execution_ids"]) == {
+        successor["contract_execution_id"],
+        clone_id,
+    }
+    assert guide["contract_runtime_next_legal_action"] == {}
+    assert guide["contract_runtime_current_state"] == {}
+    assert guide["contract_runtime_next_action_took_precedence"] is False
+    assert guide["next_legal_action_decision_source"] != (
+        "contract_runtime_current_state"
+    )
+    assert guide["worker_guide"]["contract_runtime_next_action_took_precedence"] is False
 
 
 def test_parallel_branch_allocation_revision_persists_contract_execution_identity():
