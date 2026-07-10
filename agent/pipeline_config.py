@@ -47,12 +47,131 @@ PROVIDER_ALIASES: Dict[str, str] = {
 
 # Valid canonical provider names
 VALID_PROVIDERS = {"anthropic", "openai"}
+VALID_BACKEND_MODES = {
+    "anthropic_api",
+    "claude_cli",
+    "codex_cli",
+    "docker_live_ai",
+    "fixture",
+    "openai_api",
+}
+VALID_AUTH_MODES = {"api_key_env", "cli_auth", "external_harness", "not_required"}
+
+BACKEND_PROVIDER = {
+    "anthropic_api": "anthropic",
+    "claude_cli": "anthropic",
+    "codex_cli": "openai",
+    "openai_api": "openai",
+}
+BACKEND_AUTH_MODE = {
+    "anthropic_api": "api_key_env",
+    "claude_cli": "cli_auth",
+    "codex_cli": "cli_auth",
+    "docker_live_ai": "external_harness",
+    "fixture": "not_required",
+    "openai_api": "api_key_env",
+}
+
+
+def _default_backend_mode(provider: str) -> str:
+    return "codex_cli" if provider == "openai" else "claude_cli"
+
+
+def _default_auth_mode(backend_mode: str) -> str:
+    if backend_mode.endswith("_api"):
+        return "api_key_env"
+    if backend_mode.endswith("_cli"):
+        return "cli_auth"
+    if backend_mode == "docker_live_ai":
+        return "external_harness"
+    return "not_required"
+
+
+def _routing_fields(value: Dict, *, inherit_output_policy: bool = False) -> Dict[str, str]:
+    return {
+        "provider": _normalize_provider(value.get("provider", "")),
+        "model": (value.get("model") or "").strip(),
+        "backend_mode": (value.get("backend_mode") or "").strip().lower(),
+        "auth_mode": (value.get("auth_mode") or "").strip().lower(),
+        "output_policy": (
+            value.get("output_policy")
+            or ("" if inherit_output_policy else "hash_and_summary_only")
+        ).strip(),
+    }
 
 
 def _normalize_provider(raw: str) -> str:
     """Normalize a provider name using aliases. Returns canonical name or raw."""
     key = (raw or "").strip().lower()
     return PROVIDER_ALIASES.get(key, key)
+
+
+def infer_model_provider(model: str) -> str:
+    """Return a provider only when the model id is unambiguous."""
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return ""
+    if "claude" in normalized:
+        return "anthropic"
+    if (
+        "gpt" in normalized
+        or "codex" in normalized
+        or normalized.startswith(("o1", "o3", "o4"))
+    ):
+        return "openai"
+    return ""
+
+
+def validate_invocation_routing(
+    *,
+    provider: str,
+    model: str,
+    backend_mode: str,
+    auth_mode: str,
+) -> List[str]:
+    """Validate the provider-neutral routing tuple without guessing intent."""
+    provider = _normalize_provider(provider)
+    model = (model or "").strip()
+    backend_mode = (backend_mode or "").strip().lower()
+    auth_mode = (auth_mode or "").strip().lower()
+    errors: List[str] = []
+
+    if backend_mode not in VALID_BACKEND_MODES:
+        errors.append("backend_mode '{}' is invalid".format(backend_mode or "(missing)"))
+        return errors
+    if auth_mode not in VALID_AUTH_MODES:
+        errors.append("auth_mode '{}' is invalid".format(auth_mode or "(missing)"))
+
+    if backend_mode == "fixture":
+        if provider not in {"", "fixture"}:
+            errors.append("fixture backend cannot claim provider '{}'".format(provider))
+    elif provider not in VALID_PROVIDERS:
+        errors.append("provider '{}' is invalid".format(provider or "(missing)"))
+
+    required_provider = BACKEND_PROVIDER.get(backend_mode, "")
+    if required_provider and provider != required_provider:
+        errors.append(
+            "provider '{}' conflicts with backend_mode '{}' (requires '{}')".format(
+                provider or "(missing)", backend_mode, required_provider
+            )
+        )
+
+    required_auth = BACKEND_AUTH_MODE.get(backend_mode, "")
+    if required_auth and auth_mode != required_auth:
+        errors.append(
+            "auth_mode '{}' conflicts with backend_mode '{}' (requires '{}')".format(
+                auth_mode or "(missing)", backend_mode, required_auth
+            )
+        )
+
+    model_provider = infer_model_provider(model)
+    if model_provider and provider not in {"", "fixture", model_provider}:
+        errors.append(
+            "model '{}' belongs to provider '{}' but provider is '{}'".format(
+                model, model_provider, provider
+            )
+        )
+    return errors
 
 
 def _find_config_file() -> Optional[Path]:
@@ -108,10 +227,7 @@ def load_pipeline_config(path: Optional[str] = None) -> Dict:
     # Parse default section
     default = pipeline.get("default", {})
     if isinstance(default, dict):
-        result["default"] = {
-            "provider": _normalize_provider(default.get("provider", "")),
-            "model": (default.get("model") or "").strip(),
-        }
+        result["default"] = _routing_fields(default)
 
     # Parse roles section
     roles_raw = pipeline.get("roles", {})
@@ -119,10 +235,10 @@ def load_pipeline_config(path: Optional[str] = None) -> Dict:
         roles = {}
         for role_name, role_cfg in roles_raw.items():
             if isinstance(role_cfg, dict):
-                roles[role_name.lower().strip()] = {
-                    "provider": _normalize_provider(role_cfg.get("provider", "")),
-                    "model": (role_cfg.get("model") or "").strip(),
-                }
+                roles[role_name.lower().strip()] = _routing_fields(
+                    role_cfg,
+                    inherit_output_policy=True,
+                )
         if roles:
             result["roles"] = roles
 
@@ -145,12 +261,21 @@ def _apply_env_overrides(config: Dict) -> Dict:
     # Default overrides
     env_default_provider = os.getenv("PIPELINE_DEFAULT_PROVIDER", "").strip()
     env_default_model = os.getenv("PIPELINE_DEFAULT_MODEL", "").strip()
-    if env_default_provider or env_default_model:
+    env_default_backend = os.getenv("PIPELINE_DEFAULT_BACKEND_MODE", "").strip()
+    env_default_auth = os.getenv("PIPELINE_DEFAULT_AUTH_MODE", "").strip()
+    env_default_output = os.getenv("PIPELINE_DEFAULT_OUTPUT_POLICY", "").strip()
+    if any((env_default_provider, env_default_model, env_default_backend, env_default_auth, env_default_output)):
         default = dict(result.get("default", {}))
         if env_default_provider:
             default["provider"] = _normalize_provider(env_default_provider)
         if env_default_model:
             default["model"] = env_default_model
+        if env_default_backend:
+            default["backend_mode"] = env_default_backend.lower()
+        if env_default_auth:
+            default["auth_mode"] = env_default_auth.lower()
+        if env_default_output:
+            default["output_policy"] = env_default_output
         result["default"] = default
 
     # Per-role overrides
@@ -158,12 +283,21 @@ def _apply_env_overrides(config: Dict) -> Dict:
     for role in ROLE_PIPELINE_ORDER:
         env_provider = os.getenv("PIPELINE_ROLE_{}_PROVIDER".format(role.upper()), "").strip()
         env_model = os.getenv("PIPELINE_ROLE_{}_MODEL".format(role.upper()), "").strip()
-        if env_provider or env_model:
+        env_backend = os.getenv("PIPELINE_ROLE_{}_BACKEND_MODE".format(role.upper()), "").strip()
+        env_auth = os.getenv("PIPELINE_ROLE_{}_AUTH_MODE".format(role.upper()), "").strip()
+        env_output = os.getenv("PIPELINE_ROLE_{}_OUTPUT_POLICY".format(role.upper()), "").strip()
+        if any((env_provider, env_model, env_backend, env_auth, env_output)):
             role_cfg = dict(roles.get(role, {}))
             if env_provider:
                 role_cfg["provider"] = _normalize_provider(env_provider)
             if env_model:
                 role_cfg["model"] = env_model
+            if env_backend:
+                role_cfg["backend_mode"] = env_backend.lower()
+            if env_auth:
+                role_cfg["auth_mode"] = env_auth.lower()
+            if env_output:
+                role_cfg["output_policy"] = env_output
             roles[role] = role_cfg
     if roles:
         result["roles"] = roles
@@ -184,8 +318,25 @@ def resolve_role_config(role_name: str, config: Dict) -> Dict:
 
     provider = role_cfg.get("provider", "") or default.get("provider", "")
     model = role_cfg.get("model", "") or default.get("model", "")
+    backend_mode = role_cfg.get("backend_mode", "") or default.get("backend_mode", "")
+    auth_mode = role_cfg.get("auth_mode", "") or default.get("auth_mode", "")
+    output_policy = (
+        role_cfg.get("output_policy", "")
+        or default.get("output_policy", "")
+        or "hash_and_summary_only"
+    )
+    if not backend_mode and provider:
+        backend_mode = _default_backend_mode(provider)
+    if not auth_mode and backend_mode:
+        auth_mode = _default_auth_mode(backend_mode)
 
-    return {"provider": provider, "model": model}
+    return {
+        "provider": provider,
+        "model": model,
+        "backend_mode": backend_mode,
+        "auth_mode": auth_mode,
+        "output_policy": output_policy,
+    }
 
 
 def validate_pipeline_config(config: Dict) -> List[str]:
@@ -205,6 +356,8 @@ def validate_pipeline_config(config: Dict) -> List[str]:
     if default:
         provider = default.get("provider", "")
         model = default.get("model", "")
+        backend_mode = default.get("backend_mode", "")
+        auth_mode = default.get("auth_mode", "")
         if provider and provider not in VALID_PROVIDERS:
             errors.append("Default config provider '{}' is invalid, "
                           "valid values: {}".format(provider, ", ".join(sorted(VALID_PROVIDERS))))
@@ -213,11 +366,14 @@ def validate_pipeline_config(config: Dict) -> List[str]:
         if model and not provider:
             # Try to infer
             # Infer provider from model name
-            inferred = ("anthropic" if "claude" in model.lower()
-                        else "openai" if "gpt" in model.lower() else "")
+            inferred = infer_model_provider(model)
             if not inferred:
                 errors.append("Default config model '{}' cannot infer provider, "
                               "please specify provider explicitly".format(model))
+        if backend_mode and backend_mode not in VALID_BACKEND_MODES:
+            errors.append("Default config backend_mode '{}' is invalid".format(backend_mode))
+        if auth_mode and auth_mode not in VALID_AUTH_MODES:
+            errors.append("Default config auth_mode '{}' is invalid".format(auth_mode))
 
     # Validate roles
     ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa", "coordinator", "gatekeeper", "utility"]
@@ -229,6 +385,8 @@ def validate_pipeline_config(config: Dict) -> List[str]:
             continue
         provider = role_cfg.get("provider", "")
         model = role_cfg.get("model", "")
+        backend_mode = role_cfg.get("backend_mode", "")
+        auth_mode = role_cfg.get("auth_mode", "")
         if provider and provider not in VALID_PROVIDERS:
             errors.append("Role '{}' provider '{}' is invalid, "
                           "valid values: {}".format(role_name, provider,
@@ -238,11 +396,36 @@ def validate_pipeline_config(config: Dict) -> List[str]:
                 role_name, provider))
         if model and not provider:
             # Infer provider from model name
-            inferred = ("anthropic" if "claude" in model.lower()
-                        else "openai" if "gpt" in model.lower() else "")
+            inferred = infer_model_provider(model)
             if not inferred:
                 errors.append("Role '{}' model '{}' cannot infer provider, "
                               "please specify provider explicitly".format(role_name, model))
+        if backend_mode and backend_mode not in VALID_BACKEND_MODES:
+            errors.append("Role '{}' backend_mode '{}' is invalid".format(role_name, backend_mode))
+        if auth_mode and auth_mode not in VALID_AUTH_MODES:
+            errors.append("Role '{}' auth_mode '{}' is invalid".format(role_name, auth_mode))
+
+    effective_entries = [("Default config", resolve_role_config("", config))]
+    effective_entries.extend(
+        ("Role '{}'".format(role_name), resolve_role_config(role_name, config))
+        for role_name in roles
+        if role_name in ROLE_PIPELINE_ORDER
+    )
+    for label, entry in effective_entries:
+        if not any(entry.get(field) for field in ("provider", "model", "backend_mode", "auth_mode")):
+            continue
+        provider = entry.get("provider", "")
+        backend_mode = entry.get("backend_mode", "") or _default_backend_mode(provider)
+        auth_mode = entry.get("auth_mode", "") or _default_auth_mode(backend_mode)
+        for error in validate_invocation_routing(
+            provider=provider,
+            model=entry.get("model", ""),
+            backend_mode=backend_mode,
+            auth_mode=auth_mode,
+        ):
+            rendered = "{} {}".format(label, error)
+            if rendered not in errors:
+                errors.append(rendered)
 
     return errors
 
@@ -255,14 +438,13 @@ def validate_provider_availability(config: Dict) -> List[str]:
     warnings: List[str] = []
 
     all_providers = set()
-
-    default = config.get("default", {})
-    if default.get("provider"):
-        all_providers.add(default["provider"])
-
-    for role_cfg in config.get("roles", {}).values():
-        if role_cfg.get("provider"):
-            all_providers.add(role_cfg["provider"])
+    entries = [config.get("default", {})]
+    entries.extend(config.get("roles", {}).values())
+    for entry in entries:
+        provider = entry.get("provider")
+        backend_mode = entry.get("backend_mode") or _default_backend_mode(provider)
+        if provider and backend_mode.endswith("_api"):
+            all_providers.add(provider)
 
     if "anthropic" in all_providers:
         if not os.getenv("ANTHROPIC_API_KEY", "").strip():
@@ -317,6 +499,9 @@ def apply_config_to_stages(stages: List[Dict],
         if resolved["model"]:
             stage["model"] = resolved["model"]
             stage["provider"] = resolved["provider"]
+            stage["backend_mode"] = resolved["backend_mode"]
+            stage["auth_mode"] = resolved["auth_mode"]
+            stage["output_policy"] = resolved["output_policy"]
 
     return stages
 

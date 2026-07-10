@@ -7,8 +7,15 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
+from agent.ai_invocation import (
+    AIInvocationRequest,
+    REQUEST_SCHEMA_VERSION as AI_INVOCATION_REQUEST_SCHEMA_VERSION,
+    RESULT_SCHEMA_VERSION as AI_INVOCATION_RESULT_SCHEMA_VERSION,
+    RoutePromptContract,
+)
 from agent.governance.asset_binding_proposals import (
     PRECHECK_SCHEMA_VERSION as ASSET_BINDING_PRECHECK_SCHEMA_VERSION,
     PROPOSAL_SCHEMA_VERSION as ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
@@ -88,6 +95,10 @@ MF_SUB_REQUIRED_OUTPUT = (
     "test_results",
     "checkpoint_id",
     "fence_token",
+)
+MF_SUB_AI_REQUIRED_OUTPUT = MF_SUB_REQUIRED_OUTPUT + (
+    "invocation_request",
+    "invocation_result",
 )
 
 _REQUIRED_CONTEXT_FIELDS = (
@@ -6834,6 +6845,85 @@ def _require_context(context: BranchTaskRuntimeContext) -> None:
         )
 
 
+def _mf_subagent_invocation_request_evidence(
+    context: BranchTaskRuntimeContext,
+    *,
+    prompt: str,
+    backend: str,
+    route_prompt_contract: Mapping[str, Any],
+    invocation_routing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    backend_name = str(backend or "codex_subagent").strip().lower()
+    routing = dict(invocation_routing or {
+        "provider": "openai",
+        "model": "",
+        "backend_mode": "codex_cli",
+        "auth_mode": "cli_auth",
+        "output_policy": "hash_and_summary_only",
+    })
+    provider = str(routing.get("provider") or "").strip().lower()
+    model = str(routing.get("model") or "").strip()
+    backend_mode = str(routing.get("backend_mode") or "").strip().lower()
+    auth_mode = str(routing.get("auth_mode") or "").strip().lower()
+    output_policy = str(
+        routing.get("output_policy") or "hash_and_summary_only"
+    ).strip()
+    if not provider or not backend_mode or not auth_mode:
+        raise MfSubagentContractError(
+            "MF subagent invocation routing requires explicit provider, backend_mode, and auth_mode"
+        )
+    from agent.pipeline_config import validate_invocation_routing
+    routing_errors = validate_invocation_routing(
+        provider=provider,
+        model=model,
+        backend_mode=backend_mode,
+        auth_mode=auth_mode,
+    )
+    if routing_errors:
+        raise MfSubagentContractError(
+            "MF subagent invocation routing is invalid: " + "; ".join(routing_errors)
+        )
+    runtime_context_id = mf_subagent_runtime_context_id(context)
+    evidence_refs = [
+        f"backlog:{context.backlog_id}",
+        f"task:{context.task_id}",
+        f"runtime_context:{runtime_context_id}",
+        f"merge_queue:{context.merge_queue_id}",
+    ]
+    if context.snapshot_id:
+        evidence_refs.append(f"graph_snapshot:{context.snapshot_id}")
+    if context.projection_id:
+        evidence_refs.append(f"graph_projection:{context.projection_id}")
+    request = AIInvocationRequest(
+        role=MF_SUB_ROLE,
+        provider=provider,
+        model=model,
+        backend_mode=backend_mode,
+        cwd=context.worktree_path,
+        prompt=prompt,
+        auth_mode=auth_mode,
+        output_policy=output_policy,
+        route=RoutePromptContract.from_mapping(route_prompt_contract),
+        metadata={
+            "worktree": context.worktree_path,
+            "runtime_context_id": runtime_context_id,
+            "evidence_refs": evidence_refs,
+            "requested_backend": backend_name,
+        },
+    )
+    evidence = request.to_evidence()
+    evidence.update(
+        {
+            "worktree": context.worktree_path,
+            "requested_backend": backend_name,
+            "evidence_refs": evidence_refs,
+            "raw_prompt_output_stored": False,
+        }
+    )
+    evidence["request_binding_sha256"] = _mf_invocation_request_binding(evidence)
+    return evidence
+
+
 def build_mf_subagent_input(
     context: BranchTaskRuntimeContext,
     *,
@@ -6843,6 +6933,7 @@ def build_mf_subagent_input(
     test_commands: Sequence[str] | None = None,
     operator_notes: str = "",
     backend: str = "codex_subagent",
+    invocation_routing: Mapping[str, Any] | None = None,
     route_context_hash: str = "",
     prompt_contract_id: str = "",
     prompt_contract_hash: str = "",
@@ -6883,6 +6974,14 @@ def build_mf_subagent_input(
     happy_path_reminders = dict(
         agent_task_contract.get("mf_parallel_happy_path_reminders") or {}
     )
+    invocation_request = _mf_subagent_invocation_request_evidence(
+        context,
+        prompt=prompt,
+        backend=backend,
+        route_prompt_contract=child_route_prompt_contract,
+        invocation_routing=invocation_routing,
+    )
+    agent_task_contract["required_output"] = list(MF_SUB_AI_REQUIRED_OUTPUT)
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
         "role": MF_SUB_ROLE,
@@ -6966,6 +7065,17 @@ def build_mf_subagent_input(
             parent_route_lineage=normalized_parent_route_lineage,
             child_route_prompt_contract=child_route_prompt_contract,
         ),
+        "invocation_request": invocation_request,
+        "invocation_contract": {
+            "request_field": "invocation_request",
+            "request_schema_version": AI_INVOCATION_REQUEST_SCHEMA_VERSION,
+            "request_binding_field": "request_binding_sha256",
+            "request_echo_required": True,
+            "result_field": "invocation_result",
+            "result_schema_version": AI_INVOCATION_RESULT_SCHEMA_VERSION,
+            "result_required": True,
+            "result_validation": "required_and_request_bound",
+        },
         "agent_task_contract": agent_task_contract,
         "worker_prompt_reminders": list(MF_PARALLEL_HAPPY_PATH_PROMPT_REMINDERS),
         "mf_parallel_happy_path_reminders": happy_path_reminders,
@@ -6995,14 +7105,467 @@ def build_mf_subagent_input(
                 ),
             },
         },
-        "required_output": list(MF_SUB_REQUIRED_OUTPUT),
+        "required_output": list(MF_SUB_AI_REQUIRED_OUTPUT),
     }
+
+
+_AI_INVOCATION_FORBIDDEN_PERSISTED_KEYS = {
+    "api_key",
+    "authorization",
+    "credential",
+    "credentials",
+    "env",
+    "env_keys",
+    "output_text",
+    "password",
+    "prompt",
+    "raw_output",
+    "result",
+    "secret",
+    "stderr",
+    "stdout",
+    "system_prompt",
+    "token",
+}
+_AI_INVOCATION_SECRET_VALUE_RE = re.compile(
+    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]+)",
+    re.IGNORECASE,
+)
+
+_AI_INVOCATION_REQUEST_ALLOWED_KEYS = {
+    "auth_mode",
+    "backend_mode",
+    "cwd",
+    "evidence_refs",
+    "model",
+    "output_policy",
+    "prompt_sha256",
+    "provider",
+    "raw_prompt_exposed",
+    "raw_prompt_output_stored",
+    "request_binding_sha256",
+    "requested_backend",
+    "role",
+    "route_prompt_contract",
+    "schema_version",
+    "timeout_sec",
+    "worktree",
+}
+_AI_INVOCATION_RESULT_ALLOWED_KEYS = {
+    "auth_mode",
+    "auth_status",
+    "backend_mode",
+    "blocker_id",
+    "calls_models",
+    "command",
+    "cwd",
+    "elapsed_ms",
+    "error",
+    "error_present",
+    "error_sha256",
+    "evidence_refs",
+    "model",
+    "no_raw_prompt_output",
+    "ordered_step_outputs",
+    "output_empty",
+    "output_path",
+    "output_policy",
+    "output_sha256",
+    "prompt_sha256",
+    "provider",
+    "provider_backed",
+    "raw_error_stored",
+    "raw_output_stored",
+    "request_binding_sha256",
+    "request_schema_version",
+    "returncode",
+    "role",
+    "route_alert_ack",
+    "route_prompt_contract",
+    "runtime_monitor",
+    "schema_version",
+    "status",
+    "worktree",
+}
+_AI_INVOCATION_ROUTE_ALLOWED_KEYS = {
+    "prompt_contract_hash",
+    "prompt_contract_id",
+    "raw_context_exposed",
+    "route_context_hash",
+    "route_token_ref",
+}
+_AI_INVOCATION_ROUTE_ALERT_ALLOWED_KEYS = {
+    "prompt_contract_hash",
+    "prompt_contract_id",
+    "route_context_hash",
+    "status",
+}
+_AI_INVOCATION_STEP_OUTPUT_ALLOWED_KEYS = {"status", "step_id"}
+_AI_INVOCATION_RUNTIME_MONITOR_ALLOWED_KEYS = {
+    "early_progress",
+    "early_progress_timeout_sec",
+    "heartbeat_count",
+    "heartbeat_enabled",
+    "heartbeat_failures",
+    "heartbeat_interval_sec",
+    "last_heartbeat",
+    "progress_observed",
+    "schema_version",
+}
+_AI_INVOCATION_HEARTBEAT_ALLOWED_KEYS = {
+    "error",
+    "http_status",
+    "observer_session_id",
+    "ok",
+    "phase",
+}
+_AI_INVOCATION_PROGRESS_ALLOWED_KEYS = {
+    "output_file_nonempty",
+    "progress_observed",
+    "schema_version",
+    "stderr_bytes",
+    "stdout_bytes",
+    "stream_output_observed",
+    "worktree_changed",
+    "worktree_status_available",
+}
+_AI_INVOCATION_PROVIDER_RAW_KEY_RE = re.compile(
+    r"(?:^|_)(?:raw_)?provider_(?:error|output|response|result)(?:_|$)"
+)
+
+
+def _mf_invocation_binding_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    route = _mapping(
+        value.get("route_prompt_contract"),
+        field_name="route_prompt_contract",
+    )
+    return {
+        "schema_version": str(
+            value.get("request_schema_version") or value.get("schema_version") or ""
+        ),
+        "role": str(value.get("role") or ""),
+        "provider": str(value.get("provider") or "").strip().lower(),
+        "model": str(value.get("model") or "").strip(),
+        "backend_mode": str(value.get("backend_mode") or "").strip().lower(),
+        "auth_mode": str(value.get("auth_mode") or "").strip().lower(),
+        "output_policy": str(value.get("output_policy") or "").strip(),
+        "prompt_sha256": str(value.get("prompt_sha256") or "").strip(),
+        "route_prompt_contract": {
+            field: route.get(field, False if field == "raw_context_exposed" else "")
+            for field in sorted(_AI_INVOCATION_ROUTE_ALLOWED_KEYS)
+        },
+    }
+
+
+def _mf_invocation_request_binding(value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        _mf_invocation_binding_payload(value),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _reject_unknown_invocation_fields(
+    value: Mapping[str, Any],
+    *,
+    allowed: set[str],
+    field_name: str,
+) -> None:
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise MfSubagentContractError(
+            f"MF subagent {field_name} contains unknown persisted fields: "
+            + ", ".join(unknown)
+        )
+
+
+def _validate_mf_invocation_route_fields(
+    value: Any,
+    *,
+    field_name: str,
+    allowed: set[str],
+) -> dict[str, Any]:
+    route = dict(_mapping(value, field_name=field_name))
+    _reject_unknown_invocation_fields(
+        route,
+        allowed=allowed,
+        field_name=field_name,
+    )
+    return route
+
+
+def _validate_no_sensitive_mf_invocation_fields(
+    payload: Any,
+    *,
+    path: str,
+) -> None:
+    if isinstance(payload, Mapping):
+        for key, item in payload.items():
+            normalized = str(key).strip().lower()
+            if normalized == "error" and item is not None and item != "":
+                raise MfSubagentContractError(
+                    "MF subagent invocation evidence contains raw error text: "
+                    + path + "." + str(key)
+                )
+            if normalized in _AI_INVOCATION_FORBIDDEN_PERSISTED_KEYS:
+                raise MfSubagentContractError(
+                    "MF subagent invocation evidence contains forbidden persisted field: "
+                    + path + "." + str(key)
+                )
+            if _AI_INVOCATION_PROVIDER_RAW_KEY_RE.search(normalized):
+                raise MfSubagentContractError(
+                    "MF subagent invocation evidence contains unknown provider payload field: "
+                    + path + "." + str(key)
+                )
+            _validate_no_sensitive_mf_invocation_fields(
+                item,
+                path=path + "." + str(key),
+            )
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        for index, item in enumerate(payload):
+            _validate_no_sensitive_mf_invocation_fields(
+                item,
+                path="{}[{}]".format(path, index),
+            )
+    elif isinstance(payload, str) and _AI_INVOCATION_SECRET_VALUE_RE.search(payload):
+        raise MfSubagentContractError(
+            "MF subagent invocation evidence contains credential-like persisted text: "
+            + path
+        )
+
+
+def _validate_mf_ai_invocation_request(value: Any) -> dict[str, Any]:
+    request = dict(_mapping(value, field_name="invocation_request"))
+    _reject_unknown_invocation_fields(
+        request,
+        allowed=_AI_INVOCATION_REQUEST_ALLOWED_KEYS,
+        field_name="invocation_request",
+    )
+    if request.get("schema_version") != AI_INVOCATION_REQUEST_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request schema_version must be ai_invocation_request.v1"
+        )
+    if str(request.get("role") or "") != MF_SUB_ROLE:
+        raise MfSubagentContractError("MF subagent invocation_request role must be mf_sub")
+    from agent.pipeline_config import validate_invocation_routing
+
+    routing_errors = validate_invocation_routing(
+        provider=str(request.get("provider") or ""),
+        model=str(request.get("model") or ""),
+        backend_mode=str(request.get("backend_mode") or ""),
+        auth_mode=str(request.get("auth_mode") or ""),
+    )
+    if routing_errors:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request routing is invalid: "
+            + "; ".join(routing_errors)
+        )
+    if request.get("raw_prompt_exposed") is not False:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request must set raw_prompt_exposed=false"
+        )
+    if request.get("raw_prompt_output_stored") is not False:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request must set raw_prompt_output_stored=false"
+        )
+    route = _validate_mf_invocation_route_fields(
+        request.get("route_prompt_contract"),
+        field_name="invocation_request.route_prompt_contract",
+        allowed=_AI_INVOCATION_ROUTE_ALLOWED_KEYS,
+    )
+    if route.get("raw_context_exposed") is not False:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request route must set raw_context_exposed=false"
+        )
+    evidence_refs = request.get("evidence_refs")
+    if evidence_refs is not None:
+        from agent.ai_lifecycle import sanitize_evidence_refs
+
+        sanitized_refs = sanitize_evidence_refs(evidence_refs)
+        if not isinstance(evidence_refs, Sequence) or isinstance(
+            evidence_refs, (str, bytes)
+        ) or list(evidence_refs) != sanitized_refs:
+            raise MfSubagentContractError(
+                "MF subagent invocation_request evidence_refs are not opaque sanitized references"
+            )
+    expected_binding = _mf_invocation_request_binding(request)
+    if str(request.get("request_binding_sha256") or "") != expected_binding:
+        raise MfSubagentContractError(
+            "MF subagent invocation_request request binding is invalid"
+        )
+    _validate_no_sensitive_mf_invocation_fields(
+        request,
+        path="invocation_request",
+    )
+    return request
+
+
+def _validate_mf_ai_invocation_result(
+    value: Any,
+    *,
+    expected_request: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(_mapping(value, field_name="invocation_result"))
+    _reject_unknown_invocation_fields(
+        result,
+        allowed=_AI_INVOCATION_RESULT_ALLOWED_KEYS,
+        field_name="invocation_result",
+    )
+    if result.get("schema_version") != AI_INVOCATION_RESULT_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result schema_version must be ai_invocation_result.v1"
+        )
+    if result.get("request_schema_version") != AI_INVOCATION_REQUEST_SCHEMA_VERSION:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result request_schema_version must be ai_invocation_request.v1"
+        )
+    if str(result.get("role") or "") != MF_SUB_ROLE:
+        raise MfSubagentContractError("MF subagent invocation_result role must be mf_sub")
+
+    from agent.pipeline_config import validate_invocation_routing
+    routing_errors = validate_invocation_routing(
+        provider=str(result.get("provider") or ""),
+        model=str(result.get("model") or ""),
+        backend_mode=str(result.get("backend_mode") or ""),
+        auth_mode=str(result.get("auth_mode") or ""),
+    )
+    if routing_errors:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result routing is invalid: " + "; ".join(routing_errors)
+        )
+    result_route = _validate_mf_invocation_route_fields(
+        result.get("route_prompt_contract"),
+        field_name="invocation_result.route_prompt_contract",
+        allowed=_AI_INVOCATION_ROUTE_ALLOWED_KEYS,
+    )
+    if result_route.get("raw_context_exposed") is not False:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result route must set raw_context_exposed=false"
+        )
+    route_alert = result.get("route_alert_ack")
+    if route_alert is not None:
+        _validate_mf_invocation_route_fields(
+            route_alert,
+            field_name="invocation_result.route_alert_ack",
+            allowed=_AI_INVOCATION_ROUTE_ALERT_ALLOWED_KEYS,
+        )
+    ordered_steps = result.get("ordered_step_outputs")
+    if ordered_steps is not None:
+        if not isinstance(ordered_steps, Sequence) or isinstance(
+            ordered_steps, (str, bytes)
+        ):
+            raise MfSubagentContractError(
+                "MF subagent invocation_result ordered_step_outputs must be a list"
+            )
+        for index, step in enumerate(ordered_steps):
+            step_value = dict(
+                _mapping(
+                    step,
+                    field_name=f"invocation_result.ordered_step_outputs[{index}]",
+                )
+            )
+            _reject_unknown_invocation_fields(
+                step_value,
+                allowed=_AI_INVOCATION_STEP_OUTPUT_ALLOWED_KEYS,
+                field_name=f"invocation_result.ordered_step_outputs[{index}]",
+            )
+    runtime_monitor = result.get("runtime_monitor")
+    if runtime_monitor is not None:
+        monitor_value = dict(
+            _mapping(
+                runtime_monitor,
+                field_name="invocation_result.runtime_monitor",
+            )
+        )
+        _reject_unknown_invocation_fields(
+            monitor_value,
+            allowed=_AI_INVOCATION_RUNTIME_MONITOR_ALLOWED_KEYS,
+            field_name="invocation_result.runtime_monitor",
+        )
+        if monitor_value and monitor_value.get("schema_version") != (
+            "codex_cli_runtime_monitor.v1"
+        ):
+            raise MfSubagentContractError(
+                "MF subagent invocation_result runtime_monitor schema_version "
+                "must be codex_cli_runtime_monitor.v1"
+            )
+        last_heartbeat = monitor_value.get("last_heartbeat")
+        if last_heartbeat is not None:
+            _validate_mf_invocation_route_fields(
+                last_heartbeat,
+                field_name="invocation_result.runtime_monitor.last_heartbeat",
+                allowed=_AI_INVOCATION_HEARTBEAT_ALLOWED_KEYS,
+            )
+        early_progress = monitor_value.get("early_progress")
+        if early_progress is not None:
+            progress_value = _validate_mf_invocation_route_fields(
+                early_progress,
+                field_name="invocation_result.runtime_monitor.early_progress",
+                allowed=_AI_INVOCATION_PROGRESS_ALLOWED_KEYS,
+            )
+            if progress_value.get("schema_version") != (
+                "codex_cli_progress_snapshot.v1"
+            ):
+                raise MfSubagentContractError(
+                    "MF subagent invocation_result runtime_monitor early_progress "
+                    "schema_version must be codex_cli_progress_snapshot.v1"
+                )
+    if result.get("raw_output_stored") is not False:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result must set raw_output_stored=false"
+        )
+    if result.get("no_raw_prompt_output") is not True:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result must set no_raw_prompt_output=true"
+        )
+    if result.get("error") is not None and result.get("error") != "":
+        raise MfSubagentContractError(
+            "MF subagent invocation_result must not persist raw error text"
+        )
+    if result.get("output_path") is not None and result.get("output_path") != "":
+        raise MfSubagentContractError(
+            "MF subagent invocation_result must not retain a raw output path"
+        )
+    if result.get("raw_error_stored") not in {None, False}:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result must set raw_error_stored=false"
+        )
+    evidence_refs = result.get("evidence_refs")
+    if evidence_refs is not None:
+        from agent.ai_lifecycle import sanitize_evidence_refs
+
+        sanitized_refs = sanitize_evidence_refs(evidence_refs)
+        if not isinstance(evidence_refs, Sequence) or isinstance(
+            evidence_refs, (str, bytes)
+        ) or list(evidence_refs) != sanitized_refs:
+            raise MfSubagentContractError(
+                "MF subagent invocation_result evidence_refs are not opaque sanitized references"
+            )
+
+    result_binding = str(result.get("request_binding_sha256") or "")
+    expected_binding = str(expected_request.get("request_binding_sha256") or "")
+    if result_binding != expected_binding:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result request binding does not match invocation_request"
+        )
+    if _mf_invocation_request_binding(result) != expected_binding:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result request tuple does not match invocation_request"
+        )
+    _validate_no_sensitive_mf_invocation_fields(
+        result,
+        path="invocation_result",
+    )
+    return result
 
 
 def normalize_mf_subagent_result(
     payload: Mapping[str, Any],
     *,
     expected_fence_token: str,
+    expected_invocation_request: Mapping[str, Any] | None = None,
+    require_invocation_result: bool = False,
 ) -> dict[str, Any]:
     """Validate and normalize a branch worker result before queueing merge review."""
 
@@ -7036,6 +7599,35 @@ def normalize_mf_subagent_result(
     test_status = str(test_results.get("status") or "").lower()
     tests_passed = bool(test_results.get("passed")) or test_status in _PASS_STATUSES
     merge_queue_ready = status in _READY_STATUSES and tests_passed and not blockers
+    invocation_contract = (
+        payload.get("invocation_contract")
+        if isinstance(payload.get("invocation_contract"), Mapping)
+        else {}
+    )
+    request_value = expected_invocation_request or payload.get("invocation_request")
+    invocation_applicable = bool(
+        require_invocation_result
+        or request_value is not None
+        or payload.get("invocation_result") is not None
+        or invocation_contract.get("result_required")
+    )
+    if invocation_applicable and request_value is None:
+        raise MfSubagentContractError(
+            "MF subagent invocation_result requires its sanitized invocation_request"
+        )
+    if invocation_applicable and payload.get("invocation_result") is None:
+        raise MfSubagentContractError(
+            "MF subagent result missing required invocation_result"
+        )
+    invocation_request = {}
+    invocation_result = {}
+    if request_value is not None:
+        invocation_request = _validate_mf_ai_invocation_request(request_value)
+    if payload.get("invocation_result") is not None:
+        invocation_result = _validate_mf_ai_invocation_result(
+            payload.get("invocation_result"),
+            expected_request=invocation_request,
+        )
 
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -7050,6 +7642,8 @@ def normalize_mf_subagent_result(
         "blockers": blockers,
         "summary": str(payload.get("summary") or ""),
         "evidence": _mapping(payload.get("evidence"), field_name="evidence"),
+        "invocation_request": invocation_request,
+        "invocation_result": invocation_result,
     }
 
 
@@ -7203,6 +7797,15 @@ def validate_mf_subagent_finish_gate(
     normalized = normalize_mf_subagent_result(
         payload,
         expected_fence_token=context.fence_token,
+        expected_invocation_request=(
+            payload.get("invocation_request")
+            if isinstance(payload.get("invocation_request"), Mapping)
+            else None
+        ),
+        require_invocation_result=bool(
+            isinstance(payload.get("invocation_contract"), Mapping)
+            and payload.get("invocation_contract", {}).get("result_required")
+        ),
     )
     if not normalized["merge_queue_ready"]:
         raise MfSubagentContractError("MF subagent finish gate is not merge-queue ready")
@@ -7576,6 +8179,8 @@ def validate_mf_subagent_finish_gate(
         "changed_files": normalized["changed_files"],
         "new_files": normalized["new_files"],
         "test_results": normalized["test_results"],
+        "invocation_request": normalized["invocation_request"],
+        "invocation_result": normalized["invocation_result"],
         "route_identity": route_identity,
         "route_lineage": route_lineage,
         "observer_command_id": observer_command_id,
@@ -7622,6 +8227,8 @@ def validate_mf_subagent_finish_gate(
         "commit": claimed_head or context.head_commit,
         "changed_files": normalized["changed_files"],
         "new_files": normalized["new_files"],
+        "invocation_request": normalized["invocation_request"],
+        "invocation_result": normalized["invocation_result"],
         "route_id": _string(child_route_prompt_contract.get("route_id")),
         "route_context_hash": _string(
             child_route_prompt_contract.get("route_context_hash")
@@ -7729,6 +8336,8 @@ def validate_mf_subagent_finish_gate(
         "blockers": normalized["blockers"],
         "summary": normalized["summary"],
         "evidence": normalized["evidence"],
+        "invocation_request": normalized["invocation_request"],
+        "invocation_result": normalized["invocation_result"],
         "merge_queue_ready": True,
         "implementation": True,
         "implementation_ready": True,

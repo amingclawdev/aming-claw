@@ -745,6 +745,86 @@ def _observer_poll_public_session(
     return public
 
 
+def _observer_poll_invocation_fields(plan: dict) -> dict:
+    """Keep request and result contracts distinct; retain result-only legacy alias."""
+    request = (
+        plan.get("invocation_request")
+        if isinstance(plan.get("invocation_request"), dict)
+        else {}
+    )
+    result = (
+        plan.get("invocation_result")
+        if isinstance(plan.get("invocation_result"), dict)
+        else {}
+    )
+    legacy = plan.get("invocation") if isinstance(plan.get("invocation"), dict) else {}
+    if legacy.get("schema_version") == "ai_invocation_request.v1":
+        request = request or legacy
+    elif legacy:
+        result = result or legacy
+
+    if result:
+        import hashlib
+
+        result = dict(result)
+        had_error = "error" in result
+        raw_error = str(result.pop("error", "") or "")
+        for field in (
+            "authorization",
+            "command",
+            "credential",
+            "credentials",
+            "env",
+            "output_text",
+            "password",
+            "prompt",
+            "raw_output",
+            "result",
+            "secret",
+            "stderr",
+            "stdout",
+            "system_prompt",
+        ):
+            result.pop(field, None)
+        if had_error:
+            result["error"] = ""
+            result["error_present"] = bool(raw_error)
+            result["error_sha256"] = (
+                "sha256:" + hashlib.sha256(raw_error.encode("utf-8")).hexdigest()
+                if raw_error
+                else ""
+            )
+            result["raw_error_stored"] = False
+        if "evidence_refs" in result:
+            from agent.ai_lifecycle import sanitize_evidence_refs
+
+            result["evidence_refs"] = sanitize_evidence_refs(result["evidence_refs"])
+
+    fields = {}
+    if request:
+        fields["invocation_request"] = request
+    if result:
+        fields["invocation_result"] = result
+        fields["invocation"] = result
+    return fields
+
+
+def _validate_cli_invocation_routing(provider: str, model: str, backend_mode: str) -> None:
+    from agent.pipeline_config import BACKEND_AUTH_MODE, validate_invocation_routing
+
+    backend = str(backend_mode or "").strip().lower()
+    effective_provider = "fixture" if backend == "fixture" else provider
+    effective_model = "" if backend == "fixture" else model
+    errors = validate_invocation_routing(
+        provider=effective_provider,
+        model=effective_model,
+        backend_mode=backend,
+        auth_mode=BACKEND_AUTH_MODE.get(backend, ""),
+    )
+    if errors:
+        raise click.ClickException("invalid AI invocation routing: " + "; ".join(errors))
+
+
 def _observer_poll_completion_result(plan: dict) -> dict:
     route_identity = plan.get("route_identity") if isinstance(plan.get("route_identity"), dict) else {}
     return {
@@ -756,10 +836,13 @@ def _observer_poll_completion_result(plan: dict) -> dict:
         "route_id": str(route_identity.get("route_id") or ""),
         "route_context_hash": str(route_identity.get("route_context_hash") or ""),
         "prompt_contract_id": str(route_identity.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(route_identity.get("prompt_contract_hash") or ""),
+        "route_token_ref": str(route_identity.get("route_token_ref") or ""),
         "visible_injection_manifest_hash": str(
             route_identity.get("visible_injection_manifest_hash") or ""
         ),
         "calls_models": bool(plan.get("calls_models")),
+        **_observer_poll_invocation_fields(plan),
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
@@ -798,6 +881,16 @@ def _observer_poll_failure_result(plan: dict) -> dict:
             or failure.get("prompt_contract_id")
             or ""
         ),
+        "prompt_contract_hash": str(
+            route_identity.get("prompt_contract_hash")
+            or failure.get("prompt_contract_hash")
+            or ""
+        ),
+        "route_token_ref": str(
+            route_identity.get("route_token_ref")
+            or failure.get("route_token_ref")
+            or ""
+        ),
         "visible_injection_manifest_hash": str(
             route_identity.get("visible_injection_manifest_hash")
             or failure.get("visible_injection_manifest_hash")
@@ -816,6 +909,7 @@ def _observer_poll_failure_result(plan: dict) -> dict:
             or "blocked"
         ),
         "calls_models": bool(plan.get("calls_models")),
+        **_observer_poll_invocation_fields(plan),
         "execute": bool(plan.get("execute")),
         "service_manager_required": False,
         "executor_worker_required": False,
@@ -1056,6 +1150,7 @@ def observer_poll(
         observer_poll_timeline_payload,
     )
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     base_url = governance_url.rstrip("/")
     encoded_project = urllib.parse.quote(project_id, safe="")
     cwd = workspace or os.getcwd()
@@ -1520,6 +1615,7 @@ def observer_run(
     from agent.observer_runtime import ObserverRunRequest, run_observer
     from agent.ai_invocation import RoutePromptContract
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else ""
     dispatch_gate = {}
     if dispatch_gate_file:
@@ -1550,11 +1646,17 @@ def observer_run(
         main_worktree=main_worktree or os.getcwd(),
     )
     result = run_observer(request, execute=execute)
+    result.update(_observer_poll_invocation_fields(result))
     if json_output:
         click.echo(json.dumps(result, indent=2, sort_keys=True))
     else:
         click.echo(f"observer run: {result.get('status')} project={project_id} backlog={backlog_id}")
-        invocation = result.get("invocation") or result.get("invocation_request") or {}
+        invocation = (
+            result.get("invocation_result")
+            or result.get("invocation")
+            or result.get("invocation_request")
+            or {}
+        )
         click.echo(f"backend: {invocation.get('backend_mode', backend_mode)} execute={execute}")
         click.echo(f"route: {route_context_hash}")
         if not result.get("ok"):
@@ -1662,6 +1764,7 @@ def observer_dogfood(
         build_dogfood_observer_run_plan,
     )
 
+    _validate_cli_invocation_routing(provider, model, backend_mode)
     branch_runtime_evidence: dict[str, Any] = {}
     if branch_runtime_evidence_file:
         try:

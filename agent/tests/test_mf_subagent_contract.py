@@ -3353,6 +3353,32 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         "prompt_contract_id": "rprompt-1",
         "prompt_contract_hash": "sha256:prompt-contract",
     }
+    invocation = payload["invocation_request"]
+    assert invocation["schema_version"] == "ai_invocation_request.v1"
+    assert invocation["role"] == MF_SUB_ROLE
+    assert invocation["provider"] == "openai"
+    assert invocation["backend_mode"] == "codex_cli"
+    assert invocation["cwd"] == "/tmp/aming-claw-wt/task-mf-sub-1"
+    assert invocation["worktree"] == "/tmp/aming-claw-wt/task-mf-sub-1"
+    assert invocation["output_policy"] == "hash_and_summary_only"
+    assert invocation["request_binding_sha256"].startswith("sha256:")
+    assert invocation["route_prompt_contract"]["route_context_hash"] == (
+        "sha256:route-context"
+    )
+    assert invocation["route_prompt_contract"]["prompt_contract_id"] == "rprompt-1"
+    assert "runtime_context:" in " ".join(invocation["evidence_refs"])
+    assert invocation["raw_prompt_output_stored"] is False
+    assert "Implement the isolated change." not in json.dumps(invocation)
+    assert payload["invocation_contract"] == {
+        "request_field": "invocation_request",
+        "request_schema_version": "ai_invocation_request.v1",
+        "request_binding_field": "request_binding_sha256",
+        "request_echo_required": True,
+        "result_field": "invocation_result",
+        "result_schema_version": "ai_invocation_result.v1",
+        "result_required": True,
+        "result_validation": "required_and_request_bound",
+    }
     assert payload["agent_task_contract"]["schema_version"] == (
         AGENT_TASK_CONTRACT_SCHEMA_VERSION
     )
@@ -3376,7 +3402,228 @@ def test_build_input_carries_branch_runtime_identity() -> None:
         "test_results",
         "checkpoint_id",
         "fence_token",
+        "invocation_request",
+        "invocation_result",
     ]
+    assert payload["agent_task_contract"]["required_output"] == payload["required_output"]
+
+
+def test_build_input_does_not_guess_invocation_routing_from_backend_name() -> None:
+    payload = build_mf_subagent_input(
+        _context(),
+        prompt="Use the explicit provider-neutral invocation lane.",
+        backend="claude_subagent",
+    )
+
+    invocation = payload["invocation_request"]
+    assert invocation["requested_backend"] == "claude_subagent"
+    assert invocation["provider"] == "openai"
+    assert invocation["backend_mode"] == "codex_cli"
+    assert invocation["auth_mode"] == "cli_auth"
+
+
+def test_build_input_rejects_contradictory_explicit_invocation_routing() -> None:
+    with pytest.raises(MfSubagentContractError, match="routing is invalid"):
+        build_mf_subagent_input(
+            _context(),
+            prompt="Do not launch.",
+            invocation_routing={
+                "provider": "anthropic",
+                "model": "gpt-4o",
+                "backend_mode": "codex_cli",
+                "auth_mode": "cli_auth",
+            },
+        )
+
+
+def _mf_invocation_request() -> dict[str, object]:
+    return build_mf_subagent_input(
+        _context(),
+        prompt="Use the provider-neutral MF invocation contract.",
+        route_context_hash="sha256:route-context",
+        prompt_contract_id="rprompt-test",
+        prompt_contract_hash="sha256:prompt-contract",
+        route_token_ref="rtok-test",
+        invocation_routing={
+            "provider": "openai",
+            "model": "gpt-5.4-codex",
+            "backend_mode": "codex_cli",
+            "auth_mode": "cli_auth",
+            "output_policy": "hash_and_summary_only",
+        },
+    )["invocation_request"]
+
+
+def _mf_invocation_result(
+    invocation_request: dict[str, object] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    request = invocation_request or _mf_invocation_request()
+    payload: dict[str, object] = {
+        "schema_version": "ai_invocation_result.v1",
+        "request_schema_version": "ai_invocation_request.v1",
+        "status": "completed",
+        "role": request["role"],
+        "provider": request["provider"],
+        "model": request["model"],
+        "backend_mode": request["backend_mode"],
+        "auth_mode": request["auth_mode"],
+        "auth_status": "host_auth_reused",
+        "output_policy": request["output_policy"],
+        "provider_backed": True,
+        "calls_models": True,
+        "raw_output_stored": False,
+        "no_raw_prompt_output": True,
+        "raw_error_stored": False,
+        "error": "",
+        "error_present": False,
+        "error_sha256": "",
+        "command": ["codex", "exec"],
+        "output_path": "",
+        "prompt_sha256": request["prompt_sha256"],
+        "output_sha256": "sha256:output",
+        "route_prompt_contract": request["route_prompt_contract"],
+        "request_binding_sha256": request["request_binding_sha256"],
+        "evidence_refs": ["task:task-mf-sub-1", "runtime_context:mfrctx-test"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_normalize_result_validates_and_preserves_invocation_result() -> None:
+    invocation_request = _mf_invocation_request()
+    invocation_result = _mf_invocation_result(
+        invocation_request,
+        runtime_monitor={
+            "schema_version": "codex_cli_runtime_monitor.v1",
+            "early_progress_timeout_sec": 0.25,
+            "heartbeat_enabled": True,
+            "heartbeat_interval_sec": 10.0,
+            "heartbeat_count": 1,
+            "heartbeat_failures": 0,
+            "progress_observed": True,
+            "last_heartbeat": {
+                "ok": True,
+                "http_status": 200,
+                "observer_session_id": "observer-session-1",
+                "phase": "execute_child",
+            },
+            "early_progress": {
+                "schema_version": "codex_cli_progress_snapshot.v1",
+                "output_file_nonempty": False,
+                "stdout_bytes": 1,
+                "stderr_bytes": 0,
+                "stream_output_observed": True,
+                "worktree_status_available": True,
+                "worktree_changed": False,
+                "progress_observed": True,
+            },
+        },
+    )
+    normalized = normalize_mf_subagent_result(
+        {
+            "status": "review_ready",
+            "changed_files": ["x.py"],
+            "test_results": {"status": "passed"},
+            "checkpoint_id": "ckpt-new",
+            "fence_token": "fence-2",
+            "invocation_request": invocation_request,
+            "invocation_result": invocation_result,
+        },
+        expected_fence_token="fence-2",
+    )
+
+    assert normalized["invocation_request"] == invocation_request
+    assert normalized["invocation_result"] == invocation_result
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"provider": "anthropic"}, "routing is invalid"),
+        ({"raw_output_stored": True}, "raw_output_stored=false"),
+        ({"error": "raw provider output"}, "raw error text"),
+        ({"output_path": "/tmp/raw-provider-output.txt"}, "raw output path"),
+        ({"evidence_refs": ["credential:secret"]}, "evidence_refs"),
+        ({"blocker_id": "sk-secretcredential"}, "credential-like"),
+        ({"provider_result": "raw provider output"}, "unknown persisted fields"),
+        ({"provider_error": "raw provider error"}, "unknown persisted fields"),
+        (
+            {
+                "runtime_monitor": {
+                    "schema_version": "codex_cli_runtime_monitor.v1",
+                    "provider_payload": "opaque",
+                }
+            },
+            "runtime_monitor contains unknown persisted fields",
+        ),
+        (
+            {
+                "runtime_monitor": {
+                    "schema_version": "codex_cli_runtime_monitor.v1",
+                    "early_progress": {
+                        "schema_version": "codex_cli_progress_snapshot.v1",
+                        "opaque_output": "hidden",
+                    },
+                }
+            },
+            "early_progress contains unknown persisted fields",
+        ),
+    ],
+)
+def test_normalize_result_rejects_unsafe_or_contradictory_invocation_result(
+    override: dict[str, object],
+    message: str,
+) -> None:
+    invocation_request = _mf_invocation_request()
+    with pytest.raises(MfSubagentContractError, match=message):
+        normalize_mf_subagent_result(
+            {
+                "status": "review_ready",
+                "changed_files": ["x.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-new",
+                "fence_token": "fence-2",
+                "invocation_request": invocation_request,
+                "invocation_result": _mf_invocation_result(
+                    invocation_request,
+                    **override,
+                ),
+            },
+            expected_fence_token="fence-2",
+        )
+
+
+def test_normalize_result_requires_request_bound_invocation_result_when_applicable() -> None:
+    invocation_request = _mf_invocation_request()
+    base = {
+        "status": "review_ready",
+        "changed_files": ["x.py"],
+        "test_results": {"status": "passed"},
+        "checkpoint_id": "ckpt-new",
+        "fence_token": "fence-2",
+        "invocation_request": invocation_request,
+    }
+
+    with pytest.raises(MfSubagentContractError, match="missing required invocation_result"):
+        normalize_mf_subagent_result(base, expected_fence_token="fence-2")
+
+    with pytest.raises(MfSubagentContractError, match="requires its sanitized"):
+        normalize_mf_subagent_result(
+            {
+                **base,
+                "invocation_request": None,
+                "invocation_result": _mf_invocation_result(invocation_request),
+            },
+            expected_fence_token="fence-2",
+        )
+
+    tampered = _mf_invocation_result(invocation_request, model="gpt-4o")
+    with pytest.raises(MfSubagentContractError, match="request tuple"):
+        normalize_mf_subagent_result(
+            {**base, "invocation_result": tampered},
+            expected_fence_token="fence-2",
+        )
 
 
 def test_build_input_carries_parent_and_child_route_lineage() -> None:
@@ -3515,6 +3762,8 @@ def test_normalize_result_blocks_unready_handoff_states(
 
 
 def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
+    invocation_request = _mf_invocation_request()
+    invocation_result = _mf_invocation_result(invocation_request)
     gate = validate_mf_subagent_finish_gate(
         {
             "project_id": "aming-claw",
@@ -3532,6 +3781,8 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
             "checkpoint_id": "ckpt-finish",
             "fence_token": "fence-2",
             "summary": "Ready.",
+            "invocation_request": invocation_request,
+            "invocation_result": invocation_result,
             "worker_self_attestation": _finish_time_worker_attestation(),
             "mf_subagent_startup_gate": _finish_startup_evidence(),
             "real_startup_events": [_startup_event(_finish_startup_evidence())],
@@ -3547,6 +3798,10 @@ def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
     assert gate["head_commit"] == "head456"
     assert gate["merge_queue_id"] == "mq-1"
     assert gate["replay_source"] == FINISH_GATE_REPLAY_SOURCE
+    assert gate["invocation_request"] == invocation_request
+    assert gate["invocation_result"] == invocation_result
+    assert gate["close_gate_projection"]["invocation_result"] == invocation_result
+    assert gate["lane_ownership_projection"]["invocation_result"] == invocation_result
     assert gate["merge_queue_ready"] is True
     assert gate["read_receipt_hash"] == "sha256:read-finish"
     assert gate["read_receipt_event_id"] == "2873"

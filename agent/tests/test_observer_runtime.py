@@ -5,6 +5,8 @@ import subprocess
 import urllib.error
 from pathlib import Path
 
+import pytest
+
 from agent.ai_invocation import RoutePromptContract
 from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
@@ -25,9 +27,11 @@ from agent.observer_runtime import (
     build_observer_runtime_text_context,
     build_observer_poll_loop_metadata,
     build_observer_poll_plan,
+    build_observer_invocation_request,
     build_observer_prompt,
     observer_poll_timeline_payload,
     ObserverRunRequest,
+    run_observer,
     _timeline_startup_read_receipt_recording_status,
 )
 
@@ -1164,6 +1168,106 @@ def test_observer_prompt_says_startup_is_not_progress(tmp_path):
 
     assert "Actual startup evidence proves launch only" in prompt
     assert "first progress" in prompt
+
+
+@pytest.mark.parametrize(
+    ("provider", "backend_mode", "auth_mode"),
+    [
+        ("fixture", "fixture", "not_required"),
+        ("openai", "codex_cli", "cli_auth"),
+        ("openai", "openai_api", "api_key_env"),
+        ("openai", "docker_live_ai", "external_harness"),
+    ],
+)
+def test_observer_invocation_auth_comes_from_effective_backend(
+    provider: str,
+    backend_mode: str,
+    auth_mode: str,
+    tmp_path,
+) -> None:
+    invocation = build_observer_invocation_request(
+        ObserverRunRequest(
+            project_id="aming-claw",
+            backlog_id="AC-ROUTE-HANDOFF",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route",
+                prompt_contract_id="rprompt-test",
+                prompt_contract_hash="sha256:prompt",
+                route_token_ref="rtok-test",
+            ),
+            provider=provider,
+            backend_mode=backend_mode,
+            workspace=str(tmp_path),
+        )
+    )
+
+    assert invocation.auth_mode == auth_mode
+
+
+def test_run_observer_fixture_does_not_require_api_key_or_provider_route_token(
+    tmp_path,
+) -> None:
+    result = run_observer(
+        ObserverRunRequest(
+            project_id="aming-claw",
+            backlog_id="AC-ROUTE-HANDOFF",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route",
+                prompt_contract_id="rprompt-test",
+            ),
+            provider="fixture",
+            backend_mode="fixture",
+            workspace=str(tmp_path),
+        ),
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert result["invocation"]["auth_mode"] == "not_required"
+    assert result["invocation"]["auth_status"] == "not_required"
+    assert result["invocation"]["provider_backed"] is False
+
+
+@pytest.mark.parametrize(
+    ("prompt_contract_hash", "route_token_ref", "missing_field"),
+    [
+        ("", "rtok-test", "prompt_contract_hash"),
+        ("sha256:prompt", "", "route_token_ref"),
+    ],
+)
+def test_run_observer_requires_complete_route_identity_before_launch(
+    monkeypatch,
+    tmp_path,
+    prompt_contract_hash: str,
+    route_token_ref: str,
+    missing_field: str,
+) -> None:
+    def fail_invoke(_request):
+        raise AssertionError("provider invocation must not start")
+
+    monkeypatch.setattr("agent.observer_runtime.invoke_ai", fail_invoke)
+    result = run_observer(
+        ObserverRunRequest(
+            project_id="aming-claw",
+            backlog_id="AC-ROUTE-HANDOFF",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route",
+                prompt_contract_id="rprompt-test",
+                prompt_contract_hash=prompt_contract_hash,
+                route_token_ref=route_token_ref,
+            ),
+            provider="openai",
+            backend_mode="openai_api",
+            workspace=str(tmp_path),
+        ),
+        execute=True,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "rejected"
+    assert missing_field in result["missing"]
+    assert result["invocation_request"]["auth_mode"] == "api_key_env"
 
 
 def test_build_observer_poll_plan_turns_claimed_command_into_dry_run_plan(tmp_path):
