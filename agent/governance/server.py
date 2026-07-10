@@ -4941,11 +4941,41 @@ def handle_role_assign(ctx: RequestContext):
     project_id = ctx.body.get("project_id", "")
     with DBContext(project_id) as conn:
         session = ctx.require_auth(conn)
+        role = str(ctx.body.get("role") or "").strip().lower()
+        scope = list(ctx.body.get("scope") or [])
+        if role == "qa" and any(
+            ctx.body.get(key)
+            for key in ("backlog_id", "task_id", "commit_sha")
+        ):
+            backlog_id = str(ctx.body.get("backlog_id") or "").strip()
+            task_id = str(ctx.body.get("task_id") or "").strip()
+            commit_sha = str(ctx.body.get("commit_sha") or "").strip().lower()
+            if not backlog_id or not task_id or not re.fullmatch(
+                r"[0-9a-f]{40,64}", commit_sha
+            ):
+                raise ValidationError(
+                    "bounded QA role assignment requires backlog_id, task_id, "
+                    "and full commit_sha"
+                )
+            scope.extend(
+                [
+                    f"backlog:{backlog_id}",
+                    f"task:{task_id}",
+                    f"commit:{commit_sha}",
+                    _qa_scope_binding_ref(
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        commit_sha=commit_sha,
+                    ),
+                ]
+            )
+            scope = list(dict.fromkeys(str(item) for item in scope if str(item)))
         result = project_service.assign_role(
             conn, project_id, session,
             principal_id=ctx.body.get("principal_id", ""),
-            role=ctx.body.get("role", ""),
-            scope=ctx.body.get("scope"),
+            role=role,
+            scope=scope,
         )
     return 201, result
 
@@ -6673,6 +6703,22 @@ def _qa_session_scope_refs(session: Mapping[str, Any]) -> set[str]:
     return refs
 
 
+def _qa_scope_binding_ref(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    commit_sha: str,
+) -> str:
+    binding = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "commit_sha": str(commit_sha or "").strip().lower(),
+    }
+    return f"qa_scope:{stable_sha256(binding)}"
+
+
 def _require_bounded_qa_session_authority(
     ctx: RequestContext,
     conn,
@@ -6730,6 +6776,13 @@ def _require_bounded_qa_session_authority(
         f"task:{required_values['task_id']}",
         f"commit:{required_values['commit_sha']}",
     }
+    qa_scope_binding_ref = _qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=required_values["backlog_id"],
+        task_id=required_values["task_id"],
+        commit_sha=required_values["commit_sha"],
+    )
+    required_refs.add(qa_scope_binding_ref)
     scope_refs = _qa_session_scope_refs(session)
     missing_refs = sorted(required_refs - scope_refs)
     if missing_refs:
@@ -6763,6 +6816,7 @@ def _require_bounded_qa_session_authority(
         "principal_id": principal_id,
         "qa_session_id": session_id,
         "required_scope_refs": sorted(required_refs),
+        "qa_scope_binding_ref": qa_scope_binding_ref,
         "raw_qa_session_token_persisted": False,
         "observer_impersonation": False,
     }
@@ -6819,6 +6873,33 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             commit_sha=str(body.get("commit_sha") or body.get("head_commit") or ""),
             action=action,
         )
+        from . import graph_snapshot_store
+
+        snapshot_id = _resolve_graph_snapshot_id(
+            conn,
+            ctx.get_project_id(),
+            str(body.get("snapshot_id") or "active"),
+        )
+        snapshot = graph_snapshot_store.get_graph_snapshot(
+            conn,
+            ctx.get_project_id(),
+            snapshot_id,
+        ) or {}
+        snapshot_commit_sha = str(snapshot.get("commit_sha") or "").strip().lower()
+        if snapshot_commit_sha != str(proof.get("commit_sha") or ""):
+            raise GovernanceError(
+                "qa_graph_snapshot_commit_mismatch",
+                "QA graph query snapshot must be built from the exact candidate commit",
+                409,
+                {
+                    "snapshot_id": snapshot_id,
+                    "snapshot_commit_sha": snapshot_commit_sha,
+                    "required_commit_sha": proof.get("commit_sha", ""),
+                },
+            )
+        proof["snapshot_id"] = snapshot_id
+        proof["snapshot_commit_sha"] = snapshot_commit_sha
+        body["snapshot_id"] = snapshot_id
         principal_id = str(session.get("principal_id") or "").strip()
         supplied_actor = str(body.get("actor") or "").strip()
         if supplied_actor and supplied_actor != principal_id:
@@ -10741,11 +10822,19 @@ def _runtime_context_qa_verification_guide(
         "raw_route_token_required": False,
         "qa_session": {
             "register_tool": "qa_session_register",
+            "register_body": {
+                "project_id": project_id,
+                "backlog_id": backlog_id or parent_task_id,
+                "task_id": task_id,
+                "commit_sha": "<full-candidate-commit>",
+            },
             "scope": [
                 f"backlog:{backlog_id or parent_task_id}",
                 f"task:{task_id}",
                 "commit:<full-candidate-commit>",
+                "qa_scope:<server-derived-canonical-binding-hash>",
             ],
+            "scope_binding_ref": "qa_scope:<server-derived-canonical-binding-hash>",
             "required_role": "qa",
             "raw_qa_session_token_persisted": False,
             "observer_impersonation_allowed": False,
@@ -26874,6 +26963,8 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query-trace.start")
+        qa_proof = getattr(ctx, "_trusted_qa_graph_query_authority", {})
+        qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():
@@ -26888,6 +26979,12 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     parent_task_id=str(body.get("parent_task_id") or ""),
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
                     task_id=str(body.get("task_id") or ""),
+                    backlog_id=str(qa_proof.get("backlog_id") or ""),
+                    commit_sha=str(qa_proof.get("commit_sha") or ""),
+                    qa_session_id=str(qa_proof.get("qa_session_id") or ""),
+                    qa_scope_binding_ref=str(
+                        qa_proof.get("qa_scope_binding_ref") or ""
+                    ),
                     worker_role=str(body.get("worker_role") or ""),
                     fence_token=str(body.get("fence_token") or ""),
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
@@ -26923,6 +27020,8 @@ def handle_graph_governance_query(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query")
+        qa_proof = getattr(ctx, "_trusted_qa_graph_query_authority", {})
+        qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
         cross_project_contract_line = (
             _runtime_context_cross_project_graph_contract_preflight(
                 target_project_id=project_id,
@@ -26954,6 +27053,12 @@ def handle_graph_governance_query(ctx: RequestContext):
                     parent_task_id=str(body.get("parent_task_id") or ""),
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
                     task_id=str(body.get("task_id") or ""),
+                    backlog_id=str(qa_proof.get("backlog_id") or ""),
+                    commit_sha=str(qa_proof.get("commit_sha") or ""),
+                    qa_session_id=str(qa_proof.get("qa_session_id") or ""),
+                    qa_scope_binding_ref=str(
+                        qa_proof.get("qa_scope_binding_ref") or ""
+                    ),
                     worker_role=str(body.get("worker_role") or ""),
                     fence_token=str(body.get("fence_token") or ""),
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
@@ -35670,6 +35775,31 @@ def _strip_route_action_scope_lineage_value(value: Any) -> Any:
 def _strip_caller_route_action_scope_lineage(payload: Mapping[str, Any]) -> dict[str, Any]:
     stripped = _strip_route_action_scope_lineage_value(dict(payload))
     return dict(stripped) if isinstance(stripped, Mapping) else {}
+
+
+_SERVER_PROJECTED_TIMELINE_KEYS = frozenset(
+    {
+        "contract_gate_decision",
+        "meta_contract_gate",
+        "source_backed_contract_gate_authority",
+        *_ROUTE_ACTION_SCOPE_LINEAGE_KEYS,
+    }
+)
+
+
+def _strip_caller_server_projected_timeline_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_caller_server_projected_timeline_value(child)
+            for key, child in value.items()
+            if key not in _SERVER_PROJECTED_TIMELINE_KEYS
+        }
+    if isinstance(value, list):
+        return [
+            _strip_caller_server_projected_timeline_value(item)
+            for item in value
+        ]
+    return value
 
 
 def _timeline_event_has_action_scope_verification_marker(
@@ -58768,15 +58898,21 @@ def _timeline_trusted_qa_verification_authority(
     placeholders = ",".join("?" for _ in trace_ids)
     rows = conn.execute(
         f"""
-        SELECT trace_id, query_source, query_purpose, actor, task_id
-        FROM graph_query_traces
-        WHERE project_id = ? AND trace_id IN ({placeholders})
+        SELECT t.trace_id, t.snapshot_id, t.query_source, t.query_purpose,
+               t.actor, t.task_id, t.backlog_id, t.commit_sha,
+               t.qa_session_id, t.qa_scope_binding_ref, t.status,
+               s.commit_sha AS snapshot_commit_sha
+        FROM graph_query_traces t
+        JOIN graph_snapshots s
+          ON s.project_id = t.project_id AND s.snapshot_id = t.snapshot_id
+        WHERE t.project_id = ? AND t.trace_id IN ({placeholders})
         """,
         (project_id, *trace_ids),
     ).fetchall()
     rows_by_trace = {str(row["trace_id"] or "").strip(): row for row in rows}
     mismatches: list[dict[str, str]] = []
     task_id = str(body.get("task_id") or "").strip()
+    snapshot_ids: set[str] = set()
     for trace_id in trace_ids:
         row = rows_by_trace.get(trace_id)
         if row is None:
@@ -58787,11 +58923,29 @@ def _timeline_trusted_qa_verification_authority(
             "query_purpose": "independent_verification",
             "actor": principal_id,
             "task_id": task_id,
+            "backlog_id": str(proof.get("backlog_id") or ""),
+            "commit_sha": str(proof.get("commit_sha") or ""),
+            "qa_session_id": str(proof.get("qa_session_id") or ""),
+            "qa_scope_binding_ref": str(
+                proof.get("qa_scope_binding_ref") or ""
+            ),
+            "status": "complete",
+            "snapshot_commit_sha": str(proof.get("commit_sha") or ""),
         }
         for field, expected in expected_fields.items():
             actual = str(row[field] or "").strip()
             if actual != expected:
                 mismatches.append({"trace_id": trace_id, "field": field, "expected": expected, "actual": actual})
+        snapshot_ids.add(str(row["snapshot_id"] or "").strip())
+    if len(snapshot_ids) != 1:
+        mismatches.append(
+            {
+                "trace_id": "|".join(trace_ids),
+                "field": "snapshot_id",
+                "expected": "one exact candidate snapshot",
+                "actual": "|".join(sorted(snapshot_ids)),
+            }
+        )
     if mismatches:
         raise GovernanceError(
             "qa_graph_trace_mismatch",
@@ -58808,6 +58962,8 @@ def _timeline_trusted_qa_verification_authority(
             "query_source": "qa",
             "query_purpose": "independent_verification",
             "db_verified_graph_trace": True,
+            "snapshot_id": next(iter(snapshot_ids)),
+            "snapshot_commit_sha": str(proof.get("commit_sha") or ""),
         }
     )
     return proof
@@ -58878,6 +59034,13 @@ def handle_task_timeline_append(ctx: RequestContext):
         MfSubagentContractError,
         validate_meta_contract_timeline_event,
     )
+
+    for container_key in ("payload", "verification", "artifact_refs"):
+        container = ctx.body.get(container_key)
+        if isinstance(container, Mapping):
+            ctx.body[container_key] = _strip_caller_server_projected_timeline_value(
+                container
+            )
 
     event = {
         "event_type": ctx.body.get("event_type", ""),
@@ -59070,6 +59233,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                 validation_payload,
                 ctx.body.get("verification") or {},
                 ctx.body.get("artifact_refs") or {},
+                conn=conn,
             )
         )
         if trusted_runtime_context_worker_proof:
@@ -59223,6 +59387,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             norm_payload,
             ctx.body.get("verification") or {},
             ctx.body.get("artifact_refs") or {},
+            conn=conn,
         )
         if source_authority:
             norm_payload.pop("meta_contract_gate", None)

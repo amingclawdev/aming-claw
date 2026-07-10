@@ -1173,6 +1173,18 @@ TOOLS: list[dict] = [
                     "items": {"type": "string"},
                     "description": "Optional bounded QA scope such as backlog or contract execution ids.",
                 },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Bounded QA backlog scope; provide with task_id and full commit_sha.",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Bounded QA task scope; provide with backlog_id and full commit_sha.",
+                },
+                "commit_sha": {
+                    "type": "string",
+                    "description": "Bounded QA full candidate commit; server derives the canonical tuple binding.",
+                },
             },
             "required": ["project_id"],
         },
@@ -3813,6 +3825,9 @@ class ToolDispatcher:
             }
             if args.get("scope") is not None:
                 body["scope"] = args["scope"]
+            for key in ("backlog_id", "task_id", "commit_sha"):
+                if args.get(key) is not None:
+                    body[key] = args[key]
             return self._api("POST", "/api/role/assign", body)
 
         if name == "qa_session_heartbeat":

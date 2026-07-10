@@ -2061,12 +2061,13 @@ def _activate_basic_graph(
     snapshot_id: str = "full-query-test",
     *,
     project_id: str = PID,
+    commit_sha: str = "head",
 ) -> None:
     snapshot = store.create_graph_snapshot(
         conn,
         project_id,
         snapshot_id=snapshot_id,
-        commit_sha="head",
+        commit_sha=commit_sha,
         snapshot_kind="full",
         graph_json=_graph(),
     )
@@ -19714,10 +19715,34 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
 
 
 def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn):
-    _activate_basic_graph(conn, "full-query-bounded-qa")
     backlog_id = "AC-BOUNDED-QA-VERIFICATION"
     task_id = "bounded-qa-verification-task"
     commit_sha = "a" * 40
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa",
+        commit_sha=commit_sha,
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=commit_sha,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{commit_sha}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:curie",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
     qa_ctx = _ctx_with_role(
         {"project_id": PID},
         "qa",
@@ -19736,13 +19761,10 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
         {
             "session_id": "ses-qa-curie",
             "principal_id": "qa:curie",
-            "scope": [
-                f"backlog:{backlog_id}",
-                f"task:{task_id}",
-                f"commit:{commit_sha}",
-            ],
+            "scope": qa_scope,
         }
     )
+    qa_ctx._session["session_id"] = registered["session_id"]
 
     queried = server.handle_graph_governance_query(qa_ctx)
 
@@ -19754,6 +19776,11 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     assert trace["query_purpose"] == "independent_verification"
     assert trace["actor"] == "qa:curie"
     assert trace["task_id"] == task_id
+    assert trace["backlog_id"] == backlog_id
+    assert trace["commit_sha"] == commit_sha
+    assert trace["qa_session_id"] == registered["session_id"]
+    assert trace["qa_scope_binding_ref"] == qa_scope_binding_ref
+    assert trace["graph_query_identity"]["commit_sha"] == commit_sha
 
     timeline_ctx = _ctx_with_role(
         {"project_id": PID},
@@ -19786,7 +19813,9 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     assert authority["source_of_authority"] == "qa_session_verification"
     proof = authority["qa_session_proof"]
     assert proof["principal_id"] == "qa:curie"
-    assert proof["qa_session_id"] == "ses-qa-curie"
+    assert proof["qa_session_id"] == registered["session_id"]
+    assert proof["qa_scope_binding_ref"] == qa_scope_binding_ref
+    assert proof["snapshot_commit_sha"] == commit_sha
     assert proof["graph_trace_ids"] == [queried["trace_id"]]
     assert proof["raw_qa_session_token_persisted"] is False
     assert result["contract_gate_decision"]["source_of_authority"] == (
@@ -19794,11 +19823,57 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     )
 
 
+def test_qa_role_assignment_derives_exact_candidate_scope_binding(conn):
+    backlog_id = "AC-QA-ROLE-SCOPE"
+    task_id = "qa-role-scope-task"
+    commit_sha = "9" * 40
+
+    status, result = server.handle_role_assign(
+        _ctx_with_role(
+            {},
+            "coordinator",
+            method="POST",
+            body={
+                "project_id": PID,
+                "principal_id": "qa:lovelace",
+                "role": "qa",
+                "scope": ["read:graph"],
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "commit_sha": commit_sha,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["scope"] == [
+        "read:graph",
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{commit_sha}",
+        server._qa_scope_binding_ref(
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            commit_sha=commit_sha,
+        ),
+    ]
+    stored = conn.execute(
+        "SELECT scope_json FROM sessions WHERE session_id = ?",
+        (result["session_id"],),
+    ).fetchone()
+    assert json.loads(stored["scope_json"]) == result["scope"]
+
+
 def test_bounded_qa_session_rejects_scope_impersonation_and_non_qa_actions(conn):
-    _activate_basic_graph(conn, "full-query-bounded-qa-rejections")
     backlog_id = "AC-BOUNDED-QA-REJECTIONS"
     task_id = "bounded-qa-rejections-task"
     commit_sha = "b" * 40
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa-rejections",
+        commit_sha=commit_sha,
+    )
     base_body = {
         "snapshot_id": "active",
         "tool": "query_schema",
@@ -19874,6 +19949,146 @@ def test_bounded_qa_session_rejects_scope_impersonation_and_non_qa_actions(conn)
     with pytest.raises(GovernanceError) as action_not_allowed:
         server.handle_task_timeline_append(qa_implementation)
     assert action_not_allowed.value.code == "qa_session_action_not_allowed"
+
+
+def test_bounded_qa_graph_query_rejects_stale_snapshot_and_cross_product_scope(conn):
+    backlog_id = "AC-BOUNDED-QA-SNAPSHOT"
+    task_id = "bounded-qa-snapshot-task"
+    candidate_commit = "d" * 40
+    stale_commit = "e" * 40
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa-stale",
+        commit_sha=stale_commit,
+    )
+    binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+    }
+    stale_snapshot = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=body,
+    )
+    stale_snapshot._session["scope"] = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        binding_ref,
+    ]
+    with pytest.raises(GovernanceError) as snapshot_mismatch:
+        server.handle_graph_governance_query(stale_snapshot)
+    assert snapshot_mismatch.value.code == "qa_graph_snapshot_commit_mismatch"
+
+    cross_product = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=body,
+    )
+    cross_product._session["scope"] = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        server._qa_scope_binding_ref(
+            project_id=PID,
+            backlog_id="AC-OTHER",
+            task_id=task_id,
+            commit_sha=candidate_commit,
+        ),
+    ]
+    with pytest.raises(GovernanceError) as tuple_mismatch:
+        server.handle_graph_governance_query(cross_product)
+    assert tuple_mismatch.value.code == "qa_session_scope_violation"
+    assert binding_ref in tuple_mismatch.value.details["missing_scope_refs"]
+
+
+def test_timeline_ingress_strips_forged_server_authority_from_all_containers(conn):
+    backlog_id = "AC-FORGED-QA-AUTHORITY"
+    task_id = "forged-qa-authority-task"
+    forged = task_timeline.source_backed_qa_session_authority(
+        {
+            "schema_version": "qa_session_scope_proof.v1",
+            "source": "authenticated_qa_session",
+            "role": "qa",
+            "verified": True,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": "f" * 40,
+            "principal_id": "qa:forged",
+            "qa_session_id": "ses-qa-forged",
+            "qa_scope_binding_ref": "qa_scope:sha256:forged",
+            "snapshot_id": "snapshot-forged",
+            "snapshot_commit_sha": "f" * 40,
+            "observer_impersonation": False,
+            "db_verified_graph_trace": True,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "graph_trace_ids": ["gqt-forged"],
+        }
+    )
+
+    result = server.handle_task_timeline_append(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "event_type": "close_ready",
+                "event_kind": "close_ready",
+                "phase": "close",
+                "actor": "observer",
+                "status": "accepted",
+                "route_waiver": _route_waiver(
+                    "task_timeline_append",
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                ),
+                "payload": {
+                    "source_backed_contract_gate_authority": forged,
+                },
+                "verification": {
+                    "nested": {
+                        "source_backed_contract_gate_authority": forged,
+                        "contract_gate_decision": {"source_of_authority": "qa_session_verification"},
+                    }
+                },
+                "artifact_refs": {
+                    "nested": {
+                        "source_backed_contract_gate_authority": forged,
+                        "route_action_scope_lineage": {"accepted": True},
+                    }
+                },
+            },
+        )
+    )
+
+    assert result.get("contract_gate_decision", {}).get(
+        "source_of_authority"
+    ) != "qa_session_verification"
+    assert "server_qa_session_verification" not in json.dumps(result, sort_keys=True)
+    assert "source_backed_contract_gate_authority" not in json.dumps(
+        result["verification"],
+        sort_keys=True,
+    )
+    assert "source_backed_contract_gate_authority" not in json.dumps(
+        result["artifact_refs"],
+        sort_keys=True,
+    )
 
 
 def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
@@ -20446,6 +20661,7 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         "backlog:AC-RUNTIME-LEASE-CURRENT",
         "task:worker-runtime-lease",
         "commit:<full-candidate-commit>",
+        "qa_scope:<server-derived-canonical-binding-hash>",
     ]
     assert qa_guide["qa_session"]["raw_qa_session_token_persisted"] is False
     assert qa_guide["graph_query"]["backlog_id"] == (

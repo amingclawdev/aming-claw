@@ -17327,7 +17327,7 @@ def test_backlog_close_contract_runtime_projection_rejects_cross_backlog_record(
     assert raised.exception.details["error"] == "contract_execution_scope_mismatch"
 
 
-def test_source_backed_qa_session_authority_is_hash_bound_and_role_bounded():
+def test_source_backed_qa_session_authority_hash_alone_is_not_trusted():
     from agent.governance import task_timeline
 
     proof = {
@@ -17353,7 +17353,7 @@ def test_source_backed_qa_session_authority_is_hash_bound_and_role_bounded():
         {"source_backed_contract_gate_authority": authority},
         {},
         {},
-    ) == "qa_session_verification"
+    ) == ""
 
     tampered = copy.deepcopy(authority)
     tampered["qa_session_proof"]["role"] = "observer"

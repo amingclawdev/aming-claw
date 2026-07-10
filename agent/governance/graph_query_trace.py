@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   parent_task_id TEXT NOT NULL DEFAULT '',
   runtime_context_id TEXT NOT NULL DEFAULT '',
   task_id TEXT NOT NULL DEFAULT '',
+  backlog_id TEXT NOT NULL DEFAULT '',
+  commit_sha TEXT NOT NULL DEFAULT '',
+  qa_session_id TEXT NOT NULL DEFAULT '',
+  qa_scope_binding_ref TEXT NOT NULL DEFAULT '',
   worker_role TEXT NOT NULL DEFAULT '',
   fence_token TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
@@ -249,6 +253,10 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "parent_task_id",
     "runtime_context_id",
     "task_id",
+    "backlog_id",
+    "commit_sha",
+    "qa_session_id",
+    "qa_scope_binding_ref",
     "worker_role",
     "fence_token",
     "actor",
@@ -256,6 +264,10 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
 _TRACE_IDENTITY_COLUMNS = {
     "runtime_context_id": "TEXT NOT NULL DEFAULT ''",
     "task_id": "TEXT NOT NULL DEFAULT ''",
+    "backlog_id": "TEXT NOT NULL DEFAULT ''",
+    "commit_sha": "TEXT NOT NULL DEFAULT ''",
+    "qa_session_id": "TEXT NOT NULL DEFAULT ''",
+    "qa_scope_binding_ref": "TEXT NOT NULL DEFAULT ''",
     "worker_role": "TEXT NOT NULL DEFAULT ''",
     "fence_token": "TEXT NOT NULL DEFAULT ''",
 }
@@ -310,6 +322,10 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
         "parent_task_id": str(source.get("parent_task_id") or ""),
         "runtime_context_id": str(source.get("runtime_context_id") or ""),
         "task_id": str(source.get("task_id") or ""),
+        "backlog_id": str(source.get("backlog_id") or ""),
+        "commit_sha": str(source.get("commit_sha") or ""),
+        "qa_session_id": str(source.get("qa_session_id") or ""),
+        "qa_scope_binding_ref": str(source.get("qa_scope_binding_ref") or ""),
         "worker_role": str(source.get("worker_role") or ""),
         "fence_token": str(source.get("fence_token") or ""),
         "actor": str(source.get("actor") or ""),
@@ -515,6 +531,10 @@ def start_trace(
     parent_task_id: str = "",
     runtime_context_id: str = "",
     task_id: str = "",
+    backlog_id: str = "",
+    commit_sha: str = "",
+    qa_session_id: str = "",
+    qa_scope_binding_ref: str = "",
     worker_role: str = "",
     fence_token: str = "",
     budget: dict[str, Any] | None = None,
@@ -535,10 +555,11 @@ def start_trace(
         """
         INSERT INTO graph_query_traces
           (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
-           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
+           run_id, parent_task_id, runtime_context_id, task_id, backlog_id,
+           commit_sha, qa_session_id, qa_scope_binding_ref, worker_role,
            fence_token, status, budget_json, usage_json, artifact_path,
            created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             tid,
@@ -551,6 +572,10 @@ def start_trace(
             str(parent_task_id or ""),
             str(runtime_context_id or ""),
             str(task_id or ""),
+            str(backlog_id or ""),
+            str(commit_sha or ""),
+            str(qa_session_id or ""),
+            str(qa_scope_binding_ref or ""),
             str(worker_role or ""),
             str(fence_token or ""),
             "running",
@@ -570,6 +595,10 @@ def start_trace(
         "query_purpose": purpose,
         "runtime_context_id": str(runtime_context_id or ""),
         "task_id": str(task_id or ""),
+        "backlog_id": str(backlog_id or ""),
+        "commit_sha": str(commit_sha or ""),
+        "qa_session_id": str(qa_session_id or ""),
+        "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
         "worker_role": str(worker_role or ""),
         "fence_token": str(fence_token or ""),
         "budget": budget_json,
@@ -583,6 +612,10 @@ def start_trace(
             "parent_task_id": str(parent_task_id or ""),
             "runtime_context_id": str(runtime_context_id or ""),
             "task_id": str(task_id or ""),
+            "backlog_id": str(backlog_id or ""),
+            "commit_sha": str(commit_sha or ""),
+            "qa_session_id": str(qa_session_id or ""),
+            "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
             "worker_role": str(worker_role or ""),
             "fence_token": str(fence_token or ""),
             "actor": str(actor or ""),
@@ -1760,6 +1793,10 @@ def traced_query(
     parent_task_id: str = "",
     runtime_context_id: str = "",
     task_id: str = "",
+    backlog_id: str = "",
+    commit_sha: str = "",
+    qa_session_id: str = "",
+    qa_scope_binding_ref: str = "",
     worker_role: str = "",
     fence_token: str = "",
     budget: dict[str, Any] | None = None,
@@ -1779,6 +1816,10 @@ def traced_query(
             parent_task_id=parent_task_id,
             runtime_context_id=runtime_context_id,
             task_id=task_id,
+            backlog_id=backlog_id,
+            commit_sha=commit_sha,
+            qa_session_id=qa_session_id,
+            qa_scope_binding_ref=qa_scope_binding_ref,
             worker_role=worker_role,
             fence_token=fence_token,
             budget=budget,
@@ -1787,6 +1828,27 @@ def traced_query(
         created_trace = True
     else:
         trace = _load_trace_for_query(conn, project_id, trace_id)
+        expected_binding = {"snapshot_id": snapshot_id}
+        if str(trace.get("query_source") or "") == "qa" or query_source == "qa":
+            expected_binding.update(
+                {
+                    "query_source": str(query_source or ""),
+                    "query_purpose": str(query_purpose or ""),
+                    "actor": str(actor or ""),
+                    "task_id": str(task_id or ""),
+                    "backlog_id": str(backlog_id or ""),
+                    "commit_sha": str(commit_sha or ""),
+                    "qa_session_id": str(qa_session_id or ""),
+                    "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
+                }
+            )
+        mismatches = {
+            field: {"expected": expected, "actual": str(trace.get(field) or "")}
+            for field, expected in expected_binding.items()
+            if expected and str(trace.get(field) or "") != expected
+        }
+        if mismatches:
+            raise ValueError(f"graph query trace binding mismatch: {mismatches}")
     usage = dict(trace.get("usage") or _empty_usage())
     budget_json = dict(trace.get("budget") or _budget_for(trace.get("query_source") or query_source, budget))
     if usage.get("query_count", 0) >= budget_json.get("max_queries", 0):

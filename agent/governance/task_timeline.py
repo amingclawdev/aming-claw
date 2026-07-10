@@ -496,6 +496,17 @@ def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _decode_json(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -795,6 +806,7 @@ def _source_backed_runtime_context_worker_authority_valid(
 
 def _source_backed_qa_session_authority_valid(
     authority: Mapping[str, Any],
+    conn: sqlite3.Connection | None = None,
 ) -> bool:
     if not authority:
         return False
@@ -834,12 +846,78 @@ def _source_backed_qa_session_authority_valid(
         "commit_sha",
         "principal_id",
         "qa_session_id",
+        "qa_scope_binding_ref",
+        "snapshot_id",
+        "snapshot_commit_sha",
     )
     if any(not _text(proof.get(field)) for field in required_fields):
         return False
     graph_trace_ids = proof.get("graph_trace_ids")
-    return isinstance(graph_trace_ids, list) and bool(
-        [item for item in graph_trace_ids if _text(item)]
+    trace_ids = (
+        [_text(item) for item in graph_trace_ids if _text(item)]
+        if isinstance(graph_trace_ids, list)
+        else []
+    )
+    if not trace_ids or conn is None:
+        return False
+    try:
+        session = conn.execute(
+            """
+            SELECT principal_id, project_id, role, scope_json, status
+            FROM sessions
+            WHERE session_id = ?
+            """,
+            (_text(proof.get("qa_session_id")),),
+        ).fetchone()
+        if session is None:
+            return False
+        if (
+            _text(session["principal_id"]) != _text(proof.get("principal_id"))
+            or _text(session["project_id"]) != _text(proof.get("project_id"))
+            or _text(session["role"]) != "qa"
+            or _text(session["status"]) != "active"
+        ):
+            return False
+        scope = _decode_json(session["scope_json"], [])
+        if not isinstance(scope, list) or _text(
+            proof.get("qa_scope_binding_ref")
+        ) not in {_text(item) for item in scope}:
+            return False
+        placeholders = ",".join("?" for _ in trace_ids)
+        rows = conn.execute(
+            f"""
+            SELECT t.trace_id, t.project_id, t.snapshot_id, t.actor,
+                   t.query_source, t.query_purpose, t.task_id, t.backlog_id,
+                   t.commit_sha, t.qa_session_id, t.qa_scope_binding_ref,
+                   t.status, s.commit_sha AS snapshot_commit_sha
+            FROM graph_query_traces t
+            JOIN graph_snapshots s
+              ON s.project_id = t.project_id AND s.snapshot_id = t.snapshot_id
+            WHERE t.project_id = ? AND t.trace_id IN ({placeholders})
+            """,
+            (_text(proof.get("project_id")), *trace_ids),
+        ).fetchall()
+    except (sqlite3.Error, KeyError, TypeError):
+        return False
+    rows_by_trace = {_text(row["trace_id"]): row for row in rows}
+    expected = {
+        "project_id": _text(proof.get("project_id")),
+        "snapshot_id": _text(proof.get("snapshot_id")),
+        "actor": _text(proof.get("principal_id")),
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "task_id": _text(proof.get("task_id")),
+        "backlog_id": _text(proof.get("backlog_id")),
+        "commit_sha": _text(proof.get("commit_sha")),
+        "qa_session_id": _text(proof.get("qa_session_id")),
+        "qa_scope_binding_ref": _text(proof.get("qa_scope_binding_ref")),
+        "status": "complete",
+        "snapshot_commit_sha": _text(proof.get("snapshot_commit_sha")),
+    }
+    return all(
+        trace_id in rows_by_trace
+        and all(_text(rows_by_trace[trace_id][field]) == value for field, value in expected.items())
+        for trace_id in trace_ids
     )
 
 
@@ -847,6 +925,8 @@ def _source_backed_timeline_authority_source(
     payload: Mapping[str, Any],
     verification: Mapping[str, Any],
     artifact_refs: Mapping[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
 ) -> str:
     for source in (payload, verification, artifact_refs):
         runtime_gate = _first_deep_mapping(
@@ -874,7 +954,7 @@ def _source_backed_timeline_authority_source(
             source,
             "source_backed_contract_gate_authority",
         )
-        if _source_backed_qa_session_authority_valid(authority):
+        if _source_backed_qa_session_authority_valid(authority, conn=conn):
             return "qa_session_verification"
 
     for source in (payload, verification, artifact_refs):
@@ -1038,6 +1118,7 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
         payload,
         verification,
         artifact_refs,
+        conn=conn,
     )
     _ensure_cross_ref_bridge_meta_contract_aliases()
     from .mf_subagent_contract import (

@@ -1707,6 +1707,9 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "project_id": "aming-claw",
             "principal_id": "qa:hooke",
             "scope": ["backlog:AC-QA"],
+            "backlog_id": "AC-QA",
+            "task_id": "qa-task",
+            "commit_sha": "a" * 40,
         },
     )
     dispatcher.dispatch(
@@ -1799,6 +1802,9 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
                 "principal_id": "qa:hooke",
                 "role": "qa",
                 "scope": ["backlog:AC-QA"],
+                "backlog_id": "AC-QA",
+                "task_id": "qa-task",
+                "commit_sha": "a" * 40,
             },
         )
     ]
