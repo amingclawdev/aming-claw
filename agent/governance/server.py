@@ -11522,6 +11522,9 @@ def _runtime_context_worker_guide_response(
     contract_runtime_next_legal_action = dict(
         current_state_response.get("contract_runtime_next_legal_action") or {}
     )
+    contract_runtime_execution_resolution = dict(
+        current_state_response.get("contract_runtime_execution_resolution") or {}
+    )
     contract_runtime_authority_decision_source = str(
         current_state_response.get("contract_runtime_authority_decision_source")
         or contract_runtime_next_legal_action.get("authority_decision_source")
@@ -11603,11 +11606,37 @@ def _runtime_context_worker_guide_response(
         or action_plan.get("next_legal_action")
         or ""
     )
+    scope_blocking_reasons: list[str] = []
+    contract_runtime_resolution_blocked = bool(
+        contract_runtime_execution_resolution.get("fail_closed")
+        and contract_runtime_execution_resolution.get("status")
+        == "ambiguous_active_source_backed_worker_lineage"
+    )
+    if contract_runtime_resolution_blocked:
+        next_legal_action = "stop_for_contract_runtime_execution_resolution"
+        next_legal_action_decision_source = (
+            "contract_runtime_execution_resolution_gate"
+        )
+        next_required_evidence = [
+            {
+                "id": "contract_runtime_execution_resolution",
+                "status": "blocked",
+                "producer": "runtime_context_service",
+                "worker_owned": False,
+                "next_legal_action": next_legal_action,
+                "contract_runtime_execution_resolution": (
+                    contract_runtime_execution_resolution
+                ),
+            },
+            *next_required_evidence,
+        ]
+        scope_blocking_reasons.append(
+            "ambiguous_contract_runtime_execution_resolution"
+        )
     branch_head_scope_mismatch = (
         row_scoped_finish_head_projection.get("status")
         == "branch_head_scope_mismatch"
     )
-    scope_blocking_reasons: list[str] = []
     if branch_head_scope_mismatch:
         next_legal_action = "stop_for_row_scope_reconciliation"
         next_legal_action_decision_source = "runtime_context_row_scope_gate"

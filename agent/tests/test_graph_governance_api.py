@@ -42856,10 +42856,26 @@ def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     assert guide["contract_runtime_next_legal_action"] == {}
     assert guide["contract_runtime_current_state"] == {}
     assert guide["contract_runtime_next_action_took_precedence"] is False
-    assert guide["next_legal_action_decision_source"] != (
-        "contract_runtime_current_state"
+    assert guide["next_legal_action"] == (
+        "stop_for_contract_runtime_execution_resolution"
     )
-    assert guide["worker_guide"]["contract_runtime_next_action_took_precedence"] is False
+    assert guide["next_legal_action_decision_source"] == (
+        "contract_runtime_execution_resolution_gate"
+    )
+    assert guide["next_required_evidence"][0]["id"] == (
+        "contract_runtime_execution_resolution"
+    )
+    assert "ambiguous_contract_runtime_execution_resolution" in (
+        guide["blocking_reasons"]
+    )
+    worker_guide = guide["worker_guide"]
+    assert worker_guide["contract_runtime_next_action_took_precedence"] is False
+    assert worker_guide["next_legal_action"] == (
+        "stop_for_contract_runtime_execution_resolution"
+    )
+    assert worker_guide["next_legal_action_decision_source"] == (
+        "contract_runtime_execution_resolution_gate"
+    )
 
 
 def test_parallel_branch_allocation_revision_persists_contract_execution_identity():
