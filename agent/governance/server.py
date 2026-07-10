@@ -9865,12 +9865,17 @@ def _runtime_context_contract_execution_identity(
                 "contract_version": revision.get("contract_version") or "",
             }
         )
+    observer_command_id = _runtime_context_public_text(
+        payload.get("observer_command_id"),
+        contract.get("observer_command_id"),
+    )
     return {
         "contract_execution_id": _runtime_context_public_text(
             payload.get("contract_execution_id"),
             contract.get("contract_execution_id"),
             payload.get("successor_contract_execution_id"),
             contract.get("successor_contract_execution_id"),
+            observer_command_id if observer_command_id.startswith("cex-") else "",
         ),
         "contract_chain_id": _runtime_context_public_text(
             payload.get("contract_chain_id"),
@@ -60904,12 +60909,27 @@ def _persist_observer_runtime_text_contract_revision(
             ),
             "raw_private_context_exposed": False,
         }
+        revision_payload = _observer_runtime_text_contract_revision_payload(
+            body,
+            prepared,
+        )
+        previous_contract_identity = _runtime_context_contract_execution_identity(
+            _runtime_context_latest_contract_revision_payload(conn, context)
+        )
+        for field in (
+            "contract_execution_id",
+            "successor_contract_execution_id",
+            "parent_contract_execution_id",
+            "contract_chain_id",
+        ):
+            if previous_contract_identity.get(field) and not revision_payload.get(field):
+                revision_payload[field] = previous_contract_identity[field]
         with sqlite_write_lock():
             revision = append_branch_contract_revision(
                 conn,
                 context,
                 contract_version=str(body.get("contract_version") or MF_PARALLEL_CONTRACT_ID),
-                payload=_observer_runtime_text_contract_revision_payload(body, prepared),
+                payload=revision_payload,
                 route_gate=route_gate,
                 route_identity=route_identity if isinstance(route_identity, Mapping) else {},
                 route_evidence_type="observer_runtime_text_prepare",

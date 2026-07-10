@@ -41806,6 +41806,102 @@ def test_parallel_branch_allocation_revision_persists_contract_execution_identit
     )
     assert payload["contract_chain_id"] == "cchain-canonical-bridge"
 
+    legacy_identity = server._runtime_context_contract_execution_identity(
+        {
+            "payload": {
+                "observer_command_id": "cex-mf-parallel-legacy-runtime-text",
+            }
+        }
+    )
+    assert legacy_identity["contract_execution_id"] == (
+        "cex-mf-parallel-legacy-runtime-text"
+    )
+
+
+def test_observer_runtime_text_revision_carries_forward_contract_identity(conn):
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id="AC-CONTRACT-CANONICAL-RUNTIME-TEXT",
+        task_id="contract-canonical-runtime-text-worker",
+        owned_files=("agent/governance/server.py",),
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-canonical-runtime-text-allocation",
+        payload={
+            "contract_execution_id": "cex-mf-parallel-runtime-text",
+            "successor_contract_execution_id": "cex-mf-parallel-runtime-text",
+            "parent_contract_execution_id": "onboard-service-runtime-text",
+            "root_contract_execution_id": "onboard-service-runtime-text",
+            "contract_chain_id": "cchain-runtime-text",
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-canonical-runtime-text",
+            "route_context_hash": "sha256:contract-canonical-runtime-text",
+            "prompt_contract_id": "rprompt-contract-canonical-runtime-text",
+            "prompt_contract_hash": (
+                "sha256:prompt-contract-canonical-runtime-text"
+            ),
+            "route_token_ref": "rtok-contract-canonical-runtime-text",
+        },
+    )
+    conn.commit()
+
+    persisted = server._persist_observer_runtime_text_contract_revision(
+        PID,
+        {
+            "project_id": PID,
+            "observer_command_id": "cmd-runtime-text-not-contract-id",
+            "owned_files": ["agent/governance/server.py"],
+        },
+        {
+            "ok": True,
+            "project_id": PID,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "observer_command_id": "cmd-runtime-text-not-contract-id",
+            "launch_text_hash": "sha256:runtime-text-launch",
+            "merge_queue_id": "mq-runtime-text",
+            "runtime_context": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "worker_id": runtime_context.worker_id,
+                "worker_slot_id": runtime_context.worker_slot_id,
+            },
+            "branch_runtime_evidence": {
+                "context": {
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "worker_id": runtime_context.worker_id,
+                    "worker_slot_id": runtime_context.worker_slot_id,
+                }
+            },
+        },
+    )
+
+    assert persisted["payload"]["contract_execution_id"] == (
+        "cex-mf-parallel-runtime-text"
+    )
+    assert persisted["payload"]["successor_contract_execution_id"] == (
+        "cex-mf-parallel-runtime-text"
+    )
+    assert persisted["payload"]["parent_contract_execution_id"] == (
+        "onboard-service-runtime-text"
+    )
+    assert persisted["payload"]["contract_chain_id"] == "cchain-runtime-text"
+    latest_identity = server._runtime_context_contract_execution_identity(
+        server._runtime_context_latest_contract_revision_payload(
+            conn,
+            runtime_context,
+        )
+    )
+    assert latest_identity["contract_execution_id"] == (
+        "cex-mf-parallel-runtime-text"
+    )
+    assert latest_identity["contract_chain_id"] == "cchain-runtime-text"
+
 
 def test_contract_runtime_schema_initialization_preserves_caller_transaction():
     conn = sqlite3.connect(":memory:")
