@@ -714,6 +714,22 @@ def source_backed_runtime_context_worker_authority(
     return envelope
 
 
+def source_backed_qa_session_authority(
+    qa_session_proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    proof = dict(qa_session_proof) if isinstance(qa_session_proof, Mapping) else {}
+    envelope: dict[str, Any] = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_qa_session_verification",
+        "source_of_authority": "qa_session_verification",
+        "qa_session_proof": proof,
+    }
+    envelope["authority_hash"] = _canonical_contract_hash(
+        {key: value for key, value in envelope.items() if key != "authority_hash"}
+    )
+    return envelope
+
+
 def _source_backed_route_gate_authority_valid(authority: Mapping[str, Any]) -> bool:
     if not authority:
         return False
@@ -777,6 +793,56 @@ def _source_backed_runtime_context_worker_authority_valid(
     )
 
 
+def _source_backed_qa_session_authority_valid(
+    authority: Mapping[str, Any],
+) -> bool:
+    if not authority:
+        return False
+    if _text(authority.get("schema_version")) != "source_backed_contract_gate_authority.v1":
+        return False
+    if _text(authority.get("source")) != "server_qa_session_verification":
+        return False
+    if _text(authority.get("source_of_authority")) != "qa_session_verification":
+        return False
+    authority_hash = _text(authority.get("authority_hash"))
+    if not authority_hash:
+        return False
+    expected_hash = _canonical_contract_hash(
+        {key: value for key, value in dict(authority).items() if key != "authority_hash"}
+    )
+    if authority_hash != expected_hash:
+        return False
+    proof = _mapping(authority.get("qa_session_proof"))
+    if _text(proof.get("schema_version")) != "qa_session_scope_proof.v1":
+        return False
+    if _text(proof.get("source")) != "authenticated_qa_session":
+        return False
+    if _text(proof.get("role")) != "qa" or not _truthy(proof.get("verified")):
+        return False
+    if proof.get("observer_impersonation") is not False:
+        return False
+    if not _truthy(proof.get("db_verified_graph_trace")):
+        return False
+    if _text(proof.get("query_source")) != "qa":
+        return False
+    if _text(proof.get("query_purpose")) != "independent_verification":
+        return False
+    required_fields = (
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "commit_sha",
+        "principal_id",
+        "qa_session_id",
+    )
+    if any(not _text(proof.get(field)) for field in required_fields):
+        return False
+    graph_trace_ids = proof.get("graph_trace_ids")
+    return isinstance(graph_trace_ids, list) and bool(
+        [item for item in graph_trace_ids if _text(item)]
+    )
+
+
 def _source_backed_timeline_authority_source(
     payload: Mapping[str, Any],
     verification: Mapping[str, Any],
@@ -802,6 +868,14 @@ def _source_backed_timeline_authority_source(
         )
         if _source_backed_runtime_context_worker_authority_valid(authority):
             return "runtime_context_worker_proof"
+
+    for source in (payload, verification, artifact_refs):
+        authority = _first_deep_mapping(
+            source,
+            "source_backed_contract_gate_authority",
+        )
+        if _source_backed_qa_session_authority_valid(authority):
+            return "qa_session_verification"
 
     for source in (payload, verification, artifact_refs):
         route_lineage = _first_deep_mapping(source, "route_action_scope_lineage")

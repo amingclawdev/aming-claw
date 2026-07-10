@@ -17327,5 +17327,42 @@ def test_backlog_close_contract_runtime_projection_rejects_cross_backlog_record(
     assert raised.exception.details["error"] == "contract_execution_scope_mismatch"
 
 
+def test_source_backed_qa_session_authority_is_hash_bound_and_role_bounded():
+    from agent.governance import task_timeline
+
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "role": "qa",
+        "verified": True,
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-AUTHORITY",
+        "task_id": "qa-authority-task",
+        "commit_sha": "a" * 40,
+        "principal_id": "qa:curie",
+        "qa_session_id": "ses-qa-curie",
+        "observer_impersonation": False,
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "graph_trace_ids": ["gqt-qa-authority"],
+    }
+    authority = task_timeline.source_backed_qa_session_authority(proof)
+
+    assert task_timeline._source_backed_timeline_authority_source(
+        {"source_backed_contract_gate_authority": authority},
+        {},
+        {},
+    ) == "qa_session_verification"
+
+    tampered = copy.deepcopy(authority)
+    tampered["qa_session_proof"]["role"] = "observer"
+    assert task_timeline._source_backed_timeline_authority_source(
+        {"source_backed_contract_gate_authority": tampered},
+        {},
+        {},
+    ) == ""
+
+
 if __name__ == "__main__":
     unittest.main()

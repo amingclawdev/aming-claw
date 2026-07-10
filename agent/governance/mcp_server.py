@@ -1255,6 +1255,10 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
@@ -2454,7 +2458,13 @@ def _dispatch_tool(name: str, args: dict) -> Any:
 
     if name == "task_timeline_append":
         pid = args["project_id"]
-        return _http("POST", f"/api/task/{pid}/timeline", _task_timeline_body(args))
+        qa_session_token = str(args.get("qa_session_token") or "").strip()
+        return _http_with_optional_gov_token(
+            "POST",
+            f"/api/task/{pid}/timeline",
+            _task_timeline_body(args),
+            gov_token=qa_session_token,
+        )
 
     if name == "task_timeline_list":
         pid = args["project_id"]

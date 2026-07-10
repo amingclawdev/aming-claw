@@ -1768,6 +1768,12 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    tool_by_name = {
+        tool["name"]: tool for tool in governance_mcp_server.TOOLS
+    }
+    assert "qa_session_token" in tool_by_name["task_timeline_append"][
+        "inputSchema"
+    ]["properties"]
 
     assert governance_mcp_server._dispatch_tool(
         "contract_runtime_current",
@@ -1803,6 +1809,22 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
             "submitter_principal": "observer:parent",
         },
     )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "qa_session_token": "gov-qa-token",
+            "backlog_id": "AC-QA",
+            "task_id": "qa-task",
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:curie",
+            "status": "passed",
+            "commit_sha": "a" * 40,
+            "payload": {"graph_trace_ids": ["gqt-qa"]},
+        },
+    )["ok"] is True
 
     assert calls[0] == (
         "GET",
@@ -1825,6 +1847,22 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
     assert calls[2][2]["submitter_principal"] == "observer:parent"
     assert "qa_session_token" not in calls[2][2]
     assert calls[2][3] == "gov-qa-token"
+    assert calls[3] == (
+        "POST",
+        "/api/task/aming-claw/timeline",
+        {
+            "backlog_id": "AC-QA",
+            "task_id": "qa-task",
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:curie",
+            "status": "passed",
+            "commit_sha": "a" * 40,
+            "payload": {"graph_trace_ids": ["gqt-qa"]},
+        },
+        "gov-qa-token",
+    )
 
 
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):

@@ -1706,6 +1706,10 @@ TOOLS: list[dict] = [
                 "artifact_refs": {"type": "object"},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
@@ -2613,6 +2617,18 @@ TOOLS: list[dict] = [
                 "query_purpose": {
                     "type": "string",
                     "description": "Audited query purpose; use independent_verification for QA verifier graph checks.",
+                },
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Required bounded QA session backlog scope when query_source=qa.",
+                },
+                "commit_sha": {
+                    "type": "string",
+                    "description": "Required full candidate commit in bounded QA session scope when query_source=qa.",
+                },
+                "qa_session_token": {
+                    "type": "string",
+                    "description": "Raw QA role token used only as X-Gov-Token; never forwarded into graph query data.",
                 },
                 "repo_root": {"type": "string"},
                 "project_root": {"type": "string"},
@@ -3985,7 +4001,16 @@ class ToolDispatcher:
 
         if name == "task_timeline_append":
             pid = args["project_id"]
-            return self._api("POST", f"/api/task/{pid}/timeline", _task_timeline_body(args))
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            body = _task_timeline_body(args)
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/task/{pid}/timeline",
+                    body,
+                    role_token=qa_session_token,
+                )
+            return self._api("POST", f"/api/task/{pid}/timeline", body)
 
         if name == "task_timeline_list":
             pid = args["project_id"]
@@ -4398,14 +4423,26 @@ class ToolDispatcher:
 
         if name == "graph_query":
             pid = args["project_id"]
+            qa_session_token = str(args.get("qa_session_token") or "").strip()
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if key not in {"project_id", "qa_session_token"} and value is not None
             }
-            body.setdefault("actor", "mcp")
             body.setdefault("query_source", "observer")
             body.setdefault("query_purpose", "prompt_context_build")
+            if not (
+                qa_session_token
+                and str(body.get("query_source") or "").strip().lower() == "qa"
+            ):
+                body.setdefault("actor", "mcp")
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/graph-governance/{pid}/query",
+                    body,
+                    role_token=qa_session_token,
+                )
             return self._api("POST", f"/api/graph-governance/{pid}/query", body)
 
         if name in {"runtime_context_current", "runtime_context_worker_guide"}:

@@ -1677,6 +1677,8 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     names = _tool_names()
     assert {"qa_session_register", "qa_session_heartbeat"}.issubset(names)
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
+    assert "qa_session_token" in _tool_properties("graph_query")
+    assert "qa_session_token" in _tool_properties("task_timeline_append")
     for tool_name in (
         "onboard_contract_submit_line",
         "contract_add_current",
@@ -1758,6 +1760,35 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "evidence_kind": "independent_verification",
         },
     )
+    dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "qa_session_token": "gov-qa-token",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": "AC-QA",
+            "task_id": "qa-task",
+            "commit_sha": "a" * 40,
+        },
+    )
+    dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "qa_session_token": "gov-qa-token",
+            "backlog_id": "AC-QA",
+            "task_id": "qa-task",
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:hooke",
+            "status": "passed",
+            "commit_sha": "a" * 40,
+            "payload": {"graph_trace_ids": ["gqt-qa"]},
+        },
+    )
 
     assert recorder.calls == [
         (
@@ -1813,6 +1844,35 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
                 "stage_id": "qa",
                 "line_id": "qa_independent_verification",
                 "evidence_kind": "independent_verification",
+            },
+            "gov-qa-token",
+        ),
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/query",
+            {
+                "tool": "query_schema",
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "backlog_id": "AC-QA",
+                "task_id": "qa-task",
+                "commit_sha": "a" * 40,
+            },
+            "gov-qa-token",
+        ),
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {
+                "backlog_id": "AC-QA",
+                "task_id": "qa-task",
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "actor": "qa:hooke",
+                "status": "passed",
+                "commit_sha": "a" * 40,
+                "payload": {"graph_trace_ids": ["gqt-qa"]},
             },
             "gov-qa-token",
         ),

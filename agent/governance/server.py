@@ -6646,8 +6646,194 @@ def _require_graph_governance_mf_subagent(ctx: RequestContext, conn, action: str
     return session
 
 
+def _qa_session_scope_refs(session: Mapping[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    scope = session.get("scope")
+    if not isinstance(scope, list):
+        return refs
+    for item in scope:
+        if isinstance(item, str):
+            token = item.strip()
+            if token:
+                refs.add(token)
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        for key, prefix in (
+            ("backlog_id", "backlog"),
+            ("bug_id", "backlog"),
+            ("task_id", "task"),
+            ("contract_execution_id", "task"),
+            ("commit_sha", "commit"),
+            ("commit", "commit"),
+        ):
+            value = str(item.get(key) or "").strip()
+            if value:
+                refs.add(f"{prefix}:{value}")
+    return refs
+
+
+def _require_bounded_qa_session_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    commit_sha: str,
+    action: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    session = ctx.require_auth(conn)
+    from .permissions import session_role
+
+    role = session_role(session)
+    if role != "qa":
+        raise GovernanceError(
+            "qa_session_required",
+            f"{action} requires an authenticated QA session",
+            403,
+            {"required_role": "qa", "actual_role": role or "unknown"},
+        )
+    session_project_id = str(session.get("project_id") or "").strip()
+    if session_project_id != project_id:
+        raise GovernanceError(
+            "qa_session_scope_violation",
+            f"{action} QA session project scope does not match the request",
+            403,
+            {
+                "required_project_id": project_id,
+                "session_project_id": session_project_id,
+            },
+        )
+    required_values = {
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "commit_sha": str(commit_sha or "").strip().lower(),
+    }
+    missing_values = [key for key, value in required_values.items() if not value]
+    if missing_values:
+        raise GovernanceError(
+            "qa_session_scope_required",
+            f"{action} requires explicit backlog, task, and full commit scope",
+            422,
+            {"missing_fields": missing_values},
+        )
+    if not re.fullmatch(r"[0-9a-f]{40,64}", required_values["commit_sha"]):
+        raise GovernanceError(
+            "qa_session_scope_required",
+            f"{action} requires a full commit_sha",
+            422,
+            {"field": "commit_sha", "required_format": "full_git_object_id"},
+        )
+    required_refs = {
+        f"backlog:{required_values['backlog_id']}",
+        f"task:{required_values['task_id']}",
+        f"commit:{required_values['commit_sha']}",
+    }
+    scope_refs = _qa_session_scope_refs(session)
+    missing_refs = sorted(required_refs - scope_refs)
+    if missing_refs:
+        raise GovernanceError(
+            "qa_session_scope_violation",
+            f"{action} is outside the authenticated QA session scope",
+            403,
+            {
+                "missing_scope_refs": missing_refs,
+                "required_scope_refs": sorted(required_refs),
+            },
+        )
+    principal_id = str(session.get("principal_id") or "").strip()
+    session_id = str(session.get("session_id") or "").strip()
+    if not principal_id or not session_id:
+        raise GovernanceError(
+            "qa_session_identity_invalid",
+            f"{action} requires a concrete QA principal and session id",
+            403,
+            {},
+        )
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "role": "qa",
+        "verified": True,
+        "project_id": project_id,
+        "backlog_id": required_values["backlog_id"],
+        "task_id": required_values["task_id"],
+        "commit_sha": required_values["commit_sha"],
+        "principal_id": principal_id,
+        "qa_session_id": session_id,
+        "required_scope_refs": sorted(required_refs),
+        "raw_qa_session_token_persisted": False,
+        "observer_impersonation": False,
+    }
+    return session, proof
+
+
+def _qa_request_has_impersonation_claim(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if normalized in {
+                "filed_on_behalf",
+                "filed_on_behalf_by",
+                "observer_impersonation",
+                "on_behalf",
+                "on_behalf_of",
+            } and (bool(child) if isinstance(child, bool) else bool(str(child or "").strip())):
+                return True
+            if _qa_request_has_impersonation_claim(child):
+                return True
+    elif isinstance(value, list):
+        return any(_qa_request_has_impersonation_claim(item) for item in value)
+    return False
+
+
 def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, action: str) -> dict:
     query_source = str(body.get("query_source") or "api_debug").strip().lower().replace("-", "_")
+    if query_source == "qa":
+        query_purpose = str(body.get("query_purpose") or "").strip()
+        if query_purpose != "independent_verification":
+            raise GovernanceError(
+                "unsupported_qa_graph_query_purpose",
+                "QA graph queries require query_purpose=independent_verification",
+                422,
+                {
+                    "query_source": "qa",
+                    "query_purpose": query_purpose,
+                    "allowed_query_purposes": ["independent_verification"],
+                },
+            )
+        if _qa_request_has_impersonation_claim(body):
+            raise GovernanceError(
+                "qa_observer_impersonation_forbidden",
+                "QA graph queries cannot be filed on behalf of another lane",
+                403,
+                {"observer_impersonation": False},
+            )
+        session, proof = _require_bounded_qa_session_authority(
+            ctx,
+            conn,
+            project_id=ctx.get_project_id(),
+            backlog_id=str(body.get("backlog_id") or ""),
+            task_id=str(body.get("task_id") or ""),
+            commit_sha=str(body.get("commit_sha") or body.get("head_commit") or ""),
+            action=action,
+        )
+        principal_id = str(session.get("principal_id") or "").strip()
+        supplied_actor = str(body.get("actor") or "").strip()
+        if supplied_actor and supplied_actor != principal_id:
+            raise GovernanceError(
+                "qa_session_principal_mismatch",
+                "QA graph query actor must match the authenticated QA principal",
+                403,
+                {
+                    "authenticated_principal_id": principal_id,
+                    "supplied_actor": supplied_actor,
+                },
+            )
+        body["actor"] = principal_id
+        setattr(ctx, "_trusted_qa_graph_query_authority", proof)
+        return session
     if query_source != "mf_subagent":
         return _require_graph_governance_operator(ctx, conn, action)
 
@@ -10470,6 +10656,7 @@ def _runtime_context_qa_verification_guide(
     base_append_body = {
         "backlog_id": backlog_id or parent_task_id,
         "task_id": task_id,
+        "commit_sha": "<full-candidate-commit>",
         "event_type": "independent_verification.completed",
         "event_kind": "independent_verification",
         "phase": "verification",
@@ -10479,6 +10666,8 @@ def _runtime_context_qa_verification_guide(
             "reviewer_role": "independent_qa",
             "requirement_id": "independent_verification_lane",
             "verification_plan_id": verification_plan["plan_id"],
+            "graph_trace_ids": ["<db-verified-qa-graph-query-trace-id>"],
+            "observer_impersonation": False,
         },
         "verification": {
             "requirement_id": "independent_verification_lane",
@@ -10513,6 +10702,10 @@ def _runtime_context_qa_verification_guide(
             "route_owned_source_event_required": True,
         },
     }
+    qa_session_body = {
+        **base_append_body,
+        "qa_session_token": "<raw-qa-session-token-used-as-header-only>",
+    }
     focused_pass_with_full_suite_caveat_body = {
         **base_append_body,
         "status": "passed",
@@ -10546,6 +10739,17 @@ def _runtime_context_qa_verification_guide(
         "purpose": "independent_verification",
         "observer_or_hotfix_actor_must_not_author_evidence": True,
         "raw_route_token_required": False,
+        "qa_session": {
+            "register_tool": "qa_session_register",
+            "scope": [
+                f"backlog:{backlog_id or parent_task_id}",
+                f"task:{task_id}",
+                "commit:<full-candidate-commit>",
+            ],
+            "required_role": "qa",
+            "raw_qa_session_token_persisted": False,
+            "observer_impersonation_allowed": False,
+        },
         "verification_plan": verification_plan,
         "observer_prefill_route_token": {
             "schema_version": "runtime_context.qa_route_token_prefill.v1",
@@ -10606,6 +10810,10 @@ def _runtime_context_qa_verification_guide(
             "tool": "graph_query",
             "query_source": "qa",
             "query_purpose": "independent_verification",
+            "backlog_id": backlog_id or parent_task_id,
+            "task_id": task_id,
+            "commit_sha": "<full-candidate-commit>",
+            "qa_session_token": "<raw-qa-session-token-used-as-header-only>",
             "db_verified_trace_ids_required": True,
             "required_provenance": [
                 "qa_principal",
@@ -10632,12 +10840,14 @@ def _runtime_context_qa_verification_guide(
         "append_evidence": {
             "tool": "task_timeline_append",
             "event_kind": "independent_verification",
-            "preferred_authorization_form": "qa_child_route_token_ref",
+            "preferred_authorization_form": "bounded_qa_session",
             "accepted_authorization_forms": [
+                "bounded_qa_session",
                 "qa_child_route_token_ref",
                 "route_token_ref",
                 "accepted_route_owned_source_event_lineage",
             ],
+            "bounded_qa_session_body": qa_session_body,
             "qa_child_route_token_ref_body": qa_child_route_ref_body,
             "route_token_ref_body": route_ref_body,
             "source_event_lineage_body": source_lineage_body,
@@ -58475,6 +58685,134 @@ def _trusted_contract_runtime_actor_role_from_context(
     return session_role if session_role in {"observer", "qa", "mf_sub"} else ""
 
 
+def _timeline_trusted_qa_verification_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        session = ctx.require_auth(conn)
+        from .permissions import session_role
+
+        role = session_role(session)
+    except Exception:
+        return {}
+    if role != "qa":
+        return {}
+
+    event_kind = str(event.get("event_kind") or "").strip().lower().replace("-", "_")
+    phase = str(event.get("phase") or "").strip().lower().replace("-", "_")
+    status = str(body.get("status") or "").strip().lower()
+    if event_kind not in {"independent_verification", "qa_verification"}:
+        raise GovernanceError(
+            "qa_session_action_not_allowed",
+            "QA sessions may append only independent verification evidence",
+            403,
+            {"event_kind": event_kind, "allowed_event_kinds": ["independent_verification", "qa_verification"]},
+        )
+    if phase not in {"qa", "verification", "independent_verification"}:
+        raise GovernanceError(
+            "qa_session_action_not_allowed",
+            "QA verification evidence requires a QA or verification phase",
+            422,
+            {"phase": phase},
+        )
+    if status not in {"accepted", "ok", "pass", "passed", "succeeded", "success"}:
+        raise GovernanceError(
+            "qa_verification_status_invalid",
+            "QA verification authority requires a passing status",
+            422,
+            {"status": status},
+        )
+    if _qa_request_has_impersonation_claim(body):
+        raise GovernanceError(
+            "qa_observer_impersonation_forbidden",
+            "QA verification evidence cannot be filed on behalf of another lane",
+            403,
+            {"observer_impersonation": False},
+        )
+
+    session, proof = _require_bounded_qa_session_authority(
+        ctx,
+        conn,
+        project_id=project_id,
+        backlog_id=str(body.get("backlog_id") or ""),
+        task_id=str(body.get("task_id") or ""),
+        commit_sha=str(body.get("commit_sha") or ""),
+        action="task_timeline_append.independent_verification",
+    )
+    principal_id = str(session.get("principal_id") or "").strip()
+    actor = str(body.get("actor") or "").strip()
+    if actor != principal_id:
+        raise GovernanceError(
+            "qa_session_principal_mismatch",
+            "QA verification actor must match the authenticated QA principal",
+            403,
+            {
+                "authenticated_principal_id": principal_id,
+                "supplied_actor": actor,
+            },
+        )
+
+    trace_ids = _runtime_context_service_graph_trace_values_from_event(body)
+    if not trace_ids:
+        raise GovernanceError(
+            "qa_graph_trace_required",
+            "QA verification evidence requires a DB-verified QA graph query trace",
+            422,
+            {"required_query_source": "qa", "required_query_purpose": "independent_verification"},
+        )
+    placeholders = ",".join("?" for _ in trace_ids)
+    rows = conn.execute(
+        f"""
+        SELECT trace_id, query_source, query_purpose, actor, task_id
+        FROM graph_query_traces
+        WHERE project_id = ? AND trace_id IN ({placeholders})
+        """,
+        (project_id, *trace_ids),
+    ).fetchall()
+    rows_by_trace = {str(row["trace_id"] or "").strip(): row for row in rows}
+    mismatches: list[dict[str, str]] = []
+    task_id = str(body.get("task_id") or "").strip()
+    for trace_id in trace_ids:
+        row = rows_by_trace.get(trace_id)
+        if row is None:
+            mismatches.append({"trace_id": trace_id, "field": "trace_id", "expected": "persisted", "actual": "missing"})
+            continue
+        expected_fields = {
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "actor": principal_id,
+            "task_id": task_id,
+        }
+        for field, expected in expected_fields.items():
+            actual = str(row[field] or "").strip()
+            if actual != expected:
+                mismatches.append({"trace_id": trace_id, "field": field, "expected": expected, "actual": actual})
+    if mismatches:
+        raise GovernanceError(
+            "qa_graph_trace_mismatch",
+            "QA verification graph trace identity does not match the authenticated QA lane",
+            422,
+            {"identity_mismatches": mismatches},
+        )
+    proof.update(
+        {
+            "action": "task_timeline_append.independent_verification",
+            "event_kind": event_kind,
+            "phase": phase,
+            "graph_trace_ids": list(trace_ids),
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "db_verified_graph_trace": True,
+        }
+    )
+    return proof
+
+
 def _timeline_trusted_runtime_context_worker_proof(
     ctx: RequestContext,
     conn,
@@ -58551,6 +58889,7 @@ def handle_task_timeline_append(ctx: RequestContext):
     )
     trusted_route_gate = getattr(ctx, "_trusted_route_token_gate", {})
     route_gate = dict(trusted_route_gate) if isinstance(trusted_route_gate, Mapping) else {}
+    trusted_qa_verification_authority: dict[str, Any] = {}
 
     with DBContext(project_id) as conn:
         legacy_route_gate = _legacy_contract_route_gate(ctx.body or {})
@@ -58589,7 +58928,23 @@ def handle_task_timeline_append(ctx: RequestContext):
                 )
             )
             if not contract_runtime_completed_projection_gate:
-                if not trusted_runtime_context_worker_context:
+                if (
+                    not _body_has_route_token_input(ctx.body or {})
+                    and not _body_has_route_waiver(ctx.body or {})
+                ):
+                    trusted_qa_verification_authority = (
+                        _timeline_trusted_qa_verification_authority(
+                            ctx,
+                            conn,
+                            project_id=project_id,
+                            body=ctx.body or {},
+                            event=event,
+                        )
+                    )
+                if (
+                    not trusted_runtime_context_worker_context
+                    and not trusted_qa_verification_authority
+                ):
                     route_gate, source_block = (
                         _timeline_no_token_source_event_gate_or_block(
                             conn,
@@ -58638,6 +58993,12 @@ def handle_task_timeline_append(ctx: RequestContext):
         raw_status = ctx.body.get("status", "")
         raw_payload = _timeline_payload_with_route_gate(ctx.body, route_gate)
         raw_payload = _strip_caller_route_action_scope_lineage(raw_payload)
+        if trusted_qa_verification_authority:
+            raw_payload["source_backed_contract_gate_authority"] = (
+                task_timeline.source_backed_qa_session_authority(
+                    trusted_qa_verification_authority
+                )
+            )
         if legacy_route_gate:
             raw_payload["legacy_contract_route_gate"] = legacy_route_gate
             raw_payload["agent_facing_decision_source"] = (
@@ -58721,6 +59082,14 @@ def handle_task_timeline_append(ctx: RequestContext):
             norm_payload = dict(norm_payload) if isinstance(norm_payload, dict) else {}
             norm_payload["source_backed_contract_gate_authority"] = worker_authority
             source_authority_before_runtime = "runtime_context_worker_proof"
+        elif trusted_qa_verification_authority:
+            qa_authority = task_timeline.source_backed_qa_session_authority(
+                trusted_qa_verification_authority
+            )
+            validation_payload["source_backed_contract_gate_authority"] = qa_authority
+            norm_payload = dict(norm_payload) if isinstance(norm_payload, dict) else {}
+            norm_payload["source_backed_contract_gate_authority"] = qa_authority
+            source_authority_before_runtime = "qa_session_verification"
         if (
             not source_authority_before_runtime
             and task_timeline._source_backed_route_gate_accepted(
@@ -58830,6 +59199,11 @@ def handle_task_timeline_append(ctx: RequestContext):
             meta_contract_gate = _contract_runtime_close_audit_meta_gate(
                 meta_contract_gate,
                 authority_source="runtime_context_worker_proof",
+            )
+        elif trusted_qa_verification_authority:
+            meta_contract_gate = _contract_runtime_close_audit_meta_gate(
+                meta_contract_gate,
+                authority_source="qa_session_verification",
             )
         elif route_gate:
             meta_contract_gate = _contract_runtime_close_audit_meta_gate(
