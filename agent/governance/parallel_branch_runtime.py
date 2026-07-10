@@ -603,6 +603,7 @@ _RUNTIME_CONTEXT_EVENT_KIND_CLAUSES: dict[str, tuple[str, ...]] = {
     "runtime_context_read_receipt": ("runtime_context_read_receipt",),
     "worker_read_receipt": ("runtime_context_read_receipt",),
     "read_receipt": ("runtime_context_read_receipt",),
+    "worker_commit": ("worker_commit",),
     "independent_verification": ("independent_verification",),
     "verification": ("independent_verification",),
     "qa_verification": ("independent_verification",),
@@ -3967,11 +3968,14 @@ def _runtime_context_timeline_derived_evidence(
     graph_trace_ids: list[str] = []
     graph_trace_event_refs: list[str] = []
     implementation_refs: list[str] = []
+    worker_commit_ref = ""
+    worker_commit_sha = ""
     verification_refs: list[str] = []
     finish_gate: dict[str, Any] = {}
     close_evidence: dict[str, Any] = {}
     graph_kinds = {
         "implementation",
+        "worker_commit",
         "merge",
         "merge_evidence",
         "mf_subagent_read_receipt",
@@ -4039,6 +4043,12 @@ def _runtime_context_timeline_derived_evidence(
             timeline_refs.setdefault("route_action_precheck_event_ref", event_ref)
         if _runtime_context_is_implementation_event_kind(event_kind) and event_ref:
             implementation_refs.append(event_ref)
+        if event_kind == "worker_commit" and is_worker_lane_evidence:
+            worker_commit_ref = event_ref
+            worker_commit_sha = _runtime_context_deep_text(
+                event,
+                "worker_commit_sha",
+            ) or _runtime_context_deep_text(event, "commit_sha")
         if event_kind in {
             "mf_subagent_heartbeat",
             "worker_heartbeat",
@@ -4129,6 +4139,9 @@ def _runtime_context_timeline_derived_evidence(
         timeline_refs["implementation_event_refs"] = _runtime_context_dedupe(
             implementation_refs
         )
+    if worker_commit_ref:
+        timeline_refs["worker_commit_event_ref"] = worker_commit_ref
+        timeline_refs["worker_commit_sha"] = worker_commit_sha
     if verification_refs:
         timeline_refs["verification_event_refs"] = _runtime_context_dedupe(
             verification_refs
@@ -4557,6 +4570,12 @@ def _runtime_context_current_values(
         ),
         "implementation_event_refs": list(
             timeline_refs.get("implementation_event_refs") or []
+        ),
+        "worker_commit_event_ref": _runtime_context_text(
+            timeline_refs.get("worker_commit_event_ref")
+        ),
+        "worker_commit_sha": _runtime_context_text(
+            timeline_refs.get("worker_commit_sha")
         ),
         "changed_files": list(timeline_refs.get("changed_files") or []),
         "owned_changed_files": list(timeline_refs.get("owned_changed_files") or []),
@@ -5815,6 +5834,23 @@ def build_runtime_context_current_view(
         close_evidence=close,
         generated_at=generated_at,
     )
+    contract_version = _runtime_context_text(
+        revision_payload.get("contract_version")
+        or revision_payload.get("contract_template_id")
+        or _runtime_context_deep_text(revision_payload, "contract_version")
+        or _runtime_context_deep_text(revision_payload, "contract_template_id")
+        or _runtime_context_deep_text(revision_payload, "contract_id")
+    )
+    current_values["runtime_contract_version"] = contract_version
+    current_values["contract_worker_commit_required"] = contract_version in {
+        "mf_parallel.v2",
+        "v2",
+    }
+    current_values["contract_worker_commit_authority"] = (
+        "ContractRuntime.completed_lines.worker_commit"
+        if current_values["contract_worker_commit_required"]
+        else "legacy_runtime_projection"
+    )
     current_values["terminal_dispatch_blockers"] = terminal_dispatch_blockers
     current_values["terminal_dispatch_blocker_count"] = len(terminal_dispatch_blockers)
     current_values["terminal_dispatch_blocker_ref"] = (
@@ -6450,9 +6486,10 @@ def runtime_context_mf_parallel_happy_path_reminders(
             "worker_graph_query",
             "implementation_and_tests",
             "implementation_evidence",
+            "git_commit",
+            "worker_commit_evidence",
             "finish_time_worker_attestation",
-            "finish_gate_before_git_commit",
-            "git_commit_after_finish_gate",
+            "finish_gate",
             "independent_qa_before_merge_queue",
             "durable_merge_queue_materialize",
             "merge_queue_apply",
@@ -6468,20 +6505,18 @@ def runtime_context_mf_parallel_happy_path_reminders(
                     "evidence to satisfy missed ordering."
                 ),
             },
-            "finish_gate_before_git_commit": {
+            "contract_canonical_worker_commit": {
                 "required": True,
                 "sequence": [
                     "implementation_evidence",
+                    "git_commit",
+                    "worker_commit_evidence",
                     "finish_time_worker_attestation",
                     "finish_gate",
-                    "git_commit",
                 ],
-                "worker_final_must_not_commit_before_finish_gate": True,
-                "forbidden_before_finish_gate": [
-                    "git commit",
-                    "::git-commit final directive",
-                    "host commit request",
-                ],
+                "source_of_authority": "ContractRuntime.worker_commit",
+                "finish_consumes_contract_recorded_commit": True,
+                "later_head_drift_rejected": True,
             },
             "independent_qa_before_durable_merge_queue": {
                 "required": True,
@@ -6572,6 +6607,7 @@ def runtime_context_mf_parallel_happy_path_reminders(
                 "required_before": "finish_gate",
                 "sequence": [
                     "implementation_evidence",
+                    "worker_commit_evidence",
                     "finish_time_worker_attestation",
                     "refresh_runtime_context_current",
                     "finish_gate",
@@ -6915,9 +6951,9 @@ def _runtime_context_read_receipt_hash_action(
                 "focused tests",
                 "git diff --check",
                 "startup transcript identity available for finish-time attestation",
-                "uncommitted worker diff until finish-time attestation and finish gate pass",
+                "clean implementation commit recorded through the worker_commit facade",
             ],
-            "must_precede": ["finish_time_worker_attestation"],
+            "must_precede": ["worker_commit_evidence", "finish_time_worker_attestation"],
             "pre_edit_required_evidence": [
                 "mf_subagent_startup.worker_session_id",
                 "mf_subagent_startup.worker_transcript_ref_or_path",
@@ -6927,6 +6963,7 @@ def _runtime_context_read_receipt_hash_action(
             ],
             "evidence_to_file": [
                 "implementation_evidence",
+                "worker_commit_evidence",
                 "finish_time_worker_attestation",
                 "finish_gate",
                 "verification_or_test_results",
@@ -6995,25 +7032,26 @@ def _runtime_context_read_receipt_hash_action(
                 "raw_token_exfiltration",
                 "author_worker_evidence_as_observer",
                 "bypass_timeline_gate",
-                "git_commit_before_finish_gate",
-                "emit_git_commit_directive_before_finish_gate",
+                "finish_without_contract_worker_commit",
+                "observer_authored_worker_commit",
             ],
-            "precommit_finish_order": {
+            "contract_worker_commit_order": {
                 "required": True,
                 "sequence": [
                     "implementation_evidence",
+                    "git_commit",
+                    "worker_commit_evidence",
                     "finish_time_worker_attestation",
                     "finish_gate",
-                    "git_commit",
                 ],
                 "blocker": (
-                    "runtime-context workers must leave the row-scoped branch "
-                    "head unchanged until finish-time attestation and finish "
-                    "gate pass"
+                    "runtime-context workers must record the exact clean HEAD in "
+                    "the source-backed Contract before finish-time attestation"
                 ),
                 "committed_branch_evidence_lane": {
-                    "implemented": False,
-                    "accepted": False,
+                    "implemented": True,
+                    "accepted": True,
+                    "line_id": "worker_commit",
                 },
             },
             "scope": {
@@ -7951,6 +7989,11 @@ def _runtime_context_next_legal_action(
         return "run_worker_graph_query"
     if not _runtime_context_string_list(values.get("implementation_event_refs")):
         return "record_implementation_evidence"
+    if (
+        values.get("contract_worker_commit_required")
+        and not _runtime_context_text(values.get("worker_commit_event_ref"))
+    ):
+        return "record_worker_commit"
     for field, action in (
         ("worker_self_attesting", "record_finish_time_worker_attestation"),
         ("finish_gate_ref", "record_finish_gate"),
@@ -8033,6 +8076,11 @@ def _runtime_context_failed_qa_revision_projection(
             "required_revision_cycle": [
                 "revise_implementation_in_owned_scope",
                 "record_implementation_evidence",
+                *(
+                    ["record_worker_commit"]
+                    if values.get("contract_worker_commit_required")
+                    else []
+                ),
                 "record_worker_verification",
                 "record_review_ready",
                 "request_independent_qa_again",
@@ -8085,6 +8133,11 @@ def _runtime_context_failed_qa_revision_projection(
             "required_revision_cycle": [
                 "revise_implementation_in_owned_scope",
                 "record_implementation_evidence",
+                *(
+                    ["record_worker_commit"]
+                    if values.get("contract_worker_commit_required")
+                    else []
+                ),
                 "record_worker_verification",
                 "record_review_ready",
                 "request_independent_qa_again",
@@ -8323,10 +8376,35 @@ def _runtime_context_next_required_evidence(
             close_satisfying_required=True,
             requires=requires,
         )
-    if "worker_self_attesting" in missing_fields:
+    if (
+        values.get("contract_worker_commit_required")
+        and not _runtime_context_text(values.get("worker_commit_event_ref"))
+    ):
         requires = [
             evidence_id
             for evidence_id in ("worker_graph_trace", "implementation_evidence")
+            if evidence_id in seen
+        ]
+        _add(
+            item_id="worker_commit",
+            field="worker_commit_event_ref",
+            gate="finish",
+            next_action="record_worker_commit",
+            producer="mf_subagent_worker",
+            consumer="ContractRuntime.worker_commit",
+            expected_source="contract_runtime.completed_lines.worker_commit",
+            evidence_ref="contract_runtime",
+            close_satisfying_required=True,
+            requires=requires,
+        )
+    if "worker_self_attesting" in missing_fields:
+        requires = [
+            evidence_id
+            for evidence_id in (
+                "worker_graph_trace",
+                "implementation_evidence",
+                "worker_commit",
+            )
             if evidence_id in seen
         ]
         _add(
@@ -8347,6 +8425,7 @@ def _runtime_context_next_required_evidence(
             for evidence_id in (
                 "worker_graph_trace",
                 "implementation_evidence",
+                "worker_commit",
                 "finish_time_worker_attestation",
             )
             if evidence_id in seen
@@ -9558,6 +9637,9 @@ def build_runtime_context_worker_view(
                 "fence_token_redacted",
                 "session_token_ref",
                 "session_token_ref_present",
+                "runtime_contract_version",
+                "contract_worker_commit_required",
+                "contract_worker_commit_authority",
             )
         },
         "branch": {

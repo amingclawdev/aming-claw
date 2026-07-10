@@ -32,7 +32,10 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
-from agent.governance.contracts.runtime import ContractRuntimeError
+from agent.governance.contracts.runtime import (
+    ContractRuntimeError,
+    _mf_parallel_worker_commit_errors,
+)
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
@@ -264,6 +267,218 @@ def test_route_token_ref_superseded_guidance_prefers_same_scope_issue():
 
 def _fake_sha(label: str) -> str:
     return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _worker_commit_contract_proof():
+    commit_sha = "a" * 40
+    identity = {
+        "runtime_context_id": "mfrctx-worker-commit",
+        "task_id": "worker-commit-task",
+        "parent_task_id": "worker-commit-parent",
+        "worker_id": "worker-commit-slot",
+        "worker_slot_id": "worker-commit-slot",
+        "worker_session_id": "worker-commit-session",
+        "actor_session_principal": "worker-commit-session",
+        "filer_principal": "worker-commit-session",
+        "implementation_event_ref": "timeline:101",
+        "target_project_root": "/tmp/worker-commit",
+        "session_token_ref": "wstok-worker-commit",
+        "fence_token_hash": _fake_sha("worker-commit-fence"),
+        "worker_role": "mf_sub",
+        "evidence_owner_role": "mf_sub",
+        "owned_files": ["agent/governance/server.py"],
+        "changed_files": ["agent/governance/server.py"],
+        "commit_diff_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-worker-commit"],
+        "db_verified": True,
+        "clean_worktree": True,
+        "dirty_files": [],
+        "commit_sha": commit_sha,
+        "head_commit": commit_sha,
+        "immutable_head_commit": commit_sha,
+        "validated_head_commit": commit_sha,
+        "observer_impersonation": False,
+    }
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "line_id": "worker_implementation",
+                "actor_role": "mf_sub",
+                "payload": {
+                    **identity,
+                    "graph_trace_ids": ["gqt-worker-commit"],
+                    "changed_files": ["agent/governance/server.py"],
+                },
+            }
+        ],
+    }
+    write = {
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "commit_sha": commit_sha,
+        "payload": identity,
+    }
+    return record, write
+
+
+def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit():
+    record, write = _worker_commit_contract_proof()
+
+    assert _mf_parallel_worker_commit_errors(
+        record,
+        write,
+        actor_role="mf_sub",
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("missing_commit", "full immutable commit_sha"),
+        ("wrong_commit", "head_commit must equal commit_sha"),
+        ("dirty", "rejects dirty worktree evidence"),
+        ("out_of_fence", "contains out-of-fence files"),
+        ("observer_impersonation", "rejects observer impersonation"),
+        ("observer_actor", "requires actor_role=mf_sub"),
+    ],
+)
+def test_contract_runtime_worker_commit_proof_rejects_invalid_evidence(
+    mutation,
+    expected_error,
+):
+    record, write = _worker_commit_contract_proof()
+    actor_role = "mf_sub"
+    payload = write["payload"]
+    if mutation == "missing_commit":
+        write["commit_sha"] = ""
+        payload["commit_sha"] = ""
+        payload["head_commit"] = ""
+        payload["immutable_head_commit"] = ""
+        payload["validated_head_commit"] = ""
+    elif mutation == "wrong_commit":
+        payload["head_commit"] = "b" * 40
+    elif mutation == "dirty":
+        payload["dirty_files"] = ["agent/governance/server.py"]
+    elif mutation == "out_of_fence":
+        payload["changed_files"] = [
+            "agent/governance/server.py",
+            "outside-owned-fence.py",
+        ]
+        payload["commit_diff_files"] = list(payload["changed_files"])
+    elif mutation == "observer_impersonation":
+        payload["observer_impersonation"] = True
+    elif mutation == "observer_actor":
+        actor_role = "observer"
+
+    errors = _mf_parallel_worker_commit_errors(record, write, actor_role=actor_role)
+    assert any(expected_error in error for error in errors)
+
+
+def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift(
+    tmp_path,
+    monkeypatch,
+):
+    worktree = tmp_path / "worker-commit-drift"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Commit Test"],
+        cwd=worktree,
+        check=True,
+    )
+    owned = worktree / "owned.py"
+    owned.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    owned.write_text("implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "implementation"], cwd=worktree, check=True)
+    worker_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    commit_payload = {
+        "runtime_context_id": "mfrctx-drift",
+        "task_id": "task-drift",
+        "worker_commit_sha": worker_commit,
+        "changed_files": ["owned.py"],
+        "commit_diff_files": ["owned.py"],
+        "owned_files": ["owned.py"],
+        "implementation_event_ref": "timeline:202",
+        "worker_session_id": "worker-session-drift",
+        "graph_trace_ids": ["gqt-drift"],
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_actual_worker_commit_line",
+        lambda *_args, **_kwargs: (
+            {"line_id": "worker_commit", "commit_sha": worker_commit},
+            commit_payload,
+        ),
+    )
+    context = SimpleNamespace(
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        task_id="task-drift",
+    )
+    kwargs = {
+        "project_id": PID,
+        "context": context,
+        "runtime_context_id": "mfrctx-drift",
+        "revision_payload": {},
+        "body": {"contract_execution_id": "cex-drift"},
+        "source": "test.finish",
+    }
+
+    projection = server._runtime_context_contract_worker_commit_projection(
+        None,
+        **kwargs,
+    )
+    assert projection["worker_commit_sha"] == worker_commit
+
+    owned.write_text("dirty after commit\n", encoding="utf-8")
+    with pytest.raises(GovernanceError) as dirty:
+        server._runtime_context_contract_worker_commit_projection(None, **kwargs)
+    assert dirty.value.code == "contract_worker_commit_drift"
+
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "later drift"], cwd=worktree, check=True)
+    with pytest.raises(GovernanceError) as drift:
+        server._runtime_context_contract_worker_commit_projection(None, **kwargs)
+    assert drift.value.code == "contract_worker_commit_drift"
+
+
+def test_generic_timeline_path_cannot_author_contract_worker_commit():
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_close_gate(
+            None,
+            project_id=PID,
+            body={
+                "contract_execution_id": "cex-worker-commit",
+                "actor": "mf_sub",
+            },
+            event_kind="worker_commit",
+            norm_payload={"worker_commit_sha": "a" * 40},
+            trusted_actor_role="mf_sub",
+        )
+
+    assert rejected.value.code == "contract_worker_commit_facade_required"
 
 
 def _persist_append_route_token_ref(
@@ -10762,6 +10977,8 @@ def _runtime_context_qa_handoff_current_values(
         "visible_injection_manifest_hash": f"sha256:visible-{label}",
         "graph_trace_ids": [f"gqt-{label}"],
         "implementation_event_refs": [implementation_event_ref],
+        "worker_commit_event_ref": "timeline:worker-commit",
+        "worker_commit_sha": "a" * 40,
         "worker_self_attesting": True,
         "finish_gate_ref": finish_gate_ref,
         "checkpoint_id": f"ckpt-{label}",
@@ -10789,6 +11006,35 @@ def test_runtime_context_action_plan_hands_off_independent_qa_after_finish():
     )
     assert action_plan["next_required_evidence"][0]["producer"] == "independent_qa"
     assert action_plan["next_required_evidence"][0]["worker_owned"] is False
+
+
+def test_runtime_context_v2_action_plan_requires_worker_commit_before_attestation():
+    current_values = _runtime_context_qa_handoff_current_values("worker-commit-next")
+    current_values.update(
+        {
+            "contract_worker_commit_required": True,
+            "worker_commit_event_ref": "",
+            "worker_commit_sha": "",
+            "worker_self_attesting": False,
+            "finish_gate_ref": "",
+            "checkpoint_id": "",
+        }
+    )
+    action_plan = build_runtime_context_action_plan_view(
+        {
+            "runtime_context_id": current_values["runtime_context_id"],
+            "current_values": current_values,
+            "lane_plan": {},
+        },
+        gate_inputs_view={},
+        close_gate_view={"missing": [], "ready": False},
+    )
+
+    assert action_plan["next_legal_action"] == "record_worker_commit"
+    assert action_plan["next_required_evidence"][0]["id"] == "worker_commit"
+    assert action_plan["next_required_evidence"][0]["expected_source"] == (
+        "contract_runtime.completed_lines.worker_commit"
+    )
 
 
 def test_runtime_context_failed_qa_without_revision_keeps_rework_action():
@@ -27431,6 +27677,16 @@ def _complete_source_backed_mf_parallel_successor(
         **route_identity,
     }
     worker_graph_trace_id = "gqt-20260628-feed1234"
+    worker_payload.update(
+        {
+            "worker_session_id": runtime_context.worker_slot_id,
+            "actor_session_principal": runtime_context.worker_slot_id,
+            "filer_principal": runtime_context.worker_slot_id,
+            "session_token_ref": runtime_context_session_token_ref(runtime_context),
+            "fence_token_hash": _fake_sha("source-backed-worker-fence"),
+            "graph_trace_ids": [worker_graph_trace_id],
+        }
+    )
     _insert_mf_sub_graph_query_trace(
         conn,
         trace_id=worker_graph_trace_id,
@@ -27503,6 +27759,27 @@ def _complete_source_backed_mf_parallel_successor(
             "worker_implementation",
             "implementation",
             worker_payload,
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "worker_commit",
+            "worker_commit",
+            "worker_commit",
+            {
+                **worker_payload,
+                "evidence_owner_role": "mf_sub",
+                "implementation_event_ref": "timeline:source-backed-implementation",
+                "commit_sha": worker_commit,
+                "head_commit": worker_commit,
+                "immutable_head_commit": worker_commit,
+                "validated_head_commit": worker_commit,
+                "clean_worktree": True,
+                "dirty_files": [],
+                "commit_diff_files": ["agent/governance/server.py"],
+                "db_verified": True,
+                "observer_impersonation": False,
+            },
             worker_commit,
         ),
         (

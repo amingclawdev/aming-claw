@@ -1479,6 +1479,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
         "worker_startup",
         "worker_graph_context",
         "worker_implementation",
+        "worker_commit",
         "worker_finish_time_attestation",
         "worker_finish_gate",
         "worker_review_ready_handoff",
@@ -1498,8 +1499,9 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(4, "mf_subagent_startup"),
             _event(5, "graph_trace"),
             _event(6, "implementation"),
-            _event(7, "record_finish_time_worker_attestation"),
-            _event(8, "mf_subagent_finish_gate"),
+            _event(7, "worker_commit"),
+            _event(8, "record_finish_time_worker_attestation"),
+            _event(9, "mf_subagent_finish_gate"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
@@ -1515,9 +1517,10 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(4, "mf_subagent_startup"),
             _event(5, "graph_trace"),
             _event(6, "implementation"),
-            _event(7, "record_finish_time_worker_attestation"),
-            _event(8, "mf_subagent_finish_gate"),
-            _event(9, "review_ready"),
+            _event(7, "worker_commit"),
+            _event(8, "record_finish_time_worker_attestation"),
+            _event(9, "mf_subagent_finish_gate"),
+            _event(10, "review_ready"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
@@ -1534,16 +1537,52 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(4, "mf_subagent_startup"),
             _event(5, "graph_trace"),
             _event(6, "implementation"),
-            _event(7, "record_finish_time_worker_attestation"),
-            _event(8, "mf_subagent_finish_gate"),
-            _event(9, "review_ready"),
-            _event(10, "qa_graph_trace"),
+            _event(7, "worker_commit"),
+            _event(8, "record_finish_time_worker_attestation"),
+            _event(9, "mf_subagent_finish_gate"),
+            _event(10, "review_ready"),
+            _event(11, "qa_graph_trace"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
     assert qa["next_legal_action"]["id"] == "qa_independent_verification"
     assert qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+
+
+def test_builtin_mf_parallel_v2_req_2ff0e242e70f_requires_commit_after_implementation():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev-mf-v2-worker-commit",
+            "state": "bound",
+        }
+    }
+    through_implementation = [
+        _event(1, "contract_binding"),
+        _event(2, "dispatch_bounded_worker"),
+        _event(3, "mf_subagent_read_receipt"),
+        _event(4, "mf_subagent_startup"),
+        _event(5, "graph_trace"),
+        _event(6, "implementation"),
+    ]
+
+    projection = build_contract_state_projection(
+        through_implementation,
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert projection["next_legal_action"]["id"] == "worker_commit"
+    assert "worker_finish_time_attestation" in projection["missing_evidence"]
+
+    premature_attestation = build_contract_state_projection(
+        [*through_implementation, _event(7, "record_finish_time_worker_attestation")],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert premature_attestation["next_legal_action"]["id"] == "worker_commit"
+    assert "worker_finish_time_attestation" in premature_attestation["missing_evidence"]
 
 
 def test_finish_gate_completion_satisfies_worker_startup_and_finish_requirements():

@@ -379,6 +379,33 @@ def test_registry_reports_unknown_contract(tmp_path):
         ContractDefinitionRegistry(tmp_path).get("missing")
 
 
+def test_mf_parallel_v2_records_worker_commit_before_finish_attestation():
+    definition = ContractDefinitionRegistry().get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev1",
+    )
+    lines = [
+        line
+        for stage in definition["rule_layer"]["stages"]
+        for line in stage.get("lines", [])
+    ]
+    line_ids = [line["line_id"] for line in lines]
+
+    assert line_ids.index("worker_implementation") < line_ids.index("worker_commit")
+    assert line_ids.index("worker_commit") < line_ids.index(
+        "worker_finish_time_attestation"
+    )
+    worker_commit = next(line for line in lines if line["line_id"] == "worker_commit")
+    finish_attestation = next(
+        line for line in lines if line["line_id"] == "worker_finish_time_attestation"
+    )
+    assert worker_commit["owner_role"] == "mf_sub"
+    assert worker_commit["allowed_writer_roles"] == ["mf_sub"]
+    assert worker_commit["requires"] == ["worker_implementation"]
+    assert finish_attestation["requires"] == ["worker_commit"]
+
+
 def test_runtime_guide_and_write_gate_reject_wrong_role_or_stale_hash(tmp_path):
     instruction_dir = tmp_path / "instructions"
     instruction_dir.mkdir()

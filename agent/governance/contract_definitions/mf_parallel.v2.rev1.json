@@ -21,7 +21,7 @@
     "inline": [
       "The compiled runtime guide is authoritative for the next legal action.",
       "Observer owns orchestration, child-contract prefill, dispatch, merge, reconcile, and close-ready evidence only.",
-      "mf_sub workers own read receipt, startup, graph trace, implementation, finish-time attestation, and finish gate evidence in their assigned worktree/fence.",
+            "mf_sub workers own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence in their assigned worktree/fence.",
       "QA owns QA graph context and independent verification evidence; observer must not write or reconstruct QA evidence.",
       "Prefer explicit parallel child contracts with owned_files fences before dispatching workers."
     ],
@@ -127,8 +127,8 @@
         ],
         "stage_id": "worker_context"
       },
-      {
-        "description": "The worker records bounded implementation evidence for owned files only.",
+            {
+                "description": "The worker records bounded implementation evidence for owned files only.",
         "lines": [
           {
             "allowed_writer_roles": [
@@ -142,11 +142,29 @@
               "worker_graph_context"
             ]
           }
-        ],
-        "stage_id": "worker_implementation"
-      },
-      {
-        "description": "The worker records finish-time self-attestation before the finish gate.",
+                ],
+                "stage_id": "worker_implementation"
+            },
+            {
+                "description": "The worker records the exact clean implementation commit before finish-time attestation.",
+                "lines": [
+                    {
+                        "allowed_writer_roles": [
+                            "mf_sub"
+                        ],
+                        "description": "Worker-authored commit evidence binding the active runtime, task, session, implementation event, DB graph traces, exact owned-file diff, clean worktree, and immutable HEAD.",
+                        "evidence_kind": "worker_commit",
+                        "line_id": "worker_commit",
+                        "owner_role": "mf_sub",
+                        "requires": [
+                            "worker_implementation"
+                        ]
+                    }
+                ],
+                "stage_id": "worker_commit"
+            },
+            {
+                "description": "The worker records finish-time self-attestation before the finish gate.",
         "lines": [
           {
             "allowed_writer_roles": [
@@ -154,11 +172,11 @@
             ],
             "description": "Finish-time worker self-attestation authored by the worker session, not observer reconstruction.",
             "evidence_kind": "record_finish_time_worker_attestation",
-            "line_id": "worker_finish_time_attestation",
-            "owner_role": "mf_sub",
-            "requires": [
-              "worker_implementation"
-            ]
+                        "line_id": "worker_finish_time_attestation",
+                        "owner_role": "mf_sub",
+                        "requires": [
+                            "worker_commit"
+                        ]
           }
         ],
         "stage_id": "worker_attestation"

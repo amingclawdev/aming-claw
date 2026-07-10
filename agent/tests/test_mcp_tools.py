@@ -16,6 +16,43 @@ def _tool_properties(name: str) -> dict:
     return tool["inputSchema"]["properties"]
 
 
+def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
+    assert "runtime_context_worker_commit" in _tool_names()
+    properties = _tool_properties("runtime_context_worker_commit")
+    assert {
+        "contract_execution_id",
+        "implementation_event_ref",
+        "worker_commit_sha",
+        "owned_files",
+        "changed_files",
+        "graph_trace_ids",
+    }.issubset(properties)
+
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "runtime_context_worker_commit",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-worker-commit",
+            "contract_execution_id": "cex-worker-commit",
+            "worker_commit_sha": "a" * 40,
+        },
+    )
+    assert recorder.calls[-1] == (
+        "POST",
+        (
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-worker-commit/worker-commit"
+        ),
+        {
+            "runtime_context_id": "mfrctx-worker-commit",
+            "contract_execution_id": "cex-worker-commit",
+            "worker_commit_sha": "a" * 40,
+        },
+    )
+
+
 def test_mf_timeline_precheck_schema_exposes_repair_view():
     view = _tool_properties("mf_timeline_precheck")["view"]
     assert "repair" in view["enum"]

@@ -8496,6 +8496,14 @@ def _runtime_context_service_timeline_refs(
             or event_type_normalized in {"mf.implementation", "worker.implementation"}
             or action_normalized == "record_implementation_evidence"
         )
+        is_worker_commit = (
+            event_kind_normalized == "worker_commit"
+            or event_type_normalized in {
+                "mf_subagent.worker_commit",
+                "runtime_context.worker_commit",
+            }
+            or action_normalized == "record_worker_commit"
+        )
         is_read_receipt = "read_receipt" in haystack
         is_startup = (
             event_kind_normalized == "mf_subagent_startup"
@@ -8622,6 +8630,16 @@ def _runtime_context_service_timeline_refs(
             )
             if changed_files:
                 refs["changed_files"] = changed_files
+        if is_worker_commit:
+            refs["worker_commit_event_ref"] = ref
+            refs["worker_commit_payload"] = public_contract_revision_payload(payload)
+            worker_commit_sha = _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(payload, "worker_commit_sha")
+                or _timeline_first_deep_text(payload, "commit_sha")
+                or str(event.get("commit_sha") or "")
+            )
+            if worker_commit_sha:
+                refs["worker_commit_sha"] = worker_commit_sha
         is_verification = (
             event_kind_normalized in {"verification", "qa_verification"}
             or phase_normalized == "verification"
@@ -8631,7 +8649,12 @@ def _runtime_context_service_timeline_refs(
         event_graph_trace_ids = _runtime_context_service_graph_trace_values_from_event(
             event
         )
-        if is_implementation or is_finish_gate or is_finish_time_worker_attestation:
+        if (
+            is_implementation
+            or is_worker_commit
+            or is_finish_gate
+            or is_finish_time_worker_attestation
+        ):
             worker_graph_trace_ids.extend(event_graph_trace_ids)
         elif is_verification:
             verification_graph_trace_ids.extend(event_graph_trace_ids)
@@ -10686,10 +10709,15 @@ def _runtime_context_worker_guide_response(
             ),
             target_project_root=target_project_root,
             worktree_path=worktree_path,
+            contract_worker_commit_required=bool(
+                task.get("contract_worker_commit_required")
+            ),
         )
     )
     finish_submission_head_commit = str(
-        row_scoped_finish_head_projection.get("submission_head_commit") or ""
+        timeline_refs.get("worker_commit_sha")
+        or row_scoped_finish_head_projection.get("submission_head_commit")
+        or ""
     ).strip()
     graph_payload_shape = dict(graph_identity.get("payload_shape") or {})
     if target_project_root:
@@ -11339,10 +11367,10 @@ def _runtime_context_worker_guide_response(
                 "for this row. current_branch_head_commit is informational when "
                 "successor repairs continue on the same branch."
             ),
-            "precommit_finish_order": (
-                "Leave worker changes uncommitted until finish-time worker "
-                "attestation and finish gate pass; only then create the worker "
-                "git commit."
+            "contract_worker_commit_order": (
+                "Create the implementation commit, record its exact clean HEAD "
+                "through runtime_context.worker_commit, then submit finish-time "
+                "worker attestation."
             ),
             "transcript_identity_before_edit": (
                 "Before implementation edits, ensure startup evidence already "
@@ -11447,9 +11475,9 @@ def _runtime_context_worker_guide_response(
                 "row_scoped_finish_head_projection.status is "
                 "branch_head_scope_mismatch."
             ),
-            "precommit_finish_order": (
-                "This finish gate must pass before the worker creates its git "
-                "commit. If the runtime blocks, stop and report the blocker."
+            "contract_worker_commit_order": (
+                "This finish gate consumes the exact ContractRuntime worker_commit. "
+                "If HEAD or the worktree drifted afterward, stop and report it."
             ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
@@ -11650,6 +11678,37 @@ def _runtime_context_worker_guide_response(
                 },
                 "body_source": "copy_safe_body",
             },
+            "auth": _auth_guide("body.session_token"),
+        },
+        "worker_commit": {
+            "canonical_facade_status": "available",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/worker-commit"
+            ),
+            "mcp_tool": "runtime_context_worker_commit",
+            "required_order": [
+                "implementation_evidence",
+                "git_commit",
+                "worker_commit",
+                "finish_time_worker_attestation",
+                "finish_gate",
+            ],
+            "required_fields": [
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_session_id",
+                "filer_principal",
+                "implementation_event_ref",
+                "worker_commit_sha",
+                "owned_files",
+                "changed_files",
+                "graph_trace_ids",
+            ],
+            "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+            "timeline_projection_authoritative": False,
             "auth": _auth_guide("body.session_token"),
         },
         "finish_gate": {
@@ -11992,6 +12051,10 @@ def _runtime_context_worker_guide_response(
         ),
         "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
             "implementation_evidence_facade_payload_skeleton",
+            {},
+        ),
+        "worker_commit_facade_payload_skeleton": actionable_payloads.get(
+            "worker_commit_facade_payload_skeleton",
             {},
         ),
         "finish_time_transcript_readiness": actionable_payloads.get(
@@ -12405,6 +12468,7 @@ def _runtime_context_row_scoped_finish_head_projection(
     implementation_event_ref: str = "",
     worktree_path: str = "",
     target_project_root: str = "",
+    contract_worker_commit_required: bool = False,
 ) -> dict[str, Any]:
     row_head = _runtime_context_non_placeholder_text(
         row_scoped_implementation_head_commit
@@ -12422,11 +12486,15 @@ def _runtime_context_row_scoped_finish_head_projection(
             else "pending_row_scoped_implementation_head"
         )
     )
-    next_legal_action = (
-        "stop_for_row_scope_reconciliation"
-        if mismatch
-        else "record_finish_time_worker_attestation"
-    )
+    if contract_worker_commit_required:
+        status = "worker_commit_ready" if mismatch else "implementation_commit_pending"
+        next_legal_action = "record_worker_commit"
+    else:
+        next_legal_action = (
+            "stop_for_row_scope_reconciliation"
+            if mismatch
+            else "record_finish_time_worker_attestation"
+        )
     return {
         "schema_version": "runtime_context.row_scoped_finish_head_projection.v1",
         "status": status,
@@ -12441,24 +12509,31 @@ def _runtime_context_row_scoped_finish_head_projection(
         "submission_head_commit": (
             submission_head or "<row-scoped-worker-implementation-head-commit>"
         ),
-        "finish_gate_allowed_against_current_branch_head": not mismatch,
-        "worker_finish_scope_requires_row_head": True,
+        "finish_gate_allowed_against_current_branch_head": (
+            False if contract_worker_commit_required else not mismatch
+        ),
+        "worker_finish_scope_requires_row_head": not contract_worker_commit_required,
+        "worker_commit_must_record_current_branch_head": contract_worker_commit_required,
         "later_branch_commits_must_not_widen_row_scope": True,
         "current_branch_head_is_later_than_row_head": mismatch,
         "next_legal_action": next_legal_action,
         "guide": (
-            "Do not submit finish-time or finish-gate evidence for the row using "
-            "the current branch HEAD after it moved past the row-scoped head. "
-            "Finish-time worker attestation and finish gate must happen before "
-            "the worker commit unless an explicit committed-branch evidence lane "
-            "is implemented. Stop and request a row-scope recovery decision "
-            "before close."
-            if mismatch
+            (
+                "The branch HEAD moved after implementation evidence. Record that "
+                "exact clean immutable HEAD through runtime_context.worker_commit "
+                "before any finish-time attestation."
+                if mismatch
+                else (
+                    "Create the bounded implementation commit, then record its exact "
+                    "clean HEAD through runtime_context.worker_commit before finish-time "
+                    "attestation and finish gate."
+                )
+            )
+            if contract_worker_commit_required
             else (
-                "Use the row-scoped worker implementation head for finish-time "
-                "and finish-gate evidence before creating the worker git commit. "
-                "The current branch head is only a service/deployment head when "
-                "successor repairs continue on the same branch."
+                "Stop and reconcile the row-scoped implementation head before finish."
+                if mismatch
+                else "Use the pinned legacy row head for finish evidence."
             )
         ),
         "merge_queue_policy": (
@@ -12541,6 +12616,10 @@ def _runtime_context_worker_recovery_payloads(
     implementation_evidence_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/implementation-evidence"
+    )
+    worker_commit_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/worker-commit"
     )
     reissue_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
@@ -13170,6 +13249,35 @@ def _runtime_context_worker_recovery_payloads(
         "tests": "copy_safe_body.tests",
         "route_token_ref": "copy_safe_body.route_token_ref",
     }
+    active_contract_execution_id = (
+        str(successor_contract_execution_id or contract_execution_id or "").strip()
+        or "<active ContractRuntime contract_execution_id>"
+    )
+    worker_commit_body = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": active_contract_execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "worker_session_id": (
+            normalized_worker_session_id or "<same worker_session_id as startup>"
+        ),
+        "filer_principal": (
+            normalized_worker_session_id or "<same worker_session_id as startup>"
+        ),
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "implementation_event_ref": "<accepted implementation timeline ref>",
+        "worker_commit_sha": "<exact full clean git HEAD after implementation commit>",
+        "owned_files": ["<all runtime-context owned files>"],
+        "changed_files": ["<exact base..worker_commit_sha changed file>"],
+        "graph_trace_ids": ["<same DB-verified implementation graph trace id>"],
+        **safe_route_identity,
+    }
     merge_materialize_body = {
         "project_id": project_id,
         "merge_queue_id": (
@@ -13431,6 +13539,13 @@ def _runtime_context_worker_recovery_payloads(
                     "implementation_evidence_facade_payload_skeleton.copy_safe_body"
                 ),
             },
+            "runtime_context_worker_commit": {
+                "method": "POST",
+                "path": worker_commit_path,
+                "tool": "runtime_context_worker_commit",
+                "facade": "runtime_context.worker_commit",
+                "body_source": "worker_commit_facade_payload_skeleton.copy_safe_body",
+            },
             "parallel_branch_merge_queue_materialize": {
                 "method": "POST",
                 "path": (
@@ -13613,6 +13728,37 @@ def _runtime_context_worker_recovery_payloads(
                     "current_worker_route_token_ref for the happy path."
                 ),
             },
+        },
+        "worker_commit_facade_payload_skeleton": {
+            "method": "POST",
+            "path": worker_commit_path,
+            "facade": "runtime_context.worker_commit",
+            "mcp_tool": "runtime_context_worker_commit",
+            "body_source": "copy_safe_body",
+            "required_order": [
+                "implementation_evidence",
+                "git_commit",
+                "worker_commit",
+                "finish_time_worker_attestation",
+                "finish_gate",
+            ],
+            "required_fields": [
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_session_id",
+                "filer_principal",
+                "implementation_event_ref",
+                "worker_commit_sha",
+                "owned_files",
+                "changed_files",
+                "graph_trace_ids",
+            ],
+            "body": worker_commit_body,
+            "copy_safe_body": dict(worker_commit_body),
+            "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+            "timeline_projection_authoritative": False,
         },
         "session_token_rejoin_submission": session_token_rejoin_submission,
         "session_token_initial_join_submission": session_token_initial_join_submission,
@@ -15998,6 +16144,10 @@ def _runtime_context_finish_gate_submission_payload(
             target_head_commit=str(getattr(context, "target_head_commit", "") or ""),
             target_project_root=target_project_root,
             worktree_path=worktree_path,
+            contract_worker_commit_required=bool(
+                isinstance(finish_order_projection, Mapping)
+                and finish_order_projection.get("canonical_worker_commit_required")
+            ),
         )
     )
     checkpoint_id = str(
@@ -16108,9 +16258,9 @@ def _runtime_context_finish_gate_submission_payload(
                 "current_branch_head_commit is informational when successor "
                 "repairs continue on the same branch."
             ),
-            "precommit_finish_order": (
-                "Record finish-time worker attestation and finish gate before "
-                "creating the worker git commit."
+            "contract_worker_commit_order": (
+                "Finish evidence consumes the exact ContractRuntime worker_commit; "
+                "later HEAD or worktree drift is rejected."
             ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
@@ -17716,6 +17866,540 @@ def _runtime_context_require_precommit_finish_order(
     return projection
 
 
+def _runtime_context_git_dirty_files(worktree_path: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError(f"unable to inspect assigned worktree status: {exc}") from exc
+    return parse_git_porcelain_paths(proc.stdout)
+
+
+def _runtime_context_worker_commit_contract_execution_id(
+    revision_payload: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> str:
+    identity = _runtime_context_contract_execution_identity(revision_payload)
+    expected = str(identity.get("contract_execution_id") or "").strip()
+    supplied = str(
+        body.get("contract_execution_id")
+        or body.get("successor_contract_execution_id")
+        or ""
+    ).strip()
+    if expected and supplied and supplied != expected:
+        raise ValidationError(
+            "contract_execution_id does not match the active runtime contract"
+        )
+    return expected or supplied
+
+
+def _runtime_context_actual_worker_commit_line(
+    conn,
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        record = _contract_runtime(conn).store.get(contract_execution_id)
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_worker_commit_required",
+            str(exc),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "next_legal_action": "record_worker_commit",
+            },
+        ) from exc
+    for raw_line in reversed(list(record.get("completed_lines") or [])):
+        if not isinstance(raw_line, Mapping):
+            continue
+        if str(raw_line.get("line_id") or "").strip() != "worker_commit":
+            continue
+        payload = (
+            raw_line.get("payload")
+            if isinstance(raw_line.get("payload"), Mapping)
+            else {}
+        )
+        line_runtime_context_id = _timeline_first_deep_text(
+            raw_line,
+            "runtime_context_id",
+        )
+        line_task_id = _timeline_first_deep_text(raw_line, "task_id")
+        if line_runtime_context_id != runtime_context_id or line_task_id != task_id:
+            continue
+        return dict(raw_line), dict(payload)
+    raise GovernanceError(
+        "contract_worker_commit_required",
+        "finish requires the exact source-backed ContractRuntime worker_commit line",
+        422,
+        {
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+            "timeline_projection_authoritative": False,
+            "next_legal_action": "record_worker_commit",
+        },
+    )
+
+
+def _runtime_context_contract_worker_commit_projection(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    revision_payload: Mapping[str, Any],
+    body: Mapping[str, Any],
+    source: str,
+) -> dict[str, Any]:
+    """Validate finish state against the actual ContractRuntime commit line."""
+
+    contract_execution_id = _runtime_context_worker_commit_contract_execution_id(
+        revision_payload,
+        body,
+    )
+    if not contract_execution_id:
+        actual_head = _runtime_context_git_head_commit(
+            str(getattr(context, "worktree_path", "") or "")
+        )
+        legacy = _runtime_context_finish_commit_order_projection(
+            context=context,
+            actual_head=actual_head,
+            source=source,
+        )
+        legacy["canonical_worker_commit_required"] = False
+        legacy["compatibility_only"] = True
+        return legacy
+
+    line, payload = _runtime_context_actual_worker_commit_line(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=str(getattr(context, "task_id", "") or ""),
+    )
+    commit_sha = str(
+        line.get("commit_sha")
+        or payload.get("worker_commit_sha")
+        or payload.get("commit_sha")
+        or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    from . import batch_jobs
+
+    actual_head = batch_jobs.git_commit(worktree_path) if worktree_path else ""
+    dirty_files = (
+        _runtime_context_git_dirty_files(worktree_path) if worktree_path else []
+    )
+    committed_files = (
+        batch_jobs.git_changed_files(
+            worktree_path,
+            base_ref=str(getattr(context, "base_commit", "") or ""),
+            head_ref=actual_head or "HEAD",
+        )
+        if worktree_path and getattr(context, "base_commit", "")
+        else []
+    )
+    recorded_files = _runtime_context_service_query_values(
+        payload,
+        "changed_files",
+    )
+    recorded_diff_files = _runtime_context_service_query_values(
+        payload,
+        "commit_diff_files",
+    )
+    errors: list[str] = []
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
+        errors.append("ContractRuntime worker_commit is missing a full commit SHA")
+    if actual_head != commit_sha:
+        errors.append("assigned worktree HEAD drifted after ContractRuntime worker_commit")
+    if dirty_files:
+        errors.append("assigned worktree became dirty after ContractRuntime worker_commit")
+    if set(committed_files) != set(recorded_files):
+        errors.append("current committed diff does not match ContractRuntime worker_commit")
+    if set(recorded_diff_files) != set(recorded_files):
+        errors.append("ContractRuntime worker_commit diff proof is internally inconsistent")
+    if errors:
+        raise GovernanceError(
+            "contract_worker_commit_drift",
+            "; ".join(errors),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "recorded_commit_sha": commit_sha,
+                "actual_worktree_head_commit": actual_head,
+                "recorded_changed_files": recorded_files,
+                "actual_changed_files": committed_files,
+                "dirty_files": dirty_files,
+                "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+                "next_legal_action": "stop_and_report_worker_commit_drift",
+            },
+        )
+    return {
+        "schema_version": "runtime_context.contract_worker_commit_projection.v1",
+        "status": "validated",
+        "blocked": False,
+        "source": source,
+        "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+        "canonical_worker_commit_required": True,
+        "timeline_projection_authoritative": False,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": str(getattr(context, "task_id", "") or ""),
+        "worker_commit_sha": commit_sha,
+        "head_commit": commit_sha,
+        "implementation_event_ref": str(
+            payload.get("implementation_event_ref") or ""
+        ),
+        "worker_session_id": str(payload.get("worker_session_id") or ""),
+        "changed_files": recorded_files,
+        "commit_diff_files": recorded_diff_files,
+        "owned_files": _runtime_context_service_query_values(payload, "owned_files"),
+        "graph_trace_ids": _runtime_context_service_query_values(
+            payload,
+            "graph_trace_ids",
+            "verified_trace_ids",
+        ),
+        "clean_worktree": True,
+        "contract_runtime_line": {
+            "stage_id": str(line.get("stage_id") or ""),
+            "line_id": "worker_commit",
+            "evidence_kind": str(line.get("evidence_kind") or "worker_commit"),
+            "line_instance_id": str(line.get("line_instance_id") or ""),
+        },
+    }
+
+
+@route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/worker-commit")
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/worker-commit")
+def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
+    """Record the exact clean worker commit in source-backed ContractRuntime."""
+
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    conn = get_connection(project_id)
+    try:
+        context, runtime_context_id, _session = _runtime_context_mf_sub_write_context(
+            ctx,
+            conn,
+            action="graph-governance.runtime-context.worker-commit",
+            allow_validated=True,
+        )
+        revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
+        contract_execution_id = _runtime_context_worker_commit_contract_execution_id(
+            revision_payload,
+            body,
+        )
+        if not contract_execution_id:
+            raise ValidationError("contract_execution_id is required for worker_commit")
+        parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+        for field, expected in (
+            ("runtime_context_id", runtime_context_id),
+            ("task_id", str(context.task_id or "")),
+            ("parent_task_id", parent_task_id),
+        ):
+            supplied = str(body.get(field) or "").strip()
+            if supplied != expected:
+                raise ValidationError(f"{field} must exactly match the active runtime")
+
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+        )
+        timeline_refs, startup_gate, _finish_gate, _close_evidence = (
+            _runtime_context_service_timeline_refs(
+                conn,
+                project_id=project_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+                timeline_events=timeline_events,
+            )
+        )
+        implementation_event_ref = str(
+            body.get("implementation_event_ref") or ""
+        ).strip()
+        latest_implementation_ref = str(
+            timeline_refs.get("latest_implementation_event_ref") or ""
+        ).strip()
+        if not implementation_event_ref or implementation_event_ref != latest_implementation_ref:
+            raise ValidationError(
+                "implementation_event_ref must equal the latest worker implementation evidence"
+            )
+        implementation_payload = (
+            timeline_refs.get("latest_implementation_payload")
+            if isinstance(timeline_refs.get("latest_implementation_payload"), Mapping)
+            else {}
+        )
+        implementation_files = _runtime_context_service_query_values(
+            implementation_payload,
+            "changed_files",
+            "worker_changed_files",
+        )
+        implementation_trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                implementation_payload,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+        supplied_trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                body,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "trace_ids",
+            )
+        )
+        if not supplied_trace_ids or set(supplied_trace_ids) != set(
+            implementation_trace_ids
+        ):
+            raise ValidationError(
+                "worker_commit graph_trace_ids must exactly match worker_implementation"
+            )
+        graph_trace_db_evidence = _runtime_context_service_graph_trace_refs(
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=context.backlog_id,
+            fence_token=_runtime_context_request_value(ctx, "fence_token"),
+            explicit_trace_ids=supplied_trace_ids,
+            strict_explicit_trace_ids=True,
+        )
+        verified_trace_ids = list(
+            graph_trace_db_evidence.get("verified_trace_ids") or []
+        )
+        if not graph_trace_db_evidence.get("db_verified") or set(
+            verified_trace_ids
+        ) != set(supplied_trace_ids):
+            raise ValidationError("worker_commit requires exact DB-verified graph traces")
+
+        startup_payload = (
+            startup_gate.get("payload")
+            if isinstance(startup_gate, Mapping)
+            and isinstance(startup_gate.get("payload"), Mapping)
+            else {}
+        )
+        startup_worker_session_id = _timeline_first_deep_text(
+            startup_payload,
+            "worker_session_id",
+        )
+        worker_session_id = str(body.get("worker_session_id") or "").strip()
+        filer_principal = str(
+            body.get("filer_principal") or body.get("actor") or ""
+        ).strip()
+        if (
+            not worker_session_id
+            or worker_session_id != startup_worker_session_id
+            or filer_principal != worker_session_id
+        ):
+            raise ValidationError(
+                "worker_commit must be filed by the exact startup worker session"
+            )
+        if any(
+            str(body.get(key) or "").strip()
+            for key in ("filed_on_behalf_by", "on_behalf_of")
+        ) or any(bool(body.get(key)) for key in ("filed_on_behalf", "on_behalf")):
+            raise ValidationError("worker_commit cannot be filed on behalf")
+
+        from . import batch_jobs, task_timeline
+        from .parallel_branch_runtime import (
+            runtime_context_secret_hash,
+            runtime_context_session_token_ref,
+        )
+
+        worktree_path = str(context.worktree_path or "").strip()
+        actual_head = batch_jobs.git_commit(worktree_path)
+        supplied_commit = str(
+            body.get("worker_commit_sha")
+            or body.get("commit_sha")
+            or body.get("head_commit")
+            or ""
+        ).strip()
+        if supplied_commit != actual_head or not re.fullmatch(
+            r"[0-9a-f]{40,64}", actual_head
+        ):
+            raise ValidationError("worker_commit_sha must equal the full assigned worktree HEAD")
+        dirty_files = _runtime_context_git_dirty_files(worktree_path)
+        if dirty_files:
+            raise GovernanceError(
+                "worker_commit_dirty_worktree",
+                "worker_commit requires a clean assigned worktree",
+                422,
+                {"dirty_files": dirty_files, "next_legal_action": "clean_worktree"},
+            )
+        commit_diff_files = batch_jobs.git_changed_files(
+            worktree_path,
+            base_ref=context.base_commit,
+            head_ref=actual_head,
+        )
+        owned_files = sorted(set(context.owned_files or context.target_files or ()))
+        supplied_owned_files = sorted(
+            set(_runtime_context_service_query_values(body, "owned_files"))
+        )
+        supplied_changed_files = sorted(
+            set(_runtime_context_service_query_values(body, "changed_files"))
+        )
+        if supplied_owned_files != owned_files:
+            raise ValidationError("worker_commit owned_files must equal the allocated fence")
+        if (
+            sorted(commit_diff_files) != sorted(implementation_files)
+            or supplied_changed_files != sorted(commit_diff_files)
+        ):
+            raise ValidationError(
+                "worker_commit diff must exactly match worker_implementation changed_files"
+            )
+        out_of_fence = sorted(set(commit_diff_files) - set(owned_files))
+        if out_of_fence:
+            raise GovernanceError(
+                "worker_commit_out_of_fence",
+                "worker_commit contains files outside the allocated fence",
+                422,
+                {"out_of_fence_files": out_of_fence, "owned_files": owned_files},
+            )
+
+        session_token_ref = runtime_context_session_token_ref(context)
+        fence_token_hash = runtime_context_secret_hash(context.fence_token)
+        payload = {
+            "schema_version": "runtime_context.worker_commit.v1",
+            "action": "record_worker_commit",
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": context.backlog_id,
+            "worker_role": "mf_sub",
+            "evidence_owner_role": "mf_sub",
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id or context.worker_id,
+            "worker_session_id": worker_session_id,
+            "actor_session_principal": worker_session_id,
+            "filer_principal": filer_principal,
+            "submitter_principal": filer_principal,
+            "implementation_event_ref": implementation_event_ref,
+            "target_project_root": _runtime_context_effective_target_project_root(context),
+            "session_token_ref": session_token_ref,
+            "fence_token_hash": fence_token_hash,
+            "worker_commit_sha": actual_head,
+            "commit_sha": actual_head,
+            "head_commit": actual_head,
+            "immutable_head_commit": actual_head,
+            "validated_head_commit": actual_head,
+            "clean_worktree": True,
+            "dirty_files": [],
+            "owned_files": owned_files,
+            "changed_files": sorted(commit_diff_files),
+            "commit_diff_files": sorted(commit_diff_files),
+            "graph_trace_ids": verified_trace_ids,
+            "graph_trace_db_evidence": _runtime_context_service_redact_graph_trace_refs(
+                graph_trace_db_evidence
+            ),
+            "db_verified": True,
+            "observer_impersonation": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+        }
+        second_head = batch_jobs.git_commit(worktree_path)
+        second_dirty_files = _runtime_context_git_dirty_files(worktree_path)
+        second_diff_files = batch_jobs.git_changed_files(
+            worktree_path,
+            base_ref=context.base_commit,
+            head_ref=second_head,
+        )
+        if (
+            second_head != actual_head
+            or second_dirty_files
+            or sorted(second_diff_files) != sorted(commit_diff_files)
+        ):
+            raise GovernanceError(
+                "worker_commit_state_changed_during_validation",
+                "worker commit state changed during validation",
+                409,
+                {"next_legal_action": "retry_worker_commit_after_stabilizing_worktree"},
+            )
+        contract_body = {
+            **body,
+            **payload,
+            "actor": "mf_sub",
+            "commit_sha": actual_head,
+            "contract_runtime_line": {
+                "stage_id": "worker_commit",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+            },
+        }
+        contract_gate = _contract_runtime_close_gate(
+            conn,
+            project_id=project_id,
+            body=contract_body,
+            event_kind="worker_commit",
+            norm_payload=payload,
+            trusted_actor_role="mf_sub",
+            trusted_worker_commit_facade=True,
+        )
+        final_head = batch_jobs.git_commit(worktree_path)
+        final_dirty_files = _runtime_context_git_dirty_files(worktree_path)
+        if final_head != actual_head or final_dirty_files:
+            conn.rollback()
+            raise GovernanceError(
+                "worker_commit_state_changed_during_write",
+                "worker commit state changed while recording ContractRuntime evidence",
+                409,
+                {"next_legal_action": "retry_worker_commit_after_stabilizing_worktree"},
+            )
+        event = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            task_id=context.task_id,
+            backlog_id=context.backlog_id,
+            attempt_num=int(body.get("attempt_num") or 0),
+            event_type="mf_subagent.worker_commit",
+            event_kind="worker_commit",
+            phase="worker_commit",
+            status="passed",
+            actor=filer_principal,
+            payload={
+                **payload,
+                "contract_runtime_close_evidence_gate": contract_gate,
+                "timeline_projection_authoritative": False,
+            },
+            commit_sha=actual_head,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    response = _runtime_context_write_response(
+        action="record_worker_commit",
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        context=context,
+        legacy_endpoint="/api/task/{project_id}/timeline",
+        result={"ok": True},
+        event=event,
+        gate=contract_gate,
+    )
+    response["worker_commit"] = payload
+    response["contract_runtime_close_evidence_gate"] = contract_gate
+    response["next_legal_action"] = "record_finish_time_worker_attestation"
+    return response
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/finish-time-worker-attestation")
 def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: RequestContext):
@@ -17795,11 +18479,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 actual_head = batch_jobs.git_commit(worktree_path)
             except batch_jobs.BatchJobError:
                 actual_head = ""
-        finish_order_projection = _runtime_context_finish_commit_order_projection(
-            context=context,
-            actual_head=actual_head,
-            source="runtime_context.finish_time_worker_attestation",
-        )
+        finish_order_projection: dict[str, Any] = {}
         head_commit = actual_head or str(body.get("head_commit") or context.head_commit or "")
         changed_files: list[str] = []
         if worktree_path and os.path.exists(worktree_path) and context.base_commit:
@@ -17874,11 +18554,24 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 "finish-time worker attestation requires read_receipt_hash and "
                 "read_receipt_event_id lineage"
             )
-        finish_order_projection = _runtime_context_require_precommit_finish_order(
+        finish_order_projection = _runtime_context_contract_worker_commit_projection(
+            conn,
+            project_id=project_id,
             context=context,
-            actual_head=actual_head,
+            runtime_context_id=runtime_context_id,
+            revision_payload=revision_payload,
+            body=body,
             source="runtime_context.finish_time_worker_attestation",
         )
+        if finish_order_projection.get("canonical_worker_commit_required"):
+            head_commit = str(finish_order_projection.get("worker_commit_sha") or "")
+            changed_files = list(finish_order_projection.get("changed_files") or [])
+        else:
+            finish_order_projection = _runtime_context_require_precommit_finish_order(
+                context=context,
+                actual_head=actual_head,
+                source="runtime_context.finish_time_worker_attestation.legacy",
+            )
 
         graph_trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -17980,6 +18673,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "base_commit": context.base_commit,
             "target_head_commit": context.target_head_commit,
             "head_commit": head_commit,
+            "contract_worker_commit_evidence": finish_order_projection,
             "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
             "owned_files": list(body.get("owned_files") or changed_files),
@@ -18026,6 +18720,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             or "",
             "observer_command_id": observer_command_id,
             "head_commit": head_commit,
+            "contract_worker_commit_evidence": finish_order_projection,
             "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
             "graph_trace_ids": verified_graph_trace_ids,
@@ -18119,6 +18814,7 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             str(body.get("parent_task_id") or "").strip()
             or _runtime_context_mf_sub_parent_task_id(context)
         )
+        revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
         from . import batch_jobs
 
         worktree_path = str(context.worktree_path or "")
@@ -18129,20 +18825,38 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
                 actual_head_commit = batch_jobs.git_commit(worktree_path)
             except batch_jobs.BatchJobError:
                 pass
-        if actual_head_commit:
-            expected_head_commit = actual_head_commit
-        finish_order_projection = _runtime_context_require_precommit_finish_order(
+        finish_order_projection = _runtime_context_contract_worker_commit_projection(
+            conn,
+            project_id=project_id,
             context=context,
-            actual_head=actual_head_commit,
+            runtime_context_id=runtime_context_id,
+            revision_payload=revision_payload,
+            body=body,
             source="runtime_context.finish_gate",
         )
+        if finish_order_projection.get("canonical_worker_commit_required"):
+            expected_head_commit = str(
+                finish_order_projection.get("worker_commit_sha") or ""
+            )
+        else:
+            if actual_head_commit:
+                expected_head_commit = actual_head_commit
+            finish_order_projection = _runtime_context_require_precommit_finish_order(
+                context=context,
+                actual_head=actual_head_commit,
+                source="runtime_context.finish_gate.legacy",
+            )
         expected_changed_files = _runtime_context_service_query_values(
             body,
             "changed_files",
             "owned_changed_files",
             "worker_changed_files",
         )
-        if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+        if finish_order_projection.get("canonical_worker_commit_required"):
+            expected_changed_files = list(
+                finish_order_projection.get("changed_files") or []
+            )
+        elif worktree_path and os.path.exists(worktree_path) and context.base_commit:
             try:
                 expected_changed_files = batch_jobs.git_changed_files_with_worktree(
                     worktree_path,
@@ -18268,6 +18982,7 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
+        "contract_worker_commit_evidence": finish_order_projection,
         "finish_order_projection": finish_order_projection,
     }
     evidence = finish_body.get("evidence") if isinstance(finish_body.get("evidence"), Mapping) else {}
@@ -19606,19 +20321,41 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     actual_head = ""
             finish_order_projection: dict[str, Any] = {}
             if runtime_context_lane:
-                finish_order_projection = _runtime_context_require_precommit_finish_order(
+                finish_order_projection = (
+                    _runtime_context_contract_worker_commit_projection(
+                    conn,
+                    project_id=project_id,
                     context=context,
-                    actual_head=actual_head,
+                    runtime_context_id=runtime_context_id_for_branch_context(context),
+                    revision_payload=latest_contract_revision,
+                    body=_sanitized_body,
                     source="parallel_branch.finish_gate.runtime_context_lane",
+                    )
                 )
+                if not finish_order_projection.get(
+                    "canonical_worker_commit_required"
+                ):
+                    finish_order_projection = (
+                        _runtime_context_require_precommit_finish_order(
+                            context=context,
+                            actual_head=actual_head,
+                            source=(
+                                "parallel_branch.finish_gate."
+                                "runtime_context_lane.legacy"
+                            ),
+                        )
+                    )
                 gate["finish_order_projection"] = finish_order_projection
+                gate["contract_worker_commit_evidence"] = finish_order_projection
             if actual_head and claimed_head and actual_head != claimed_head:
                 raise ValidationError("head_commit does not match assigned worktree HEAD")
             validated_head = actual_head or claimed_head or context.head_commit
             actual_changed_files: list[str] = []
             if worktree_path and os.path.exists(worktree_path) and context.base_commit:
                 try:
-                    if runtime_context_lane:
+                    if runtime_context_lane and not finish_order_projection.get(
+                        "canonical_worker_commit_required"
+                    ):
                         actual_changed_files = batch_jobs.git_changed_files_with_worktree(
                             worktree_path,
                             base_ref=context.base_commit,
@@ -40786,6 +41523,7 @@ _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES = (
         "implementation",
         "implementation",
     ),
+    ("worker_commit", "worker_commit", "worker_commit", "worker_commit"),
     (
         "worker_attestation",
         "worker_finish_time_attestation",
@@ -41128,6 +41866,24 @@ def _contract_runtime_projection_for_context(
         source = source_map.get(source_key)
         if not isinstance(source, Mapping) or not source.get("source_ref"):
             break
+        if line_id == "worker_commit":
+            source_ref = str(source.get("source_ref") or "")
+            projected_line_refs.append(
+                {
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "line_instance_id": f"runtime_context:{runtime_context_id}",
+                    "source_ref": source_ref,
+                    "completion_authoritative": False,
+                    "source_of_authority": (
+                        "ContractRuntime.completed_lines.worker_commit"
+                    ),
+                }
+            )
+            if source_ref and source_ref not in source_refs:
+                source_refs.append(source_ref)
+            continue
         line = _contract_runtime_projected_worker_line(
             record=record,
             context=context,
@@ -41916,6 +42672,13 @@ def _contract_runtime_projection_source_map(
             "head_commit": str(
                 timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""
             ),
+        },
+        "worker_commit": {
+            "source_ref": str(timeline_refs.get("worker_commit_event_ref") or ""),
+            "payload": dict(timeline_refs.get("worker_commit_payload") or {}),
+            "commit_sha": str(timeline_refs.get("worker_commit_sha") or ""),
+            "completion_authoritative": False,
+            "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
         },
         "finish_time_worker_attestation": {
             "source_ref": attestation_ref,
@@ -51764,6 +52527,7 @@ _CONTRACT_RUNTIME_CLOSE_EVENT_KIND_TOKENS = {
     "close_ready",
     "hotfix_under_action",
     "implementation",
+    "worker_commit",
     "independent_verification",
     "qa_verification",
     "verification",
@@ -52544,10 +53308,27 @@ def _contract_runtime_close_gate(
     event_kind: str,
     norm_payload: Mapping[str, Any],
     trusted_actor_role: str = "",
+    trusted_worker_commit_facade: bool = False,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body)
     if not contract_execution_id:
         return {}
+    if (
+        _contract_runtime_close_normalized(event_kind) == "worker_commit"
+        and not trusted_worker_commit_facade
+    ):
+        raise GovernanceError(
+            "contract_worker_commit_facade_required",
+            "worker_commit ContractRuntime writes require the canonical Runtime Context facade",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+                "timeline_append_authoritative": False,
+                "next_legal_action": "record_worker_commit",
+                "mcp_tool": "runtime_context_worker_commit",
+            },
+        )
     actor_role = _contract_runtime_close_actor_role(
         body,
         trusted_actor_role=trusted_actor_role,
@@ -52966,6 +53747,8 @@ def _contract_runtime_close_authority_event_kind(
         return "graph_query_trace", "worker_context", "passed"
     if evidence_kind == "implementation":
         return "implementation", "implementation", "accepted"
+    if evidence_kind == "worker_commit":
+        return "worker_commit", "worker_commit", "passed"
     if evidence_kind == "record_finish_time_worker_attestation":
         return "finish_time_worker_attestation", "worker_attestation", "passed"
     if evidence_kind == "mf_subagent_finish_gate":
@@ -52998,6 +53781,7 @@ def _contract_runtime_close_authority_requirement_ids(
         "mf_subagent_startup": ["mf_subagent_startup"],
         "graph_trace": ["worker_graph_trace", "mf_subagent_graph_trace"],
         "implementation": ["implementation", "worker_implementation_evidence"],
+        "worker_commit": ["worker_commit"],
         "record_finish_time_worker_attestation": ["finish_time_worker_attestation"],
         "mf_subagent_finish_gate": ["mf_subagent_finish_gate"],
         "review_ready": ["review_ready", "bounded_implementation_subagent.review_ready"],
@@ -53569,6 +54353,7 @@ def _contract_runtime_close_authority_timeline_line(
     mapping = {
         "implementation": ("worker_implementation", "implementation"),
         "worker_implementation": ("worker_implementation", "implementation"),
+        "worker_commit": ("worker_commit", "worker_commit"),
         "mf_subagent_finish_gate": ("worker_finish_gate", "mf_subagent_finish_gate"),
         "worker_finish_gate": ("worker_finish_gate", "mf_subagent_finish_gate"),
         "independent_verification": (
@@ -53939,11 +54724,12 @@ def _contract_runtime_close_authority_explicit_commit(
 
 _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER = {
     "worker_implementation": 10,
-    "worker_finish_gate": 20,
-    "qa_independent_verification": 30,
-    "observer_merge": 40,
-    "observer_reconcile": 50,
-    "observer_close_ready": 60,
+    "worker_commit": 20,
+    "worker_finish_gate": 30,
+    "qa_independent_verification": 40,
+    "observer_merge": 50,
+    "observer_reconcile": 60,
+    "observer_close_ready": 70,
 }
 
 
@@ -54145,6 +54931,13 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "close_commit_id": "contract_runtime.observer_close_ready_close_commit",
         },
     }
+    if str(record.get("contract_id") or "").strip() == "mf_parallel.v2":
+        required_specs["worker_commit"] = {
+            "line_ids": {"worker_commit"},
+            "evidence_kinds": {"worker_commit"},
+            "actor_roles": {"mf_sub"},
+            "missing_id": "contract_runtime.worker_commit",
+        }
     found: dict[str, dict[str, Any]] = {}
     rejected_by_requirement: dict[str, list[dict[str, Any]]] = {
         key: [] for key in required_specs
@@ -54186,12 +54979,31 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         if requirement_id not in found:
             missing.append(str(spec["missing_id"]))
 
-    ordering_pairs = [
-        (
-            "worker_implementation",
-            "worker_finish_gate",
-            "contract_runtime.worker_finish_after_implementation",
-        ),
+    ordering_pairs = []
+    if "worker_commit" in required_specs:
+        ordering_pairs.extend(
+            [
+                (
+                    "worker_implementation",
+                    "worker_commit",
+                    "contract_runtime.worker_commit_after_implementation",
+                ),
+                (
+                    "worker_commit",
+                    "worker_finish_gate",
+                    "contract_runtime.worker_finish_after_worker_commit",
+                ),
+            ]
+        )
+    else:
+        ordering_pairs.append(
+            (
+                "worker_implementation",
+                "worker_finish_gate",
+                "contract_runtime.worker_finish_after_implementation",
+            )
+        )
+    ordering_pairs.extend([
         (
             "worker_finish_gate",
             "qa_independent_verification",
@@ -54212,7 +55024,7 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "observer_close_ready",
             "contract_runtime.close_ready_after_reconcile",
         ),
-    ]
+    ])
     ordering_diagnostics: list[dict[str, Any]] = []
     for before, after, missing_id in ordering_pairs:
         before_line = found.get(before)
@@ -54232,6 +55044,27 @@ def _contract_runtime_mf_parallel_close_authority_gate(
 
     commit_mismatches: list[dict[str, Any]] = []
     commit_bridge_diagnostics: list[dict[str, Any]] = []
+    worker_commit_line = found.get("worker_commit")
+    worker_finish_line = found.get("worker_finish_gate")
+    if worker_commit_line and worker_finish_line:
+        recorded_worker_commit = _contract_runtime_close_authority_explicit_commit(
+            worker_commit_line
+        )
+        finish_commit = _contract_runtime_close_authority_explicit_commit(
+            worker_finish_line
+        )
+        if not recorded_worker_commit or finish_commit != recorded_worker_commit:
+            missing.append("contract_runtime.worker_finish_exact_worker_commit")
+            commit_mismatches.append(
+                {
+                    "requirement_id": "worker_finish_gate",
+                    "line_id": "worker_finish_gate",
+                    "expected_worker_commit": recorded_worker_commit,
+                    "actual_commit": finish_commit,
+                    "reason": "worker_finish_commit_mismatch",
+                    "source_ref": str(worker_finish_line.get("_source_ref") or ""),
+                }
+            )
     if close_commit:
         for requirement_id in (
             "observer_merge",
@@ -54305,6 +55138,9 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         "commit_bridge_diagnostics": commit_bridge_diagnostics,
         "checks": {
             "has_worker_implementation": "worker_implementation" in found,
+            "has_worker_commit": (
+                "worker_commit" in found if "worker_commit" in required_specs else True
+            ),
             "has_worker_finish_gate": "worker_finish_gate" in found,
             "has_independent_qa": "qa_independent_verification" in found,
             "has_observer_merge": "observer_merge" in found,

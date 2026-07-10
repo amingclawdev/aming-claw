@@ -373,6 +373,9 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     properties.update(
         {
             "task_id": {"type": "string"},
+            "contract_execution_id": {"type": "string"},
+            "implementation_event_ref": {"type": "string"},
+            "worker_commit_sha": {"type": "string"},
             "agent_id": {"type": "string"},
             "actual_host_worker_id": {
                 "type": "string",
@@ -2714,8 +2717,30 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "runtime_context_worker_commit",
+        "description": "Worker-authored canonical Runtime Context commit facade. Records the exact clean immutable HEAD in source-backed ContractRuntime after implementation evidence and before finish attestation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": _runtime_context_write_schema_properties(),
+            "required": [
+                "project_id",
+                "runtime_context_id",
+                "contract_execution_id",
+                "task_id",
+                "parent_task_id",
+                "worker_session_id",
+                "filer_principal",
+                "implementation_event_ref",
+                "worker_commit_sha",
+                "owned_files",
+                "changed_files",
+                "graph_trace_ids",
+            ],
+        },
+    },
+    {
         "name": "runtime_context_finish_time_worker_attestation",
-        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Must run before the worker git commit; runtime-context lanes block if the assigned row head already moved and no committed-branch evidence lane exists.",
+        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Consumes the exact source-backed ContractRuntime worker_commit and rejects later HEAD or worktree drift.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
@@ -2724,7 +2749,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_finish_gate",
-        "description": "Canonical Runtime Context finish-gate facade that records mf_subagent_finish_gate evidence before the worker git commit.",
+        "description": "Canonical Runtime Context finish-gate facade that consumes the exact ContractRuntime worker_commit after finish-time attestation.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
@@ -2886,7 +2911,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "parallel_branch_finish_gate",
-        "description": "Worker-facing wrapper to validate an mf_sub finish claim and record a fenced finish-gate checkpoint. Runtime-context workers must run it before git commit unless an explicit committed-branch evidence lane exists.",
+        "description": "Legacy/direct worker wrapper for a fenced finish-gate checkpoint. Runtime-context workers use runtime_context_worker_commit, then runtime_context_finish_time_worker_attestation and runtime_context_finish_gate.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4398,6 +4423,7 @@ class ToolDispatcher:
         if name in {
             "runtime_context_read_receipt",
             "runtime_context_implementation_evidence",
+            "runtime_context_worker_commit",
             "runtime_context_finish_time_worker_attestation",
             "runtime_context_finish_gate",
             "runtime_context_session_token_initial_join",
@@ -4409,6 +4435,7 @@ class ToolDispatcher:
             suffix_by_name = {
                 "runtime_context_read_receipt": "read-receipts",
                 "runtime_context_implementation_evidence": "implementation-evidence",
+                "runtime_context_worker_commit": "worker-commit",
                 "runtime_context_finish_time_worker_attestation": (
                     "finish-time-worker-attestation"
                 ),

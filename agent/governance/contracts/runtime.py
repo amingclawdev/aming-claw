@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
 import urllib.error
@@ -1896,6 +1897,7 @@ _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
         "worker_startup",
         "worker_graph_context",
         "worker_implementation",
+        "worker_commit",
         "worker_finish_time_attestation",
         "worker_finish_gate",
         "worker_review_ready_handoff",
@@ -1917,6 +1919,7 @@ _FAILED_QA_RETRY_SETUP_LINE_IDS = frozenset(
 _FAILED_QA_RETRY_PROOF_LINE_IDS = frozenset(
     {
         "worker_implementation",
+        "worker_commit",
         "worker_finish_time_attestation",
         "worker_finish_gate",
         "worker_review_ready_handoff",
@@ -2003,6 +2006,239 @@ _LINE_PAYLOAD_SCHEMA_BLOCKLIST = {
         }
     ),
 }
+
+
+_WORKER_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _worker_commit_mapping_candidates(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
+    if depth > 6:
+        return []
+    if isinstance(value, Mapping):
+        candidates: list[Mapping[str, Any]] = [value]
+        for child in value.values():
+            candidates.extend(_worker_commit_mapping_candidates(child, depth=depth + 1))
+        return candidates
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        candidates = []
+        for child in value:
+            candidates.extend(_worker_commit_mapping_candidates(child, depth=depth + 1))
+        return candidates
+    return []
+
+
+def _worker_commit_text(value: Any, *keys: str) -> str:
+    for candidate in _worker_commit_mapping_candidates(value):
+        for key in keys:
+            text = str(candidate.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _worker_commit_strings(value: Any, *keys: str) -> list[str]:
+    values: list[str] = []
+    for candidate in _worker_commit_mapping_candidates(value):
+        for key in keys:
+            raw = candidate.get(key)
+            if isinstance(raw, str):
+                items = [raw]
+            elif isinstance(raw, Sequence) and not isinstance(
+                raw,
+                (str, bytes, bytearray),
+            ):
+                items = list(raw)
+            else:
+                continue
+            for item in items:
+                text = str(item or "").strip()
+                if text and text not in values:
+                    values.append(text)
+    return values
+
+
+def _worker_commit_flag(value: Any, *keys: str) -> bool:
+    for candidate in _worker_commit_mapping_candidates(value):
+        for key in keys:
+            if key in candidate and _truthy_contract_flag(candidate.get(key)):
+                return True
+    return False
+
+
+def _worker_commit_completed_implementation(
+    record: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> Mapping[str, Any] | None:
+    for line in reversed(list(record.get("completed_lines") or [])):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "worker_implementation":
+            continue
+        line_runtime_context_id = _worker_commit_text(line, "runtime_context_id")
+        line_task_id = _worker_commit_text(line, "task_id")
+        if runtime_context_id and line_runtime_context_id != runtime_context_id:
+            continue
+        if task_id and line_task_id != task_id:
+            continue
+        return line
+    return None
+
+
+def _mf_parallel_worker_commit_errors(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    *,
+    actor_role: str,
+) -> tuple[str, ...]:
+    if str(write.get("line_id") or "").strip() != "worker_commit":
+        return ()
+    if _record_contract_id(record) not in {"mf_parallel", "mf_parallel.v2"}:
+        return ()
+
+    errors: list[str] = []
+    if actor_role != "mf_sub":
+        errors.append("worker_commit requires actor_role=mf_sub")
+    evidence_owner_role = _worker_commit_text(write, "evidence_owner_role", "worker_role")
+    if evidence_owner_role != "mf_sub":
+        errors.append("worker_commit requires mf_sub evidence ownership")
+    if _worker_commit_flag(write, "observer_impersonation", "filed_on_behalf", "on_behalf"):
+        errors.append("worker_commit rejects observer impersonation or on-behalf evidence")
+
+    required_text_fields = {
+        "runtime_context_id": ("runtime_context_id",),
+        "task_id": ("task_id",),
+        "parent_task_id": ("parent_task_id",),
+        "worker_id": ("worker_id",),
+        "worker_slot_id": ("worker_slot_id", "lane_id"),
+        "worker_session_id": ("worker_session_id",),
+        "actor_session_principal": ("actor_session_principal",),
+        "implementation_event_ref": ("implementation_event_ref",),
+        "target_project_root": ("target_project_root",),
+        "session_token_ref": ("session_token_ref", "evidence_owner_session_ref"),
+        "fence_token_hash": ("fence_token_hash",),
+    }
+    resolved: dict[str, str] = {}
+    for field, aliases in required_text_fields.items():
+        resolved[field] = _worker_commit_text(write, *aliases)
+        if not resolved[field]:
+            errors.append(f"worker_commit requires {field}")
+
+    commit_sha = str(write.get("commit_sha") or "").strip() or _worker_commit_text(
+        write,
+        "commit_sha",
+        "worker_commit_sha",
+    )
+    if not _WORKER_COMMIT_SHA_RE.fullmatch(commit_sha):
+        errors.append("worker_commit requires a full immutable commit_sha")
+    for field in ("head_commit", "immutable_head_commit", "validated_head_commit"):
+        value = _worker_commit_text(write, field)
+        if value != commit_sha:
+            errors.append(f"worker_commit {field} must equal commit_sha")
+
+    worker_session_id = resolved.get("worker_session_id", "")
+    if worker_session_id and resolved.get("actor_session_principal") != worker_session_id:
+        errors.append("worker_commit actor_session_principal must match worker_session_id")
+    filer_principal = _worker_commit_text(write, "filer_principal", "submitter_principal")
+    if filer_principal != worker_session_id:
+        errors.append("worker_commit filer_principal must match worker_session_id")
+
+    clean_worktree = _worker_commit_flag(write, "clean_worktree", "worktree_clean")
+    if not clean_worktree:
+        errors.append("worker_commit requires clean_worktree=true")
+    if _worker_commit_strings(write, "dirty_files", "worktree_status"):
+        errors.append("worker_commit rejects dirty worktree evidence")
+
+    changed_files = set(_worker_commit_strings(write, "changed_files"))
+    commit_diff_files = set(_worker_commit_strings(write, "commit_diff_files"))
+    owned_files = set(_worker_commit_strings(write, "owned_files"))
+    if not changed_files:
+        errors.append("worker_commit requires non-empty changed_files")
+    if changed_files != commit_diff_files:
+        errors.append("worker_commit changed_files must exactly match commit_diff_files")
+    if not owned_files:
+        errors.append("worker_commit requires owned_files")
+    out_of_fence = sorted(changed_files - owned_files)
+    if out_of_fence:
+        errors.append(f"worker_commit contains out-of-fence files: {out_of_fence!r}")
+
+    graph_trace_ids = set(
+        _worker_commit_strings(
+            write,
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "verified_trace_ids",
+        )
+    )
+    if not graph_trace_ids:
+        errors.append("worker_commit requires DB graph trace ids")
+    if not _worker_commit_flag(write, "db_verified"):
+        errors.append("worker_commit requires db_verified graph trace evidence")
+
+    implementation = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=resolved.get("runtime_context_id", ""),
+        task_id=resolved.get("task_id", ""),
+    )
+    if implementation is None:
+        errors.append("worker_commit requires matching worker_implementation lineage")
+    else:
+        implementation_changed_files = set(
+            _worker_commit_strings(implementation, "changed_files")
+        )
+        if implementation_changed_files != changed_files:
+            errors.append("worker_commit diff does not match worker_implementation changed_files")
+        implementation_graph_trace_ids = set(
+            _worker_commit_strings(
+                implementation,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+        if implementation_graph_trace_ids != graph_trace_ids:
+            errors.append("worker_commit graph traces do not match worker_implementation lineage")
+        for field in ("worker_id", "worker_slot_id"):
+            implementation_value = _worker_commit_text(implementation, field)
+            if implementation_value and implementation_value != resolved.get(field, ""):
+                errors.append(f"worker_commit {field} does not match worker_implementation")
+    return tuple(dict.fromkeys(errors))
+
+
+def _gate_decision_with_additional_errors(
+    decision: Any,
+    errors: Sequence[str],
+) -> Any:
+    if not errors:
+        return decision
+    return make_gate_decision(
+        action=str(getattr(decision, "action", "") or "submit_line"),
+        gate_id=str(getattr(decision, "gate_id", "") or "worker_commit_proof"),
+        errors=(*tuple(getattr(decision, "errors", ()) or ()), *tuple(errors)),
+        warnings=tuple(getattr(decision, "warnings", ()) or ()),
+        next_move=getattr(decision, "next_move", {}) or {},
+        gate_type=str(getattr(decision, "gate_type", "") or "line_proof"),
+        stage_id=str(getattr(decision, "stage_id", "") or ""),
+        line_id=str(getattr(decision, "line_id", "") or ""),
+        required_role=str(getattr(decision, "required_role", "") or ""),
+        actor_role=str(getattr(decision, "actor_role", "") or ""),
+        missing_lines=tuple(getattr(decision, "missing_lines", ()) or ()),
+        missing_proof_fields=tuple(getattr(decision, "missing_proof_fields", ()) or ()),
+        hash_status=getattr(decision, "hash_status", {}) or {},
+        graph_status=getattr(decision, "graph_status", {}) or {},
+        dirty_scope_status=getattr(decision, "dirty_scope_status", {}) or {},
+        imported_legacy_checks=tuple(getattr(decision, "imported_legacy_checks", ()) or ()),
+        projection_actions=tuple(getattr(decision, "projection_actions", ()) or ()),
+        policy_hash=str(getattr(decision, "policy_hash", "") or ""),
+        contract_definition_hash=str(
+            getattr(decision, "contract_definition_hash", "") or ""
+        ),
+        execution_state_revision=int(
+            getattr(decision, "execution_state_revision", 0) or 0
+        ),
+        runtime_guide_hash=str(getattr(decision, "runtime_guide_hash", "") or ""),
+    )
 
 
 def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
@@ -2992,6 +3228,14 @@ class ContractRuntime:
             )
             or gate_decision
         )
+        gate_decision = _gate_decision_with_additional_errors(
+            gate_decision,
+            _mf_parallel_worker_commit_errors(
+                gate_record,
+                effective_write,
+                actor_role=effective_actor_role,
+            ),
+        )
         if _line_write_declares_no_mutation_expected(effective_write):
             return {
                 "schema_version": "contract_runtime_write_result.v1",
@@ -3105,6 +3349,14 @@ class ContractRuntime:
                 gate_decision=gate_decision,
             )
             or gate_decision
+        )
+        gate_decision = _gate_decision_with_additional_errors(
+            gate_decision,
+            _mf_parallel_worker_commit_errors(
+                gate_record,
+                effective_write,
+                actor_role=effective_actor_role,
+            ),
         )
         return {
             "schema_version": "contract_runtime_line_write_precheck_result.v1",
@@ -3362,6 +3614,19 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "graph_trace_evidence",
     "target_project_root",
     "commit_sha",
+    "head_commit",
+    "immutable_head_commit",
+    "validated_head_commit",
+    "implementation_event_ref",
+    "worker_session_id",
+    "filer_principal",
+    "session_token_ref",
+    "fence_token_hash",
+    "owned_files",
+    "changed_files",
+    "commit_diff_files",
+    "clean_worktree",
+    "dirty_files",
     "actor_session_principal",
     "evidence_owner_actor",
     "evidence_owner_role",

@@ -122,9 +122,10 @@ def test_mf_parallel_v2_qa_graph_context_guides_exact_graph_evidence_shape() -> 
             {"id": 4, "event_kind": "mf_subagent_startup"},
             {"id": 5, "event_kind": "graph_trace"},
             {"id": 6, "event_kind": "implementation"},
-            {"id": 7, "event_kind": "record_finish_time_worker_attestation"},
-            {"id": 8, "event_kind": "mf_subagent_finish_gate"},
-            {"id": 9, "event_kind": "review_ready"},
+            {"id": 7, "event_kind": "worker_commit"},
+            {"id": 8, "event_kind": "record_finish_time_worker_attestation"},
+            {"id": 9, "event_kind": "mf_subagent_finish_gate"},
+            {"id": 10, "event_kind": "review_ready"},
         ],
         contract={
             "contract": {
@@ -1649,6 +1650,7 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     ]
     assert implementation_step["evidence_to_file"] == [
         "implementation_evidence",
+        "worker_commit_evidence",
         "finish_time_worker_attestation",
         "finish_gate",
         "verification_or_test_results",
@@ -1665,18 +1667,22 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "agent/governance/parallel_branch_runtime.py"
     ]
     assert "merge" in read_action["worker_constraints"]["blocked_actions"]
-    assert "git_commit_before_finish_gate" in read_action["worker_constraints"][
+    assert "finish_without_contract_worker_commit" in read_action["worker_constraints"][
         "blocked_actions"
     ]
-    assert "emit_git_commit_directive_before_finish_gate" in read_action[
+    assert "observer_authored_worker_commit" in read_action[
         "worker_constraints"
     ]["blocked_actions"]
     finish_order_rule = read_action["worker_constraints"][
         "mf_parallel_happy_path_reminders"
-    ]["worker_rules"]["finish_gate_before_git_commit"]
-    assert finish_order_rule["worker_final_must_not_commit_before_finish_gate"] is True
-    assert "::git-commit final directive" in finish_order_rule[
-        "forbidden_before_finish_gate"
+    ]["worker_rules"]["contract_canonical_worker_commit"]
+    assert finish_order_rule["source_of_authority"] == "ContractRuntime.worker_commit"
+    assert finish_order_rule["sequence"] == [
+        "implementation_evidence",
+        "git_commit",
+        "worker_commit_evidence",
+        "finish_time_worker_attestation",
+        "finish_gate",
     ]
     finish_proof_rule = read_action["worker_constraints"][
         "mf_parallel_happy_path_reminders"
@@ -7796,7 +7802,14 @@ def test_runtime_context_projects_validated_missing_durable_merge_queue_item() -
         "queue_item_id": "mq-durable-missing:mf-sub-durable-missing",
         "target_ref": "refs/heads/main",
         "current_target_head": "target-runtime-context",
+        "validated_target_head": "target-runtime-context",
+        "merge_preview_id": "mp-runtime-context",
         "checkpoint_id": "ckpt-durable-missing",
+        "finish_gate_ref": "timeline:finish-mf-sub-durable-missing",
+        "verification_event_refs": ["timeline:qa-mf-sub-durable-missing"],
+        "graph_trace_ids": ["gqt-mf-sub-durable-missing"],
+        "route_action_precheck_event_ref": "timeline:route-mf-sub-durable-missing",
+        "close_ready_event_ref": "timeline:close-mf-sub-durable-missing",
         "require_finish_gate": True,
         "worker_role": "mf_sub",
         "status": "queued_for_merge",

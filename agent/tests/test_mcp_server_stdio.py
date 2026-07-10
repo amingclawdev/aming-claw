@@ -99,6 +99,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         "mf_parallel_enter",
         "mf_batch_parallel_enter",
         "runtime_context_implementation_evidence",
+        "runtime_context_worker_commit",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
         "runtime_context_session_token_initial_join",
@@ -210,6 +211,14 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
         {**common, "changed_files": ["src/app.js"]},
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_commit",
+        {
+            **common,
+            "contract_execution_id": "cex-demo",
+            "worker_commit_sha": "a" * 40,
+        },
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
         "runtime_context_finish_time_worker_attestation",
         {**common, "graph_trace_ids": ["gqt-demo"]},
     )["ok"] is True
@@ -241,6 +250,17 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "session_token": "worker-session",
                 "fence_token": "fence-demo",
                 "changed_files": ["src/app.js"],
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/demo/runtime-contexts/mfrctx-demo/worker-commit",
+            {
+                "runtime_context_id": "mfrctx-demo",
+                "session_token": "worker-session",
+                "fence_token": "fence-demo",
+                "contract_execution_id": "cex-demo",
+                "worker_commit_sha": "a" * 40,
             },
         ),
         (

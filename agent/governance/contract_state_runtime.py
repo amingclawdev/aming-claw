@@ -38,6 +38,7 @@ _DEFAULT_REQUIREMENT_ORDER = {
     "graph_trace": 450,
     "implementation": 500,
     "worker_implementation": 500,
+    "worker_commit": 525,
     "record_finish_time_worker_attestation": 550,
     "finish_gate": 600,
     "independent_verification_lane": 700,
@@ -322,6 +323,7 @@ _META_CONTRACT_ALLOWED_ACTIONS_BY_ROLE = {
         "finish_gate",
         "record_finish_time_worker_attestation",
         "implementation",
+        "worker_commit",
         "review_ready",
         "worker_progress",
         "patch",
@@ -437,6 +439,7 @@ _WORKER_TIMELINE_EVENT_KINDS = {
     "read_receipt",
     "record_finish_time_worker_attestation",
     "review_ready",
+    "worker_commit",
     "worker_progress",
 }
 
@@ -2401,12 +2404,27 @@ def _mf_parallel_default_requirements(
         return requirements
 
     for requirement in requirements:
+        if requirement.get("id") == "worker_finish_time_attestation":
+            requirement["requires"] = ["worker_commit"]
         if requirement.get("id") == "qa_independent_verification":
             requirement["requires"] = ["qa_graph_context"]
             requirement["order"] = 720
 
     requirements.extend(
         [
+            {
+                "id": "worker_commit",
+                "action": "record_worker_commit",
+                "detail": (
+                    "mf_sub worker records the exact clean implementation commit "
+                    "for the active runtime, task, session, graph traces, and owned diff"
+                ),
+                "accepted_event_kinds": ["worker_commit"],
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+                "requires": ["worker_implementation"],
+                "order": 525,
+            },
             {
                 "id": "worker_review_ready_handoff",
                 "action": "record_worker_review_ready_handoff",
@@ -2908,11 +2926,26 @@ def _completed_requirement_sources(
     completed_sources: dict[str, dict[str, Any]] = {}
     for requirement in requirements:
         requirement_id = str(requirement.get("id") or "")
+        prerequisite_ids = _string_list(requirement.get("prerequisite_ids"))
+        prerequisite_sources = [
+            completed_sources.get(prerequisite_id)
+            for prerequisite_id in prerequisite_ids
+        ]
+        if any(not isinstance(source, Mapping) for source in prerequisite_sources):
+            continue
+        prerequisite_event_ids = [
+            _event_numeric_id(source)
+            for source in prerequisite_sources
+            if isinstance(source, Mapping)
+        ]
+        prerequisite_event_id = max(prerequisite_event_ids, default=0)
         best_source: dict[str, Any] | None = None
         best_event_id = 0
         requires_fresh_qa = _requirement_needs_fresh_qa(requirement)
         for event in events:
             event_id = _event_numeric_id(event)
+            if prerequisite_event_id and event_id and event_id <= prerequisite_event_id:
+                continue
             if (
                 requires_fresh_qa
                 and latest_implementation_event_id
@@ -2923,7 +2956,11 @@ def _completed_requirement_sources(
             matched, source = _event_satisfies_requirement(event, requirement)
             if not (matched and source):
                 continue
-            if best_source is None or event_id >= best_event_id:
+            if (
+                best_source is None
+                or (prerequisite_ids and event_id < best_event_id)
+                or (not prerequisite_ids and event_id >= best_event_id)
+            ):
                 best_source = dict(source)
                 best_event_id = event_id
         if best_source:
