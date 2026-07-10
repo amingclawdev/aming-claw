@@ -71,7 +71,7 @@ def register(
 
     # Check for duplicate active session with different role in same project
     existing = conn.execute(
-        "SELECT session_id, role FROM sessions WHERE principal_id = ? AND project_id = ? AND status = 'active'",
+        "SELECT session_id, role, token_hash FROM sessions WHERE principal_id = ? AND project_id = ? AND status = 'active'",
         (principal_id, project_id),
     ).fetchone()
     if existing and existing["role"] != role_enum.value:
@@ -85,12 +85,27 @@ def register(
         now = _utc_iso()
         ttl_delta, redis_ttl = _ttl_for_role(role_enum)
         expires = (datetime.now(timezone.utc) + ttl_delta).strftime("%Y-%m-%dT%H:%M:%SZ")
-        conn.execute(
-            "UPDATE sessions SET token_hash = ?, expires_at = ? WHERE session_id = ?",
-            (token_hash, expires, existing["session_id"]),
-        )
+        if scope is None:
+            conn.execute(
+                "UPDATE sessions SET token_hash = ?, expires_at = ? WHERE session_id = ?",
+                (token_hash, expires, existing["session_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET token_hash = ?, expires_at = ?, scope_json = ? "
+                "WHERE session_id = ?",
+                (
+                    token_hash,
+                    expires,
+                    json.dumps(scope),
+                    existing["session_id"],
+                ),
+            )
         # Update Redis cache
         rc = get_redis()
+        rc.invalidate_session(existing["session_id"])
+        if existing["token_hash"]:
+            rc.delete(f"token:{existing['token_hash']}")
         session_data = dict(conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (existing["session_id"],)
         ).fetchone())
@@ -102,8 +117,10 @@ def register(
             "principal_id": principal_id,
             "project_id": project_id,
             "role": role_enum.value,
+            "scope": json.loads(session_data.get("scope_json") or "[]"),
             "token": token,
             "refreshed": True,
+            "expires_at": expires,
         }
 
     # Create new session

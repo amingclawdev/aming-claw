@@ -19865,6 +19865,72 @@ def test_qa_role_assignment_derives_exact_candidate_scope_binding(conn):
     assert json.loads(stored["scope_json"]) == result["scope"]
 
 
+def test_qa_role_assignment_rejects_caller_authority_and_refreshes_scope(conn):
+    principal_id = "qa:noether"
+    first = {
+        "project_id": PID,
+        "principal_id": principal_id,
+        "role": "qa",
+        "scope": ["read:graph"],
+        "backlog_id": "AC-QA-FIRST",
+        "task_id": "qa-first-task",
+        "commit_sha": "1" * 40,
+    }
+    _, registered = server.handle_role_assign(
+        _ctx_with_role({}, "coordinator", method="POST", body=first)
+    )
+
+    forged = dict(first)
+    forged["scope"] = [
+        "backlog:AC-FORGED",
+        "task:forged-task",
+        f"commit:{'f' * 40}",
+        "qa_scope:sha256:caller-controlled",
+    ]
+    with pytest.raises(ValidationError, match="server-derived"):
+        server.handle_role_assign(
+            _ctx_with_role({}, "coordinator", method="POST", body=forged)
+        )
+
+    missing_tuple = dict(first)
+    missing_tuple.pop("commit_sha")
+    with pytest.raises(ValidationError, match="full commit_sha"):
+        server.handle_role_assign(
+            _ctx_with_role({}, "coordinator", method="POST", body=missing_tuple)
+        )
+
+    second = {
+        **first,
+        "scope": ["read:graph", "run:tests"],
+        "backlog_id": "AC-QA-SECOND",
+        "task_id": "qa-second-task",
+        "commit_sha": "2" * 40,
+    }
+    _, refreshed = server.handle_role_assign(
+        _ctx_with_role({}, "coordinator", method="POST", body=second)
+    )
+
+    assert refreshed["session_id"] == registered["session_id"]
+    assert refreshed["scope"] == [
+        "read:graph",
+        "run:tests",
+        "backlog:AC-QA-SECOND",
+        "task:qa-second-task",
+        f"commit:{'2' * 40}",
+        server._qa_scope_binding_ref(
+            project_id=PID,
+            backlog_id="AC-QA-SECOND",
+            task_id="qa-second-task",
+            commit_sha="2" * 40,
+        ),
+    ]
+    stored = conn.execute(
+        "SELECT scope_json FROM sessions WHERE session_id = ?",
+        (registered["session_id"],),
+    ).fetchone()
+    assert json.loads(stored["scope_json"]) == refreshed["scope"]
+
+
 def test_bounded_qa_session_rejects_scope_impersonation_and_non_qa_actions(conn):
     backlog_id = "AC-BOUNDED-QA-REJECTIONS"
     task_id = "bounded-qa-rejections-task"

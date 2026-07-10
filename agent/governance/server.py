@@ -4942,11 +4942,14 @@ def handle_role_assign(ctx: RequestContext):
     with DBContext(project_id) as conn:
         session = ctx.require_auth(conn)
         role = str(ctx.body.get("role") or "").strip().lower()
-        scope = list(ctx.body.get("scope") or [])
-        if role == "qa" and any(
-            ctx.body.get(key)
-            for key in ("backlog_id", "task_id", "commit_sha")
+        raw_scope = ctx.body.get("scope")
+        if raw_scope is not None and (
+            not isinstance(raw_scope, list)
+            or any(not isinstance(item, str) for item in raw_scope)
         ):
+            raise ValidationError("role assignment scope must be a list of strings")
+        scope = [item.strip() for item in (raw_scope or []) if item.strip()]
+        if role == "qa":
             backlog_id = str(ctx.body.get("backlog_id") or "").strip()
             task_id = str(ctx.body.get("task_id") or "").strip()
             commit_sha = str(ctx.body.get("commit_sha") or "").strip().lower()
@@ -4956,6 +4959,18 @@ def handle_role_assign(ctx: RequestContext):
                 raise ValidationError(
                     "bounded QA role assignment requires backlog_id, task_id, "
                     "and full commit_sha"
+                )
+            reserved_scope = [
+                item
+                for item in scope
+                if item.lower().startswith(
+                    ("backlog:", "task:", "commit:", "qa_scope:")
+                )
+            ]
+            if reserved_scope:
+                raise ValidationError(
+                    "bounded QA authority scope is server-derived; caller scope "
+                    "cannot contain backlog:, task:, commit:, or qa_scope: refs"
                 )
             scope.extend(
                 [

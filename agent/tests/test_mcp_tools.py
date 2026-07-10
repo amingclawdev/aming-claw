@@ -1679,6 +1679,15 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
     assert "qa_session_token" in _tool_properties("graph_query")
     assert "qa_session_token" in _tool_properties("task_timeline_append")
+    qa_register = next(
+        tool for tool in TOOLS if tool.get("name") == "qa_session_register"
+    )
+    assert set(qa_register["inputSchema"]["required"]) == {
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "commit_sha",
+    }
     for tool_name in (
         "onboard_contract_submit_line",
         "contract_add_current",
@@ -1706,7 +1715,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         {
             "project_id": "aming-claw",
             "principal_id": "qa:hooke",
-            "scope": ["backlog:AC-QA"],
+            "scope": ["read:graph"],
             "backlog_id": "AC-QA",
             "task_id": "qa-task",
             "commit_sha": "a" * 40,
@@ -1801,7 +1810,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
                 "project_id": "aming-claw",
                 "principal_id": "qa:hooke",
                 "role": "qa",
-                "scope": ["backlog:AC-QA"],
+                "scope": ["read:graph"],
                 "backlog_id": "AC-QA",
                 "task_id": "qa-task",
                 "commit_sha": "a" * 40,

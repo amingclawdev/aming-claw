@@ -1171,7 +1171,7 @@ TOOLS: list[dict] = [
                 "scope": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional bounded QA scope such as backlog or contract execution ids.",
+                    "description": "Optional non-authority QA capabilities; canonical backlog/task/commit refs are server-derived.",
                 },
                 "backlog_id": {
                     "type": "string",
@@ -1186,7 +1186,7 @@ TOOLS: list[dict] = [
                     "description": "Bounded QA full candidate commit; server derives the canonical tuple binding.",
                 },
             },
-            "required": ["project_id"],
+            "required": ["project_id", "backlog_id", "task_id", "commit_sha"],
         },
     },
     {
