@@ -28702,6 +28702,40 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "target_head_after_merge": close_commit[:8],
         },
     )
+    runtime = server._contract_runtime(conn)
+    stored_with_merge = runtime.store.get(contract_execution_id)
+    persisted_merge = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": contract_execution_id,
+        "status": "passed",
+        "commit_sha": close_commit[:8],
+        "payload": {
+            "source_backed": True,
+            "source_ref": f"timeline:{merge_event['id']}",
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
+        },
+        "artifact_refs": {
+            "source_ref": f"timeline:{merge_event['id']}",
+            "timeline_event_ref": f"timeline:{merge_event['id']}",
+        },
+    }
+    stored_with_merge["completed_lines"].append(persisted_merge)
+    stored_with_merge["runtime_guide"]["completed_lines"] = list(
+        stored_with_merge["completed_lines"]
+    )
+    runtime.store.update(
+        contract_execution_id,
+        stored_with_merge,
+        expected_revision=int(stored_with_merge["execution_state_revision"]),
+    )
     reconcile_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -28756,6 +28790,23 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "completed_lines_projection"
         ]["projected_completed_lines"]
     }
+    projected_completed_lines = projected_after_timeline["runtime_guide"][
+        "completed_lines_projection"
+    ]["projected_completed_lines"]
+    context_line_ids = [
+        line["line_id"]
+        for line in projected_completed_lines
+        if line.get("line_instance_id")
+        == f"runtime_context:{runtime_context.runtime_context_id}"
+    ]
+    assert context_line_ids.index("qa_independent_verification") < context_line_ids.index(
+        "observer_merge"
+    )
+    assert context_line_ids[-3:] == [
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    ]
     assert {
         "qa_graph_context",
         "qa_independent_verification",
@@ -28782,12 +28833,17 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     }
     assert projected_refs["qa_independent_verification"] == f"timeline:{qa_event['id']}"
     assert projected_refs["qa_independent_verification"] != f"timeline:{qa_decoy_id}"
-    assert projected_refs["observer_merge"] == f"timeline:{merge_event['id']}"
+    assert "observer_merge" not in projected_refs
     assert projected_refs["observer_reconcile"] == f"timeline:{reconcile_event['id']}"
     assert projected_refs["observer_close_ready"] == f"timeline:{close_ready_event['id']}"
 
     stored = server._contract_runtime_store(conn).get(contract_execution_id)
     stored_line_ids = {line["line_id"] for line in stored["completed_lines"]}
+    assert "observer_merge" in stored_line_ids
+    stored_merge = next(
+        line for line in stored["completed_lines"] if line["line_id"] == "observer_merge"
+    )
+    assert stored_merge["artifact_refs"]["source_ref"] == f"timeline:{merge_event['id']}"
     assert "observer_close_ready" not in stored_line_ids
     assert "qa_independent_verification" not in stored_line_ids
     assert "worker_read_runtime_guide" not in stored_line_ids

@@ -40952,20 +40952,56 @@ def _contract_runtime_merge_projected_completed_lines(
         for context_key in _contract_runtime_line_context_keys(line):
             projected_by_context.setdefault(context_key, []).append(index)
 
+    deferred_by_merge: dict[int, list[int]] = {}
+    merge_anchors = [
+        (index, line)
+        for index, line in enumerate(completed)
+        if str(line.get("line_id") or "").strip() == "observer_merge"
+    ]
+    for projected_index, line in enumerate(projected):
+        if str(line.get("line_id") or "").strip() not in {
+            "observer_reconcile",
+            "observer_close_ready",
+        }:
+            continue
+        line_instance_id = str(line.get("line_instance_id") or "").strip()
+        context_keys = _contract_runtime_line_context_keys(line)
+        for merge_index, merge_line in merge_anchors:
+            merge_instance_id = str(
+                merge_line.get("line_instance_id") or ""
+            ).strip()
+            merge_context_keys = _contract_runtime_line_context_keys(merge_line)
+            if (
+                (line_instance_id and line_instance_id == merge_instance_id)
+                or bool(context_keys.intersection(merge_context_keys))
+                or (not merge_instance_id and not merge_context_keys)
+            ):
+                deferred_by_merge.setdefault(merge_index, []).append(projected_index)
+                break
+    deferred = {
+        projected_index
+        for projected_indexes in deferred_by_merge.values()
+        for projected_index in projected_indexes
+    }
+
     merged: list[Mapping[str, Any]] = []
     inserted: set[int] = set()
-    for line in completed:
+    for completed_index, line in enumerate(completed):
         merged.append(line)
-        if str(line.get("line_id") or "").strip() != (
+        if str(line.get("line_id") or "").strip() == (
             "observer_dispatch_bounded_workers"
         ):
-            continue
-        for context_key in _contract_runtime_line_context_keys(line):
-            for projected_index in projected_by_context.get(context_key, []):
-                if projected_index in inserted:
-                    continue
-                merged.append(projected[projected_index])
-                inserted.add(projected_index)
+            for context_key in _contract_runtime_line_context_keys(line):
+                for projected_index in projected_by_context.get(context_key, []):
+                    if projected_index in inserted or projected_index in deferred:
+                        continue
+                    merged.append(projected[projected_index])
+                    inserted.add(projected_index)
+        for projected_index in deferred_by_merge.get(completed_index, []):
+            if projected_index in inserted:
+                continue
+            merged.append(projected[projected_index])
+            inserted.add(projected_index)
     for index, line in enumerate(projected):
         if index not in inserted:
             merged.append(line)
