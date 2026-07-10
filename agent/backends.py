@@ -911,9 +911,45 @@ def run_via_api(
     model = (model_override or get_claude_model()).strip()
     provider = (provider_override or get_model_provider()).strip().lower()
     prompt = prompt_override if prompt_override is not None else build_claude_prompt(task)
-    provider = provider if provider in {"openai", "anthropic"} else "anthropic"
+    if provider not in {"openai", "anthropic"}:
+        raise ValueError(
+            "API invocation requires an explicit openai or anthropic provider"
+        )
+    if not model:
+        model = "gpt-4o" if provider == "openai" else "claude-sonnet-4-6"
     backend_mode = BACKEND_OPENAI_API if provider == "openai" else BACKEND_ANTHROPIC_API
+    try:
+        from pipeline_config import validate_invocation_routing
+    except ImportError:  # pragma: no cover - package import path
+        from agent.pipeline_config import validate_invocation_routing
+    routing_errors = validate_invocation_routing(
+        provider=provider,
+        model=model,
+        backend_mode=backend_mode,
+        auth_mode="api_key_env",
+    )
+    if routing_errors:
+        raise ValueError("Invalid API invocation routing: " + "; ".join(routing_errors))
     workspace = resolve_workspace()
+    evidence_refs = []
+    raw_evidence_refs = task.get("evidence_refs", []) or []
+    if isinstance(raw_evidence_refs, str):
+        raw_evidence_refs = [raw_evidence_refs]
+    for value in raw_evidence_refs:
+        if str(value).strip():
+            evidence_refs.append(str(value).strip())
+    for kind, value in (
+        ("task", task.get("id") or task.get("task_id")),
+        ("backlog", task.get("backlog_id")),
+        ("runtime_context", task.get("runtime_context_id")),
+    ):
+        if value:
+            evidence_refs.append("{}:{}".format(kind, value))
+    try:
+        from ai_lifecycle import AILifecycleManager, sanitize_evidence_refs
+    except ImportError:  # pragma: no cover - package import path
+        from agent.ai_lifecycle import AILifecycleManager, sanitize_evidence_refs
+    evidence_refs = sanitize_evidence_refs(evidence_refs)
     request = AIInvocationRequest(
         role=str(task.get("role") or task.get("type") or "task"),
         provider=provider,
@@ -921,17 +957,28 @@ def run_via_api(
         backend_mode=backend_mode,
         cwd=str(workspace),
         prompt=prompt,
-        timeout_sec=120,
+        timeout_sec=int(task.get("timeout_sec") or 120),
         auth_mode="api_key_env",
+        output_policy=str(task.get("output_policy") or "hash_and_summary_only"),
         route=RoutePromptContract.from_mapping(task),
+        metadata={
+            "worktree": str(task.get("worktree") or task.get("worktree_path") or workspace),
+            "evidence_refs": evidence_refs,
+        },
     )
     result = invoke_ai(request)
     completed = result.status == "completed" and result.returncode == 0
+    invocation_evidence = AILifecycleManager.invocation_result_evidence(result)
+    persisted_error = (
+        "AI invocation failed ({})".format(result.auth_status or "unknown")
+        if not completed
+        else ""
+    )
     return {
         "stdout": result.output_text if completed else "",
-        "stderr": "" if completed else result.error,
+        "stderr": persisted_error,
         "last_message": result.output_text if completed else "",
-        "returncode": 0 if completed else 1,
+        "returncode": 0 if completed else int(result.returncode or 1),
         "elapsed_ms": result.elapsed_ms,
         "cmd": result.command or ["api", provider, model],
         "timeout_retries": 0,
@@ -940,7 +987,7 @@ def run_via_api(
         "attempt_tag": "api",
         "noop_reason": None,
         "attempt_count": 1,
-        "ai_invocation": result.to_evidence(),
+        "ai_invocation": invocation_evidence,
     }
 
 
@@ -1096,7 +1143,7 @@ def _load_pipeline_provider_config() -> Dict:
         return config
     except ValueError as exc:
         logger.error("[Pipeline] %s", t("log.pipeline_config_failed", err=exc))
-        return {}
+        raise
     except Exception as exc:
         logger.debug("[Pipeline] %s", t("log.pipeline_config_debug", err=exc))
         return {}

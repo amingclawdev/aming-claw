@@ -40,6 +40,7 @@ try:
         runtime_context_id_for_branch_context,
         runtime_context_session_token_ref,
     )
+    from pipeline_config import BACKEND_AUTH_MODE
 except ImportError:  # pragma: no cover - package import path
     from agent.ai_invocation import (
         BACKEND_CLAUDE_CLI,
@@ -64,6 +65,7 @@ except ImportError:  # pragma: no cover - package import path
         runtime_context_id_for_branch_context,
         runtime_context_session_token_ref,
     )
+    from agent.pipeline_config import BACKEND_AUTH_MODE
 else:  # pragma: no cover - direct module import path
     from ai_invocation import BACKEND_CLAUDE_CLI, BACKEND_CODEX_CLI, BACKEND_DOCKER_LIVE_AI
 
@@ -124,6 +126,8 @@ OBSERVER_POLL_TIMELINE_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
     "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
     "visible_injection_manifest_hash",
 )
 OBSERVER_POLL_TIMELINE_FLAG_FIELDS = (
@@ -534,7 +538,17 @@ def build_observer_poll_loop_metadata(config: ObserverPollLoopConfig) -> dict[st
     }
 
 
-def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
+def observer_invocation_auth_mode(backend_mode: str) -> str:
+    """Return the auth contract owned by the effective invocation backend."""
+
+    return str(BACKEND_AUTH_MODE.get(str(backend_mode or "").strip().lower()) or "")
+
+
+def validate_observer_run_request(
+    request: ObserverRunRequest,
+    *,
+    require_launch_identity: bool = False,
+) -> list[str]:
     missing: list[str] = []
     if not request.project_id:
         missing.append("project_id")
@@ -544,10 +558,16 @@ def validate_observer_run_request(request: ObserverRunRequest) -> list[str]:
         missing.append("route_context_hash")
     if not request.route.prompt_contract_id:
         missing.append("prompt_contract_id")
+    if require_launch_identity and not request.route.prompt_contract_hash:
+        missing.append("prompt_contract_hash")
+    if require_launch_identity and not request.route.route_token_ref:
+        missing.append("route_token_ref")
     if not request.provider:
         missing.append("provider")
     if not request.backend_mode:
         missing.append("backend_mode")
+    elif not observer_invocation_auth_mode(request.backend_mode):
+        missing.append("auth_mode")
     return missing
 
 
@@ -2272,7 +2292,7 @@ def build_observer_invocation_request(request: ObserverRunRequest) -> AIInvocati
         cwd=workspace,
         prompt=build_observer_prompt(request),
         timeout_sec=request.timeout_sec,
-        auth_mode="cli_auth" if request.backend_mode.endswith("_cli") else "api_key_env",
+        auth_mode=observer_invocation_auth_mode(request.backend_mode),
         route=request.route,
         metadata=metadata,
         env={str(key): str(value) for key, value in request.env.items()},
@@ -8120,6 +8140,22 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
                 "backlog_id": request.backlog_id,
                 "execute": execute,
                 "missing": execution_gate.get("missing") or [],
+                "one_hop_execution_gate": execution_gate,
+                "invocation_request": invocation_request.to_evidence(),
+            }
+        launch_missing = validate_observer_run_request(
+            request,
+            require_launch_identity=request.backend_mode != "fixture",
+        )
+        if launch_missing:
+            return {
+                "ok": False,
+                "schema_version": OBSERVER_RUN_SCHEMA_VERSION,
+                "status": "rejected",
+                "project_id": request.project_id,
+                "backlog_id": request.backlog_id,
+                "execute": execute,
+                "missing": launch_missing,
                 "one_hop_execution_gate": execution_gate,
                 "invocation_request": invocation_request.to_evidence(),
             }

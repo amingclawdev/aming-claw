@@ -20391,7 +20391,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
         task_id="worker-runtime-initial-join-renewed",
         target_files=["agent/governance/server.py"],
         allowed_actions=["task_timeline_append"],
-        now=datetime(2026, 7, 7, 18, 0, tzinfo=timezone.utc),
+        now=datetime(2099, 7, 7, 18, 0, tzinfo=timezone.utc),
         evidence_refs=["test:original-route-token-ref"],
     )
     old_ref = old_issue["route_token_ref"]
@@ -20454,7 +20454,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
         allowed_actions=["task_timeline_append"],
         target_files=["agent/governance/server.py"],
         ttl_hours=48.0,
-        now=datetime(2026, 7, 7, 18, 10, tzinfo=timezone.utc),
+        now=datetime(2099, 7, 7, 18, 10, tzinfo=timezone.utc),
         evidence_refs=["test:real-renewal"],
     )
     renewed_ref = renewed["route_token_ref"]
@@ -20503,7 +20503,7 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
                 **renewed_identity,
                 "reason": "host adapter needs first worker auth env after observer renewal",
                 "ttl_seconds": 1200,
-                "now_iso": "2026-07-07T18:00:00Z",
+                "now_iso": "2099-07-07T18:00:00Z",
             },
         )
     )
@@ -21204,9 +21204,14 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
     assert action_plan["next_required_evidence"][0]["id"] == "failed_qa_revision"
 
 
+@pytest.mark.parametrize(
+    "qa_status",
+    ["failed", "accepted_with_known_baseline_failure"],
+)
 def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_failed_qa(
     conn,
     tmp_path,
+    qa_status,
 ):
     backlog_id = "AC-RUNTIME-TOKEN-REJOIN-CONTRACT-FAILED-QA"
     target_root = tmp_path / "runtime-token-rejoin-contract-failed-qa"
@@ -21300,6 +21305,38 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         )
     assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
 
+    qa_payload = {
+        "status": qa_status,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "summary": (
+            "Independent QA failed in ContractRuntime without a "
+            "failed timeline event."
+        ),
+    }
+    qa_verification = {
+        "result": "failed",
+        "verdict": "fail",
+        "acceptance_failed": ["contract_runtime_failed_qa_revision"],
+    }
+    if qa_status == "accepted_with_known_baseline_failure":
+        qa_payload.update(
+            {
+                "summary": (
+                    "Independent QA accepted the row diff with a known "
+                    "baseline failure outside the worker scope."
+                ),
+                "failed_count": 1,
+                "full_suite_green": False,
+            }
+        )
+        qa_verification = {
+            "result": qa_status,
+            "failed_count": 1,
+            "full_suite_green": False,
+        }
+
     qa_result = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -21309,26 +21346,13 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                 "stage_id": "qa",
                 "line_id": "qa_independent_verification",
                 "evidence_kind": "independent_verification",
-                "status": "failed",
+                "status": qa_status,
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
                 "parent_task_id": backlog_id,
                 "worker_role": "mf_sub",
-                "payload": {
-                    "status": "failed",
-                    "runtime_context_id": runtime_context.runtime_context_id,
-                    "task_id": runtime_context.task_id,
-                    "parent_task_id": backlog_id,
-                    "summary": (
-                        "Independent QA failed in ContractRuntime without a "
-                        "failed timeline event."
-                    ),
-                },
-                "verification": {
-                    "result": "failed",
-                    "verdict": "fail",
-                    "acceptance_failed": ["contract_runtime_failed_qa_revision"],
-                },
+                "payload": qa_payload,
+                "verification": qa_verification,
             },
         )
     )
@@ -21363,6 +21387,9 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert result["reopen_for_revision"] is True
     assert result["contract_runtime_failed_qa_revision"]["contract_execution_id"] == (
         successor["contract_execution_id"]
+    )
+    assert result["contract_runtime_failed_qa_revision"]["failed_qa_status"] == (
+        qa_status
     )
     assert result["previous_status"] == STATE_VALIDATED
     assert result["current_status"] == STATE_WORKTREE_READY
@@ -28675,6 +28702,40 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "target_head_after_merge": close_commit[:8],
         },
     )
+    runtime = server._contract_runtime(conn)
+    stored_with_merge = runtime.store.get(contract_execution_id)
+    persisted_merge = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": contract_execution_id,
+        "status": "passed",
+        "commit_sha": close_commit[:8],
+        "payload": {
+            "source_backed": True,
+            "source_ref": f"timeline:{merge_event['id']}",
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": contract_execution_id,
+        },
+        "artifact_refs": {
+            "source_ref": f"timeline:{merge_event['id']}",
+            "timeline_event_ref": f"timeline:{merge_event['id']}",
+        },
+    }
+    stored_with_merge["completed_lines"].append(persisted_merge)
+    stored_with_merge["runtime_guide"]["completed_lines"] = list(
+        stored_with_merge["completed_lines"]
+    )
+    runtime.store.update(
+        contract_execution_id,
+        stored_with_merge,
+        expected_revision=int(stored_with_merge["execution_state_revision"]),
+    )
     reconcile_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -28729,6 +28790,23 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "completed_lines_projection"
         ]["projected_completed_lines"]
     }
+    projected_completed_lines = projected_after_timeline["runtime_guide"][
+        "completed_lines_projection"
+    ]["projected_completed_lines"]
+    context_line_ids = [
+        line["line_id"]
+        for line in projected_completed_lines
+        if line.get("line_instance_id")
+        == f"runtime_context:{runtime_context.runtime_context_id}"
+    ]
+    assert context_line_ids.index("qa_independent_verification") < context_line_ids.index(
+        "observer_merge"
+    )
+    assert context_line_ids[-3:] == [
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    ]
     assert {
         "qa_graph_context",
         "qa_independent_verification",
@@ -28755,12 +28833,17 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     }
     assert projected_refs["qa_independent_verification"] == f"timeline:{qa_event['id']}"
     assert projected_refs["qa_independent_verification"] != f"timeline:{qa_decoy_id}"
-    assert projected_refs["observer_merge"] == f"timeline:{merge_event['id']}"
+    assert "observer_merge" not in projected_refs
     assert projected_refs["observer_reconcile"] == f"timeline:{reconcile_event['id']}"
     assert projected_refs["observer_close_ready"] == f"timeline:{close_ready_event['id']}"
 
     stored = server._contract_runtime_store(conn).get(contract_execution_id)
     stored_line_ids = {line["line_id"] for line in stored["completed_lines"]}
+    assert "observer_merge" in stored_line_ids
+    stored_merge = next(
+        line for line in stored["completed_lines"] if line["line_id"] == "observer_merge"
+    )
+    assert stored_merge["artifact_refs"]["source_ref"] == f"timeline:{merge_event['id']}"
     assert "observer_close_ready" not in stored_line_ids
     assert "qa_independent_verification" not in stored_line_ids
     assert "worker_read_runtime_guide" not in stored_line_ids

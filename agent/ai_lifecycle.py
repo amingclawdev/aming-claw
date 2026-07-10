@@ -16,6 +16,7 @@ Usage:
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -28,9 +29,37 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from ai_invocation import AIInvocationRequest, RoutePromptContract, build_codex_exec_command
+    from ai_invocation import (
+        AIInvocationRequest,
+        AIInvocationResult,
+        BACKEND_ANTHROPIC_API,
+        BACKEND_CLAUDE_CLI,
+        BACKEND_CODEX_CLI,
+        BACKEND_DOCKER_LIVE_AI,
+        BACKEND_FIXTURE,
+        BACKEND_OPENAI_API,
+        RoutePromptContract,
+        build_claude_code_command,
+        build_codex_exec_command,
+        invoke_ai,
+        sha256_text,
+    )
 except ImportError:  # pragma: no cover - package import path
-    from agent.ai_invocation import AIInvocationRequest, RoutePromptContract, build_codex_exec_command
+    from agent.ai_invocation import (
+        AIInvocationRequest,
+        AIInvocationResult,
+        BACKEND_ANTHROPIC_API,
+        BACKEND_CLAUDE_CLI,
+        BACKEND_CODEX_CLI,
+        BACKEND_DOCKER_LIVE_AI,
+        BACKEND_FIXTURE,
+        BACKEND_OPENAI_API,
+        RoutePromptContract,
+        build_claude_code_command,
+        build_codex_exec_command,
+        invoke_ai,
+        sha256_text,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +84,45 @@ _DEFAULT_CLAUDE_ROLE_TURN_CAPS = {
     "qa": "40",
     "gatekeeper": "20",
 }
+_CLI_BACKENDS = {BACKEND_CODEX_CLI, BACKEND_CLAUDE_CLI}
+_IN_PROCESS_BACKENDS = {
+    BACKEND_OPENAI_API,
+    BACKEND_ANTHROPIC_API,
+    BACKEND_FIXTURE,
+    BACKEND_DOCKER_LIVE_AI,
+}
+_EVIDENCE_REF_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_.-]{0,63}:[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+)
+_SENSITIVE_REF_RE = re.compile(
+    r"(?:^|[_.-])(api[_-]?key|authorization|credential|password|prompt|secret|session[_-]?token|token)(?:$|[_.-])",
+    re.IGNORECASE,
+)
+_SECRET_REF_VALUE_RE = re.compile(
+    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_evidence_refs(values) -> list[str]:
+    """Keep opaque evidence identifiers and drop free-form or secret-bearing text."""
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    sanitized: list[str] = []
+    for value in values:
+        ref = str(value or "").strip()
+        kind = ref.partition(":")[0]
+        if (
+            ref
+            and _EVIDENCE_REF_RE.fullmatch(ref)
+            and not _SENSITIVE_REF_RE.search(kind)
+            and not _SECRET_REF_VALUE_RE.search(ref)
+            and ref not in sanitized
+        ):
+            sanitized.append(ref)
+    return sanitized
 
 
 def _build_turn_caps():
@@ -133,6 +201,12 @@ class AISession:
     input_path: str = ""
     output_path: str = ""
     prompt_file: str = ""
+    backend_mode: str = ""
+    auth_mode: str = ""
+    output_policy: str = "hash_and_summary_only"
+    invocation_request: Optional[AIInvocationRequest] = field(default=None, repr=False)
+    invocation_evidence: dict = field(default_factory=dict)
+    invocation_result: dict = field(default_factory=dict)
 
 
 class AILifecycleManager:
@@ -145,15 +219,157 @@ class AILifecycleManager:
     @staticmethod
     def _resolve_provider_model(role: str) -> tuple[str, str]:
         """Resolve provider/model for a role, defaulting to anthropic."""
+        resolved = AILifecycleManager._resolve_invocation_routing(role)
+        return resolved["provider"], resolved["model"]
+
+    @staticmethod
+    def _resolve_invocation_routing(role: str) -> dict[str, str]:
+        """Resolve provider, backend, auth, and output policy for a role."""
         try:
-            from pipeline_config import get_effective_pipeline_config, resolve_role_config
-            config = get_effective_pipeline_config()
-            resolved = resolve_role_config(role, config)
-            provider = (resolved.get("provider") or "anthropic").strip().lower()
-            model = (resolved.get("model") or "").strip()
-            return provider or "anthropic", model
-        except Exception:
-            return "anthropic", ""
+            from pipeline_config import (
+                get_effective_pipeline_config,
+                resolve_role_config,
+                validate_invocation_routing,
+            )
+        except ImportError:  # pragma: no cover - package import path
+            from agent.pipeline_config import (
+                get_effective_pipeline_config,
+                resolve_role_config,
+                validate_invocation_routing,
+            )
+        config = get_effective_pipeline_config()
+        resolved = resolve_role_config(role, config)
+        provider = (resolved.get("provider") or "anthropic").strip().lower()
+        model = (resolved.get("model") or "").strip()
+        backend_mode = (resolved.get("backend_mode") or "").strip().lower()
+        if not backend_mode:
+            backend_mode = BACKEND_CODEX_CLI if provider == "openai" else BACKEND_CLAUDE_CLI
+        auth_mode = (resolved.get("auth_mode") or "").strip().lower()
+        if not auth_mode:
+            auth_mode = "api_key_env" if backend_mode.endswith("_api") else "cli_auth"
+        errors = validate_invocation_routing(
+            provider=provider,
+            model=model,
+            backend_mode=backend_mode,
+            auth_mode=auth_mode,
+        )
+        if errors:
+            raise ValueError("Invalid AI invocation routing: " + "; ".join(errors))
+        return {
+            "provider": provider,
+            "model": model,
+            "backend_mode": backend_mode,
+            "auth_mode": auth_mode,
+            "output_policy": (
+                resolved.get("output_policy") or "hash_and_summary_only"
+            ).strip(),
+        }
+
+    @staticmethod
+    def _validate_invocation_request(request: AIInvocationRequest) -> None:
+        try:
+            from pipeline_config import validate_invocation_routing
+        except ImportError:  # pragma: no cover - package import path
+            from agent.pipeline_config import validate_invocation_routing
+        errors = validate_invocation_routing(
+            provider=request.provider,
+            model=request.model,
+            backend_mode=request.resolved_backend(),
+            auth_mode=request.auth_mode,
+        )
+        if errors:
+            raise ValueError("Invalid AI invocation request: " + "; ".join(errors))
+
+    @staticmethod
+    def _evidence_refs(context: dict, project_id: str) -> list[str]:
+        context = context if isinstance(context, dict) else {}
+        metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+        refs: list[str] = []
+        for source in (context.get("evidence_refs"), metadata.get("evidence_refs")):
+            refs.extend(sanitize_evidence_refs(source))
+        identities = (
+            ("project", project_id),
+            ("backlog", context.get("backlog_id") or metadata.get("backlog_id")),
+            ("task", context.get("task_id") or metadata.get("task_id")),
+            (
+                "runtime_context",
+                context.get("runtime_context_id") or metadata.get("runtime_context_id"),
+            ),
+            ("graph_snapshot", context.get("snapshot_id") or metadata.get("snapshot_id")),
+            ("graph_projection", context.get("projection_id") or metadata.get("projection_id")),
+        )
+        refs.extend(f"{kind}:{value}" for kind, value in identities if value)
+        return sanitize_evidence_refs(refs)
+
+    @classmethod
+    def build_invocation_request(
+        cls,
+        *,
+        role: str,
+        prompt: str,
+        system_prompt: str,
+        context: dict,
+        project_id: str,
+        timeout_sec: int,
+        workspace: str,
+        output_path: str = "",
+    ) -> AIInvocationRequest:
+        """Build the single provider-neutral request used by lifecycle launchers."""
+        routing = cls._resolve_invocation_routing(role)
+        cwd = workspace or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        worktree = str(
+            context.get("worktree_path")
+            or context.get("workspace")
+            or cwd
+        )
+        return AIInvocationRequest(
+            role=role,
+            provider=routing["provider"],
+            model=routing["model"],
+            backend_mode=routing["backend_mode"],
+            cwd=cwd,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            timeout_sec=timeout_sec,
+            output_path=output_path,
+            auth_mode=routing["auth_mode"],
+            output_policy=routing["output_policy"],
+            route=RoutePromptContract.from_mapping(context or {}),
+            metadata={
+                "project_id": project_id,
+                "worktree": worktree,
+                "evidence_refs": cls._evidence_refs(context, project_id),
+            },
+        )
+
+    @staticmethod
+    def invocation_request_evidence(request: AIInvocationRequest) -> dict:
+        """Return persistent request evidence without raw prompts or credentials."""
+        AILifecycleManager._validate_invocation_request(request)
+        evidence = request.to_evidence()
+        metadata = request.metadata if isinstance(request.metadata, dict) else {}
+        evidence["worktree"] = str(metadata.get("worktree") or request.cwd)
+        evidence["evidence_refs"] = sanitize_evidence_refs(
+            metadata.get("evidence_refs", [])
+        )
+        evidence["raw_prompt_output_stored"] = False
+        return evidence
+
+    @classmethod
+    def invocation_result_evidence(cls, result: AIInvocationResult) -> dict:
+        evidence = result.to_evidence()
+        request_evidence = cls.invocation_request_evidence(result.request)
+        raw_error = str(result.error or "")
+        evidence["cwd"] = result.request.cwd
+        evidence["worktree"] = request_evidence["worktree"]
+        evidence["output_policy"] = result.request.output_policy
+        evidence["evidence_refs"] = request_evidence["evidence_refs"]
+        evidence["error"] = ""
+        evidence["error_present"] = bool(raw_error)
+        evidence["error_sha256"] = sha256_text(raw_error) if raw_error else ""
+        evidence["raw_error_stored"] = False
+        evidence["output_path"] = ""
+        return evidence
 
     @staticmethod
     def _allowed_tools_for_role(role: str) -> str:
@@ -197,23 +413,15 @@ class AILifecycleManager:
 
     @staticmethod
     def _build_claude_command(role: str, model: str, prompt_file: str, cwd: str = "", context: Optional[dict] = None, prompt: str = "") -> list[str]:
-        claude_bin = os.getenv("CLAUDE_BIN", "claude")
         allowed_tools = AILifecycleManager._allowed_tools_for_role(role)
-        cmd = [
-            claude_bin,
-            "-p",
-            "--system-prompt-file", prompt_file,
-        ]
-        if model:
-            cmd.extend(["--model", model])
-        if cwd:
-            cmd.extend(["--add-dir", cwd])
-        if allowed_tools:
-            cmd.extend(["--allowedTools", allowed_tools])
         max_turns = AILifecycleManager._claude_turn_cap(role, context=context, prompt=prompt)
-        if max_turns:
-            cmd.extend(["--max-turns", max_turns])
-        return cmd
+        return build_claude_code_command(
+            model=model,
+            cwd=cwd,
+            prompt_file=prompt_file,
+            allowed_tools=allowed_tools,
+            max_turns=max_turns,
+        )
 
     @staticmethod
     def _build_codex_command(model: str, cwd: str) -> list[str]:
@@ -222,7 +430,6 @@ class AILifecycleManager:
     @staticmethod
     def _compose_codex_prompt(system_prompt: str, prompt: str) -> str:
         return (
-            "Follow this system instruction exactly.\n\n"
             "=== SYSTEM PROMPT START ===\n"
             f"{system_prompt}\n"
             "=== SYSTEM PROMPT END ===\n\n"
@@ -230,6 +437,32 @@ class AILifecycleManager:
             f"{prompt}\n"
             "=== TASK PROMPT END ===\n"
         )
+
+    @classmethod
+    def _build_command_for_request(
+        cls,
+        request: AIInvocationRequest,
+        *,
+        prompt_file: str,
+        context: dict,
+    ) -> list[str]:
+        backend_mode = request.resolved_backend()
+        if backend_mode == BACKEND_CODEX_CLI:
+            return build_codex_exec_command(
+                model=request.model,
+                cwd=request.cwd,
+                output_path=request.output_path,
+            )
+        if backend_mode == BACKEND_CLAUDE_CLI:
+            return cls._build_claude_command(
+                request.role,
+                request.model,
+                prompt_file,
+                request.cwd,
+                context=context,
+                prompt=request.prompt,
+            )
+        return []
 
     def create_session(
         self,
@@ -239,8 +472,9 @@ class AILifecycleManager:
         project_id: str,
         timeout_sec: int = 120,
         workspace: str = "",
+        invocation_request: Optional[AIInvocationRequest] = None,
     ) -> AISession:
-        """Start an AI CLI process.
+        """Start an AI invocation through the provider-neutral contract.
 
         Args:
             role: coordinator / dev / tester / qa
@@ -249,6 +483,7 @@ class AILifecycleManager:
             project_id: Project identifier
             timeout_sec: Max execution time
             workspace: Working directory for the CLI
+            invocation_request: Optional prebuilt request for future launchers
 
         Returns:
             AISession with PID and session_id
@@ -267,63 +502,77 @@ class AILifecycleManager:
             except Exception:
                 pass
 
-        # Build system prompt from context
-        system_prompt = self._build_system_prompt(role, prompt, context, project_id)
-        _al_log(f"build_system_prompt: {len(system_prompt)} chars role={role}")
-
-        # Audit: write prompt to Redis Stream for full round-trip tracking
-        self._audit_prompt(session_id, role, project_id, workspace or "", prompt, system_prompt)
-        _al_log("audit_prompt done")
-
-        _provider, _model = self._resolve_provider_model(role)
-        _al_log(f"pipeline_config: role={role} provider={_provider} model={_model}")
-
         cwd = workspace or os.getenv("CODEX_WORKSPACE", os.getcwd())
         log_dir = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        output_last = os.path.join(log_dir, f"last-message-{session_id.replace('ai-','')}.txt")
+        output_last = os.path.join(tempfile.gettempdir(), f"last-message-{session_id}.txt")
         lifecycle_log_path = os.path.join(log_dir, f"ai-lifecycle-{session_id}.txt")
         input_path = os.path.join(log_dir, f"input-{session_id.replace('ai-','')}.txt")
         output_path = os.path.join(log_dir, f"output-{session_id.replace('ai-','')}.txt")
 
-        # Write system prompt to file
-        prompt_file = os.path.join(tempfile.gettempdir(), f"ctx-{session_id}.md")
-        try:
-            with open(prompt_file, "w", encoding="utf-8") as f:
-                f.write(system_prompt)
-            _al_log(f"prompt_file: {prompt_file} ({len(system_prompt)} bytes)")
-        except Exception as e:
-            _al_log(f"ERROR prompt_file write failed: {e}")
+        system_prompt = self._build_system_prompt(role, prompt, context, project_id)
+        _al_log(f"build_system_prompt: {len(system_prompt)} chars role={role}")
 
-        provider = _provider if _provider in ("anthropic", "openai") else "anthropic"
-        invocation_request = AIInvocationRequest(
-            role=role,
-            provider=provider,
-            model=_model,
-            backend_mode="codex_cli" if provider == "openai" else "claude_cli",
-            cwd=cwd,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            timeout_sec=timeout_sec,
-            output_path=output_last,
-            auth_mode="cli_auth",
-            route=RoutePromptContract.from_mapping(context or {}),
+        if invocation_request is None:
+            invocation_request = self.build_invocation_request(
+                role=role,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                context=context,
+                project_id=project_id,
+                timeout_sec=timeout_sec,
+                workspace=cwd,
+                output_path=output_last,
+            )
+        self._validate_invocation_request(invocation_request)
+        request_evidence = self.invocation_request_evidence(invocation_request)
+        provider = invocation_request.provider
+        model = invocation_request.model
+        backend_mode = invocation_request.resolved_backend()
+        cwd = invocation_request.cwd or cwd
+        output_last = invocation_request.output_path or output_last
+        _al_log(
+            "invocation_contract: "
+            + json.dumps(request_evidence, sort_keys=True, separators=(",", ":"))
         )
-        try:
-            _al_log("invocation_contract: " + json.dumps(invocation_request.to_evidence(), sort_keys=True))
-        except Exception:
-            pass
-        if provider == "openai":
-            cmd = build_codex_exec_command(model=_model, cwd=cwd, output_path=output_last)
-            composed_prompt = self._compose_codex_prompt(system_prompt, prompt)
-            stdin_prompt = composed_prompt
-        else:
-            cmd = self._build_claude_command(role, _model, prompt_file, cwd, context=context, prompt=prompt)
-            stdin_prompt = prompt
+        self._audit_prompt(
+            session_id,
+            role,
+            project_id,
+            cwd,
+            prompt,
+            system_prompt,
+            invocation_evidence=request_evidence,
+        )
+        _al_log("audit_prompt done")
+
+        prompt_file = ""
+        if backend_mode == BACKEND_CLAUDE_CLI:
+            prompt_file = os.path.join(tempfile.gettempdir(), f"ctx-{session_id}.md")
+            try:
+                with open(prompt_file, "w", encoding="utf-8") as f:
+                    f.write(invocation_request.system_prompt)
+                _al_log(
+                    f"prompt_file: {prompt_file} "
+                    f"({len(invocation_request.system_prompt)} bytes)"
+                )
+            except Exception as e:
+                _al_log(f"ERROR prompt_file write failed: {e}")
+
+        cmd = self._build_command_for_request(
+            invocation_request,
+            prompt_file=prompt_file,
+            context=context,
+        )
+        stdin_prompt = (
+            invocation_request.prompt_text()
+            if backend_mode == BACKEND_CODEX_CLI
+            else invocation_request.prompt
+        )
 
         # Strip env vars that cause nested Claude issues
         env = dict(os.environ)
-        if provider == "anthropic":
+        if backend_mode == BACKEND_CLAUDE_CLI:
             env = {k: v for k, v in env.items()
                    if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
                                 "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
@@ -348,12 +597,17 @@ class AILifecycleManager:
             started_at=time.time(),
             timeout_sec=timeout_sec,
             provider=provider,
-            model=_model,
+            model=model,
             workspace=cwd,
             log_path=lifecycle_log_path,
             input_path=input_path,
             output_path=output_path,
             prompt_file=prompt_file,
+            backend_mode=backend_mode,
+            auth_mode=invocation_request.auth_mode,
+            output_policy=invocation_request.output_policy,
+            invocation_request=invocation_request,
+            invocation_evidence=request_evidence,
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -361,24 +615,40 @@ class AILifecycleManager:
                 _al_log(f"Session registered: sid={session_id} pid={session.pid}")
             # else: pid==0, suppress pid-dependent log until Popen assigns real PID
 
-        # Run CLI in a background thread using Popen and pipe reader threads.
-        # This keeps stdout/stderr drained while the process runs, allowing the
-        # heartbeat watchdog to kill silent sessions instead of waiting for the
-        # absolute communicate() timeout.
+        def _record_result(result: AIInvocationResult) -> None:
+            evidence = self.invocation_result_evidence(result)
+            session.invocation_result = evidence
+            try:
+                with open(output_path, "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+            except Exception:
+                pass
+
+        # Run the provider request in a background thread. CLI backends retain
+        # the existing streaming watchdog; API/fixture backends use invoke_ai.
         def _run():
             try:
-                # Save input for replay/debug
                 try:
                     os.makedirs(os.path.dirname(input_path), exist_ok=True)
-                    with open(input_path, "w", encoding="utf-8") as _f:
-                        _f.write(f"=== SYSTEM PROMPT ({len(system_prompt)} chars) ===\n")
-                        _f.write(system_prompt)
-                        _f.write(f"\n\n=== STDIN PROMPT ({len(stdin_prompt)} chars) ===\n")
-                        _f.write(stdin_prompt)
-                        _f.write(f"\n\n=== CLI CMD ===\n")
-                        _f.write(" ".join(cmd))
+                    with open(input_path, "w", encoding="utf-8") as handle:
+                        json.dump(request_evidence, handle, indent=2, sort_keys=True)
+                        handle.write("\n")
                 except Exception:
                     pass
+
+                if backend_mode not in _CLI_BACKENDS:
+                    result = invoke_ai(invocation_request)
+                    session.stdout = result.output_text
+                    session.stderr = result.error
+                    session.exit_code = result.returncode
+                    session.status = result.status
+                    _record_result(result)
+                    _al_log(
+                        f"invoke_ai done: backend={backend_mode} status={result.status} "
+                        f"rc={result.returncode}"
+                    )
+                    return
 
                 _al_log(f"Popen starting: {' '.join(cmd[:6])}...")
                 popen_kwargs = dict(
@@ -464,32 +734,42 @@ class AILifecycleManager:
                     session.stdout = "".join(stdout_parts)
                     session.stderr = "".join(stderr_parts)
                 if timeout_reason:
-                    session.exit_code = -1
+                    session.exit_code = 124
                     session.status = "timeout"
                     session.stderr = (session.stderr + f"\n{timeout_reason}").strip()
                 else:
                     session.exit_code = proc.returncode
                     session.status = "completed" if proc.returncode == 0 else "failed"
-                if provider == "openai" and os.path.exists(output_last):
+                if backend_mode == BACKEND_CODEX_CLI and os.path.exists(output_last):
                     try:
                         session.stdout = Path(output_last).read_text(encoding="utf-8")
                     except Exception:
                         pass
                 _al_log(f"Popen done: rc={proc.returncode} stdout={len(session.stdout)} stderr={len(session.stderr)}")
-                # Save output for debug
-                try:
-                    with open(output_path, "w", encoding="utf-8") as _f:
-                        _f.write(f"=== STATUS: {session.status} rc={proc.returncode} elapsed={time.time()-session.started_at:.1f}s ===\n\n")
-                        _f.write(f"=== STDOUT ({len(session.stdout)} chars) ===\n")
-                        _f.write(session.stdout)
-                        if session.stderr:
-                            _f.write(f"\n\n=== STDERR ({len(session.stderr)} chars) ===\n")
-                            _f.write(session.stderr)
-                except Exception:
-                    pass
+                _record_result(
+                    AIInvocationResult(
+                        request=invocation_request,
+                        status=session.status,
+                        output_text=session.stdout,
+                        error=session.stderr,
+                        command=cmd,
+                        returncode=int(session.exit_code or 0),
+                        elapsed_ms=int((time.time() - session.started_at) * 1000),
+                        provider_backed=True,
+                        calls_models=session.status == "completed",
+                        raw_output_stored=False,
+                        auth_status=(
+                            "cli_timeout"
+                            if session.status == "timeout"
+                            else "cli_auth_unknown"
+                            if session.status == "completed"
+                            else "cli_failed"
+                        ),
+                    )
+                )
             except subprocess.TimeoutExpired:
                 session.status = "timeout"
-                session.exit_code = -1
+                session.exit_code = 124
                 session.stdout = ""
                 session.stderr = "Timeout exceeded"
                 _al_log(f"Popen TIMEOUT after {_MAX_TIMEOUT}s")
@@ -499,25 +779,64 @@ class AILifecycleManager:
                     proc.communicate(timeout=5)
                 except Exception:
                     pass
+                _record_result(
+                    AIInvocationResult(
+                        request=invocation_request,
+                        status="timeout",
+                        error=session.stderr,
+                        command=cmd,
+                        returncode=124,
+                        elapsed_ms=int((time.time() - session.started_at) * 1000),
+                        provider_backed=True,
+                        calls_models=False,
+                        auth_status="cli_timeout",
+                    )
+                )
             except FileNotFoundError:
                 session.status = "failed"
                 session.exit_code = -1
                 session.stdout = ""
                 session.stderr = f"CLI not found: {cmd[0]}"
                 _al_log(f"Popen ERROR: CLI not found: {cmd[0]}")
+                _record_result(
+                    AIInvocationResult(
+                        request=invocation_request,
+                        status="failed",
+                        error=session.stderr,
+                        command=cmd,
+                        returncode=127,
+                        elapsed_ms=int((time.time() - session.started_at) * 1000),
+                        provider_backed=True,
+                        calls_models=False,
+                        auth_status="cli_not_found",
+                    )
+                )
             except Exception as e:
                 session.status = "failed"
                 session.exit_code = -1
                 session.stdout = ""
                 session.stderr = str(e)
                 _al_log(f"Popen ERROR: {e}")
+                _record_result(
+                    AIInvocationResult(
+                        request=invocation_request,
+                        status="failed",
+                        error=session.stderr,
+                        command=cmd,
+                        returncode=1,
+                        elapsed_ms=int((time.time() - session.started_at) * 1000),
+                        provider_backed=True,
+                        calls_models=False,
+                        auth_status="failed",
+                    )
+                )
             finally:
-                # Cleanup prompt file
-                try:
-                    if os.path.exists(prompt_file):
-                        os.remove(prompt_file)
-                except Exception:
-                    pass
+                for private_path in (prompt_file, output_last):
+                    try:
+                        if private_path and os.path.exists(private_path):
+                            os.remove(private_path)
+                    except Exception:
+                        pass
 
         _al_log(f"session_created: {session_id} timeout={timeout_sec}s")
         thread = threading.Thread(target=_run, daemon=True)
@@ -557,11 +876,15 @@ class AILifecycleManager:
             "role": session.role,
             "provider": session.provider,
             "model": session.model,
+            "backend_mode": session.backend_mode,
+            "auth_mode": session.auth_mode,
+            "output_policy": session.output_policy,
             "workspace": session.workspace,
             "pid": session.pid,
             "log_path": session.log_path,
             "input_path": session.input_path,
             "output_path": session.output_path,
+            "ai_invocation": session.invocation_result or session.invocation_evidence,
         }
         self.audit_result(session_id, session.project_id, result)
         return result
@@ -689,23 +1012,40 @@ class AILifecycleManager:
 
     @staticmethod
     def _audit_prompt(session_id: str, role: str, project_id: str,
-                      workspace: str, prompt: str, system_prompt: str):
-        """Write AI prompt to Redis Stream for audit trail."""
+                      workspace: str, prompt: str, system_prompt: str,
+                      invocation_evidence: Optional[dict] = None):
+        """Write hash-only invocation request evidence to Redis."""
         try:
             from governance.redis_client import get_redis
             r = get_redis()
             if not r:
                 return
+            evidence = invocation_evidence or {
+                "prompt_sha256": sha256_text(
+                    AILifecycleManager._compose_codex_prompt(system_prompt, prompt)
+                ),
+                "raw_prompt_exposed": False,
+                "raw_prompt_output_stored": False,
+            }
             stream_key = f"ai:prompt:{session_id}"
             r.xadd(stream_key, {
-                "type": "prompt",
+                "type": "invocation_request",
                 "session_id": session_id,
                 "role": role,
                 "project_id": project_id,
                 "workspace": workspace,
                 "prompt_length": str(len(prompt)),
                 "system_prompt_length": str(len(system_prompt)),
-                "user_prompt": prompt[:5000],  # Truncate for Redis memory
+                "prompt_sha256": str(evidence.get("prompt_sha256") or ""),
+                "backend_mode": str(evidence.get("backend_mode") or ""),
+                "route_prompt_contract": json.dumps(
+                    evidence.get("route_prompt_contract") or {},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "evidence_refs": json.dumps(evidence.get("evidence_refs") or []),
+                "raw_prompt_exposed": "false",
+                "raw_prompt_output_stored": "false",
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, maxlen=5000)
         except Exception as e:
@@ -713,23 +1053,41 @@ class AILifecycleManager:
 
     @staticmethod
     def audit_result(session_id: str, project_id: str, result: dict):
-        """Write AI result to Redis Stream for full round-trip audit."""
+        """Write hash-only invocation result evidence to Redis."""
         try:
             from governance.redis_client import get_redis
             r = get_redis()
             if not r:
                 return
+            invocation = (
+                result.get("ai_invocation")
+                if isinstance(result.get("ai_invocation"), dict)
+                else {}
+            )
             stream_key = f"ai:prompt:{session_id}"
             r.xadd(stream_key, {
-                "type": "result",
+                "type": "invocation_result",
                 "session_id": session_id,
                 "project_id": project_id,
                 "status": result.get("status", "unknown"),
                 "exit_code": str(result.get("exit_code", -1)),
                 "elapsed_sec": str(result.get("elapsed_sec", 0)),
                 "stdout_length": str(len(result.get("stdout", ""))),
-                "stdout": result.get("stdout", "")[:10000],
-                "stderr": result.get("stderr", "")[:2000],
+                "stderr_length": str(len(result.get("stderr", ""))),
+                "prompt_sha256": str(invocation.get("prompt_sha256") or ""),
+                "output_sha256": str(
+                    invocation.get("output_sha256")
+                    or sha256_text(result.get("stdout", ""))
+                ),
+                "auth_status": str(invocation.get("auth_status") or "unknown"),
+                "provider_backed": str(bool(invocation.get("provider_backed"))).lower(),
+                "calls_models": str(bool(invocation.get("calls_models"))).lower(),
+                "raw_output_stored": str(
+                    bool(invocation.get("raw_output_stored"))
+                ).lower(),
+                "no_raw_prompt_output": str(
+                    bool(invocation.get("no_raw_prompt_output", True))
+                ).lower(),
                 "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, maxlen=5000)
         except Exception as e:

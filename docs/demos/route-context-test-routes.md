@@ -212,6 +212,41 @@ set with `validate-report.mjs --require-live-observer-route`, so route proof
 quality is auditable even when the broader install-audit report still records
 unrelated demo-suite blockers.
 
+The live environment probe, observer launcher, MF worker handoff, and Docker
+proof use the same provider-neutral request/result envelope. Persistent
+evidence carries identity and hashes only:
+
+```json
+{
+  "schema_version": "ai_invocation_result.v1",
+  "request_schema_version": "ai_invocation_request.v1",
+  "role": "observer",
+  "provider": "openai",
+  "model": "host-configured",
+  "backend_mode": "codex_cli",
+  "cwd": "/work/aming-claw",
+  "auth_mode": "cli_auth",
+  "output_policy": "hash_and_summary_only",
+  "provider_backed": true,
+  "calls_models": true,
+  "route_prompt_contract": {
+    "route_context_hash": "sha256:...",
+    "prompt_contract_id": "rprompt-docker-live-observer-route-v1",
+    "prompt_contract_hash": "sha256:...",
+    "route_token_ref": "docker-proof:..."
+  },
+  "evidence_refs": ["docker_install_audit:...", "route_context:..."],
+  "prompt_sha256": "sha256:...",
+  "output_sha256": "sha256:...",
+  "raw_output_stored": false,
+  "no_raw_prompt_output": true
+}
+```
+
+API-key modes use the same schema with `openai_api` or `anthropic_api` and
+`auth_mode: api_key_env`. A missing key is terminal structured evidence with
+`auth_status: missing_api_key`; it does not fall back to another runtime.
+
 The external route proof should bind the target project root to a
 source-controlled manifest hash:
 

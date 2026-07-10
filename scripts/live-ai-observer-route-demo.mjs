@@ -27,8 +27,11 @@ function blockedPayload() {
     live_ai: {
       approval: "missing",
       execution_mode: "blocked",
+      provider_backed: false,
       calls_models: false,
       silent_quota_use: false,
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
     },
   };
 }
@@ -37,6 +40,8 @@ function allowedPayload() {
   const routeContextHash = hash(`${SCENARIO_ID}:route-context:v1`);
   const promptContractHash = hash(`${SCENARIO_ID}:prompt-contract:v1`);
   const finalDriftPromptHash = hash(`${SCENARIO_ID}:final-drift-prompt:v1`);
+  const invocationPromptHash = hash(`${SCENARIO_ID}:fixture-invocation-prompt:v1`);
+  const invocationOutputHash = hash(`${SCENARIO_ID}:fixture-invocation-output:v1`);
   const stepOutputs = [
     {
       step_id: "01_route_alert_ack",
@@ -78,10 +83,46 @@ function allowedPayload() {
       execution_mode: "deterministic_test_harness",
       provider: "manual",
       model: "manual",
+      provider_backed: false,
       calls_models: false,
       silent_quota_use: false,
       prompt_output_policy: "redacted",
       credential_output_policy: "redacted",
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
+    },
+    invocation: {
+      schema_version: "ai_invocation_result.v1",
+      request_schema_version: "ai_invocation_request.v1",
+      status: "completed",
+      role: "observer",
+      provider: "fixture",
+      model: "deterministic",
+      backend_mode: "fixture",
+      auth_mode: "not_required",
+      auth_status: "not_required",
+      output_policy: "hash_and_summary_only",
+      provider_backed: false,
+      calls_models: false,
+      route_prompt_contract: {
+        route_context_hash: routeContextHash,
+        prompt_contract_id: "rprompt-live-observer-route-demo",
+        prompt_contract_hash: promptContractHash,
+        route_token_ref: "",
+        raw_context_exposed: false,
+      },
+      evidence_refs: [`scenario:${SCENARIO_ID}`, "route:deterministic-fixture"],
+      route_alert_ack: {
+        status: "acknowledged",
+        route_context_hash: routeContextHash,
+        prompt_contract_id: "rprompt-live-observer-route-demo",
+        prompt_contract_hash: promptContractHash,
+      },
+      ordered_step_outputs: stepOutputs,
+      prompt_sha256: invocationPromptHash,
+      output_sha256: invocationOutputHash,
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
     },
     observer_evidence: {
       route_alert_ack: {
@@ -141,6 +182,8 @@ function allowedPayload() {
   };
 
   assert.equal(payload.live_ai.calls_models, false);
+  assert.equal(payload.invocation.schema_version, "ai_invocation_result.v1");
+  assert.equal(payload.invocation.raw_output_stored, false);
   assert.equal(payload.observer_evidence.no_raw_prompt_output, true);
   assert.deepEqual(payload.timeline.map((event) => event.seq), [1, 2, 3, 4, 5]);
   return payload;

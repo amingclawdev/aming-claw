@@ -11,7 +11,6 @@ const DEFAULT_ROLE = "tester";
 const DEFAULT_FETCH_TIMEOUT_MS = 5000;
 const DEFAULT_VERSION_TIMEOUT_MS = 3000;
 const DEFAULT_LIVE_TIMEOUT_MS = 15000;
-const OUTPUT_TAIL_CHARS = 2000;
 const SECRET_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
   "CLAUDECODE",
@@ -124,14 +123,26 @@ function sanitizeUrl(url) {
   }
 }
 
-function tailText(text, maxChars = OUTPUT_TAIL_CHARS) {
-  const sanitized = sanitizeText(text);
-  if (sanitized.length <= maxChars) return sanitized;
-  return sanitized.slice(sanitized.length - maxChars);
-}
-
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function hashOnlyError(value) {
+  const raw = String(value || "");
+  return {
+    error: "",
+    error_present: Boolean(raw),
+    error_sha256: raw ? `sha256:${sha256(raw)}` : "",
+    raw_error_stored: false,
+  };
+}
+
+function opaqueEvidenceRef(kind, value) {
+  const ref = `${String(kind || "").trim()}:${String(value || "").trim()}`;
+  if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}:[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(ref)) return "";
+  if (/(api[_-]?key|authorization|credential|password|prompt|secret|session[_-]?token|token)/i.test(kind)) return "";
+  if (/\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+/i.test(ref)) return "";
+  return ref;
 }
 
 function check(id, status, details = {}) {
@@ -170,6 +181,9 @@ function baseReport(options) {
       version: "",
       auth_status: "",
       error: "",
+      error_present: false,
+      error_sha256: "",
+      raw_error_stored: false,
     },
     evidence: {
       expected_provider: "",
@@ -188,9 +202,15 @@ function baseReport(options) {
     },
     checks: [],
     invocation: {
+      schema_version: "ai_invocation_result.v1",
+      request_schema_version: "ai_invocation_request.v1",
       allowed: Boolean(options.allowLiveAi),
       attempted: false,
+      role: options.role,
       provider: "",
+      model: "",
+      backend_mode: "",
+      cwd: options.cwd,
       adapter: "",
       status: "not_requested",
       command: [],
@@ -199,10 +219,24 @@ function baseReport(options) {
       exit_code: null,
       signal: "",
       auth_status: "unknown",
+      auth_mode: "cli_auth",
+      output_policy: "hash_and_summary_only",
+      provider_backed: false,
+      calls_models: false,
       prompt_sha256: "",
-      stdout_tail: "",
-      stderr_tail: "",
+      output_sha256: "",
+      stdout_sha256: "",
+      stderr_sha256: "",
+      raw_output_stored: false,
+      no_raw_prompt_output: true,
+      evidence_refs: [
+        opaqueEvidenceRef("project", options.projectId),
+        opaqueEvidenceRef("role", options.role),
+      ].filter(Boolean),
       error: "",
+      error_present: false,
+      error_sha256: "",
+      raw_error_stored: false,
     },
     http: {
       url: sanitizeUrl(`${options.governanceUrl}/api/projects/${encodeURIComponent(options.projectId)}/ai-config`),
@@ -211,6 +245,9 @@ function baseReport(options) {
       duration_ms: 0,
       response_keys: [],
       error: "",
+      error_present: false,
+      error_sha256: "",
+      raw_error_stored: false,
     },
     options: {
       governance_url: options.governanceUrl,
@@ -257,14 +294,14 @@ async function fetchJson(url, timeoutMs) {
     summary.status_code = response.status;
     summary.ok = response.ok;
     summary.response_keys = json && typeof json === "object" ? Object.keys(json).slice(0, 40) : [];
-    if (!response.ok) summary.error = sanitizeText(json?.error || text || response.statusText);
+    if (!response.ok) Object.assign(summary, hashOnlyError(json?.error || text || response.statusText));
     if (response.ok && (!json || typeof json !== "object")) {
       summary.ok = false;
-      summary.error = "AI config response was not a JSON object";
+      Object.assign(summary, hashOnlyError("AI config response was not a JSON object"));
     }
     return { ok: Boolean(summary.ok), json, summary };
   } catch (error) {
-    summary.error = sanitizeText(error.message || String(error));
+    Object.assign(summary, hashOnlyError(error.message || String(error)));
     return { ok: false, json: null, summary };
   } finally {
     clearTimeout(timeout);
@@ -334,7 +371,7 @@ function evaluateConfig(config, report) {
     status: String(observed.status || ""),
     version: sanitizeText(observed.version || ""),
     auth_status: String(observed.auth_status || "unknown"),
-    error: sanitizeText(observed.error || ""),
+    ...hashOnlyError(observed.error || ""),
   };
 
   if (!expected.provider || !expected.model) {
@@ -407,7 +444,7 @@ function evaluateConfig(config, report) {
       expected: "detected",
       observed: String(observed.status || "unknown"),
       path: String(observed.path || ""),
-      error: sanitizeText(observed.error || ""),
+      ...hashOnlyError(observed.error || ""),
       reason: `${expected.provider} runtime is not detected.`,
     }));
   } else {
@@ -443,8 +480,7 @@ function adapterForProvider(provider) {
 
 function providerEnv(_provider) {
   // Preserve the user's real AI runtime environment for the child process.
-  // Secrets are never serialized into the report; stdout/stderr/args are
-  // sanitized at the capture boundary instead.
+  // Secrets and raw provider output are never serialized into the report.
   return { ...process.env };
 }
 
@@ -455,10 +491,14 @@ function spawnCapture(command, args, options) {
     duration_ms: 0,
     exit_code: null,
     signal: "",
-    stdout_tail: "",
-    stderr_tail: "",
+    stdout_sha256: "",
+    stderr_sha256: "",
+    output_sha256: "",
     status: "running",
     error: "",
+    error_present: false,
+    error_sha256: "",
+    raw_error_stored: false,
   };
   const started = Date.now();
   return new Promise((resolvePromise) => {
@@ -486,7 +526,7 @@ function spawnCapture(command, args, options) {
     child.on("error", (error) => {
       clearTimeout(timeout);
       summary.status = "failed";
-      summary.error = sanitizeText(error.message || String(error));
+      Object.assign(summary, hashOnlyError(error.message || String(error)));
       summary.duration_ms = Date.now() - started;
       resolvePromise(summary);
     });
@@ -496,8 +536,9 @@ function spawnCapture(command, args, options) {
       summary.signal = signal || "";
       if (!timedOut) summary.status = code === 0 ? "passed" : "failed";
       summary.duration_ms = Date.now() - started;
-      summary.stdout_tail = tailText(stdout);
-      summary.stderr_tail = tailText(stderr);
+      summary.stdout_sha256 = `sha256:${sha256(stdout)}`;
+      summary.stderr_sha256 = `sha256:${sha256(stderr)}`;
+      summary.output_sha256 = summary.stdout_sha256;
       resolvePromise(summary);
     });
     if (options.input) child.stdin.end(options.input);
@@ -515,7 +556,7 @@ function versionProbe(command, timeoutMs) {
     ok: !result.error && result.status === 0,
     status: result.error ? "failed" : result.status === 0 ? "passed" : "failed",
     exit_code: result.status,
-    error: sanitizeText(result.error?.message || ""),
+    ...hashOnlyError(result.error?.message || ""),
     version: sanitizeText(`${result.stdout || result.stderr || ""}`.trim().split(/\r?\n/, 1)[0] || ""),
   };
 }
@@ -554,14 +595,17 @@ const openaiCodexAdapter = {
       } catch {
         lastMessage = "";
       }
-      const stdoutTail = tailText(lastMessage || result.stdout_tail);
+      const outputSha256 = lastMessage
+        ? `sha256:${sha256(lastMessage)}`
+        : result.output_sha256;
       return {
         ...result,
-        stdout_tail: stdoutTail,
+        output_sha256: outputSha256,
         adapter: openaiCodexAdapter.name,
         provider: openaiCodexAdapter.provider,
+        backend_mode: "codex_cli",
         auth_status: result.status === "passed" ? "live_ok" : "live_failed",
-        prompt_sha256: sha256(prompt),
+        prompt_sha256: `sha256:${sha256(prompt)}`,
       };
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
@@ -597,8 +641,9 @@ const anthropicClaudeAdapter = {
       ...result,
       adapter: anthropicClaudeAdapter.name,
       provider: anthropicClaudeAdapter.provider,
+      backend_mode: "claude_cli",
       auth_status: result.status === "passed" ? "live_ok" : "live_failed",
-      prompt_sha256: sha256(prompt),
+      prompt_sha256: `sha256:${sha256(prompt)}`,
     };
   },
 };
@@ -606,16 +651,16 @@ const anthropicClaudeAdapter = {
 async function maybeInvoke(report, options) {
   const adapter = adapterForProvider(report.expected.provider);
   report.invocation.provider = report.expected.provider;
+  report.invocation.model = report.expected.model;
   report.invocation.adapter = adapter?.name || "";
+  report.invocation.backend_mode = report.expected.provider === "openai" ? "codex_cli" : "claude_cli";
   report.invocation.timeout_ms = options.timeoutMs;
 
   const blockingChecks = report.checks.filter((item) => item.status !== "passed");
   const blocksBeforeInvocation = blockingChecks.filter((item) => item.id !== "invocation_allowed");
   if (blocksBeforeInvocation.length) {
     report.invocation.status = "blocked";
-    report.invocation.error = sanitizeText(
-      `Skipping live invocation because prerequisite checks did not pass: ${blocksBeforeInvocation.map((item) => item.id).join(", ")}`,
-    );
+    report.invocation.failure_reason = "prerequisite_checks_failed";
     return;
   }
 
@@ -626,7 +671,7 @@ async function maybeInvoke(report, options) {
       reason: "Live provider invocation is explicit and was not requested.",
     }));
     report.invocation.status = "blocked";
-    report.invocation.error = "Live provider invocation requires --allow-live-ai.";
+    report.invocation.failure_reason = "live_ai_not_allowed";
     return;
   }
 
@@ -645,6 +690,9 @@ async function maybeInvoke(report, options) {
     attempted: true,
     provider: result.provider,
     adapter: result.adapter,
+    role: options.role,
+    model: report.expected.model,
+    backend_mode: result.backend_mode,
     status: result.status,
     command: result.command,
     timeout_ms: result.timeout_ms,
@@ -652,10 +700,20 @@ async function maybeInvoke(report, options) {
     exit_code: result.exit_code,
     signal: result.signal,
     auth_status: result.auth_status,
+    auth_mode: "cli_auth",
+    output_policy: "hash_and_summary_only",
+    provider_backed: true,
+    calls_models: result.status === "passed",
     prompt_sha256: result.prompt_sha256,
-    stdout_tail: result.stdout_tail,
-    stderr_tail: result.stderr_tail,
-    error: result.error,
+    output_sha256: result.output_sha256,
+    stdout_sha256: result.stdout_sha256,
+    stderr_sha256: result.stderr_sha256,
+    raw_output_stored: false,
+    no_raw_prompt_output: true,
+    error: "",
+    error_present: result.error_present === true,
+    error_sha256: result.error_sha256 || "",
+    raw_error_stored: false,
   };
   report.observed.auth_status = result.auth_status;
 }
@@ -698,7 +756,7 @@ async function run() {
     report.checks.push(check("fetch_ai_config", "failed", {
       expected: "HTTP 2xx JSON object",
       observed: fetched.summary.status_code || 0,
-      reason: fetched.summary.error || "Unable to fetch project AI config.",
+      reason: "Unable to fetch project AI config.",
     }));
     return finishReport(report, "failed");
   }
@@ -722,7 +780,9 @@ async function run() {
       report.checks.push(check("local_version_probe", "blocked", {
         expected: `${versionCommand} --version`,
         observed: version.exit_code,
-        error: version.error,
+        error_present: version.error_present,
+        error_sha256: version.error_sha256,
+        raw_error_stored: false,
         reason: "Detected tool path did not pass a local version probe.",
       }));
     }
@@ -756,7 +816,8 @@ run()
     })();
     const report = finishReport(baseReport(options), "failed");
     report.checks.push(check("script_error", "failed", {
-      reason: sanitizeText(error.message || String(error)),
+      reason: "Live AI environment probe failed.",
+      ...hashOnlyError(error.message || String(error)),
     }));
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     process.exitCode = 1;
