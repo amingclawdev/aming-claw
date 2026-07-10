@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ from .execution_state import (
 from .gate_decision import make_gate_decision
 from .gate_kernel import ContractGateKernel
 from .guide_compiler import attach_writer_role_safe_copy_payload, compile_runtime_guide
-from .hash import stable_sha256
+from .hash import canonical_json, stable_sha256
 from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
 from .schema import ContractDefinitionError, is_new_execution_allowed, iter_stage_lines
@@ -3164,11 +3165,65 @@ def _is_non_runtime_source_mismatch(
         record.get("definition_governance_hints_sha256") or ""
     )
     current_hints_sha256 = str(definition.get("governance_hints_sha256") or "")
-    return bool(
+    if bool(
         pinned_hints_sha256
         and current_hints_sha256
         and pinned_hints_sha256 != current_hints_sha256
+    ):
+        return True
+    return _is_legacy_root_governance_hints_only_source_mismatch(record, definition)
+
+
+def _is_legacy_root_governance_hints_only_source_mismatch(
+    record: Mapping[str, Any],
+    definition: Mapping[str, Any],
+) -> bool:
+    """Prove an envelope-only transition for records predating its hash field."""
+
+    if str(record.get("definition_governance_hints_sha256") or ""):
+        return False
+    pinned_source_sha256 = str(record.get("definition_source_sha256") or "")
+    current_source_sha256 = str(definition.get("source_sha256") or "")
+    current_envelope = definition.get("governance_hints")
+    source_path = Path(str(definition.get("_source_path") or ""))
+    if not (
+        pinned_source_sha256
+        and current_source_sha256
+        and pinned_source_sha256 != current_source_sha256
+        and isinstance(current_envelope, Mapping)
+        and source_path.suffix.lower() == ".json"
+    ):
+        return False
+
+    try:
+        current_source = source_path.read_bytes()
+        current_payload = json.loads(current_source.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(current_payload, dict):
+        return False
+    source_envelope = current_payload.get("governance_hints")
+    if not isinstance(source_envelope, Mapping) or source_envelope != current_envelope:
+        return False
+    if _source_bytes_sha256(current_source) != current_source_sha256:
+        return False
+
+    current_payload.pop("governance_hints")
+    prior_source_candidates = (
+        (
+            json.dumps(current_payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        ).encode("utf-8"),
+        (canonical_json(current_payload) + "\n").encode("utf-8"),
     )
+    return any(
+        _source_bytes_sha256(candidate) == pinned_source_sha256
+        for candidate in prior_source_candidates
+    )
+
+
+def _source_bytes_sha256(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
 def _enforce_start_precheck(definition: Mapping[str, Any]) -> bool:

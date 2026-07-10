@@ -643,6 +643,67 @@ def test_envelope_only_source_change_keeps_active_runtime_projection_current(
     assert refreshed_guide["next_legal_action"] == original_guide["next_legal_action"]
 
 
+def test_historical_runtime_without_envelope_hash_accepts_only_root_envelope_change(
+    tmp_path: Path,
+):
+    service = ContractCrudService(tmp_path)
+    created = service.create(_definition())
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        service.registry,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    execution_id = "cex-historical-envelope-only-runtime"
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id="aming-claw",
+        backlog_id="AC-HISTORICAL-ENVELOPE-ONLY-RUNTIME",
+        contract_execution_id=execution_id,
+        actor_role="observer",
+        route_token_ref="rtok-historical-envelope-only-runtime",
+    )
+    original_guide = record["runtime_guide"]
+    historical_record = runtime.store.get(execution_id)
+    historical_record.pop("definition_governance_hints_sha256")
+    runtime.store.update(execution_id, historical_record)
+
+    source_path = Path(created["data"]["path"])
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    payload["governance_hints"] = {
+        "schema_version": "governance_hints.v1",
+        "asset_binding_events": [{
+            "schema_version": "asset_binding_event.v1",
+            "operation": "bind",
+            "path": ".",
+            "role": "config",
+            "target_module": "agent.governance.contracts.registry",
+        }],
+    }
+    source_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    envelope_definition = service.registry.get("observer_hotfix")
+    assert envelope_definition["definition_hash"] == record["definition_hash"]
+    assert envelope_definition["source_sha256"] != record["definition_source_sha256"]
+    refreshed_guide = runtime.current_guide(execution_id, actor_role="observer")
+    assert refreshed_guide["runtime_guide_hash"] == original_guide["runtime_guide_hash"]
+    assert refreshed_guide["next_legal_action"] == original_guide["next_legal_action"]
+
+    payload["instruction_layer"]["inline"] = ["Business behavior changed."]
+    source_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    changed_definition = service.registry.get("observer_hotfix")
+    assert changed_definition["definition_hash"] != record["definition_hash"]
+    with pytest.raises(StalePinnedContractExecutionError) as exc:
+        runtime.current_guide(execution_id, actor_role="observer")
+    assert exc.value.field == "definition_hash"
+
+
 def test_direct_source_edit_warns_without_blocking_runtime_until_contract_update(
     tmp_path: Path,
 ):
