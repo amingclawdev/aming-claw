@@ -42865,6 +42865,7 @@ def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     assert guide["next_required_evidence"][0]["id"] == (
         "contract_runtime_execution_resolution"
     )
+    assert len(guide["next_required_evidence"]) == 1
     assert "ambiguous_contract_runtime_execution_resolution" in (
         guide["blocking_reasons"]
     )
@@ -42875,6 +42876,26 @@ def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     )
     assert worker_guide["next_legal_action_decision_source"] == (
         "contract_runtime_execution_resolution_gate"
+    )
+    assert worker_guide["next_required_evidence"] == (
+        guide["next_required_evidence"]
+    )
+    executable_contract = guide["executable_contract"]
+    assert executable_contract["next_legal_action"] == (
+        "stop_for_contract_runtime_execution_resolution"
+    )
+    assert executable_contract["next_required_evidence"] == (
+        guide["next_required_evidence"]
+    )
+    assert worker_guide["executable_contract"] == executable_contract
+    actionable_payloads = guide["actionable_payloads"]
+    assert actionable_payloads["status"] == "blocked"
+    assert actionable_payloads["next_legal_action"] == (
+        "stop_for_contract_runtime_execution_resolution"
+    )
+    assert "finish_time_worker_attestation_submission" not in actionable_payloads
+    assert "implementation_evidence_facade_payload_skeleton" not in (
+        actionable_payloads
     )
 
 

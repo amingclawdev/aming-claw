@@ -10043,6 +10043,10 @@ def _runtime_context_projection_response(
     response["runtime_context_service"][
         "contract_runtime_execution_resolution"
     ] = contract_execution_resolution
+    _runtime_context_project_contract_resolution_blocker_into_worker_views(
+        exposed_views,
+        contract_execution_resolution,
+    )
     contract_execution_id = str(
         contract_identity.get("contract_execution_id") or ""
     ).strip()
@@ -10431,6 +10435,62 @@ def _runtime_context_project_contract_runtime_into_worker_views(
     ):
         if isinstance(container, dict):
             container.update(fields)
+
+
+def _runtime_context_project_contract_resolution_blocker_into_worker_views(
+    exposed_views: Mapping[str, Any],
+    resolution: Mapping[str, Any],
+) -> None:
+    if not (
+        isinstance(exposed_views, Mapping)
+        and isinstance(resolution, Mapping)
+        and resolution.get("fail_closed")
+        and resolution.get("status")
+        == "ambiguous_active_source_backed_worker_lineage"
+    ):
+        return
+    worker_view = exposed_views.get("worker_view")
+    if not isinstance(worker_view, dict):
+        return
+    next_legal_action = "stop_for_contract_runtime_execution_resolution"
+    blocker = {
+        "id": "contract_runtime_execution_resolution",
+        "status": "blocked",
+        "producer": "runtime_context_service",
+        "worker_owned": False,
+        "next_legal_action": next_legal_action,
+        "contract_runtime_execution_resolution": dict(resolution),
+    }
+    for container in (
+        worker_view,
+        worker_view.get("task") if isinstance(worker_view.get("task"), dict) else {},
+        (
+            worker_view.get("control_plane")
+            if isinstance(worker_view.get("control_plane"), dict)
+            else {}
+        ),
+        (
+            worker_view.get("action_plan")
+            if isinstance(worker_view.get("action_plan"), dict)
+            else {}
+        ),
+    ):
+        if not isinstance(container, dict):
+            continue
+        container["next_legal_action"] = next_legal_action
+        container["next_required_evidence"] = [dict(blocker)]
+        container["missing_evidence"] = [dict(blocker)]
+        reasons = [
+            str(reason)
+            for reason in container.get("blocking_reasons") or []
+            if str(reason)
+        ]
+        container["blocking_reasons"] = list(
+            dict.fromkeys(
+                [*reasons, "ambiguous_contract_runtime_execution_resolution"]
+            )
+        )
+        container["contract_runtime_execution_resolution"] = dict(resolution)
 
 
 def _runtime_context_source_backed_contract_identity(
@@ -11627,8 +11687,7 @@ def _runtime_context_worker_guide_response(
                 "contract_runtime_execution_resolution": (
                     contract_runtime_execution_resolution
                 ),
-            },
-            *next_required_evidence,
+            }
         ]
         scope_blocking_reasons.append(
             "ambiguous_contract_runtime_execution_resolution"
@@ -12850,6 +12909,26 @@ def _runtime_context_worker_guide_response(
         actionable_payloads,
         worker_scope_files,
     )
+    if contract_runtime_resolution_blocked:
+        actionable_payloads = {
+            "schema_version": (
+                "runtime_context.contract_execution_resolution_blocker.v1"
+            ),
+            "status": "blocked",
+            "next_legal_action": next_legal_action,
+            "contract_runtime_execution_resolution": (
+                contract_runtime_execution_resolution
+            ),
+            "worker_session_lifecycle_policy": actionable_payloads.get(
+                "worker_session_lifecycle_policy",
+                {},
+            ),
+            "write_authorization_policy": {
+                "status": "blocked",
+                "reason": "ambiguous_contract_runtime_execution_resolution",
+                "worker_mutations_allowed": False,
+            },
+        }
     executable_contract = _runtime_context_executable_contract_envelope(
         current_state_response,
         actionable_payloads=actionable_payloads,
