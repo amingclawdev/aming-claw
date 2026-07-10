@@ -810,23 +810,16 @@ def _observer_poll_invocation_fields(plan: dict) -> dict:
 
 
 def _validate_cli_invocation_routing(provider: str, model: str, backend_mode: str) -> None:
-    from agent.pipeline_config import validate_invocation_routing
+    from agent.pipeline_config import BACKEND_AUTH_MODE, validate_invocation_routing
 
     backend = str(backend_mode or "").strip().lower()
-    auth_mode = (
-        "cli_auth"
-        if backend.endswith("_cli")
-        else "api_key_env"
-        if backend.endswith("_api")
-        else "external_harness"
-        if backend == "docker_live_ai"
-        else "not_required"
-    )
+    effective_provider = "fixture" if backend == "fixture" else provider
+    effective_model = "" if backend == "fixture" else model
     errors = validate_invocation_routing(
-        provider=provider,
-        model=model,
+        provider=effective_provider,
+        model=effective_model,
         backend_mode=backend,
-        auth_mode=auth_mode,
+        auth_mode=BACKEND_AUTH_MODE.get(backend, ""),
     )
     if errors:
         raise click.ClickException("invalid AI invocation routing: " + "; ".join(errors))
