@@ -432,6 +432,11 @@ def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift
             commit_payload,
         ),
     )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_requires_worker_commit",
+        lambda *_args, **_kwargs: True,
+    )
     context = SimpleNamespace(
         worktree_path=str(worktree),
         base_commit=base_commit,
@@ -7476,6 +7481,11 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "implementation_evidence",
         "close_ready",
     }
+    assert worker_guide_result["contract_worker_commit_required"] is False
+    assert "worker_commit_facade_payload_skeleton" not in worker_guide_result
+    assert "worker_commit_facade_payload_skeleton" not in (
+        worker_guide_result["actionable_payloads"]
+    )
     write_guide_contracts = {
         "read_receipt": {
             "legacy_method": "POST",
@@ -7658,6 +7668,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
     assert finish_time_attestation_submission["reminders"][
         "transcript_identity_before_edit"
     ].startswith("Before implementation edits")
+    assert "precommit_finish_order" in finish_time_attestation_submission[
+        "reminders"
+    ]
+    assert "contract_worker_commit_order" not in finish_time_attestation_submission[
+        "reminders"
+    ]
     readiness = worker_guide["finish_time_transcript_readiness"]
     assert readiness["status"] == "worker_must_supply_before_finish_time_attestation"
     assert readiness["if_unavailable"].startswith("stop before implementation edits")
@@ -7708,6 +7724,12 @@ def test_runtime_context_current_state_route_role_filters_worker_view(conn):
         "status": "passed",
         "passed": True,
     }
+    assert "precommit_finish_order" in write_guides["finish_gate"][
+        "finish_gate_submission"
+    ]["reminders"]
+    assert "contract_worker_commit_order" not in write_guides["finish_gate"][
+        "finish_gate_submission"
+    ]["reminders"]
 
     assert worker_guide["graph_query_identity"]["fence_token_hash"] == fence_hash
     assert worker_guide["graph_query_identity"]["fence_token_redacted"] is True
@@ -21577,6 +21599,9 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     backlog_id = "AC-RUNTIME-TOKEN-REJOIN-CONTRACT-FAILED-QA"
     target_root = tmp_path / "runtime-token-rejoin-contract-failed-qa"
     target_root.mkdir()
+    worker_head_commit = hashlib.sha1(
+        b"contract-failed-qa-worker-head"
+    ).hexdigest()
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -21586,13 +21611,22 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         token="lost-contract-failed-qa-token",
         worktree_path=str(target_root),
     )
-    _record_mf_parallel_runtime_context_worker_evidence(
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
         conn,
         runtime_context,
         backlog_id=backlog_id,
         fence_token="fence-contract-failed-qa",
         graph_trace_id="gqt-contract-failed-qa-worker",
-        head_commit="head-contract-failed-qa",
+        head_commit=worker_head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-contract-failed-qa-worker",
+        head_commit=worker_head_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
     runtime_context = upsert_branch_context(
         conn,
@@ -21773,15 +21807,16 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         )
     )
     action_plan = runtime_current["executable_contract"]
-    assert action_plan["next_legal_action"] == "revise_after_failed_independent_qa"
+    assert action_plan["next_legal_action"] == "record_implementation_evidence"
     required = action_plan["next_required_evidence"][0]
-    assert required["id"] == "failed_qa_revision"
-    assert required["expected_source"] == (
-        "contract_runtime.qa_independent_verification.failed"
-    )
-    assert required["evidence_ref"].startswith(
-        f"contract_runtime:{successor['contract_execution_id']}:"
-    )
+    assert required["id"] == "implementation_evidence"
+    assert required["expected_source"] == "task_timeline.implementation"
+    revision = runtime_current["runtime_context_service"]["views"][
+        "worker_view"
+    ]["action_plan"]["failed_qa_revision_projection"]
+    assert revision["status"] == "revision_in_progress"
+    assert revision["projected_setup_lines_reused"] is True
+    assert revision["duplicate_read_receipt_required"] is False
     assert runtime_current["contract_runtime_failed_qa_revision"][
         "raw_tokens_exposed"
     ] is False
@@ -28973,13 +29008,22 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         )
     )
     assert dispatch["ok"] is True
-    _record_mf_parallel_runtime_context_worker_evidence(
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
         conn,
         runtime_context,
         backlog_id=backlog_id,
         fence_token=fence_token,
         graph_trace_id="gqt-runtime-context-close-projection",
         head_commit=worker_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context=runtime_context,
+        parent_task_id=contract_execution_id,
+        graph_trace_id="gqt-runtime-context-close-projection",
+        head_commit=worker_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
     graph_query_trace.ensure_schema(conn)
     qa_graph_trace_id = "gqt-runtime-context-close-projection-qa"
@@ -29238,10 +29282,15 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     assert stored_merge["artifact_refs"]["source_ref"] == f"timeline:{merge_event['id']}"
     assert "observer_close_ready" not in stored_line_ids
     assert "qa_independent_verification" not in stored_line_ids
-    assert "worker_read_runtime_guide" not in stored_line_ids
-    assert "worker_implementation" not in stored_line_ids
+    assert {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_commit",
+    }.issubset(stored_line_ids)
     assert stored["runtime_guide"]["next_legal_action"]["line_id"] == (
-        "worker_read_runtime_guide"
+        "worker_finish_time_attestation"
     )
 
     _persist_backlog_close_route_token_ref(
@@ -31163,6 +31212,21 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
         fence_token=runtime_context.fence_token,
         run_id=_mf_sub_run_id(runtime_context.task_id, runtime_context.fence_token),
     )
+    implementation_payload, child_worker_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            runtime_context,
+            parent_task_id=child_execution_id,
+            graph_trace_id=child_graph_trace_id,
+            head_commit=worker_commit,
+            implementation_event_ref="contract_runtime:worker_implementation",
+        )
+    )
+    implementation_payload.update(
+        {"route_token_ref": child_route_token_ref}
+    )
+    child_worker_commit_payload.update(
+        {"route_token_ref": child_route_token_ref}
+    )
     line_specs = [
         (
             "observer",
@@ -31213,7 +31277,15 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
             "worker_implementation",
             "worker_implementation",
             "implementation",
-            worker_payload,
+            implementation_payload,
+            worker_commit,
+        ),
+        (
+            "mf_sub",
+            "worker_commit",
+            "worker_commit",
+            "worker_commit",
+            child_worker_commit_payload,
             worker_commit,
         ),
         (
@@ -35710,6 +35782,22 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
     )
     runtime = server._contract_runtime(conn)
     execution_id = successor["contract_execution_id"]
+    implementation_payload, worker_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            SimpleNamespace(
+                runtime_context_id="mfrctx-mf-parallel-failed-qa-direct-fix",
+                task_id="worker-mf-parallel-failed-qa-direct-fix",
+                worker_id="worker-mf-parallel-failed-qa-direct-fix",
+                worker_slot_id="worker-mf-parallel-failed-qa-direct-fix",
+                target_project_root="/tmp/mf-parallel-failed-qa-direct-fix",
+                fence_token="fence-mf-parallel-failed-qa-direct-fix",
+            ),
+            parent_task_id=backlog_id,
+            graph_trace_id="gqt-mf-parallel-failed-qa-direct-fix",
+            head_commit="c" * 40,
+            implementation_event_ref="contract_runtime:worker_implementation",
+        )
+    )
 
     def submit_line(actor_role, stage_id, line_id, evidence_kind, payload=None):
         runtime.current_guide(execution_id, actor_role=actor_role)
@@ -35721,8 +35809,15 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
             line_id=line_id,
             evidence_kind=evidence_kind,
         )
-        if payload is not None:
-            write["payload"] = payload
+        effective_payload = payload
+        if line_id == "worker_implementation":
+            effective_payload = implementation_payload
+        elif line_id == "worker_commit":
+            effective_payload = worker_commit_payload
+            write["commit_sha"] = "c" * 40
+        if effective_payload is not None:
+            write["payload"] = effective_payload
+            write.update(effective_payload)
         result = runtime.submit_line_write(execution_id, write, actor_role=actor_role)
         assert result["ok"] is True
         return result["record"]
@@ -35743,8 +35838,9 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
         ("mf_sub", "worker_read", "worker_read_runtime_guide", "read_receipt"),
         ("mf_sub", "worker_startup", "worker_startup", "mf_subagent_startup"),
         ("mf_sub", "worker_context", "worker_graph_context", "graph_trace"),
-        ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
-        (
+            ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
+            ("mf_sub", "worker_commit", "worker_commit", "worker_commit"),
+            (
             "mf_sub",
             "worker_attestation",
             "worker_finish_time_attestation",
@@ -35835,6 +35931,22 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
     )
     runtime = server._contract_runtime(conn)
     execution_id = successor["contract_execution_id"]
+    implementation_payload, worker_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            SimpleNamespace(
+                runtime_context_id="mfrctx-mf-parallel-latest-qa-pass",
+                task_id="worker-mf-parallel-latest-qa-pass",
+                worker_id="worker-mf-parallel-latest-qa-pass",
+                worker_slot_id="worker-mf-parallel-latest-qa-pass",
+                target_project_root="/tmp/mf-parallel-latest-qa-pass",
+                fence_token="fence-mf-parallel-latest-qa-pass",
+            ),
+            parent_task_id=backlog_id,
+            graph_trace_id="gqt-mf-parallel-latest-qa-pass",
+            head_commit="d" * 40,
+            implementation_event_ref="contract_runtime:worker_implementation",
+        )
+    )
 
     def submit_line(actor_role, stage_id, line_id, evidence_kind, payload=None):
         runtime.current_guide(execution_id, actor_role=actor_role)
@@ -35846,8 +35958,15 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
             line_id=line_id,
             evidence_kind=evidence_kind,
         )
-        if payload is not None:
-            write["payload"] = payload
+        effective_payload = payload
+        if line_id == "worker_implementation":
+            effective_payload = implementation_payload
+        elif line_id == "worker_commit":
+            effective_payload = worker_commit_payload
+            write["commit_sha"] = "d" * 40
+        if effective_payload is not None:
+            write["payload"] = effective_payload
+            write.update(effective_payload)
         result = runtime.submit_line_write(execution_id, write, actor_role=actor_role)
         assert result["ok"] is True
         return result["record"]
@@ -35868,8 +35987,9 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
         ("mf_sub", "worker_read", "worker_read_runtime_guide", "read_receipt"),
         ("mf_sub", "worker_startup", "worker_startup", "mf_subagent_startup"),
         ("mf_sub", "worker_context", "worker_graph_context", "graph_trace"),
-        ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
-        (
+            ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
+            ("mf_sub", "worker_commit", "worker_commit", "worker_commit"),
+            (
             "mf_sub",
             "worker_attestation",
             "worker_finish_time_attestation",
@@ -41191,6 +41311,124 @@ def _insert_mf_parallel_source_backed_runtime_context(
     )
 
 
+def _mf_parallel_worker_proof_payloads(
+    runtime_context: BranchTaskRuntimeContext,
+    *,
+    parent_task_id: str,
+    graph_trace_id: str,
+    head_commit: str,
+    implementation_event_ref: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    worker_id = runtime_context.worker_id
+    worker_slot_id = runtime_context.worker_slot_id or worker_id
+    worker_session_id = f"session-{runtime_context.task_id}"
+    changed_files = ["agent/governance/server.py"]
+    common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": runtime_context.target_project_root,
+        "owned_files": changed_files,
+        "changed_files": changed_files,
+        "graph_trace_ids": [graph_trace_id],
+    }
+    implementation = dict(common)
+    worker_commit = {
+        **common,
+        "evidence_owner_role": "mf_sub",
+        "worker_session_id": worker_session_id,
+        "actor_session_principal": worker_session_id,
+        "filer_principal": worker_session_id,
+        "implementation_event_ref": implementation_event_ref,
+        "session_token_ref": f"wstok-{runtime_context.task_id}",
+        "fence_token_hash": _fake_sha(runtime_context.fence_token),
+        "worker_commit_sha": head_commit,
+        "commit_sha": head_commit,
+        "head_commit": head_commit,
+        "immutable_head_commit": head_commit,
+        "validated_head_commit": head_commit,
+        "clean_worktree": True,
+        "dirty_files": [],
+        "commit_diff_files": changed_files,
+        "db_verified": True,
+        "observer_impersonation": False,
+    }
+    return implementation, worker_commit
+
+
+def _record_mf_parallel_contract_runtime_worker_prefix(
+    conn,
+    *,
+    contract_execution_id: str,
+    runtime_context: BranchTaskRuntimeContext,
+    parent_task_id: str,
+    graph_trace_id: str,
+    head_commit: str,
+    implementation_event_ref: str,
+) -> None:
+    implementation, worker_commit = _mf_parallel_worker_proof_payloads(
+        runtime_context,
+        parent_task_id=parent_task_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=implementation_event_ref,
+    )
+    common = dict(implementation)
+    specs = [
+        ("worker_read", "worker_read_runtime_guide", "read_receipt", common, ""),
+        ("worker_startup", "worker_startup", "mf_subagent_startup", common, ""),
+        ("worker_context", "worker_graph_context", "graph_trace", common, ""),
+        (
+            "worker_implementation",
+            "worker_implementation",
+            "implementation",
+            implementation,
+            head_commit,
+        ),
+        ("worker_commit", "worker_commit", "worker_commit", worker_commit, head_commit),
+    ]
+    runtime = server._contract_runtime(conn)
+    for stage_id, line_id, evidence_kind, payload, commit_sha in specs:
+        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        write.update(payload)
+        if line_id == "worker_graph_context":
+            write.update(
+                {
+                    "graph_query_trace_ids": [graph_trace_id],
+                    "db_verified": True,
+                    "query_source": "mf_subagent",
+                    "query_purpose": "subagent_context_build",
+                    "graph_trace_evidence": {
+                        **common,
+                        "db_verified": True,
+                        "graph_trace_ids": [graph_trace_id],
+                        "query_source": "mf_subagent",
+                        "query_purpose": "subagent_context_build",
+                    },
+                }
+            )
+        if commit_sha:
+            write["commit_sha"] = commit_sha
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role="mf_sub",
+        )
+        assert result["ok"] is True, (line_id, result.get("decision"))
+
+
 def _record_mf_parallel_runtime_context_worker_evidence(
     conn,
     runtime_context: BranchTaskRuntimeContext,
@@ -42558,6 +42796,15 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         head_commit=head_commit,
     )
     assert len(set(evidence_events.values())) == 5
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+    )
 
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
@@ -42618,7 +42865,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
     projection = current["runtime_guide"]["completed_lines_projection"]
     assert projection["source"] == "runtime_context_worker_evidence"
-    assert projection["projected_line_count"] >= 7
+    assert projection["projected_line_count"] == 3
     submit_guidance = current["submit_line_guidance"]
     assert submit_guidance["completed_lines_projection_present"] is True
     assert submit_guidance[
@@ -42628,7 +42875,11 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         "skip_duplicate_submit_line_when_projected_or_complete"
     ] is True
     assert submit_guidance["duplicate_submit_line_required"] is False
-    assert "worker_implementation" in submit_guidance["projected_line_ids"]
+    assert {
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+        "worker_review_ready_handoff",
+    }.issubset(submit_guidance["projected_line_ids"])
     assert "fence-runtime-context-projection" not in json.dumps(current)
 
     stored_before_qa = server._contract_runtime_store(conn).get(
@@ -42640,6 +42891,11 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stored_line_ids_before_qa == {
         "observer_prefill_child_contracts",
         "observer_dispatch_bounded_workers",
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_commit",
         "qa_graph_context",
     }
 
@@ -42701,9 +42957,13 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     stored_line_ids_after_qa = {line["line_id"] for line in stored_lines_after_qa}
     assert "qa_graph_context" in stored_line_ids_after_qa
     assert "qa_independent_verification" in stored_line_ids_after_qa
-    assert "worker_read_runtime_guide" not in stored_line_ids_after_qa
-    assert "worker_startup" not in stored_line_ids_after_qa
-    assert "worker_graph_context" not in stored_line_ids_after_qa
+    assert {
+        "worker_read_runtime_guide",
+        "worker_startup",
+        "worker_graph_context",
+        "worker_implementation",
+        "worker_commit",
+    }.issubset(stored_line_ids_after_qa)
     qa_line = [
         line
         for line in stored_lines_after_qa

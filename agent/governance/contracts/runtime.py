@@ -1690,12 +1690,15 @@ _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
 
 def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
+    *,
+    failed_qa_rejoin_contexts: set[tuple[str, str]] | None = None,
 ) -> list[Mapping[str, Any]]:
     last_failed_qa_index = _last_failed_qa_line_index(lines)
     post_failed_retry_contexts = _post_failed_qa_retry_context_keys(
         lines,
         failed_qa_index=last_failed_qa_index,
     )
+    post_failed_retry_contexts.update(failed_qa_rejoin_contexts or set())
     satisfying: list[Mapping[str, Any]] = []
     for index, line in enumerate(lines):
         if isinstance(line, Mapping) and not _line_shape_allows_contract_completion(
@@ -1947,6 +1950,26 @@ def _post_failed_qa_retry_context_keys(
         if not _line_status_allows_contract_completion(line):
             continue
         contexts.update(_line_retry_context_keys(line))
+    return contexts
+
+
+def _failed_qa_rejoin_context_keys_from_projection(
+    projection: Mapping[str, Any] | None,
+) -> set[tuple[str, str]]:
+    if not isinstance(projection, Mapping):
+        return set()
+    contexts: set[tuple[str, str]] = set()
+    for item in projection.get("failed_qa_revision_rejoin_contexts") or []:
+        if not isinstance(item, Mapping):
+            continue
+        runtime_context_id = str(item.get("runtime_context_id") or "").strip()
+        task_id = str(item.get("task_id") or "").strip()
+        if runtime_context_id:
+            contexts.add(("runtime_context_id", runtime_context_id))
+            contexts.add(("line_instance_id", f"runtime_context:{runtime_context_id}"))
+        if task_id:
+            contexts.add(("task_id", task_id))
+            contexts.add(("line_instance_id", f"task:{task_id}"))
     return contexts
 
 
@@ -3080,6 +3103,19 @@ class ContractRuntime:
             projection=projection,
         )
 
+    def pinned_definition_has_line(
+        self,
+        contract_execution_id: str,
+        line_id: str,
+    ) -> bool:
+        record = self.store.get(contract_execution_id)
+        definition = self._load_pinned_definition(record)
+        expected = str(line_id or "").strip()
+        return bool(expected) and any(
+            str(line.get("line_id") or "").strip() == expected
+            for _stage, line in iter_stage_lines(definition)
+        )
+
     def _record_view(
         self,
         record: Mapping[str, Any],
@@ -3111,7 +3147,10 @@ class ContractRuntime:
             line_items,
         )
         completion_satisfying_lines = _contract_completion_satisfying_lines(
-            completion_input_lines
+            completion_input_lines,
+            failed_qa_rejoin_contexts=(
+                _failed_qa_rejoin_context_keys_from_projection(projection)
+            ),
         )
         state = build_execution_state(
             definition,

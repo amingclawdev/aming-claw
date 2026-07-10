@@ -4447,6 +4447,9 @@ def _runtime_context_current_values(
         "agent_id": context.agent_id,
         "allocation_owner": context.allocation_owner or context.agent_id,
         "attempt": context.attempt,
+        "retry_round": context.retry_round,
+        "runtime_context_status": context.status,
+        "last_recovery_action": context.last_recovery_action,
         "fence_token_present": bool(context.fence_token),
         "fence_token_hash": fence_token_hash,
         "fence_token_redacted": bool(context.fence_token),
@@ -7955,6 +7958,13 @@ def _runtime_context_next_legal_action(
         and failed_qa_revision_projection.get("status") == "revision_required"
     ):
         return "revise_after_failed_independent_qa"
+    if (
+        isinstance(failed_qa_revision_projection, Mapping)
+        and failed_qa_revision_projection.get("status") == "revision_in_progress"
+    ):
+        return _runtime_context_text(
+            failed_qa_revision_projection.get("next_legal_action")
+        ) or "record_implementation_evidence"
     if route_token_action.get("status") in {"missing", "stale"}:
         return "refresh_route_token_ref"
     if read_receipt_hash_action.get("status") == "missing":
@@ -8106,6 +8116,34 @@ def _runtime_context_failed_qa_revision_projection(
         failed_status = _runtime_context_lane_clause_id(
             contract_evidence.get("failed_qa_status") or "failed"
         )
+        failed_qa_rejoin_reopened = bool(
+            contract_evidence.get("failed_qa_rejoin_reopened")
+            or _runtime_context_text(values.get("last_recovery_action"))
+            == "mf_subagent_failed_qa_revision_rejoin_issued"
+        )
+        if failed_qa_rejoin_reopened:
+            return {
+                "schema_version": "runtime_context.failed_qa_revision_projection.v1",
+                "status": "revision_in_progress",
+                "source": "contract_runtime_completed_lines",
+                "next_legal_action": "record_implementation_evidence",
+                "failed_qa_source_ref": failed_ref,
+                "failed_qa_event_kind": _runtime_context_text(
+                    contract_evidence.get("failed_qa_line_id")
+                    or "qa_independent_verification"
+                ),
+                "failed_qa_status": failed_status,
+                "allowed_files": owned_files,
+                "expected_source": (
+                    "contract_runtime.qa_independent_verification.failed"
+                ),
+                "contract_runtime_failed_qa_revision": contract_evidence,
+                "projected_setup_lines_reused": True,
+                "duplicate_read_receipt_required": False,
+                "duplicate_startup_required": False,
+                "next_required_line_id": "worker_implementation",
+                "raw_route_token_exposed": False,
+            }
         return {
             "schema_version": "runtime_context.failed_qa_revision_projection.v1",
             "status": "revision_required",
@@ -8189,6 +8227,33 @@ def _runtime_context_failed_qa_revision_required_item(
         "allowed_files": list(projection.get("allowed_files") or []),
         "required_revision_cycle": list(
             projection.get("required_revision_cycle") or []
+        ),
+    }
+
+
+def _runtime_context_failed_qa_revision_implementation_item(
+    projection: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "runtime_context.next_required_evidence.item.v1",
+        "id": "implementation_evidence",
+        "status": "missing",
+        "field": "implementation_event_refs",
+        "gate": "finish",
+        "next_action": "record_implementation_evidence",
+        "producer": "mf_subagent_worker",
+        "consumer": "independent_qa_revision",
+        "expected_source": "task_timeline.implementation",
+        "evidence_ref": "timeline",
+        "runtime_context_id": _runtime_context_text(values.get("runtime_context_id")),
+        "task_id": _runtime_context_text(values.get("task_id")),
+        "parent_task_id": _runtime_context_text(values.get("parent_task_id")),
+        "worker_owned": True,
+        "close_satisfying_required": True,
+        "requires": [],
+        "failed_qa_source_ref": _runtime_context_text(
+            projection.get("failed_qa_source_ref")
         ),
     }
 
@@ -8626,6 +8691,22 @@ def build_runtime_context_action_plan_view(
         for index, item in enumerate(next_required_evidence):
             item["sequence_index"] = index
             item["is_next"] = index == 0
+    elif failed_qa_revision_projection.get("status") == "revision_in_progress":
+        next_required_evidence = [
+            _runtime_context_failed_qa_revision_implementation_item(
+                failed_qa_revision_projection,
+                values,
+            ),
+            *[
+                item
+                for item in next_required_evidence
+                if _runtime_context_text(item.get("id"))
+                not in {"failed_qa_revision", "implementation_evidence"}
+            ],
+        ]
+        for index, item in enumerate(next_required_evidence):
+            item["sequence_index"] = index
+            item["is_next"] = index == 0
     worker_next_moves = [
         {
             "id": item.get("id", ""),
@@ -8647,6 +8728,21 @@ def build_runtime_context_action_plan_view(
                 "event_ref": failed_qa_revision_projection.get(
                     "failed_qa_event_ref", ""
                 ),
+                "source_ref": failed_qa_revision_projection.get(
+                    "failed_qa_source_ref", ""
+                ),
+                "source": failed_qa_revision_projection.get("source", ""),
+            }
+        )
+    elif failed_qa_revision_projection.get("status") == "revision_in_progress":
+        blocking_reasons.append(
+            {
+                "code": "failed_independent_qa_revision_in_progress",
+                "message": (
+                    "independent QA failed; the legal rejoin preserves projected "
+                    "setup evidence and now requires revised implementation evidence"
+                ),
+                "next_action": "record_implementation_evidence",
                 "source_ref": failed_qa_revision_projection.get(
                     "failed_qa_source_ref", ""
                 ),

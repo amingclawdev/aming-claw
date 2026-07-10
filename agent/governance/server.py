@@ -9715,6 +9715,22 @@ def _runtime_context_projection_response(
         latest_revision_payload,
         contract_revision_id=str(source_refs.get("contract_revision_id") or ""),
     )
+    contract_execution_id = str(
+        contract_identity.get("contract_execution_id") or ""
+    ).strip()
+    try:
+        contract_worker_commit_required = bool(
+            contract_execution_id
+            and _contract_runtime(conn).pinned_definition_has_line(
+                contract_execution_id,
+                "worker_commit",
+            )
+        )
+    except ContractRuntimeError:
+        contract_worker_commit_required = False
+    response["contract_worker_commit_required"] = (
+        contract_worker_commit_required
+    )
     current_actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -10627,6 +10643,9 @@ def _runtime_context_worker_guide_response(
         or {}
     )
     task = dict(worker_view.get("task") or {})
+    contract_worker_commit_required = bool(
+        current_state_response.get("contract_worker_commit_required")
+    )
     route_identity = dict(worker_view.get("route_identity") or {})
     source_refs = (
         current_state_response.get("source_refs")
@@ -10709,9 +10728,7 @@ def _runtime_context_worker_guide_response(
             ),
             target_project_root=target_project_root,
             worktree_path=worktree_path,
-            contract_worker_commit_required=bool(
-                task.get("contract_worker_commit_required")
-            ),
+            contract_worker_commit_required=contract_worker_commit_required,
         )
     )
     finish_submission_head_commit = str(
@@ -11367,10 +11384,22 @@ def _runtime_context_worker_guide_response(
                 "for this row. current_branch_head_commit is informational when "
                 "successor repairs continue on the same branch."
             ),
-            "contract_worker_commit_order": (
-                "Create the implementation commit, record its exact clean HEAD "
-                "through runtime_context.worker_commit, then submit finish-time "
-                "worker attestation."
+            **(
+                {
+                    "contract_worker_commit_order": (
+                        "Create the implementation commit, record its exact clean HEAD "
+                        "through runtime_context.worker_commit, then submit finish-time "
+                        "worker attestation."
+                    )
+                }
+                if contract_worker_commit_required
+                else {
+                    "precommit_finish_order": (
+                        "Leave worker changes uncommitted until finish-time worker "
+                        "attestation and finish gate pass; only then create the worker "
+                        "git commit."
+                    )
+                }
             ),
             "transcript_identity_before_edit": (
                 "Before implementation edits, ensure startup evidence already "
@@ -11475,9 +11504,20 @@ def _runtime_context_worker_guide_response(
                 "row_scoped_finish_head_projection.status is "
                 "branch_head_scope_mismatch."
             ),
-            "contract_worker_commit_order": (
-                "This finish gate consumes the exact ContractRuntime worker_commit. "
-                "If HEAD or the worktree drifted afterward, stop and report it."
+            **(
+                {
+                    "contract_worker_commit_order": (
+                        "This finish gate consumes the exact ContractRuntime worker_commit. "
+                        "If HEAD or the worktree drifted afterward, stop and report it."
+                    )
+                }
+                if contract_worker_commit_required
+                else {
+                    "precommit_finish_order": (
+                        "This finish gate must pass before the worker creates its git "
+                        "commit. If the runtime blocks, stop and report the blocker."
+                    )
+                }
             ),
             "canonical_finish_gate_required": True,
             "raw_finish_time_attestation_alone_close_satisfying": False,
@@ -11832,6 +11872,8 @@ def _runtime_context_worker_guide_response(
             "auth": _auth_guide("body.session_token"),
         },
     }
+    if not contract_worker_commit_required:
+        write_guides.pop("worker_commit", None)
     executable_contract_identity = (
         current_state_response.get("executable_contract")
         if isinstance(current_state_response.get("executable_contract"), Mapping)
@@ -11970,6 +12012,8 @@ def _runtime_context_worker_guide_response(
         contract_hash=str(contract_execution_identity.get("contract_hash") or ""),
         context_hash=str(contract_read_receipt.get("context_hash") or ""),
     )
+    if not contract_worker_commit_required:
+        actionable_payloads.pop("worker_commit_facade_payload_skeleton", None)
     actionable_payloads["finish_time_worker_attestation_submission"] = (
         finish_attestation_submission
     )
@@ -12011,6 +12055,7 @@ def _runtime_context_worker_guide_response(
         "session_token_ref": str(worker_view.get("session_token_ref") or ""),
         "session_token_ref_present": bool(worker_view.get("session_token_ref")),
         "raw_session_token_exposed": False,
+        "contract_worker_commit_required": contract_worker_commit_required,
         "executable_contract": executable_contract,
         "actionable_payloads": actionable_payloads,
         "capacity_fallback_guidance": actionable_payloads.get(
@@ -12051,10 +12096,6 @@ def _runtime_context_worker_guide_response(
         ),
         "implementation_evidence_facade_payload_skeleton": actionable_payloads.get(
             "implementation_evidence_facade_payload_skeleton",
-            {},
-        ),
-        "worker_commit_facade_payload_skeleton": actionable_payloads.get(
-            "worker_commit_facade_payload_skeleton",
             {},
         ),
         "finish_time_transcript_readiness": actionable_payloads.get(
@@ -12267,6 +12308,10 @@ def _runtime_context_worker_guide_response(
             "worker_evidence_substitution_allowed": False,
         },
     }
+    if contract_worker_commit_required:
+        response["worker_commit_facade_payload_skeleton"] = (
+            actionable_payloads.get("worker_commit_facade_payload_skeleton", {})
+        )
     return response
 
 
@@ -17120,6 +17165,7 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             "task_id": str(getattr(context, "task_id", "") or ""),
             "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
             "worker_role": "mf_sub",
+            "failed_qa_rejoin_reopened": failed_qa_rejoin_reopened,
             "raw_tokens_exposed": False,
             "observer_authored_worker_evidence": False,
         }
@@ -17953,6 +17999,29 @@ def _runtime_context_actual_worker_commit_line(
     )
 
 
+def _runtime_context_contract_requires_worker_commit(
+    conn,
+    contract_execution_id: str,
+) -> bool:
+    if not contract_execution_id:
+        return False
+    try:
+        return _contract_runtime(conn).pinned_definition_has_line(
+            contract_execution_id,
+            "worker_commit",
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_worker_commit_definition_unavailable",
+            str(exc),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "source_of_authority": "ContractRuntime.pinned_definition",
+            },
+        ) from exc
+
+
 def _runtime_context_contract_worker_commit_projection(
     conn,
     *,
@@ -17969,7 +18038,10 @@ def _runtime_context_contract_worker_commit_projection(
         revision_payload,
         body,
     )
-    if not contract_execution_id:
+    if not _runtime_context_contract_requires_worker_commit(
+        conn,
+        contract_execution_id,
+    ):
         actual_head = _runtime_context_git_head_commit(
             str(getattr(context, "worktree_path", "") or "")
         )
@@ -41663,6 +41735,19 @@ def _contract_runtime_mf_parallel_context_projection(
             "observer_authored_worker_backfill": False,
         },
     }
+    failed_qa_rejoin_contexts = [
+        {
+            "runtime_context_id": str(item.get("runtime_context_id") or ""),
+            "task_id": str(item.get("task_id") or ""),
+            "parent_task_id": str(item.get("parent_task_id") or ""),
+        }
+        for item in expected_context_summaries
+        if item.get("failed_qa_revision_rejoin")
+    ]
+    if failed_qa_rejoin_contexts:
+        projection["failed_qa_revision_rejoin_contexts"] = (
+            failed_qa_rejoin_contexts
+        )
     if identity_mismatch:
         projection["dispatch_identity_mismatch"] = identity_mismatch
     return projection
@@ -41864,26 +41949,41 @@ def _contract_runtime_projection_for_context(
         _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES
     ):
         source = source_map.get(source_key)
+        if line_id == "worker_commit":
+            worker_commit_key = (
+                stage_id,
+                line_id,
+                f"runtime_context:{runtime_context_id}",
+            )
+            source_ref = str(
+                source.get("source_ref")
+                if isinstance(source, Mapping)
+                else ""
+            )
+            if source_ref:
+                projected_line_refs.append(
+                    {
+                        "stage_id": stage_id,
+                        "line_id": line_id,
+                        "evidence_kind": evidence_kind,
+                        "line_instance_id": f"runtime_context:{runtime_context_id}",
+                        "source_ref": source_ref,
+                        "completion_authoritative": False,
+                        "source_of_authority": (
+                            "ContractRuntime.completed_lines.worker_commit"
+                        ),
+                    }
+                )
+                if source_ref not in source_refs:
+                    source_refs.append(source_ref)
+            if _contract_runtime_projection_key_completed(
+                worker_commit_key,
+                local_keys,
+            ):
+                continue
+            break
         if not isinstance(source, Mapping) or not source.get("source_ref"):
             break
-        if line_id == "worker_commit":
-            source_ref = str(source.get("source_ref") or "")
-            projected_line_refs.append(
-                {
-                    "stage_id": stage_id,
-                    "line_id": line_id,
-                    "evidence_kind": evidence_kind,
-                    "line_instance_id": f"runtime_context:{runtime_context_id}",
-                    "source_ref": source_ref,
-                    "completion_authoritative": False,
-                    "source_of_authority": (
-                        "ContractRuntime.completed_lines.worker_commit"
-                    ),
-                }
-            )
-            if source_ref and source_ref not in source_refs:
-                source_refs.append(source_ref)
-            continue
         line = _contract_runtime_projected_worker_line(
             record=record,
             context=context,
@@ -41945,6 +42045,10 @@ def _contract_runtime_projection_for_context(
         "projected_lines": projected_lines,
         "projected_line_refs": projected_line_refs,
         "source_refs": source_refs,
+        "failed_qa_revision_rejoin": (
+            str(getattr(context, "last_recovery_action", "") or "")
+            == "mf_subagent_failed_qa_revision_rejoin_issued"
+        ),
     }
 
 
