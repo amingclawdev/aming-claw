@@ -159,6 +159,66 @@ class AIInvocationRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
+    @classmethod
+    def from_agent_run(
+        cls,
+        run: Any,
+        *,
+        prompt: str,
+        system_prompt: str = "",
+        cwd: str = "",
+        timeout_sec: int | None = None,
+        output_path: str = "",
+        route: RoutePromptContract | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> "AIInvocationRequest":
+        """Adapt a pinned AgentRun into the existing invocation wire contract."""
+        config = run.config
+        request_metadata = dict(metadata or {})
+        request_metadata["cli_agent_service"] = {
+            "schema_version": "cli_agent_service.invocation_adapter.v1",
+            "run_id": run.run_id,
+            "profile_id": config.profile_id,
+            "profile_version": config.profile_version,
+            "runtime_id": config.runtime_id,
+            "runtime_version": config.runtime_version,
+            "endpoint_id": config.endpoint_id,
+            "endpoint_version": config.endpoint_version,
+            "launcher_id": config.launcher_id,
+            "launcher_version": config.launcher_version,
+            "role_policy_id": config.role_policy_id,
+            "role_policy_version": config.role_policy_version,
+            "credential_ref": config.credential_ref,
+            "credential_ref_version": config.credential_ref_version,
+            "resolution_sources": {
+                resolution.field_name: resolution.source
+                for resolution in config.resolutions
+            },
+            "raw_credential_material_exposed": False,
+        }
+        resolved_timeout = timeout_sec
+        if resolved_timeout is None:
+            resolved_timeout = (
+                run.profile.role_policy.timeout_sec if run.profile is not None else 120
+            )
+        return cls(
+            role=config.role,
+            provider=config.provider,
+            model=config.model,
+            backend_mode=config.backend_mode,
+            cwd=cwd,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            timeout_sec=resolved_timeout,
+            output_path=output_path,
+            auth_mode=config.auth_mode,
+            output_policy=config.output_policy,
+            route=route or RoutePromptContract(),
+            metadata=request_metadata,
+            env=dict(env or {}),
+        )
+
     def resolved_backend(self) -> str:
         if self.backend_mode:
             return self.backend_mode
