@@ -11,6 +11,77 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 class TestAILifecycleProviderRouting(unittest.TestCase):
+    def test_agent_run_adapter_dispatches_cli_api_and_external_local_routes(self):
+        from ai_invocation import AIInvocationResult, invoke_agent_run
+        from cli_agent_service.config import resolve_agent_config
+        from cli_agent_service.models import (
+            AgentProfile,
+            CredentialRef,
+            HarnessRuntime,
+            InferenceEndpoint,
+            LauncherAdapter,
+            RolePolicy,
+        )
+
+        def profile(profile_id, provider, model, backend_mode, auth_mode):
+            return AgentProfile(
+                profile_id=profile_id,
+                harness_runtime=HarnessRuntime(runtime_id="runtime-" + profile_id),
+                inference_endpoint=InferenceEndpoint(
+                    endpoint_id="endpoint-" + profile_id,
+                    provider=provider,
+                    model=model,
+                    backend_mode=backend_mode,
+                    auth_mode=auth_mode,
+                ),
+                credential_ref=CredentialRef(
+                    ref_id="credential:provider-home:" + profile_id,
+                    provider=provider,
+                ),
+                launcher_adapter=LauncherAdapter(launcher_id="launcher-" + profile_id),
+                role_policy=RolePolicy(policy_id="policy-" + profile_id, roles=("dev",)),
+            )
+
+        cli_run = resolve_agent_config(
+            run_id="run-cli",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile("cli", "openai", "gpt-5.4-codex", "codex_cli", "cli_auth"),
+        )
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            invoke_cli.side_effect = lambda request: AIInvocationResult(
+                request=request,
+                status="completed",
+            )
+            cli_result = invoke_agent_run(cli_run, prompt="cli prompt")
+        self.assertEqual(cli_result.request.backend_mode, "codex_cli")
+        invoke_cli.assert_called_once()
+
+        api_run = resolve_agent_config(
+            run_id="run-api",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile("api", "openai", "gpt-4o", "openai_api", "api_key_env"),
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            api_result = invoke_agent_run(api_run, prompt="api prompt")
+        self.assertEqual(api_result.auth_status, "missing_api_key")
+
+        local_run = resolve_agent_config(
+            run_id="run-local",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile(
+                "local",
+                "openai",
+                "local-c0-model",
+                "docker_live_ai",
+                "external_harness",
+            ),
+        )
+        local_result = invoke_agent_run(local_run, prompt="local prompt")
+        self.assertEqual(local_result.auth_status, "external_harness_required")
+
     def test_pipeline_routing_carries_backend_auth_and_output_policy(self):
         from pipeline_config import resolve_role_config
 

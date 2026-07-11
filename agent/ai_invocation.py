@@ -92,10 +92,12 @@ def safe_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
 
 @dataclass
 class RoutePromptContract:
+    route_id: str = ""
     route_context_hash: str = ""
     prompt_contract_id: str = ""
     prompt_contract_hash: str = ""
     route_token_ref: str = ""
+    visible_injection_manifest_hash: str = ""
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "RoutePromptContract":
@@ -105,6 +107,7 @@ class RoutePromptContract:
         prompt_contract = _nested(data, "prompt_contract")
         route_token = _nested(data, "route_token")
         return cls(
+            route_id=_first_string(data, ("route_id",)),
             route_context_hash=(
                 _first_string(data, ("route_context_hash",))
                 or _first_string(route_context, ("route_context_hash",))
@@ -130,14 +133,20 @@ class RoutePromptContract:
                 _first_string(data, ("route_token_ref", "route_token_id", "token_id"))
                 or _first_string(route_token, ("token_id", "route_token_id"))
             ),
+            visible_injection_manifest_hash=_first_string(
+                data,
+                ("visible_injection_manifest_hash",),
+            ),
         )
 
     def as_dict(self) -> dict[str, str | bool]:
         return {
+            "route_id": self.route_id,
             "route_context_hash": self.route_context_hash,
             "prompt_contract_id": self.prompt_contract_id,
             "prompt_contract_hash": self.prompt_contract_hash,
             "route_token_ref": self.route_token_ref,
+            "visible_injection_manifest_hash": self.visible_injection_manifest_hash,
             "raw_context_exposed": False,
         }
 
@@ -175,6 +184,30 @@ class AIInvocationRequest:
     ) -> "AIInvocationRequest":
         """Adapt a pinned AgentRun into the existing invocation wire contract."""
         config = run.config
+        governance_refs = {
+            reference.name: reference.value for reference in run.governance_refs
+        }
+        pinned_route = RoutePromptContract.from_mapping(governance_refs)
+        supplied_route = route or RoutePromptContract()
+        effective_route = RoutePromptContract(
+            route_id=supplied_route.route_id or pinned_route.route_id,
+            route_context_hash=(
+                supplied_route.route_context_hash or pinned_route.route_context_hash
+            ),
+            prompt_contract_id=(
+                supplied_route.prompt_contract_id or pinned_route.prompt_contract_id
+            ),
+            prompt_contract_hash=(
+                supplied_route.prompt_contract_hash or pinned_route.prompt_contract_hash
+            ),
+            route_token_ref=(
+                supplied_route.route_token_ref or pinned_route.route_token_ref
+            ),
+            visible_injection_manifest_hash=(
+                supplied_route.visible_injection_manifest_hash
+                or pinned_route.visible_injection_manifest_hash
+            ),
+        )
         request_metadata = dict(metadata or {})
         request_metadata["cli_agent_service"] = {
             "schema_version": "cli_agent_service.invocation_adapter.v1",
@@ -191,6 +224,7 @@ class AIInvocationRequest:
             "role_policy_version": config.role_policy_version,
             "credential_ref": config.credential_ref,
             "credential_ref_version": config.credential_ref_version,
+            "governance_refs": governance_refs,
             "resolution_sources": {
                 resolution.field_name: resolution.source
                 for resolution in config.resolutions
@@ -214,7 +248,7 @@ class AIInvocationRequest:
             output_path=output_path,
             auth_mode=config.auth_mode,
             output_policy=config.output_policy,
-            route=route or RoutePromptContract(),
+            route=effective_route,
             metadata=request_metadata,
             env=dict(env or {}),
         )
@@ -989,6 +1023,34 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def invoke_agent_run(
+    run: Any,
+    *,
+    prompt: str,
+    system_prompt: str = "",
+    cwd: str = "",
+    timeout_sec: int | None = None,
+    output_path: str = "",
+    route: RoutePromptContract | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AIInvocationResult:
+    """Invoke a pinned AgentRun through the canonical request/result dispatcher."""
+    return invoke_ai(
+        AIInvocationRequest.from_agent_run(
+            run,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            output_path=output_path,
+            route=route,
+            metadata=metadata,
+            env=env,
+        )
+    )
 
 
 def invoke_ai(request: AIInvocationRequest) -> AIInvocationResult:

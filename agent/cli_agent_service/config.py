@@ -11,15 +11,17 @@ from .models import (
     FieldResolution,
     ResolutionCandidate,
     ResolvedAgentConfig,
+    validate_credential_ref_id,
 )
 
 
-PROFILE_PRECEDENCE = 100
-RUN_REQUEST_PRECEDENCE = 90
-PROJECT_ROLE_PRECEDENCE = 70
-PIPELINE_ROLE_PRECEDENCE = 60
-PIPELINE_DEFAULT_PRECEDENCE = 50
-COMPATIBILITY_DEFAULT_PRECEDENCE = 10
+REQUEST_OVERRIDE_PRECEDENCE = 100
+RUN_IDENTITY_PRECEDENCE = 100
+ROLE_PRECEDENCE = 80
+PROJECT_PRECEDENCE = 60
+PROFILE_DEFAULT_PRECEDENCE = 40
+PIPELINE_DEFAULT_PRECEDENCE = 30
+COMPATIBILITY_DEFAULT_PRECEDENCE = 20
 INTRINSIC_DEFAULT_PRECEDENCE = 1
 
 _ROUTING_FIELDS = (
@@ -31,6 +33,7 @@ _ROUTING_FIELDS = (
 )
 _FIXTURE_AUTHORITY_SOURCES = (
     "agent_profile",
+    "request_overrides",
     "project_config.ai.routing.",
     "pipeline_config.roles.",
     "pipeline_config.default",
@@ -168,6 +171,7 @@ def resolve_agent_config(
     pipeline_config: Mapping[str, Any] | None = None,
     project_config: Any = None,
     compatibility_defaults: Mapping[str, Any] | None = None,
+    request_overrides: Mapping[str, Any] | None = None,
     governance_refs: Mapping[str, str] | None = None,
     created_at: str = "",
     parent_run_id: str = "",
@@ -175,9 +179,8 @@ def resolve_agent_config(
 ) -> AgentRun:
     """Resolve and pin one run without loading credential material.
 
-    Precedence is immutable profile, project role, pipeline role, pipeline
-    default, then explicit compatibility defaults. An existing run is returned
-    unchanged, so later legacy reads cannot rewrite its selected profile.
+    Precedence is request override, role, project, then defaults. An existing run
+    is returned unchanged, so later reads cannot rewrite its pinned values.
     """
     run_id = str(run_id or "").strip()
     role = str(role or "").strip().lower()
@@ -228,16 +231,19 @@ def resolve_agent_config(
     def add(field_name: str, value: Any, source: str, precedence: int) -> None:
         if field_name not in candidates:
             return
+        normalized = str(value or "").strip()
+        if field_name == "credential_ref" and normalized:
+            normalized = validate_credential_ref_id(normalized)
         candidates[field_name].append(
             ResolutionCandidate(
-                value=str(value or "").strip(),
+                value=normalized,
                 source=source,
                 precedence=precedence,
             )
         )
 
-    add("project_id", project_id, "run_request.project_id", RUN_REQUEST_PRECEDENCE)
-    add("role", role, "run_request.role", RUN_REQUEST_PRECEDENCE)
+    add("project_id", project_id, "run_request.project_id", RUN_IDENTITY_PRECEDENCE)
+    add("role", role, "run_request.role", RUN_IDENTITY_PRECEDENCE)
     add(
         "output_policy",
         "hash_and_summary_only",
@@ -266,7 +272,7 @@ def resolve_agent_config(
             "auth_mode": endpoint.auth_mode,
             "output_policy": profile.output_policy,
         }.items():
-            add(field_name, value, "agent_profile", PROFILE_PRECEDENCE)
+            add(field_name, value, "agent_profile", PROFILE_DEFAULT_PRECEDENCE)
 
     project_role = _project_role_entry(project_config, role)
     for field_name in _ROUTING_FIELDS:
@@ -274,7 +280,7 @@ def resolve_agent_config(
             field_name,
             project_role.get(field_name),
             "project_config.ai.routing.{}".format(role),
-            PROJECT_ROLE_PRECEDENCE,
+            PROJECT_PRECEDENCE,
         )
 
     pipeline = _mapping(pipeline_config)
@@ -284,7 +290,7 @@ def resolve_agent_config(
             field_name,
             pipeline_role.get(field_name),
             "pipeline_config.roles.{}".format(role),
-            PIPELINE_ROLE_PRECEDENCE,
+            ROLE_PRECEDENCE,
         )
     pipeline_default = _mapping(pipeline.get("default"))
     for field_name in _ROUTING_FIELDS:
@@ -302,6 +308,22 @@ def resolve_agent_config(
             defaults.get(field_name),
             "compatibility_defaults",
             COMPATIBILITY_DEFAULT_PRECEDENCE,
+        )
+
+    overrides = _mapping(request_overrides)
+    unsupported_overrides = sorted(set(overrides) - set(_ROUTING_FIELDS))
+    if unsupported_overrides:
+        raise ValueError(
+            "request overrides contain unsupported public routing fields: {}".format(
+                ", ".join(unsupported_overrides)
+            )
+        )
+    for field_name in _ROUTING_FIELDS:
+        add(
+            field_name,
+            overrides.get(field_name),
+            "request_overrides",
+            REQUEST_OVERRIDE_PRECEDENCE,
         )
 
     provider_resolution = _selected_resolution("provider", candidates["provider"])

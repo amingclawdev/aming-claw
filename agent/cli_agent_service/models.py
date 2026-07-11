@@ -53,6 +53,15 @@ def _strings(values: Iterable[str]) -> tuple[str, ...]:
 
 _LOWER_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{1,191}")
 _HASH_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_CREDENTIAL_REF_PATTERN = re.compile(
+    r"(?:credential:[a-z0-9][a-z0-9_-]{1,63}"
+    r"(?::[a-z0-9][a-z0-9_-]{1,63})+|credref-[a-z0-9][a-z0-9-]{2,127})"
+)
+_SECRET_SHAPED_CREDENTIAL_SEGMENT = re.compile(
+    r"(?:^|[-_])(api[-_]?key|bearer|password|raw|secret|token)(?:$|[-_])|"
+    r"^(?:sk|ghp|github_pat|xox[baprs])[-_]",
+    re.IGNORECASE,
+)
 _GOVERNANCE_REF_PATTERNS = {
     "project_id": _LOWER_ID_PATTERN,
     "backlog_id": re.compile(r"[A-Z][A-Z0-9-]{2,191}"),
@@ -68,9 +77,21 @@ _GOVERNANCE_REF_PATTERNS = {
     "session_token_ref": re.compile(r"wstok-[0-9a-f]{16,128}"),
     "visible_injection_manifest_hash": _HASH_PATTERN,
     "graph_trace_id": re.compile(r"gqt-[a-z0-9][a-z0-9-]{2,191}"),
+    "snapshot_id": re.compile(r"[a-z][a-z0-9-]{2,191}"),
     "timeline_ref": re.compile(r"timeline:[0-9]+"),
     "commit_sha": re.compile(r"[0-9a-f]{40}"),
 }
+
+
+def validate_credential_ref_id(value: str) -> str:
+    """Return one opaque credential reference or reject secret-shaped material."""
+    normalized = _required(value, "ref_id")
+    if not _CREDENTIAL_REF_PATTERN.fullmatch(normalized):
+        raise ValueError("credential reference must be an opaque public-safe identifier")
+    segments = normalized.replace("credref-", "credential:", 1).split(":")[1:]
+    if any(_SECRET_SHAPED_CREDENTIAL_SEGMENT.search(segment) for segment in segments):
+        raise ValueError("credential reference must not contain credential material")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -207,7 +228,7 @@ class CredentialRef:
     )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ref_id", _required(self.ref_id, "ref_id"))
+        object.__setattr__(self, "ref_id", validate_credential_ref_id(self.ref_id))
         object.__setattr__(self, "version", _required(self.version, "version"))
         object.__setattr__(self, "provider", str(self.provider or "").strip())
         object.__setattr__(self, "ref_kind", _required(self.ref_kind, "ref_kind"))

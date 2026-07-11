@@ -76,7 +76,7 @@ def test_models_are_versioned_immutable_and_public_safe():
     assert "credential_value" not in json.dumps(public)
 
 
-def test_selected_profile_wins_and_explains_every_public_field():
+def test_request_role_project_defaults_precedence_is_explicit():
     from cli_agent_service.config import resolve_agent_config
     from cli_agent_service.models import PUBLIC_CONFIGURATION_FIELDS
 
@@ -85,6 +85,13 @@ def test_selected_profile_wins_and_explains_every_public_field():
         role="dev",
         project_id="aming-claw",
         profile=_profile(),
+        request_overrides={
+            "provider": "openai",
+            "model": "gpt-5.5-codex",
+            "backend_mode": "codex_cli",
+            "auth_mode": "cli_auth",
+            "output_policy": "hash_and_summary_only",
+        },
         project_config={
             "ai": {
                 "routing": {
@@ -105,7 +112,7 @@ def test_selected_profile_wins_and_explains_every_public_field():
     )
 
     assert run.config.provider == "openai"
-    assert run.config.model == "gpt-5.4-codex"
+    assert run.config.model == "gpt-5.5-codex"
     assert run.config.profile_id == "profile-codex-dev"
     assert {item.field_name for item in run.config.resolutions} == set(
         PUBLIC_CONFIGURATION_FIELDS
@@ -117,16 +124,20 @@ def test_selected_profile_wins_and_explains_every_public_field():
         "credential_ref",
         "launcher_id",
         "role_policy_id",
-        "provider",
-        "model",
-        "backend_mode",
-        "auth_mode",
-        "output_policy",
     ):
         assert run.config.resolution_for(field_name).source == "agent_profile"
+    assert run.config.resolution_for("model").source == "request_overrides"
+    provider_resolution = run.config.resolution_for("provider")
+    assert provider_resolution.source == "request_overrides"
+    assert [candidate.source for candidate in provider_resolution.candidates[:4]] == [
+        "request_overrides",
+        "pipeline_config.roles.dev",
+        "project_config.ai.routing.dev",
+        "agent_profile",
+    ]
 
 
-def test_project_role_precedes_pipeline_and_keeps_routing_tuple_coherent():
+def test_role_precedes_project_and_keeps_routing_tuple_coherent():
     from cli_agent_service.config import resolve_agent_config
 
     run = resolve_agent_config(
@@ -159,16 +170,14 @@ def test_project_role_precedes_pipeline_and_keeps_routing_tuple_coherent():
         },
     )
 
-    assert run.config.provider == "openai"
-    assert run.config.model == "gpt-5.4-codex"
-    assert run.config.backend_mode == "codex_cli"
+    assert run.config.provider == "anthropic"
+    assert run.config.model == "claude-opus-4-6"
+    assert run.config.backend_mode == "claude_cli"
     assert run.config.auth_mode == "cli_auth"
     assert run.config.output_policy == "redact_all"
-    assert run.config.resolution_for("provider").source == (
-        "project_config.ai.routing.dev"
-    )
-    assert run.config.resolution_for("backend_mode").source.endswith(
-        ":derived_backend_mode"
+    assert run.config.resolution_for("provider").source == "pipeline_config.roles.dev"
+    assert run.config.resolution_for("backend_mode").source == (
+        "pipeline_config.roles.dev"
     )
 
 
@@ -318,6 +327,40 @@ def test_governance_refs_are_allowlisted_and_value_validated():
             )
 
 
+def test_credential_refs_reject_raw_or_secret_shaped_values():
+    from cli_agent_service.config import resolve_agent_config
+    from cli_agent_service.models import CredentialRef
+
+    for unsafe_ref in (
+        "sk-proj-raw-secret-value",
+        "credential:raw:provider-value",
+        "credential:openai:sk-secret-value",
+        "plain-reference",
+    ):
+        with pytest.raises(ValueError, match="credential reference"):
+            CredentialRef(ref_id=unsafe_ref)
+
+    with pytest.raises(ValueError, match="credential reference"):
+        resolve_agent_config(
+            run_id="run-raw-compat-credential",
+            role="dev",
+            project_id="aming-claw",
+            profile=_profile(),
+            compatibility_defaults={
+                "credential_ref": "sk-proj-raw-secret-value",
+            },
+        )
+
+    with pytest.raises(ValueError, match="unsupported public routing fields"):
+        resolve_agent_config(
+            run_id="run-raw-request-credential",
+            role="dev",
+            project_id="aming-claw",
+            profile=_profile(),
+            request_overrides={"credential_ref": "credential:provider-home:other"},
+        )
+
+
 def test_profile_role_and_project_policy_fail_closed():
     from cli_agent_service.config import resolve_agent_config
 
@@ -346,7 +389,17 @@ def test_agent_run_adapts_to_existing_ai_invocation_request_contract():
         role="dev",
         project_id="aming-claw",
         profile=_profile(),
-        governance_refs={"runtime_context_id": "mfrctx-example"},
+        governance_refs={
+            "runtime_context_id": "mfrctx-example",
+            "contract_execution_id": "cex-example",
+            "route_id": "route-example",
+            "route_context_hash": "sha256:" + "1" * 64,
+            "prompt_contract_id": "rprompt-example",
+            "prompt_contract_hash": "sha256:" + "2" * 64,
+            "route_token_ref": "rtok-" + "3" * 32,
+            "visible_injection_manifest_hash": "sha256:" + "4" * 64,
+            "snapshot_id": "qa-candidate-example",
+        },
     )
     request = AIInvocationRequest.from_agent_run(
         run,
@@ -365,5 +418,13 @@ def test_agent_run_adapts_to_existing_ai_invocation_request_contract():
     adapter = request.metadata["cli_agent_service"]
     assert adapter["run_id"] == "run-adapter"
     assert adapter["credential_ref"] == "credential:codex-home:dev"
+    assert adapter["governance_refs"]["runtime_context_id"] == "mfrctx-example"
+    assert adapter["governance_refs"]["snapshot_id"] == "qa-candidate-example"
     assert adapter["raw_credential_material_exposed"] is False
+    assert request.route.route_id == "route-example"
+    assert request.route.route_context_hash == "sha256:" + "1" * 64
+    assert request.route.prompt_contract_id == "rprompt-example"
+    assert request.route.prompt_contract_hash == "sha256:" + "2" * 64
+    assert request.route.route_token_ref == "rtok-" + "3" * 32
+    assert request.route.visible_injection_manifest_hash == "sha256:" + "4" * 64
     assert request.to_evidence()["schema_version"] == "ai_invocation_request.v1"
