@@ -44818,13 +44818,35 @@ def _contract_runtime_projected_worker_source_owned(
         else event_actor
     )
     worker_role = str(source_payload.get("worker_role") or "").strip().lower()
-    meta_contract_gate = (
-        source_payload.get("meta_contract_gate")
-        if isinstance(source_payload.get("meta_contract_gate"), Mapping)
+    worker_commit_evidence = (
+        source_payload.get("contract_worker_commit_evidence")
+        if isinstance(source_payload.get("contract_worker_commit_evidence"), Mapping)
         else {}
     )
-    meta_contract_role = str(meta_contract_gate.get("role") or "").strip().lower()
-    meta_contract_status = str(meta_contract_gate.get("status") or "").strip().lower()
+    worker_commit_status = str(
+        worker_commit_evidence.get("status") or ""
+    ).strip().lower()
+    worker_commit_source = str(
+        worker_commit_evidence.get("source_of_authority") or ""
+    ).strip()
+    expected_runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    expected_task_id = str(getattr(context, "task_id", "") or "").strip()
+    worker_commit_runtime_context_id = str(
+        worker_commit_evidence.get("runtime_context_id") or ""
+    ).strip()
+    worker_commit_task_id = str(
+        worker_commit_evidence.get("task_id") or ""
+    ).strip()
+    worker_commit_values = {
+        str(value).strip()
+        for value in (
+            worker_commit_evidence.get("worker_commit_sha"),
+            worker_commit_evidence.get("head_commit"),
+        )
+        if str(value or "").strip()
+    }
     source_identities = {
         str(source_payload.get(key) or "").strip()
         for key in (
@@ -44838,12 +44860,19 @@ def _contract_runtime_projected_worker_source_owned(
     }
     return bool(
         expected_identities
-        and (event_principal in expected_identities or event_actor == "mf_sub")
+        and (
+            event_principal in expected_identities
+            or event_actor == "mf_sub"
+            or event_actor.startswith("mf_sub:")
+        )
         and worker_role == "mf_sub"
-        and meta_contract_role == "mf_sub"
-        and meta_contract_status in {"accepted", "ok", "pass", "passed"}
         and source_identities
         and source_identities.issubset(expected_identities)
+        and worker_commit_status in {"accepted", "ok", "pass", "passed", "validated"}
+        and worker_commit_source == "ContractRuntime.completed_lines.worker_commit"
+        and worker_commit_runtime_context_id == expected_runtime_context_id
+        and worker_commit_task_id == expected_task_id
+        and len(worker_commit_values) == 1
     )
 
 

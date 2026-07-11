@@ -42144,6 +42144,16 @@ def _record_mf_parallel_runtime_context_worker_evidence(
             "filer_principal": runtime_context.worker_slot_id,
             "graph_trace_ids": [graph_trace_id],
             "head_commit": head_commit,
+            "contract_worker_commit_evidence": {
+                "status": "validated",
+                "source_of_authority": (
+                    "ContractRuntime.completed_lines.worker_commit"
+                ),
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "worker_commit_sha": head_commit,
+                "head_commit": head_commit,
+            },
             "review_ready": True,
             "close_satisfying": True,
             "worker_self_attestation_gate": {
@@ -44667,7 +44677,7 @@ def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
             "source_event": {"actor": "worker-finish-commit"},
             "payload": {
                 "worker_role": "mf_sub",
-                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "meta_contract_gate": {"role": "observer", "status": "failed"},
                 "worker_id": "worker-finish-commit",
                 "worker_slot_id": "worker-finish-commit",
                 "worker_session_id": "worker-finish-commit",
@@ -44675,6 +44685,9 @@ def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
                 "head_commit": commit_sha,
                 "validated_head_commit": commit_sha,
                 "contract_worker_commit_evidence": {
+                    "status": "validated",
+                    "runtime_context_id": "mfrctx-finish-commit",
+                    "task_id": "worker-finish-commit",
                     "worker_commit_sha": commit_sha,
                     "head_commit": commit_sha,
                     "source_of_authority": (
@@ -44737,6 +44750,20 @@ def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(
     timeline_refs,
     source_actor,
 ):
+    if source_payload:
+        source_payload = {
+            **source_payload,
+            "contract_worker_commit_evidence": {
+                "status": "validated",
+                "source_of_authority": (
+                    "ContractRuntime.completed_lines.worker_commit"
+                ),
+                "runtime_context_id": "mfrctx-finish-commit-blocked",
+                "task_id": "worker-finish-commit-blocked",
+                "worker_commit_sha": "a" * 40,
+                "head_commit": "a" * 40,
+            },
+        }
     context = SimpleNamespace(
         runtime_context_id="mfrctx-finish-commit-blocked",
         task_id="worker-finish-commit-blocked",
