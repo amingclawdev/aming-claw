@@ -672,6 +672,69 @@ def test_generic_timeline_path_cannot_author_contract_worker_commit():
     assert rejected.value.code == "contract_worker_commit_facade_required"
 
 
+def test_contract_runtime_worker_implementation_preserves_top_level_lineage_proof():
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-WORKER-IMPLEMENTATION-LINEAGE",
+        "contract_execution_id": "cex-worker-implementation-lineage",
+        "definition_hash": _fake_sha("worker-implementation-definition"),
+        "instruction_bundle_hash": _fake_sha("worker-implementation-instructions"),
+        "execution_state": {"execution_state_revision": 4},
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha("worker-implementation-guide"),
+            "next_legal_action": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+            },
+        },
+    }
+    body = {
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-worker-implementation-lineage"],
+        "payload": {
+            "runtime_context_id": "mfrctx-worker-implementation-lineage",
+            "task_id": "worker-implementation-lineage-task",
+        },
+    }
+
+    write = server._contract_runtime_line_write_body(
+        record,
+        body,
+        actor_role="mf_sub",
+    )
+
+    assert write["changed_files"] == body["changed_files"]
+    assert write["graph_trace_ids"] == body["graph_trace_ids"]
+    assert write["payload"]["changed_files"] == body["changed_files"]
+    assert write["payload"]["graph_trace_ids"] == body["graph_trace_ids"]
+
+    with pytest.raises(ValidationError) as missing:
+        server._contract_runtime_line_write_body(
+            record,
+            {"payload": body["payload"]},
+            actor_role="mf_sub",
+        )
+    assert missing.value.details["missing_proof_fields"] == [
+        "changed_files",
+        "graph_trace_ids",
+    ]
+    assert missing.value.details["timeline_evidence_backfill_allowed"] is False
+
+    with pytest.raises(ValidationError, match="conflicts with payload.changed_files"):
+        server._contract_runtime_line_write_body(
+            record,
+            {
+                **body,
+                "payload": {
+                    **body["payload"],
+                    "changed_files": ["agent/governance/task_timeline.py"],
+                },
+            },
+            actor_role="mf_sub",
+        )
+
+
 def _persist_append_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -6010,6 +6073,11 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
     assert resolved["scope"]["backlog_id"] == backlog_id
 
     captured.clear()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_changed_files",
+        lambda *_args, **_kwargs: [],
+    )
     with pytest.raises(
         ValidationError,
         match="finish-time worker attestation requires non-empty passed test_results",
@@ -9586,7 +9654,7 @@ def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
         "contract_gate_decision"
     ]
     assert stored_implementation_gate["source_of_authority"] == (
-        "route_action_scope_lineage"
+        "runtime_context_worker_proof"
     )
     stored_implementation_meta_gate = stored_implementation_gate["meta_contract_gate"]
     assert stored_implementation_meta_gate["role"] == "mf_sub"
@@ -44195,6 +44263,32 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     worker_token = "contract-canonical-worker-token"
     worker_root = tmp_path / worker_task_id
     worker_root.mkdir()
+    subprocess.run(["git", "init"], cwd=worker_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worker_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Canonical Worker"],
+        cwd=worker_root,
+        check=True,
+    )
+    worker_file = worker_root / "agent" / "governance" / "server.py"
+    worker_file.parent.mkdir(parents=True)
+    worker_file.write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worker_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "base"],
+        cwd=worker_root,
+        check=True,
+        capture_output=True,
+    )
+    base_commit = batch_jobs.git_commit(worker_root)
     successor, runtime_context = (
         _setup_mf_parallel_contract_runtime_worker_dispatch(
             conn,
@@ -44213,8 +44307,9 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
             runtime_context,
             agent_id=actual_worker_id,
             allocation_owner=actual_worker_id,
-            base_commit="base-contract-canonical-worker",
-            target_head_commit="target-contract-canonical-worker",
+            base_commit=base_commit,
+            head_commit=base_commit,
+            target_head_commit=base_commit,
             merge_queue_id="mq-contract-canonical-worker",
             owned_files=("agent/governance/server.py",),
             target_files=("agent/governance/server.py",),
@@ -44306,9 +44401,9 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
                 "actual_git_root": str(worker_root),
                 "branch": runtime_context.branch_ref,
                 "branch_ref": runtime_context.branch_ref,
-                "head_commit": "base-contract-canonical-worker",
-                "base_commit": "base-contract-canonical-worker",
-                "target_head_commit": "target-contract-canonical-worker",
+                "head_commit": base_commit,
+                "base_commit": base_commit,
+                "target_head_commit": base_commit,
                 "merge_queue_id": "mq-contract-canonical-worker",
                 "owned_files": ["agent/governance/server.py"],
                 "read_receipt_hash": (
@@ -44374,10 +44469,32 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     )
     assert graph_line["accepted"] is True
 
+    worker_file.write_text("implementation\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worker_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "implementation"],
+        cwd=worker_root,
+        check=True,
+        capture_output=True,
+    )
+    worker_commit = batch_jobs.git_commit(worker_root)
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            head_commit=worker_commit,
+            target_head_commit=worker_commit,
+        ),
+    )
+
     child_route = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
         backlog_id=backlog_id,
-        task_id=worker_task_id,
+        task_id=contract_execution_id,
         target_files=["agent/governance/server.py"],
         allowed_actions=["task_timeline_append"],
         parent_route_identity={
@@ -44423,6 +44540,7 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
                     "graph_trace_ids": [graph_trace_id],
                     "test_results": {"passed": True},
                     "summary": "canonical worker bridge implementation",
+                    "commit_sha": worker_commit,
                     "route_token_ref": child_route["route_token_ref"],
                     **child_route_identity,
                 },
@@ -44437,6 +44555,11 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     assert contract_record["completed_lines"][-1]["line_id"] == (
         "worker_implementation"
     )
+    implementation_line = contract_record["completed_lines"][-1]
+    assert implementation_line["payload"]["changed_files"] == [
+        "agent/governance/server.py"
+    ]
+    assert implementation_line["payload"]["graph_trace_ids"] == [graph_trace_id]
     implementation_events = task_timeline.list_events(
         conn,
         PID,
@@ -44446,6 +44569,65 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     assert implementation_events[-1]["payload"][
         "contract_runtime_canonical_line"
     ]["line_id"] == "worker_implementation"
+    implementation_event = implementation_events[-1]
+    assert implementation_event["payload"]["changed_files"] == [
+        "agent/governance/server.py"
+    ]
+    assert implementation_event["payload"]["graph_trace_ids"] == [graph_trace_id]
+    assert implementation_event["payload"]["graph_trace_db_evidence"][
+        "db_verified"
+    ] is True
+    assert implementation_event["payload"]["graph_trace_db_evidence"][
+        "verified_trace_ids"
+    ] == [graph_trace_id]
+    assert implementation_response["route_token_gate"]["scope"]["task_id"] == (
+        contract_execution_id
+    )
+    assert implementation_event["payload"]["resolved_route_scope"]["task_id"] == (
+        contract_execution_id
+    )
+
+    worker_commit_response = (
+        server.handle_graph_governance_runtime_context_worker_commit(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": worker_task_id,
+                    "parent_task_id": backlog_id,
+                    "session_token": worker_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": "fence-contract-canonical-worker",
+                    "target_project_root": str(worker_root),
+                    "worker_session_id": actual_worker_id,
+                    "filer_principal": actual_worker_id,
+                    "actor": actual_worker_id,
+                    "implementation_event_ref": f"timeline:{implementation_event['id']}",
+                    "worker_commit_sha": worker_commit,
+                    "commit_sha": worker_commit,
+                    "head_commit": worker_commit,
+                    "owned_files": ["agent/governance/server.py"],
+                    "changed_files": ["agent/governance/server.py"],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            )
+        )
+    )
+    assert worker_commit_response["ok"] is True
+    assert worker_commit_response["worker_commit"]["commit_sha"] == worker_commit
+    assert worker_commit_response["worker_commit"]["changed_files"] == [
+        "agent/governance/server.py"
+    ]
+    committed_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert committed_record["completed_lines"][-1]["line_id"] == "worker_commit"
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):

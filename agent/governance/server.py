@@ -16292,6 +16292,16 @@ def _runtime_context_implementation_resolved_ref_route_identity(
     )
     lineage_payload = dict(lineage_payload)
     lineage_payload["_runtime_context_route_ref_resolved"] = True
+    resolved_scope = (
+        resolved.get("scope")
+        if isinstance(resolved.get("scope"), Mapping)
+        else {}
+    )
+    lineage_payload["resolved_route_scope"] = {
+        key: str(resolved_scope.get(key) or "").strip()
+        for key in ("project_id", "backlog_id", "task_id")
+        if str(resolved_scope.get(key) or "").strip()
+    }
     return identity, lineage_payload
 
 
@@ -16691,13 +16701,39 @@ def _runtime_context_timeline_route_gate(
             "child_route_lineage": dict(child_lineage),
         }
 
-    scope_task_id = parent_task_id or str(
-        parent_lineage.get("selected_task_id")
-        or parent_lineage.get("task_id")
-        or getattr(context, "root_task_id", "")
-        or getattr(context, "backlog_id", "")
-        or ""
+    resolved_route_scope = (
+        dict(lineage_payload.get("resolved_route_scope"))
+        if isinstance(lineage_payload.get("resolved_route_scope"), Mapping)
+        else {}
     )
+    expected_backlog_id = str(getattr(context, "backlog_id", "") or "")
+    for field, expected in (
+        ("project_id", project_id),
+        ("backlog_id", expected_backlog_id),
+    ):
+        supplied = str(resolved_route_scope.get(field) or "").strip()
+        if supplied and supplied != expected:
+            raise GovernanceError(
+                "runtime_context_resolved_route_scope_mismatch",
+                "resolved route-token scope does not match the active runtime context",
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "field": field,
+                    "expected": expected,
+                    "actual": supplied,
+                    "fail_closed": True,
+                },
+            )
+    scope_task_id = str(resolved_route_scope.get("task_id") or "").strip()
+    if not scope_task_id:
+        scope_task_id = parent_task_id or str(
+            parent_lineage.get("selected_task_id")
+            or parent_lineage.get("task_id")
+            or getattr(context, "root_task_id", "")
+            or expected_backlog_id
+            or ""
+        )
     return {
         "schema_version": "route_token_mutation_gate.v1",
         "allowed": True,
@@ -16723,7 +16759,7 @@ def _runtime_context_timeline_route_gate(
         "parent_task_id": parent_task_id,
         "scope": {
             "project_id": project_id,
-            "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+            "backlog_id": expected_backlog_id,
             "task_id": scope_task_id,
         },
         "parent_route_lineage": parent_lineage,
@@ -21119,6 +21155,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 "child_route_lineage",
                 "route_lineage",
                 "parent_route_lineage_repair",
+                "resolved_route_scope",
             }
             and value
         ):
@@ -46849,6 +46886,61 @@ def _contract_runtime_line_write_body(
         from .runtime_context import attach_contract_runtime_worker_provenance
 
         write = attach_contract_runtime_worker_provenance(write, worker_proof)
+    if write.get("line_id") == "worker_implementation":
+        payload = (
+            dict(write.get("payload"))
+            if isinstance(write.get("payload"), Mapping)
+            else {}
+        )
+        proof_fields = (
+            "changed_files",
+            "owned_changed_files",
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+        )
+        for key in proof_fields:
+            if key not in body:
+                continue
+            top_level = _runtime_context_service_query_values(body, key)
+            nested = _runtime_context_service_query_values(payload, key)
+            if nested and set(nested) != set(top_level):
+                raise ValidationError(
+                    f"worker_implementation {key} conflicts with payload.{key}"
+                )
+            payload[key] = top_level
+        changed_files = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                payload,
+                "changed_files",
+                "owned_changed_files",
+            )
+        )
+        graph_trace_ids = _runtime_context_service_dedupe(
+            _runtime_context_service_query_values(
+                payload,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            )
+        )
+        missing_proof_fields = []
+        if not changed_files:
+            missing_proof_fields.append("changed_files")
+        if not graph_trace_ids:
+            missing_proof_fields.append("graph_trace_ids")
+        if missing_proof_fields:
+            raise ValidationError(
+                "worker_implementation requires non-empty canonical lineage proof",
+                {
+                    "missing_proof_fields": missing_proof_fields,
+                    "next_legal_action": "runtime_context_implementation_evidence",
+                    "timeline_evidence_backfill_allowed": False,
+                },
+            )
+        payload["changed_files"] = changed_files
+        payload["graph_trace_ids"] = graph_trace_ids
+        write["payload"] = payload
+        write["changed_files"] = changed_files
+        write["graph_trace_ids"] = graph_trace_ids
     return write
 
 
