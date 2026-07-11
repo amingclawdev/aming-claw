@@ -22672,6 +22672,32 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert saved.status == STATE_WORKTREE_READY
     assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
 
+    revision_before_duplicate_read = server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"]
+    duplicate_read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": result["fence_token"],
+                "session_token": result["session_token"],
+                "target_project_root": str(target_root),
+                "read_receipt_hash": "sha256:contract-failed-qa-rejoin-read",
+                "actor": runtime_context.worker_slot_id,
+            },
+        )
+    )
+    assert duplicate_read["ok"] is True
+    assert server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"] == revision_before_duplicate_read
+
     runtime_current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
@@ -22696,9 +22722,58 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert revision["status"] == "revision_in_progress"
     assert revision["projected_setup_lines_reused"] is True
     assert revision["duplicate_read_receipt_required"] is False
+    assert runtime_current["contract_runtime_next_legal_action"]["line_id"] == (
+        "worker_implementation"
+    )
     assert runtime_current["contract_runtime_failed_qa_revision"][
         "raw_tokens_exposed"
     ] is False
+
+    revised_implementation = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": result["fence_token"],
+                    "session_token": result["session_token"],
+                    "target_project_root": str(target_root),
+                    "changed_files": ["agent/governance/server.py"],
+                    "commit_sha": hashlib.sha1(
+                        b"contract-failed-qa-revised-worker-head"
+                    ).hexdigest(),
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "test_results": {"status": "passed", "passed": True},
+                    "payload": {
+                        "worker_role": "mf_sub",
+                        "summary": "Worker corrected the failed-QA findings.",
+                    },
+                },
+            )
+        )
+    )
+    assert revised_implementation["ok"] is True
+    assert revised_implementation["contract_runtime_canonical_line"]["status"] in {
+        "completed",
+        "already_completed",
+    }
+    revised_record = server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )
+    assert revised_record["execution_state_revision"] > qa_result[
+        "contract_runtime_current_state"
+    ]["execution_state_revision"]
+    assert revised_record["completed_lines"][-1]["line_id"] == (
+        "worker_implementation"
+    )
+    assert revised_record["completed_lines"][-1]["commit_sha"] == hashlib.sha1(
+        b"contract-failed-qa-revised-worker-head"
+    ).hexdigest()
 
 
 def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(

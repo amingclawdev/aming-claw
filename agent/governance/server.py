@@ -10606,10 +10606,23 @@ def _runtime_context_contract_runtime_worker_projection(
         return {}
     runtime = _contract_runtime(conn)
     try:
-        guide = runtime.current_guide(execution_id, actor_role="mf_sub")
+        runtime.current_guide(execution_id, actor_role="mf_sub")
         record = runtime.store.get(execution_id)
+        record, _context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=str(record.get("project_id") or ""),
+                record=record,
+                actor_role="mf_sub",
+            )
+        )
     except ContractRuntimeError:
         return {}
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
     current_state = _runtime_current_state_from_record(record)
     next_action = _runtime_next_action_from_guide(
         guide,
@@ -19323,7 +19336,7 @@ def _runtime_context_submit_canonical_contract_line(
     payload: Mapping[str, Any],
     contract_execution_id: str = "",
 ) -> dict[str, Any]:
-    """Advance a runtime-context Contract line without timeline projection.
+    """Advance a runtime-context Contract line in the facade transaction.
 
     Callers must invoke this inside the same SQLite transaction as the runtime
     state and timeline log write. A rejected Contract line therefore rolls the
@@ -19416,6 +19429,30 @@ def _runtime_context_submit_canonical_contract_line(
             }
         runtime.current_guide(execution_id, actor_role="mf_sub")
         record = runtime.store.get(execution_id)
+        projected_record, candidate_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=str(record.get("project_id") or project_id),
+                record=record,
+                actor_role="mf_sub",
+            )
+        )
+        failed_qa_rejoin_contexts = (
+            candidate_projection.get("failed_qa_revision_rejoin_contexts")
+            if isinstance(candidate_projection, Mapping)
+            else []
+        )
+        use_failed_qa_rejoin_projection = any(
+            isinstance(item, Mapping)
+            and str(item.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            for item in (failed_qa_rejoin_contexts or [])
+        )
+        context_projection = (
+            candidate_projection if use_failed_qa_rejoin_projection else {}
+        )
+        if use_failed_qa_rejoin_projection:
+            record = projected_record
     except ContractRuntimeError as exc:
         raise GovernanceError(
             "contract_runtime_canonical_line_unavailable",
@@ -19429,6 +19466,18 @@ def _runtime_context_submit_canonical_contract_line(
                 "line_id": line_id,
             },
         ) from exc
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    next_line_id = str(next_line.get("line_id") or "").strip()
 
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
@@ -19448,7 +19497,11 @@ def _runtime_context_submit_canonical_contract_line(
             {"line": completed, "payload": completed_payload},
             "task_id",
         )
-        if completed_runtime == runtime_context_id and completed_task == task_id:
+        if (
+            completed_runtime == runtime_context_id
+            and completed_task == task_id
+            and next_line_id != line_id
+        ):
             return {
                 "schema_version": "runtime_context.canonical_contract_line.v1",
                 "accepted": True,
@@ -19465,17 +19518,7 @@ def _runtime_context_submit_canonical_contract_line(
                 ),
             }
 
-    guide = (
-        record.get("runtime_guide")
-        if isinstance(record.get("runtime_guide"), Mapping)
-        else {}
-    )
-    next_line = (
-        guide.get("next_legal_action")
-        if isinstance(guide.get("next_legal_action"), Mapping)
-        else {}
-    )
-    if str(next_line.get("line_id") or "").strip() != line_id:
+    if next_line_id != line_id:
         raise GovernanceError(
             "contract_runtime_canonical_line_out_of_order",
             "runtime-context facade cannot advance a non-current Contract line",
@@ -19516,6 +19559,10 @@ def _runtime_context_submit_canonical_contract_line(
         execution_id,
         write,
         actor_role="mf_sub",
+        projected_completed_lines=_contract_runtime_projection_completed_lines(
+            context_projection
+        ),
+        projection=context_projection,
     )
     if not result.get("ok"):
         raise GovernanceError(
@@ -20882,9 +20929,17 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
     payload = _strip_top_level_timeline_role_fields(supplied_payload)
     raw_fence_token = _runtime_context_request_value(ctx, "fence_token")
     raw_session_token = _runtime_context_request_value(ctx, "session_token")
+    from .parallel_branch_runtime import runtime_context_session_token_ref
+
     session_token_ref = (
         _runtime_context_request_value(ctx, "session_token_ref")
         or _runtime_context_request_value(ctx, "worker_session_token_ref")
+        or (
+            runtime_context_session_token_ref(context)
+            if not _body_has_route_token_input(body)
+            and not _body_has_route_waiver(body)
+            else ""
+        )
     )
     submitted_actor = str(body.get("actor") or "").strip()
     fence_token_hash = _runtime_context_implementation_fence_hash(
@@ -43809,7 +43864,20 @@ def _contract_runtime_mf_parallel_context_projection(
         expected_context_summaries=expected_context_summaries,
         existing_keys=existing_keys,
     )
-    if not projected_lines and not identity_mismatch:
+    failed_qa_rejoin_contexts = [
+        {
+            "runtime_context_id": str(item.get("runtime_context_id") or ""),
+            "task_id": str(item.get("task_id") or ""),
+            "parent_task_id": str(item.get("parent_task_id") or ""),
+        }
+        for item in expected_context_summaries
+        if item.get("failed_qa_revision_rejoin")
+    ]
+    if (
+        not projected_lines
+        and not identity_mismatch
+        and not failed_qa_rejoin_contexts
+    ):
         return {}
     projected_completed_lines = (
         _contract_runtime_merge_projected_completed_lines(
@@ -43822,7 +43890,13 @@ def _contract_runtime_mf_parallel_context_projection(
     projection = {
         "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
         "status": (
-            "projected" if projected_lines else "stale_dispatch_identity_mismatch"
+            "projected"
+            if projected_lines
+            else (
+                "stale_dispatch_identity_mismatch"
+                if identity_mismatch
+                else "failed_qa_revision_rejoin"
+            )
         ),
         "source": "runtime_context_worker_evidence",
         "source_of_authority": "branch_runtime_context+task_timeline+graph_query_traces",
@@ -43839,15 +43913,6 @@ def _contract_runtime_mf_parallel_context_projection(
             "observer_authored_worker_backfill": False,
         },
     }
-    failed_qa_rejoin_contexts = [
-        {
-            "runtime_context_id": str(item.get("runtime_context_id") or ""),
-            "task_id": str(item.get("task_id") or ""),
-            "parent_task_id": str(item.get("parent_task_id") or ""),
-        }
-        for item in expected_context_summaries
-        if item.get("failed_qa_revision_rejoin")
-    ]
     if failed_qa_rejoin_contexts:
         projection["failed_qa_revision_rejoin_contexts"] = (
             failed_qa_rejoin_contexts
@@ -44213,6 +44278,10 @@ def _contract_runtime_projection_context_summary(
         "projected_line_ids": line_ids,
         "worker_projected_line_ids": worker_line_ids,
         "source_refs": source_refs,
+        "failed_qa_revision_rejoin": bool(
+            isinstance(projection, Mapping)
+            and projection.get("failed_qa_revision_rejoin")
+        ),
     }
 
 
@@ -55648,14 +55717,35 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         record = runtime.store.get(contract_execution_id)
     except ContractRuntimeError:
         return {}
+    if actor_role:
+        record, _ = _contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=str(record.get("project_id") or body.get("project_id") or ""),
+            record=record,
+            actor_role=actor_role,
+        )
     completed_line = _contract_runtime_completed_line_request_for_event(
         record,
         event_kind=event_kind,
         body=body,
     )
+    current_state = _runtime_current_state_from_record(record)
+    current_line = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    current_line_is_requested = bool(
+        completed_line
+        and all(
+            str(current_line.get(field) or "").strip()
+            == str(completed_line.get(field) or "").strip()
+            for field in ("stage_id", "line_id", "evidence_kind")
+        )
+    )
     matched_completed_line = (
         _contract_runtime_matching_completed_line(record, completed_line)
-        if completed_line
+        if completed_line and not current_line_is_requested
         else None
     )
     if matched_completed_line is not None:
@@ -55685,7 +55775,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
                 return gate
     if not actor_role:
         return {}
-    if _runtime_current_state_from_record(record).get("next_legal_action"):
+    if current_state.get("next_legal_action"):
         return {}
     line = _contract_runtime_close_line_for_event(
         record,
