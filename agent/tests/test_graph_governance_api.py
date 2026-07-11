@@ -42555,6 +42555,61 @@ def test_runtime_context_source_backed_resolver_rejects_ambiguous_active_candida
     }
 
 
+def test_runtime_context_canonical_line_rejects_supplied_id_when_resolution_is_ambiguous(
+    conn,
+):
+    backlog_id = "AC-CONTRACT-RESOLUTION-AMBIGUOUS-SUPPLIED"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-resolution-ambiguous-supplied-parent",
+        worker_task_id="contract-resolution-ambiguous-supplied-worker",
+        fence_token="fence-contract-resolution-ambiguous-supplied",
+        token="contract-resolution-ambiguous-supplied-token",
+    )
+    clone_id = "cex-contract-resolution-ambiguous-supplied-clone"
+    _clone_contract_runtime_record_for_resolution_test(
+        conn,
+        source_contract_execution_id=successor["contract_execution_id"],
+        clone_contract_execution_id=clone_id,
+    )
+    original = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+
+    with pytest.raises(
+        GovernanceError,
+        match="one unambiguous source-backed contract execution",
+    ):
+        server._runtime_context_submit_canonical_contract_line(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            contract_execution_id=successor["contract_execution_id"],
+            stage_id="worker_read",
+            line_id="worker_read_runtime_guide",
+            evidence_kind="read_receipt",
+            payload={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+            },
+        )
+
+    unchanged = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    cloned = server._contract_runtime_store(conn).get(clone_id)
+    assert unchanged["execution_state_revision"] == original[
+        "execution_state_revision"
+    ]
+    assert unchanged["completed_lines"][-1]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert cloned["completed_lines"][-1]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+
+
 def test_runtime_context_current_projects_contract_runtime_state_for_unique_fallback(
     conn,
     tmp_path,

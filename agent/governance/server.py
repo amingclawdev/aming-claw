@@ -19307,6 +19307,25 @@ def _runtime_context_submit_canonical_contract_line(
         resolved_identity.get("contract_execution_id") or ""
     ).strip()
     supplied_execution_id = str(contract_execution_id or "").strip()
+    resolution_status = str(
+        contract_execution_resolution.get("status") or ""
+    ).strip()
+    if resolution_status == "ambiguous_active_source_backed_worker_lineage" or (
+        contract_execution_resolution.get("fail_closed")
+        and supplied_execution_id
+    ):
+        raise GovernanceError(
+            "contract_runtime_execution_resolution_blocked",
+            "canonical worker line requires one unambiguous source-backed contract execution",
+            422,
+            {
+                "supplied_contract_execution_id": supplied_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "contract_execution_resolution": contract_execution_resolution,
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
     if (
         resolved_execution_id
         and supplied_execution_id
