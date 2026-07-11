@@ -8280,10 +8280,7 @@ def _close_event_key(event: dict[str, Any]) -> str:
         return kind
     if phase in MF_CLOSE_REQUIRED_EVENT_KINDS:
         return phase
-    if (
-        phase == "verification"
-        and kind in {"qa_verification", "independent_verification"}
-    ):
+    if kind in {"qa_verification", "independent_verification"}:
         return "verification"
     return ""
 

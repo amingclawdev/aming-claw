@@ -31199,7 +31199,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 **append_base,
                 "event_type": "qa.independent_verification",
                 "event_kind": "independent_verification",
-                "phase": "verification",
+                "phase": "qa",
                 "status": "passed",
                 "actor": "qa:direct-main",
                 "commit_sha": close_commit,
