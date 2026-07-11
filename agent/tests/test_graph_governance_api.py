@@ -2082,6 +2082,86 @@ def _activate_basic_graph(
     conn.commit()
 
 
+def _append_authenticated_qa_verification(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    commit_sha: str,
+    snapshot_id: str,
+    principal_id: str = "qa:direct-main",
+) -> dict:
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=commit_sha,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{commit_sha}",
+        qa_scope_binding_ref,
+    ]
+    qa_session = server.role_service.register(
+        conn,
+        principal_id,
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": commit_sha,
+        },
+    )
+    qa_graph_ctx._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": principal_id,
+            "scope": qa_scope,
+        }
+    )
+    qa_graph = server.handle_graph_governance_query(qa_graph_ctx)
+    qa_timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "qa",
+            "status": "passed",
+            "actor": principal_id,
+            "commit_sha": commit_sha,
+            "verification": {
+                "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
+                "diff_check": {"unexpected_files": []},
+                "live_regression": {"status": "passed"},
+            },
+            "payload": {
+                "graph_trace_ids": [qa_graph["trace_id"]],
+                "observer_impersonation": False,
+            },
+        },
+    )
+    qa_timeline_ctx._session = dict(qa_graph_ctx._session)
+    return server.handle_task_timeline_append(qa_timeline_ctx)
+
+
 def _graph_with_dependency() -> dict:
     graph = _graph("L7.1")
     graph["deps_graph"]["nodes"].append(
@@ -31208,9 +31288,29 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     "diff_check": {"unexpected_files": []},
                     "live_regression": {"status": "passed"},
                 },
-                "payload": {**route_identity, "independent": True},
+                "payload": {"observer_impersonation": False},
             },
         )
+    )
+    impersonated_precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+    impersonated_gate = impersonated_precheck["timeline_gate"][
+        "contract_runtime_close_authority_projection"
+    ]["parentless_direct_main_close_authority_gate"]
+    assert impersonated_gate["passed"] is False
+    assert "independent_verification_after_implementation" in impersonated_gate[
+        "missing_requirement_ids"
+    ]
+    _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        commit_sha=close_commit,
+        snapshot_id="full-parentless-direct-main",
     )
     server.handle_task_timeline_append(
         _ctx_with_role(
@@ -31431,27 +31531,12 @@ def test_parentless_direct_main_rejects_loose_operator_approval_shape(
             },
         )
     )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "qa.independent_verification",
-                "event_kind": "independent_verification",
-                "phase": "verification",
-                "status": "passed",
-                "actor": "qa:direct-main",
-                "commit_sha": close_commit,
-                "verification": {
-                    "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
-                    "diff_check": {"unexpected_files": []},
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {**route_identity, "independent": True},
-            },
-        )
+    _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        commit_sha=close_commit,
+        snapshot_id="full-parentless-direct-main-loose-approval",
     )
     server.handle_task_timeline_append(
         _ctx_with_role(
@@ -31645,27 +31730,12 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
             },
         )
     )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "qa.independent_verification",
-                "event_kind": "independent_verification",
-                "phase": "verification",
-                "status": "passed",
-                "actor": "qa:direct-main",
-                "commit_sha": close_commit,
-                "verification": {
-                    "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
-                    "diff_check": {"unexpected_files": []},
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {**route_identity, "independent": True},
-            },
-        )
+    _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        commit_sha=close_commit,
+        snapshot_id="full-parentless-direct-main-active-child",
     )
     server.handle_task_timeline_append(
         _ctx_with_role(

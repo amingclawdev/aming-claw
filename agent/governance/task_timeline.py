@@ -8379,11 +8379,30 @@ def _event_has_test_evidence(event: dict[str, Any]) -> bool:
     ) or _event_has_test_command_evidence(event)
 
 
-def _observer_direct_independent_verification_event(event: dict[str, Any]) -> bool:
+def _observer_direct_independent_verification_event(
+    event: dict[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    authority = {}
+    for source in (
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    ):
+        authority = _mapping(source.get("source_backed_contract_gate_authority"))
+        if authority:
+            break
+    # Canonical close handlers pass a DB connection; pure projections keep their
+    # historical structural behavior for offline diagnostics and unit tests.
+    qa_session_authority_valid = conn is None or (
+        _source_backed_qa_session_authority_valid(authority, conn=conn)
+    )
     return (
         _independent_qa_event_kind_matches(event)
         and _independent_qa_reviewer_or_actor_is_qa(event)
         and not _is_independent_qa_observer_transport(event)
+        and qa_session_authority_valid
     )
 
 
@@ -8391,6 +8410,8 @@ def _observer_direct_close_exception_gate(
     rows: list[dict[str, Any]],
     contract: dict[str, Any] | None,
     close_commit_evidence_gate: Mapping[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Allow a narrow operator-supervised observer direct lane to replace worker gates."""
 
@@ -8437,7 +8458,10 @@ def _observer_direct_close_exception_gate(
         rows,
         "verification",
         after_event_id=implementation_event_id,
-        predicate=_observer_direct_independent_verification_event,
+        predicate=lambda event: _observer_direct_independent_verification_event(
+            event,
+            conn=conn,
+        ),
     )
     close_ready = _latest_passing_close_event(
         rows,
@@ -10405,6 +10429,8 @@ def _route_context_gate_with_independent_qa(
 def mf_close_gate_verification(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
@@ -10555,6 +10581,7 @@ def mf_close_gate_verification(
         rows,
         contract,
         close_commit_evidence_gate,
+        conn=conn,
     )
     if observer_direct_close_exception_gate.get("passed"):
         route_context_gate = _gate_replaced_by_observer_direct_exception(

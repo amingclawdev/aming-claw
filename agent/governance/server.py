@@ -58646,7 +58646,11 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             }
         },
     }
-    verification = task_timeline.mf_close_gate_verification(events, contract=contract)
+    verification = task_timeline.mf_close_gate_verification(
+        events,
+        contract=contract,
+        conn=conn,
+    )
     direct_gate = (
         verification.get("observer_direct_close_exception_gate")
         if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
@@ -70273,6 +70277,7 @@ def _mf_close_gate_verification(
     verification = task_timeline.mf_close_gate_verification(
         enriched_events,
         contract=contract,
+        conn=conn,
     )
     startup_gate = verification.get("close_timeline_startup_gate")
     if isinstance(startup_gate, dict) and (
