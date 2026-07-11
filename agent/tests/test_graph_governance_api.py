@@ -44638,6 +44638,99 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     )
 
 
+def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
+    commit_sha = "3752db90f311ef34e37d5f2debad9e69b8ec6f7c"
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-finish-commit",
+        task_id="worker-finish-commit",
+        parent_task_id="cex-finish-commit",
+        worker_id="worker-finish-commit",
+        worker_slot_id="worker-finish-commit",
+    )
+
+    line = server._contract_runtime_projected_worker_line(
+        record={"contract_execution_id": "cex-finish-commit"},
+        context=context,
+        stage_id="worker_finish",
+        line_id="worker_finish_gate",
+        evidence_kind="mf_subagent_finish_gate",
+        source_key="finish_gate",
+        source={
+            "source_ref": "timeline:finish-commit",
+            "payload": {
+                "head_commit": commit_sha,
+                "validated_head_commit": commit_sha,
+                "contract_worker_commit_evidence": {
+                    "worker_commit_sha": commit_sha,
+                    "head_commit": commit_sha,
+                    "source_of_authority": (
+                        "ContractRuntime.completed_lines.worker_commit"
+                    ),
+                },
+            },
+        },
+        timeline_refs={"changed_files": ["agent/governance/server.py"]},
+        startup_payload={},
+        graph_refs={"verified_trace_ids": []},
+    )
+
+    assert line["commit_sha"] == commit_sha
+    assert line["payload"]["head_commit"] == commit_sha
+    assert line["payload"]["source_backed"] is True
+    assert line["payload"]["projection_persists_completed_line"] is False
+    assert line["payload"]["observer_authored_worker_backfill"] is False
+
+
+@pytest.mark.parametrize(
+    ("source_payload", "timeline_refs"),
+    [
+        ({}, {}),
+        (
+            {
+                "validated_head_commit": "a" * 40,
+                "head_commit": "b" * 40,
+            },
+            {},
+        ),
+        (
+            {"validated_head_commit": "a" * 40},
+            {"head_commit": "b" * 40},
+        ),
+    ],
+)
+def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(
+    source_payload,
+    timeline_refs,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-finish-commit-blocked",
+        task_id="worker-finish-commit-blocked",
+        parent_task_id="cex-finish-commit-blocked",
+        worker_id="worker-finish-commit-blocked",
+        worker_slot_id="worker-finish-commit-blocked",
+    )
+
+    line = server._contract_runtime_projected_worker_line(
+        record={"contract_execution_id": "cex-finish-commit-blocked"},
+        context=context,
+        stage_id="worker_finish",
+        line_id="worker_finish_gate",
+        evidence_kind="mf_subagent_finish_gate",
+        source_key="finish_gate",
+        source={
+            "source_ref": "timeline:finish-commit-blocked",
+            "payload": source_payload,
+        },
+        timeline_refs=timeline_refs,
+        startup_payload={},
+        graph_refs={"verified_trace_ids": []},
+    )
+
+    assert "commit_sha" not in line
+    assert line["payload"]["head_commit"] == ""
+    assert line["payload"]["observer_authored_worker_backfill"] is False
+
+
 def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     conn,
     tmp_path,

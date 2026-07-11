@@ -44619,6 +44619,11 @@ def _contract_runtime_projected_worker_line(
         list(timeline_refs.get("changed_files") or [])
     )
     graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
+    head_commit = _contract_runtime_projected_worker_head_commit(
+        source=source,
+        source_key=source_key,
+        timeline_refs=timeline_refs,
+    )
     payload = {
         "schema_version": "mf_parallel.runtime_context_worker_line_projection.v1",
         "source": "runtime_context_worker_evidence",
@@ -44634,7 +44639,7 @@ def _contract_runtime_projected_worker_line(
         "read_receipt_hash": str(timeline_refs.get("read_receipt_hash") or ""),
         "graph_trace_ids": graph_trace_ids,
         "changed_files": changed_files,
-        "head_commit": str(timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""),
+        "head_commit": head_commit,
         "projection_contract_execution_id": str(
             record.get("contract_execution_id") or ""
         ),
@@ -44670,14 +44675,55 @@ def _contract_runtime_projected_worker_line(
             ),
         },
     }
-    head_commit = str(
-        timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""
-    ).strip()
     if head_commit:
         line["commit_sha"] = head_commit
     if graph_trace_ids:
         line["trace_id"] = graph_trace_ids[0]
     return line
+
+
+def _contract_runtime_projected_worker_head_commit(
+    *,
+    source: Mapping[str, Any],
+    source_key: str,
+    timeline_refs: Mapping[str, Any],
+) -> str:
+    timeline_commit = str(
+        timeline_refs.get("head_commit") or timeline_refs.get("commit_sha") or ""
+    ).strip()
+    if source_key not in {
+        "finish_time_worker_attestation",
+        "finish_gate",
+        "review_ready",
+    }:
+        return timeline_commit
+
+    source_payload = (
+        source.get("payload") if isinstance(source.get("payload"), Mapping) else {}
+    )
+    worker_commit_evidence = (
+        source_payload.get("contract_worker_commit_evidence")
+        if isinstance(source_payload.get("contract_worker_commit_evidence"), Mapping)
+        else {}
+    )
+    candidates = {
+        str(value).strip()
+        for value in (
+            source_payload.get("validated_head_commit"),
+            source_payload.get("head_commit"),
+            worker_commit_evidence.get("worker_commit_sha"),
+            worker_commit_evidence.get("head_commit"),
+        )
+        if str(value or "").strip()
+    }
+    if len(candidates) > 1:
+        return ""
+    if candidates:
+        source_commit = next(iter(candidates))
+        if timeline_commit and timeline_commit != source_commit:
+            return ""
+        return source_commit
+    return timeline_commit
 
 
 def _contract_runtime_projection_line_keys(
