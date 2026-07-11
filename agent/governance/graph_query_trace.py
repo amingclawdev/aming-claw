@@ -13,12 +13,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import graph_events
 from .graph_contracts import graph_direction_contract
 from . import graph_snapshot_store as store
 from . import reconcile_feedback
+from .contracts.hash import stable_sha256
 
 
 GRAPH_QUERY_TRACE_SCHEMA_SQL = """
@@ -41,6 +42,20 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   visible_injection_manifest_hash TEXT NOT NULL DEFAULT '',
   route_token_ref TEXT NOT NULL DEFAULT '',
   commit_sha TEXT NOT NULL DEFAULT '',
+  graph_basis TEXT NOT NULL DEFAULT '',
+  canonical_base_snapshot_id TEXT NOT NULL DEFAULT '',
+  base_commit_sha TEXT NOT NULL DEFAULT '',
+  candidate_commit_sha TEXT NOT NULL DEFAULT '',
+  changed_files_json TEXT NOT NULL DEFAULT '[]',
+  candidate_diff_hash TEXT NOT NULL DEFAULT '',
+  changed_files_source TEXT NOT NULL DEFAULT '',
+  candidate_overlay_json TEXT NOT NULL DEFAULT '{}',
+  candidate_overlay_hash TEXT NOT NULL DEFAULT '',
+  root_identity_json TEXT NOT NULL DEFAULT '{}',
+  root_identity_hash TEXT NOT NULL DEFAULT '',
+  query_root_identity_hash TEXT NOT NULL DEFAULT '',
+  canonical_project_identity_hash TEXT NOT NULL DEFAULT '',
+  repository_identity_hash TEXT NOT NULL DEFAULT '',
   qa_session_id TEXT NOT NULL DEFAULT '',
   qa_scope_binding_ref TEXT NOT NULL DEFAULT '',
   worker_role TEXT NOT NULL DEFAULT '',
@@ -177,6 +192,11 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "list_unresolved_feedback": {"required_args": [], "summary": "List unresolved graph feedback rows."},
     "list_low_health_nodes": {"required_args": [], "summary": "List structurally suspicious low-health nodes."},
     "get_file_excerpt": {"required_args": ["path"], "summary": "Read a bounded excerpt from a project file."},
+    "candidate_overlay": {
+        "required_args": [],
+        "summary": "Inspect the bounded QA candidate file and public-symbol overlay.",
+        "optional_args": ["path", "query", "status", "limit"],
+    },
     "query_schema": {"required_args": [], "summary": "Discover graph query tools, sources, and purposes."},
     "list_tools": {"required_args": [], "summary": "Alias for query_schema."},
 }
@@ -267,6 +287,18 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "visible_injection_manifest_hash",
     "route_token_ref",
     "commit_sha",
+    "graph_basis",
+    "canonical_base_snapshot_id",
+    "base_commit_sha",
+    "candidate_commit_sha",
+    "changed_files",
+    "candidate_diff_hash",
+    "changed_files_source",
+    "candidate_overlay_hash",
+    "root_identity_hash",
+    "query_root_identity_hash",
+    "canonical_project_identity_hash",
+    "repository_identity_hash",
     "qa_session_id",
     "qa_scope_binding_ref",
     "worker_role",
@@ -284,6 +316,20 @@ _TRACE_IDENTITY_COLUMNS = {
     "visible_injection_manifest_hash": "TEXT NOT NULL DEFAULT ''",
     "route_token_ref": "TEXT NOT NULL DEFAULT ''",
     "commit_sha": "TEXT NOT NULL DEFAULT ''",
+    "graph_basis": "TEXT NOT NULL DEFAULT ''",
+    "canonical_base_snapshot_id": "TEXT NOT NULL DEFAULT ''",
+    "base_commit_sha": "TEXT NOT NULL DEFAULT ''",
+    "candidate_commit_sha": "TEXT NOT NULL DEFAULT ''",
+    "changed_files_json": "TEXT NOT NULL DEFAULT '[]'",
+    "candidate_diff_hash": "TEXT NOT NULL DEFAULT ''",
+    "changed_files_source": "TEXT NOT NULL DEFAULT ''",
+    "candidate_overlay_json": "TEXT NOT NULL DEFAULT '{}'",
+    "candidate_overlay_hash": "TEXT NOT NULL DEFAULT ''",
+    "root_identity_json": "TEXT NOT NULL DEFAULT '{}'",
+    "root_identity_hash": "TEXT NOT NULL DEFAULT ''",
+    "query_root_identity_hash": "TEXT NOT NULL DEFAULT ''",
+    "canonical_project_identity_hash": "TEXT NOT NULL DEFAULT ''",
+    "repository_identity_hash": "TEXT NOT NULL DEFAULT ''",
     "qa_session_id": "TEXT NOT NULL DEFAULT ''",
     "qa_scope_binding_ref": "TEXT NOT NULL DEFAULT ''",
     "worker_role": "TEXT NOT NULL DEFAULT ''",
@@ -324,10 +370,181 @@ def _decode(raw: Any, default: Any) -> Any:
     return default
 
 
+def _candidate_changed_files(source: dict[str, Any]) -> list[str]:
+    raw = source.get("changed_files")
+    if raw is None:
+        raw = _decode(source.get("changed_files_json"), [])
+    return _string_list(raw)
+
+
+def _is_full_commit(value: str) -> bool:
+    return len(value) in {40, 64} and all(
+        ch in "0123456789abcdef" for ch in value
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return (
+        text.startswith("sha256:")
+        and len(text) == len("sha256:") + 64
+        and all(ch in "0123456789abcdef" for ch in text.removeprefix("sha256:"))
+    )
+
+
+def _normalize_candidate_review_context(
+    *,
+    snapshot_id: str,
+    commit_sha: str,
+    graph_basis: str,
+    canonical_base_snapshot_id: str,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+    changed_files: Any,
+    candidate_diff_hash: str,
+    changed_files_source: str,
+    candidate_overlay: Mapping[str, Any] | None = None,
+    candidate_overlay_hash: str = "",
+    root_identity: Mapping[str, Any] | None = None,
+    root_identity_hash: str = "",
+    query_root_identity_hash: str = "",
+    canonical_project_identity_hash: str = "",
+    repository_identity_hash: str = "",
+) -> dict[str, Any]:
+    normalized_overlay = dict(candidate_overlay or {})
+    normalized_root_identity = dict(root_identity or {})
+    context = {
+        "graph_basis": str(graph_basis or "").strip(),
+        "canonical_base_snapshot_id": str(canonical_base_snapshot_id or "").strip(),
+        "base_commit_sha": str(base_commit_sha or "").strip().lower(),
+        "candidate_commit_sha": str(candidate_commit_sha or "").strip().lower(),
+        "changed_files": _string_list(changed_files),
+        "candidate_diff_hash": str(candidate_diff_hash or "").strip().lower(),
+        "changed_files_source": str(changed_files_source or "").strip(),
+        "candidate_overlay": normalized_overlay,
+        "candidate_overlay_hash": str(candidate_overlay_hash or "").strip().lower(),
+        "root_identity": normalized_root_identity,
+        "root_identity_hash": str(root_identity_hash or "").strip().lower(),
+        "query_root_identity_hash": str(query_root_identity_hash or "").strip().lower(),
+        "canonical_project_identity_hash": str(
+            canonical_project_identity_hash or ""
+        ).strip().lower(),
+        "repository_identity_hash": str(repository_identity_hash or "").strip().lower(),
+    }
+    supplied = changed_files is not None or candidate_overlay is not None or root_identity is not None or any(
+        value
+        for key, value in context.items()
+        if key not in {"changed_files", "candidate_overlay", "root_identity"}
+    )
+    if not supplied:
+        return context
+
+    missing = [
+        field
+        for field in (
+            "graph_basis",
+            "canonical_base_snapshot_id",
+            "base_commit_sha",
+            "candidate_commit_sha",
+            "candidate_diff_hash",
+            "changed_files_source",
+        )
+        if not context[field]
+    ]
+    if missing:
+        raise ValueError(
+            "candidate graph review context requires fields: " + ", ".join(missing)
+        )
+    if context["graph_basis"] not in store.QA_GRAPH_BASES:
+        raise ValueError(f"unsupported graph_basis: {context['graph_basis']}")
+    if context["canonical_base_snapshot_id"] != str(snapshot_id or "").strip():
+        raise ValueError("canonical_base_snapshot_id must match snapshot_id")
+    if not _is_full_commit(context["base_commit_sha"]):
+        raise ValueError("base_commit_sha must be a full git object id")
+    if not _is_full_commit(context["candidate_commit_sha"]):
+        raise ValueError("candidate_commit_sha must be a full git object id")
+    if str(commit_sha or "").strip().lower() != context["candidate_commit_sha"]:
+        raise ValueError("commit_sha must match candidate_commit_sha")
+    if not _is_sha256(context["candidate_diff_hash"]):
+        raise ValueError("candidate_diff_hash must be a sha256 digest")
+    if not context["changed_files_source"].startswith("server_"):
+        raise ValueError("changed_files_source must identify server derivation")
+    if context["graph_basis"] == store.QA_GRAPH_BASIS_EXACT_CANDIDATE:
+        if context["base_commit_sha"] != context["candidate_commit_sha"]:
+            raise ValueError(
+                "exact candidate graph basis requires matching base and candidate commits"
+            )
+        if context["changed_files"]:
+            raise ValueError(
+                "exact candidate graph basis requires an empty changed_files list"
+            )
+        empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
+        if context["candidate_diff_hash"] != empty_diff_hash:
+            raise ValueError("exact candidate graph basis requires the empty diff hash")
+    elif context["base_commit_sha"] == context["candidate_commit_sha"]:
+        raise ValueError("canonical base plus candidate diff requires distinct commits")
+    if context["graph_basis"] == store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF:
+        bounded_fields = (
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        )
+        missing_bounded = [field for field in bounded_fields if not context[field]]
+        if not context["candidate_overlay"]:
+            missing_bounded.append("candidate_overlay")
+        if not context["root_identity"]:
+            missing_bounded.append("root_identity")
+        if missing_bounded:
+            raise ValueError(
+                "canonical base candidate overlay requires fields: "
+                + ", ".join(missing_bounded)
+            )
+        for field in bounded_fields:
+            if not _is_sha256(context[field]):
+                raise ValueError(f"{field} must be a sha256 digest")
+        if stable_sha256(context["candidate_overlay"]) != context["candidate_overlay_hash"]:
+            raise ValueError("candidate_overlay_hash must hash the exact candidate overlay")
+        if stable_sha256(context["root_identity"]) != context["root_identity_hash"]:
+            raise ValueError("root_identity_hash must hash the exact root identity")
+        root_identity = context["root_identity"]
+        for field in (
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        ):
+            if str(root_identity.get(field) or "").strip().lower() != context[field]:
+                raise ValueError(f"root_identity.{field} must match the trace binding")
+    return context
+
+
 def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
     """Return the Runtime Context projection identity for one graph query trace."""
 
     source = trace or {}
+    candidate_context = {
+        "graph_basis": str(source.get("graph_basis") or ""),
+        "canonical_base_snapshot_id": str(
+            source.get("canonical_base_snapshot_id") or ""
+        ),
+        "base_commit_sha": str(source.get("base_commit_sha") or ""),
+        "candidate_commit_sha": str(source.get("candidate_commit_sha") or ""),
+        "changed_files": _candidate_changed_files(source),
+        "candidate_diff_hash": str(source.get("candidate_diff_hash") or ""),
+        "changed_files_source": str(source.get("changed_files_source") or ""),
+        "candidate_overlay_hash": str(source.get("candidate_overlay_hash") or ""),
+        "root_identity_hash": str(source.get("root_identity_hash") or ""),
+        "query_root_identity_hash": str(
+            source.get("query_root_identity_hash") or ""
+        ),
+        "canonical_project_identity_hash": str(
+            source.get("canonical_project_identity_hash") or ""
+        ),
+        "repository_identity_hash": str(
+            source.get("repository_identity_hash") or ""
+        ),
+    }
     return {
         "schema_version": GRAPH_QUERY_IDENTITY_SCHEMA_VERSION,
         "identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
@@ -350,6 +567,8 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
         ),
         "route_token_ref": str(source.get("route_token_ref") or ""),
         "commit_sha": str(source.get("commit_sha") or ""),
+        **candidate_context,
+        "candidate_review_context": dict(candidate_context),
         "qa_session_id": str(source.get("qa_session_id") or ""),
         "qa_scope_binding_ref": str(source.get("qa_scope_binding_ref") or ""),
         "worker_role": str(source.get("worker_role") or ""),
@@ -565,6 +784,20 @@ def start_trace(
     visible_injection_manifest_hash: str = "",
     route_token_ref: str = "",
     commit_sha: str = "",
+    graph_basis: str = "",
+    canonical_base_snapshot_id: str = "",
+    base_commit_sha: str = "",
+    candidate_commit_sha: str = "",
+    changed_files: list[str] | None = None,
+    candidate_diff_hash: str = "",
+    changed_files_source: str = "",
+    candidate_overlay: Mapping[str, Any] | None = None,
+    candidate_overlay_hash: str = "",
+    root_identity: Mapping[str, Any] | None = None,
+    root_identity_hash: str = "",
+    query_root_identity_hash: str = "",
+    canonical_project_identity_hash: str = "",
+    repository_identity_hash: str = "",
     qa_session_id: str = "",
     qa_scope_binding_ref: str = "",
     worker_role: str = "",
@@ -583,18 +816,40 @@ def start_trace(
     budget_json = _budget_for(source, budget)
     usage = _empty_usage()
     artifact = _artifact_path(project_id, snapshot_id, tid)
-    conn.execute(
-        """
-        INSERT INTO graph_query_traces
-          (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
-           run_id, parent_task_id, runtime_context_id, task_id, backlog_id,
-           route_id, route_context_hash, prompt_contract_id, prompt_contract_hash,
-           visible_injection_manifest_hash, route_token_ref, commit_sha,
-           qa_session_id, qa_scope_binding_ref, worker_role, fence_token, status,
-           budget_json, usage_json, artifact_path, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
+    candidate_context = _normalize_candidate_review_context(
+        snapshot_id=snapshot_id,
+        commit_sha=commit_sha,
+        graph_basis=graph_basis,
+        canonical_base_snapshot_id=canonical_base_snapshot_id,
+        base_commit_sha=base_commit_sha,
+        candidate_commit_sha=candidate_commit_sha,
+        changed_files=changed_files,
+        candidate_diff_hash=candidate_diff_hash,
+        changed_files_source=changed_files_source,
+        candidate_overlay=candidate_overlay,
+        candidate_overlay_hash=candidate_overlay_hash,
+        root_identity=root_identity,
+        root_identity_hash=root_identity_hash,
+        query_root_identity_hash=query_root_identity_hash,
+        canonical_project_identity_hash=canonical_project_identity_hash,
+        repository_identity_hash=repository_identity_hash,
+    )
+    insert_columns = (
+        "trace_id", "project_id", "snapshot_id", "actor", "query_source",
+        "query_purpose", "run_id", "parent_task_id", "runtime_context_id",
+        "task_id", "backlog_id", "route_id", "route_context_hash",
+        "prompt_contract_id", "prompt_contract_hash",
+        "visible_injection_manifest_hash", "route_token_ref", "commit_sha",
+        "graph_basis", "canonical_base_snapshot_id", "base_commit_sha",
+        "candidate_commit_sha", "changed_files_json", "candidate_diff_hash",
+        "changed_files_source", "candidate_overlay_json",
+        "candidate_overlay_hash", "root_identity_json", "root_identity_hash",
+        "query_root_identity_hash", "canonical_project_identity_hash",
+        "repository_identity_hash", "qa_session_id", "qa_scope_binding_ref",
+        "worker_role", "fence_token", "status", "budget_json", "usage_json",
+        "artifact_path", "created_at", "updated_at",
+    )
+    insert_values = (
             tid,
             project_id,
             snapshot_id,
@@ -613,6 +868,20 @@ def start_trace(
             str(visible_injection_manifest_hash or ""),
             str(route_token_ref or ""),
             str(commit_sha or ""),
+            candidate_context["graph_basis"],
+            candidate_context["canonical_base_snapshot_id"],
+            candidate_context["base_commit_sha"],
+            candidate_context["candidate_commit_sha"],
+            _json(candidate_context["changed_files"]),
+            candidate_context["candidate_diff_hash"],
+            candidate_context["changed_files_source"],
+            _json(candidate_context["candidate_overlay"]),
+            candidate_context["candidate_overlay_hash"],
+            _json(candidate_context["root_identity"]),
+            candidate_context["root_identity_hash"],
+            candidate_context["query_root_identity_hash"],
+            candidate_context["canonical_project_identity_hash"],
+            candidate_context["repository_identity_hash"],
             str(qa_session_id or ""),
             str(qa_scope_binding_ref or ""),
             str(worker_role or ""),
@@ -623,7 +892,14 @@ def start_trace(
             str(artifact),
             now,
             now,
-        ),
+    )
+    conn.execute(
+        "INSERT INTO graph_query_traces ("
+        + ", ".join(insert_columns)
+        + ") VALUES ("
+        + ", ".join("?" for _ in insert_columns)
+        + ")",
+        insert_values,
     )
     _append_artifact(artifact, {
         "event": "trace_started",
@@ -644,6 +920,7 @@ def start_trace(
         ),
         "route_token_ref": str(route_token_ref or ""),
         "commit_sha": str(commit_sha or ""),
+        **candidate_context,
         "qa_session_id": str(qa_session_id or ""),
         "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
         "worker_role": str(worker_role or ""),
@@ -669,6 +946,7 @@ def start_trace(
             ),
             "route_token_ref": str(route_token_ref or ""),
             "commit_sha": str(commit_sha or ""),
+            **candidate_context,
             "qa_session_id": str(qa_session_id or ""),
             "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
             "worker_role": str(worker_role or ""),
@@ -691,6 +969,13 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
     trace = dict(row)
     trace["budget"] = _decode(trace.pop("budget_json", "{}"), {})
     trace["usage"] = _decode(trace.pop("usage_json", "{}"), {})
+    trace["changed_files"] = _string_list(
+        _decode(trace.pop("changed_files_json", "[]"), [])
+    )
+    trace["candidate_overlay"] = _decode(
+        trace.pop("candidate_overlay_json", "{}"), {}
+    )
+    trace["root_identity"] = _decode(trace.pop("root_identity_json", "{}"), {})
     events = conn.execute(
         """
         SELECT seq, tool, args_hash, result_hash, result_count, duration_ms, created_at
@@ -1773,7 +2058,7 @@ def _with_graph_contract(tool: str, result: dict[str, Any]) -> dict[str, Any]:
     return wrapped
 
 
-def run_tool(
+def _run_base_tool(
     conn: sqlite3.Connection,
     project_id: str,
     snapshot_id: str,
@@ -1833,6 +2118,317 @@ def run_tool(
     raise ValueError(f"unsupported graph query tool: {tool}; allowed: {allowed}")
 
 
+def _candidate_overlay_files(
+    candidate_overlay: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(candidate_overlay, Mapping):
+        return []
+    raw = candidate_overlay.get("files")
+    return [dict(item) for item in raw or [] if isinstance(item, Mapping)]
+
+
+def _candidate_overlay_file_matches_path(
+    file_change: Mapping[str, Any],
+    path: str,
+    *,
+    directory: bool = False,
+) -> bool:
+    wanted = _norm_path(path)
+    paths = {
+        _norm_path(file_change.get("path")),
+        _norm_path(file_change.get("old_path")),
+    }
+    paths.discard("")
+    if not wanted:
+        return True
+    if directory:
+        return any(item == wanted or item.startswith(f"{wanted}/") for item in paths)
+    return wanted in paths
+
+
+def _candidate_overlay_compact_file(file_change: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: file_change.get(key)
+        for key in (
+            "status",
+            "path",
+            "old_path",
+            "similarity",
+            "file_kind",
+            "language",
+            "symbol_delta",
+        )
+        if file_change.get(key) not in (None, "", [], {})
+    }
+
+
+def _candidate_overlay_symbol_rows(
+    file_change: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    delta = file_change.get("symbol_delta")
+    if not isinstance(delta, Mapping):
+        return []
+    rows: list[dict[str, Any]] = []
+    for delta_kind in ("added", "removed"):
+        for symbol in delta.get(delta_kind) or []:
+            if isinstance(symbol, Mapping):
+                rows.append(
+                    {
+                        "delta": delta_kind,
+                        "path": str(
+                            file_change.get("old_path")
+                            if delta_kind == "removed"
+                            else file_change.get("path")
+                            or ""
+                        ),
+                        "symbol": dict(symbol),
+                    }
+                )
+    for change in delta.get("modified") or []:
+        if not isinstance(change, Mapping):
+            continue
+        before = change.get("before") if isinstance(change.get("before"), Mapping) else {}
+        after = change.get("after") if isinstance(change.get("after"), Mapping) else {}
+        rows.append(
+            {
+                "delta": "modified",
+                "path": str(file_change.get("path") or ""),
+                "symbol": dict(after),
+                "before": dict(before),
+            }
+        )
+    return rows
+
+
+def _candidate_overlay_excerpt(
+    source: str | None,
+    *,
+    line_start: int,
+    line_end: int | None,
+    max_lines: int,
+    max_chars: int,
+) -> dict[str, Any]:
+    if source is None:
+        return {"exists": False, "content": "", "line_start": 0, "line_end": 0}
+    lines = source.splitlines()
+    start = max(1, int(line_start or 1))
+    requested_end = int(line_end) if line_end is not None else start + max_lines - 1
+    end = min(len(lines), max(start, requested_end), start + max_lines - 1)
+    content = "\n".join(lines[start - 1 : end])
+    truncated = len(content) > max_chars or end < len(lines) and end < requested_end
+    content = content[:max_chars]
+    return {
+        "exists": True,
+        "content": content,
+        "line_start": start,
+        "line_end": end,
+        "line_count": len(lines),
+        "truncated": truncated,
+        "source_hash": "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    }
+
+
+def _candidate_overlay_projection(
+    *,
+    tool: str,
+    args: Mapping[str, Any],
+    candidate_overlay: Mapping[str, Any],
+    candidate_sources: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    files = _candidate_overlay_files(candidate_overlay)
+    limit = max(1, min(int(args.get("limit") or 100), 300))
+    query = str(args.get("query") or args.get("q") or "").strip().lower()
+    path = _norm_path(args.get("path") or args.get("file") or args.get("rel_path"))
+    status = str(args.get("status") or "").strip().upper()
+    projection: dict[str, Any] = {
+        "schema_version": "qa_review_graph.query_projection.v1",
+        "graph_basis": str(candidate_overlay.get("graph_basis") or ""),
+        "candidate_overlay_hash": stable_sha256(candidate_overlay),
+        "base_snapshot_results_preserved": True,
+        "summary": dict(candidate_overlay.get("summary") or {}),
+        "impact": dict(candidate_overlay.get("impact") or {}),
+        "query_projection": tool,
+    }
+
+    if tool in {"candidate_overlay", "find_node_by_path", "search_structure"}:
+        directory = _bool_arg(dict(args), "directory") or str(args.get("match") or "").lower() in {
+            "directory",
+            "prefix",
+            "subtree",
+        }
+        matches: list[dict[str, Any]] = []
+        for file_change in files:
+            if status and str(file_change.get("status") or "").upper() != status:
+                continue
+            if path and not _candidate_overlay_file_matches_path(
+                file_change, path, directory=directory
+            ):
+                continue
+            if query and query not in " ".join(_flatten_text(file_change)).lower():
+                continue
+            matches.append(_candidate_overlay_compact_file(file_change))
+        projection["file_matches"] = matches[:limit]
+        projection["file_match_count"] = len(matches[:limit])
+
+    if tool == "function_index":
+        matches = []
+        for file_change in files:
+            for row in _candidate_overlay_symbol_rows(file_change):
+                symbol = row.get("symbol") if isinstance(row.get("symbol"), Mapping) else {}
+                haystack = " ".join(_flatten_text(symbol)).lower()
+                if query and query not in haystack:
+                    continue
+                matches.append(row)
+        projection["symbol_matches"] = matches[:limit]
+        projection["symbol_match_count"] = len(matches[:limit])
+
+    if tool in {"function_callees", "function_callers"}:
+        call_matches: list[dict[str, Any]] = []
+        for file_change in files:
+            candidate = file_change.get("candidate")
+            if not isinstance(candidate, Mapping):
+                continue
+            for symbol in candidate.get("symbols") or []:
+                if not isinstance(symbol, Mapping):
+                    continue
+                identity = str(symbol.get("identity") or symbol.get("name") or "")
+                calls = [str(item) for item in symbol.get("calls") or [] if str(item)]
+                if tool == "function_callees" and (
+                    not query or query in identity.lower()
+                ):
+                    call_matches.extend(
+                        {
+                            "direction": "callee",
+                            "caller": identity,
+                            "callee": call,
+                            "caller_file": str(file_change.get("path") or ""),
+                            "source": "candidate_overlay",
+                        }
+                        for call in calls
+                    )
+                elif tool == "function_callers":
+                    call_matches.extend(
+                        {
+                            "direction": "caller",
+                            "caller": identity,
+                            "callee": call,
+                            "caller_file": str(file_change.get("path") or ""),
+                            "source": "candidate_overlay",
+                        }
+                        for call in calls
+                        if not query or query in call.lower()
+                    )
+        projection["call_matches"] = call_matches[:limit]
+        projection["call_match_count"] = len(call_matches[:limit])
+
+    file_kind_by_tool = {
+        "get_tests": "test",
+        "get_docs": "doc",
+        "search_docs": "doc",
+        "get_config": "config",
+    }
+    if tool in file_kind_by_tool:
+        wanted_kind = file_kind_by_tool[tool]
+        impacted = [
+            _candidate_overlay_compact_file(item)
+            for item in files
+            if str(item.get("file_kind") or "") == wanted_kind
+            and (not query or query in " ".join(_flatten_text(item)).lower())
+        ]
+        projection["impact_matches"] = impacted[:limit]
+        projection["impact_match_count"] = len(impacted[:limit])
+
+    if tool == "get_file_excerpt" and path:
+        source_entry = None
+        for key, value in (candidate_sources or {}).items():
+            if _norm_path(key) == path and isinstance(value, Mapping):
+                source_entry = value
+                break
+        if source_entry is not None:
+            line_start = int(args.get("line_start") or args.get("start_line") or 1)
+            line_end_raw = args.get("line_end")
+            if line_end_raw is None:
+                line_end_raw = args.get("end_line")
+            kwargs = {
+                "line_start": line_start,
+                "line_end": int(line_end_raw) if line_end_raw is not None else None,
+                "max_lines": max(1, min(int(args.get("max_lines") or 80), 400)),
+                "max_chars": max(1, min(int(args.get("max_chars") or 8000), 50_000)),
+            }
+            projection["file_excerpt"] = {
+                "status": str(source_entry.get("status") or ""),
+                "path": path,
+                "old_path": str(source_entry.get("old_path") or ""),
+                "base": _candidate_overlay_excerpt(source_entry.get("base"), **kwargs),
+                "candidate": _candidate_overlay_excerpt(
+                    source_entry.get("candidate"), **kwargs
+                ),
+            }
+    return projection
+
+
+def run_tool(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    tool: str,
+    args: dict[str, Any] | None = None,
+    project_root: str | Path | None = None,
+    candidate_overlay: Mapping[str, Any] | None = None,
+    candidate_sources: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_tool = str(tool or "").strip().lower()
+    normalized_args = dict(args or {})
+    if normalized_tool == "candidate_overlay":
+        if not candidate_overlay:
+            raise ValueError(
+                "candidate_overlay is available only for bounded QA base-diff queries"
+            )
+        base_result: dict[str, Any] = {"ok": True}
+    elif normalized_tool == "get_file_excerpt" and candidate_overlay:
+        requested_path = _norm_path(
+            normalized_args.get("path")
+            or normalized_args.get("file")
+            or normalized_args.get("rel_path")
+        )
+        source_paths = {_norm_path(key) for key in (candidate_sources or {})}
+        if requested_path in source_paths:
+            base_result = {
+                "ok": True,
+                "path": requested_path,
+                "source": "candidate_overlay_git_objects",
+            }
+        else:
+            base_result = _run_base_tool(
+                conn,
+                project_id,
+                snapshot_id,
+                tool=normalized_tool,
+                args=normalized_args,
+                project_root=project_root,
+            )
+    else:
+        base_result = _run_base_tool(
+            conn,
+            project_id,
+            snapshot_id,
+            tool=normalized_tool,
+            args=normalized_args,
+            project_root=project_root,
+        )
+    if not candidate_overlay:
+        return base_result
+    result = dict(base_result)
+    result["qa_review_graph"] = _candidate_overlay_projection(
+        tool=normalized_tool,
+        args=normalized_args,
+        candidate_overlay=candidate_overlay,
+        candidate_sources=candidate_sources,
+    )
+    return result
+
+
 def traced_query(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1856,6 +2452,21 @@ def traced_query(
     visible_injection_manifest_hash: str = "",
     route_token_ref: str = "",
     commit_sha: str = "",
+    graph_basis: str = "",
+    canonical_base_snapshot_id: str = "",
+    base_commit_sha: str = "",
+    candidate_commit_sha: str = "",
+    changed_files: list[str] | None = None,
+    candidate_diff_hash: str = "",
+    changed_files_source: str = "",
+    candidate_overlay: Mapping[str, Any] | None = None,
+    candidate_overlay_hash: str = "",
+    root_identity: Mapping[str, Any] | None = None,
+    root_identity_hash: str = "",
+    query_root_identity_hash: str = "",
+    canonical_project_identity_hash: str = "",
+    repository_identity_hash: str = "",
+    candidate_sources: Mapping[str, Any] | None = None,
     qa_session_id: str = "",
     qa_scope_binding_ref: str = "",
     worker_role: str = "",
@@ -1885,6 +2496,20 @@ def traced_query(
             visible_injection_manifest_hash=visible_injection_manifest_hash,
             route_token_ref=route_token_ref,
             commit_sha=commit_sha,
+            graph_basis=graph_basis,
+            canonical_base_snapshot_id=canonical_base_snapshot_id,
+            base_commit_sha=base_commit_sha,
+            candidate_commit_sha=candidate_commit_sha,
+            changed_files=changed_files,
+            candidate_diff_hash=candidate_diff_hash,
+            changed_files_source=changed_files_source,
+            candidate_overlay=candidate_overlay,
+            candidate_overlay_hash=candidate_overlay_hash,
+            root_identity=root_identity,
+            root_identity_hash=root_identity_hash,
+            query_root_identity_hash=query_root_identity_hash,
+            canonical_project_identity_hash=canonical_project_identity_hash,
+            repository_identity_hash=repository_identity_hash,
             qa_session_id=qa_session_id,
             qa_scope_binding_ref=qa_scope_binding_ref,
             worker_role=worker_role,
@@ -1895,7 +2520,7 @@ def traced_query(
         created_trace = True
     else:
         trace = _load_trace_for_query(conn, project_id, trace_id)
-        expected_binding = {"snapshot_id": snapshot_id}
+        expected_binding: dict[str, Any] = {"snapshot_id": snapshot_id}
         if str(trace.get("query_source") or "") == "qa" or query_source == "qa":
             expected_binding.update(
                 {
@@ -1909,6 +2534,33 @@ def traced_query(
                     "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
                 }
             )
+            stored_graph_basis = str(trace.get("graph_basis") or "")
+            supplied_graph_basis = str(graph_basis or "")
+            if stored_graph_basis or supplied_graph_basis:
+                if stored_graph_basis and not supplied_graph_basis:
+                    raise ValueError(
+                        "bounded QA graph query trace reuse requires the persisted "
+                        "candidate review context"
+                    )
+                candidate_context = _normalize_candidate_review_context(
+                    snapshot_id=snapshot_id,
+                    commit_sha=commit_sha,
+                    graph_basis=graph_basis,
+                    canonical_base_snapshot_id=canonical_base_snapshot_id,
+                    base_commit_sha=base_commit_sha,
+                    candidate_commit_sha=candidate_commit_sha,
+                    changed_files=changed_files,
+                    candidate_diff_hash=candidate_diff_hash,
+                    changed_files_source=changed_files_source,
+                    candidate_overlay=candidate_overlay,
+                    candidate_overlay_hash=candidate_overlay_hash,
+                    root_identity=root_identity,
+                    root_identity_hash=root_identity_hash,
+                    query_root_identity_hash=query_root_identity_hash,
+                    canonical_project_identity_hash=canonical_project_identity_hash,
+                    repository_identity_hash=repository_identity_hash,
+                )
+                expected_binding.update(candidate_context)
         stored_route_token_ref = str(trace.get("route_token_ref") or "")
         if stored_route_token_ref or route_token_ref:
             route_binding = {
@@ -1934,11 +2586,34 @@ def traced_query(
                     + ", ".join(missing_route_binding)
                 )
             expected_binding.update(route_binding)
-        mismatches = {
-            field: {"expected": expected, "actual": str(trace.get(field) or "")}
-            for field, expected in expected_binding.items()
-            if expected and str(trace.get(field) or "") != expected
-        }
+        mismatches: dict[str, dict[str, Any]] = {}
+        for field, expected in expected_binding.items():
+            actual: Any = trace.get(field)
+            if field == "changed_files":
+                expected_value = _string_list(expected)
+                actual_value = _string_list(actual)
+                if expected_value != actual_value:
+                    mismatches[field] = {
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    }
+                continue
+            if field in {"candidate_overlay", "root_identity"}:
+                expected_value = stable_sha256(expected or {})
+                actual_value = stable_sha256(actual or {})
+                if expected_value != actual_value:
+                    mismatches[field] = {
+                        "expected_hash": expected_value,
+                        "actual_hash": actual_value,
+                    }
+                continue
+            expected_value = str(expected or "")
+            actual_value = str(actual or "")
+            if expected_value and actual_value != expected_value:
+                mismatches[field] = {
+                    "expected": expected_value,
+                    "actual": actual_value,
+                }
         if mismatches:
             raise ValueError(f"graph query trace binding mismatch: {mismatches}")
     usage = dict(trace.get("usage") or _empty_usage())
@@ -1959,7 +2634,16 @@ def traced_query(
     result: dict[str, Any]
     error = ""
     try:
-        result = run_tool(conn, project_id, snapshot_id, tool=tool, args=args, project_root=project_root)
+        result = run_tool(
+            conn,
+            project_id,
+            snapshot_id,
+            tool=tool,
+            args=args,
+            project_root=project_root,
+            candidate_overlay=candidate_overlay,
+            candidate_sources=candidate_sources,
+        )
         result.setdefault("ok", True)
     except Exception as exc:
         error = str(exc)

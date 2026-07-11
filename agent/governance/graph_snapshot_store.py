@@ -15,6 +15,16 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
+QA_GRAPH_BASIS_EXACT_CANDIDATE = "exact_candidate_snapshot"
+QA_GRAPH_BASIS_CANONICAL_BASE_DIFF = "canonical_base_plus_candidate_diff"
+QA_GRAPH_BASES = frozenset(
+    {
+        QA_GRAPH_BASIS_EXACT_CANDIDATE,
+        QA_GRAPH_BASIS_CANONICAL_BASE_DIFF,
+    }
+)
+
+
 GRAPH_SNAPSHOT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS graph_snapshots (
   project_id TEXT NOT NULL,
@@ -3158,6 +3168,60 @@ def resolve_commit_graph_state(
         "pending_scope_status": "",
         "is_active": False,
         "warnings": ["no graph snapshot is available"],
+    }
+
+
+def resolve_bounded_qa_graph_basis(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    candidate_commit_sha: str,
+) -> dict[str, Any]:
+    """Resolve the snapshot side of a bounded QA candidate review.
+
+    Exact candidate snapshots retain their existing behavior. When the
+    candidate has no materialized snapshot, only the active canonical snapshot
+    may serve as the base for a server-derived candidate diff.
+    """
+
+    ensure_schema(conn)
+    project_id = str(project_id or "").strip()
+    snapshot_id = str(snapshot_id or "").strip()
+    candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
+    snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+
+    snapshot_commit_sha = str(snapshot.get("commit_sha") or "").strip().lower()
+    if snapshot_commit_sha == candidate_commit_sha:
+        return {
+            "schema_version": "bounded_qa.graph_basis.v1",
+            "graph_basis": QA_GRAPH_BASIS_EXACT_CANDIDATE,
+            "snapshot_id": snapshot_id,
+            "canonical_base_snapshot_id": snapshot_id,
+            "base_commit_sha": snapshot_commit_sha,
+            "candidate_commit_sha": candidate_commit_sha,
+            "requires_candidate_diff": False,
+        }
+
+    active = get_active_graph_snapshot(conn, project_id)
+    active_snapshot_id = str(active.get("snapshot_id") or "") if active else ""
+    if not active or snapshot_id != active_snapshot_id:
+        raise ValueError(
+            "bounded QA base-diff review requires the active canonical graph snapshot"
+        )
+    active_commit_sha = str(active.get("commit_sha") or "").strip().lower()
+    if not active_commit_sha:
+        raise ValueError("active canonical graph snapshot has no base commit")
+
+    return {
+        "schema_version": "bounded_qa.graph_basis.v1",
+        "graph_basis": QA_GRAPH_BASIS_CANONICAL_BASE_DIFF,
+        "snapshot_id": snapshot_id,
+        "canonical_base_snapshot_id": active_snapshot_id,
+        "base_commit_sha": active_commit_sha,
+        "candidate_commit_sha": candidate_commit_sha,
+        "requires_candidate_diff": True,
     }
 
 

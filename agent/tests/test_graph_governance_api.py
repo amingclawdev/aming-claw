@@ -886,6 +886,25 @@ def _direct_fix_graph_trace_payload(
         "query_purpose": query_purpose,
         "target_project_root": target_project_root,
     }
+    if actor_role == "qa":
+        candidate_commit = hashlib.sha1(trace_id.encode("utf-8")).hexdigest()
+        evidence.update(
+            {
+                "source": "graph_query_traces",
+                "qa_session_id": "ses-qa",
+                "missing_trace_ids": [],
+                "identity_mismatches": [],
+                "graph_basis": "exact_candidate_snapshot",
+                "canonical_base_snapshot_id": f"full-{trace_id}",
+                "base_commit_sha": candidate_commit,
+                "candidate_commit_sha": candidate_commit,
+                "changed_files": [],
+                "candidate_diff_hash": (
+                    "sha256:" + hashlib.sha256(b"").hexdigest()
+                ),
+                "changed_files_source": "server_exact_candidate_snapshot",
+            }
+        )
     if actor_role == "mf_sub":
         evidence.update(
             {
@@ -1133,6 +1152,92 @@ def _insert_observer_graph_query_trace(
             created_at,
         ),
     )
+
+
+def _insert_exact_qa_graph_query_trace(
+    conn,
+    *,
+    trace_id: str,
+    snapshot_id: str,
+    candidate_commit_sha: str,
+    backlog_id: str,
+    task_id: str,
+    target_project_root: str,
+    actor: str = "qa-principal",
+    qa_session_id: str = "ses-qa",
+    query_purpose: str = "independent_verification",
+    created_at: str = "2026-07-04T10:00:00Z",
+) -> dict[str, Any]:
+    _activate_basic_graph(conn, snapshot_id, commit_sha=candidate_commit_sha)
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id=snapshot_id,
+        actor=actor,
+        query_source="qa",
+        query_purpose=query_purpose,
+        task_id=task_id,
+        created_at=created_at,
+    )
+    empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit_sha,
+    )
+    conn.execute(
+        """
+        UPDATE graph_query_traces
+        SET backlog_id = ?, commit_sha = ?, qa_session_id = ?,
+            qa_scope_binding_ref = ?, graph_basis = ?,
+            canonical_base_snapshot_id = ?, base_commit_sha = ?,
+            candidate_commit_sha = ?, changed_files_json = ?,
+            candidate_diff_hash = ?, changed_files_source = ?
+        WHERE project_id = ? AND trace_id = ?
+        """,
+        (
+            backlog_id,
+            candidate_commit_sha,
+            qa_session_id,
+            qa_scope_binding_ref,
+            "exact_candidate_snapshot",
+            snapshot_id,
+            candidate_commit_sha,
+            candidate_commit_sha,
+            "[]",
+            empty_diff_hash,
+            "server_exact_candidate_snapshot",
+            PID,
+            trace_id,
+        ),
+    )
+    return {
+        "schema_version": "qa_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
+        "producer": "graph_query_trace",
+        "db_verified": True,
+        "trace_ids": [trace_id],
+        "graph_trace_ids": [trace_id],
+        "graph_query_trace_ids": [trace_id],
+        "verified_trace_ids": [trace_id],
+        "requested_trace_ids": [trace_id],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "query_source": "qa",
+        "query_purpose": query_purpose,
+        "qa_principal": actor,
+        "qa_session_id": qa_session_id,
+        "qa_scope_binding_ref": qa_scope_binding_ref,
+        "target_project_root": target_project_root,
+        "graph_basis": "exact_candidate_snapshot",
+        "canonical_base_snapshot_id": snapshot_id,
+        "base_commit_sha": candidate_commit_sha,
+        "candidate_commit_sha": candidate_commit_sha,
+        "changed_files": [],
+        "candidate_diff_hash": empty_diff_hash,
+        "changed_files_source": "server_exact_candidate_snapshot",
+    }
 
 
 def _route_waiver(action: str, *, task_id: str = "", backlog_id: str = "") -> dict:
@@ -20366,6 +20471,16 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     assert trace["qa_session_id"] == registered["session_id"]
     assert trace["qa_scope_binding_ref"] == qa_scope_binding_ref
     assert trace["graph_query_identity"]["commit_sha"] == commit_sha
+    assert trace["graph_query_identity"]["graph_basis"] == "exact_candidate_snapshot"
+    assert trace["graph_query_identity"]["canonical_base_snapshot_id"] == (
+        "full-query-bounded-qa"
+    )
+    assert trace["graph_query_identity"]["base_commit_sha"] == commit_sha
+    assert trace["graph_query_identity"]["candidate_commit_sha"] == commit_sha
+    assert trace["graph_query_identity"]["changed_files"] == []
+    assert trace["graph_query_identity"]["candidate_diff_hash"] == (
+        "sha256:" + hashlib.sha256(b"").hexdigest()
+    )
 
     timeline_ctx = _ctx_with_role(
         {"project_id": PID},
@@ -20401,11 +20516,789 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     assert proof["qa_session_id"] == registered["session_id"]
     assert proof["qa_scope_binding_ref"] == qa_scope_binding_ref
     assert proof["snapshot_commit_sha"] == commit_sha
+    assert proof["graph_basis"] == "exact_candidate_snapshot"
+    assert proof["base_commit_sha"] == commit_sha
+    assert proof["candidate_commit_sha"] == commit_sha
+    assert proof["changed_files"] == []
     assert proof["graph_trace_ids"] == [queried["trace_id"]]
     assert proof["raw_qa_session_token_persisted"] is False
     assert result["contract_gate_decision"]["source_of_authority"] == (
         "qa_session_verification"
     )
+
+
+def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-BOUNDED-QA-BASE-DIFF"
+    task_id = "bounded-qa-base-diff-task"
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="bounded-qa-base-diff",
+    )
+    base_commit = fixture.main_head
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-review"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_path = fixture.root / "src" / "candidate_review.py"
+    candidate_path.write_text(
+        "def candidate_entry():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/candidate_review.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate review change"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, explicit_root=None, *, fallback_self=True: (
+            Path(explicit_root).resolve() if explicit_root else fixture.root
+        ),
+    )
+    snapshot_id = "full-query-bounded-qa-base"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=base_commit)
+
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:base-diff",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    query_body = {
+        "snapshot_id": "active",
+        "project_root": str(fixture.root),
+        "tool": "candidate_overlay",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+    }
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=query_body,
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:base-diff",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(qa_ctx)
+
+    identity = queried["graph_query_identity"]
+    assert identity["graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert identity["snapshot_id"] == snapshot_id
+    assert identity["canonical_base_snapshot_id"] == snapshot_id
+    assert identity["base_commit_sha"] == base_commit
+    assert identity["candidate_commit_sha"] == candidate_commit
+    assert identity["commit_sha"] == candidate_commit
+    assert identity["changed_files"] == ["src/candidate_review.py"]
+    assert identity["candidate_diff_hash"].startswith("sha256:")
+    assert identity["changed_files_source"] == "server_git_diff_name_status_z_m"
+    for field in (
+        "candidate_overlay_hash",
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
+    ):
+        assert identity[field].startswith("sha256:")
+    assert identity["candidate_review_context"] == {
+        key: identity[key]
+        for key in (
+            "graph_basis",
+            "canonical_base_snapshot_id",
+            "base_commit_sha",
+            "candidate_commit_sha",
+            "changed_files",
+            "candidate_diff_hash",
+            "changed_files_source",
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        )
+    }
+    review_graph = queried["result"]["qa_review_graph"]
+    assert review_graph["base_snapshot_results_preserved"] is True
+    assert review_graph["summary"]["status_counts"]["A"] == 1
+    assert review_graph["summary"]["public_symbol_delta_counts"]["added"] == 1
+    assert review_graph["file_matches"][0]["path"] == "src/candidate_review.py"
+
+    symbol_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            **query_body,
+            "tool": "function_index",
+            "args": {"query": "candidate_entry"},
+        },
+    )
+    symbol_ctx._session = dict(qa_ctx._session)
+    symbol_query = server.handle_graph_governance_query(symbol_ctx)
+    symbol_matches = symbol_query["result"]["qa_review_graph"]["symbol_matches"]
+    assert [item["symbol"]["name"] for item in symbol_matches] == [
+        "candidate_entry"
+    ]
+
+    stored = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    assert stored["graph_query_identity"]["candidate_review_context"] == identity[
+        "candidate_review_context"
+    ]
+
+    forged_timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:base-diff",
+            "status": "passed",
+            "commit_sha": candidate_commit,
+            "payload": {
+                "graph_trace_ids": [queried["trace_id"]],
+                "candidate_review_context": {
+                    **identity["candidate_review_context"],
+                    "changed_files": ["src/forged.py"],
+                },
+                "observer_impersonation": False,
+            },
+        },
+    )
+    forged_timeline_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as forged_evidence:
+        server.handle_task_timeline_append(forged_timeline_ctx)
+    assert forged_evidence.value.code == "qa_graph_review_context_mismatch"
+
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa-rotated",
+        commit_sha=candidate_commit,
+    )
+    stale_timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:base-diff",
+            "status": "passed",
+            "commit_sha": candidate_commit,
+            "payload": {
+                "graph_trace_ids": [queried["trace_id"]],
+                "candidate_review_context": identity["candidate_review_context"],
+                "test_results": {"status": "passed"},
+                "observer_impersonation": False,
+            },
+        },
+    )
+    stale_timeline_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as stale_base:
+        server.handle_task_timeline_append(stale_timeline_ctx)
+    assert stale_base.value.code == "qa_graph_trace_mismatch"
+    store.activate_graph_snapshot(conn, PID, snapshot_id)
+    conn.commit()
+
+    timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "actor": "qa:base-diff",
+            "status": "passed",
+            "commit_sha": candidate_commit,
+            "payload": {
+                "graph_trace_ids": [queried["trace_id"]],
+                "candidate_review_context": identity["candidate_review_context"],
+                "test_results": {"status": "passed"},
+                "observer_impersonation": False,
+            },
+        },
+    )
+    timeline_ctx._session = dict(qa_ctx._session)
+
+    verification = server.handle_task_timeline_append(timeline_ctx)
+
+    proof = verification["payload"]["source_backed_contract_gate_authority"][
+        "qa_session_proof"
+    ]
+    assert proof["graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert proof["snapshot_commit_sha"] == base_commit
+    assert proof["candidate_commit_sha"] == candidate_commit
+    assert proof["changed_files"] == ["src/candidate_review.py"]
+    assert proof["candidate_diff_hash"] == identity["candidate_diff_hash"]
+    assert proof["candidate_overlay_hash"] == identity["candidate_overlay_hash"]
+    assert proof["repository_identity_hash"] == identity["repository_identity_hash"]
+
+
+def test_bounded_qa_base_graph_candidate_diff_rejects_forged_tuple(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-BOUNDED-QA-BASE-DIFF-FORGED"
+    task_id = "bounded-qa-base-diff-forged-task"
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="bounded-qa-base-diff-forged",
+    )
+    base_commit = fixture.main_head
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-forged"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_path = fixture.root / "src" / "candidate_forged.py"
+    candidate_path.write_text(
+        "def candidate_forged():\n"
+        "    return False\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/candidate_forged.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate forged tuple fixture"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, explicit_root=None, *, fallback_self=True: (
+            Path(explicit_root).resolve() if explicit_root else fixture.root
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa-base-forged",
+        commit_sha=base_commit,
+    )
+    binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit,
+    )
+    scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{candidate_commit}",
+        binding_ref,
+    ]
+    base_body = {
+        "snapshot_id": "active",
+        "project_root": str(fixture.root),
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+    }
+    forged_claims = [
+        {"graph_basis": "exact_candidate_snapshot"},
+        {"base_commit_sha": "f" * 40},
+        {"changed_files": ["src/not-the-candidate.py"]},
+        {"candidate_diff_hash": "sha256:" + "0" * 64},
+        {"candidate_overlay_hash": "sha256:" + "0" * 64},
+        {"repository_identity_hash": "sha256:" + "0" * 64},
+    ]
+    for forged_claim in forged_claims:
+        qa_ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body={**base_body, "candidate_review_context": forged_claim},
+        )
+        qa_ctx._session.update(
+            {
+                "session_id": "ses-qa-base-diff-forged",
+                "principal_id": "qa:base-diff-forged",
+                "scope": scope,
+            }
+        )
+        with pytest.raises(GovernanceError) as exc:
+            server.handle_graph_governance_query(qa_ctx)
+        assert exc.value.code == "qa_graph_review_context_mismatch"
+
+
+def test_qa_candidate_overlay_materializes_file_and_public_symbol_deltas(
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-candidate-overlay-deltas",
+    )
+    base_sources = {
+        "src/modified.py": (
+            "def retained_entry():\n"
+            "    return 'base-value'\n\n"
+            "def removed_entry():\n"
+            "    return 'removed-value'\n"
+        ),
+        "src/deleted.py": (
+            "def deleted_entry():\n"
+            "    return 'deleted-only-value-with-distinct-source'\n"
+        ),
+        "src/renamed.py": (
+            "def renamed_entry():\n"
+            "    return 'rename-preserves-this-exact-source'\n"
+        ),
+    }
+    for relative_path, source in base_sources.items():
+        path = fixture.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate overlay base files"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-overlay-deltas"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (fixture.root / "src/modified.py").write_text(
+        "def retained_entry():\n"
+        "    return 'candidate-value'\n\n"
+        "def added_entry():\n"
+        "    return 'added-value'\n",
+        encoding="utf-8",
+    )
+    (fixture.root / "src/added.py").write_text(
+        "def independently_added_entry():\n"
+        "    return 'brand-new-distinct-source'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "rm", "src/deleted.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "mv", "src/renamed.py", "src/renamed_target.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "add", "src"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate overlay all statuses"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    context = server._qa_candidate_diff_context(
+        fixture.root,
+        project_id=PID,
+        canonical_project_root=fixture.root,
+        base_commit_sha=base_commit,
+        candidate_commit_sha=candidate_commit,
+    )
+
+    overlay = context["candidate_overlay"]
+    assert overlay["summary"]["status_counts"] == {
+        "A": 1,
+        "M": 1,
+        "D": 1,
+        "R": 1,
+    }
+    files = {item["path"]: item for item in overlay["files"]}
+    assert files["src/added.py"]["status"] == "A"
+    assert files["src/modified.py"]["status"] == "M"
+    assert files["src/deleted.py"]["status"] == "D"
+    assert files["src/renamed_target.py"]["status"] == "R"
+    assert files["src/renamed_target.py"]["old_path"] == "src/renamed.py"
+    modified_delta = files["src/modified.py"]["symbol_delta"]
+    assert [item["name"] for item in modified_delta["added"]] == ["added_entry"]
+    assert [item["name"] for item in modified_delta["removed"]] == [
+        "removed_entry"
+    ]
+    assert [item["after"]["name"] for item in modified_delta["modified"]] == [
+        "retained_entry"
+    ]
+    assert overlay["summary"]["public_symbol_delta_counts"] == {
+        "added": 3,
+        "modified": 1,
+        "removed": 3,
+    }
+    assert context["candidate_overlay_hash"] == server.stable_sha256(overlay)
+    assert context["changed_files_source"] == "server_git_diff_name_status_z_m"
+    assert context["root_identity"]["repository_identity_match"] is True
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected_reason"),
+    [
+        (
+            ".aming-claw.yaml",
+            "graph:\n  exclude_paths: [generated]\n",
+            "graph_config_change_requires_exact_candidate_snapshot",
+        ),
+        (
+            "agent/governance/graph_structure_hints.py",
+            "GRAPH_STRUCTURE_HINTS = {}\n",
+            "graph_algorithm_change_requires_exact_candidate_snapshot",
+        ),
+        (
+            "src/hinted.py",
+            "# governance-hint: contract binding\n"
+            "def hinted_entry():\n"
+            "    return True\n",
+            "governance_hint_change_requires_exact_candidate_snapshot",
+        ),
+    ],
+)
+def test_qa_candidate_overlay_requires_exact_snapshot_for_graph_inputs(
+    tmp_path,
+    relative_path,
+    source,
+    expected_reason,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-candidate-overlay-unsafe-input",
+    )
+    base_commit = fixture.main_head
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-unsafe-input"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changed_path = fixture.root / relative_path
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text(source, encoding="utf-8")
+    subprocess.run(
+        ["git", "add", relative_path],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "unsafe overlay input"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_candidate_diff_context(
+            fixture.root,
+            project_id=PID,
+            canonical_project_root=fixture.root,
+            base_commit_sha=base_commit,
+            candidate_commit_sha=candidate_commit,
+        )
+    assert exc.value.reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "expected_reason"),
+    [
+        (
+            "src/unsupported.go",
+            b"package overlay\n\nfunc CandidateEntry() bool { return true }\n",
+            "unsupported_source_language_requires_exact_candidate_snapshot",
+        ),
+        (
+            "src/binary.py",
+            b"def candidate_entry():\n    return b'bad'\x00\n",
+            "binary_source_requires_exact_candidate_snapshot",
+        ),
+        (
+            "docs/oversized.md",
+            b"x" * (server._QA_OVERLAY_MAX_FILE_BYTES + 1),
+            "oversized_source_requires_exact_candidate_snapshot",
+        ),
+    ],
+)
+def test_qa_candidate_overlay_rejects_unbounded_or_unsupported_sources(
+    tmp_path,
+    relative_path,
+    payload,
+    expected_reason,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-candidate-overlay-source-limit",
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-source-limit"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changed_path = fixture.root / relative_path
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_bytes(payload)
+    subprocess.run(
+        ["git", "add", relative_path],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate source limit"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_candidate_diff_context(
+            fixture.root,
+            project_id=PID,
+            canonical_project_root=fixture.root,
+            base_commit_sha=fixture.main_head,
+            candidate_commit_sha=candidate_commit,
+        )
+    assert exc.value.reason == expected_reason
+
+
+def test_qa_candidate_overlay_accepts_linked_candidate_worktree(tmp_path):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-overlay-linked-canonical",
+    )
+    candidate_root = tmp_path / "qa-overlay-linked-candidate"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "candidate-linked-root",
+            str(candidate_root),
+            fixture.main_head,
+        ],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (candidate_root / "src/linked_candidate.py").write_text(
+        "def linked_candidate_entry():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/linked_candidate.py"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "linked candidate root"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(candidate_root)
+
+    context = server._qa_candidate_diff_context(
+        candidate_root,
+        project_id=PID,
+        canonical_project_root=fixture.root,
+        base_commit_sha=fixture.main_head,
+        candidate_commit_sha=candidate_commit,
+    )
+
+    identity = context["root_identity"]
+    assert identity["query_root_is_linked_worktree"] is True
+    assert identity["query_root_head_commit"] == candidate_commit
+    assert identity["canonical_head_commit"] == fixture.main_head
+    assert identity["repository_identity_match"] is True
+
+
+def test_qa_candidate_overlay_rejects_wrong_repository_root(tmp_path):
+    canonical = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-overlay-canonical-repository",
+    )
+    unrelated = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-overlay-unrelated-repository",
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-wrong-root"],
+        cwd=canonical.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (canonical.root / "src/candidate.py").write_text(
+        "def candidate_entry():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/candidate.py"],
+        cwd=canonical.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "wrong root candidate"],
+        cwd=canonical.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(canonical.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=canonical.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_candidate_diff_context(
+            unrelated.root,
+            project_id=PID,
+            canonical_project_root=canonical.root,
+            base_commit_sha=canonical.main_head,
+            candidate_commit_sha=candidate_commit,
+        )
+    assert exc.value.reason == "query_root_repository_mismatch"
 
 
 def test_qa_role_assignment_derives_exact_candidate_scope_binding(conn):
@@ -21239,7 +22132,32 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         "query_purpose=independent_verification",
         "source=graph_query_traces",
         "db_verified=true",
+        "graph_basis",
+        "canonical_base_snapshot_id",
+        "base_commit_sha",
+        "candidate_commit_sha",
+        "changed_files",
+        "candidate_diff_hash",
+        "changed_files_source",
+        "candidate_overlay_hash",
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
     ]
+    assert current_qa_guide["graph_query"]["graph_basis_policy"] == {
+        "accepted": [
+            "exact_candidate_snapshot",
+            "canonical_base_plus_candidate_diff",
+        ],
+        "canonical_base_snapshot_server_resolved": True,
+        "changed_files_server_derived": True,
+        "candidate_diff_hash_server_derived": True,
+        "candidate_overlay_server_derived": True,
+        "root_identity_server_derived": True,
+        "unsafe_overlay_requires_exact_candidate_snapshot": True,
+        "full_candidate_snapshot_required": False,
+    }
     current_qa_graph_shape = current_qa_guide["qa_graph_context"][
         "accepted_evidence_shape"
     ]
@@ -21331,6 +22249,18 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     assert qa_guide["qa_graph_context"]["required_top_level_fields"] == [
         "graph_trace_ids",
         "graph_query_trace_ids",
+        "graph_basis",
+        "canonical_base_snapshot_id",
+        "base_commit_sha",
+        "candidate_commit_sha",
+        "changed_files",
+        "candidate_diff_hash",
+        "changed_files_source",
+        "candidate_overlay_hash",
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
     ]
     assert (
         qa_guide["qa_graph_context"]["required_nested_payload_field"]
@@ -22696,14 +23626,14 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     )
     if current["next_legal_action"]["line_id"] == "qa_graph_context":
         qa_graph_trace_id = "gqt-contract-failed-qa-qa"
-        _insert_observer_graph_query_trace(
+        bounded_graph_evidence = _insert_exact_qa_graph_query_trace(
             conn,
             trace_id=qa_graph_trace_id,
             snapshot_id="scope-contract-failed-qa-qa",
-            actor="qa",
-            query_source="qa",
-            query_purpose="independent_verification",
-            task_id=successor["contract_execution_id"],
+            candidate_commit_sha=worker_head_commit,
+            backlog_id=backlog_id,
+            task_id=runtime_context.task_id,
+            target_project_root=str(target_root),
             created_at="2026-07-06T02:01:00Z",
         )
         qa_graph = server.handle_project_contract_runtime_line_write(
@@ -22725,14 +23655,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                     "payload": {
                         "schema_version": "mf_parallel.qa_graph_context.v1",
                         "graph_trace_ids": [qa_graph_trace_id],
-                        "graph_trace_evidence": {
-                            "db_verified": True,
-                            "graph_trace_ids": [qa_graph_trace_id],
-                            "verified_trace_ids": [qa_graph_trace_id],
-                            "query_source": "qa",
-                            "query_purpose": "independent_verification",
-                            "target_project_root": str(target_root),
-                        },
+                        "graph_trace_evidence": bounded_graph_evidence,
                     },
                 },
             )
@@ -28967,14 +29890,23 @@ def _complete_source_backed_mf_parallel_successor(
         run_id=_mf_sub_run_id(runtime_context.task_id, runtime_context.fence_token),
     )
     qa_graph_trace_id = "gqt-20260628-aabb5678"
-    _insert_observer_graph_query_trace(
+    qa_graph_evidence = _insert_exact_qa_graph_query_trace(
         conn,
         trace_id=qa_graph_trace_id,
         snapshot_id="scope-mf-parallel-source-backed-qa",
-        actor="qa",
-        query_source="qa",
-        query_purpose="qa_gate_validation",
+        candidate_commit_sha=worker_commit,
+        backlog_id=backlog_id,
         task_id=contract_execution_id,
+        target_project_root=runtime_context.target_project_root,
+        actor="qa",
+        qa_session_id="ses-qa-source-backed-complete",
+        query_purpose="qa_gate_validation",
+    )
+    current_full_snapshot_id = "full-mf-parallel-source-backed-close"
+    _activate_basic_graph(
+        conn,
+        current_full_snapshot_id,
+        commit_sha=close_commit,
     )
     line_specs = [
         (
@@ -29135,7 +30067,20 @@ def _complete_source_backed_mf_parallel_successor(
             "observer_integration",
             "observer_reconcile",
             "reconcile",
-            {**route_identity, "graph_reconciled": True, "scope_reconciled": True},
+            {
+                **route_identity,
+                "reconcile_mode": "current_full",
+                "current_full_reconcile": True,
+                "reconciled_commit_sha": close_commit,
+                "canonical_head_commit": close_commit,
+                "merged_head_commit": close_commit,
+                "active_graph_commit": close_commit,
+                "active_snapshot_id": current_full_snapshot_id,
+                "canonical_head_verified": True,
+                "active_snapshot_verified": True,
+                "graph_reconciled": True,
+                "scope_reconciled": True,
+            },
             close_commit,
         ),
         (
@@ -29191,13 +30136,7 @@ def _complete_source_backed_mf_parallel_successor(
             write["db_verified"] = True
             write["query_source"] = "qa"
             write["query_purpose"] = "qa_gate_validation"
-            write["graph_trace_evidence"] = {
-                "db_verified": True,
-                "graph_trace_ids": [qa_graph_trace_id],
-                "query_source": "qa",
-                "query_purpose": "qa_gate_validation",
-                "target_project_root": runtime_context.target_project_root,
-            }
+            write["graph_trace_evidence"] = qa_graph_evidence
         if payload.get("worker_id"):
             write["worker_id"] = payload["worker_id"]
         if payload.get("worker_slot_id"):
@@ -30260,26 +31199,49 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     )
     graph_query_trace.ensure_schema(conn)
     qa_graph_trace_id = "gqt-runtime-context-close-projection-qa"
+    qa_snapshot_id = "scope-runtime-context-close-projection-qa"
+    _activate_basic_graph(conn, qa_snapshot_id, commit_sha=worker_commit)
+    empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
     conn.execute(
         """
         INSERT INTO graph_query_traces
           (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
-           run_id, parent_task_id, runtime_context_id, task_id, worker_role,
-           fence_token, status, budget_json, usage_json, artifact_path,
-           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           run_id, parent_task_id, runtime_context_id, task_id, backlog_id,
+           commit_sha, graph_basis, canonical_base_snapshot_id,
+           base_commit_sha, candidate_commit_sha, changed_files_json,
+           candidate_diff_hash, changed_files_source, qa_session_id,
+           qa_scope_binding_ref, worker_role, fence_token, status, budget_json,
+           usage_json, artifact_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             qa_graph_trace_id,
             PID,
-            "scope-runtime-context-close-projection-qa",
-            "qa",
+            qa_snapshot_id,
+            "qa:runtime-context-close-projection",
             "qa",
             "independent_verification",
             "",
-            "",
-            "",
-            "",
+            contract_execution_id,
+            runtime_context.runtime_context_id,
+            runtime_context.task_id,
+            backlog_id,
+            worker_commit,
+            "exact_candidate_snapshot",
+            qa_snapshot_id,
+            worker_commit,
+            worker_commit,
+            "[]",
+            empty_diff_hash,
+            "server_exact_candidate_snapshot",
+            "ses-runtime-context-close-projection-qa",
+            server._qa_scope_binding_ref(
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=runtime_context.task_id,
+                commit_sha=worker_commit,
+            ),
             "",
             "",
             "complete",
@@ -30405,6 +31367,12 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         stored_with_merge,
         expected_revision=int(stored_with_merge["execution_state_revision"]),
     )
+    current_full_snapshot_id = "full-runtime-context-close-projection"
+    _activate_basic_graph(
+        conn,
+        current_full_snapshot_id,
+        commit_sha=close_commit,
+    )
     reconcile_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -30421,6 +31389,15 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "task_id": runtime_context.task_id,
             "parent_task_id": contract_execution_id,
             "target_commit_sha": close_commit,
+            "reconcile_mode": "current_full",
+            "current_full_reconcile": True,
+            "reconciled_commit_sha": close_commit,
+            "canonical_head_commit": close_commit,
+            "merged_head_commit": close_commit,
+            "active_graph_commit": close_commit,
+            "active_snapshot_id": current_full_snapshot_id,
+            "canonical_head_verified": True,
+            "active_snapshot_verified": True,
             "graph_reconciled": True,
             "scope_reconciled": True,
         },
@@ -45910,16 +46887,69 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     )
     assert current["next_legal_action"]["line_id"] == "qa_graph_context"
     qa_graph_trace_id = "gqt-runtime-context-projection-qa"
+    qa_snapshot_id = "scope-runtime-context-projection-qa"
+    _activate_basic_graph(conn, qa_snapshot_id, commit_sha=head_commit)
     _insert_observer_graph_query_trace(
         conn,
         trace_id=qa_graph_trace_id,
-        snapshot_id="scope-runtime-context-projection-qa",
-        actor="qa",
+        snapshot_id=qa_snapshot_id,
+        actor="qa-principal",
         query_source="qa",
         query_purpose="independent_verification",
-        task_id=successor["contract_execution_id"],
+        task_id=runtime_context.task_id,
         created_at="2026-06-29T01:01:00Z",
     )
+    empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
+    conn.execute(
+        """
+        UPDATE graph_query_traces
+        SET backlog_id = ?, commit_sha = ?, qa_session_id = ?,
+            qa_scope_binding_ref = ?, graph_basis = ?,
+            canonical_base_snapshot_id = ?, base_commit_sha = ?,
+            candidate_commit_sha = ?, changed_files_json = ?,
+            candidate_diff_hash = ?, changed_files_source = ?
+        WHERE project_id = ? AND trace_id = ?
+        """,
+        (
+            backlog_id,
+            head_commit,
+            "ses-qa",
+            server._qa_scope_binding_ref(
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=runtime_context.task_id,
+                commit_sha=head_commit,
+            ),
+            "exact_candidate_snapshot",
+            qa_snapshot_id,
+            head_commit,
+            head_commit,
+            "[]",
+            empty_diff_hash,
+            "server_exact_candidate_snapshot",
+            PID,
+            qa_graph_trace_id,
+        ),
+    )
+    bounded_graph_evidence = {
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "graph_trace_ids": [qa_graph_trace_id],
+        "verified_trace_ids": [qa_graph_trace_id],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "qa_session_id": "ses-qa",
+        "target_project_root": runtime_context.target_project_root,
+        "graph_basis": "exact_candidate_snapshot",
+        "canonical_base_snapshot_id": qa_snapshot_id,
+        "base_commit_sha": head_commit,
+        "candidate_commit_sha": head_commit,
+        "changed_files": [],
+        "candidate_diff_hash": empty_diff_hash,
+        "changed_files_source": "server_exact_candidate_snapshot",
+    }
     qa_graph = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -45937,18 +46967,11 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
                 "target_project_root": runtime_context.target_project_root,
                 "payload": {
                     "schema_version": "mf_parallel.qa_graph_context.v1",
-                    "graph_trace_ids": [qa_graph_trace_id],
-                    "graph_query_trace_ids": [qa_graph_trace_id],
-                    "graph_trace_evidence": {
-                        "db_verified": True,
                         "graph_trace_ids": [qa_graph_trace_id],
-                        "verified_trace_ids": [qa_graph_trace_id],
-                        "query_source": "qa",
-                        "query_purpose": "independent_verification",
-                        "target_project_root": runtime_context.target_project_root,
+                        "graph_query_trace_ids": [qa_graph_trace_id],
+                        "graph_trace_evidence": bounded_graph_evidence,
                     },
                 },
-            },
         )
     )
     assert qa_graph["ok"] is True

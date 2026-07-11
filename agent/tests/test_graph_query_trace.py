@@ -9,6 +9,7 @@ from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
+from agent.governance.contracts.hash import stable_sha256
 from agent.governance.db import _ensure_schema
 
 
@@ -732,6 +733,194 @@ def test_qa_independent_verification_graph_query_is_first_class(conn, tmp_path):
     assert trace["actor"] == "codex-qa-verifier"
     assert trace["query_source"] == "qa"
     assert trace["query_purpose"] == "independent_verification"
+
+
+def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    base_commit = "a" * 40
+    candidate_commit = "b" * 40
+    candidate_diff_hash = "sha256:" + "c" * 64
+    symbol = {
+        "identity": "agent.governance.server::serve",
+        "name": "serve",
+        "kind": "function",
+        "visibility": "public",
+        "line_start": 1,
+        "line_end": 2,
+        "source_hash": "sha256:" + "d" * 64,
+        "decorators": [],
+        "calls": ["helper"],
+    }
+    candidate_overlay = {
+        "schema_version": "qa_review_graph.overlay.v1",
+        "graph_basis": "canonical_base_plus_candidate_diff",
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "files": [
+            {
+                "status": "M",
+                "path": "agent/governance/server.py",
+                "file_kind": "source",
+                "language": "python",
+                "candidate": {"symbols": [symbol]},
+                "symbol_delta": {
+                    "added": [symbol],
+                    "modified": [],
+                    "removed": [],
+                    "counts": {"added": 1, "modified": 0, "removed": 0},
+                },
+            }
+        ],
+        "summary": {"file_count": 1},
+        "impact": {"source": ["agent/governance/server.py"]},
+    }
+    repository_identity_hash = "sha256:" + "e" * 64
+    query_root_identity_hash = "sha256:" + "f" * 64
+    canonical_project_identity_hash = "sha256:" + "1" * 64
+    root_identity = {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "query_root": str(project_root),
+        "query_root_identity_hash": query_root_identity_hash,
+        "canonical_project_root": str(project_root),
+        "canonical_project_identity_hash": canonical_project_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+    }
+    bounded = {
+        "candidate_overlay": candidate_overlay,
+        "candidate_overlay_hash": stable_sha256(candidate_overlay),
+        "root_identity": root_identity,
+        "root_identity_hash": stable_sha256(root_identity),
+        "query_root_identity_hash": query_root_identity_hash,
+        "canonical_project_identity_hash": canonical_project_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+    }
+    trace = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        actor="qa:bounded",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id="qa-bounded-task",
+        backlog_id="AC-QA-BOUNDED-TRACE",
+        commit_sha=candidate_commit,
+        graph_basis="canonical_base_plus_candidate_diff",
+        canonical_base_snapshot_id=snapshot_id,
+        base_commit_sha=base_commit,
+        candidate_commit_sha=candidate_commit,
+        changed_files=["agent/governance/server.py"],
+        candidate_diff_hash=candidate_diff_hash,
+        changed_files_source="server_git_diff_name_status_z_m",
+        **bounded,
+        qa_session_id="ses-qa-bounded",
+        qa_scope_binding_ref="qa_scope:sha256:bounded",
+    )["trace"]
+
+    identity = trace["graph_query_identity"]
+    assert identity["graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert identity["canonical_base_snapshot_id"] == snapshot_id
+    assert identity["base_commit_sha"] == base_commit
+    assert identity["candidate_commit_sha"] == candidate_commit
+    assert identity["changed_files"] == ["agent/governance/server.py"]
+    assert identity["candidate_diff_hash"] == candidate_diff_hash
+    assert identity["candidate_review_context"] == {
+        key: identity[key]
+        for key in (
+            "graph_basis",
+            "canonical_base_snapshot_id",
+            "base_commit_sha",
+            "candidate_commit_sha",
+            "changed_files",
+            "candidate_diff_hash",
+            "changed_files_source",
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        )
+    }
+    assert trace["candidate_overlay"] == candidate_overlay
+    assert trace["root_identity"] == root_identity
+
+    with pytest.raises(ValueError, match="requires the persisted candidate review context"):
+        graph_query_trace.traced_query(
+            conn,
+            PID,
+            snapshot_id,
+            trace_id=trace["trace_id"],
+            actor="qa:bounded",
+            query_source="qa",
+            query_purpose="independent_verification",
+            task_id="qa-bounded-task",
+            backlog_id="AC-QA-BOUNDED-TRACE",
+            commit_sha=candidate_commit,
+            qa_session_id="ses-qa-bounded",
+            qa_scope_binding_ref="qa_scope:sha256:bounded",
+            tool="query_schema",
+            project_root=project_root,
+        )
+
+    queried = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        trace_id=trace["trace_id"],
+        actor="qa:bounded",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id="qa-bounded-task",
+        backlog_id="AC-QA-BOUNDED-TRACE",
+        commit_sha=candidate_commit,
+        graph_basis="canonical_base_plus_candidate_diff",
+        canonical_base_snapshot_id=snapshot_id,
+        base_commit_sha=base_commit,
+        candidate_commit_sha=candidate_commit,
+        changed_files=["agent/governance/server.py"],
+        candidate_diff_hash=candidate_diff_hash,
+        changed_files_source="server_git_diff_name_status_z_m",
+        candidate_sources={
+            "agent/governance/server.py": {
+                "status": "M",
+                "base": "def serve():\n    return 'base'\n",
+                "candidate": "def serve():\n    return helper()\n",
+            }
+        },
+        qa_session_id="ses-qa-bounded",
+        qa_scope_binding_ref="qa_scope:sha256:bounded",
+        tool="candidate_overlay",
+        project_root=project_root,
+        **bounded,
+    )
+    review_graph = queried["result"]["qa_review_graph"]
+    assert review_graph["base_snapshot_results_preserved"] is True
+    assert review_graph["file_matches"][0]["status"] == "M"
+
+    with pytest.raises(ValueError, match="graph query trace binding mismatch"):
+        graph_query_trace.traced_query(
+            conn,
+            PID,
+            snapshot_id,
+            trace_id=trace["trace_id"],
+            actor="qa:bounded",
+            query_source="qa",
+            query_purpose="independent_verification",
+            task_id="qa-bounded-task",
+            backlog_id="AC-QA-BOUNDED-TRACE",
+            commit_sha=candidate_commit,
+            graph_basis="canonical_base_plus_candidate_diff",
+            canonical_base_snapshot_id=snapshot_id,
+            base_commit_sha=base_commit,
+            candidate_commit_sha=candidate_commit,
+            changed_files=["agent/governance/server.py"],
+            candidate_diff_hash="sha256:" + "d" * 64,
+            changed_files_source="server_git_diff_name_only",
+            **bounded,
+            qa_session_id="ses-qa-bounded",
+            qa_scope_binding_ref="qa_scope:sha256:bounded",
+            tool="query_schema",
+            project_root=project_root,
+        )
 
 
 def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):

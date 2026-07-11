@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +18,57 @@ from agent.governance.contracts.runtime import (
     StalePinnedContractExecutionError,
     upsert_contract_chain_successor_binding,
 )
+
+
+def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
+    template_root = Path(__file__).resolve().parents[1] / "governance" / "contract_templates"
+    mf_parallel = json.loads((template_root / "mf_parallel.v2.json").read_text())
+    direct_fix = json.loads((template_root / "direct_fix.v1.json").read_text())
+
+    policy = mf_parallel["qa_graph_context_policy"]
+    assert policy["accepted_graph_basis"] == [
+        "exact_candidate_snapshot",
+        "canonical_base_plus_candidate_diff",
+    ]
+    assert policy["candidate_diff_derivation"] == "server_only"
+    assert policy["full_candidate_snapshot_required"] is False
+    assert policy["post_merge_graph_policy"] == {
+        "reconcile_mode": "current_full",
+        "required_after": "observer_merge",
+        "required_before": "observer_close_ready",
+        "required_proof": [
+            "canonical_head_verified",
+            "active_snapshot_verified",
+            "merged_head_commit_equals_reconciled_commit",
+        ],
+    }
+
+    qa_checkpoint = next(
+        checkpoint
+        for checkpoint in direct_fix["runtime_contract_hints"][
+            "graph_query_checkpoints"
+        ]
+        if checkpoint["id"] == "qa_graph_context"
+    )
+    required_fields = qa_checkpoint["packet"]["required_fields"]
+    for field in (
+        "graph_trace_evidence.graph_basis",
+        "graph_trace_evidence.canonical_base_snapshot_id",
+        "graph_trace_evidence.base_commit_sha",
+        "graph_trace_evidence.candidate_commit_sha",
+        "graph_trace_evidence.changed_files",
+        "graph_trace_evidence.candidate_diff_hash",
+        "graph_trace_evidence.changed_files_source",
+        "graph_trace_evidence.candidate_overlay_hash",
+        "graph_trace_evidence.root_identity_hash",
+        "graph_trace_evidence.query_root_identity_hash",
+        "graph_trace_evidence.canonical_project_identity_hash",
+        "graph_trace_evidence.repository_identity_hash",
+    ):
+        assert field in required_fields
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "candidate_diff_derivation"
+    ] == "server_only"
 
 
 def test_projected_record_exposes_non_persistent_lines_to_worker_commit_lineage(
@@ -312,7 +365,12 @@ def _write_from(record, *, actor_role, stage_id, line_id, evidence_kind=None):
     }
 
 
-def _direct_fix_graph_payload(*, actor_role: str, trace_id: str):
+def _direct_fix_graph_payload(
+    *,
+    actor_role: str,
+    trace_id: str,
+    include_bounded_qa: bool = True,
+):
     query_source = {
         "observer": "observer",
         "mf_sub": "mf_subagent",
@@ -325,9 +383,12 @@ def _direct_fix_graph_payload(*, actor_role: str, trace_id: str):
     }[actor_role]
     evidence = {
         "schema_version": "direct_fix_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
         "db_verified": True,
         "trace_ids": [trace_id],
         "verified_trace_ids": [trace_id],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
         "query_source": query_source,
         "query_purpose": query_purpose,
         "target_project_root": "/tmp/aming-claw-test",
@@ -339,6 +400,22 @@ def _direct_fix_graph_payload(*, actor_role: str, trace_id: str):
                 "runtime_context_id": "mfrctx-test",
                 "task_id": "direct-fix-worker-test",
                 "parent_task_id": "cex-direct-fix-parent-test",
+            }
+        )
+    if actor_role == "qa" and include_bounded_qa:
+        commit_sha = "a" * 40
+        evidence.update(
+            {
+                "qa_session_id": "ses-qa-contract-runtime",
+                "graph_basis": "exact_candidate_snapshot",
+                "canonical_base_snapshot_id": "full-contract-runtime-qa",
+                "base_commit_sha": commit_sha,
+                "candidate_commit_sha": commit_sha,
+                "changed_files": [],
+                "candidate_diff_hash": (
+                    "sha256:" + hashlib.sha256(b"").hexdigest()
+                ),
+                "changed_files_source": "server_exact_candidate_snapshot",
             }
         )
     return {
@@ -789,6 +866,32 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
     assert any(
         "qa_graph_context query_source must be one of ['qa']" in error
         for error in bad_qa_graph["decision"]["errors"]
+    )
+    runtime.current_guide(record["contract_execution_id"], actor_role="qa")
+    qa_record = runtime.store.get(record["contract_execution_id"])
+
+    tupleless_qa_graph = runtime.submit_line_write(
+        record["contract_execution_id"],
+        {
+            **_write_from(
+                qa_record,
+                actor_role="qa",
+                stage_id="qa_graph_context",
+                line_id="qa_graph_context",
+                evidence_kind="graph_trace",
+            ),
+            "payload": _direct_fix_graph_payload(
+                actor_role="qa",
+                trace_id="gqt-mf-parallel-v2-qa",
+                include_bounded_qa=False,
+            ),
+        },
+        actor_role="qa",
+    )
+    assert tupleless_qa_graph["ok"] is False
+    assert any(
+        "qa_graph_context requires a supported graph_basis" in error
+        for error in tupleless_qa_graph["decision"]["errors"]
     )
     runtime.current_guide(record["contract_execution_id"], actor_role="qa")
     qa_record = runtime.store.get(record["contract_execution_id"])

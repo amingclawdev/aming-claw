@@ -504,6 +504,42 @@
       "mutate_merge_queues"
     ]
   },
+  "qa_graph_context_policy": {
+    "schema_version": "mf_parallel.qa_graph_context_policy.v1",
+    "accepted_graph_basis": [
+      "exact_candidate_snapshot",
+      "canonical_base_plus_candidate_diff"
+    ],
+    "required_trace_identity_fields": [
+      "graph_basis",
+      "canonical_base_snapshot_id",
+      "base_commit_sha",
+      "candidate_commit_sha",
+      "changed_files",
+      "candidate_diff_hash",
+      "changed_files_source",
+      "candidate_overlay_hash",
+      "root_identity_hash",
+      "query_root_identity_hash",
+      "canonical_project_identity_hash",
+      "repository_identity_hash"
+    ],
+    "candidate_diff_derivation": "server_only",
+    "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
+    "unsafe_overlay_policy": "require_exact_candidate_snapshot",
+    "full_candidate_snapshot_required": false,
+    "forged_or_mismatched_tuple_policy": "fail_closed",
+    "post_merge_graph_policy": {
+      "reconcile_mode": "current_full",
+      "required_after": "observer_merge",
+      "required_before": "observer_close_ready",
+      "required_proof": [
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "merged_head_commit_equals_reconciled_commit"
+      ]
+    }
+  },
   "merge_review_checklist": [
     {
       "id": "contract_fit",
@@ -527,7 +563,7 @@
     },
     {
       "id": "graph_reconcile_plan",
-      "description": "Graph binding, Asset Inbox/Governance Hint needs, and post-merge reconcile/update plan are recorded."
+      "description": "Graph binding, Asset Inbox/Governance Hint needs, and canonical current-full post-merge reconcile/update plan are recorded before close."
     },
     {
       "id": "commit_trailers",
@@ -727,7 +763,7 @@
       "phase": "verification",
       "kind": "graph_query_trace",
       "schema_version": "qa_graph_trace.v1",
-      "description": "QA must query graph with QA/independent_verification identity after worker handoff and before independent_verification; trace ids must be recorded as QA-authored evidence."
+      "description": "QA must query graph with QA/independent_verification identity after worker handoff and before independent_verification; trace ids and the server-derived graph basis, canonical base snapshot/commit, candidate commit, changed files, and candidate diff hash must be recorded as QA-authored evidence."
     },
     {
       "id": "branch_runtime_registration",

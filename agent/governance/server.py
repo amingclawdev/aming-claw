@@ -6734,6 +6734,1184 @@ def _qa_scope_binding_ref(
     return f"qa_scope:{stable_sha256(binding)}"
 
 
+_QA_OVERLAY_MAX_FILES = 160
+_QA_OVERLAY_MAX_FILE_BYTES = 512 * 1024
+_QA_OVERLAY_MAX_TOTAL_BYTES = 6 * 1024 * 1024
+_QA_OVERLAY_MAX_SYMBOLS = 10_000
+_QA_OVERLAY_UNSAFE_CONFIG_PATHS = {
+    ".aming-claw.yaml",
+    ".aming-claw.json",
+    ".aming-claw/reconcile/semantic_enrichment.yaml",
+    "config/reconcile/semantic_enrichment.yaml",
+}
+
+
+class _QACandidateOverlayError(ValueError):
+    def __init__(self, reason: str, message: str, **details: Any):
+        super().__init__(message)
+        self.reason = str(reason or "candidate_overlay_unsafe")
+        self.details = dict(details)
+
+
+def _qa_overlay_fail(reason: str, message: str, **details: Any) -> None:
+    raise _QACandidateOverlayError(reason, message, **details)
+
+
+def _qa_git_bytes(
+    project_root: Path,
+    args: Sequence[str],
+    *,
+    timeout: int = 20,
+) -> subprocess.CompletedProcess[bytes]:
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    try:
+        return subprocess.run(
+            ["git", *[str(item) for item in args]],
+            cwd=project_root,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+    except Exception as exc:
+        _qa_overlay_fail(
+            "git_command_failed",
+            f"candidate overlay git command failed: {exc}",
+            command=list(args),
+        )
+
+
+def _qa_overlay_normalize_path(raw: bytes | str) -> str:
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    except UnicodeDecodeError:
+        _qa_overlay_fail(
+            "non_utf8_git_path_requires_exact_candidate_snapshot",
+            "candidate diff contains a non-UTF-8 path",
+        )
+    path = text.replace("\\", "/").strip("/")
+    if not path or path.startswith("../") or "/../" in f"/{path}/" or Path(path).is_absolute():
+        _qa_overlay_fail(
+            "unsafe_git_path_requires_exact_candidate_snapshot",
+            "candidate diff contains an unsafe repository path",
+            path=path,
+        )
+    return path
+
+
+def _qa_parse_name_status_z(raw: bytes) -> list[dict[str, Any]]:
+    fields = raw.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    changes: list[dict[str, Any]] = []
+    index = 0
+    while index < len(fields):
+        try:
+            status_token = fields[index].decode("ascii")
+        except UnicodeDecodeError:
+            _qa_overlay_fail(
+                "invalid_git_status_requires_exact_candidate_snapshot",
+                "candidate diff status is not ASCII",
+            )
+        index += 1
+        status = status_token[:1]
+        if status not in {"A", "M", "D", "R"}:
+            _qa_overlay_fail(
+                "unsupported_git_status_requires_exact_candidate_snapshot",
+                "candidate diff contains a change type that the bounded overlay cannot model",
+                status=status_token,
+            )
+        if status == "R":
+            if index + 1 >= len(fields):
+                _qa_overlay_fail(
+                    "malformed_rename_requires_exact_candidate_snapshot",
+                    "candidate rename record is incomplete",
+                )
+            old_path = _qa_overlay_normalize_path(fields[index])
+            new_path = _qa_overlay_normalize_path(fields[index + 1])
+            index += 2
+            similarity = int(status_token[1:] or 0)
+            changes.append(
+                {
+                    "status": "R",
+                    "path": new_path,
+                    "old_path": old_path,
+                    "similarity": similarity,
+                }
+            )
+            continue
+        if index >= len(fields):
+            _qa_overlay_fail(
+                "malformed_diff_requires_exact_candidate_snapshot",
+                "candidate diff path record is incomplete",
+            )
+        path = _qa_overlay_normalize_path(fields[index])
+        index += 1
+        changes.append({"status": status, "path": path, "old_path": ""})
+    return changes
+
+
+def _qa_git_object_source(
+    project_root: Path,
+    *,
+    commit_sha: str,
+    path: str,
+) -> tuple[str, int]:
+    result = _qa_git_bytes(project_root, ["show", f"{commit_sha}:{path}"])
+    if result.returncode != 0:
+        _qa_overlay_fail(
+            "git_blob_missing_requires_exact_candidate_snapshot",
+            "candidate overlay could not read a required git blob",
+            commit_sha=commit_sha,
+            path=path,
+        )
+    raw = result.stdout
+    if len(raw) > _QA_OVERLAY_MAX_FILE_BYTES:
+        _qa_overlay_fail(
+            "oversized_source_requires_exact_candidate_snapshot",
+            "candidate overlay file exceeds the bounded per-file limit",
+            path=path,
+            byte_size=len(raw),
+            max_byte_size=_QA_OVERLAY_MAX_FILE_BYTES,
+        )
+    if b"\0" in raw:
+        _qa_overlay_fail(
+            "binary_source_requires_exact_candidate_snapshot",
+            "candidate overlay cannot safely inspect a binary file",
+            path=path,
+        )
+    try:
+        return raw.decode("utf-8"), len(raw)
+    except UnicodeDecodeError:
+        _qa_overlay_fail(
+            "non_utf8_source_requires_exact_candidate_snapshot",
+            "candidate overlay requires UTF-8 source",
+            path=path,
+        )
+
+
+def _qa_overlay_file_kind(path: str) -> str:
+    from .language_policy import DEFAULT_LANGUAGE_POLICY
+
+    policy = DEFAULT_LANGUAGE_POLICY
+    if policy.is_test_path(path):
+        return "test"
+    if policy.is_doc_path(path) or Path(path).suffix.lower() in policy.doc_extensions:
+        return "doc"
+    if policy.is_config_path(path):
+        return "config"
+    if policy.is_source_path(path):
+        return "source"
+    return "other"
+
+
+def _qa_overlay_module_name(path: str) -> str:
+    from .language_policy import DEFAULT_LANGUAGE_POLICY
+
+    return DEFAULT_LANGUAGE_POLICY.strip_source_suffix(path).replace("/", ".")
+
+
+def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
+    from .language_adapters import (
+        JavaScriptTypescriptAdapter,
+        PythonAdapter,
+        RubyAdapter,
+    )
+    from .language_policy import DEFAULT_LANGUAGE_POLICY
+
+    if not DEFAULT_LANGUAGE_POLICY.is_source_path(path):
+        return {"language": "", "symbols": [], "imports": [], "relations": []}
+    adapters = (PythonAdapter(), JavaScriptTypescriptAdapter(), RubyAdapter())
+    adapter = next((item for item in adapters if item.supports(path)), None)
+    if adapter is None:
+        _qa_overlay_fail(
+            "unsupported_source_language_requires_exact_candidate_snapshot",
+            "candidate overlay has no deterministic language adapter for a source file",
+            path=path,
+            language=DEFAULT_LANGUAGE_POLICY.language_for_path(path),
+        )
+
+    module_name = _qa_overlay_module_name(path)
+    raw_symbols: list[Mapping[str, Any]] = []
+    if isinstance(adapter, PythonAdapter):
+        from .reconcile_phases import phase_z_v2
+
+        parsed = phase_z_v2._parse_python_module(path, module_name, source)
+        if parsed is None:
+            _qa_overlay_fail(
+                "source_parse_failed_requires_exact_candidate_snapshot",
+                "candidate overlay could not parse Python source",
+                path=path,
+            )
+        source_hashes = phase_z_v2.function_source_hashes(parsed)
+        raw_symbols.extend(
+            {
+                "name": item.name,
+                "kind": "function",
+                "lineno": item.lineno,
+                "end_lineno": item.end_lineno,
+                "decorators": list(item.decorators),
+                "calls": list(item.calls),
+                "source_hash": source_hashes.get(item.qualified_name, ""),
+            }
+            for item in parsed.functions
+        )
+        raw_symbols.extend(
+            item
+            for item in adapter.parse_symbols(path, source)
+            if isinstance(item, Mapping) and str(item.get("kind") or "") == "class"
+        )
+    else:
+        raw_symbols = [
+            item
+            for item in adapter.parse_symbols(path, source)
+            if isinstance(item, Mapping)
+        ]
+
+    lines = source.splitlines()
+    symbols: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_symbol in raw_symbols:
+        name = str(raw_symbol.get("name") or "").strip()
+        if not name or name.split(".")[-1].startswith("_"):
+            continue
+        kind = str(raw_symbol.get("kind") or "symbol").strip()
+        identity = f"{module_name}::{name}"
+        if identity in seen:
+            _qa_overlay_fail(
+                "ambiguous_symbol_identity_requires_exact_candidate_snapshot",
+                "candidate overlay found duplicate public symbol identities",
+                path=path,
+                symbol_identity=identity,
+            )
+        seen.add(identity)
+        line_start = max(1, int(raw_symbol.get("lineno") or 1))
+        line_end = max(line_start, int(raw_symbol.get("end_lineno") or line_start))
+        snippet = "\n".join(lines[line_start - 1 : min(len(lines), line_end)])
+        symbols.append(
+            {
+                "identity": identity,
+                "name": name,
+                "kind": kind,
+                "visibility": "public",
+                "line_start": line_start,
+                "line_end": line_end,
+                "source_hash": str(raw_symbol.get("source_hash") or "")
+                or f"sha256:{hashlib.sha256(snippet.encode('utf-8')).hexdigest()}",
+                "decorators": sorted(
+                    {str(item) for item in raw_symbol.get("decorators") or [] if str(item)}
+                ),
+                "calls": sorted(
+                    {str(item) for item in raw_symbol.get("calls") or [] if str(item)}
+                ),
+            }
+        )
+    symbols.sort(key=lambda item: item["identity"])
+    imports = [
+        dict(item)
+        for item in adapter.parse_imports(path, source)
+        if isinstance(item, Mapping)
+    ]
+    relations = [
+        dict(item)
+        for item in adapter.extract_relations(
+            path,
+            source,
+            symbols=[dict(item) for item in raw_symbols],
+            imports=imports,
+        )
+        if isinstance(item, Mapping)
+    ]
+    if len(imports) > 2_000 or len(relations) > 2_000:
+        _qa_overlay_fail(
+            "parse_limit_requires_exact_candidate_snapshot",
+            "candidate overlay relation/import parse limit was exceeded",
+            path=path,
+        )
+    return {
+        "language": str(adapter.language() or DEFAULT_LANGUAGE_POLICY.language_for_path(path)),
+        "symbols": symbols,
+        "imports": imports,
+        "relations": relations,
+    }
+
+
+def _qa_overlay_version(path: str, source: str, byte_size: int) -> dict[str, Any]:
+    facts = _qa_overlay_source_facts(path, source)
+    return {
+        "path": path,
+        "source_hash": f"sha256:{hashlib.sha256(source.encode('utf-8')).hexdigest()}",
+        "byte_size": byte_size,
+        "line_count": len(source.splitlines()),
+        **facts,
+    }
+
+
+def _qa_overlay_symbol_delta(
+    base: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    base_symbols = {
+        str(item.get("identity") or ""): dict(item)
+        for item in (base or {}).get("symbols") or []
+        if isinstance(item, Mapping) and str(item.get("identity") or "")
+    }
+    candidate_symbols = {
+        str(item.get("identity") or ""): dict(item)
+        for item in (candidate or {}).get("symbols") or []
+        if isinstance(item, Mapping) and str(item.get("identity") or "")
+    }
+    added = [candidate_symbols[key] for key in sorted(candidate_symbols.keys() - base_symbols.keys())]
+    removed = [base_symbols[key] for key in sorted(base_symbols.keys() - candidate_symbols.keys())]
+    modified = [
+        {"before": base_symbols[key], "after": candidate_symbols[key]}
+        for key in sorted(base_symbols.keys() & candidate_symbols.keys())
+        if stable_sha256(base_symbols[key]) != stable_sha256(candidate_symbols[key])
+    ]
+    return {
+        "added": added,
+        "modified": modified,
+        "removed": removed,
+        "counts": {
+            "added": len(added),
+            "modified": len(modified),
+            "removed": len(removed),
+        },
+    }
+
+
+def _qa_overlay_assert_safe_interpretation(
+    *,
+    path: str,
+    old_path: str,
+    base_source: str | None,
+    candidate_source: str | None,
+) -> None:
+    from .graph_rule_fingerprint import ALGORITHM_INPUT_PATHS
+
+    affected_paths = {item for item in (path, old_path) if item}
+    unsafe_algorithm_paths = sorted(affected_paths.intersection(ALGORITHM_INPUT_PATHS))
+    if unsafe_algorithm_paths:
+        _qa_overlay_fail(
+            "graph_algorithm_change_requires_exact_candidate_snapshot",
+            "candidate changes graph-construction algorithm inputs",
+            paths=unsafe_algorithm_paths,
+        )
+    unsafe_config_paths = sorted(
+        affected_paths.intersection(_QA_OVERLAY_UNSAFE_CONFIG_PATHS)
+    )
+    if unsafe_config_paths:
+        _qa_overlay_fail(
+            "graph_config_change_requires_exact_candidate_snapshot",
+            "candidate changes graph interpretation/configuration inputs",
+            paths=unsafe_config_paths,
+        )
+    combined = "\n".join(item for item in (base_source, candidate_source) if item)
+    marker_reasons = (
+        ("governance-hint", "governance_hint_change_requires_exact_candidate_snapshot"),
+        ('"governance_hints"', "governance_hint_change_requires_exact_candidate_snapshot"),
+        ("aming-claw-hint:start", "graph_structure_hint_change_requires_exact_candidate_snapshot"),
+    )
+    for marker, reason in marker_reasons:
+        if marker.lower() in combined.lower() and base_source != candidate_source:
+            _qa_overlay_fail(
+                reason,
+                "candidate changes source-controlled graph/governance hint inputs",
+                path=path,
+                marker=marker,
+            )
+
+
+def _qa_checkout_root_identity(
+    *,
+    project_id: str,
+    query_root: Path,
+    canonical_root: Path,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+) -> dict[str, Any]:
+    from .checkout_provenance import describe_checkout
+
+    query = describe_checkout(query_root, project_id=project_id)
+    canonical = describe_checkout(canonical_root, project_id=project_id)
+    if not query.get("is_git_worktree") or not canonical.get("is_git_worktree"):
+        _qa_overlay_fail(
+            "non_git_root_requires_exact_candidate_snapshot",
+            "bounded candidate overlay requires git-backed query and canonical roots",
+        )
+    query_git = query.get("git") if isinstance(query.get("git"), Mapping) else {}
+    canonical_git = (
+        canonical.get("git") if isinstance(canonical.get("git"), Mapping) else {}
+    )
+    query_common = str(query_git.get("git_common_dir") or "")
+    canonical_common = str(canonical_git.get("git_common_dir") or "")
+    query_remote = str(query_git.get("remote_url") or "")
+    canonical_remote = str(canonical_git.get("remote_url") or "")
+    query_repository_identity_hash = stable_sha256(
+        {
+            "type": "git",
+            "project_id": project_id,
+            "git_common_dir": query_common,
+            "remote_url": query_remote,
+        }
+    )
+    repository_identity_hash = stable_sha256(
+        {
+            "type": "git",
+            "project_id": project_id,
+            "git_common_dir": canonical_common,
+            "remote_url": canonical_remote,
+        }
+    )
+    if query_repository_identity_hash != repository_identity_hash:
+        _qa_overlay_fail(
+            "query_root_repository_mismatch",
+            "QA query root is not a checkout of the registered canonical repository",
+            query_root=str(query_root),
+            canonical_project_root=str(canonical_root),
+        )
+    canonical_head = str(canonical.get("commit_sha") or "").strip().lower()
+    if canonical_head != base_commit_sha:
+        _qa_overlay_fail(
+            "canonical_base_not_current",
+            "active canonical base snapshot is not the current registered-project HEAD",
+            expected_base_commit_sha=base_commit_sha,
+            canonical_head_commit=canonical_head,
+        )
+    query_head = str(query.get("commit_sha") or "").strip().lower()
+    if query_head not in {base_commit_sha, candidate_commit_sha}:
+        _qa_overlay_fail(
+            "query_root_head_mismatch",
+            "QA query root must be checked out at the canonical base or candidate commit",
+            query_root_head_commit=query_head,
+            accepted_commits=[base_commit_sha, candidate_commit_sha],
+        )
+    query_root_identity_hash = stable_sha256(
+        {
+            "execution_root": str(query.get("execution_root") or ""),
+            "head_commit": query_head,
+            "checkout_identity": query.get("canonical_project_identity") or {},
+            "repository_identity_hash": query_repository_identity_hash,
+        }
+    )
+    canonical_project_identity_hash = stable_sha256(
+        {
+            "execution_root": str(canonical.get("execution_root") or ""),
+            "head_commit": canonical_head,
+            "checkout_identity": canonical.get("canonical_project_identity") or {},
+            "repository_identity_hash": repository_identity_hash,
+        }
+    )
+    return {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "query_root": str(Path(query_root).resolve()),
+        "query_root_head_commit": query_head,
+        "query_root_identity_hash": query_root_identity_hash,
+        "query_root_is_linked_worktree": bool(query_git.get("is_linked_worktree")),
+        "canonical_project_root": str(Path(canonical_root).resolve()),
+        "canonical_head_commit": canonical_head,
+        "canonical_project_identity_hash": canonical_project_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+        "repository_identity_match": True,
+    }
+
+
+def _qa_candidate_diff_context(
+    project_root: Path,
+    *,
+    project_id: str,
+    canonical_project_root: Path,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+) -> dict[str, Any]:
+    query_root = Path(project_root).resolve()
+    canonical_root = Path(canonical_project_root).resolve()
+    base_commit_sha = str(base_commit_sha or "").strip().lower()
+    candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
+
+    for field, commit_sha in (
+        ("base_commit_sha", base_commit_sha),
+        ("candidate_commit_sha", candidate_commit_sha),
+    ):
+        resolved = _qa_git_bytes(
+            canonical_root, ["rev-parse", "--verify", f"{commit_sha}^{{commit}}"]
+        )
+        resolved_sha = resolved.stdout.decode("ascii", errors="ignore").strip().lower()
+        if resolved.returncode != 0 or resolved_sha != commit_sha:
+            _qa_overlay_fail(
+                "commit_unavailable_requires_exact_candidate_snapshot",
+                f"{field} is not an available full commit",
+                field=field,
+                commit_sha=commit_sha,
+            )
+    ancestry = _qa_git_bytes(
+        canonical_root,
+        ["merge-base", "--is-ancestor", base_commit_sha, candidate_commit_sha],
+    )
+    if ancestry.returncode != 0:
+        _qa_overlay_fail(
+            "non_descendant_candidate_requires_exact_candidate_snapshot",
+            "canonical base commit is not an ancestor of candidate commit",
+        )
+
+    root_identity = _qa_checkout_root_identity(
+        project_id=project_id,
+        query_root=query_root,
+        canonical_root=canonical_root,
+        base_commit_sha=base_commit_sha,
+        candidate_commit_sha=candidate_commit_sha,
+    )
+    changed = _qa_git_bytes(
+        canonical_root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-status",
+            "-z",
+            "-M",
+            f"{base_commit_sha}..{candidate_commit_sha}",
+            "--",
+            ".",
+        ],
+    )
+    if changed.returncode != 0:
+        _qa_overlay_fail(
+            "diff_unavailable_requires_exact_candidate_snapshot",
+            "server could not derive candidate file changes",
+        )
+    file_changes = _qa_parse_name_status_z(changed.stdout)
+    if len(file_changes) > _QA_OVERLAY_MAX_FILES:
+        _qa_overlay_fail(
+            "changed_file_limit_requires_exact_candidate_snapshot",
+            "candidate overlay changed-file limit was exceeded",
+            changed_file_count=len(file_changes),
+            max_changed_files=_QA_OVERLAY_MAX_FILES,
+        )
+
+    overlay_files: list[dict[str, Any]] = []
+    candidate_sources: dict[str, dict[str, Any]] = {}
+    total_bytes = 0
+    total_symbols = 0
+    status_counts = {key: 0 for key in ("A", "M", "D", "R")}
+    symbol_counts = {key: 0 for key in ("added", "modified", "removed")}
+    for change in file_changes:
+        status = str(change["status"])
+        path = str(change["path"])
+        old_path = str(change.get("old_path") or "")
+        base_path = old_path if status == "R" else path
+        base_source: str | None = None
+        candidate_source: str | None = None
+        base_bytes = 0
+        candidate_bytes = 0
+        if status != "A":
+            base_source, base_bytes = _qa_git_object_source(
+                canonical_root, commit_sha=base_commit_sha, path=base_path
+            )
+        if status != "D":
+            candidate_source, candidate_bytes = _qa_git_object_source(
+                canonical_root, commit_sha=candidate_commit_sha, path=path
+            )
+        total_bytes += base_bytes + candidate_bytes
+        if total_bytes > _QA_OVERLAY_MAX_TOTAL_BYTES:
+            _qa_overlay_fail(
+                "total_source_limit_requires_exact_candidate_snapshot",
+                "candidate overlay total source limit was exceeded",
+                max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+            )
+        _qa_overlay_assert_safe_interpretation(
+            path=path,
+            old_path=old_path,
+            base_source=base_source,
+            candidate_source=candidate_source,
+        )
+        base_version = (
+            _qa_overlay_version(base_path, base_source, base_bytes)
+            if base_source is not None
+            else None
+        )
+        candidate_version = (
+            _qa_overlay_version(path, candidate_source, candidate_bytes)
+            if candidate_source is not None
+            else None
+        )
+        symbol_delta = _qa_overlay_symbol_delta(base_version, candidate_version)
+        total_symbols += sum(symbol_delta["counts"].values())
+        if total_symbols > _QA_OVERLAY_MAX_SYMBOLS:
+            _qa_overlay_fail(
+                "symbol_limit_requires_exact_candidate_snapshot",
+                "candidate overlay public-symbol delta limit was exceeded",
+                max_symbols=_QA_OVERLAY_MAX_SYMBOLS,
+            )
+        for key in symbol_counts:
+            symbol_counts[key] += int(symbol_delta["counts"][key])
+        status_counts[status] += 1
+        file_kind = _qa_overlay_file_kind(path)
+        language = str(
+            (candidate_version or base_version or {}).get("language") or ""
+        )
+        overlay_files.append(
+            {
+                **change,
+                "file_kind": file_kind,
+                "language": language,
+                "base": base_version,
+                "candidate": candidate_version,
+                "symbol_delta": symbol_delta,
+            }
+        )
+        source_entry = {
+            "status": status,
+            "path": path,
+            "old_path": old_path,
+            "base": base_source,
+            "candidate": candidate_source,
+        }
+        candidate_sources[path] = source_entry
+        if old_path:
+            candidate_sources[old_path] = source_entry
+
+    impact = {
+        kind: sorted(
+            {
+                str(item.get("path") or "")
+                for item in overlay_files
+                if str(item.get("file_kind") or "") == kind
+                and str(item.get("path") or "")
+            }
+        )
+        for kind in ("source", "test", "doc", "config", "other")
+    }
+    overlay = {
+        "schema_version": "qa_review_graph.overlay.v1",
+        "graph_basis": "canonical_base_plus_candidate_diff",
+        "base_commit_sha": base_commit_sha,
+        "candidate_commit_sha": candidate_commit_sha,
+        "files": overlay_files,
+        "summary": {
+            "file_count": len(overlay_files),
+            "status_counts": status_counts,
+            "public_symbol_delta_counts": symbol_counts,
+            "source_bytes_inspected": total_bytes,
+        },
+        "impact": impact,
+        "limits": {
+            "max_files": _QA_OVERLAY_MAX_FILES,
+            "max_file_bytes": _QA_OVERLAY_MAX_FILE_BYTES,
+            "max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+            "max_symbols": _QA_OVERLAY_MAX_SYMBOLS,
+        },
+    }
+    diff = _qa_git_bytes(
+        canonical_root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{base_commit_sha}..{candidate_commit_sha}",
+            "--",
+            ".",
+        ],
+    )
+    if diff.returncode != 0:
+        _qa_overlay_fail(
+            "diff_hash_unavailable_requires_exact_candidate_snapshot",
+            "server could not hash the candidate diff",
+        )
+    changed_files: list[str] = []
+    for item in file_changes:
+        for candidate_path in (item.get("old_path"), item.get("path")):
+            normalized = str(candidate_path or "")
+            if normalized and normalized not in changed_files:
+                changed_files.append(normalized)
+    root_identity_hash = stable_sha256(root_identity)
+    return {
+        "changed_files": changed_files,
+        "candidate_diff_hash": f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}",
+        "changed_files_source": "server_git_diff_name_status_z_m",
+        "candidate_overlay": overlay,
+        "candidate_overlay_hash": stable_sha256(overlay),
+        "root_identity": root_identity,
+        "root_identity_hash": root_identity_hash,
+        "query_root_identity_hash": root_identity["query_root_identity_hash"],
+        "canonical_project_identity_hash": root_identity[
+            "canonical_project_identity_hash"
+        ],
+        "repository_identity_hash": root_identity["repository_identity_hash"],
+        "_candidate_sources": candidate_sources,
+    }
+
+
+def _qa_validate_candidate_review_claims(
+    body: Mapping[str, Any],
+    review_context: Mapping[str, Any],
+) -> None:
+    containers = [body]
+    for parent_key in ("payload", "verification", "artifact_refs"):
+        parent = body.get(parent_key)
+        if isinstance(parent, Mapping):
+            containers.append(parent)
+    for container in list(containers):
+        for key in (
+            "candidate_review_context",
+            "graph_review_context",
+            "graph_trace_evidence",
+        ):
+            nested = container.get(key)
+            if isinstance(nested, Mapping):
+                containers.append(nested)
+    aliases = {
+        "graph_basis": ("graph_basis",),
+        "canonical_base_snapshot_id": (
+            "canonical_base_snapshot_id",
+            "base_snapshot_id",
+        ),
+        "base_commit_sha": ("base_commit_sha", "base_commit"),
+        "candidate_commit_sha": ("candidate_commit_sha", "candidate_commit"),
+        "changed_files": ("candidate_changed_files", "changed_files"),
+        "candidate_diff_hash": ("candidate_diff_hash", "diff_hash"),
+        "changed_files_source": ("changed_files_source",),
+        "candidate_overlay_hash": ("candidate_overlay_hash",),
+        "root_identity_hash": ("root_identity_hash",),
+        "query_root_identity_hash": ("query_root_identity_hash",),
+        "canonical_project_identity_hash": (
+            "canonical_project_identity_hash",
+        ),
+        "repository_identity_hash": ("repository_identity_hash",),
+    }
+    mismatches: list[dict[str, Any]] = []
+    for field, field_aliases in aliases.items():
+        expected = review_context.get(field)
+        for container in containers:
+            for alias in field_aliases:
+                if alias not in container:
+                    continue
+                supplied = container.get(alias)
+                if field == "changed_files":
+                    if isinstance(supplied, str):
+                        actual = [supplied] if supplied.strip() else []
+                    elif isinstance(supplied, (list, tuple, set)):
+                        actual = [
+                            str(item).strip().replace("\\", "/")
+                            for item in supplied
+                            if str(item).strip()
+                        ]
+                    else:
+                        actual = []
+                    expected_value = list(expected or [])
+                else:
+                    actual = str(supplied or "").strip().lower()
+                    expected_value = str(expected or "").strip().lower()
+                if actual != expected_value:
+                    mismatches.append(
+                        {
+                            "field": alias,
+                            "expected": expected_value,
+                            "actual": actual,
+                        }
+                    )
+    if mismatches:
+        raise GovernanceError(
+            "qa_graph_review_context_mismatch",
+            "QA graph review context must match the server-derived candidate tuple",
+            409,
+            {"identity_mismatches": mismatches},
+        )
+
+
+def _qa_graph_review_context_from_trace_row(
+    row: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    trace_id = str(row["trace_id"] or "").strip()
+    try:
+        changed_files_raw = json.loads(str(row["changed_files_json"] or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        changed_files_raw = None
+    changed_files = (
+        [
+            str(item).strip().replace("\\", "/")
+            for item in changed_files_raw
+            if str(item).strip()
+        ]
+        if isinstance(changed_files_raw, list)
+        else []
+    )
+    try:
+        candidate_overlay_raw = json.loads(
+            str(row["candidate_overlay_json"] or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        candidate_overlay_raw = None
+    try:
+        root_identity_raw = json.loads(str(row["root_identity_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        root_identity_raw = None
+    review_context = {
+        "graph_basis": str(row["graph_basis"] or "").strip(),
+        "canonical_base_snapshot_id": str(
+            row["canonical_base_snapshot_id"] or ""
+        ).strip(),
+        "base_commit_sha": str(row["base_commit_sha"] or "").strip().lower(),
+        "candidate_commit_sha": str(
+            row["candidate_commit_sha"] or ""
+        ).strip().lower(),
+        "changed_files": changed_files,
+        "candidate_diff_hash": str(row["candidate_diff_hash"] or "").strip().lower(),
+        "changed_files_source": str(row["changed_files_source"] or "").strip(),
+        "candidate_overlay_hash": str(
+            row["candidate_overlay_hash"] or ""
+        ).strip().lower(),
+        "root_identity_hash": str(row["root_identity_hash"] or "").strip().lower(),
+        "query_root_identity_hash": str(
+            row["query_root_identity_hash"] or ""
+        ).strip().lower(),
+        "canonical_project_identity_hash": str(
+            row["canonical_project_identity_hash"] or ""
+        ).strip().lower(),
+        "repository_identity_hash": str(
+            row["repository_identity_hash"] or ""
+        ).strip().lower(),
+        "query_root": (
+            str(root_identity_raw.get("query_root") or "").strip()
+            if isinstance(root_identity_raw, Mapping)
+            else ""
+        ),
+        "canonical_project_root": (
+            str(root_identity_raw.get("canonical_project_root") or "").strip()
+            if isinstance(root_identity_raw, Mapping)
+            else ""
+        ),
+    }
+    expected_context = {
+        "canonical_base_snapshot_id": str(row["snapshot_id"] or "").strip(),
+        "base_commit_sha": str(row["snapshot_commit_sha"] or "").strip().lower(),
+        "candidate_commit_sha": str(row["commit_sha"] or "").strip().lower(),
+    }
+    mismatches: list[dict[str, Any]] = [
+        {
+            "trace_id": trace_id,
+            "field": field,
+            "expected": expected,
+            "actual": str(review_context.get(field) or ""),
+        }
+        for field, expected in expected_context.items()
+        if str(review_context.get(field) or "") != expected
+    ]
+    graph_basis = review_context["graph_basis"]
+    if graph_basis not in {
+        "exact_candidate_snapshot",
+        "canonical_base_plus_candidate_diff",
+    }:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "graph_basis",
+                "expected": (
+                    "exact_candidate_snapshot|canonical_base_plus_candidate_diff"
+                ),
+                "actual": graph_basis,
+            }
+        )
+    diff_hash = review_context["candidate_diff_hash"]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", diff_hash):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "candidate_diff_hash",
+                "expected": "sha256:<64 lowercase hex characters>",
+                "actual": diff_hash,
+            }
+        )
+    if not review_context["changed_files_source"].startswith("server_"):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "changed_files_source",
+                "expected": "server-derived",
+                "actual": review_context["changed_files_source"],
+            }
+        )
+    if changed_files_raw is None:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "changed_files",
+                "expected": "persisted JSON list",
+                "actual": "invalid",
+            }
+        )
+    for field in ("base_commit_sha", "candidate_commit_sha"):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_context[field]):
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": field,
+                    "expected": "full git object id",
+                    "actual": review_context[field],
+                }
+            )
+    if graph_basis == "exact_candidate_snapshot":
+        if review_context["base_commit_sha"] != review_context["candidate_commit_sha"]:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "base_commit_sha",
+                    "expected": review_context["candidate_commit_sha"],
+                    "actual": review_context["base_commit_sha"],
+                }
+            )
+        if changed_files:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "changed_files",
+                    "expected": [],
+                    "actual": changed_files,
+                }
+            )
+        empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
+        if review_context["candidate_diff_hash"] != empty_diff_hash:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "candidate_diff_hash",
+                    "expected": empty_diff_hash,
+                    "actual": review_context["candidate_diff_hash"],
+                }
+            )
+    elif (
+        graph_basis == "canonical_base_plus_candidate_diff"
+        and review_context["base_commit_sha"]
+        == review_context["candidate_commit_sha"]
+    ):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "candidate_commit_sha",
+                "expected": "different from base_commit_sha",
+                "actual": review_context["candidate_commit_sha"],
+            }
+        )
+    if graph_basis == "canonical_base_plus_candidate_diff":
+        for field in (
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        ):
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", review_context[field]):
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": field,
+                        "expected": "sha256:<64 lowercase hex characters>",
+                        "actual": review_context[field],
+                    }
+                )
+        if not isinstance(candidate_overlay_raw, Mapping):
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "candidate_overlay",
+                    "expected": "persisted JSON object",
+                    "actual": "invalid",
+                }
+            )
+        elif stable_sha256(candidate_overlay_raw) != review_context[
+            "candidate_overlay_hash"
+        ]:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "candidate_overlay_hash",
+                    "expected": stable_sha256(candidate_overlay_raw),
+                    "actual": review_context["candidate_overlay_hash"],
+                }
+            )
+        if not isinstance(root_identity_raw, Mapping):
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "root_identity",
+                    "expected": "persisted JSON object",
+                    "actual": "invalid",
+                }
+            )
+        else:
+            expected_root_hash = stable_sha256(root_identity_raw)
+            if expected_root_hash != review_context["root_identity_hash"]:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "root_identity_hash",
+                        "expected": expected_root_hash,
+                        "actual": review_context["root_identity_hash"],
+                    }
+                )
+            for field in (
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
+            ):
+                actual = str(root_identity_raw.get(field) or "").strip().lower()
+                if actual != review_context[field]:
+                    mismatches.append(
+                        {
+                            "trace_id": trace_id,
+                            "field": f"root_identity.{field}",
+                            "expected": review_context[field],
+                            "actual": actual,
+                        }
+                    )
+    return review_context, mismatches
+
+
+def _qa_reverify_candidate_trace_context(
+    conn,
+    *,
+    project_id: str,
+    row: Any,
+    body: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    review_context, mismatches = _qa_graph_review_context_from_trace_row(row)
+    if mismatches or review_context.get("graph_basis") != (
+        "canonical_base_plus_candidate_diff"
+    ):
+        return review_context, mismatches
+
+    trace_id = str(row["trace_id"] or "").strip()
+    from . import graph_snapshot_store
+
+    active = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
+    active_snapshot_id = str(active.get("snapshot_id") or "").strip()
+    active_commit_sha = str(active.get("commit_sha") or "").strip().lower()
+    expected_snapshot_id = review_context["canonical_base_snapshot_id"]
+    expected_base_commit = review_context["base_commit_sha"]
+    if active_snapshot_id != expected_snapshot_id:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "active_snapshot_id",
+                "expected": expected_snapshot_id,
+                "actual": active_snapshot_id,
+            }
+        )
+    if active_commit_sha != expected_base_commit:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "active_snapshot_commit_sha",
+                "expected": expected_base_commit,
+                "actual": active_commit_sha,
+            }
+        )
+    try:
+        root_identity = json.loads(str(row["root_identity_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        root_identity = {}
+    query_root_raw = str(root_identity.get("query_root") or "").strip()
+    canonical_root = project_service.resolve_project_root(
+        project_id, None, fallback_self=True
+    )
+    if not query_root_raw or canonical_root is None:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "root_identity",
+                "expected": "available query and registered canonical roots",
+                "actual": query_root_raw or "missing",
+            }
+        )
+        return review_context, mismatches
+    supplied_body = body or {}
+    supplied_root = next(
+        (
+            str(supplied_body.get(key) or "").strip()
+            for key in (
+                "project_root",
+                "target_project_root",
+                "target_graph_root",
+                "worktree_path",
+                "workspace_path",
+                "repo_root",
+            )
+            if str(supplied_body.get(key) or "").strip()
+        ),
+        "",
+    )
+    if supplied_root and Path(supplied_root).resolve() != Path(query_root_raw).resolve():
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "query_root",
+                "expected": str(Path(query_root_raw).resolve()),
+                "actual": str(Path(supplied_root).resolve()),
+            }
+        )
+        return review_context, mismatches
+    try:
+        recomputed = _qa_candidate_diff_context(
+            Path(query_root_raw),
+            project_id=project_id,
+            canonical_project_root=canonical_root,
+            base_commit_sha=expected_base_commit,
+            candidate_commit_sha=review_context["candidate_commit_sha"],
+        )
+    except _QACandidateOverlayError as exc:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "candidate_overlay_reverification",
+                "expected": "server-side recomputation succeeds",
+                "actual": exc.reason,
+                "details": exc.details,
+            }
+        )
+        return review_context, mismatches
+    for field in (
+        "changed_files",
+        "candidate_diff_hash",
+        "changed_files_source",
+        "candidate_overlay_hash",
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
+    ):
+        expected = review_context[field]
+        actual = recomputed[field]
+        if actual != expected:
+            mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": field,
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
+    try:
+        persisted_overlay = json.loads(str(row["candidate_overlay_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        persisted_overlay = {}
+    if stable_sha256(persisted_overlay) != stable_sha256(
+        recomputed["candidate_overlay"]
+    ):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "candidate_overlay",
+                "expected": stable_sha256(persisted_overlay),
+                "actual": stable_sha256(recomputed["candidate_overlay"]),
+            }
+        )
+    return review_context, mismatches
+
+
 def _require_bounded_qa_session_authority(
     ctx: RequestContext,
     conn,
@@ -7068,19 +8246,90 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             snapshot_id,
         ) or {}
         snapshot_commit_sha = str(snapshot.get("commit_sha") or "").strip().lower()
-        if snapshot_commit_sha != str(proof.get("commit_sha") or ""):
+        try:
+            review_context = graph_snapshot_store.resolve_bounded_qa_graph_basis(
+                conn,
+                ctx.get_project_id(),
+                snapshot_id,
+                str(proof.get("commit_sha") or ""),
+            )
+            if review_context.get("requires_candidate_diff"):
+                query_root = _graph_governance_project_root(
+                    ctx.get_project_id(), body
+                )
+                canonical_root = project_service.resolve_project_root(
+                    ctx.get_project_id(), None, fallback_self=True
+                )
+                if canonical_root is None:
+                    _qa_overlay_fail(
+                        "canonical_project_root_unavailable",
+                        "bounded candidate overlay requires a registered canonical project root",
+                        project_id=ctx.get_project_id(),
+                    )
+                review_context.update(
+                    _qa_candidate_diff_context(
+                        query_root,
+                        project_id=ctx.get_project_id(),
+                        canonical_project_root=canonical_root,
+                        base_commit_sha=str(
+                            review_context.get("base_commit_sha") or ""
+                        ),
+                        candidate_commit_sha=str(
+                            review_context.get("candidate_commit_sha") or ""
+                        ),
+                    )
+                )
+            else:
+                review_context.update(
+                    {
+                        "changed_files": [],
+                        "candidate_diff_hash": (
+                            "sha256:"
+                            + hashlib.sha256(b"").hexdigest()
+                        ),
+                        "changed_files_source": (
+                            "server_exact_candidate_snapshot"
+                        ),
+                    }
+                )
+        except _QACandidateOverlayError as exc:
             raise GovernanceError(
-                "qa_graph_snapshot_commit_mismatch",
-                "QA graph query snapshot must be built from the exact candidate commit",
+                "qa_candidate_overlay_requires_exact_snapshot",
+                (
+                    "The candidate cannot be reviewed safely as a canonical-base "
+                    "overlay; materialize an exact candidate graph snapshot"
+                ),
                 409,
                 {
                     "snapshot_id": snapshot_id,
                     "snapshot_commit_sha": snapshot_commit_sha,
                     "required_commit_sha": proof.get("commit_sha", ""),
+                    "machine_reason": exc.reason,
+                    "exact_candidate_snapshot_required": True,
+                    **exc.details,
                 },
-            )
+            ) from exc
+        except (KeyError, ValueError, ValidationError) as exc:
+            raise GovernanceError(
+                "qa_graph_snapshot_commit_mismatch",
+                (
+                    "QA graph query requires either an exact candidate snapshot or "
+                    "the active canonical base with a server-derived candidate diff"
+                ),
+                409,
+                {
+                    "snapshot_id": snapshot_id,
+                    "snapshot_commit_sha": snapshot_commit_sha,
+                    "required_commit_sha": proof.get("commit_sha", ""),
+                    "candidate_diff_resolution_error": str(exc),
+                },
+            ) from exc
+        _qa_validate_candidate_review_claims(body, review_context)
+        proof.update(review_context)
         proof["snapshot_id"] = snapshot_id
-        proof["snapshot_commit_sha"] = snapshot_commit_sha
+        proof["snapshot_commit_sha"] = str(
+            review_context.get("base_commit_sha") or snapshot_commit_sha
+        )
         body["snapshot_id"] = snapshot_id
         principal_id = str(session.get("principal_id") or "").strip()
         supplied_actor = str(body.get("actor") or "").strip()
@@ -9534,11 +10783,25 @@ def _runtime_context_service_qa_graph_trace_refs(
         explicit_clause = ",".join("?" for _ in requested_trace_ids)
         rows = conn.execute(
             f"""
-            SELECT trace_id, query_source, query_purpose, actor
-            FROM graph_query_traces
-            WHERE project_id = ?
+            SELECT t.trace_id, t.query_source, t.query_purpose, t.actor,
+                   t.snapshot_id, t.commit_sha, t.qa_session_id,
+                   t.graph_basis, t.canonical_base_snapshot_id,
+                   t.base_commit_sha, t.candidate_commit_sha,
+                   t.changed_files_json, t.candidate_diff_hash,
+                   t.changed_files_source,
+                   t.candidate_overlay_json, t.candidate_overlay_hash,
+                   t.root_identity_json, t.root_identity_hash,
+                   t.query_root_identity_hash,
+                   t.canonical_project_identity_hash,
+                   t.repository_identity_hash,
+                   t.qa_scope_binding_ref,
+                   s.commit_sha AS snapshot_commit_sha
+            FROM graph_query_traces t
+            JOIN graph_snapshots s
+              ON s.project_id = t.project_id AND s.snapshot_id = t.snapshot_id
+            WHERE t.project_id = ?
               AND trace_id IN ({explicit_clause})
-            ORDER BY created_at DESC, trace_id DESC
+            ORDER BY t.created_at DESC, t.trace_id DESC
             """,
             (project_id, *tuple(requested_trace_ids)),
         ).fetchall()
@@ -9547,7 +10810,9 @@ def _runtime_context_service_qa_graph_trace_refs(
 
     verified: list[str] = []
     row_trace_ids: set[str] = set()
-    identity_mismatches: list[dict[str, str]] = []
+    identity_mismatches: list[dict[str, Any]] = []
+    bounded_review_contexts: list[dict[str, Any]] = []
+    bounded_qa_authorities: list[dict[str, str]] = []
     allowed_purposes = {
         "qa_context_build",
         "qa_gate_validation",
@@ -9592,8 +10857,72 @@ def _runtime_context_service_qa_graph_trace_refs(
                 }
             )
             continue
+        qa_session_id = str(row["qa_session_id"] or "").strip()
+        qa_principal = str(row["actor"] or "").strip()
+        if not qa_session_id:
+            identity_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "qa_session_id",
+                    "expected": "bounded QA session id",
+                    "actual": "",
+                }
+            )
+            continue
+        if not qa_principal:
+            identity_mismatches.append(
+                {
+                    "trace_id": trace_id,
+                    "field": "qa_principal",
+                    "expected": "authenticated QA principal",
+                    "actual": "",
+                }
+            )
+            continue
+        review_context, context_errors = _qa_reverify_candidate_trace_context(
+            conn,
+            project_id=project_id,
+            row=row,
+        )
+        if context_errors:
+            identity_mismatches.extend(context_errors)
+            continue
+        bounded_review_contexts.append(review_context)
+        bounded_qa_authorities.append(
+            {
+                "qa_session_id": qa_session_id,
+                "qa_principal": qa_principal,
+                "qa_scope_binding_ref": str(
+                    row["qa_scope_binding_ref"] or ""
+                ).strip(),
+            }
+        )
         if trace_id not in verified:
             verified.append(trace_id)
+    bounded_contexts_by_hash = {
+        stable_sha256(context): context for context in bounded_review_contexts
+    }
+    if len(bounded_contexts_by_hash) > 1:
+        identity_mismatches.append(
+            {
+                "trace_id": "|".join(requested_trace_ids),
+                "field": "candidate_review_context",
+                "expected": "one identical server-derived tuple",
+                "actual": "|".join(sorted(bounded_contexts_by_hash)),
+            }
+        )
+    bounded_authorities_by_hash = {
+        stable_sha256(authority): authority for authority in bounded_qa_authorities
+    }
+    if len(bounded_authorities_by_hash) > 1:
+        identity_mismatches.append(
+            {
+                "trace_id": "|".join(requested_trace_ids),
+                "field": "qa_session_authority",
+                "expected": "one identical bounded QA session authority",
+                "actual": "|".join(sorted(bounded_authorities_by_hash)),
+            }
+        )
     requested_set = set(requested_trace_ids)
     missing_trace_ids = [
         trace_id for trace_id in requested_trace_ids if trace_id not in row_trace_ids
@@ -9604,7 +10933,7 @@ def _runtime_context_service_qa_graph_trace_refs(
         and not missing_trace_ids
         and not identity_mismatches
     )
-    return {
+    result = {
         "schema_version": "qa_graph_trace_db_evidence.v1",
         "source": "graph_query_traces",
         "producer": "graph_query_trace",
@@ -9623,6 +10952,46 @@ def _runtime_context_service_qa_graph_trace_refs(
             "caller_requested_trace_ids": bool(requested_trace_ids),
         },
     }
+    if len(bounded_contexts_by_hash) == 1:
+        result.update(next(iter(bounded_contexts_by_hash.values())))
+        if len(bounded_authorities_by_hash) == 1:
+            result.update(next(iter(bounded_authorities_by_hash.values())))
+        requested_target_root = str(target_project_root or "").strip()
+        persisted_query_root = str(result.get("query_root") or "").strip()
+        if persisted_query_root:
+            result["requested_target_project_root"] = requested_target_root
+            result["target_project_root"] = persisted_query_root
+            if requested_target_root and (
+                Path(requested_target_root).resolve()
+                != Path(persisted_query_root).resolve()
+            ):
+                result["identity_mismatches"].append(
+                    {
+                        "trace_id": "|".join(requested_trace_ids),
+                        "field": "target_project_root",
+                        "expected": persisted_query_root,
+                        "actual": requested_target_root,
+                    }
+                )
+                result["db_verified"] = False
+        result["candidate_review_context"] = {
+            key: result[key]
+            for key in (
+                "graph_basis",
+                "canonical_base_snapshot_id",
+                "base_commit_sha",
+                "candidate_commit_sha",
+                "changed_files",
+                "candidate_diff_hash",
+                "changed_files_source",
+                "candidate_overlay_hash",
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
+            )
+        }
+    return result
 
 
 def _runtime_context_service_query_values(
@@ -11229,6 +12598,23 @@ def _qa_graph_context_evidence_shape(
     }
     trace_placeholder = "<db-verified-qa-graph-query-trace-id>"
     qa_principal_placeholder = "<qa-principal-or-session-id>"
+    candidate_review_context = {
+        "graph_basis": (
+            "<exact_candidate_snapshot-or-"
+            "canonical_base_plus_candidate_diff>"
+        ),
+        "canonical_base_snapshot_id": "<server-resolved-base-snapshot-id>",
+        "base_commit_sha": "<full-canonical-base-commit>",
+        "candidate_commit_sha": "<full-candidate-commit>",
+        "changed_files": ["<server-derived-candidate-changed-file>"],
+        "candidate_diff_hash": "sha256:<server-derived-candidate-diff-hash>",
+        "changed_files_source": "<server-derived-source>",
+        "candidate_overlay_hash": "sha256:<server-derived-overlay-hash>",
+        "root_identity_hash": "sha256:<server-derived-root-identity-hash>",
+        "query_root_identity_hash": "sha256:<server-derived-query-root-hash>",
+        "canonical_project_identity_hash": "sha256:<registered-project-identity-hash>",
+        "repository_identity_hash": "sha256:<canonical-repository-identity-hash>",
+    }
     graph_trace_evidence = {
         "schema_version": "qa_graph_trace_evidence.v1",
         "source": "graph_query_traces",
@@ -11248,6 +12634,8 @@ def _qa_graph_context_evidence_shape(
         "target_project_root": target_project_root,
         "qa_principal": qa_principal_placeholder,
         "qa_session_id": qa_principal_placeholder,
+        **candidate_review_context,
+        "candidate_review_context": dict(candidate_review_context),
         "route_identity": dict(safe_route_identity),
     }
     return {
@@ -11264,11 +12652,13 @@ def _qa_graph_context_evidence_shape(
         "target_project_root": target_project_root,
         "qa_principal": qa_principal_placeholder,
         "qa_session_id": qa_principal_placeholder,
+        **candidate_review_context,
         "payload": {
             "schema_version": "mf_parallel.qa_graph_context.v1",
             "graph_trace_ids": [trace_placeholder],
             "graph_query_trace_ids": [trace_placeholder],
             "graph_trace_evidence": graph_trace_evidence,
+            "candidate_review_context": dict(candidate_review_context),
         },
     }
 
@@ -11643,6 +13033,19 @@ def _runtime_context_qa_verification_guide(
             "commit_sha": "<full-candidate-commit>",
             "qa_session_token": "<raw-qa-session-token-used-as-header-only>",
             "db_verified_trace_ids_required": True,
+            "graph_basis_policy": {
+                "accepted": [
+                    "exact_candidate_snapshot",
+                    "canonical_base_plus_candidate_diff",
+                ],
+                "canonical_base_snapshot_server_resolved": True,
+                "changed_files_server_derived": True,
+                "candidate_diff_hash_server_derived": True,
+                "candidate_overlay_server_derived": True,
+                "root_identity_server_derived": True,
+                "unsafe_overlay_requires_exact_candidate_snapshot": True,
+                "full_candidate_snapshot_required": False,
+            },
             "required_provenance": [
                 "qa_principal",
                 "qa_session_id",
@@ -11650,6 +13053,18 @@ def _runtime_context_qa_verification_guide(
                 "query_purpose=independent_verification",
                 "source=graph_query_traces",
                 "db_verified=true",
+                "graph_basis",
+                "canonical_base_snapshot_id",
+                "base_commit_sha",
+                "candidate_commit_sha",
+                "changed_files",
+                "candidate_diff_hash",
+                "changed_files_source",
+                "candidate_overlay_hash",
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
             ],
             "route_identity": dict(safe_route_identity),
             "target_project_root": target_project_root,
@@ -11662,6 +13077,18 @@ def _runtime_context_qa_verification_guide(
             "required_top_level_fields": [
                 "graph_trace_ids",
                 "graph_query_trace_ids",
+                "graph_basis",
+                "canonical_base_snapshot_id",
+                "base_commit_sha",
+                "candidate_commit_sha",
+                "changed_files",
+                "candidate_diff_hash",
+                "changed_files_source",
+                "candidate_overlay_hash",
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
             ],
             "required_nested_payload_field": "payload.graph_trace_evidence",
         },
@@ -28264,6 +29691,50 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     ),
                     route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
+                    graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    canonical_base_snapshot_id=str(
+                        qa_proof.get("canonical_base_snapshot_id") or ""
+                    ),
+                    base_commit_sha=str(qa_proof.get("base_commit_sha") or ""),
+                    candidate_commit_sha=str(
+                        qa_proof.get("candidate_commit_sha") or ""
+                    ),
+                    changed_files=(
+                        list(qa_proof.get("changed_files") or [])
+                        if qa_proof.get("graph_basis")
+                        else None
+                    ),
+                    candidate_diff_hash=str(
+                        qa_proof.get("candidate_diff_hash") or ""
+                    ),
+                    changed_files_source=str(
+                        qa_proof.get("changed_files_source") or ""
+                    ),
+                    candidate_overlay=(
+                        qa_proof.get("candidate_overlay")
+                        if isinstance(qa_proof.get("candidate_overlay"), Mapping)
+                        else None
+                    ),
+                    candidate_overlay_hash=str(
+                        qa_proof.get("candidate_overlay_hash") or ""
+                    ),
+                    root_identity=(
+                        qa_proof.get("root_identity")
+                        if isinstance(qa_proof.get("root_identity"), Mapping)
+                        else None
+                    ),
+                    root_identity_hash=str(
+                        qa_proof.get("root_identity_hash") or ""
+                    ),
+                    query_root_identity_hash=str(
+                        qa_proof.get("query_root_identity_hash") or ""
+                    ),
+                    canonical_project_identity_hash=str(
+                        qa_proof.get("canonical_project_identity_hash") or ""
+                    ),
+                    repository_identity_hash=str(
+                        qa_proof.get("repository_identity_hash") or ""
+                    ),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
                     qa_scope_binding_ref=str(
                         qa_proof.get("qa_scope_binding_ref") or ""
@@ -28321,6 +29792,10 @@ def handle_graph_governance_query(ctx: RequestContext):
             or body.get("repo_root")
         ):
             root = _graph_governance_project_root(project_id, body)
+        if root is None and qa_proof:
+            root_identity = qa_proof.get("root_identity")
+            if isinstance(root_identity, Mapping) and root_identity.get("query_root"):
+                root = Path(str(root_identity["query_root"]))
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():
@@ -28363,6 +29838,55 @@ def handle_graph_governance_query(ctx: RequestContext):
                     ),
                     route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
+                    graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    canonical_base_snapshot_id=str(
+                        qa_proof.get("canonical_base_snapshot_id") or ""
+                    ),
+                    base_commit_sha=str(qa_proof.get("base_commit_sha") or ""),
+                    candidate_commit_sha=str(
+                        qa_proof.get("candidate_commit_sha") or ""
+                    ),
+                    changed_files=(
+                        list(qa_proof.get("changed_files") or [])
+                        if qa_proof.get("graph_basis")
+                        else None
+                    ),
+                    candidate_diff_hash=str(
+                        qa_proof.get("candidate_diff_hash") or ""
+                    ),
+                    changed_files_source=str(
+                        qa_proof.get("changed_files_source") or ""
+                    ),
+                    candidate_overlay=(
+                        qa_proof.get("candidate_overlay")
+                        if isinstance(qa_proof.get("candidate_overlay"), Mapping)
+                        else None
+                    ),
+                    candidate_overlay_hash=str(
+                        qa_proof.get("candidate_overlay_hash") or ""
+                    ),
+                    root_identity=(
+                        qa_proof.get("root_identity")
+                        if isinstance(qa_proof.get("root_identity"), Mapping)
+                        else None
+                    ),
+                    root_identity_hash=str(
+                        qa_proof.get("root_identity_hash") or ""
+                    ),
+                    query_root_identity_hash=str(
+                        qa_proof.get("query_root_identity_hash") or ""
+                    ),
+                    canonical_project_identity_hash=str(
+                        qa_proof.get("canonical_project_identity_hash") or ""
+                    ),
+                    repository_identity_hash=str(
+                        qa_proof.get("repository_identity_hash") or ""
+                    ),
+                    candidate_sources=(
+                        qa_proof.get("_candidate_sources")
+                        if isinstance(qa_proof.get("_candidate_sources"), Mapping)
+                        else None
+                    ),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
                     qa_scope_binding_ref=str(
                         qa_proof.get("qa_scope_binding_ref") or ""
@@ -28931,6 +30455,33 @@ def _record_pending_scope_reconcile_contract_event(
         or result.get("candidate_snapshot_id")
         or ""
     ).strip()
+    activation = (
+        result.get("activation_verification")
+        if isinstance(result.get("activation_verification"), Mapping)
+        else {}
+    )
+    current_full = bool(result.get("current_full_reconcile")) or str(
+        result.get("strategy") or ""
+    ).strip() == "current_full_reconcile"
+    canonical_head_commit = str(
+        result.get("head_commit") or target_commit_sha or ""
+    ).strip()
+    active_graph_commit = str(
+        result.get("active_graph_commit")
+        or activation.get("active_graph_commit")
+        or ""
+    ).strip()
+    canonical_head_verified = bool(
+        current_full
+        and canonical_head_commit
+        and canonical_head_commit == target_commit_sha
+    )
+    active_snapshot_verified = bool(
+        current_full
+        and activation.get("verified") is True
+        and active_graph_commit == target_commit_sha
+        and snapshot_id
+    )
     evidence_ref = f"reconcile:{snapshot_id}" if snapshot_id else ""
     contract_evidence = _parallel_branch_contract_evidence_item(
         "reconcile",
@@ -28944,6 +30495,18 @@ def _record_pending_scope_reconcile_contract_event(
             "strategy": result.get("strategy") or result.get("scope_reconcile_strategy") or "",
             "graph_delta_mode": result.get("graph_delta_mode") or result.get("scope_graph_delta_mode") or "",
             "fallback_reason": result.get("fallback_reason") or "",
+            "reconcile_mode": "current_full" if current_full else "scope_reconcile",
+            "reconciled_commit_sha": target_commit_sha,
+            "canonical_head_commit": canonical_head_commit,
+            "merged_head_commit": target_commit_sha if current_full else "",
+            "active_graph_commit": active_graph_commit,
+            "canonical_head_verified": canonical_head_verified,
+            "active_snapshot_verified": active_snapshot_verified,
+            "graph_reconciled": bool(
+                current_full
+                and canonical_head_verified
+                and active_snapshot_verified
+            ),
         },
     )
     return task_timeline.record_event(
@@ -28963,6 +30526,24 @@ def _record_pending_scope_reconcile_contract_event(
             "requested_by_actor": str(body.get("actor") or "").strip(),
             "target_commit_sha": target_commit_sha,
             "snapshot_id": snapshot_id,
+            "active_snapshot_id": str(
+                result.get("active_snapshot_id")
+                or activation.get("active_snapshot_id")
+                or snapshot_id
+            ).strip(),
+            "reconcile_mode": "current_full" if current_full else "scope_reconcile",
+            "current_full_reconcile": current_full,
+            "reconciled_commit_sha": target_commit_sha,
+            "canonical_head_commit": canonical_head_commit,
+            "merged_head_commit": target_commit_sha if current_full else "",
+            "active_graph_commit": active_graph_commit,
+            "canonical_head_verified": canonical_head_verified,
+            "active_snapshot_verified": active_snapshot_verified,
+            "graph_reconciled": bool(
+                current_full
+                and canonical_head_verified
+                and active_snapshot_verified
+            ),
             "result_status": result.get("status") or result.get("snapshot_status") or "",
             "graph_reconcile_result": {
                 key: value
@@ -44638,6 +46219,75 @@ def _contract_runtime_projection_dispatch_identity_mismatch(
     return {}
 
 
+def _contract_runtime_projection_current_full_reconcile_matches_merge(
+    reconcile_event: Mapping[str, Any],
+    merge_event: Mapping[str, Any],
+) -> bool:
+    reconcile_payload = (
+        reconcile_event.get("payload")
+        if isinstance(reconcile_event.get("payload"), Mapping)
+        else {}
+    )
+    merge_payload = (
+        merge_event.get("payload")
+        if isinstance(merge_event.get("payload"), Mapping)
+        else {}
+    )
+
+    def deep_true(value: Any, key: str, *, depth: int = 0) -> bool:
+        if depth > 8:
+            return False
+        if isinstance(value, Mapping):
+            if value.get(key) is True:
+                return True
+            return any(deep_true(child, key, depth=depth + 1) for child in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(deep_true(child, key, depth=depth + 1) for child in value)
+        return False
+
+    mode = _timeline_first_deep_text(reconcile_payload, "reconcile_mode")
+    strategy = _timeline_first_deep_text(reconcile_payload, "strategy")
+    current_full = (
+        str(mode or strategy).strip().lower().replace("-", "_")
+        in {"current_full", "current_full_reconcile"}
+        or deep_true(reconcile_payload, "current_full_reconcile")
+    )
+    reconciled_commit = _timeline_first_deep_text(
+        reconcile_payload, "reconciled_commit_sha"
+    ) or _timeline_first_deep_text(reconcile_payload, "target_commit_sha")
+    canonical_head = _timeline_first_deep_text(
+        reconcile_payload, "canonical_head_commit"
+    ) or _timeline_first_deep_text(reconcile_payload, "head_commit")
+    active_graph_commit = _timeline_first_deep_text(
+        reconcile_payload, "active_graph_commit"
+    )
+    snapshot_id = _timeline_first_deep_text(
+        reconcile_payload, "active_snapshot_id"
+    ) or _timeline_first_deep_text(reconcile_payload, "snapshot_id")
+    merge_commit = str(
+        merge_event.get("commit_sha")
+        or merge_payload.get("merge_commit")
+        or merge_payload.get("target_head_after_merge")
+        or ""
+    ).strip()
+    return bool(
+        current_full
+        and snapshot_id
+        and deep_true(reconcile_payload, "graph_reconciled")
+        and deep_true(reconcile_payload, "canonical_head_verified")
+        and deep_true(reconcile_payload, "active_snapshot_verified")
+        and _contract_runtime_authority_commit_matches(
+            reconciled_commit, canonical_head
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconciled_commit, active_graph_commit
+        )
+        and _contract_runtime_authority_commit_matches(
+            reconciled_commit, merge_commit
+        )
+    )
+
+
 def _contract_runtime_projection_post_worker_lines(
     *,
     conn,
@@ -44719,6 +46369,16 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
     )
+    if reconcile_event and (
+        not merge_event
+        or not _contract_runtime_projection_current_full_reconcile_matches_merge(
+            reconcile_event,
+            merge_event,
+        )
+    ):
+        reconcile_event = {}
+    if close_ready_event and not reconcile_event:
+        close_ready_event = {}
 
     lines: list[dict[str, Any]] = []
     qa_graph_line_instance_id = f"runtime_context:{runtime_context_id}"
@@ -44835,7 +46495,27 @@ def _contract_runtime_projected_qa_graph_line(
         or ""
     ).strip()
     graph_evidence = _runtime_context_service_redact_graph_trace_refs(graph_refs)
-    graph_evidence["target_project_root"] = target_project_root
+    graph_evidence["target_project_root"] = str(
+        graph_refs.get("target_project_root") or target_project_root
+    ).strip()
+    candidate_review_context = {
+        key: graph_refs.get(key)
+        for key in (
+            "graph_basis",
+            "canonical_base_snapshot_id",
+            "base_commit_sha",
+            "candidate_commit_sha",
+            "changed_files",
+            "candidate_diff_hash",
+            "changed_files_source",
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        )
+        if graph_refs.get(key) not in (None, "")
+    }
     payload = {
         "schema_version": "mf_parallel.qa_graph_context.v1",
         "source": "runtime_context_qa_graph_projection",
@@ -44852,6 +46532,7 @@ def _contract_runtime_projected_qa_graph_line(
         "graph_trace_ids": graph_trace_ids,
         "graph_query_trace_ids": graph_trace_ids,
         "graph_trace_evidence": graph_evidence,
+        "candidate_review_context": candidate_review_context,
     }
     line = {
         "stage_id": "qa_graph_context",
@@ -44869,6 +46550,7 @@ def _contract_runtime_projected_qa_graph_line(
         "query_source": "qa",
         "query_purpose": str(graph_refs.get("query_purpose") or "independent_verification"),
         "target_project_root": target_project_root,
+        **candidate_review_context,
         "payload": payload,
         "artifact_refs": {
             "source": "runtime_context_qa_graph_projection",
@@ -44878,6 +46560,7 @@ def _contract_runtime_projected_qa_graph_line(
             "timeline_event_ref": source_ref,
             "graph_trace_ids": graph_trace_ids,
             "graph_trace_evidence": graph_evidence,
+            "candidate_review_context": candidate_review_context,
         },
         "_source_ref": source_ref,
     }
@@ -60505,6 +62188,15 @@ def _timeline_trusted_qa_verification_authority(
         f"""
         SELECT t.trace_id, t.snapshot_id, t.query_source, t.query_purpose,
                t.actor, t.task_id, t.backlog_id, t.commit_sha,
+               t.graph_basis, t.canonical_base_snapshot_id,
+               t.base_commit_sha, t.candidate_commit_sha,
+               t.changed_files_json, t.candidate_diff_hash,
+               t.changed_files_source,
+               t.candidate_overlay_json, t.candidate_overlay_hash,
+               t.root_identity_json, t.root_identity_hash,
+               t.query_root_identity_hash,
+               t.canonical_project_identity_hash,
+               t.repository_identity_hash,
                t.qa_session_id, t.qa_scope_binding_ref, t.status,
                s.commit_sha AS snapshot_commit_sha
         FROM graph_query_traces t
@@ -60515,9 +62207,10 @@ def _timeline_trusted_qa_verification_authority(
         (project_id, *trace_ids),
     ).fetchall()
     rows_by_trace = {str(row["trace_id"] or "").strip(): row for row in rows}
-    mismatches: list[dict[str, str]] = []
+    mismatches: list[dict[str, Any]] = []
     task_id = str(body.get("task_id") or "").strip()
     snapshot_ids: set[str] = set()
+    review_contexts: list[dict[str, Any]] = []
     for trace_id in trace_ids:
         row = rows_by_trace.get(trace_id)
         if row is None:
@@ -60535,20 +62228,42 @@ def _timeline_trusted_qa_verification_authority(
                 proof.get("qa_scope_binding_ref") or ""
             ),
             "status": "complete",
-            "snapshot_commit_sha": str(proof.get("commit_sha") or ""),
         }
         for field, expected in expected_fields.items():
             actual = str(row[field] or "").strip()
             if actual != expected:
                 mismatches.append({"trace_id": trace_id, "field": field, "expected": expected, "actual": actual})
-        snapshot_ids.add(str(row["snapshot_id"] or "").strip())
+        row_snapshot_id = str(row["snapshot_id"] or "").strip()
+        snapshot_ids.add(row_snapshot_id)
+        review_context, review_mismatches = (
+            _qa_reverify_candidate_trace_context(
+                conn,
+                project_id=project_id,
+                row=row,
+                body=body,
+            )
+        )
+        review_contexts.append(review_context)
+        mismatches.extend(review_mismatches)
     if len(snapshot_ids) != 1:
         mismatches.append(
             {
                 "trace_id": "|".join(trace_ids),
                 "field": "snapshot_id",
-                "expected": "one exact candidate snapshot",
+                "expected": "one canonical graph basis snapshot",
                 "actual": "|".join(sorted(snapshot_ids)),
+            }
+        )
+    contexts_by_hash = {
+        stable_sha256(context): context for context in review_contexts
+    }
+    if len(contexts_by_hash) != 1:
+        mismatches.append(
+            {
+                "trace_id": "|".join(trace_ids),
+                "field": "candidate_review_context",
+                "expected": "one identical server-derived tuple",
+                "actual": sorted(contexts_by_hash),
             }
         )
     if mismatches:
@@ -60558,6 +62273,8 @@ def _timeline_trusted_qa_verification_authority(
             422,
             {"identity_mismatches": mismatches},
         )
+    review_context = next(iter(contexts_by_hash.values()))
+    _qa_validate_candidate_review_claims(body, review_context)
     proof.update(
         {
             "action": "task_timeline_append.independent_verification",
@@ -60568,7 +62285,8 @@ def _timeline_trusted_qa_verification_authority(
             "query_purpose": "independent_verification",
             "db_verified_graph_trace": True,
             "snapshot_id": next(iter(snapshot_ids)),
-            "snapshot_commit_sha": str(proof.get("commit_sha") or ""),
+            "snapshot_commit_sha": review_context["base_commit_sha"],
+            **review_context,
         }
     )
     return proof

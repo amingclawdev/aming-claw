@@ -152,8 +152,30 @@
                     "required_fields": [
                         "target_project_root",
                         "graph_trace_ids",
-                        "graph_trace_evidence.db_verified"
-                    ]
+                        "graph_trace_evidence.db_verified",
+                        "graph_trace_evidence.graph_basis",
+                        "graph_trace_evidence.canonical_base_snapshot_id",
+                        "graph_trace_evidence.base_commit_sha",
+                        "graph_trace_evidence.candidate_commit_sha",
+                        "graph_trace_evidence.changed_files",
+                        "graph_trace_evidence.candidate_diff_hash",
+                        "graph_trace_evidence.changed_files_source",
+                        "graph_trace_evidence.candidate_overlay_hash",
+                        "graph_trace_evidence.root_identity_hash",
+                        "graph_trace_evidence.query_root_identity_hash",
+                        "graph_trace_evidence.canonical_project_identity_hash",
+                        "graph_trace_evidence.repository_identity_hash"
+                    ],
+                    "graph_basis_policy": {
+                        "accepted": [
+                            "exact_candidate_snapshot",
+                            "canonical_base_plus_candidate_diff"
+                        ],
+                        "candidate_diff_derivation": "server_only",
+                        "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
+                        "unsafe_overlay_policy": "require_exact_candidate_snapshot",
+                        "full_candidate_snapshot_required": false
+                    }
                 }
             }
         ],

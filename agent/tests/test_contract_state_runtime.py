@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from agent.governance.contract_state_runtime import build_contract_state_projection
@@ -25,6 +26,47 @@ def _event(
         "verification": verification or {},
         "artifact_refs": {},
     }
+
+
+def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
+    trace_id = "gqt-contract-state-qa"
+    evidence = {
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "trace_ids": [trace_id],
+        "verified_trace_ids": [trace_id],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "qa_session_id": "ses-qa-bounded",
+        "canonical_base_snapshot_id": "full-base",
+        "base_commit_sha": "a" * 40,
+        "changed_files_source": "server_exact_candidate_snapshot",
+    }
+    if not base_diff:
+        evidence.update(
+            {
+                "graph_basis": "exact_candidate_snapshot",
+                "candidate_commit_sha": "a" * 40,
+                "changed_files": [],
+                "candidate_diff_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+            }
+        )
+        return evidence
+    evidence.update(
+        {
+            "graph_basis": "canonical_base_plus_candidate_diff",
+            "candidate_commit_sha": "b" * 40,
+            "changed_files": ["agent/governance/server.py"],
+            "candidate_diff_hash": "sha256:" + "c" * 64,
+            "changed_files_source": "server_git_diff_name_status_z_m",
+            "candidate_overlay_hash": "sha256:" + "d" * 64,
+            "root_identity_hash": "sha256:" + "e" * 64,
+            "query_root_identity_hash": "sha256:" + "f" * 64,
+            "canonical_project_identity_hash": "sha256:" + "1" * 64,
+            "repository_identity_hash": "sha256:" + "2" * 64,
+        }
+    )
+    return evidence
 
 
 def test_projection_keeps_generated_demo_requirements_conditional():
@@ -1546,8 +1588,94 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
-    assert qa["next_legal_action"]["id"] == "qa_independent_verification"
-    assert qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+    assert qa["next_legal_action"]["id"] == "qa_graph_context"
+
+    bounded_qa = build_contract_state_projection(
+        [
+            _event(1, "contract_binding"),
+            _event(2, "dispatch_bounded_worker"),
+            _event(3, "mf_subagent_read_receipt"),
+            _event(4, "mf_subagent_startup"),
+            _event(5, "graph_trace"),
+            _event(6, "implementation"),
+            _event(7, "worker_commit"),
+            _event(8, "record_finish_time_worker_attestation"),
+            _event(9, "mf_subagent_finish_gate"),
+            _event(10, "review_ready"),
+            _event(
+                11,
+                "qa_graph_trace",
+                payload={"graph_trace_evidence": _bounded_qa_graph_evidence()},
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert bounded_qa["next_legal_action"]["id"] == "qa_independent_verification"
+    assert bounded_qa["next_legal_action"]["timeline_append_hint"]["actor_role"] == "qa"
+
+
+def test_bounded_qa_graph_context_requires_complete_candidate_review_tuple():
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev-mf-v2-bounded-qa-context",
+            "state": "bound",
+        }
+    }
+    prefix = [
+        _event(1, "contract_binding"),
+        _event(2, "dispatch_bounded_worker"),
+        _event(3, "mf_subagent_read_receipt"),
+        _event(4, "mf_subagent_startup"),
+        _event(5, "graph_trace"),
+        _event(6, "implementation"),
+        _event(7, "worker_commit"),
+        _event(8, "record_finish_time_worker_attestation"),
+        _event(9, "mf_subagent_finish_gate"),
+        _event(10, "review_ready"),
+    ]
+    incomplete = build_contract_state_projection(
+        [
+            *prefix,
+            _event(
+                11,
+                "qa_graph_trace",
+                payload={
+                    "graph_trace_evidence": {
+                        "qa_session_id": "ses-qa-bounded",
+                        "graph_basis": "canonical_base_plus_candidate_diff",
+                        "canonical_base_snapshot_id": "full-base",
+                        "base_commit_sha": "a" * 40,
+                        "changed_files": ["agent/governance/server.py"],
+                        "candidate_diff_hash": "sha256:" + "c" * 64,
+                    }
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert incomplete["next_legal_action"]["id"] == "qa_graph_context"
+
+    complete = build_contract_state_projection(
+        [
+            *prefix,
+            _event(
+                11,
+                "qa_graph_trace",
+                payload={
+                    "graph_trace_evidence": _bounded_qa_graph_evidence(
+                        base_diff=True
+                    )
+                },
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert complete["next_legal_action"]["id"] == "qa_independent_verification"
 
 
 def test_builtin_mf_parallel_v2_req_2ff0e242e70f_requires_commit_after_implementation():

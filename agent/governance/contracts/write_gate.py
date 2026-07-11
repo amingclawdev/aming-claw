@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -81,6 +82,22 @@ _GRAPH_TRACE_ID_KEYS = {
     "trace_ids",
     "verified_trace_ids",
 }
+
+_QA_GRAPH_CONTEXT_LINE_IDS = {
+    "direct_fix_qa_graph_context",
+    "qa_graph_context",
+}
+_QA_GRAPH_BASES = {
+    "exact_candidate_snapshot",
+    "canonical_base_plus_candidate_diff",
+}
+_QA_BASE_DIFF_HASH_FIELDS = (
+    "candidate_overlay_hash",
+    "root_identity_hash",
+    "query_root_identity_hash",
+    "canonical_project_identity_hash",
+    "repository_identity_hash",
+)
 
 
 @dataclass(frozen=True)
@@ -220,6 +237,128 @@ def _validate_graph_context(
             continue
         if write_value and graph_value and write_value != graph_value:
             errors.append(f"{line_id} {field} does not match graph_trace_evidence")
+    if line_id in _QA_GRAPH_CONTEXT_LINE_IDS:
+        _validate_bounded_qa_graph_context(
+            errors,
+            write,
+            line_id=line_id,
+            trace_ids=trace_ids,
+        )
+
+
+def _validate_bounded_qa_graph_context(
+    errors: list[str],
+    write: Mapping[str, Any],
+    *,
+    line_id: str,
+    trace_ids: list[str],
+) -> None:
+    evidence_rows = [
+        candidate
+        for candidate in _graph_evidence_candidates(write)
+        if str(candidate.get("source") or "").strip() == "graph_query_traces"
+    ]
+    if len(evidence_rows) != 1:
+        errors.append(
+            f"{line_id} requires one source=graph_query_traces evidence object"
+        )
+        return
+    evidence = evidence_rows[0]
+    if _first_deep_value(evidence, "db_verified") is not True:
+        errors.append(f"{line_id} requires server DB-verified graph trace evidence")
+    qa_session_id = _first_deep_text(evidence, "qa_session_id")
+    if not qa_session_id:
+        errors.append(f"{line_id} requires qa_session_id")
+
+    verified_trace_ids = _flatten_graph_text_values(
+        _first_deep_value(evidence, "verified_trace_ids")
+    )
+    if not verified_trace_ids:
+        errors.append(f"{line_id} requires verified_trace_ids")
+    elif set(verified_trace_ids) != set(trace_ids):
+        errors.append(
+            f"{line_id} verified_trace_ids must match graph_trace_ids"
+        )
+    missing_trace_ids = _flatten_graph_text_values(
+        _first_deep_value(evidence, "missing_trace_ids")
+    )
+    if missing_trace_ids:
+        errors.append(f"{line_id} cannot contain missing_trace_ids")
+    identity_mismatches = _first_deep_value(evidence, "identity_mismatches")
+    if identity_mismatches:
+        errors.append(f"{line_id} cannot contain graph trace identity_mismatches")
+
+    graph_basis = _first_deep_text(evidence, "graph_basis")
+    canonical_base_snapshot_id = _first_deep_text(
+        evidence, "canonical_base_snapshot_id"
+    )
+    base_commit_sha = _first_deep_text(evidence, "base_commit_sha").lower()
+    candidate_commit_sha = _first_deep_text(
+        evidence, "candidate_commit_sha"
+    ).lower()
+    changed_files = _first_deep_value(evidence, "changed_files")
+    candidate_diff_hash = _first_deep_text(
+        evidence, "candidate_diff_hash"
+    ).lower()
+    changed_files_source = _first_deep_text(evidence, "changed_files_source")
+
+    if graph_basis not in _QA_GRAPH_BASES:
+        errors.append(f"{line_id} requires a supported graph_basis")
+    if not canonical_base_snapshot_id:
+        errors.append(f"{line_id} requires canonical_base_snapshot_id")
+    if not _is_full_commit(base_commit_sha):
+        errors.append(f"{line_id} requires full base_commit_sha")
+    if not _is_full_commit(candidate_commit_sha):
+        errors.append(f"{line_id} requires full candidate_commit_sha")
+    if not isinstance(changed_files, list):
+        errors.append(f"{line_id} requires changed_files as a JSON list")
+    if not _is_sha256(candidate_diff_hash):
+        errors.append(f"{line_id} requires candidate_diff_hash")
+    if not changed_files_source.startswith("server_"):
+        errors.append(f"{line_id} requires server-derived changed_files_source")
+
+    if graph_basis == "exact_candidate_snapshot":
+        empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
+        if base_commit_sha != candidate_commit_sha:
+            errors.append(
+                f"{line_id} exact candidate basis requires matching commits"
+            )
+        if isinstance(changed_files, list) and changed_files:
+            errors.append(
+                f"{line_id} exact candidate basis requires empty changed_files"
+            )
+        if candidate_diff_hash != empty_diff_hash:
+            errors.append(
+                f"{line_id} exact candidate basis requires the empty diff hash"
+            )
+        return
+
+    if graph_basis == "canonical_base_plus_candidate_diff":
+        if base_commit_sha == candidate_commit_sha:
+            errors.append(
+                f"{line_id} base-diff basis requires distinct base and candidate commits"
+            )
+        for field in _QA_BASE_DIFF_HASH_FIELDS:
+            value = _first_deep_text(evidence, field).lower()
+            if not _is_sha256(value):
+                errors.append(f"{line_id} requires {field}")
+
+
+def _is_full_commit(value: str) -> bool:
+    return len(value) in {40, 64} and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _is_sha256(value: str) -> bool:
+    return (
+        value.startswith("sha256:")
+        and len(value) == len("sha256:") + 64
+        and all(
+            character in "0123456789abcdef"
+            for character in value.removeprefix("sha256:")
+        )
+    )
 
 
 def _graph_trace_ids(write: Mapping[str, Any]) -> list[str]:
