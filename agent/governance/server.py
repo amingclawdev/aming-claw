@@ -19844,6 +19844,42 @@ def _runtime_context_finish_changed_files(
     )
 
 
+def _runtime_context_finish_attestation_git_scope(
+    context: Any,
+    body: Mapping[str, Any],
+    finish_order_projection: Mapping[str, Any],
+    changed_files: list[str],
+) -> dict[str, Any]:
+    canonical = bool(
+        finish_order_projection.get("canonical_worker_commit_required")
+    )
+    base_commit = str(getattr(context, "base_commit", "") or "")
+    owned_files = _runtime_context_service_query_values(
+        body,
+        "owned_files",
+    ) or list(changed_files)
+    if canonical:
+        base_commit = str(
+            finish_order_projection.get("diff_base_commit")
+            or finish_order_projection.get("commit_parent_sha")
+            or base_commit
+        )
+        owned_files = _runtime_context_service_query_values(
+            finish_order_projection,
+            "owned_files",
+        ) or sorted(
+            set(
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or changed_files
+            )
+        )
+    return {
+        "base_commit": base_commit,
+        "owned_files": owned_files,
+    }
+
+
 def _runtime_context_contract_worker_commit_projection(
     conn,
     *,
@@ -20581,6 +20617,12 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 "of hand-building the body"
             )
 
+        attestation_git_scope = _runtime_context_finish_attestation_git_scope(
+            context,
+            body,
+            finish_order_projection,
+            changed_files,
+        )
         attestation_payload = {
             **body,
             "attestation_phase": "finish",
@@ -20601,13 +20643,13 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "actual_git_root": str(body.get("actual_git_root") or worktree_path),
             "branch_ref": context.branch_ref,
             "branch": context.branch_ref,
-            "base_commit": context.base_commit,
+            "base_commit": attestation_git_scope["base_commit"],
             "target_head_commit": context.target_head_commit,
             "head_commit": head_commit,
             "contract_worker_commit_evidence": finish_order_projection,
             "finish_order_projection": finish_order_projection,
             "changed_files": changed_files,
-            "owned_files": list(body.get("owned_files") or changed_files),
+            "owned_files": attestation_git_scope["owned_files"],
             "observer_command_id": observer_command_id,
             "read_receipt_hash": read_receipt_hash,
             "read_receipt_event_id": read_receipt_event_id,

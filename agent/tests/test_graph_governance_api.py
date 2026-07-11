@@ -405,6 +405,33 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
         canonical_worker_commit_required=False,
         include_worktree=False,
     ) == ["current.py", "prior.py"]
+    context = SimpleNamespace(
+        base_commit=base_commit,
+        owned_files=("current.py", "prior.py"),
+        target_files=("current.py", "prior.py"),
+    )
+    assert server._runtime_context_finish_attestation_git_scope(
+        context,
+        {"owned_files": ["current.py"]},
+        {
+            "canonical_worker_commit_required": True,
+            "diff_base_commit": prior_commit,
+            "owned_files": ["current.py", "prior.py"],
+        },
+        ["current.py"],
+    ) == {
+        "base_commit": prior_commit,
+        "owned_files": ["current.py", "prior.py"],
+    }
+    assert server._runtime_context_finish_attestation_git_scope(
+        context,
+        {"owned_files": ["current.py"]},
+        {"canonical_worker_commit_required": False},
+        ["current.py"],
+    ) == {
+        "base_commit": base_commit,
+        "owned_files": ["current.py"],
+    }
 
 
 def test_worker_commit_startup_principal_ignores_contract_guide_placeholder():
