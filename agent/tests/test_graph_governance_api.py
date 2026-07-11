@@ -5907,6 +5907,34 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
     assert resolved["scope"]["task_id"] == contract_execution_id
     assert resolved["scope"]["backlog_id"] == backlog_id
 
+    captured.clear()
+    with pytest.raises(
+        ValidationError,
+        match="finish-time worker attestation requires non-empty passed test_results",
+    ):
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": context.parent_task_id,
+                    "fence_token": "fence-runtime-contract-scoped-route",
+                    "session_token": "session-runtime-contract-scoped-route",
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(worker_root),
+                    **route_identity,
+                    "route_token_ref": issued["route_token_ref"],
+                },
+            )
+        )
+
+    assert captured["contract_execution_id"] == contract_execution_id
+    assert captured["resolved"]["scope"]["task_id"] == contract_execution_id
+
 
 def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_trace_ids(
     conn,
