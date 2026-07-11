@@ -5708,6 +5708,7 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
 def test_runtime_context_implementation_route_ref_resolves_active_contract_execution_scope(
     conn,
     tmp_path,
+    monkeypatch,
 ):
     backlog_id = "AC-RUNTIME-CONTEXT-CONTRACT-SCOPED-ROUTE-REF"
     worker_task_id = "runtime-contract-scoped-route-worker"
@@ -5759,17 +5760,65 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
     )
     conn.commit()
 
-    resolved = server._runtime_context_resolve_implementation_route_token_ref(
-        {
-            **route_identity,
-            "parent_task_id": context.parent_task_id,
-        },
-        project_id=PID,
-        context=context,
-        contract_execution_id=contract_execution_id,
+    captured: dict[str, Any] = {}
+    original_resolve = server._runtime_context_resolve_implementation_route_token_ref
+
+    def capture_resolve(body, *, project_id, context, contract_execution_id=""):
+        captured["contract_execution_id"] = contract_execution_id
+        resolved = original_resolve(
+            body,
+            project_id=project_id,
+            context=context,
+            contract_execution_id=contract_execution_id,
+        )
+        captured["resolved"] = resolved
+        return resolved
+
+    def capture_timeline(ctx):
+        captured["timeline_body"] = dict(ctx.body or {})
+        return {
+            "id": 900001,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": worker_task_id,
+            "event_kind": "implementation",
+            "status": "passed",
+            "payload": {},
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_implementation_route_token_ref",
+        capture_resolve,
+    )
+    monkeypatch.setattr(server, "handle_task_timeline_append", capture_timeline)
+
+    response = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": context.parent_task_id,
+                "fence_token": "fence-runtime-contract-scoped-route",
+                "session_token": "session-runtime-contract-scoped-route",
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": str(worker_root),
+                "actor": context.worker_slot_id,
+                **route_identity,
+                "route_token_ref": issued["route_token_ref"],
+                "changed_files": ["agent/governance/server.py"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+            },
+        )
     )
 
-    assert resolved is not None
+    resolved = captured["resolved"]
+    assert response["ok"] is True
+    assert captured["contract_execution_id"] == contract_execution_id
+    assert captured["timeline_body"]["contract_execution_id"] == (
+        contract_execution_id
+    )
     assert resolved["route_token_ref"] == issued["route_token_ref"]
     assert resolved["scope"]["task_id"] == contract_execution_id
     assert resolved["scope"]["backlog_id"] == backlog_id

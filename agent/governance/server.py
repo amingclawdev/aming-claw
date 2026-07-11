@@ -20132,16 +20132,6 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         contract_execution_identity = _runtime_context_contract_execution_identity(
             revision_payload
         )
-        contract_execution_identity, _contract_execution_resolution = (
-            _runtime_context_resolve_contract_execution_identity(
-                conn,
-                project_id=project_id,
-                context=context,
-                runtime_context_id=runtime_context_id,
-                task_id=str(getattr(context, "task_id", "") or ""),
-                contract_identity=contract_execution_identity,
-            )
-        )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
             route_identity,
@@ -20795,6 +20785,16 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
         revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
         contract_execution_identity = _runtime_context_contract_execution_identity(
             revision_payload
+        )
+        contract_execution_identity, _contract_execution_resolution = (
+            _runtime_context_resolve_contract_execution_identity(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                task_id=str(getattr(context, "task_id", "") or ""),
+                contract_identity=contract_execution_identity,
+            )
         )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
