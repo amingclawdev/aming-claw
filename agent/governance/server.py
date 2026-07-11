@@ -9003,6 +9003,14 @@ def _runtime_context_service_timeline_refs(
             refs["startup_event_ref"] = ref
             startup_event = dict(event)
             startup_payload = public_contract_revision_payload(payload)
+            startup_gate_payload = (
+                startup_payload.get("mf_subagent_startup_gate")
+                if isinstance(
+                    startup_payload.get("mf_subagent_startup_gate"),
+                    Mapping,
+                )
+                else {}
+            )
             startup_hint = refs.setdefault("startup_hint", {})
             if isinstance(startup_hint, dict):
                 startup_hint["event_ref"] = ref
@@ -9018,9 +9026,15 @@ def _runtime_context_service_timeline_refs(
                     "read_receipt_hash",
                     "read_receipt_event_id",
                 ):
-                    value = _runtime_context_non_placeholder_text(
-                        _timeline_first_deep_text(startup_payload, key)
-                    )
+                    if key in {"worker_session_id", "filer_principal"}:
+                        value = _runtime_context_non_placeholder_text(
+                            startup_gate_payload.get(key)
+                            or startup_payload.get(key)
+                        )
+                    else:
+                        value = _runtime_context_non_placeholder_text(
+                            _timeline_first_deep_text(startup_payload, key)
+                        )
                     if value:
                         startup_hint[key] = value
         elif (
@@ -9242,6 +9256,36 @@ def _runtime_context_non_placeholder_text(value: Any) -> str:
     if not text or text.startswith("<"):
         return ""
     return text
+
+
+def _runtime_context_worker_commit_startup_principal(
+    startup_event: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+) -> str:
+    """Return only the server-verified worker principal from startup evidence."""
+
+    startup_payload = (
+        startup_event.get("payload")
+        if isinstance(startup_event.get("payload"), Mapping)
+        else {}
+    )
+    startup_gate = (
+        startup_payload.get("mf_subagent_startup_gate")
+        if isinstance(startup_payload.get("mf_subagent_startup_gate"), Mapping)
+        else {}
+    )
+    startup_hint = (
+        timeline_refs.get("startup_hint")
+        if isinstance(timeline_refs.get("startup_hint"), Mapping)
+        else {}
+    )
+    for source in (startup_gate, startup_hint, startup_payload):
+        principal = _runtime_context_non_placeholder_text(
+            source.get("worker_session_id")
+        )
+        if principal:
+            return principal
+    return ""
 
 
 def _runtime_context_test_results_from_tests(value: Any) -> dict[str, Any]:
@@ -19903,15 +19947,11 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
         ) != set(supplied_trace_ids):
             raise ValidationError("worker_commit requires exact DB-verified graph traces")
 
-        startup_payload = (
-            startup_gate.get("payload")
-            if isinstance(startup_gate, Mapping)
-            and isinstance(startup_gate.get("payload"), Mapping)
-            else {}
-        )
-        startup_worker_session_id = _timeline_first_deep_text(
-            startup_payload,
-            "worker_session_id",
+        startup_worker_session_id = (
+            _runtime_context_worker_commit_startup_principal(
+                startup_gate,
+                timeline_refs,
+            )
         )
         worker_session_id = str(body.get("worker_session_id") or "").strip()
         filer_principal = str(

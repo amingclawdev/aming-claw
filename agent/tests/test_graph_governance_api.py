@@ -332,6 +332,90 @@ def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit
     ) == ()
 
 
+def test_worker_commit_startup_principal_ignores_contract_guide_placeholder():
+    worker_session_id = "worker-session-from-startup-gate"
+    startup_event = {
+        "payload": {
+            "contract_runtime_canonical_line": {
+                "next_legal_action": {
+                    "worker_commit_facade_payload_skeleton": {
+                        "copy_safe_body": {
+                            "worker_session_id": "<same worker_session_id as startup>",
+                        }
+                    }
+                }
+            },
+            "mf_subagent_startup_gate": {
+                "worker_session_id": worker_session_id,
+                "filer_principal": worker_session_id,
+            },
+        }
+    }
+
+    assert server._runtime_context_worker_commit_startup_principal(
+        startup_event,
+        {
+            "startup_hint": {
+                "worker_session_id": "<actual worker-owned session id>",
+            }
+        },
+    ) == worker_session_id
+
+    refs, wrapped_startup, _finish, _close = (
+        server._runtime_context_service_timeline_refs(
+            None,
+            project_id=PID,
+            task_id="worker-startup-principal",
+            backlog_id="AC-WORKER-STARTUP-PRINCIPAL",
+            timeline_events=[
+                {
+                    "id": 42,
+                    "project_id": PID,
+                    "backlog_id": "AC-WORKER-STARTUP-PRINCIPAL",
+                    "task_id": "worker-startup-principal",
+                    "event_type": "mf_subagent.startup",
+                    "event_kind": "mf_subagent_startup",
+                    "status": "passed",
+                    "payload": startup_event["payload"],
+                }
+            ],
+        )
+    )
+    assert refs["startup_hint"]["worker_session_id"] == worker_session_id
+    assert wrapped_startup["event_id"] == "timeline:42"
+
+
+@pytest.mark.parametrize(
+    ("startup_event", "timeline_refs", "expected"),
+    [
+        (
+            {"payload": {"worker_session_id": "legacy-worker-session"}},
+            {},
+            "legacy-worker-session",
+        ),
+        (
+            {"payload": {"worker_session_id": "<startup placeholder>"}},
+            {"startup_hint": {"worker_session_id": "hint-worker-session"}},
+            "hint-worker-session",
+        ),
+        (
+            {"payload": {"worker_session_id": "<startup placeholder>"}},
+            {},
+            "",
+        ),
+    ],
+)
+def test_worker_commit_startup_principal_uses_only_non_placeholder_authority(
+    startup_event,
+    timeline_refs,
+    expected,
+):
+    assert server._runtime_context_worker_commit_startup_principal(
+        startup_event,
+        timeline_refs,
+    ) == expected
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_error"),
     [
