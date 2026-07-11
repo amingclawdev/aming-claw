@@ -116,6 +116,7 @@ def _selected_resolution(
 def _validate_routing(
     resolved: Mapping[str, str],
     resolutions: tuple[FieldResolution, ...],
+    profile: AgentProfile | None = None,
 ) -> None:
     provider = resolved.get("provider", "").strip().lower()
     backend_mode = resolved.get("backend_mode", "").strip().lower()
@@ -159,6 +160,34 @@ def _validate_routing(
     )
     if errors:
         raise ValueError("Invalid resolved CLI agent routing: {}".format("; ".join(errors)))
+
+    if profile is None:
+        return
+    endpoint = profile.inference_endpoint
+    expected_profile_fields = {
+        "profile_id": profile.profile_id,
+        "profile_version": profile.version,
+        "endpoint_id": endpoint.endpoint_id,
+        "endpoint_version": endpoint.version,
+        "credential_ref": profile.credential_ref.ref_id,
+        "credential_ref_version": profile.credential_ref.version,
+        "provider": endpoint.provider,
+        "backend_mode": endpoint.backend_mode,
+        "auth_mode": endpoint.auth_mode,
+    }
+    conflicts = [
+        field_name
+        for field_name, expected in expected_profile_fields.items()
+        if resolved.get(field_name, "") != expected
+    ]
+    credential_provider = profile.credential_ref.provider
+    if credential_provider and resolved.get("provider", "") != credential_provider:
+        conflicts.append("credential_ref.provider")
+    if conflicts:
+        raise ValueError(
+            "Invalid resolved CLI agent routing: selected immutable profile "
+            "conflicts with final fields: {}".format(", ".join(sorted(set(conflicts))))
+        )
 
 
 def resolve_agent_config(
@@ -353,7 +382,7 @@ def resolve_agent_config(
         for field_name in PUBLIC_CONFIGURATION_FIELDS
     )
     values = {resolution.field_name: resolution.value for resolution in resolutions}
-    _validate_routing(values, resolutions)
+    _validate_routing(values, resolutions, profile)
 
     return AgentRun(
         run_id=run_id,

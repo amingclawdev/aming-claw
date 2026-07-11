@@ -11,6 +11,59 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 class TestAILifecycleProviderRouting(unittest.TestCase):
+    def test_agent_run_rejects_conflicting_caller_route_before_dispatch(self):
+        from ai_invocation import (
+            AIInvocationResult,
+            RoutePromptContract,
+            invoke_agent_run,
+        )
+        from cli_agent_service.config import resolve_agent_config
+
+        run = resolve_agent_config(
+            run_id="run-pinned-route",
+            role="dev",
+            project_id="aming-claw",
+            compatibility_defaults={
+                "provider": "openai",
+                "model": "gpt-5.4-codex",
+                "backend_mode": "codex_cli",
+                "auth_mode": "cli_auth",
+            },
+            governance_refs={
+                "route_id": "route-pinned",
+                "route_context_hash": "sha256:" + "1" * 64,
+                "prompt_contract_id": "rprompt-pinned",
+                "prompt_contract_hash": "sha256:" + "2" * 64,
+                "route_token_ref": "rtok-" + "3" * 32,
+            },
+        )
+
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            with self.assertRaisesRegex(ValueError, "route_id"):
+                invoke_agent_run(
+                    run,
+                    prompt="must not dispatch",
+                    route=RoutePromptContract(route_id="route-conflicting"),
+                )
+        invoke_cli.assert_not_called()
+
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            invoke_cli.side_effect = lambda request: AIInvocationResult(
+                request=request,
+                status="completed",
+            )
+            result = invoke_agent_run(
+                run,
+                prompt="matching route dispatch",
+                route=RoutePromptContract(route_id="route-pinned"),
+            )
+        self.assertEqual(result.request.route.route_id, "route-pinned")
+        self.assertEqual(
+            result.request.route.route_context_hash,
+            "sha256:" + "1" * 64,
+        )
+        invoke_cli.assert_called_once()
+
     def test_agent_run_adapter_dispatches_cli_api_and_external_local_routes(self):
         from ai_invocation import AIInvocationResult, invoke_agent_run
         from cli_agent_service.config import resolve_agent_config

@@ -151,6 +151,41 @@ class RoutePromptContract:
         }
 
 
+_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _merge_pinned_route_identity(
+    pinned: RoutePromptContract,
+    supplied: RoutePromptContract,
+) -> RoutePromptContract:
+    conflicts = [
+        field_name
+        for field_name in _ROUTE_IDENTITY_FIELDS
+        if getattr(pinned, field_name)
+        and getattr(supplied, field_name)
+        and getattr(pinned, field_name) != getattr(supplied, field_name)
+    ]
+    if conflicts:
+        raise ValueError(
+            "supplied route identity conflicts with pinned AgentRun fields: {}".format(
+                ", ".join(conflicts)
+            )
+        )
+    return RoutePromptContract(
+        **{
+            field_name: getattr(pinned, field_name) or getattr(supplied, field_name)
+            for field_name in _ROUTE_IDENTITY_FIELDS
+        }
+    )
+
+
 @dataclass
 class AIInvocationRequest:
     role: str
@@ -189,25 +224,7 @@ class AIInvocationRequest:
         }
         pinned_route = RoutePromptContract.from_mapping(governance_refs)
         supplied_route = route or RoutePromptContract()
-        effective_route = RoutePromptContract(
-            route_id=supplied_route.route_id or pinned_route.route_id,
-            route_context_hash=(
-                supplied_route.route_context_hash or pinned_route.route_context_hash
-            ),
-            prompt_contract_id=(
-                supplied_route.prompt_contract_id or pinned_route.prompt_contract_id
-            ),
-            prompt_contract_hash=(
-                supplied_route.prompt_contract_hash or pinned_route.prompt_contract_hash
-            ),
-            route_token_ref=(
-                supplied_route.route_token_ref or pinned_route.route_token_ref
-            ),
-            visible_injection_manifest_hash=(
-                supplied_route.visible_injection_manifest_hash
-                or pinned_route.visible_injection_manifest_hash
-            ),
-        )
+        effective_route = _merge_pinned_route_identity(pinned_route, supplied_route)
         request_metadata = dict(metadata or {})
         request_metadata["cli_agent_service"] = {
             "schema_version": "cli_agent_service.invocation_adapter.v1",

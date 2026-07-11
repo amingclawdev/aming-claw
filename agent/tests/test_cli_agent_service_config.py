@@ -181,6 +181,39 @@ def test_role_precedes_project_and_keeps_routing_tuple_coherent():
     )
 
 
+def test_final_routing_cannot_conflict_with_selected_profile_or_credential():
+    from cli_agent_service.config import resolve_agent_config
+
+    with pytest.raises(ValueError, match="selected immutable profile.*provider"):
+        resolve_agent_config(
+            run_id="run-profile-conflict",
+            role="dev",
+            project_id="aming-claw",
+            profile=_profile(),
+            request_overrides={
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "backend_mode": "claude_cli",
+                "auth_mode": "cli_auth",
+            },
+        )
+
+    matching = resolve_agent_config(
+        run_id="run-profile-match",
+        role="dev",
+        project_id="aming-claw",
+        profile=_profile(),
+        request_overrides={
+            "provider": "openai",
+            "model": "gpt-5.5-codex",
+            "backend_mode": "codex_cli",
+            "auth_mode": "cli_auth",
+        },
+    )
+    assert matching.config.model == "gpt-5.5-codex"
+    assert matching.config.credential_ref == "credential:codex-home:dev"
+
+
 def test_pipeline_role_precedes_default_and_compatibility_defaults():
     from cli_agent_service.config import resolve_agent_config
 
