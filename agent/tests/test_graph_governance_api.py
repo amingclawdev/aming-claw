@@ -43457,6 +43457,82 @@ def test_runtime_context_read_receipt_atomically_advances_canonical_contract(
     assert canonical_line["timeline_projection_authoritative"] is False
 
 
+def test_runtime_context_read_receipt_resolves_source_backed_contract_when_revision_omits_id(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-CANONICAL-READ-RESOLVED"
+    worker_task_id = "contract-canonical-read-resolved-worker"
+    worker_token = "contract-canonical-read-resolved-token"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="contract-canonical-read-resolved-parent",
+            worker_task_id=worker_task_id,
+            fence_token="fence-contract-canonical-read-resolved",
+            token=worker_token,
+            worktree_path=str(worker_root),
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-contract-canonical-read-resolved-missing-id",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity={
+            "route_id": "route-contract-canonical-read-resolved",
+            "route_context_hash": "sha256:route-contract-canonical-read-resolved",
+            "prompt_contract_id": "rprompt-contract-canonical-read-resolved",
+            "prompt_contract_hash": "sha256:prompt-contract-canonical-read-resolved",
+            "route_token_ref": "rtok-contract-canonical-read-resolved",
+        },
+    )
+    conn.commit()
+
+    response = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": "fence-contract-canonical-read-resolved",
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worker_root),
+                "actor": runtime_context.worker_slot_id,
+                "read_receipt_hash": "sha256:contract-canonical-read-resolved",
+                "launch_text_hash": "sha256:contract-canonical-launch-resolved",
+            },
+        )
+    )
+
+    canonical_line = response["contract_runtime_canonical_line"]
+    assert canonical_line["accepted"] is True
+    assert canonical_line["status"] == "completed"
+    assert canonical_line["contract_execution_id"] == contract_execution_id
+    contract_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_record["completed_lines"][-1]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert contract_record["completed_lines"][-1]["payload"][
+        "runtime_context_id"
+    ] == runtime_context.runtime_context_id
+
+
 def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fails(
     conn,
     tmp_path,

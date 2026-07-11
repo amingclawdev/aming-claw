@@ -19289,11 +19289,43 @@ def _runtime_context_submit_canonical_contract_line(
     contract_identity = _runtime_context_contract_execution_identity(
         revision_payload,
     )
-    execution_id = str(
-        contract_execution_id
-        or contract_identity.get("contract_execution_id")
-        or ""
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
     ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    resolved_identity, contract_execution_resolution = (
+        _runtime_context_resolve_contract_execution_identity(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            contract_identity=contract_identity,
+        )
+    )
+    resolved_execution_id = str(
+        resolved_identity.get("contract_execution_id") or ""
+    ).strip()
+    supplied_execution_id = str(contract_execution_id or "").strip()
+    if (
+        resolved_execution_id
+        and supplied_execution_id
+        and supplied_execution_id != resolved_execution_id
+    ):
+        raise GovernanceError(
+            "contract_runtime_execution_identity_mismatch",
+            "supplied contract execution does not match the source-backed worker lineage",
+            422,
+            {
+                "supplied_contract_execution_id": supplied_execution_id,
+                "resolved_contract_execution_id": resolved_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "contract_execution_resolution": contract_execution_resolution,
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
+    execution_id = resolved_execution_id or supplied_execution_id
     if not execution_id:
         return {
             "schema_version": "runtime_context.canonical_contract_line.v1",
@@ -19301,6 +19333,7 @@ def _runtime_context_submit_canonical_contract_line(
             "status": "compatibility_no_contract_execution",
             "canonical": False,
             "line_id": line_id,
+            "contract_execution_resolution": contract_execution_resolution,
         }
 
     runtime = _contract_runtime(conn)
@@ -19330,10 +19363,6 @@ def _runtime_context_submit_canonical_contract_line(
             },
         ) from exc
 
-    runtime_context_id = str(
-        getattr(context, "runtime_context_id", "") or ""
-    ).strip()
-    task_id = str(getattr(context, "task_id", "") or "").strip()
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
             continue
