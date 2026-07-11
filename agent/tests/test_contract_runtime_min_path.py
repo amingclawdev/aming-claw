@@ -8,6 +8,7 @@ import pytest
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.hash import file_sha256
 from agent.governance.contracts.runtime import (
+    _mf_parallel_worker_commit_errors,
     ContractRuntimeError,
     read_backlog_contract_chain_current,
     rebuild_backlog_contract_chain_projection,
@@ -15,6 +16,118 @@ from agent.governance.contracts.runtime import (
     StalePinnedContractExecutionError,
     upsert_contract_chain_successor_binding,
 )
+
+
+def test_projected_record_exposes_non_persistent_lines_to_worker_commit_lineage(
+    tmp_path,
+):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="mf_parallel.v2",
+        stages=[
+            {
+                "stage_id": "worker_implementation",
+                "lines": [
+                    {
+                        "line_id": "worker_implementation",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "implementation",
+                    }
+                ],
+            },
+            {
+                "stage_id": "worker_commit",
+                "lines": [
+                    {
+                        "line_id": "worker_commit",
+                        "owner_role": "mf_sub",
+                        "allowed_writer_roles": ["mf_sub"],
+                        "evidence_kind": "worker_commit",
+                        "requires": ["worker_implementation"],
+                    }
+                ],
+            },
+        ],
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+        store=SQLiteContractExecutionStore(conn),
+    )
+    record = runtime.start_execution(
+        "mf_parallel.v2",
+        project_id="aming-claw",
+        backlog_id="AC-PROJECTED-WORKER-COMMIT-LINEAGE",
+        contract_execution_id="cex-projected-worker-commit-lineage",
+        actor_role="observer",
+    )
+    identity = {
+        "runtime_context_id": "mfrctx-projected-worker-commit",
+        "task_id": "task-projected-worker-commit",
+        "parent_task_id": "cex-projected-worker-commit-lineage",
+        "worker_id": "worker-projected-worker-commit",
+        "worker_slot_id": "worker-projected-worker-commit",
+        "worker_session_id": "session-projected-worker-commit",
+        "actor_session_principal": "session-projected-worker-commit",
+        "filer_principal": "session-projected-worker-commit",
+        "implementation_event_ref": "timeline:implementation",
+        "target_project_root": str(tmp_path),
+        "session_token_ref": "wstok-projected-worker-commit",
+        "fence_token_hash": "sha256:fence",
+        "worker_role": "mf_sub",
+        "evidence_owner_role": "mf_sub",
+        "owned_files": ["agent/governance/contracts/runtime.py"],
+        "changed_files": ["agent/governance/contracts/runtime.py"],
+        "commit_diff_files": ["agent/governance/contracts/runtime.py"],
+        "graph_trace_ids": ["gqt-projected-worker-commit"],
+        "db_verified": True,
+        "clean_worktree": True,
+        "dirty_files": [],
+        "commit_sha": "a" * 40,
+        "head_commit": "a" * 40,
+        "immutable_head_commit": "a" * 40,
+        "validated_head_commit": "a" * 40,
+        "observer_impersonation": False,
+    }
+    projected_line = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "payload": {
+            "runtime_context_id": identity["runtime_context_id"],
+            "task_id": identity["task_id"],
+            "worker_id": identity["worker_id"],
+            "worker_slot_id": identity["worker_slot_id"],
+            "changed_files": identity["changed_files"],
+            "graph_trace_ids": identity["graph_trace_ids"],
+        },
+    }
+
+    projected = runtime.projected_record(
+        record["contract_execution_id"],
+        actor_role="mf_sub",
+        completed_lines=[projected_line],
+    )
+    write = {
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "commit_sha": identity["commit_sha"],
+        "payload": identity,
+    }
+
+    assert projected["completed_lines"] == [projected_line]
+    assert runtime.store.get(record["contract_execution_id"])["completed_lines"] == []
+    assert _mf_parallel_worker_commit_errors(
+        projected,
+        write,
+        actor_role="mf_sub",
+    ) == ()
 
 
 def _write_minimal_contract(tmp_path, *, status: str = "active"):

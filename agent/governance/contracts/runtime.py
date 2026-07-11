@@ -3272,6 +3272,7 @@ class ContractRuntime:
         )
         _attach_precheck_decision(guide, current_precheck.to_dict())
         view = deepcopy(dict(record))
+        view["completed_lines"] = deepcopy(line_items)
         view["execution_state"] = state
         view["runtime_guide"] = guide
         view["precheck_decision"] = current_precheck.to_dict()
