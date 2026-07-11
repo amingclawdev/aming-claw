@@ -15966,6 +15966,7 @@ def _runtime_context_implementation_event_route_identity(
     runtime_context_id: str,
     context,
     parent_route_identity: Mapping[str, Any],
+    contract_execution_id: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     token = _runtime_context_child_route_token(body.get("route_token"))
     if not token:
@@ -15979,6 +15980,7 @@ def _runtime_context_implementation_event_route_identity(
                     body,
                     project_id=project_id,
                     context=context,
+                    contract_execution_id=contract_execution_id,
                 )
             except _orc.RouteTokenRefError as exc:
                 raise GovernanceError(
@@ -16021,6 +16023,7 @@ def _runtime_context_resolve_implementation_route_token_ref(
     *,
     project_id: str,
     context,
+    contract_execution_id: str = "",
 ) -> dict | None:
     """Resolve implementation-evidence refs across child and parent scopes.
 
@@ -16044,6 +16047,7 @@ def _runtime_context_resolve_implementation_route_token_ref(
     candidates = _runtime_context_service_dedupe(
         [
             str(getattr(context, "task_id", "") or ""),
+            str(contract_execution_id or ""),
             str(body.get("parent_task_id") or ""),
             str(getattr(context, "root_task_id", "") or ""),
             backlog_id,
@@ -20128,6 +20132,16 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         contract_execution_identity = _runtime_context_contract_execution_identity(
             revision_payload
         )
+        contract_execution_identity, _contract_execution_resolution = (
+            _runtime_context_resolve_contract_execution_identity(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                task_id=str(getattr(context, "task_id", "") or ""),
+                contract_identity=contract_execution_identity,
+            )
+        )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
             route_identity,
@@ -20803,6 +20817,9 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             runtime_context_id=runtime_context_id,
             context=context,
             parent_route_identity=parent_route_identity,
+            contract_execution_id=str(
+                contract_execution_identity.get("contract_execution_id") or ""
+            ),
         )
     )
 

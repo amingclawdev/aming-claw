@@ -5705,6 +5705,76 @@ def test_runtime_context_implementation_evidence_accepts_parent_bound_route_ref(
     )
 
 
+def test_runtime_context_implementation_route_ref_resolves_active_contract_execution_scope(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-RUNTIME-CONTEXT-CONTRACT-SCOPED-ROUTE-REF"
+    worker_task_id = "runtime-contract-scoped-route-worker"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="runtime-contract-scoped-route-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-runtime-contract-scoped-route",
+        token="session-runtime-contract-scoped-route",
+        worktree_path=str(worker_root),
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=[f"contract_runtime:{contract_execution_id}"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    route_identity = {
+        "route_id": issued["route_id"],
+        "route_context_hash": issued["route_context_hash"],
+        "prompt_contract_id": issued["prompt_contract_id"],
+        "prompt_contract_hash": issued["route_token"]["prompt_contract_hash"],
+        "visible_injection_manifest_hash": issued[
+            "visible_injection_manifest_hash"
+        ],
+        "route_token_ref": issued["route_token_ref"],
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-contract-scoped-route-missing-id",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+    )
+    conn.commit()
+
+    resolved = server._runtime_context_resolve_implementation_route_token_ref(
+        {
+            **route_identity,
+            "parent_task_id": context.parent_task_id,
+        },
+        project_id=PID,
+        context=context,
+        contract_execution_id=contract_execution_id,
+    )
+
+    assert resolved is not None
+    assert resolved["route_token_ref"] == issued["route_token_ref"]
+    assert resolved["scope"]["task_id"] == contract_execution_id
+    assert resolved["scope"]["backlog_id"] == backlog_id
+
+
 def test_runtime_context_implementation_evidence_rejects_empty_or_fake_graph_trace_ids(
     conn,
     tmp_path,
