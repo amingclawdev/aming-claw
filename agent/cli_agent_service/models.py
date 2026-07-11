@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Iterable, Mapping
 
 
@@ -16,6 +17,9 @@ AGENT_PROFILE_SCHEMA_VERSION = "cli_agent_service.agent_profile.v1"
 RESOLVED_CONFIG_SCHEMA_VERSION = "cli_agent_service.resolved_config.v1"
 AGENT_RUN_SCHEMA_VERSION = "cli_agent_service.agent_run.v1"
 GOVERNANCE_REF_SCHEMA_VERSION = "cli_agent_service.governance_ref.v1"
+REGISTRY_LEASE_SCHEMA_VERSION = "cli_agent_service.registry_lease.v1"
+REGISTRY_RUN_SCHEMA_VERSION = "cli_agent_service.registry_run.v1"
+RECONCILIATION_SCHEMA_VERSION = "cli_agent_service.reconciliation.v1"
 
 PUBLIC_CONFIGURATION_FIELDS = (
     "profile_id",
@@ -490,3 +494,132 @@ class AgentRun:
             },
             "raw_credential_material_exposed": False,
         }
+
+
+class RunState(str, Enum):
+    """Host execution states; these values never imply governance progress."""
+
+    REGISTERED = "registered"
+    LEASED = "leased"
+    RUNNING = "running"
+    LIVE = "live"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    LOST = "lost"
+    ORPHANED = "orphaned"
+
+
+@dataclass(frozen=True)
+class RegistryLease:
+    lease_id: str
+    run_id: str
+    profile_id: str
+    owner_id: str
+    status: str
+    acquired_at: str
+    expires_at: str
+    heartbeat_at: str = ""
+    released_at: str = ""
+    schema_version: str = field(default=REGISTRY_LEASE_SCHEMA_VERSION, init=False)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "lease_id": self.lease_id,
+            "run_id": self.run_id,
+            "profile_id": self.profile_id,
+            "owner_id": self.owner_id,
+            "status": self.status,
+            "acquired_at": self.acquired_at,
+            "expires_at": self.expires_at,
+            "heartbeat_at": self.heartbeat_at,
+            "released_at": self.released_at,
+        }
+
+
+@dataclass(frozen=True)
+class RegistryRun:
+    run: AgentRun
+    state: str
+    pid: int | None = None
+    process_start_identity: str = ""
+    process_group_id: int | None = None
+    argv_hash: str = ""
+    last_heartbeat_at: str = ""
+    lease: RegistryLease | None = None
+    evidence_refs: tuple[GovernanceRef, ...] = ()
+    exit_code: int | None = None
+    failure_category: str = ""
+    updated_at: str = ""
+    schema_version: str = field(default=REGISTRY_RUN_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        normalized_state = str(self.state or "").strip().lower()
+        if normalized_state not in {item.value for item in RunState}:
+            raise ValueError("invalid registry run state: {}".format(self.state))
+        object.__setattr__(self, "state", normalized_state)
+        object.__setattr__(self, "evidence_refs", _governance_refs(self.evidence_refs))
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run": self.run.to_public_dict(),
+            "state": self.state,
+            "pid": self.pid,
+            "process_start_identity": self.process_start_identity,
+            "process_group_id": self.process_group_id,
+            "argv_hash": self.argv_hash,
+            "last_heartbeat_at": self.last_heartbeat_at,
+            "lease": self.lease.to_public_dict() if self.lease else None,
+            "evidence_refs": {ref.name: ref.value for ref in self.evidence_refs},
+            "exit_code": self.exit_code,
+            "failure_category": self.failure_category,
+            "updated_at": self.updated_at,
+            "operational_state_only": True,
+            "governance_authority": False,
+        }
+
+
+@dataclass(frozen=True)
+class ProcessObservation:
+    alive: bool
+    start_identity: str = ""
+    exit_code: int | None = None
+    observable: bool = True
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    run_id: str
+    classification: str
+    previous_state: str
+    process_identity_match: bool = False
+    detail: str = ""
+    schema_version: str = field(default=RECONCILIATION_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        if self.classification not in {
+            RunState.LIVE.value,
+            RunState.COMPLETED.value,
+            RunState.FAILED.value,
+            RunState.LOST.value,
+            RunState.ORPHANED.value,
+        }:
+            raise ValueError("invalid reconciliation classification")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "classification": self.classification,
+            "previous_state": self.previous_state,
+            "process_identity_match": self.process_identity_match,
+            "detail": self.detail,
+            "operational_state_only": True,
+            "governance_authority": False,
+        }
+
+
+# Descriptive aliases retained for callers that name the persisted shape explicitly.
+RegistryRunRecord = RegistryRun
+LeaseState = RegistryLease
