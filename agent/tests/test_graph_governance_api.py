@@ -43456,6 +43456,67 @@ def test_runtime_context_worker_guide_projects_canonical_worker_commit_after_imp
     assert worker_guide["next_legal_action"] == "record_worker_commit"
     assert worker_guide["next_required_evidence"] == expected_next_required_evidence
 
+    _implementation_payload, worker_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            runtime_context,
+            parent_task_id=backlog_id,
+            graph_trace_id=graph_trace_id,
+            head_commit=head_commit,
+            implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+        )
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
+    record = runtime.store.get(successor["contract_execution_id"])
+    write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    write["payload"] = worker_commit_payload
+    write.update(worker_commit_payload)
+    write["commit_sha"] = head_commit
+    assert runtime.submit_line_write(
+        successor["contract_execution_id"],
+        write,
+        actor_role="mf_sub",
+    )["ok"] is True
+    conn.commit()
+
+    finish_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                query=query,
+            )
+        )
+    )
+    finish_next = finish_guide["contract_runtime_next_legal_action"]
+    assert finish_next["line_id"] == "worker_finish_time_attestation"
+    writer_safe_copy = finish_next["writer_role_safe_copy_payload"]
+    copy_payload = writer_safe_copy["copy_payload"]
+    assert copy_payload["contract_execution_id"] == successor["contract_execution_id"]
+    assert copy_payload["stage_id"] == finish_next["stage_id"]
+    assert copy_payload["line_id"] == finish_next["line_id"]
+    assert copy_payload["execution_state_revision"] == finish_next[
+        "execution_state_revision"
+    ]
+    assert copy_payload["runtime_guide_hash"] == finish_next[
+        "submit_line_guidance"
+    ]["current_required_runtime_guide_hash"]
+    assert finish_guide["worker_guide"][
+        "contract_runtime_next_legal_action"
+    ]["writer_role_safe_copy_payload"] == writer_safe_copy
+    serialized_safe_copy = json.dumps(writer_safe_copy, sort_keys=True)
+    assert '"session_token":' not in serialized_safe_copy
+    assert '"fence_token":' not in serialized_safe_copy
+    assert '"route_token":' not in serialized_safe_copy
+
 
 def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
     conn,

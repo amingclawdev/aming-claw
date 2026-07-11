@@ -42100,6 +42100,9 @@ def _runtime_next_action_from_guide(
     ):
         if key in next_line:
             result[key] = next_line[key]
+    writer_safe_copy = guide.get("writer_role_safe_copy_payload")
+    if isinstance(writer_safe_copy, Mapping):
+        result["writer_role_safe_copy_payload"] = dict(writer_safe_copy)
     bridge_guidance = _contract_runtime_mf_sub_host_bridge_guidance(guide)
     if bridge_guidance:
         result["mf_sub_host_bridge_guidance"] = bridge_guidance
