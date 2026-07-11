@@ -391,6 +391,20 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
         ["prior.py"],
         ["current.py"],
     )
+    assert server._runtime_context_finish_changed_files(
+        str(worktree),
+        base_commit=base_commit,
+        head_commit=current_commit,
+        canonical_worker_commit_required=True,
+        include_worktree=True,
+    ) == ["current.py"]
+    assert server._runtime_context_finish_changed_files(
+        str(worktree),
+        base_commit=base_commit,
+        head_commit=current_commit,
+        canonical_worker_commit_required=False,
+        include_worktree=False,
+    ) == ["current.py", "prior.py"]
 
 
 def test_worker_commit_startup_principal_ignores_contract_guide_placeholder():

@@ -19813,6 +19813,37 @@ def _runtime_context_worker_commit_diff_matches(
     )
 
 
+def _runtime_context_finish_changed_files(
+    worktree_path: str,
+    *,
+    base_commit: str,
+    head_commit: str,
+    canonical_worker_commit_required: bool,
+    include_worktree: bool,
+) -> list[str]:
+    from . import batch_jobs
+
+    if canonical_worker_commit_required:
+        return list(
+            _runtime_context_worker_commit_revision_diff(
+                worktree_path,
+                head_commit,
+            )["changed_files"]
+        )
+    if not base_commit:
+        return []
+    changed_files_fn = (
+        batch_jobs.git_changed_files_with_worktree
+        if include_worktree
+        else batch_jobs.git_changed_files
+    )
+    return changed_files_fn(
+        worktree_path,
+        base_ref=base_commit,
+        head_ref=head_commit or "HEAD",
+    )
+
+
 def _runtime_context_contract_worker_commit_projection(
     conn,
     *,
@@ -20369,12 +20400,25 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         finish_order_projection: dict[str, Any] = {}
         head_commit = actual_head or str(body.get("head_commit") or context.head_commit or "")
         changed_files: list[str] = []
-        if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+        contract_execution_id = str(
+            contract_execution_identity.get("contract_execution_id") or ""
+        )
+        canonical_worker_commit_required = (
+            _runtime_context_contract_requires_worker_commit(
+                conn,
+                contract_execution_id,
+            )
+        )
+        if worktree_path and os.path.exists(worktree_path):
             try:
-                changed_files = batch_jobs.git_changed_files_with_worktree(
+                changed_files = _runtime_context_finish_changed_files(
                     worktree_path,
-                    base_ref=context.base_commit,
-                    head_ref=head_commit or "HEAD",
+                    base_commit=str(context.base_commit or ""),
+                    head_commit=head_commit,
+                    canonical_worker_commit_required=(
+                        canonical_worker_commit_required
+                    ),
+                    include_worktree=True,
                 )
             except batch_jobs.BatchJobError:
                 changed_files = []
@@ -22309,22 +22353,26 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 raise ValidationError("head_commit does not match assigned worktree HEAD")
             validated_head = actual_head or claimed_head or context.head_commit
             actual_changed_files: list[str] = []
-            if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+            if worktree_path and os.path.exists(worktree_path):
                 try:
-                    if runtime_context_lane and not finish_order_projection.get(
-                        "canonical_worker_commit_required"
-                    ):
-                        actual_changed_files = batch_jobs.git_changed_files_with_worktree(
-                            worktree_path,
-                            base_ref=context.base_commit,
-                            head_ref=validated_head or "HEAD",
+                    canonical_worker_commit_required = bool(
+                        runtime_context_lane
+                        and finish_order_projection.get(
+                            "canonical_worker_commit_required"
                         )
-                    else:
-                        actual_changed_files = batch_jobs.git_changed_files(
-                            worktree_path,
-                            base_ref=context.base_commit,
-                            head_ref=validated_head or "HEAD",
-                        )
+                    )
+                    actual_changed_files = _runtime_context_finish_changed_files(
+                        worktree_path,
+                        base_commit=str(context.base_commit or ""),
+                        head_commit=validated_head,
+                        canonical_worker_commit_required=(
+                            canonical_worker_commit_required
+                        ),
+                        include_worktree=(
+                            bool(runtime_context_lane)
+                            and not canonical_worker_commit_required
+                        ),
+                    )
                 except batch_jobs.BatchJobError:
                     actual_changed_files = []
             if actual_changed_files:
