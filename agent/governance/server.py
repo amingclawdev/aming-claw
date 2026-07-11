@@ -43742,6 +43742,15 @@ def _contract_runtime_projection_for_context(
             break
         if not isinstance(source, Mapping) or not source.get("source_ref"):
             break
+        if source_key in {
+            "finish_time_worker_attestation",
+            "finish_gate",
+            "review_ready",
+        } and not _contract_runtime_projected_worker_source_owned(
+            context=context,
+            source=source,
+        ):
+            break
         line = _contract_runtime_projected_worker_line(
             record=record,
             context=context,
@@ -44508,6 +44517,23 @@ def _contract_runtime_projection_source_map(
         "review_ready",
     )
     finish_ref = str(timeline_refs.get("finish_event_ref") or "").strip()
+    attestation_event = _contract_runtime_projection_event_for_ref(
+        timeline_events,
+        attestation_ref,
+    )
+    finish_event = _contract_runtime_projection_event_for_ref(
+        timeline_events,
+        finish_ref,
+    )
+    review_ready_event = _contract_runtime_projection_event_for_ref(
+        timeline_events,
+        review_ready_ref or finish_ref,
+    )
+    finish_source_payload = (
+        finish_payload.get("payload")
+        if isinstance(finish_payload.get("payload"), Mapping)
+        else finish_payload
+    )
     return {
         "read_receipt": {
             "source_ref": str(timeline_refs.get("read_receipt_event_ref") or ""),
@@ -44544,15 +44570,30 @@ def _contract_runtime_projection_source_map(
         },
         "finish_time_worker_attestation": {
             "source_ref": attestation_ref,
-            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+            "payload": (
+                dict(finish_source_payload)
+                if isinstance(finish_source_payload, Mapping)
+                else {}
+            ),
+            "source_event": attestation_event,
         },
         "finish_gate": {
             "source_ref": finish_ref,
-            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+            "payload": (
+                dict(finish_source_payload)
+                if isinstance(finish_source_payload, Mapping)
+                else {}
+            ),
+            "source_event": finish_event,
         },
         "review_ready": {
             "source_ref": review_ready_ref or finish_ref,
-            "payload": dict(finish_payload) if isinstance(finish_payload, Mapping) else {},
+            "payload": (
+                dict(finish_source_payload)
+                if isinstance(finish_source_payload, Mapping)
+                else {}
+            ),
+            "source_event": review_ready_event,
         },
     }
 
@@ -44564,6 +44605,19 @@ def _contract_runtime_finish_time_worker_attestation_ref(
         if _runtime_context_is_finish_time_worker_attestation_event(event):
             return _runtime_context_event_ref(event)
     return ""
+
+
+def _contract_runtime_projection_event_for_ref(
+    timeline_events: Sequence[Mapping[str, Any]],
+    source_ref: str,
+) -> dict[str, Any]:
+    wanted = str(source_ref or "").strip()
+    if not wanted:
+        return {}
+    for event in timeline_events:
+        if _runtime_context_event_ref(event) == wanted:
+            return dict(event)
+    return {}
 
 
 def _contract_runtime_timeline_ref_for_token(
@@ -44620,6 +44674,7 @@ def _contract_runtime_projected_worker_line(
     )
     graph_trace_ids = list(graph_refs.get("verified_trace_ids") or [])
     head_commit = _contract_runtime_projected_worker_head_commit(
+        context=context,
         source=source,
         source_key=source_key,
         timeline_refs=timeline_refs,
@@ -44684,6 +44739,7 @@ def _contract_runtime_projected_worker_line(
 
 def _contract_runtime_projected_worker_head_commit(
     *,
+    context: Any,
     source: Mapping[str, Any],
     source_key: str,
     timeline_refs: Mapping[str, Any],
@@ -44697,6 +44753,11 @@ def _contract_runtime_projected_worker_head_commit(
         "review_ready",
     }:
         return timeline_commit
+    if not _contract_runtime_projected_worker_source_owned(
+        context=context,
+        source=source,
+    ):
+        return ""
 
     source_payload = (
         source.get("payload") if isinstance(source.get("payload"), Mapping) else {}
@@ -44723,7 +44784,67 @@ def _contract_runtime_projected_worker_head_commit(
         if timeline_commit and timeline_commit != source_commit:
             return ""
         return source_commit
-    return timeline_commit
+    return ""
+
+
+def _contract_runtime_projected_worker_source_owned(
+    *,
+    context: Any,
+    source: Mapping[str, Any],
+) -> bool:
+    source_event = (
+        source.get("source_event")
+        if isinstance(source.get("source_event"), Mapping)
+        else {}
+    )
+    source_payload = (
+        source.get("payload") if isinstance(source.get("payload"), Mapping) else {}
+    )
+    expected_identities = {
+        str(value).strip()
+        for value in (
+            getattr(context, "worker_id", ""),
+            getattr(context, "worker_slot_id", ""),
+            getattr(context, "actual_host_worker_id", ""),
+            getattr(context, "host_session_id", ""),
+            getattr(context, "host_startup_id", ""),
+        )
+        if str(value or "").strip()
+    }
+    event_actor = str(source_event.get("actor") or "").strip()
+    event_principal = (
+        event_actor.split(":", 1)[1]
+        if event_actor.startswith("mf_sub:") and ":" in event_actor
+        else event_actor
+    )
+    worker_role = str(source_payload.get("worker_role") or "").strip().lower()
+    meta_contract_gate = (
+        source_payload.get("meta_contract_gate")
+        if isinstance(source_payload.get("meta_contract_gate"), Mapping)
+        else {}
+    )
+    meta_contract_role = str(meta_contract_gate.get("role") or "").strip().lower()
+    meta_contract_status = str(meta_contract_gate.get("status") or "").strip().lower()
+    source_identities = {
+        str(source_payload.get(key) or "").strip()
+        for key in (
+            "worker_id",
+            "worker_slot_id",
+            "worker_session_id",
+            "filer_principal",
+            "actor_session_principal",
+        )
+        if str(source_payload.get(key) or "").strip()
+    }
+    return bool(
+        expected_identities
+        and (event_principal in expected_identities or event_actor == "mf_sub")
+        and worker_role == "mf_sub"
+        and meta_contract_role == "mf_sub"
+        and meta_contract_status in {"accepted", "ok", "pass", "passed"}
+        and source_identities
+        and source_identities.issubset(expected_identities)
+    )
 
 
 def _contract_runtime_projection_line_keys(

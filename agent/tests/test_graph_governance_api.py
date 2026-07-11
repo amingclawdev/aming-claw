@@ -42101,7 +42101,7 @@ def _record_mf_parallel_runtime_context_worker_evidence(
         event_kind="finish_time_worker_attestation",
         phase="worker_attestation",
         status="passed",
-        actor="mf_sub:runtime-context-worker",
+        actor="mf_sub",
         payload={
             "schema_version": "runtime_context.finish_time_worker_attestation.v1",
             "action": "record_finish_time_worker_attestation",
@@ -42109,6 +42109,10 @@ def _record_mf_parallel_runtime_context_worker_evidence(
             "task_id": runtime_context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
+            "worker_id": runtime_context.worker_id,
+            "worker_slot_id": runtime_context.worker_slot_id,
+            "worker_session_id": runtime_context.worker_slot_id,
+            "filer_principal": runtime_context.worker_slot_id,
             "graph_trace_ids": [graph_trace_id],
             "head_commit": head_commit,
             "finish_time_worker_self_attestation": {
@@ -42128,13 +42132,16 @@ def _record_mf_parallel_runtime_context_worker_evidence(
         event_kind="mf_subagent_finish_gate",
         phase="finish_gate",
         status="passed",
-        actor="mf_sub:runtime-context-worker",
+        actor="mf_sub",
         payload={
             "runtime_context_id": runtime_context.runtime_context_id,
             "task_id": runtime_context.task_id,
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
+            "worker_id": runtime_context.worker_id,
             "worker_slot_id": runtime_context.worker_slot_id,
+            "worker_session_id": runtime_context.worker_slot_id,
+            "filer_principal": runtime_context.worker_slot_id,
             "graph_trace_ids": [graph_trace_id],
             "head_commit": head_commit,
             "review_ready": True,
@@ -44657,7 +44664,14 @@ def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
         source_key="finish_gate",
         source={
             "source_ref": "timeline:finish-commit",
+            "source_event": {"actor": "worker-finish-commit"},
             "payload": {
+                "worker_role": "mf_sub",
+                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "worker_id": "worker-finish-commit",
+                "worker_slot_id": "worker-finish-commit",
+                "worker_session_id": "worker-finish-commit",
+                "filer_principal": "worker-finish-commit",
                 "head_commit": commit_sha,
                 "validated_head_commit": commit_sha,
                 "contract_worker_commit_evidence": {
@@ -44682,25 +44696,46 @@ def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
 
 
 @pytest.mark.parametrize(
-    ("source_payload", "timeline_refs"),
+    ("source_payload", "timeline_refs", "source_actor"),
     [
-        ({}, {}),
+        ({}, {"head_commit": "a" * 40}, "worker-finish-commit-blocked"),
         (
             {
+                "worker_role": "mf_sub",
+                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "worker_id": "worker-finish-commit-blocked",
                 "validated_head_commit": "a" * 40,
                 "head_commit": "b" * 40,
             },
             {},
+            "worker-finish-commit-blocked",
         ),
         (
-            {"validated_head_commit": "a" * 40},
+            {
+                "worker_role": "mf_sub",
+                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "worker_id": "worker-finish-commit-blocked",
+                "validated_head_commit": "a" * 40,
+            },
             {"head_commit": "b" * 40},
+            "worker-finish-commit-blocked",
+        ),
+        (
+            {
+                "worker_role": "mf_sub",
+                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "worker_id": "worker-finish-commit-blocked",
+                "validated_head_commit": "a" * 40,
+            },
+            {},
+            "observer",
         ),
     ],
 )
 def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(
     source_payload,
     timeline_refs,
+    source_actor,
 ):
     context = SimpleNamespace(
         runtime_context_id="mfrctx-finish-commit-blocked",
@@ -44719,6 +44754,7 @@ def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(
         source_key="finish_gate",
         source={
             "source_ref": "timeline:finish-commit-blocked",
+            "source_event": {"actor": source_actor},
             "payload": source_payload,
         },
         timeline_refs=timeline_refs,
