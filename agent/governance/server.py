@@ -19760,6 +19760,59 @@ def _runtime_context_cross_project_graph_contract_preflight(
         governance_conn.close()
 
 
+def _runtime_context_worker_commit_revision_diff(
+    worktree_path: str,
+    head_commit: str,
+) -> dict[str, Any]:
+    """Return the immutable single-commit diff for one worker revision."""
+
+    from . import batch_jobs
+
+    head = str(head_commit or "").strip()
+    if not worktree_path or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise GovernanceError(
+            "worker_commit_revision_boundary_invalid",
+            "worker_commit requires an immutable full HEAD before diff validation",
+            422,
+            {"head_commit": head, "fail_closed": True},
+        )
+    try:
+        parent = batch_jobs.git_commit(worktree_path, ref=f"{head}^")
+        changed_files = batch_jobs.git_changed_files(
+            worktree_path,
+            base_ref=parent,
+            head_ref=head,
+        )
+    except Exception as exc:
+        raise GovernanceError(
+            "worker_commit_revision_boundary_unresolved",
+            "worker_commit could not resolve the immutable revision parent",
+            422,
+            {
+                "head_commit": head,
+                "next_legal_action": "stop_and_report_worker_commit_revision_boundary",
+                "fail_closed": True,
+            },
+        ) from exc
+    return {
+        "head_commit": head,
+        "parent_commit": parent,
+        "changed_files": sorted(set(changed_files)),
+    }
+
+
+def _runtime_context_worker_commit_diff_matches(
+    commit_diff_files: list[str],
+    implementation_files: list[str],
+    supplied_changed_files: list[str],
+) -> bool:
+    committed = sorted(set(commit_diff_files))
+    return (
+        committed == sorted(set(implementation_files))
+        and committed == sorted(set(supplied_changed_files))
+    )
+
+
 def _runtime_context_contract_worker_commit_projection(
     conn,
     *,
@@ -19811,15 +19864,13 @@ def _runtime_context_contract_worker_commit_projection(
     dirty_files = (
         _runtime_context_git_dirty_files(worktree_path) if worktree_path else []
     )
-    committed_files = (
-        batch_jobs.git_changed_files(
-            worktree_path,
-            base_ref=str(getattr(context, "base_commit", "") or ""),
-            head_ref=actual_head or "HEAD",
-        )
-        if worktree_path and getattr(context, "base_commit", "")
-        else []
+    revision_diff = (
+        _runtime_context_worker_commit_revision_diff(worktree_path, actual_head)
+        if worktree_path and actual_head
+        else {}
     )
+    committed_files = list(revision_diff.get("changed_files") or [])
+    commit_parent = str(revision_diff.get("parent_commit") or "")
     recorded_files = _runtime_context_service_query_values(
         payload,
         "changed_files",
@@ -19828,6 +19879,9 @@ def _runtime_context_contract_worker_commit_projection(
         payload,
         "commit_diff_files",
     )
+    recorded_commit_parent = str(
+        payload.get("commit_parent_sha") or payload.get("diff_base_commit") or ""
+    ).strip()
     errors: list[str] = []
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
         errors.append("ContractRuntime worker_commit is missing a full commit SHA")
@@ -19839,6 +19893,8 @@ def _runtime_context_contract_worker_commit_projection(
         errors.append("current committed diff does not match ContractRuntime worker_commit")
     if set(recorded_diff_files) != set(recorded_files):
         errors.append("ContractRuntime worker_commit diff proof is internally inconsistent")
+    if recorded_commit_parent and recorded_commit_parent != commit_parent:
+        errors.append("ContractRuntime worker_commit revision parent drifted")
     if errors:
         raise GovernanceError(
             "contract_worker_commit_drift",
@@ -19852,6 +19908,8 @@ def _runtime_context_contract_worker_commit_projection(
                 "actual_worktree_head_commit": actual_head,
                 "recorded_changed_files": recorded_files,
                 "actual_changed_files": committed_files,
+                "recorded_commit_parent": recorded_commit_parent,
+                "actual_commit_parent": commit_parent,
                 "dirty_files": dirty_files,
                 "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
                 "next_legal_action": "stop_and_report_worker_commit_drift",
@@ -19870,6 +19928,8 @@ def _runtime_context_contract_worker_commit_projection(
         "task_id": str(getattr(context, "task_id", "") or ""),
         "worker_commit_sha": commit_sha,
         "head_commit": commit_sha,
+        "commit_parent_sha": commit_parent,
+        "diff_base_commit": commit_parent,
         "implementation_event_ref": str(
             payload.get("implementation_event_ref") or ""
         ),
@@ -20050,11 +20110,12 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 422,
                 {"dirty_files": dirty_files, "next_legal_action": "clean_worktree"},
             )
-        commit_diff_files = batch_jobs.git_changed_files(
+        revision_diff = _runtime_context_worker_commit_revision_diff(
             worktree_path,
-            base_ref=context.base_commit,
-            head_ref=actual_head,
+            actual_head,
         )
+        commit_parent_sha = str(revision_diff["parent_commit"])
+        commit_diff_files = list(revision_diff["changed_files"])
         owned_files = sorted(set(context.owned_files or context.target_files or ()))
         supplied_owned_files = sorted(
             set(_runtime_context_service_query_values(body, "owned_files"))
@@ -20064,9 +20125,10 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
         )
         if supplied_owned_files != owned_files:
             raise ValidationError("worker_commit owned_files must equal the allocated fence")
-        if (
-            sorted(commit_diff_files) != sorted(implementation_files)
-            or supplied_changed_files != sorted(commit_diff_files)
+        if not _runtime_context_worker_commit_diff_matches(
+            commit_diff_files,
+            implementation_files,
+            supplied_changed_files,
         ):
             raise ValidationError(
                 "worker_commit diff must exactly match worker_implementation changed_files"
@@ -20107,6 +20169,8 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "head_commit": actual_head,
             "immutable_head_commit": actual_head,
             "validated_head_commit": actual_head,
+            "commit_parent_sha": commit_parent_sha,
+            "diff_base_commit": commit_parent_sha,
             "clean_worktree": True,
             "dirty_files": [],
             "owned_files": owned_files,
@@ -20123,14 +20187,15 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
         }
         second_head = batch_jobs.git_commit(worktree_path)
         second_dirty_files = _runtime_context_git_dirty_files(worktree_path)
-        second_diff_files = batch_jobs.git_changed_files(
+        second_revision_diff = _runtime_context_worker_commit_revision_diff(
             worktree_path,
-            base_ref=context.base_commit,
-            head_ref=second_head,
+            second_head,
         )
+        second_diff_files = list(second_revision_diff["changed_files"])
         if (
             second_head != actual_head
             or second_dirty_files
+            or str(second_revision_diff["parent_commit"]) != commit_parent_sha
             or sorted(second_diff_files) != sorted(commit_diff_files)
         ):
             raise GovernanceError(

@@ -332,6 +332,67 @@ def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit
     ) == ()
 
 
+def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
+    worktree = tmp_path / "worker-commit-revision-diff"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Revision Test"],
+        cwd=worktree,
+        check=True,
+    )
+    (worktree / "base.py").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = batch_jobs.git_commit(worktree)
+
+    (worktree / "prior.py").write_text("prior revision\n", encoding="utf-8")
+    subprocess.run(["git", "add", "prior.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "prior revision"],
+        cwd=worktree,
+        check=True,
+    )
+    prior_commit = batch_jobs.git_commit(worktree)
+
+    (worktree / "current.py").write_text("current revision\n", encoding="utf-8")
+    subprocess.run(["git", "add", "current.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "current revision"],
+        cwd=worktree,
+        check=True,
+    )
+    current_commit = batch_jobs.git_commit(worktree)
+
+    revision_diff = server._runtime_context_worker_commit_revision_diff(
+        str(worktree),
+        current_commit,
+    )
+
+    assert revision_diff["parent_commit"] == prior_commit
+    assert revision_diff["changed_files"] == ["current.py"]
+    assert batch_jobs.git_changed_files(
+        worktree,
+        base_ref=base_commit,
+        head_ref=current_commit,
+    ) == ["current.py", "prior.py"]
+    assert server._runtime_context_worker_commit_diff_matches(
+        revision_diff["changed_files"],
+        ["current.py"],
+        ["current.py"],
+    )
+    assert not server._runtime_context_worker_commit_diff_matches(
+        revision_diff["changed_files"],
+        ["prior.py"],
+        ["current.py"],
+    )
+
+
 def test_worker_commit_startup_principal_ignores_contract_guide_placeholder():
     worker_session_id = "worker-session-from-startup-gate"
     startup_event = {
