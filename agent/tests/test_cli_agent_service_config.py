@@ -227,6 +227,97 @@ def test_existing_run_cannot_be_overridden_by_legacy_or_another_profile():
     assert resolved_again.config.provider == "openai"
 
 
+def test_existing_run_reuse_pins_project_and_role_identity():
+    from cli_agent_service.config import resolve_agent_config
+
+    original = resolve_agent_config(
+        run_id="run-pinned-identity",
+        role="dev",
+        project_id="aming-claw",
+        profile=_profile(),
+    )
+
+    with pytest.raises(ValueError, match="existing project_id"):
+        resolve_agent_config(
+            run_id=original.run_id,
+            role="dev",
+            project_id="other-project",
+            existing_run=original,
+        )
+    with pytest.raises(ValueError, match="existing role"):
+        resolve_agent_config(
+            run_id=original.run_id,
+            role="qa",
+            project_id="aming-claw",
+            existing_run=original,
+        )
+
+
+def test_missing_routing_fails_closed_and_fixture_must_be_explicit():
+    from cli_agent_service.config import resolve_agent_config
+
+    with pytest.raises(ValueError, match="missing routing fields"):
+        resolve_agent_config(
+            run_id="run-unresolved",
+            role="dev",
+            project_id="aming-claw",
+        )
+    with pytest.raises(ValueError, match="model"):
+        resolve_agent_config(
+            run_id="run-missing-model",
+            role="dev",
+            project_id="aming-claw",
+            compatibility_defaults={"provider": "openai"},
+        )
+
+    fixture_run = resolve_agent_config(
+        run_id="run-explicit-fixture",
+        role="test",
+        project_id="aming-claw",
+        compatibility_defaults={"provider": "fixture"},
+    )
+    assert fixture_run.config.provider == "fixture"
+    assert fixture_run.config.backend_mode == "fixture"
+    assert fixture_run.config.resolution_for("provider").source == (
+        "compatibility_defaults"
+    )
+
+
+def test_governance_refs_are_allowlisted_and_value_validated():
+    from cli_agent_service.config import resolve_agent_config
+
+    run = resolve_agent_config(
+        run_id="run-safe-refs",
+        role="dev",
+        project_id="aming-claw",
+        profile=_profile(),
+        governance_refs={
+            "runtime_context_id": "mfrctx-example",
+            "timeline_ref": "timeline:123",
+        },
+    )
+    assert run.to_public_dict()["governance_refs"] == {
+        "runtime_context_id": "mfrctx-example",
+        "timeline_ref": "timeline:123",
+    }
+
+    unsafe_refs = (
+        {"session_token": "raw-secret-value"},
+        {"credential": "sk-secret-value"},
+        {"runtime_context_id": "raw-secret-value"},
+        {"session_token_ref": "raw-secret-value"},
+    )
+    for governance_refs in unsafe_refs:
+        with pytest.raises(ValueError, match="governance reference"):
+            resolve_agent_config(
+                run_id="run-unsafe-ref",
+                role="dev",
+                project_id="aming-claw",
+                profile=_profile(),
+                governance_refs=governance_refs,
+            )
+
+
 def test_profile_role_and_project_policy_fail_closed():
     from cli_agent_service.config import resolve_agent_config
 

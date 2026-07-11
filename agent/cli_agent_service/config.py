@@ -29,6 +29,13 @@ _ROUTING_FIELDS = (
     "auth_mode",
     "output_policy",
 )
+_FIXTURE_AUTHORITY_SOURCES = (
+    "agent_profile",
+    "project_config.ai.routing.",
+    "pipeline_config.roles.",
+    "pipeline_config.default",
+    "compatibility_defaults",
+)
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -103,9 +110,39 @@ def _selected_resolution(
     )
 
 
-def _validate_routing(resolved: Mapping[str, str]) -> None:
-    if not resolved.get("backend_mode"):
-        return
+def _validate_routing(
+    resolved: Mapping[str, str],
+    resolutions: tuple[FieldResolution, ...],
+) -> None:
+    provider = resolved.get("provider", "").strip().lower()
+    backend_mode = resolved.get("backend_mode", "").strip().lower()
+    fixture_fields = tuple(
+        field_name
+        for field_name, value in (
+            ("provider", provider),
+            ("backend_mode", backend_mode),
+        )
+        if value == "fixture"
+    )
+    sources = {resolution.field_name: resolution.source for resolution in resolutions}
+    explicit_fixture = any(
+        sources.get(field_name, "").startswith(_FIXTURE_AUTHORITY_SOURCES)
+        for field_name in fixture_fields
+    )
+    if fixture_fields and not explicit_fixture:
+        raise ValueError("Invalid resolved CLI agent routing: fixture must be explicit")
+    if not fixture_fields:
+        missing = tuple(
+            field_name
+            for field_name in ("provider", "model", "backend_mode", "auth_mode")
+            if not resolved.get(field_name, "").strip()
+        )
+        if missing:
+            raise ValueError(
+                "Invalid resolved CLI agent routing: missing routing fields: {}".format(
+                    ", ".join(missing)
+                )
+            )
     try:
         from pipeline_config import validate_invocation_routing
     except ImportError:
@@ -154,6 +191,10 @@ def resolve_agent_config(
     if existing_run is not None:
         if existing_run.run_id != run_id:
             raise ValueError("existing run_id does not match requested run_id")
+        if existing_run.config.project_id != project_id:
+            raise ValueError("existing project_id does not match requested project_id")
+        if existing_run.config.role != role:
+            raise ValueError("existing role does not match requested role")
         return existing_run
 
     if profile is not None:
@@ -290,7 +331,7 @@ def resolve_agent_config(
         for field_name in PUBLIC_CONFIGURATION_FIELDS
     )
     values = {resolution.field_name: resolution.value for resolution in resolutions}
-    _validate_routing(values)
+    _validate_routing(values, resolutions)
 
     return AgentRun(
         run_id=run_id,

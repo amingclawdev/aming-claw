@@ -222,12 +222,16 @@ class AIInvocationRequest:
     def resolved_backend(self) -> str:
         if self.backend_mode:
             return self.backend_mode
-        provider = self.provider.lower()
+        provider = self.provider.strip().lower()
         if provider == "openai":
             return BACKEND_CODEX_CLI
         if provider == "anthropic":
             return BACKEND_CLAUDE_CLI
-        return BACKEND_FIXTURE
+        if provider == "fixture":
+            return BACKEND_FIXTURE
+        raise ValueError(
+            "AI invocation routing is unresolved: explicit provider or backend_mode is required"
+        )
 
     def prompt_text(self) -> str:
         if self.system_prompt:

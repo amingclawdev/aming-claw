@@ -116,6 +116,24 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
                 )
         popen.assert_not_called()
 
+    def test_unresolved_request_does_not_fall_back_to_fixture(self):
+        from ai_invocation import AIInvocationRequest
+
+        unresolved = AIInvocationRequest(
+            role="dev",
+            provider="",
+            prompt="must never become a fixture invocation",
+        )
+        with self.assertRaisesRegex(ValueError, "routing is unresolved"):
+            unresolved.resolved_backend()
+
+        explicit_fixture = AIInvocationRequest(
+            role="test",
+            provider="fixture",
+            prompt="explicit fixture invocation",
+        )
+        self.assertEqual(explicit_fixture.resolved_backend(), "fixture")
+
     def test_persisted_evidence_drops_raw_refs_and_error_text(self):
         from ai_invocation import AIInvocationRequest, AIInvocationResult
         from ai_lifecycle import AILifecycleManager

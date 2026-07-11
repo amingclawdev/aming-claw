@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -14,6 +15,7 @@ ROLE_POLICY_SCHEMA_VERSION = "cli_agent_service.role_policy.v1"
 AGENT_PROFILE_SCHEMA_VERSION = "cli_agent_service.agent_profile.v1"
 RESOLVED_CONFIG_SCHEMA_VERSION = "cli_agent_service.resolved_config.v1"
 AGENT_RUN_SCHEMA_VERSION = "cli_agent_service.agent_run.v1"
+GOVERNANCE_REF_SCHEMA_VERSION = "cli_agent_service.governance_ref.v1"
 
 PUBLIC_CONFIGURATION_FIELDS = (
     "profile_id",
@@ -49,17 +51,71 @@ def _strings(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(str(value).strip() for value in values if str(value).strip())
 
 
-def _pairs(
-    values: Mapping[str, str] | Iterable[tuple[str, str]],
-) -> tuple[tuple[str, str], ...]:
+_LOWER_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{1,191}")
+_HASH_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_GOVERNANCE_REF_PATTERNS = {
+    "project_id": _LOWER_ID_PATTERN,
+    "backlog_id": re.compile(r"[A-Z][A-Z0-9-]{2,191}"),
+    "task_id": _LOWER_ID_PATTERN,
+    "parent_task_id": _LOWER_ID_PATTERN,
+    "runtime_context_id": re.compile(r"mfrctx-[a-z0-9][a-z0-9-]{2,127}"),
+    "contract_execution_id": re.compile(r"cex-[a-z0-9][a-z0-9-]{2,191}"),
+    "route_id": re.compile(r"route-[a-z0-9][a-z0-9-]{2,191}"),
+    "route_context_hash": _HASH_PATTERN,
+    "prompt_contract_id": re.compile(r"rprompt-[a-z0-9][a-z0-9-]{2,191}"),
+    "prompt_contract_hash": _HASH_PATTERN,
+    "route_token_ref": re.compile(r"rtok-[0-9a-f]{16,128}"),
+    "session_token_ref": re.compile(r"wstok-[0-9a-f]{16,128}"),
+    "visible_injection_manifest_hash": _HASH_PATTERN,
+    "graph_trace_id": re.compile(r"gqt-[a-z0-9][a-z0-9-]{2,191}"),
+    "timeline_ref": re.compile(r"timeline:[0-9]+"),
+    "commit_sha": re.compile(r"[0-9a-f]{40}"),
+}
+
+
+@dataclass(frozen=True)
+class GovernanceRef:
+    """One explicitly public-safe governance identifier or content hash."""
+
+    name: str
+    value: str
+    schema_version: str = field(default=GOVERNANCE_REF_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        name = str(self.name or "").strip()
+        value = str(self.value or "").strip()
+        pattern = _GOVERNANCE_REF_PATTERNS.get(name)
+        if pattern is None:
+            raise ValueError("governance reference '{}' is not public-safe".format(name))
+        if not pattern.fullmatch(value):
+            raise ValueError(
+                "governance reference '{}' has an invalid public-safe value".format(name)
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "value", value)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "name": self.name,
+            "value": self.value,
+            "public_safe": True,
+        }
+
+
+def _governance_refs(
+    values: Mapping[str, str]
+    | Iterable[GovernanceRef | tuple[str, str]],
+) -> tuple[GovernanceRef, ...]:
     items = values.items() if isinstance(values, Mapping) else values
-    return tuple(
-        sorted(
-            (str(key).strip(), str(value).strip())
-            for key, value in items
-            if str(key).strip() and str(value).strip()
-        )
+    refs = tuple(
+        item if isinstance(item, GovernanceRef) else GovernanceRef(*item)
+        for item in items
     )
+    names = tuple(ref.name for ref in refs)
+    if len(names) != len(set(names)):
+        raise ValueError("governance references must be unique")
+    return tuple(sorted(refs, key=lambda ref: ref.name))
 
 
 @dataclass(frozen=True)
@@ -372,7 +428,7 @@ class AgentRun:
     run_id: str
     config: ResolvedAgentConfig
     profile: AgentProfile | None = None
-    governance_refs: tuple[tuple[str, str], ...] = ()
+    governance_refs: tuple[GovernanceRef, ...] = ()
     created_at: str = ""
     parent_run_id: str = ""
     successor_of_run_id: str = ""
@@ -380,7 +436,11 @@ class AgentRun:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _required(self.run_id, "run_id"))
-        object.__setattr__(self, "governance_refs", _pairs(self.governance_refs))
+        object.__setattr__(
+            self,
+            "governance_refs",
+            _governance_refs(self.governance_refs),
+        )
         object.__setattr__(self, "created_at", str(self.created_at or "").strip())
         object.__setattr__(
             self,
@@ -404,6 +464,8 @@ class AgentRun:
             "successor_of_run_id": self.successor_of_run_id,
             "profile": self.profile.to_public_dict() if self.profile else None,
             "config": self.config.to_public_dict(),
-            "governance_refs": dict(self.governance_refs),
+            "governance_refs": {
+                ref.name: ref.value for ref in self.governance_refs
+            },
             "raw_credential_material_exposed": False,
         }
