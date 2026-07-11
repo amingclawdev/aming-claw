@@ -1446,6 +1446,39 @@ def test_meta_contract_allows_worker_progress_and_patch_for_worker_only(
     assert transport_gate["observer_worker_transport"] is True
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event_type", "mf_subagent.worker_commit"),
+        ("event_kind", "worker_commit"),
+        ("payload_action", "record_worker_commit"),
+    ],
+)
+def test_meta_contract_treats_canonical_worker_commit_as_worker_progress(
+    field: str,
+    value: str,
+) -> None:
+    event = {
+        "event_type": "",
+        "event_kind": "",
+        "phase": "worker_commit",
+        "actor": "mf_sub",
+        "status": "passed",
+        "payload": {"worker_role": "mf_sub"},
+    }
+    if field == "payload_action":
+        event["payload"]["action"] = value
+        event["phase"] = ""
+    else:
+        event[field] = value
+
+    gate = validate_meta_contract_timeline_event(event)
+
+    assert gate["allowed"] is True
+    assert gate["role"] == MF_SUB_ROLE
+    assert gate["action"] == "worker_progress"
+
+
 def test_meta_contract_allows_canonical_finish_time_attestation_event_kind() -> None:
     gate = validate_meta_contract_timeline_event(
         {
