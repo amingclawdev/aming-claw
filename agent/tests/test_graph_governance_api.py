@@ -44743,6 +44743,16 @@ def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
             {},
             "observer",
         ),
+        (
+            {
+                "worker_role": "mf_sub",
+                "meta_contract_gate": {"role": "mf_sub", "status": "passed"},
+                "worker_id": "worker-finish-commit-blocked",
+                "validated_head_commit": "a" * 40,
+            },
+            {},
+            "mf_sub:attacker",
+        ),
     ],
 )
 def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(

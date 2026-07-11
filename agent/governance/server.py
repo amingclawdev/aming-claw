@@ -44863,7 +44863,6 @@ def _contract_runtime_projected_worker_source_owned(
         and (
             event_principal in expected_identities
             or event_actor == "mf_sub"
-            or event_actor.startswith("mf_sub:")
         )
         and worker_role == "mf_sub"
         and source_identities
