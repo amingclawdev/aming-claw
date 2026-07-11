@@ -11,6 +11,130 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 class TestAILifecycleProviderRouting(unittest.TestCase):
+    def test_agent_run_rejects_conflicting_caller_route_before_dispatch(self):
+        from ai_invocation import (
+            AIInvocationResult,
+            RoutePromptContract,
+            invoke_agent_run,
+        )
+        from cli_agent_service.config import resolve_agent_config
+
+        run = resolve_agent_config(
+            run_id="run-pinned-route",
+            role="dev",
+            project_id="aming-claw",
+            compatibility_defaults={
+                "provider": "openai",
+                "model": "gpt-5.4-codex",
+                "backend_mode": "codex_cli",
+                "auth_mode": "cli_auth",
+            },
+            governance_refs={
+                "route_id": "route-pinned",
+                "route_context_hash": "sha256:" + "1" * 64,
+                "prompt_contract_id": "rprompt-pinned",
+                "prompt_contract_hash": "sha256:" + "2" * 64,
+                "route_token_ref": "rtok-" + "3" * 32,
+            },
+        )
+
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            with self.assertRaisesRegex(ValueError, "route_id"):
+                invoke_agent_run(
+                    run,
+                    prompt="must not dispatch",
+                    route=RoutePromptContract(route_id="route-conflicting"),
+                )
+        invoke_cli.assert_not_called()
+
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            invoke_cli.side_effect = lambda request: AIInvocationResult(
+                request=request,
+                status="completed",
+            )
+            result = invoke_agent_run(
+                run,
+                prompt="matching route dispatch",
+                route=RoutePromptContract(route_id="route-pinned"),
+            )
+        self.assertEqual(result.request.route.route_id, "route-pinned")
+        self.assertEqual(
+            result.request.route.route_context_hash,
+            "sha256:" + "1" * 64,
+        )
+        invoke_cli.assert_called_once()
+
+    def test_agent_run_adapter_dispatches_cli_api_and_external_local_routes(self):
+        from ai_invocation import AIInvocationResult, invoke_agent_run
+        from cli_agent_service.config import resolve_agent_config
+        from cli_agent_service.models import (
+            AgentProfile,
+            CredentialRef,
+            HarnessRuntime,
+            InferenceEndpoint,
+            LauncherAdapter,
+            RolePolicy,
+        )
+
+        def profile(profile_id, provider, model, backend_mode, auth_mode):
+            return AgentProfile(
+                profile_id=profile_id,
+                harness_runtime=HarnessRuntime(runtime_id="runtime-" + profile_id),
+                inference_endpoint=InferenceEndpoint(
+                    endpoint_id="endpoint-" + profile_id,
+                    provider=provider,
+                    model=model,
+                    backend_mode=backend_mode,
+                    auth_mode=auth_mode,
+                ),
+                credential_ref=CredentialRef(
+                    ref_id="credential:provider-home:" + profile_id,
+                    provider=provider,
+                ),
+                launcher_adapter=LauncherAdapter(launcher_id="launcher-" + profile_id),
+                role_policy=RolePolicy(policy_id="policy-" + profile_id, roles=("dev",)),
+            )
+
+        cli_run = resolve_agent_config(
+            run_id="run-cli",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile("cli", "openai", "gpt-5.4-codex", "codex_cli", "cli_auth"),
+        )
+        with patch("ai_invocation.invoke_cli") as invoke_cli:
+            invoke_cli.side_effect = lambda request: AIInvocationResult(
+                request=request,
+                status="completed",
+            )
+            cli_result = invoke_agent_run(cli_run, prompt="cli prompt")
+        self.assertEqual(cli_result.request.backend_mode, "codex_cli")
+        invoke_cli.assert_called_once()
+
+        api_run = resolve_agent_config(
+            run_id="run-api",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile("api", "openai", "gpt-4o", "openai_api", "api_key_env"),
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            api_result = invoke_agent_run(api_run, prompt="api prompt")
+        self.assertEqual(api_result.auth_status, "missing_api_key")
+
+        local_run = resolve_agent_config(
+            run_id="run-local",
+            role="dev",
+            project_id="aming-claw",
+            profile=profile(
+                "local",
+                "openai",
+                "local-c0-model",
+                "docker_live_ai",
+                "external_harness",
+            ),
+        )
+        local_result = invoke_agent_run(local_run, prompt="local prompt")
+        self.assertEqual(local_result.auth_status, "external_harness_required")
+
     def test_pipeline_routing_carries_backend_auth_and_output_policy(self):
         from pipeline_config import resolve_role_config
 
@@ -115,6 +239,24 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
                     invocation_request=request,
                 )
         popen.assert_not_called()
+
+    def test_unresolved_request_does_not_fall_back_to_fixture(self):
+        from ai_invocation import AIInvocationRequest
+
+        unresolved = AIInvocationRequest(
+            role="dev",
+            provider="",
+            prompt="must never become a fixture invocation",
+        )
+        with self.assertRaisesRegex(ValueError, "routing is unresolved"):
+            unresolved.resolved_backend()
+
+        explicit_fixture = AIInvocationRequest(
+            role="test",
+            provider="fixture",
+            prompt="explicit fixture invocation",
+        )
+        self.assertEqual(explicit_fixture.resolved_backend(), "fixture")
 
     def test_persisted_evidence_drops_raw_refs_and_error_text(self):
         from ai_invocation import AIInvocationRequest, AIInvocationResult

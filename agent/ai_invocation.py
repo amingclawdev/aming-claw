@@ -92,10 +92,12 @@ def safe_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
 
 @dataclass
 class RoutePromptContract:
+    route_id: str = ""
     route_context_hash: str = ""
     prompt_contract_id: str = ""
     prompt_contract_hash: str = ""
     route_token_ref: str = ""
+    visible_injection_manifest_hash: str = ""
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "RoutePromptContract":
@@ -105,6 +107,7 @@ class RoutePromptContract:
         prompt_contract = _nested(data, "prompt_contract")
         route_token = _nested(data, "route_token")
         return cls(
+            route_id=_first_string(data, ("route_id",)),
             route_context_hash=(
                 _first_string(data, ("route_context_hash",))
                 or _first_string(route_context, ("route_context_hash",))
@@ -130,16 +133,57 @@ class RoutePromptContract:
                 _first_string(data, ("route_token_ref", "route_token_id", "token_id"))
                 or _first_string(route_token, ("token_id", "route_token_id"))
             ),
+            visible_injection_manifest_hash=_first_string(
+                data,
+                ("visible_injection_manifest_hash",),
+            ),
         )
 
     def as_dict(self) -> dict[str, str | bool]:
         return {
+            "route_id": self.route_id,
             "route_context_hash": self.route_context_hash,
             "prompt_contract_id": self.prompt_contract_id,
             "prompt_contract_hash": self.prompt_contract_hash,
             "route_token_ref": self.route_token_ref,
+            "visible_injection_manifest_hash": self.visible_injection_manifest_hash,
             "raw_context_exposed": False,
         }
+
+
+_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _merge_pinned_route_identity(
+    pinned: RoutePromptContract,
+    supplied: RoutePromptContract,
+) -> RoutePromptContract:
+    conflicts = [
+        field_name
+        for field_name in _ROUTE_IDENTITY_FIELDS
+        if getattr(pinned, field_name)
+        and getattr(supplied, field_name)
+        and getattr(pinned, field_name) != getattr(supplied, field_name)
+    ]
+    if conflicts:
+        raise ValueError(
+            "supplied route identity conflicts with pinned AgentRun fields: {}".format(
+                ", ".join(conflicts)
+            )
+        )
+    return RoutePromptContract(
+        **{
+            field_name: getattr(pinned, field_name) or getattr(supplied, field_name)
+            for field_name in _ROUTE_IDENTITY_FIELDS
+        }
+    )
 
 
 @dataclass
@@ -159,15 +203,86 @@ class AIInvocationRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
+    @classmethod
+    def from_agent_run(
+        cls,
+        run: Any,
+        *,
+        prompt: str,
+        system_prompt: str = "",
+        cwd: str = "",
+        timeout_sec: int | None = None,
+        output_path: str = "",
+        route: RoutePromptContract | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> "AIInvocationRequest":
+        """Adapt a pinned AgentRun into the existing invocation wire contract."""
+        config = run.config
+        governance_refs = {
+            reference.name: reference.value for reference in run.governance_refs
+        }
+        pinned_route = RoutePromptContract.from_mapping(governance_refs)
+        supplied_route = route or RoutePromptContract()
+        effective_route = _merge_pinned_route_identity(pinned_route, supplied_route)
+        request_metadata = dict(metadata or {})
+        request_metadata["cli_agent_service"] = {
+            "schema_version": "cli_agent_service.invocation_adapter.v1",
+            "run_id": run.run_id,
+            "profile_id": config.profile_id,
+            "profile_version": config.profile_version,
+            "runtime_id": config.runtime_id,
+            "runtime_version": config.runtime_version,
+            "endpoint_id": config.endpoint_id,
+            "endpoint_version": config.endpoint_version,
+            "launcher_id": config.launcher_id,
+            "launcher_version": config.launcher_version,
+            "role_policy_id": config.role_policy_id,
+            "role_policy_version": config.role_policy_version,
+            "credential_ref": config.credential_ref,
+            "credential_ref_version": config.credential_ref_version,
+            "governance_refs": governance_refs,
+            "resolution_sources": {
+                resolution.field_name: resolution.source
+                for resolution in config.resolutions
+            },
+            "raw_credential_material_exposed": False,
+        }
+        resolved_timeout = timeout_sec
+        if resolved_timeout is None:
+            resolved_timeout = (
+                run.profile.role_policy.timeout_sec if run.profile is not None else 120
+            )
+        return cls(
+            role=config.role,
+            provider=config.provider,
+            model=config.model,
+            backend_mode=config.backend_mode,
+            cwd=cwd,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            timeout_sec=resolved_timeout,
+            output_path=output_path,
+            auth_mode=config.auth_mode,
+            output_policy=config.output_policy,
+            route=effective_route,
+            metadata=request_metadata,
+            env=dict(env or {}),
+        )
+
     def resolved_backend(self) -> str:
         if self.backend_mode:
             return self.backend_mode
-        provider = self.provider.lower()
+        provider = self.provider.strip().lower()
         if provider == "openai":
             return BACKEND_CODEX_CLI
         if provider == "anthropic":
             return BACKEND_CLAUDE_CLI
-        return BACKEND_FIXTURE
+        if provider == "fixture":
+            return BACKEND_FIXTURE
+        raise ValueError(
+            "AI invocation routing is unresolved: explicit provider or backend_mode is required"
+        )
 
     def prompt_text(self) -> str:
         if self.system_prompt:
@@ -925,6 +1040,34 @@ def invoke_cli(request: AIInvocationRequest) -> AIInvocationResult:
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def invoke_agent_run(
+    run: Any,
+    *,
+    prompt: str,
+    system_prompt: str = "",
+    cwd: str = "",
+    timeout_sec: int | None = None,
+    output_path: str = "",
+    route: RoutePromptContract | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AIInvocationResult:
+    """Invoke a pinned AgentRun through the canonical request/result dispatcher."""
+    return invoke_ai(
+        AIInvocationRequest.from_agent_run(
+            run,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            output_path=output_path,
+            route=route,
+            metadata=metadata,
+            env=env,
+        )
+    )
 
 
 def invoke_ai(request: AIInvocationRequest) -> AIInvocationResult:
