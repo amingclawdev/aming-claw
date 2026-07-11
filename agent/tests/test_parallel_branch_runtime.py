@@ -3313,6 +3313,24 @@ def test_runtime_context_current_values_prefer_finish_time_worker_attestation() 
     assert "finish_time_worker_attestation" not in next_required_ids
 
 
+def test_runtime_context_current_values_accept_canonical_contract_qa_ref() -> None:
+    context = _runtime_projection_context()
+    projection = build_runtime_context_projection(
+        context,
+        timeline_refs={
+            "verification_event_refs": [],
+            "contract_runtime_verification_refs": [
+                "contract_runtime:cex-canonical-qa:completed_lines:3"
+            ],
+        },
+    ).to_dict()
+
+    current_values = projection["views"]["current"]["current_values"]
+    assert current_values["verification_event_refs"] == [
+        "contract_runtime:cex-canonical-qa:completed_lines:3"
+    ]
+
+
 def test_runtime_context_current_values_accept_legacy_implementation_evidence_kind() -> None:
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)

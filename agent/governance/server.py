@@ -9761,6 +9761,21 @@ def _runtime_context_projection_response(
             timeline_events=timeline_events,
         )
     )
+    contract_runtime_qa_verification = (
+        _runtime_context_contract_runtime_qa_verification_evidence(
+            conn,
+            project_id=context_project_id,
+            context=context,
+        )
+    )
+    if contract_runtime_qa_verification:
+        timeline_refs = dict(timeline_refs)
+        timeline_refs["contract_runtime_verification_refs"] = [
+            contract_runtime_qa_verification["verification_ref"]
+        ]
+        timeline_refs["contract_runtime_verification"] = dict(
+            contract_runtime_qa_verification
+        )
     explicit_trace_ids = _runtime_context_service_query_values(
         ctx.query,
         "graph_trace_ids",
@@ -10008,6 +10023,11 @@ def _runtime_context_projection_response(
             "contract_runtime_failed_qa_revision": (
                 contract_runtime_failed_qa_revision.get("failed_qa_source_ref", "")
                 if contract_runtime_failed_qa_revision
+                else ""
+            ),
+            "contract_runtime_qa_verification": (
+                contract_runtime_qa_verification.get("verification_ref", "")
+                if contract_runtime_qa_verification
                 else ""
             ),
         },
@@ -17967,6 +17987,99 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
         ):
             return True
     return False
+
+
+def _runtime_context_contract_runtime_qa_verification_evidence(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Project canonical QA completion without inventing a timeline event."""
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    context_head = str(getattr(context, "head_commit", "") or "").strip()
+    if not conn or not backlog_id or not context_head:
+        return {}
+    try:
+        records = _contract_runtime_store(conn).list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+
+    for record in reversed(list(records)):
+        if not _is_mf_parallel_record_contract_id(
+            str((record or {}).get("contract_id") or "")
+        ):
+            continue
+        if not _contract_runtime_dispatch_line_match(record, context):
+            continue
+        completed_lines = record.get("completed_lines")
+        if not isinstance(completed_lines, list):
+            continue
+        for index, raw_line in reversed(list(enumerate(completed_lines))):
+            if not isinstance(raw_line, Mapping):
+                continue
+            line = dict(raw_line)
+            if str(line.get("line_id") or "").strip() != (
+                "qa_independent_verification"
+            ):
+                continue
+            if _contract_runtime_value_reports_failed_qa(line):
+                break
+            if not _contract_runtime_line_status_passes(line):
+                break
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            actor_role = str(
+                line.get("actor_role")
+                or line.get("evidence_owner_role")
+                or payload.get("actor_role")
+                or ""
+            ).strip().lower()
+            if actor_role != "qa" or bool(line.get("observer_impersonation")):
+                break
+            verified_commit = str(
+                line.get("commit_sha")
+                or payload.get("candidate_commit")
+                or payload.get("snapshot_commit_sha")
+                or payload.get("commit_sha")
+                or ""
+            ).strip()
+            if verified_commit != context_head:
+                break
+            execution_id = str(record.get("contract_execution_id") or "").strip()
+            if not execution_id:
+                break
+            source_ref = f"contract_runtime:{execution_id}:completed_lines:{index}"
+            return {
+                "schema_version": (
+                    "runtime_context.contract_runtime_qa_verification_evidence.v1"
+                ),
+                "source": "contract_runtime_completed_lines",
+                "source_of_authority": "contract_runtime",
+                "status": "passed",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "runtime_context_id": _contract_runtime_context_identity(context)[0],
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "commit_sha": verified_commit,
+                "verification_ref": source_ref,
+                "graph_trace_ids": _runtime_context_service_query_values(
+                    payload,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "trace_ids",
+                ),
+                "observer_authored_qa_evidence": False,
+                "synthetic_timeline_event_created": False,
+            }
+    return {}
 
 
 def _runtime_context_failed_qa_line_matches_context(

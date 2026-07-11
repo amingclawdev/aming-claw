@@ -3582,6 +3582,14 @@ def _runtime_context_timeline_refs(
                 or source.get("verification_event_ids")
             )
         ),
+        "contract_runtime_verification_refs": _runtime_context_dedupe(
+            _runtime_context_string_list(
+                source.get("contract_runtime_verification_refs")
+            )
+        ),
+        "contract_runtime_verification": _runtime_context_mapping(
+            source.get("contract_runtime_verification")
+        ),
     }
     return normalized
 
@@ -4307,8 +4315,15 @@ def _runtime_context_current_values(
     checkpoint_id = context.checkpoint_id or _runtime_context_text(
         finish_gate.get("checkpoint_id")
     )
-    verification_event_refs = _runtime_context_string_list(
-        timeline_refs.get("verification_event_refs")
+    verification_event_refs = _runtime_context_dedupe(
+        [
+            *_runtime_context_string_list(
+                timeline_refs.get("verification_event_refs")
+            ),
+            *_runtime_context_string_list(
+                timeline_refs.get("contract_runtime_verification_refs")
+            ),
+        ]
     )
     finish_gate_payload = _runtime_context_mapping(finish_gate.get("payload"))
     nested_finish_gate_payload = _runtime_context_nested_finish_gate_payload(

@@ -42449,6 +42449,75 @@ def test_runtime_context_current_projects_contract_runtime_state_for_unique_fall
     assert worker_view["contract_runtime_next_legal_action"] == current_next
 
 
+def test_runtime_context_projects_canonical_contract_qa_without_timeline_backfill(
+    monkeypatch,
+):
+    context = SimpleNamespace(
+        backlog_id="AC-CANONICAL-QA-PROJECTION",
+        runtime_context_id="mfrctx-canonical-qa",
+        task_id="worker-canonical-qa",
+        parent_task_id="cex-canonical-qa",
+        head_commit="f" * 40,
+    )
+    record = {
+        "contract_execution_id": "cex-canonical-qa",
+        "contract_id": "mf_parallel",
+        "completed_lines": [
+            {
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_owner_role": "qa",
+                "observer_impersonation": False,
+                "commit_sha": "f" * 40,
+                "payload": {
+                    "verdict": "PASS",
+                    "candidate_commit": "f" * 40,
+                    "graph_trace_ids": ["gqt-canonical-qa"],
+                },
+            }
+        ],
+    }
+
+    class CanonicalStore:
+        def list_by_backlog(self, *, project_id, backlog_id):
+            assert project_id == PID
+            assert backlog_id == context.backlog_id
+            return [record]
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: CanonicalStore(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda _record, _context: True,
+    )
+
+    evidence = server._runtime_context_contract_runtime_qa_verification_evidence(
+        object(),
+        project_id=PID,
+        context=context,
+    )
+
+    assert evidence["source_of_authority"] == "contract_runtime"
+    assert evidence["verification_ref"] == (
+        "contract_runtime:cex-canonical-qa:completed_lines:0"
+    )
+    assert evidence["commit_sha"] == context.head_commit
+    assert evidence["graph_trace_ids"] == ["gqt-canonical-qa"]
+    assert evidence["observer_authored_qa_evidence"] is False
+    assert evidence["synthetic_timeline_event_created"] is False
+
+    record["completed_lines"][0]["payload"]["verdict"] = "FAILED"
+    assert server._runtime_context_contract_runtime_qa_verification_evidence(
+        object(),
+        project_id=PID,
+        context=context,
+    ) == {}
+
+
 def _worker_guide_state_with_contract_next_action(
     next_action: dict[str, Any],
     *,
