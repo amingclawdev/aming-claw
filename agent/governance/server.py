@@ -6857,6 +6857,173 @@ def _qa_request_has_impersonation_claim(value: Any) -> bool:
     return False
 
 
+def _observer_graph_query_route_authority(
+    conn,
+    *,
+    project_id: str,
+    body: dict[str, Any],
+    action: str,
+) -> dict[str, Any]:
+    """Resolve observer graph identity exclusively from a registered route ref."""
+
+    nested_identity = (
+        body.get("route_identity")
+        if isinstance(body.get("route_identity"), Mapping)
+        else {}
+    )
+    route_token_refs = {
+        str(value or "").strip()
+        for value in (
+            body.get("route_token_ref"),
+            body.get("observer_route_token_ref"),
+            nested_identity.get("route_token_ref"),
+        )
+        if str(value or "").strip()
+    }
+    if not route_token_refs:
+        return {}
+    if len(route_token_refs) != 1:
+        raise GovernanceError(
+            "observer_graph_query_route_identity_conflict",
+            "observer graph query received conflicting route_token_ref aliases",
+            422,
+            {"route_token_ref_alias_conflict": True},
+        )
+    route_token_ref = next(iter(route_token_refs))
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            renew_within_seconds=observer_route_context.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        raise GovernanceError(
+            "observer_graph_query_route_token_invalid",
+            str(exc),
+            422,
+            {"route_token_ref": route_token_ref},
+        ) from exc
+
+    if not resolved or str(resolved.get("caller_role") or "") != "observer":
+        raise GovernanceError(
+            "observer_graph_query_route_token_invalid",
+            "observer graph query requires an active observer route token ref",
+            403,
+            {"route_token_ref": route_token_ref},
+        )
+    normalized_actions = {
+        str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+        for value in resolved.get("allowed_actions") or []
+        if str(value or "").strip()
+    }
+    if not normalized_actions & {"graph_query", "graph_governance_query"}:
+        raise GovernanceError(
+            "observer_graph_query_route_action_forbidden",
+            "observer route token ref does not allow graph_query",
+            403,
+            {
+                "route_token_ref": route_token_ref,
+                "allowed_actions": sorted(normalized_actions),
+            },
+        )
+
+    scope = resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    trusted_scope = {
+        "project_id": str(scope.get("project_id") or "").strip(),
+        "backlog_id": str(scope.get("backlog_id") or "").strip(),
+        "task_id": str(scope.get("task_id") or "").strip(),
+    }
+    if (
+        trusted_scope["project_id"] != project_id
+        or not trusted_scope["backlog_id"]
+        or not trusted_scope["task_id"]
+    ):
+        raise GovernanceError(
+            "observer_graph_query_route_scope_incomplete",
+            "observer graph query route scope requires exact project, backlog, and task identity",
+            422,
+            {"route_token_ref": route_token_ref, "route_scope": trusted_scope},
+        )
+    scope_mismatches = {
+        field: {
+            "expected": trusted_scope[field],
+            "actual": str(body.get(field) or "").strip(),
+        }
+        for field in ("backlog_id", "task_id")
+        if str(body.get(field) or "").strip()
+        and str(body.get(field) or "").strip() != trusted_scope[field]
+    }
+    if scope_mismatches:
+        raise GovernanceError(
+            "observer_graph_query_route_scope_mismatch",
+            "observer graph query scope cannot override the registered route scope",
+            403,
+            {
+                "route_token_ref": route_token_ref,
+                "scope_mismatches": scope_mismatches,
+            },
+        )
+
+    identity_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    )
+    trusted_identity: dict[str, str] = {"route_token_ref": route_token_ref}
+    identity_mismatches: dict[str, dict[str, str]] = {}
+    for field in identity_fields:
+        expected = str(resolved.get(field) or "").strip()
+        claims = {
+            str(value or "").strip()
+            for value in (body.get(field), nested_identity.get(field))
+            if str(value or "").strip()
+        }
+        if len(claims) > 1 or (claims and expected not in claims):
+            identity_mismatches[field] = {
+                "expected": expected,
+                "actual": ",".join(sorted(claims)),
+            }
+        trusted_identity[field] = expected
+    if identity_mismatches:
+        raise GovernanceError(
+            "observer_graph_query_route_identity_mismatch",
+            "observer graph query route identity cannot override the registered route token",
+            403,
+            {
+                "route_token_ref": route_token_ref,
+                "identity_mismatches": identity_mismatches,
+            },
+        )
+    if any(not trusted_identity[field] for field in identity_fields):
+        raise GovernanceError(
+            "observer_graph_query_route_identity_incomplete",
+            "observer graph query route token is missing required public identity fields",
+            422,
+            {"route_token_ref": route_token_ref},
+        )
+
+    body.update(trusted_scope)
+    body.update(trusted_identity)
+    body["route_identity"] = dict(trusted_identity)
+    body["actor"] = "observer"
+    proof = {
+        "schema_version": "observer_graph_query_route_scope_proof.v1",
+        "source": "server_registered_observer_route_token",
+        "verified": True,
+        "query_source": "observer",
+        "action": action,
+        **trusted_scope,
+        **trusted_identity,
+        "raw_route_token_persisted": False,
+    }
+    return proof
+
+
 def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, action: str) -> dict:
     query_source = str(body.get("query_source") or "api_debug").strip().lower().replace("-", "_")
     if query_source == "qa":
@@ -6929,6 +7096,17 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             )
         body["actor"] = principal_id
         setattr(ctx, "_trusted_qa_graph_query_authority", proof)
+        return session
+    if query_source == "observer":
+        session = _require_graph_governance_operator(ctx, conn, action)
+        observer_proof = _observer_graph_query_route_authority(
+            conn,
+            project_id=ctx.get_project_id(),
+            body=body,
+            action=action,
+        )
+        if observer_proof:
+            setattr(ctx, "_trusted_observer_graph_query_authority", observer_proof)
         return session
     if query_source != "mf_subagent":
         return _require_graph_governance_operator(ctx, conn, action)
@@ -27674,6 +27852,8 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query-trace.start")
         qa_proof = getattr(ctx, "_trusted_qa_graph_query_authority", {})
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
+        observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
+        observer_proof = observer_proof if isinstance(observer_proof, Mapping) else {}
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():
@@ -27687,8 +27867,31 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     run_id=str(body.get("run_id") or ""),
                     parent_task_id=str(body.get("parent_task_id") or ""),
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
-                    task_id=str(body.get("task_id") or ""),
-                    backlog_id=str(qa_proof.get("backlog_id") or ""),
+                    task_id=str(
+                        qa_proof.get("task_id")
+                        or observer_proof.get("task_id")
+                        or body.get("task_id")
+                        or ""
+                    ),
+                    backlog_id=str(
+                        qa_proof.get("backlog_id")
+                        or observer_proof.get("backlog_id")
+                        or ""
+                    ),
+                    route_id=str(observer_proof.get("route_id") or ""),
+                    route_context_hash=str(
+                        observer_proof.get("route_context_hash") or ""
+                    ),
+                    prompt_contract_id=str(
+                        observer_proof.get("prompt_contract_id") or ""
+                    ),
+                    prompt_contract_hash=str(
+                        observer_proof.get("prompt_contract_hash") or ""
+                    ),
+                    visible_injection_manifest_hash=str(
+                        observer_proof.get("visible_injection_manifest_hash") or ""
+                    ),
+                    route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
                     qa_scope_binding_ref=str(
@@ -27731,6 +27934,8 @@ def handle_graph_governance_query(ctx: RequestContext):
         _require_graph_query_capability(ctx, conn, body, "graph-governance.query")
         qa_proof = getattr(ctx, "_trusted_qa_graph_query_authority", {})
         qa_proof = qa_proof if isinstance(qa_proof, Mapping) else {}
+        observer_proof = getattr(ctx, "_trusted_observer_graph_query_authority", {})
+        observer_proof = observer_proof if isinstance(observer_proof, Mapping) else {}
         cross_project_contract_line = (
             _runtime_context_cross_project_graph_contract_preflight(
                 target_project_id=project_id,
@@ -27761,8 +27966,31 @@ def handle_graph_governance_query(ctx: RequestContext):
                     run_id=str(body.get("run_id") or ""),
                     parent_task_id=str(body.get("parent_task_id") or ""),
                     runtime_context_id=str(body.get("runtime_context_id") or ""),
-                    task_id=str(body.get("task_id") or ""),
-                    backlog_id=str(qa_proof.get("backlog_id") or ""),
+                    task_id=str(
+                        qa_proof.get("task_id")
+                        or observer_proof.get("task_id")
+                        or body.get("task_id")
+                        or ""
+                    ),
+                    backlog_id=str(
+                        qa_proof.get("backlog_id")
+                        or observer_proof.get("backlog_id")
+                        or ""
+                    ),
+                    route_id=str(observer_proof.get("route_id") or ""),
+                    route_context_hash=str(
+                        observer_proof.get("route_context_hash") or ""
+                    ),
+                    prompt_contract_id=str(
+                        observer_proof.get("prompt_contract_id") or ""
+                    ),
+                    prompt_contract_hash=str(
+                        observer_proof.get("prompt_contract_hash") or ""
+                    ),
+                    visible_injection_manifest_hash=str(
+                        observer_proof.get("visible_injection_manifest_hash") or ""
+                    ),
+                    route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
                     qa_scope_binding_ref=str(

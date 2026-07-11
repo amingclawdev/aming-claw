@@ -885,3 +885,59 @@ def test_low_health_query_uses_structural_and_feedback_signals(conn, tmp_path):
     assert "L7.2" in low
     assert "missing_test_binding" in low["L7.2"]["issues"]
     assert "high_function_count" in low["L7.2"]["issues"]
+
+
+def test_route_bound_trace_persists_identity_and_rejects_unbound_reuse(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    route_identity = {
+        "route_id": "route-observer-graph",
+        "route_context_hash": "sha256:observer-graph-context",
+        "prompt_contract_id": "rprompt-observer-graph",
+        "prompt_contract_hash": "sha256:observer-graph-prompt",
+        "visible_injection_manifest_hash": "sha256:observer-graph-manifest",
+        "route_token_ref": "rtok-observer-graph",
+    }
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="gate_validation",
+        task_id="observer-graph-task",
+        backlog_id="AC-OBSERVER-GRAPH",
+        **route_identity,
+        tool="query_schema",
+        project_root=project_root,
+    )
+
+    stored = graph_query_trace.get_trace(conn, PID, result["trace_id"])["trace"]
+    identity = stored["graph_query_identity"]
+    assert identity["task_id"] == "observer-graph-task"
+    assert identity["backlog_id"] == "AC-OBSERVER-GRAPH"
+    for field, value in route_identity.items():
+        assert identity[field] == value
+
+    started = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="gate_validation",
+        task_id="observer-graph-task",
+        backlog_id="AC-OBSERVER-GRAPH",
+        **route_identity,
+    )["trace"]
+    with pytest.raises(ValueError, match="route-bound graph query trace requires"):
+        graph_query_trace.traced_query(
+            conn,
+            PID,
+            snapshot_id,
+            trace_id=started["trace_id"],
+            actor="observer",
+            query_source="observer",
+            query_purpose="gate_validation",
+            tool="query_schema",
+            project_root=project_root,
+        )

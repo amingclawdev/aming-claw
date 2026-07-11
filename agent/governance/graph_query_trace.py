@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   runtime_context_id TEXT NOT NULL DEFAULT '',
   task_id TEXT NOT NULL DEFAULT '',
   backlog_id TEXT NOT NULL DEFAULT '',
+  route_id TEXT NOT NULL DEFAULT '',
+  route_context_hash TEXT NOT NULL DEFAULT '',
+  prompt_contract_id TEXT NOT NULL DEFAULT '',
+  prompt_contract_hash TEXT NOT NULL DEFAULT '',
+  visible_injection_manifest_hash TEXT NOT NULL DEFAULT '',
+  route_token_ref TEXT NOT NULL DEFAULT '',
   commit_sha TEXT NOT NULL DEFAULT '',
   qa_session_id TEXT NOT NULL DEFAULT '',
   qa_scope_binding_ref TEXT NOT NULL DEFAULT '',
@@ -254,6 +260,12 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "runtime_context_id",
     "task_id",
     "backlog_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "route_token_ref",
     "commit_sha",
     "qa_session_id",
     "qa_scope_binding_ref",
@@ -265,6 +277,12 @@ _TRACE_IDENTITY_COLUMNS = {
     "runtime_context_id": "TEXT NOT NULL DEFAULT ''",
     "task_id": "TEXT NOT NULL DEFAULT ''",
     "backlog_id": "TEXT NOT NULL DEFAULT ''",
+    "route_id": "TEXT NOT NULL DEFAULT ''",
+    "route_context_hash": "TEXT NOT NULL DEFAULT ''",
+    "prompt_contract_id": "TEXT NOT NULL DEFAULT ''",
+    "prompt_contract_hash": "TEXT NOT NULL DEFAULT ''",
+    "visible_injection_manifest_hash": "TEXT NOT NULL DEFAULT ''",
+    "route_token_ref": "TEXT NOT NULL DEFAULT ''",
     "commit_sha": "TEXT NOT NULL DEFAULT ''",
     "qa_session_id": "TEXT NOT NULL DEFAULT ''",
     "qa_scope_binding_ref": "TEXT NOT NULL DEFAULT ''",
@@ -323,6 +341,14 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
         "runtime_context_id": str(source.get("runtime_context_id") or ""),
         "task_id": str(source.get("task_id") or ""),
         "backlog_id": str(source.get("backlog_id") or ""),
+        "route_id": str(source.get("route_id") or ""),
+        "route_context_hash": str(source.get("route_context_hash") or ""),
+        "prompt_contract_id": str(source.get("prompt_contract_id") or ""),
+        "prompt_contract_hash": str(source.get("prompt_contract_hash") or ""),
+        "visible_injection_manifest_hash": str(
+            source.get("visible_injection_manifest_hash") or ""
+        ),
+        "route_token_ref": str(source.get("route_token_ref") or ""),
         "commit_sha": str(source.get("commit_sha") or ""),
         "qa_session_id": str(source.get("qa_session_id") or ""),
         "qa_scope_binding_ref": str(source.get("qa_scope_binding_ref") or ""),
@@ -532,6 +558,12 @@ def start_trace(
     runtime_context_id: str = "",
     task_id: str = "",
     backlog_id: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+    prompt_contract_hash: str = "",
+    visible_injection_manifest_hash: str = "",
+    route_token_ref: str = "",
     commit_sha: str = "",
     qa_session_id: str = "",
     qa_scope_binding_ref: str = "",
@@ -556,10 +588,11 @@ def start_trace(
         INSERT INTO graph_query_traces
           (trace_id, project_id, snapshot_id, actor, query_source, query_purpose,
            run_id, parent_task_id, runtime_context_id, task_id, backlog_id,
-           commit_sha, qa_session_id, qa_scope_binding_ref, worker_role,
-           fence_token, status, budget_json, usage_json, artifact_path,
-           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           route_id, route_context_hash, prompt_contract_id, prompt_contract_hash,
+           visible_injection_manifest_hash, route_token_ref, commit_sha,
+           qa_session_id, qa_scope_binding_ref, worker_role, fence_token, status,
+           budget_json, usage_json, artifact_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             tid,
@@ -573,6 +606,12 @@ def start_trace(
             str(runtime_context_id or ""),
             str(task_id or ""),
             str(backlog_id or ""),
+            str(route_id or ""),
+            str(route_context_hash or ""),
+            str(prompt_contract_id or ""),
+            str(prompt_contract_hash or ""),
+            str(visible_injection_manifest_hash or ""),
+            str(route_token_ref or ""),
             str(commit_sha or ""),
             str(qa_session_id or ""),
             str(qa_scope_binding_ref or ""),
@@ -596,6 +635,14 @@ def start_trace(
         "runtime_context_id": str(runtime_context_id or ""),
         "task_id": str(task_id or ""),
         "backlog_id": str(backlog_id or ""),
+        "route_id": str(route_id or ""),
+        "route_context_hash": str(route_context_hash or ""),
+        "prompt_contract_id": str(prompt_contract_id or ""),
+        "prompt_contract_hash": str(prompt_contract_hash or ""),
+        "visible_injection_manifest_hash": str(
+            visible_injection_manifest_hash or ""
+        ),
+        "route_token_ref": str(route_token_ref or ""),
         "commit_sha": str(commit_sha or ""),
         "qa_session_id": str(qa_session_id or ""),
         "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
@@ -613,6 +660,14 @@ def start_trace(
             "runtime_context_id": str(runtime_context_id or ""),
             "task_id": str(task_id or ""),
             "backlog_id": str(backlog_id or ""),
+            "route_id": str(route_id or ""),
+            "route_context_hash": str(route_context_hash or ""),
+            "prompt_contract_id": str(prompt_contract_id or ""),
+            "prompt_contract_hash": str(prompt_contract_hash or ""),
+            "visible_injection_manifest_hash": str(
+                visible_injection_manifest_hash or ""
+            ),
+            "route_token_ref": str(route_token_ref or ""),
             "commit_sha": str(commit_sha or ""),
             "qa_session_id": str(qa_session_id or ""),
             "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
@@ -1794,6 +1849,12 @@ def traced_query(
     runtime_context_id: str = "",
     task_id: str = "",
     backlog_id: str = "",
+    route_id: str = "",
+    route_context_hash: str = "",
+    prompt_contract_id: str = "",
+    prompt_contract_hash: str = "",
+    visible_injection_manifest_hash: str = "",
+    route_token_ref: str = "",
     commit_sha: str = "",
     qa_session_id: str = "",
     qa_scope_binding_ref: str = "",
@@ -1817,6 +1878,12 @@ def traced_query(
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             backlog_id=backlog_id,
+            route_id=route_id,
+            route_context_hash=route_context_hash,
+            prompt_contract_id=prompt_contract_id,
+            prompt_contract_hash=prompt_contract_hash,
+            visible_injection_manifest_hash=visible_injection_manifest_hash,
+            route_token_ref=route_token_ref,
             commit_sha=commit_sha,
             qa_session_id=qa_session_id,
             qa_scope_binding_ref=qa_scope_binding_ref,
@@ -1842,6 +1909,31 @@ def traced_query(
                     "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
                 }
             )
+        stored_route_token_ref = str(trace.get("route_token_ref") or "")
+        if stored_route_token_ref or route_token_ref:
+            route_binding = {
+                "query_source": str(query_source or ""),
+                "actor": str(actor or ""),
+                "task_id": str(task_id or ""),
+                "backlog_id": str(backlog_id or ""),
+                "route_id": str(route_id or ""),
+                "route_context_hash": str(route_context_hash or ""),
+                "prompt_contract_id": str(prompt_contract_id or ""),
+                "prompt_contract_hash": str(prompt_contract_hash or ""),
+                "visible_injection_manifest_hash": str(
+                    visible_injection_manifest_hash or ""
+                ),
+                "route_token_ref": str(route_token_ref or ""),
+            }
+            missing_route_binding = sorted(
+                field for field, value in route_binding.items() if not value
+            )
+            if missing_route_binding:
+                raise ValueError(
+                    "route-bound graph query trace requires identity fields: "
+                    + ", ".join(missing_route_binding)
+                )
+            expected_binding.update(route_binding)
         mismatches = {
             field: {"expected": expected, "actual": str(trace.get(field) or "")}
             for field, expected in expected_binding.items()

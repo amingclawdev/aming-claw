@@ -1524,6 +1524,7 @@ def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
         "project_root",
         "repo_root",
         "task_id",
+        "backlog_id",
         "parent_task_id",
         "worker_role",
         "fence_token",
@@ -1537,6 +1538,44 @@ def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
         "route_identity",
     ):
         assert key in properties
+    assert "route_token_ref" in properties["task_id"]["description"]
+    assert "route_token_ref" in properties["backlog_id"]["description"]
+    assert "Observer queries derive canonical" in properties["route_token_ref"][
+        "description"
+    ]
+
+
+def test_mcp_graph_query_forwards_observer_route_scope_claims():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "tool": "function_index",
+            "args": {"query": "handle_graph_governance_query"},
+            "query_source": "observer",
+            "query_purpose": "gate_validation",
+            "task_id": "observer-route-task",
+            "backlog_id": "AC-OBSERVER-ROUTE",
+            "route_token_ref": "rtok-observer-route",
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/query",
+        {
+            "tool": "function_index",
+            "args": {"query": "handle_graph_governance_query"},
+            "query_source": "observer",
+            "query_purpose": "gate_validation",
+            "task_id": "observer-route-task",
+            "backlog_id": "AC-OBSERVER-ROUTE",
+            "route_token_ref": "rtok-observer-route",
+            "actor": "mcp",
+        },
+    )
 
 
 def test_mcp_contract_runtime_generic_tools_route_to_facade():

@@ -2632,7 +2632,7 @@ TOOLS: list[dict] = [
                 },
                 "backlog_id": {
                     "type": "string",
-                    "description": "Required bounded QA session backlog scope when query_source=qa.",
+                    "description": "Required bounded QA scope when query_source=qa. For route-bound observer queries the server derives backlog_id from route_token_ref and rejects mismatched client claims.",
                 },
                 "commit_sha": {
                     "type": "string",
@@ -2654,7 +2654,7 @@ TOOLS: list[dict] = [
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Required when query_source=mf_subagent: the calling worker's task_id.",
+                    "description": "Required for mf_subagent and bounded QA queries. For route-bound observer queries the server derives task_id from route_token_ref and rejects mismatched client claims.",
                 },
                 "parent_task_id": {
                     "type": "string",
@@ -2694,7 +2694,7 @@ TOOLS: list[dict] = [
                 },
                 "route_token_ref": {
                     "type": "string",
-                    "description": "Opaque server-registered route token reference; raw route tokens are not required for mf_sub graph queries.",
+                    "description": "Opaque server-registered route token reference. Observer queries derive canonical backlog/task/route identity from this ref; raw route tokens are never required.",
                 },
                 "visible_injection_manifest_hash": {
                     "type": "string",

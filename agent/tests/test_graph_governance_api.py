@@ -19794,6 +19794,110 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
     assert one_shot_trace["trace"]["event_count"] == 1
 
 
+def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(conn):
+    backlog_id = "AC-OBSERVER-GRAPH-ROUTE"
+    task_id = "observer-graph-route-task"
+    _activate_basic_graph(conn, "full-observer-graph-route", commit_sha="a" * 40)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["graph_query"],
+        evidence_refs=["timeline:observer-graph-route"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    conn.commit()
+
+    queried = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "query_schema",
+                "query_source": "observer",
+                "query_purpose": "gate_validation",
+                "actor": "mcp",
+                "route_token_ref": issued["route_token_ref"],
+            },
+        )
+    )
+    identity = queried["graph_query_identity"]
+    assert identity["actor"] == "observer"
+    assert identity["task_id"] == task_id
+    assert identity["backlog_id"] == backlog_id
+    assert identity["route_token_ref"] == issued["route_token_ref"]
+    for field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+    ):
+        assert identity[field] == issued["route_token"][field]
+
+    mismatch_cases = [
+        ({"task_id": "wrong-task"}, "observer_graph_query_route_scope_mismatch"),
+        ({"backlog_id": "WRONG-BACKLOG"}, "observer_graph_query_route_scope_mismatch"),
+        ({"route_id": "route-forged"}, "observer_graph_query_route_identity_mismatch"),
+    ]
+    for overrides, expected_code in mismatch_cases:
+        with pytest.raises(GovernanceError) as exc:
+            server.handle_graph_governance_query(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body={
+                        "snapshot_id": "active",
+                        "tool": "query_schema",
+                        "query_source": "observer",
+                        "query_purpose": "gate_validation",
+                        "route_token_ref": issued["route_token_ref"],
+                        **overrides,
+                    },
+                )
+            )
+        assert exc.value.code == expected_code
+
+    incomplete_ref = "rtok-" + "0" * 32
+    incomplete_token = {
+        **issued["route_token"],
+        "scope": {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": "",
+        },
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=incomplete_ref,
+        token=incomplete_token,
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as incomplete_exc:
+        server.handle_graph_governance_query(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "snapshot_id": "active",
+                    "tool": "query_schema",
+                    "query_source": "observer",
+                    "query_purpose": "gate_validation",
+                    "route_token_ref": incomplete_ref,
+                },
+            )
+        )
+    assert incomplete_exc.value.code == "observer_graph_query_route_scope_incomplete"
+
+
 def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn):
     backlog_id = "AC-BOUNDED-QA-VERIFICATION"
     task_id = "bounded-qa-verification-task"
