@@ -18385,8 +18385,14 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
     context_status = str(getattr(context, "status", "") or "")
     failed_qa_rejoin_reopened = (
         context_status == STATE_WORKTREE_READY
-        and str(getattr(context, "last_recovery_action", "") or "")
-        == "mf_subagent_failed_qa_revision_rejoin_issued"
+        and (
+            str(getattr(context, "last_recovery_action", "") or "")
+            == "mf_subagent_failed_qa_revision_rejoin_issued"
+            or (
+                int(getattr(context, "attempt", 0) or 0) > 1
+                and int(getattr(context, "retry_round", 0) or 0) > 0
+            )
+        )
     )
     if (
         context_status not in FAILED_QA_REVISION_REJOIN_STATES
@@ -44109,6 +44115,14 @@ def _contract_runtime_projection_for_context(
         graph_refs=graph_refs,
         finish_payload=finish_payload,
     )
+    failed_qa_revision_rejoin = bool(
+        str(getattr(context, "status", "") or "") == "worktree_ready"
+        and _runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=project_id,
+            context=context,
+        )
+    )
 
     projected_lines: list[dict[str, Any]] = []
     projected_line_refs: list[dict[str, Any]] = []
@@ -44223,10 +44237,7 @@ def _contract_runtime_projection_for_context(
         "projected_lines": projected_lines,
         "projected_line_refs": projected_line_refs,
         "source_refs": source_refs,
-        "failed_qa_revision_rejoin": (
-            str(getattr(context, "last_recovery_action", "") or "")
-            == "mf_subagent_failed_qa_revision_rejoin_issued"
-        ),
+        "failed_qa_revision_rejoin": failed_qa_revision_rejoin,
     }
 
 

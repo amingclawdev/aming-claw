@@ -22485,7 +22485,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         conn,
         backlog_id=backlog_id,
         task_id="contract-failed-qa-parent",
-        worker_task_id="contract-failed-qa-worker",
+        worker_task_id="contract-revision-worker",
         fence_token="fence-contract-failed-qa",
         token="lost-contract-failed-qa-token",
         worktree_path=str(target_root),
@@ -22698,6 +22698,30 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         successor["contract_execution_id"]
     )["execution_state_revision"] == revision_before_duplicate_read
 
+    reissued = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "fence_token": result["fence_token"],
+                "session_token": result["session_token"],
+                "target_project_root": str(target_root),
+                "ttl_seconds": 3600,
+                "now_iso": "2999-01-01T00:01:00Z",
+            },
+        )
+    )
+    assert reissued["ok"] is True
+    saved = get_branch_context(conn, PID, runtime_context.task_id)
+    assert saved is not None
+    assert saved.last_recovery_action == "mf_subagent_session_token_reissued"
+
     runtime_current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
@@ -22705,7 +22729,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
             query={
                 "parent_task_id": backlog_id,
                 "fence_token": result["fence_token"],
-                "session_token": result["session_token"],
+                "session_token": reissued["session_token"],
                 "target_project_root": str(target_root),
                 "view": "all",
             },
@@ -22741,7 +22765,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
                 body={
                     "parent_task_id": backlog_id,
                     "fence_token": result["fence_token"],
-                    "session_token": result["session_token"],
+                    "session_token": reissued["session_token"],
                     "target_project_root": str(target_root),
                     "changed_files": ["agent/governance/server.py"],
                     "commit_sha": hashlib.sha1(
