@@ -18000,85 +18000,93 @@ def _runtime_context_contract_runtime_qa_verification_evidence(
     context_head = str(getattr(context, "head_commit", "") or "").strip()
     if not conn or not backlog_id or not context_head:
         return {}
-    try:
-        records = _contract_runtime_store(conn).list_by_backlog(
+    runtime_context_id, task_id, _parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    contract_identity, resolution = (
+        _runtime_context_source_backed_contract_identity(
+            conn,
             project_id=project_id,
-            backlog_id=backlog_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
         )
+    )
+    execution_id = str(
+        contract_identity.get("contract_execution_id") or ""
+    ).strip()
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
     except (ContractRuntimeError, sqlite3.Error):
         return {}
-
-    for record in reversed(list(records)):
-        if not _is_mf_parallel_record_contract_id(
-            str((record or {}).get("contract_id") or "")
+    if not _is_mf_parallel_record_contract_id(
+        str((record or {}).get("contract_id") or "")
+    ):
+        return {}
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return {}
+    for index, raw_line in reversed(list(enumerate(completed_lines))):
+        if not isinstance(raw_line, Mapping):
+            continue
+        line = dict(raw_line)
+        if str(line.get("line_id") or "").strip() != (
+            "qa_independent_verification"
         ):
             continue
-        if not _contract_runtime_dispatch_line_match(record, context):
-            continue
-        completed_lines = record.get("completed_lines")
-        if not isinstance(completed_lines, list):
-            continue
-        for index, raw_line in reversed(list(enumerate(completed_lines))):
-            if not isinstance(raw_line, Mapping):
-                continue
-            line = dict(raw_line)
-            if str(line.get("line_id") or "").strip() != (
-                "qa_independent_verification"
-            ):
-                continue
-            if _contract_runtime_value_reports_failed_qa(line):
-                break
-            if not _contract_runtime_line_status_passes(line):
-                break
-            payload = (
-                line.get("payload")
-                if isinstance(line.get("payload"), Mapping)
-                else {}
-            )
-            actor_role = str(
-                line.get("actor_role")
-                or line.get("evidence_owner_role")
-                or payload.get("actor_role")
-                or ""
-            ).strip().lower()
-            if actor_role != "qa" or bool(line.get("observer_impersonation")):
-                break
-            verified_commit = str(
-                line.get("commit_sha")
-                or payload.get("candidate_commit")
-                or payload.get("snapshot_commit_sha")
-                or payload.get("commit_sha")
-                or ""
-            ).strip()
-            if verified_commit != context_head:
-                break
-            execution_id = str(record.get("contract_execution_id") or "").strip()
-            if not execution_id:
-                break
-            source_ref = f"contract_runtime:{execution_id}:completed_lines:{index}"
-            return {
-                "schema_version": (
-                    "runtime_context.contract_runtime_qa_verification_evidence.v1"
-                ),
-                "source": "contract_runtime_completed_lines",
-                "source_of_authority": "contract_runtime",
-                "status": "passed",
-                "project_id": project_id,
-                "backlog_id": backlog_id,
-                "contract_execution_id": execution_id,
-                "runtime_context_id": _contract_runtime_context_identity(context)[0],
-                "task_id": str(getattr(context, "task_id", "") or ""),
-                "commit_sha": verified_commit,
-                "verification_ref": source_ref,
-                "graph_trace_ids": _runtime_context_service_query_values(
-                    payload,
-                    "graph_trace_ids",
-                    "graph_query_trace_ids",
-                    "trace_ids",
-                ),
-                "observer_authored_qa_evidence": False,
-                "synthetic_timeline_event_created": False,
-            }
+        if _contract_runtime_value_reports_failed_qa(line):
+            return {}
+        if not _contract_runtime_line_status_passes(line):
+            return {}
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        actor_role = str(
+            line.get("actor_role")
+            or line.get("evidence_owner_role")
+            or payload.get("actor_role")
+            or ""
+        ).strip().lower()
+        if actor_role != "qa" or bool(line.get("observer_impersonation")):
+            return {}
+        verified_commit = str(
+            line.get("commit_sha")
+            or payload.get("candidate_commit")
+            or payload.get("snapshot_commit_sha")
+            or payload.get("commit_sha")
+            or ""
+        ).strip()
+        if verified_commit != context_head:
+            return {}
+        source_ref = f"contract_runtime:{execution_id}:completed_lines:{index}"
+        return {
+            "schema_version": (
+                "runtime_context.contract_runtime_qa_verification_evidence.v1"
+            ),
+            "source": "contract_runtime_completed_lines",
+            "source_of_authority": "contract_runtime",
+            "status": "passed",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "contract_execution_resolution": dict(resolution),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "commit_sha": verified_commit,
+            "verification_ref": source_ref,
+            "graph_trace_ids": _runtime_context_service_query_values(
+                payload,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "trace_ids",
+            ),
+            "observer_authored_qa_evidence": False,
+            "synthetic_timeline_event_created": False,
+        }
     return {}
 
 

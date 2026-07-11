@@ -42479,10 +42479,9 @@ def test_runtime_context_projects_canonical_contract_qa_without_timeline_backfil
     }
 
     class CanonicalStore:
-        def list_by_backlog(self, *, project_id, backlog_id):
-            assert project_id == PID
-            assert backlog_id == context.backlog_id
-            return [record]
+        def get(self, contract_execution_id):
+            assert contract_execution_id == "cex-canonical-qa"
+            return record
 
     monkeypatch.setattr(
         server,
@@ -42491,8 +42490,15 @@ def test_runtime_context_projects_canonical_contract_qa_without_timeline_backfil
     )
     monkeypatch.setattr(
         server,
-        "_contract_runtime_dispatch_line_match",
-        lambda _record, _context: True,
+        "_runtime_context_source_backed_contract_identity",
+        lambda *_args, **_kwargs: (
+            {"contract_execution_id": "cex-canonical-qa"},
+            {
+                "status": "resolved_source_backed_worker_lineage",
+                "candidate_count": 1,
+                "fail_closed": False,
+            },
+        ),
     )
 
     evidence = server._runtime_context_contract_runtime_qa_verification_evidence(
@@ -42509,8 +42515,28 @@ def test_runtime_context_projects_canonical_contract_qa_without_timeline_backfil
     assert evidence["graph_trace_ids"] == ["gqt-canonical-qa"]
     assert evidence["observer_authored_qa_evidence"] is False
     assert evidence["synthetic_timeline_event_created"] is False
+    assert evidence["contract_execution_resolution"]["candidate_count"] == 1
 
     record["completed_lines"][0]["payload"]["verdict"] = "FAILED"
+    assert server._runtime_context_contract_runtime_qa_verification_evidence(
+        object(),
+        project_id=PID,
+        context=context,
+    ) == {}
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_source_backed_contract_identity",
+        lambda *_args, **_kwargs: (
+            {},
+            {
+                "status": "ambiguous_active_source_backed_worker_lineage",
+                "candidate_count": 2,
+                "fail_closed": True,
+            },
+        ),
+    )
+    record["completed_lines"][0]["payload"]["verdict"] = "PASS"
     assert server._runtime_context_contract_runtime_qa_verification_evidence(
         object(),
         project_id=PID,
