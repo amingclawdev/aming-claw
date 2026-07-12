@@ -46946,6 +46946,16 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
     )
+    allow_taskless_reconcile = True
+    if reconcile_policy:
+        allow_taskless_reconcile = bool(
+            reconcile_policy.get(
+                "allow_taskless_reconcile_only_for_explicit_shared_batch"
+            )
+            is True
+            and str(getattr(context, "batch_id", "") or "").strip()
+            and str(getattr(context, "merge_queue_id", "") or "").strip()
+        )
     reconcile_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
         runtime_context_id=runtime_context_id,
@@ -46954,7 +46964,7 @@ def _contract_runtime_projection_post_worker_lines(
         kind_tokens={"reconcile", "observer_reconcile"},
         phase_tokens={"reconcile"},
         actor_roles={"observer"},
-        allow_taskless=True,
+        allow_taskless=allow_taskless_reconcile,
         related_task_ids=related_task_ids,
     )
     close_ready_event = _contract_runtime_projection_latest_timeline_event(
@@ -47036,6 +47046,7 @@ def _contract_runtime_projection_post_worker_lines(
                 )
                 reconcile_projection = {
                     "timeline_verified": True,
+                    "allow_taskless_reconcile": allow_taskless_reconcile,
                     "reconcile_source_ref": _runtime_context_event_ref(
                         reconcile_event
                     ),
@@ -47437,7 +47448,7 @@ def _contract_runtime_projection_timeline_scope_matches(
         return not (
             event_task_values or event_context_values or event_related_values
         )
-    return not (event_task_values or event_context_values or event_related_values)
+    return False
 
 
 def _contract_runtime_projection_timeline_actor_role(
@@ -50103,6 +50114,9 @@ def _contract_runtime_trusted_merge_projection(
                             )
                             or ""
                         ),
+                        "allow_taskless_reconcile": bool(
+                            reconcile_authority.get("allow_taskless")
+                        ),
                     }
                 )
     unique = {stable_sha256(item): item for item in candidates}
@@ -50172,7 +50186,10 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         reconcile_runtime_context_id=str(
             reconcile.get("reconcile_runtime_context_id") or ""
         ),
-        allow_taskless=True,
+        allow_taskless=bool(
+            reconcile.get("allow_taskless_reconcile")
+            or merge.get("allow_taskless_reconcile")
+        ),
     )
     root = project_service.resolve_project_root(
         project_id,

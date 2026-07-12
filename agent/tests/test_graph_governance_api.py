@@ -2019,6 +2019,8 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
             "reconcile_source_ref": f"timeline:{reconcile_event['id']}",
             "reconcile_event_id": int(reconcile_event["id"]),
             "reconcile_event_created_at": str(reconcile_event["created_at"]),
+            "reconcile_task_id": task_id,
+            "reconcile_runtime_context_id": "mfrctx-protected-current-full",
         },
     )
     assert authority["db_verified"] is True
@@ -48411,6 +48413,16 @@ def test_shared_reconcile_task_fence_accepts_only_same_or_genuinely_taskless(
         related_task_ids=set(),
         allow_taskless=True,
     ) is expected
+
+
+def test_reconcile_task_fence_rejects_taskless_when_policy_disallows_it():
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        {"task_id": "", "payload": {}},
+        runtime_context_id="",
+        task_id="expected-task",
+        related_task_ids=set(),
+        allow_taskless=False,
+    ) is False
 
 
 def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
