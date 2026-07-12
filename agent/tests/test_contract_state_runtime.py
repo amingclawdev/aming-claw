@@ -6,6 +6,7 @@ import json
 from agent.governance.contract_state_runtime import (
     _bounded_qa_graph_context_satisfies_requirement,
     _current_full_reconcile_satisfies_requirement,
+    build_cli_agent_execution_ticket,
     build_contract_state_projection,
 )
 
@@ -80,6 +81,136 @@ def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
         }
     )
     return evidence
+
+
+def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
+    launch = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-CLI-TICKET",
+        "task_id": "task-cli-ticket",
+        "parent_task_id": "observer-cli-ticket",
+        "runtime_context_id": "mfrctx-cli-ticket",
+        "worker_role": "mf_sub",
+        "worktree_path": "/tmp/cli-ticket-worker",
+        "branch_ref": "refs/heads/codex/cli-ticket",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "merge_queue_id": "mq-cli-ticket",
+        "owned_files": ["agent/observer_runtime.py"],
+        "route_id": "route-cli-ticket",
+        "route_context_hash": "sha256:route-cli-ticket",
+        "prompt_contract_id": "rprompt-cli-ticket",
+        "prompt_contract_hash": "sha256:prompt-cli-ticket",
+        "route_token_ref": "rtok-cli-ticket",
+        "visible_injection_manifest_hash": "sha256:manifest-cli-ticket",
+        "route_token": {"raw": "must-not-appear"},
+    }
+    current = {
+        "schema_version": "contract_runtime_current_state.v1",
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": "contract_runtime_current_state",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-CLI-TICKET",
+        "contract_execution_id": "cex-cli-ticket",
+        "contract_revision_id": "rev-cli-ticket",
+        "execution_state_revision": 7,
+        "execution_state_hash": "sha256:state-cli-ticket",
+        "runtime_guide_hash": "sha256:guide-cli-ticket",
+        "readiness_state": "contract_active",
+        "next_legal_action": {
+            "id": "worker_dispatch",
+            "action": "dispatch_bounded_worker",
+            "runtime_context_id": "mfrctx-cli-ticket",
+            "task_id": "task-cli-ticket",
+            "parent_task_id": "observer-cli-ticket",
+            "worker_role": "mf_sub",
+            "target_project_root": "/tmp/cli-ticket-worker",
+            "owned_files": ["agent/observer_runtime.py"],
+            "route_id": "route-cli-ticket",
+            "route_context_hash": "sha256:route-cli-ticket",
+            "prompt_contract_id": "rprompt-cli-ticket",
+            "prompt_contract_hash": "sha256:prompt-cli-ticket",
+            "route_token_ref": "rtok-cli-ticket",
+            "visible_injection_manifest_hash": "sha256:manifest-cli-ticket",
+        },
+    }
+    return current, launch
+
+
+def test_cli_agent_execution_ticket_is_idempotent_and_public_only():
+    current, launch = _cli_agent_ticket_fixture()
+    kwargs = {
+        "contract_runtime_current_state": current,
+        "launch_identity": launch,
+        "profile_requirements": {
+            "profile_id": "codex-current",
+            "harness": "codex",
+            "provider": "openai",
+            "required_capabilities": ["worker", "tool_use"],
+            "api_key": "must-not-appear",
+        },
+        "retry_policy": {
+            "attempt": 1,
+            "max_attempts": 2,
+            "on_quota_failure": "create_successor",
+            "unbounded_retry": True,
+        },
+        "expected_execution_state_revision": 7,
+        "expected_execution_state_hash": "sha256:state-cli-ticket",
+    }
+    first = build_cli_agent_execution_ticket(**kwargs)
+    second = build_cli_agent_execution_ticket(**kwargs)
+
+    assert first == second
+    assert first["status"] == "issued"
+    assert first["issue_allowed"] is True
+    assert first["source_of_authority"] == "ContractRuntime"
+    assert first["contract_execution_id"] == "cex-cli-ticket"
+    assert first["execution_state_revision"] == 7
+    assert first["dispatch_identity"]["runtime_context_id"] == "mfrctx-cli-ticket"
+    assert first["profile_requirements"]["profile_id"] == "codex-current"
+    encoded = json.dumps(first, sort_keys=True)
+    assert "must-not-appear" not in encoded
+    assert "api_key" not in encoded
+    assert "route_token\"" not in encoded
+
+
+def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
+    current, launch = _cli_agent_ticket_fixture()
+    stale = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+        expected_execution_state_revision=6,
+    )
+    assert stale["status"] == "rejected"
+    assert "stale execution_state_revision" in stale["errors"]
+
+    mismatched_launch = {**launch, "worktree_path": "/tmp/other-worker"}
+    mismatched = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=mismatched_launch,
+    )
+    assert mismatched["status"] == "rejected"
+    assert mismatched["mismatches"][0]["field"] == "worktree_path"
+
+
+def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
+    current, launch = _cli_agent_ticket_fixture()
+    issued = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    consumed_current = {
+        **current,
+        "consumed_dispatch_identity_hashes": [issued["dispatch_identity_hash"]],
+    }
+    rejected = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=consumed_current,
+        launch_identity=launch,
+    )
+
+    assert rejected["status"] == "rejected"
+    assert "dispatch identity was already consumed" in rejected["errors"]
 
 
 def _strict_mf_parallel_contract() -> dict:

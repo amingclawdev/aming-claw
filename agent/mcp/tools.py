@@ -1385,7 +1385,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "observer_runtime_text_prepare",
-        "description": "Prepare runtime launch text and a generated mf_subagent_startup_intent packet for a host-created mf_sub worker. Dry-run only: no model call, no ServiceManager/executor spawn, no actual startup evidence, and no raw launch text persistence.",
+        "description": "Prepare runtime launch text, a generated mf_subagent_startup_intent packet, and an optional ContractRuntime-issued CLI agent execution ticket for a host-created mf_sub worker. Dry-run only: no model call, no ServiceManager/executor spawn, no actual startup evidence, and no raw launch text persistence.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1398,6 +1398,24 @@ TOOLS: list[dict] = [
                 "route_id": {"type": "string"},
                 "precheck_run_id": {"type": "string"},
                 "visible_injection_manifest_hash": {"type": "string"},
+                "contract_execution_id": {
+                    "type": "string",
+                    "description": (
+                        "Current source-backed ContractRuntime execution whose "
+                        "legal dispatch action issues the immutable CLI agent ticket."
+                    ),
+                },
+                "expected_execution_state_revision": {"type": "integer"},
+                "expected_execution_state_hash": {"type": "string"},
+                "expected_dispatch_identity_hash": {"type": "string"},
+                "profile_requirements": {
+                    "type": "object",
+                    "description": "Public profile capability requirements; never raw credentials.",
+                },
+                "retry_policy": {
+                    "type": "object",
+                    "description": "Bounded retry and successor policy pinned into the ticket.",
+                },
                 "parent_route_identity": {
                     "type": "object",
                     "description": (

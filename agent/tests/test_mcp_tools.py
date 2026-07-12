@@ -1361,6 +1361,15 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
             "graph_trace_ids": ["gqt-runtime-text"],
             "base_commit": "base123",
             "target_head_commit": "target123",
+            "contract_execution_id": "cex-runtime-text",
+            "expected_execution_state_revision": 4,
+            "expected_execution_state_hash": "sha256:state-runtime-text",
+            "expected_dispatch_identity_hash": "sha256:dispatch-runtime-text",
+            "profile_requirements": {
+                "profile_id": "inherited-current",
+                "harness": "codex",
+            },
+            "retry_policy": {"attempt": 1, "max_attempts": 2},
         },
     )
 
@@ -1397,6 +1406,15 @@ def test_mcp_observer_runtime_text_prepare_routes_to_governance_endpoint(tmp_pat
                 "graph_trace_ids": ["gqt-runtime-text"],
                 "base_commit": "base123",
                 "target_head_commit": "target123",
+                "contract_execution_id": "cex-runtime-text",
+                "expected_execution_state_revision": 4,
+                "expected_execution_state_hash": "sha256:state-runtime-text",
+                "expected_dispatch_identity_hash": "sha256:dispatch-runtime-text",
+                "profile_requirements": {
+                    "profile_id": "inherited-current",
+                    "harness": "codex",
+                },
+                "retry_policy": {"attempt": 1, "max_attempts": 2},
             },
         )
     ]
@@ -2151,6 +2169,15 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "route_context_hash",
         "prompt_contract_id",
     ]
+    for key in (
+        "contract_execution_id",
+        "expected_execution_state_revision",
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+        "profile_requirements",
+        "retry_policy",
+    ):
+        assert key in runtime_text_props
 
     assert allocate["inputSchema"]["required"] == ["project_id", "task_id"]
     for key in (

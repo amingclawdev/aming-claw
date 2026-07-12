@@ -66439,6 +66439,11 @@ def _observer_runtime_text_contract_revision_payload(
             "test_command",
         ),
         "launch_text_hash": str(prepared.get("launch_text_hash") or ""),
+        "execution_ticket": (
+            dict(prepared.get("execution_ticket"))
+            if isinstance(prepared.get("execution_ticket"), Mapping)
+            else {}
+        ),
         "read_receipt_identity": {
             **dict(read_receipt_identity),
             "recorded": read_receipt_recorded,
@@ -66553,6 +66558,99 @@ def _persist_observer_runtime_text_contract_revision(
         conn.close()
 
 
+def _contract_runtime_execution_ticket_consumption(
+    record: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    consumed_ticket_ids: set[str] = set()
+    consumed_ticket_hashes: set[str] = set()
+    consumed_dispatch_hashes: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            status = str(
+                value.get("execution_ticket_status")
+                or value.get("ticket_status")
+                or value.get("status")
+                or ""
+            ).strip().lower()
+            consumed = bool(value.get("execution_ticket_consumed")) or status in {
+                "consumed",
+                "completed",
+            }
+            if consumed:
+                for key, target in (
+                    ("execution_ticket_id", consumed_ticket_ids),
+                    ("ticket_id", consumed_ticket_ids),
+                    ("execution_ticket_hash", consumed_ticket_hashes),
+                    ("ticket_hash", consumed_ticket_hashes),
+                    ("dispatch_identity_hash", consumed_dispatch_hashes),
+                ):
+                    text = str(value.get(key) or "").strip()
+                    if text:
+                        target.add(text)
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    visit(record.get("completed_lines") or [])
+    return {
+        "consumed_ticket_ids": sorted(consumed_ticket_ids),
+        "consumed_ticket_hashes": sorted(consumed_ticket_hashes),
+        "consumed_dispatch_identity_hashes": sorted(consumed_dispatch_hashes),
+    }
+
+
+def _observer_runtime_text_contract_runtime_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> dict[str, Any]:
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_read(
+            conn,
+            contract_execution_id=execution_id,
+            actor_role="observer",
+        )
+    except (ContractRuntimeError, StalePinnedContractExecutionError, sqlite3.Error) as exc:
+        return {
+            "schema_version": "contract_runtime_current_state.v1",
+            "source_of_authority": "ContractRuntime",
+            "authority_decision_source": "contract_runtime_current_state",
+            "contract_execution_id": execution_id,
+            "ticket_authority_status": "invalid",
+            "ticket_authority_error": str(exc),
+        }
+
+    current_state = _runtime_current_state_from_record(record)
+    current_state.update(
+        {
+            "source_of_authority": "ContractRuntime",
+            "authority_decision_source": "contract_runtime_current_state",
+            "project_id": str(record.get("project_id") or ""),
+            "backlog_id": str(record.get("backlog_id") or ""),
+            "contract_revision_id": str(record.get("revision") or ""),
+            "ticket_authority_status": "current",
+            **_contract_runtime_execution_ticket_consumption(record),
+        }
+    )
+    errors: list[str] = []
+    if current_state["project_id"] != str(project_id or ""):
+        errors.append("ContractRuntime project_id does not match launch project")
+    if backlog_id and current_state["backlog_id"] != str(backlog_id):
+        errors.append("ContractRuntime backlog_id does not match launch backlog")
+    if errors:
+        current_state["ticket_authority_status"] = "invalid"
+        current_state["ticket_authority_error"] = "; ".join(errors)
+    return current_state
+
+
 @route("POST", "/api/projects/{project_id}/observer/worker-launch-pack/prepare")
 @route("POST", "/api/projects/{project_id}/observer/runtime-text/prepare")
 def handle_observer_runtime_text_prepare(ctx: RequestContext):
@@ -66598,8 +66696,29 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
                 owned_files,
             )
         )
+        contract_runtime_current_state = (
+            _observer_runtime_text_contract_runtime_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=str(
+                    body.get("backlog_id") or resolved_context.get("backlog_id") or ""
+                ),
+                contract_execution_id=str(
+                    body.get("contract_execution_id")
+                    or resolved_context.get("contract_execution_id")
+                    or ""
+                ),
+            )
+        )
+        conn.commit()
     finally:
         conn.close()
+    try:
+        expected_execution_state_revision = int(
+            body.get("expected_execution_state_revision") or 0
+        )
+    except (TypeError, ValueError):
+        expected_execution_state_revision = -1
     request = ObserverRuntimeTextPrepareRequest(
         project_id=project_id,
         backlog_id=str(body.get("backlog_id") or resolved_context.get("backlog_id") or ""),
@@ -66706,6 +66825,25 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         transcript_refs=tuple(str(item) for item in (body.get("transcript_refs") or [])),
         transcript_digests=tuple(
             str(item) for item in (body.get("transcript_digests") or [])
+        ),
+        contract_execution_id=str(body.get("contract_execution_id") or ""),
+        contract_runtime_current_state=contract_runtime_current_state,
+        expected_execution_state_revision=expected_execution_state_revision,
+        expected_execution_state_hash=str(
+            body.get("expected_execution_state_hash") or ""
+        ),
+        expected_dispatch_identity_hash=str(
+            body.get("expected_dispatch_identity_hash") or ""
+        ),
+        profile_requirements=(
+            body.get("profile_requirements")
+            if isinstance(body.get("profile_requirements"), Mapping)
+            else {}
+        ),
+        retry_policy=(
+            body.get("retry_policy")
+            if isinstance(body.get("retry_policy"), Mapping)
+            else {}
         ),
     )
     prepared = build_observer_runtime_text_context(request)
@@ -66829,6 +66967,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
             prepared.get("registered_host_adapter_spawn") or {}
         ),
         "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
+        "execution_ticket": dict(prepared.get("execution_ticket") or {}),
         "local_runtime_context_bridge": local_runtime_context_bridge,
         "dispatch_timeline_event": dispatch_timeline_event,
         "full_payload_path": full_payload_path,

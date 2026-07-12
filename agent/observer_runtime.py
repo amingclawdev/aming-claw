@@ -32,6 +32,7 @@ try:
         build_mf_subagent_input,
         validate_mf_subagent_dispatch_gate,
     )
+    from governance.contract_state_runtime import build_cli_agent_execution_ticket
     from governance import batch_jobs
     from governance.parallel_branch_runtime import (
         build_registered_host_adapter_spawn_identity,
@@ -56,6 +57,9 @@ except ImportError:  # pragma: no cover - package import path
         MfSubagentContractError,
         build_mf_subagent_input,
         validate_mf_subagent_dispatch_gate,
+    )
+    from agent.governance.contract_state_runtime import (
+        build_cli_agent_execution_ticket,
     )
     from agent.governance import batch_jobs
     from agent.governance.parallel_branch_runtime import (
@@ -483,6 +487,13 @@ class ObserverRuntimeTextPrepareRequest:
     transcript_digests: tuple[str, ...] = ()
     selected_topology: str = RUNTIME_TEXT_DEFAULT_TOPOLOGY
     recommended_topology: str = RUNTIME_TEXT_DEFAULT_TOPOLOGY
+    contract_execution_id: str = ""
+    contract_runtime_current_state: Mapping[str, Any] = field(default_factory=dict)
+    expected_execution_state_revision: int = 0
+    expected_execution_state_hash: str = ""
+    expected_dispatch_identity_hash: str = ""
+    profile_requirements: Mapping[str, Any] = field(default_factory=dict)
+    retry_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -5385,6 +5396,62 @@ def _runtime_text_worker_launch_pack(
             missing=missing_prerequisites,
         )
 
+    execution_ticket_requested = bool(
+        request.contract_execution_id
+        or request.contract_runtime_current_state
+        or request.expected_execution_state_revision
+        or request.expected_execution_state_hash
+        or request.expected_dispatch_identity_hash
+        or request.profile_requirements
+        or request.retry_policy
+    )
+    execution_ticket = {
+        "schema_version": "cli_agent_execution_ticket.v1",
+        "status": "not_requested",
+        "issue_allowed": False,
+        "source_of_authority": "ContractRuntime",
+    }
+    if execution_ticket_requested:
+        execution_ticket = build_cli_agent_execution_ticket(
+            contract_runtime_current_state=request.contract_runtime_current_state,
+            launch_identity={
+                "project_id": request.project_id,
+                "backlog_id": request.backlog_id,
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+                "runtime_context_id": runtime_context_id,
+                "worker_role": "mf_sub",
+                "worktree_path": context.worktree_path,
+                "branch_ref": context.branch_ref,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+                "owned_files": list(owned_files),
+                "route_id": request.route_id,
+                "route_context_hash": request.route.route_context_hash,
+                "prompt_contract_id": request.route.prompt_contract_id,
+                "prompt_contract_hash": request.route.prompt_contract_hash,
+                "route_token_ref": request.route.route_token_ref,
+                "visible_injection_manifest_hash": (
+                    request.visible_injection_manifest_hash
+                ),
+            },
+            profile_requirements=request.profile_requirements,
+            retry_policy=request.retry_policy,
+            expected_execution_state_revision=(
+                request.expected_execution_state_revision
+            ),
+            expected_execution_state_hash=request.expected_execution_state_hash,
+            expected_dispatch_identity_hash=request.expected_dispatch_identity_hash,
+        )
+        if not execution_ticket.get("issue_allowed"):
+            add_blocker(
+                "execution_ticket_rejected",
+                "current ContractRuntime rejected the CLI agent execution ticket",
+                errors=list(execution_ticket.get("errors") or []),
+                mismatches=list(execution_ticket.get("mismatches") or []),
+            )
+
     startup_preflight = {
         "schema_version": "observer_worker_launch_pack.startup_preflight.v1",
         "allowed": not blockers,
@@ -5469,6 +5536,9 @@ def _runtime_text_worker_launch_pack(
         "graph_first_obligations": dict(graph_first_obligations),
         "raw_tokens_persisted": False,
     }
+    if execution_ticket_requested:
+        pack["execution_ticket"] = execution_ticket
+        pack["execution_ticket_requested"] = True
     pack["worker_launch_pack_hash"] = _stable_json_hash(
         {key: value for key, value in pack.items() if key != "worker_launch_pack_hash"}
     )
@@ -7521,6 +7591,16 @@ def build_observer_runtime_text_context(
                 "worker_launch_pack_hash",
                 "",
             ),
+            "execution_ticket_id": str(
+                (worker_launch_pack.get("execution_ticket") or {}).get("ticket_id")
+                if isinstance(worker_launch_pack.get("execution_ticket"), Mapping)
+                else ""
+            ),
+            "execution_ticket_hash": str(
+                (worker_launch_pack.get("execution_ticket") or {}).get("ticket_hash")
+                if isinstance(worker_launch_pack.get("execution_ticket"), Mapping)
+                else ""
+            ),
         },
         "startup_intent_event": startup_intent_event,
         "startup_recording": startup_recording,
@@ -7544,6 +7624,7 @@ def build_observer_runtime_text_context(
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
         "worker_launch_pack": worker_launch_pack,
+        "execution_ticket": dict(worker_launch_pack.get("execution_ticket") or {}),
         "local_runtime_context_bridge": worker_launch_pack.get(
             "local_runtime_context_bridge",
             {},

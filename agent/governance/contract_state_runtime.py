@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
+CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION = "cli_agent_execution_ticket.v1"
 
 CONTRACT_PASS_STATUSES = {
     "accepted",
@@ -3431,6 +3432,392 @@ def _route_identity_hash(route_binding: Mapping[str, Any]) -> str:
         return ""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_json_hash(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+_CLI_AGENT_TICKET_ROUTE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+_CLI_AGENT_TICKET_PROFILE_FIELDS = (
+    "profile_id",
+    "profile_kind",
+    "harness",
+    "provider",
+    "model",
+    "runtime_id",
+    "endpoint_id",
+    "launcher_id",
+    "independent_qa_required",
+)
+
+_CLI_AGENT_TICKET_RETRY_FIELDS = (
+    "attempt",
+    "max_attempts",
+    "backoff_seconds",
+    "on_auth_failure",
+    "on_quota_failure",
+    "on_crash",
+    "successor_required",
+)
+
+_CLI_AGENT_TICKET_ACTION_FIELDS = (
+    "id",
+    "action",
+    "stage_id",
+    "line_id",
+    "evidence_kind",
+    "owner_role",
+    "worker_role",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "target_project_root",
+    "worktree_path",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _ticket_public_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _ticket_string_items(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted(
+        {
+            str(item).strip()
+            for item in value
+            if isinstance(item, (str, int, float)) and str(item).strip()
+        }
+    )
+
+
+def _ticket_profile_requirements(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    result: dict[str, Any] = {}
+    for key in _CLI_AGENT_TICKET_PROFILE_FIELDS:
+        field_value = source.get(key)
+        if isinstance(field_value, bool):
+            result[key] = field_value
+        else:
+            text = _ticket_public_text(field_value)
+            if text:
+                result[key] = text
+    for key in ("required_capabilities", "preferred_profile_ids", "excluded_profile_ids"):
+        items = _ticket_string_items(source.get(key))
+        if items:
+            result[key] = items
+    return result
+
+
+def _ticket_retry_policy(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    result: dict[str, Any] = {}
+    for key in _CLI_AGENT_TICKET_RETRY_FIELDS:
+        field_value = source.get(key)
+        if key in {"attempt", "max_attempts"}:
+            try:
+                result[key] = max(0, int(field_value))
+            except (TypeError, ValueError):
+                continue
+        elif key == "backoff_seconds":
+            try:
+                result[key] = max(0.0, float(field_value))
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(field_value, bool):
+            result[key] = field_value
+        else:
+            text = _ticket_public_text(field_value)
+            if text:
+                result[key] = text
+    return result
+
+
+def _ticket_current_authority(
+    contract_runtime_current_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    source = (
+        contract_runtime_current_state
+        if isinstance(contract_runtime_current_state, Mapping)
+        else {}
+    )
+    nested = source.get("contract_runtime_current_state")
+    if isinstance(nested, Mapping):
+        source = nested
+    execution = source.get("execution") if isinstance(source.get("execution"), Mapping) else {}
+    active = (
+        source.get("active_contract_execution")
+        if isinstance(source.get("active_contract_execution"), Mapping)
+        else {}
+    )
+    next_action = (
+        source.get("next_legal_action")
+        if isinstance(source.get("next_legal_action"), Mapping)
+        else {}
+    )
+    public_action = {
+        key: next_action.get(key)
+        for key in _CLI_AGENT_TICKET_ACTION_FIELDS
+        if next_action.get(key) not in (None, "", [], {})
+    }
+    for key in ("owned_files", "target_files"):
+        items = _ticket_string_items(next_action.get(key))
+        if items:
+            public_action[key] = items
+    try:
+        state_revision = int(
+            source.get("execution_state_revision")
+            or execution.get("execution_state_revision")
+            or 0
+        )
+    except (TypeError, ValueError):
+        state_revision = 0
+    return {
+        "source_of_authority": _ticket_public_text(
+            source.get("source_of_authority") or "ContractRuntime"
+        ),
+        "authority_decision_source": _ticket_public_text(
+            source.get("authority_decision_source")
+            or "contract_runtime_current_state"
+        ),
+        "project_id": _ticket_public_text(
+            source.get("project_id") or execution.get("project_id")
+        ),
+        "backlog_id": _ticket_public_text(
+            source.get("backlog_id") or execution.get("backlog_id")
+        ),
+        "contract_execution_id": _ticket_public_text(
+            source.get("contract_execution_id")
+            or execution.get("contract_execution_id")
+            or active.get("contract_execution_id")
+        ),
+        "contract_revision_id": _ticket_public_text(
+            source.get("contract_revision_id")
+            or source.get("current_revision_id")
+            or execution.get("contract_revision_id")
+            or active.get("contract_revision_id")
+        ),
+        "execution_state_revision": state_revision,
+        "execution_state_hash": _ticket_public_text(
+            source.get("execution_state_hash")
+            or execution.get("execution_state_hash")
+        ),
+        "runtime_guide_hash": _ticket_public_text(source.get("runtime_guide_hash")),
+        "readiness_state": _ticket_public_text(
+            source.get("readiness_state") or source.get("status")
+        ),
+        "next_legal_action": public_action,
+        "consumed_ticket_ids": _ticket_string_items(
+            source.get("consumed_ticket_ids")
+        ),
+        "consumed_ticket_hashes": _ticket_string_items(
+            source.get("consumed_ticket_hashes")
+        ),
+        "consumed_dispatch_identity_hashes": _ticket_string_items(
+            source.get("consumed_dispatch_identity_hashes")
+        ),
+        "status": _ticket_public_text(source.get("ticket_authority_status")),
+        "error": _ticket_public_text(source.get("ticket_authority_error")),
+    }
+
+
+def _ticket_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    identity = {
+        "project_id": _ticket_public_text(source.get("project_id")),
+        "backlog_id": _ticket_public_text(source.get("backlog_id")),
+        "task_id": _ticket_public_text(source.get("task_id")),
+        "parent_task_id": _ticket_public_text(source.get("parent_task_id")),
+        "runtime_context_id": _ticket_public_text(source.get("runtime_context_id")),
+        "worker_role": _ticket_public_text(source.get("worker_role")),
+        "worktree_path": _ticket_public_text(
+            source.get("worktree_path") or source.get("target_project_root")
+        ),
+        "branch_ref": _ticket_public_text(
+            source.get("branch_ref") or source.get("branch")
+        ),
+        "base_commit": _ticket_public_text(source.get("base_commit")),
+        "target_head_commit": _ticket_public_text(source.get("target_head_commit")),
+        "merge_queue_id": _ticket_public_text(source.get("merge_queue_id")),
+        "owned_files": _ticket_string_items(
+            source.get("owned_files") or source.get("target_files")
+        ),
+    }
+    for field in _CLI_AGENT_TICKET_ROUTE_FIELDS:
+        identity[field] = _ticket_public_text(source.get(field))
+    return identity
+
+
+def _ticket_authority_mismatches(
+    authority: Mapping[str, Any],
+    launch: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    action = (
+        authority.get("next_legal_action")
+        if isinstance(authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    comparisons = {
+        "project_id": authority.get("project_id"),
+        "backlog_id": authority.get("backlog_id"),
+        "task_id": action.get("task_id"),
+        "parent_task_id": action.get("parent_task_id"),
+        "runtime_context_id": action.get("runtime_context_id"),
+        "worker_role": action.get("worker_role"),
+        "worktree_path": action.get("target_project_root")
+        or action.get("worktree_path"),
+        **{field: action.get(field) for field in _CLI_AGENT_TICKET_ROUTE_FIELDS},
+    }
+    for field, expected in comparisons.items():
+        expected_text = _ticket_public_text(expected)
+        actual_text = _ticket_public_text(launch.get(field))
+        if expected_text and expected_text != actual_text:
+            mismatches.append(
+                {"field": field, "expected": expected_text, "actual": actual_text}
+            )
+    expected_files = _ticket_string_items(
+        action.get("owned_files") or action.get("target_files")
+    )
+    actual_files = _ticket_string_items(launch.get("owned_files"))
+    if expected_files and expected_files != actual_files:
+        mismatches.append(
+            {"field": "owned_files", "expected": expected_files, "actual": actual_files}
+        )
+    return mismatches
+
+
+def build_cli_agent_execution_ticket(
+    *,
+    contract_runtime_current_state: Mapping[str, Any] | None,
+    launch_identity: Mapping[str, Any] | None,
+    profile_requirements: Mapping[str, Any] | None = None,
+    retry_policy: Mapping[str, Any] | None = None,
+    expected_execution_state_revision: int = 0,
+    expected_execution_state_hash: str = "",
+    expected_dispatch_identity_hash: str = "",
+) -> dict[str, Any]:
+    """Materialize one public, immutable ticket from current ContractRuntime state."""
+
+    authority = _ticket_current_authority(contract_runtime_current_state)
+    launch = _ticket_launch_identity(launch_identity)
+    profile = _ticket_profile_requirements(profile_requirements)
+    retry = _ticket_retry_policy(retry_policy)
+    dispatch_identity_hash = _stable_json_hash(launch)
+    errors: list[str] = []
+    mismatches = _ticket_authority_mismatches(authority, launch)
+    if authority.get("status") == "invalid" or authority.get("error"):
+        errors.append(str(authority.get("error") or "contract runtime authority is invalid"))
+    if authority.get("source_of_authority") != "ContractRuntime":
+        errors.append("execution ticket authority must be ContractRuntime")
+    if not authority.get("contract_execution_id"):
+        errors.append("contract_execution_id is required")
+    if int(authority.get("execution_state_revision") or 0) <= 0:
+        errors.append("execution_state_revision is required")
+    if not authority.get("execution_state_hash"):
+        errors.append("execution_state_hash is required")
+    if not authority.get("next_legal_action"):
+        errors.append("current ContractRuntime has no legal dispatch action")
+    if str(authority.get("readiness_state") or "").lower() in {
+        "complete",
+        "completed",
+        "contract_complete",
+    }:
+        errors.append("current ContractRuntime execution is complete")
+    if expected_execution_state_revision and (
+        int(authority.get("execution_state_revision") or 0)
+        != int(expected_execution_state_revision)
+    ):
+        errors.append("stale execution_state_revision")
+    if expected_execution_state_hash and (
+        str(authority.get("execution_state_hash") or "")
+        != str(expected_execution_state_hash)
+    ):
+        errors.append("stale execution_state_hash")
+    if expected_dispatch_identity_hash and (
+        dispatch_identity_hash != str(expected_dispatch_identity_hash)
+    ):
+        errors.append("stale dispatch_identity_hash")
+    if mismatches:
+        errors.append("launch identity does not match current ContractRuntime action")
+    if dispatch_identity_hash in set(
+        authority.get("consumed_dispatch_identity_hashes") or []
+    ):
+        errors.append("dispatch identity was already consumed")
+
+    rejection = {
+        "schema_version": CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION,
+        "status": "rejected",
+        "issue_allowed": False,
+        "source_of_authority": "ContractRuntime",
+        "authority": authority,
+        "dispatch_identity_hash": dispatch_identity_hash,
+        "mismatches": mismatches,
+        "errors": errors,
+        "raw_credentials_persisted": False,
+        "raw_route_token_persisted": False,
+        "raw_private_context_persisted": False,
+    }
+    if errors:
+        return rejection
+
+    material = {
+        "schema_version": CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION,
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": authority.get("authority_decision_source"),
+        "contract_execution_id": authority.get("contract_execution_id"),
+        "contract_revision_id": authority.get("contract_revision_id"),
+        "execution_state_revision": authority.get("execution_state_revision"),
+        "execution_state_hash": authority.get("execution_state_hash"),
+        "runtime_guide_hash": authority.get("runtime_guide_hash"),
+        "next_legal_action": authority.get("next_legal_action"),
+        "next_legal_action_hash": _stable_json_hash(
+            authority.get("next_legal_action") or {}
+        ),
+        "dispatch_identity": launch,
+        "dispatch_identity_hash": dispatch_identity_hash,
+        "profile_requirements": profile,
+        "profile_requirements_hash": _stable_json_hash(profile),
+        "retry_policy": retry,
+        "retry_policy_hash": _stable_json_hash(retry),
+        "immutable": True,
+        "consumed": False,
+        "raw_credentials_persisted": False,
+        "raw_route_token_persisted": False,
+        "raw_private_context_persisted": False,
+    }
+    material_hash = _stable_json_hash(material)
+    ticket_id = "caet-" + material_hash.removeprefix("sha256:")[:24]
+    ticket = {
+        **material,
+        "ticket_id": ticket_id,
+        "status": "issued",
+        "issue_allowed": True,
+    }
+    ticket["ticket_hash"] = _stable_json_hash(ticket)
+    return ticket
 
 
 def _execution_id(

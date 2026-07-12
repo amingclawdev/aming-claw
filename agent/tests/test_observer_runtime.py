@@ -266,6 +266,40 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
             route_id="route-a1",
             visible_injection_manifest_hash="sha256:visible-a1",
             backend_mode="codex_app_subagent",
+            contract_execution_id="cex-runtime-text-a1",
+            contract_runtime_current_state={
+                "source_of_authority": "ContractRuntime",
+                "project_id": "aming-claw",
+                "backlog_id": "AC-RUNTIME-TEXT-A1",
+                "contract_execution_id": "cex-runtime-text-a1",
+                "contract_revision_id": "rev-runtime-text-a1",
+                "execution_state_revision": 3,
+                "execution_state_hash": "sha256:state-runtime-text-a1",
+                "runtime_guide_hash": "sha256:guide-runtime-text-a1",
+                "readiness_state": "contract_active",
+                "next_legal_action": {
+                    "id": "worker_dispatch",
+                    "action": "dispatch_bounded_worker",
+                    "runtime_context_id": "mfrctx-runtime-text-a1",
+                    "task_id": "task-a1",
+                    "parent_task_id": "AC-RUNTIME-TEXT-A1",
+                    "worker_role": "mf_sub",
+                    "target_project_root": str(worktree),
+                    "owned_files": ["agent/observer_runtime.py"],
+                    "route_id": "route-a1",
+                    "route_context_hash": "sha256:route-a1",
+                    "prompt_contract_id": "rprompt-a1",
+                    "prompt_contract_hash": "sha256:prompt-a1",
+                    "route_token_ref": "rtok-runtime-text-a1",
+                    "visible_injection_manifest_hash": "sha256:visible-a1",
+                },
+            },
+            expected_execution_state_revision=3,
+            profile_requirements={
+                "profile_id": "inherited-current",
+                "harness": "codex",
+            },
+            retry_policy={"attempt": 1, "max_attempts": 2},
         )
     )
 
@@ -288,6 +322,14 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         prepared,
     )
     assert revision_payload["route_identity"] == prepared["route_identity"]
+    ticket = prepared["execution_ticket"]
+    assert ticket["status"] == "issued"
+    assert ticket["issue_allowed"] is True
+    assert ticket["contract_execution_id"] == "cex-runtime-text-a1"
+    assert ticket["dispatch_identity"]["worktree_path"] == str(worktree)
+    assert ticket["profile_requirements"]["profile_id"] == "inherited-current"
+    assert prepared["worker_launch_pack"]["execution_ticket"] == ticket
+    assert revision_payload["execution_ticket"] == ticket
     assert prepared["runtime_context"]["worktree_path"] == str(worktree)
     assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a1"
     assert prepared["runtime_context"]["base_commit"] == "base-a1"
@@ -405,6 +447,50 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "audited_graph_query_with_task_and_fence_identity"
         in prepared["first_progress_contract"]["observer_progress_sources"]
     )
+
+
+def test_runtime_text_ticket_authority_is_read_from_contract_runtime(monkeypatch):
+    from agent.governance import server
+
+    record = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-TEXT-AUTHORITY",
+        "contract_execution_id": "cex-runtime-text-authority",
+        "contract_id": "mf_parallel",
+        "revision": "rev-runtime-text-authority",
+        "execution_state_revision": 5,
+        "execution_state": {
+            "execution_state_revision": 5,
+            "execution_state_hash": "sha256:state-runtime-text-authority",
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:guide-runtime-text-authority",
+            "execution": {
+                "contract_execution_id": "cex-runtime-text-authority",
+                "execution_state_revision": 5,
+                "execution_state_hash": "sha256:state-runtime-text-authority",
+            },
+            "next_legal_action": {
+                "line_id": "worker_dispatch",
+                "action": "dispatch_bounded_worker",
+            },
+        },
+        "completed_lines": [],
+    }
+    monkeypatch.setattr(server, "_contract_runtime_read", lambda *args, **kwargs: record)
+
+    current = server._observer_runtime_text_contract_runtime_authority(
+        object(),
+        project_id="aming-claw",
+        backlog_id="AC-RUNTIME-TEXT-AUTHORITY",
+        contract_execution_id="cex-runtime-text-authority",
+    )
+
+    assert current["ticket_authority_status"] == "current"
+    assert current["source_of_authority"] == "ContractRuntime"
+    assert current["contract_revision_id"] == "rev-runtime-text-authority"
+    assert current["execution_state_revision"] == 5
+    assert current["next_legal_action"]["action"] == "dispatch_bounded_worker"
 
 
 def test_runtime_text_prepare_prefers_nested_context_parent_over_top_level_backlog(
