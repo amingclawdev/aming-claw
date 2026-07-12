@@ -3490,6 +3490,11 @@ _CLI_AGENT_TICKET_ACTION_FIELDS = (
     "worktree_path",
     "project_root",
     "repo_root",
+    "branch_ref",
+    "branch",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
     "route_id",
     "route_context_hash",
     "prompt_contract_id",
@@ -3705,6 +3710,10 @@ def _ticket_authority_mismatches(
         or action.get("worktree_path")
         or action.get("project_root")
         or action.get("repo_root"),
+        "branch_ref": action.get("branch_ref") or action.get("branch"),
+        "base_commit": action.get("base_commit"),
+        "target_head_commit": action.get("target_head_commit"),
+        "merge_queue_id": action.get("merge_queue_id"),
         **{field: action.get(field) for field in _CLI_AGENT_TICKET_ROUTE_FIELDS},
     }
     for field, expected in comparisons.items():
@@ -3748,6 +3757,9 @@ def _ticket_authority_missing_fields(authority: Mapping[str, Any]) -> list[str]:
         "parent_task_id",
         "runtime_context_id",
         "worker_role",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
         "route_id",
         "route_context_hash",
         "prompt_contract_id",
@@ -3757,6 +3769,8 @@ def _ticket_authority_missing_fields(authority: Mapping[str, Any]) -> list[str]:
     ):
         if not action.get(field):
             missing.append(f"next_legal_action.{field}")
+    if not (action.get("branch_ref") or action.get("branch")):
+        missing.append("next_legal_action.branch_ref")
     if not (
         action.get("target_project_root")
         or action.get("worktree_path")

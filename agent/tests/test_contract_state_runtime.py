@@ -125,6 +125,10 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
             "parent_task_id": "observer-cli-ticket",
             "worker_role": "mf_sub",
             "target_project_root": "/tmp/cli-ticket-worker",
+            "branch_ref": "refs/heads/codex/cli-ticket",
+            "base_commit": "a" * 40,
+            "target_head_commit": "a" * 40,
+            "merge_queue_id": "mq-cli-ticket",
             "owned_files": ["agent/observer_runtime.py"],
             "route_id": "route-cli-ticket",
             "route_context_hash": "sha256:route-cli-ticket",
@@ -203,6 +207,15 @@ def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
     )
     assert mismatched["status"] == "rejected"
     assert mismatched["mismatches"][0]["field"] == "worktree_path"
+
+    mismatched_branch = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity={**launch, "branch_ref": "refs/heads/codex/other"},
+    )
+    assert mismatched_branch["status"] == "rejected"
+    assert any(
+        item["field"] == "branch_ref" for item in mismatched_branch["mismatches"]
+    )
 
     invented_profile = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
