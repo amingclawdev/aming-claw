@@ -132,6 +132,17 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
             "prompt_contract_hash": "sha256:prompt-cli-ticket",
             "route_token_ref": "rtok-cli-ticket",
             "visible_injection_manifest_hash": "sha256:manifest-cli-ticket",
+            "profile_requirements": {
+                "profile_id": "codex-current",
+                "harness": "codex",
+                "provider": "openai",
+                "required_capabilities": ["worker", "tool_use"],
+            },
+            "retry_policy": {
+                "attempt": 1,
+                "max_attempts": 2,
+                "on_quota_failure": "create_successor",
+            },
         },
     }
     return current, launch
@@ -193,6 +204,36 @@ def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
     assert mismatched["status"] == "rejected"
     assert mismatched["mismatches"][0]["field"] == "worktree_path"
 
+    invented_profile = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+        profile_requirements={"profile_id": "another-account", "harness": "codex"},
+    )
+    assert invented_profile["status"] == "rejected"
+    assert "profile requirements do not match current ContractRuntime action" in (
+        invented_profile["errors"]
+    )
+
+    identity_free = {
+        **current,
+        "next_legal_action": {
+            "id": "worker_dispatch",
+            "action": "dispatch_bounded_worker",
+            "profile_requirements": current["next_legal_action"][
+                "profile_requirements"
+            ],
+            "retry_policy": current["next_legal_action"]["retry_policy"],
+        },
+    }
+    unbound = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=identity_free,
+        launch_identity=launch,
+    )
+    assert unbound["status"] == "rejected"
+    assert "next_legal_action.runtime_context_id" in unbound[
+        "missing_authority_fields"
+    ]
+
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
     current, launch = _cli_agent_ticket_fixture()
@@ -211,6 +252,26 @@ def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
 
     assert rejected["status"] == "rejected"
     assert "dispatch identity was already consumed" in rejected["errors"]
+
+    consumed_by_id = {
+        **current,
+        "consumed_ticket_ids": [issued["ticket_id"]],
+    }
+    rejected_by_id = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=consumed_by_id,
+        launch_identity=launch,
+    )
+    assert "execution ticket id was already consumed" in rejected_by_id["errors"]
+
+    consumed_by_hash = {
+        **current,
+        "consumed_ticket_hashes": [issued["ticket_hash"]],
+    }
+    rejected_by_hash = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=consumed_by_hash,
+        launch_identity=launch,
+    )
+    assert "execution ticket hash was already consumed" in rejected_by_hash["errors"]
 
 
 def _strict_mf_parallel_contract() -> dict:

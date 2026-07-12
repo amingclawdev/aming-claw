@@ -44310,6 +44310,8 @@ def _runtime_next_action_from_guide(
         "caller_graph_query_schema_trace_id",
         "owned_files",
         "target_files",
+        "profile_requirements",
+        "retry_policy",
         "worker_session_lifecycle_policy",
         "write_authorization_policy",
     ):

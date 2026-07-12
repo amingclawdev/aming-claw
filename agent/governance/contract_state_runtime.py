@@ -3488,6 +3488,8 @@ _CLI_AGENT_TICKET_ACTION_FIELDS = (
     "parent_task_id",
     "target_project_root",
     "worktree_path",
+    "project_root",
+    "repo_root",
     "route_id",
     "route_context_hash",
     "prompt_contract_id",
@@ -3586,6 +3588,18 @@ def _ticket_current_authority(
         items = _ticket_string_items(next_action.get(key))
         if items:
             public_action[key] = items
+    if "profile_requirements" in next_action or "profile_requirements" in source:
+        public_action["profile_requirements"] = _ticket_profile_requirements(
+            next_action.get("profile_requirements")
+            if "profile_requirements" in next_action
+            else source.get("profile_requirements")
+        )
+    if "retry_policy" in next_action or "retry_policy" in source:
+        public_action["retry_policy"] = _ticket_retry_policy(
+            next_action.get("retry_policy")
+            if "retry_policy" in next_action
+            else source.get("retry_policy")
+        )
     try:
         state_revision = int(
             source.get("execution_state_revision")
@@ -3688,7 +3702,9 @@ def _ticket_authority_mismatches(
         "runtime_context_id": action.get("runtime_context_id"),
         "worker_role": action.get("worker_role"),
         "worktree_path": action.get("target_project_root")
-        or action.get("worktree_path"),
+        or action.get("worktree_path")
+        or action.get("project_root")
+        or action.get("repo_root"),
         **{field: action.get(field) for field in _CLI_AGENT_TICKET_ROUTE_FIELDS},
     }
     for field, expected in comparisons.items():
@@ -3709,6 +3725,53 @@ def _ticket_authority_mismatches(
     return mismatches
 
 
+def _ticket_authority_missing_fields(authority: Mapping[str, Any]) -> list[str]:
+    missing = [
+        field
+        for field in (
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "contract_revision_id",
+            "execution_state_hash",
+            "runtime_guide_hash",
+        )
+        if not authority.get(field)
+    ]
+    action = (
+        authority.get("next_legal_action")
+        if isinstance(authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    for field in (
+        "task_id",
+        "parent_task_id",
+        "runtime_context_id",
+        "worker_role",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    ):
+        if not action.get(field):
+            missing.append(f"next_legal_action.{field}")
+    if not (
+        action.get("target_project_root")
+        or action.get("worktree_path")
+        or action.get("project_root")
+        or action.get("repo_root")
+    ):
+        missing.append("next_legal_action.target_project_root")
+    if not _ticket_string_items(action.get("owned_files") or action.get("target_files")):
+        missing.append("next_legal_action.owned_files")
+    for field in ("profile_requirements", "retry_policy"):
+        if field not in action:
+            missing.append(f"next_legal_action.{field}")
+    return missing
+
+
 def build_cli_agent_execution_ticket(
     *,
     contract_runtime_current_state: Mapping[str, Any] | None,
@@ -3723,23 +3786,29 @@ def build_cli_agent_execution_ticket(
 
     authority = _ticket_current_authority(contract_runtime_current_state)
     launch = _ticket_launch_identity(launch_identity)
-    profile = _ticket_profile_requirements(profile_requirements)
-    retry = _ticket_retry_policy(retry_policy)
+    requested_profile = _ticket_profile_requirements(profile_requirements)
+    requested_retry = _ticket_retry_policy(retry_policy)
+    action = (
+        authority.get("next_legal_action")
+        if isinstance(authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    profile = _ticket_profile_requirements(action.get("profile_requirements"))
+    retry = _ticket_retry_policy(action.get("retry_policy"))
     dispatch_identity_hash = _stable_json_hash(launch)
     errors: list[str] = []
     mismatches = _ticket_authority_mismatches(authority, launch)
+    missing_authority_fields = _ticket_authority_missing_fields(authority)
     if authority.get("status") == "invalid" or authority.get("error"):
         errors.append(str(authority.get("error") or "contract runtime authority is invalid"))
     if authority.get("source_of_authority") != "ContractRuntime":
         errors.append("execution ticket authority must be ContractRuntime")
-    if not authority.get("contract_execution_id"):
-        errors.append("contract_execution_id is required")
     if int(authority.get("execution_state_revision") or 0) <= 0:
         errors.append("execution_state_revision is required")
-    if not authority.get("execution_state_hash"):
-        errors.append("execution_state_hash is required")
     if not authority.get("next_legal_action"):
         errors.append("current ContractRuntime has no legal dispatch action")
+    if missing_authority_fields:
+        errors.append("current ContractRuntime action is missing dispatch authority")
     if str(authority.get("readiness_state") or "").lower() in {
         "complete",
         "completed",
@@ -3762,26 +3831,14 @@ def build_cli_agent_execution_ticket(
         errors.append("stale dispatch_identity_hash")
     if mismatches:
         errors.append("launch identity does not match current ContractRuntime action")
+    if profile_requirements and requested_profile != profile:
+        errors.append("profile requirements do not match current ContractRuntime action")
+    if retry_policy and requested_retry != retry:
+        errors.append("retry policy does not match current ContractRuntime action")
     if dispatch_identity_hash in set(
         authority.get("consumed_dispatch_identity_hashes") or []
     ):
         errors.append("dispatch identity was already consumed")
-
-    rejection = {
-        "schema_version": CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION,
-        "status": "rejected",
-        "issue_allowed": False,
-        "source_of_authority": "ContractRuntime",
-        "authority": authority,
-        "dispatch_identity_hash": dispatch_identity_hash,
-        "mismatches": mismatches,
-        "errors": errors,
-        "raw_credentials_persisted": False,
-        "raw_route_token_persisted": False,
-        "raw_private_context_persisted": False,
-    }
-    if errors:
-        return rejection
 
     material = {
         "schema_version": CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION,
@@ -3817,6 +3874,27 @@ def build_cli_agent_execution_ticket(
         "issue_allowed": True,
     }
     ticket["ticket_hash"] = _stable_json_hash(ticket)
+    if ticket_id in set(authority.get("consumed_ticket_ids") or []):
+        errors.append("execution ticket id was already consumed")
+    if ticket["ticket_hash"] in set(authority.get("consumed_ticket_hashes") or []):
+        errors.append("execution ticket hash was already consumed")
+    if errors:
+        return {
+            "schema_version": CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION,
+            "status": "rejected",
+            "issue_allowed": False,
+            "source_of_authority": "ContractRuntime",
+            "authority": authority,
+            "dispatch_identity_hash": dispatch_identity_hash,
+            "candidate_ticket_id": ticket_id,
+            "candidate_ticket_hash": ticket["ticket_hash"],
+            "missing_authority_fields": missing_authority_fields,
+            "mismatches": mismatches,
+            "errors": errors,
+            "raw_credentials_persisted": False,
+            "raw_route_token_persisted": False,
+            "raw_private_context_persisted": False,
+        }
     return ticket
 
 

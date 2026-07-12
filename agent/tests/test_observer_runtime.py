@@ -292,6 +292,11 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                     "prompt_contract_hash": "sha256:prompt-a1",
                     "route_token_ref": "rtok-runtime-text-a1",
                     "visible_injection_manifest_hash": "sha256:visible-a1",
+                    "profile_requirements": {
+                        "profile_id": "inherited-current",
+                        "harness": "codex",
+                    },
+                    "retry_policy": {"attempt": 1, "max_attempts": 2},
                 },
             },
             expected_execution_state_revision=3,
@@ -473,6 +478,11 @@ def test_runtime_text_ticket_authority_is_read_from_contract_runtime(monkeypatch
             "next_legal_action": {
                 "line_id": "worker_dispatch",
                 "action": "dispatch_bounded_worker",
+                "profile_requirements": {
+                    "profile_id": "inherited-current",
+                    "harness": "codex",
+                },
+                "retry_policy": {"attempt": 1, "max_attempts": 2},
             },
         },
         "completed_lines": [],
@@ -491,6 +501,10 @@ def test_runtime_text_ticket_authority_is_read_from_contract_runtime(monkeypatch
     assert current["contract_revision_id"] == "rev-runtime-text-authority"
     assert current["execution_state_revision"] == 5
     assert current["next_legal_action"]["action"] == "dispatch_bounded_worker"
+    assert current["next_legal_action"]["profile_requirements"]["profile_id"] == (
+        "inherited-current"
+    )
+    assert current["next_legal_action"]["retry_policy"]["max_attempts"] == 2
 
 
 def test_runtime_text_prepare_prefers_nested_context_parent_over_top_level_backlog(
