@@ -32,6 +32,8 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     ]
     assert policy["candidate_diff_derivation"] == "server_only"
     assert policy["full_candidate_snapshot_required"] is False
+    assert policy["exact_candidate_query_root_clean_required"] is True
+    assert policy["assigned_target_project_root_required"] is True
     assert policy["post_merge_graph_policy"] == {
         "authority": (
             "contract_definition.system_layer.graph_binding_policy."
@@ -44,6 +46,9 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
             "canonical_head_verified",
             "active_snapshot_verified",
             "merged_head_commit_equals_reconciled_commit",
+            "qa_id_and_timestamp_before_merge_id_and_timestamp",
+            "merge_id_and_timestamp_before_reconcile_id_and_timestamp",
+            "reconcile_task_scope_matches_or_is_explicitly_shared_taskless",
         ],
     }
 
@@ -73,6 +78,9 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     assert qa_checkpoint["packet"]["graph_basis_policy"][
         "candidate_diff_derivation"
     ] == "server_only"
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "exact_candidate_query_root_clean_required"
+    ] is True
 
 
 def test_projected_record_exposes_non_persistent_lines_to_worker_commit_lineage(

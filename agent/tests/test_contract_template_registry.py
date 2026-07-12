@@ -353,6 +353,17 @@ def test_direct_fix_source_definition_is_registered_as_template_candidate():
     assert template["source"]["type"] == "source_controlled"
     assert template["runtime_contract_hints"]["contract_definition_id"] == "direct_fix"
     assert template["gate_policy"]["parent_blocked_handoff_required"] is True
+    qa_checkpoint = next(
+        item
+        for item in template["runtime_contract_hints"]["graph_query_checkpoints"]
+        if item["id"] == "qa_graph_context"
+    )
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "exact_candidate_query_root_clean_required"
+    ] is True
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "assigned_target_project_root_required"
+    ] is True
     assert "bypass_parent_close_gate" in template["forbidden_capabilities"]
     assert resolve_contract_template(template_id="direct_fix")["template_id"] == (
         "direct_fix.v1"

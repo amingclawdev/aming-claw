@@ -529,6 +529,9 @@
     ],
     "candidate_diff_derivation": "server_only",
     "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
+    "exact_candidate_query_root_clean_required": true,
+    "exact_candidate_query_root_tree_identity_required": true,
+    "assigned_target_project_root_required": true,
     "unsafe_overlay_policy": "require_exact_candidate_snapshot",
     "full_candidate_snapshot_required": false,
     "forged_or_mismatched_tuple_policy": "fail_closed",
@@ -540,7 +543,10 @@
       "required_proof": [
         "canonical_head_verified",
         "active_snapshot_verified",
-        "merged_head_commit_equals_reconciled_commit"
+        "merged_head_commit_equals_reconciled_commit",
+        "qa_id_and_timestamp_before_merge_id_and_timestamp",
+        "merge_id_and_timestamp_before_reconcile_id_and_timestamp",
+        "reconcile_task_scope_matches_or_is_explicitly_shared_taskless"
       ]
     }
   },

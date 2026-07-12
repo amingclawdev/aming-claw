@@ -250,6 +250,12 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     parallel_rev2_graph_policy = parallel_rev2["system_layer"]["graph_binding_policy"]
     assert "bounded_qa_review_policy" not in direct_rev1_graph_policy
     assert direct_rev2_graph_policy["bounded_qa_review_policy"]["enabled"] is True
+    assert direct_rev2_graph_policy["bounded_qa_review_policy"][
+        "exact_candidate_query_root_clean_required"
+    ] is True
+    assert direct_rev2_graph_policy["bounded_qa_review_policy"][
+        "assigned_target_project_root_required"
+    ] is True
     assert "candidate_commit_evidence_policy" not in direct_rev1_graph_policy
     assert direct_rev2_graph_policy["candidate_commit_evidence_policy"][
         "line_ids"
@@ -258,6 +264,14 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     assert parallel_rev2_graph_policy[
         "current_full_reconcile_evidence_policy"
     ]["enabled"] is True
+    reconcile_policy = parallel_rev2_graph_policy[
+        "current_full_reconcile_evidence_policy"
+    ]
+    assert reconcile_policy["required_temporal_fields"][:2] == [
+        "qa_event_id",
+        "qa_event_created_at",
+    ]
+    assert reconcile_policy["explicit_task_id_mismatch_policy"] == "fail_closed"
     assert parallel_rev2_graph_policy["candidate_commit_evidence_policy"][
         "line_ids"
     ] == ["worker_commit"]

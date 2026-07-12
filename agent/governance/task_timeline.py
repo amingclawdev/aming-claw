@@ -3367,6 +3367,9 @@ def contract_state_projection(
     events: list[dict[str, Any]] | None,
     contract: dict[str, Any] | None = None,
     backlog_row: Mapping[str, Any] | None = None,
+    *,
+    pinned_source_definition: Mapping[str, Any] | None = None,
+    pinned_source_definition_resolution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fold backlog contract JSON and timeline rows into a read-only state view."""
 
@@ -3385,7 +3388,7 @@ def contract_state_projection(
         }
     except Exception:
         contract_templates = {}
-    return build_contract_state_projection(
+    projection = build_contract_state_projection(
         rows,
         contract=contract,
         backlog_row=backlog_row,
@@ -3402,7 +3405,64 @@ def contract_state_projection(
             ]
         ),
         schema_version=CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
+        pinned_source_definition=pinned_source_definition,
     )
+    resolution = (
+        dict(pinned_source_definition_resolution)
+        if isinstance(pinned_source_definition_resolution, Mapping)
+        else {}
+    )
+    if not resolution:
+        return projection
+
+    projection["source_definition_resolution"] = resolution
+    if resolution.get("fail_closed") is not True:
+        return projection
+
+    step = {
+        "id": "pinned_source_definition_policy",
+        "action": "resolve_pinned_source_definition",
+        "detail": (
+            "resolve one ContractRuntime execution whose pinned definition "
+            "revision and hash match the backlog timeline identity"
+        ),
+        "source": "contract_state",
+        "precedence": "pinned_source_definition_resolution_required",
+        "order": -1,
+        "resolution_status": str(resolution.get("status") or "unresolved"),
+        "blocked_by": [],
+    }
+    missing = list(projection.get("missing_evidence") or [])
+    if step["id"] not in missing:
+        projection["missing_evidence"] = [step["id"], *missing]
+    ordered = [
+        item
+        for item in (projection.get("ordered_next_steps") or [])
+        if isinstance(item, Mapping) and item.get("id") != step["id"]
+    ]
+    projection["ordered_next_steps"] = [step, *ordered]
+    projection["next_legal_action"] = {
+        **step,
+        "requirement_id": step["id"],
+        "ordered_missing_steps_source": "contract_state",
+        "ordered_missing_steps": projection["ordered_next_steps"],
+        "contract_execution_id": str(
+            resolution.get("contract_execution_id") or ""
+        ),
+        "backlog_id": str(projection.get("backlog_id") or ""),
+        "projection_watermark": projection.get("projection_watermark", 0),
+    }
+    projection["contract_complete"] = False
+    source_policy = dict(projection.get("source_definition_policy") or {})
+    source_policy.update(
+        {
+            "status": "unresolved_fail_closed",
+            "resolution_status": str(resolution.get("status") or "unresolved"),
+            "strict_evidence_policies": [],
+        }
+    )
+    projection["source_definition_policy"] = source_policy
+    return projection
 
 
 def _projection_close_gate_required(

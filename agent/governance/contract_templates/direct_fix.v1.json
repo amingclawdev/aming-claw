@@ -175,6 +175,9 @@
                         "caller_authority_fields_trusted": false,
                         "candidate_diff_derivation": "server_only",
                         "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
+                        "exact_candidate_query_root_clean_required": true,
+                        "exact_candidate_query_root_tree_identity_required": true,
+                        "assigned_target_project_root_required": true,
                         "non_authoritative_template_mirror": true,
                         "unsafe_overlay_policy": "require_exact_candidate_snapshot",
                         "full_candidate_snapshot_required": false

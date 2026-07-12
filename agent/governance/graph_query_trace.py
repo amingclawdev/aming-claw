@@ -518,6 +518,31 @@ def _normalize_candidate_review_context(
         ):
             raise ValueError(f"root_identity.{field} must match the trace binding")
 
+    if context["graph_basis"] == store.QA_GRAPH_BASIS_EXACT_CANDIDATE:
+        root_identity = context["root_identity"]
+        if root_identity.get("query_root_clean") is not True:
+            raise ValueError("exact candidate query root must be clean")
+        if root_identity.get("query_root_untracked_files_checked") is not True:
+            raise ValueError(
+                "exact candidate query root cleanliness must include untracked files"
+            )
+        if not _is_sha256(root_identity.get("query_root_status_hash")):
+            raise ValueError(
+                "exact candidate query root status must have a sha256 identity"
+            )
+        tree_sha = str(root_identity.get("query_root_tree_sha") or "").strip().lower()
+        if not _is_full_commit(tree_sha):
+            raise ValueError(
+                "exact candidate query root tree must be a full git object id"
+            )
+        if (
+            str(root_identity.get("query_root_head_commit") or "").strip().lower()
+            != context["candidate_commit_sha"]
+        ):
+            raise ValueError(
+                "exact candidate query root head must match candidate_commit_sha"
+            )
+
     if context["graph_basis"] == store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF:
         missing_bounded = [] if context["candidate_overlay_hash"] else [
             "candidate_overlay_hash"

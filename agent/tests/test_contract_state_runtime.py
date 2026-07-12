@@ -18,6 +18,8 @@ def _event(
     payload=None,
     verification=None,
     project_id: str = "",
+    created_at: str = "",
+    commit_sha: str = "",
 ):
     return {
         "id": event_id,
@@ -29,6 +31,8 @@ def _event(
         "payload": payload or {},
         "verification": verification or {},
         "artifact_refs": {},
+        "created_at": created_at,
+        "commit_sha": commit_sha,
     }
 
 
@@ -1756,7 +1760,10 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
         "canonical_head_verified": True,
         "active_snapshot_verified": True,
         "provenance_verified": True,
+        "provenance_scope_verified": True,
         "durable_order_verified": True,
+        "qa_event_id": 10,
+        "qa_event_created_at": "2026-07-11T00:59:00Z",
         "merge_event_id": 11,
         "merge_event_created_at": "2026-07-11T01:00:00Z",
         "reconcile_event_id": 12,
@@ -1791,6 +1798,133 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
             }
         }
     ) is False
+
+
+def test_rev2_projection_requires_ids_and_timestamps_for_qa_merge_reconcile():
+    commit_sha = "d" * 40
+    marker = {
+        "schema_version": "current_full_reconcile.provenance.v2",
+        "protected_action": "graph_current_full_reconcile",
+        "protected_entrypoint": (
+            "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        ),
+        "provenance_id": "cfrp-contract-state-order",
+        "provenance_hash": "sha256:" + "8" * 64,
+        "request_id": "req-contract-state-order",
+        "request_started_at": "2026-07-11T01:02:30Z",
+        "marker_created_at": "2026-07-11T01:03:01Z",
+        "target_commit_sha": commit_sha,
+        "snapshot_id": "full-contract-state-order",
+        "reconcile_event_id": 3,
+        "reconcile_event_created_at": "2026-07-11T01:03:00Z",
+        "route_evidence": {
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+    }
+    authority = {
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": True,
+        "live_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "active_snapshot_id": marker["snapshot_id"],
+        "merged_commit_sha": commit_sha,
+        "reconciled_commit_sha": commit_sha,
+        "canonical_head_commit": commit_sha,
+        "active_snapshot_commit": commit_sha,
+        "graph_reconciled": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "qa_event_id": 1,
+        "qa_event_created_at": "2026-07-11T01:01:00Z",
+        "merge_event_id": 2,
+        "merge_event_created_at": "2026-07-11T01:02:00Z",
+        "reconcile_event_id": 3,
+        "reconcile_event_created_at": "2026-07-11T01:03:00Z",
+        "current_full_reconcile_marker": marker,
+        "current_full_reconcile_provenance": {
+            "provenance_id": marker["provenance_id"],
+            "provenance_hash": marker["provenance_hash"],
+            "protected_action": marker["protected_action"],
+            "protected_entrypoint": marker["protected_entrypoint"],
+            "request_id": marker["request_id"],
+            "request_started_at": marker["request_started_at"],
+            "marker_created_at": marker["marker_created_at"],
+            "reconcile_event_id": marker["reconcile_event_id"],
+            "reconcile_event_created_at": marker["reconcile_event_created_at"],
+        },
+    }
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev2",
+            "state": "bound",
+            "evidence_requirements": [
+                {
+                    "id": "qa_independent_verification",
+                    "event_kind": "independent_verification",
+                },
+                {
+                    "id": "observer_merge",
+                    "event_kind": "merge",
+                    "requires": ["qa_independent_verification"],
+                },
+                {
+                    "id": "observer_reconcile",
+                    "event_kind": "reconcile",
+                    "requires": ["observer_merge"],
+                },
+            ],
+            "server_derived_evidence_policies": {
+                "current_full_reconcile_evidence_policy": {
+                    "enabled": True,
+                    "line_ids": ["observer_reconcile"],
+                }
+            },
+        }
+    }
+
+    def projection(qa_created_at: str):
+        return build_contract_state_projection(
+            [
+                _event(
+                    1,
+                    "independent_verification",
+                    created_at=qa_created_at,
+                ),
+                _event(
+                    2,
+                    "merge",
+                    created_at="2026-07-11T01:02:00Z",
+                    commit_sha=commit_sha,
+                ),
+                _event(
+                    3,
+                    "reconcile",
+                    created_at="2026-07-11T01:03:00Z",
+                    payload={"reconcile_authority": authority},
+                ),
+            ],
+            contract=contract,
+            backlog_row={
+                "project_id": "aming-claw",
+                "bug_id": "AC-CONTRACT-RUNTIME",
+            },
+        )
+
+    contradictory = projection("2026-07-11T01:04:00Z")
+    assert contradictory["contract_complete"] is False
+    assert "observer_merge" in contradictory["missing_evidence"]
+
+    valid = projection("2026-07-11T01:01:00Z")
+    assert valid["contract_complete"] is True
+    assert valid["missing_evidence"] == []
 
 
 def test_builtin_mf_parallel_v2_req_2ff0e242e70f_requires_commit_after_implementation():

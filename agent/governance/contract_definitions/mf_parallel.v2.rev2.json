@@ -405,6 +405,10 @@
           "canonical_project_identity_hash",
           "repository_identity_hash"
         ],
+        "exact_candidate_query_root_clean_required": true,
+        "exact_candidate_query_root_tree_identity_required": true,
+        "exact_candidate_query_root_untracked_files_checked": true,
+        "assigned_target_project_root_required": true,
         "forged_or_mismatched_tuple_policy": "fail_closed",
         "line_ids": [
           "qa_graph_context"
@@ -463,14 +467,20 @@
           "active_snapshot_verified",
           "graph_reconciled",
           "provenance_verified",
+          "provenance_scope_verified",
           "durable_order_verified"
         ],
         "required_temporal_fields": [
+          "qa_event_id",
+          "qa_event_created_at",
           "merge_event_id",
           "merge_event_created_at",
           "reconcile_event_id",
           "reconcile_event_created_at"
         ],
+        "required_temporal_order": "qa_id_and_timestamp_before_merge_id_and_timestamp_before_reconcile_id_and_timestamp",
+        "allow_taskless_reconcile_only_for_explicit_shared_batch": true,
+        "explicit_task_id_mismatch_policy": "fail_closed",
         "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
         "strategy": "current_full_reconcile"
       },

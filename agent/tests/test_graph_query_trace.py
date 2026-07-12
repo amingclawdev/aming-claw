@@ -949,6 +949,10 @@ def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_pat
         "query_root": str(project_root),
         "query_root_head_commit": candidate_commit,
         "query_root_identity_hash": "sha256:" + "1" * 64,
+        "query_root_clean": True,
+        "query_root_status_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        "query_root_tree_sha": "4" * 40,
+        "query_root_untracked_files_checked": True,
         "canonical_project_root": str(project_root),
         "canonical_head_commit": candidate_commit,
         "canonical_project_identity_hash": "sha256:" + "2" * 64,
@@ -969,6 +973,8 @@ def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_pat
         **common,
     )["trace"]
     assert trace["root_identity"] == root_identity
+    assert trace["root_identity"]["query_root_clean"] is True
+    assert trace["root_identity"]["query_root_tree_sha"] == "4" * 40
     assert trace["candidate_overlay"] == {}
     assert trace["candidate_overlay_hash"] == ""
 

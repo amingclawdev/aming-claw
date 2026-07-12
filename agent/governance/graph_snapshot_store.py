@@ -2297,10 +2297,17 @@ def current_full_reconcile_state(
     project_id: str,
     merged_commit_sha: str,
     *,
+    qa_event_id: int = 0,
+    qa_event_created_at: str = "",
     merge_event_id: int = 0,
     merge_event_created_at: str = "",
     reconcile_event_id: int = 0,
     reconcile_event_created_at: str = "",
+    expected_task_id: str = "",
+    expected_runtime_context_id: str = "",
+    reconcile_task_id: str = "",
+    reconcile_runtime_context_id: str = "",
+    allow_taskless: bool = False,
 ) -> dict[str, Any]:
     """Return DB-backed current-full state for one merged canonical commit."""
 
@@ -2416,14 +2423,18 @@ def current_full_reconcile_state(
         == "graph_current_full_reconcile"
     )
     try:
+        qa_event_id = int(qa_event_id)
         merge_event_id = int(merge_event_id)
         reconcile_event_id = int(reconcile_event_id)
     except (TypeError, ValueError):
+        qa_event_id = 0
         merge_event_id = 0
         reconcile_event_id = 0
+    qa_time = _timestamp_value(qa_event_created_at)
     merge_time = _timestamp_value(merge_event_created_at)
     reconcile_time = _timestamp_value(reconcile_event_created_at)
     marker_time = _timestamp_value(marker.get("marker_created_at"))
+    qa_order_required = bool(qa_event_id or str(qa_event_created_at or "").strip())
     durable_order_verified = bool(
         merge_event_id > 0
         and reconcile_event_id > merge_event_id
@@ -2433,8 +2444,62 @@ def current_full_reconcile_state(
         and merge_time is not None
         and reconcile_time is not None
         and marker_time is not None
-        and reconcile_time >= merge_time
+        and (
+            reconcile_time > merge_time
+            if qa_order_required
+            else reconcile_time >= merge_time
+        )
         and marker_time >= reconcile_time
+        and (
+            not qa_order_required
+            or (
+                qa_event_id > 0
+                and merge_event_id > qa_event_id
+                and qa_time is not None
+                and qa_time < merge_time
+            )
+        )
+    )
+    route_scope = (
+        stored_route_evidence.get("route_token_scope")
+        if isinstance(stored_route_evidence.get("route_token_scope"), Mapping)
+        else {}
+    )
+    expected_task_id = str(expected_task_id or "").strip()
+    expected_runtime_context_id = str(expected_runtime_context_id or "").strip()
+    task_claims = {
+        str(value or "").strip()
+        for value in (
+            reconcile_task_id,
+            stored_route_evidence.get("task_id"),
+            route_scope.get("task_id"),
+        )
+        if str(value or "").strip()
+    }
+    runtime_context_claims = {
+        str(value or "").strip()
+        for value in (
+            reconcile_runtime_context_id,
+            stored_route_evidence.get("runtime_context_id"),
+            route_scope.get("runtime_context_id"),
+        )
+        if str(value or "").strip()
+    }
+
+    def scope_dimension_verified(expected: str, claims: set[str]) -> bool:
+        if not expected:
+            return not claims or len(claims) == 1
+        if claims:
+            return claims == {expected}
+        return bool(allow_taskless)
+
+    task_scope_verified = scope_dimension_verified(expected_task_id, task_claims)
+    runtime_context_scope_verified = scope_dimension_verified(
+        expected_runtime_context_id,
+        runtime_context_claims,
+    )
+    provenance_scope_verified = bool(
+        task_scope_verified and runtime_context_scope_verified
     )
     active_snapshot_verified = bool(
         active_snapshot_id
@@ -2446,6 +2511,7 @@ def current_full_reconcile_state(
         and merged_commit_sha
         and marker_verified
         and durable_order_verified
+        and provenance_scope_verified
         and active_snapshot_verified
         and pending_count == 0
     )
@@ -2465,12 +2531,24 @@ def current_full_reconcile_state(
         "current_full_reconcile_provenance": provenance,
         "provenance_verified": marker_verified,
         "durable_order_verified": durable_order_verified,
+        "qa_event_id": qa_event_id,
+        "qa_event_created_at": str(qa_event_created_at or "").strip(),
         "merge_event_id": merge_event_id,
         "merge_event_created_at": str(merge_event_created_at or "").strip(),
         "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": str(
             reconcile_event_created_at or ""
         ).strip(),
+        "provenance_scope_verified": provenance_scope_verified,
+        "task_scope_verified": task_scope_verified,
+        "runtime_context_scope_verified": runtime_context_scope_verified,
+        "expected_task_id": expected_task_id,
+        "expected_runtime_context_id": expected_runtime_context_id,
+        "reconcile_task_id": str(reconcile_task_id or "").strip(),
+        "reconcile_runtime_context_id": str(
+            reconcile_runtime_context_id or ""
+        ).strip(),
+        "allow_taskless": bool(allow_taskless),
         "strategy": "current_full_reconcile" if marker else "",
         "pending_scope_reconcile_count": pending_count,
         "pending_scope_reconcile_zero": pending_count == 0,

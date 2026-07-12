@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 
@@ -2408,6 +2409,45 @@ def _attach_server_derived_evidence_policies(
     return step
 
 
+def _pinned_source_definition_evidence_policies(
+    definition: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(definition, Mapping):
+        return {}
+    system_layer = _mapping(definition.get("system_layer"))
+    graph_binding_policy = _mapping(system_layer.get("graph_binding_policy"))
+    return {
+        str(policy_name): dict(policy)
+        for policy_name, policy in graph_binding_policy.items()
+        if isinstance(policy, Mapping)
+        and policy.get("enabled") is True
+        and _string_list(policy.get("line_ids"))
+    }
+
+
+def _pinned_source_definition_policy_summary(
+    definition: Mapping[str, Any] | None,
+    policies: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(definition, Mapping):
+        return {
+            "schema_version": "contract_state.source_definition_policy.v1",
+            "status": "legacy_compatible_unpinned",
+            "authority": "legacy_contract_projection",
+            "strict_evidence_policies": [],
+        }
+    return {
+        "schema_version": "contract_state.source_definition_policy.v1",
+        "status": "pinned",
+        "authority": "pinned_contract_source_definition",
+        "contract_id": str(definition.get("contract_id") or "").strip(),
+        "version": str(definition.get("version") or "").strip(),
+        "revision": str(definition.get("revision") or "").strip(),
+        "definition_hash": str(definition.get("definition_hash") or "").strip(),
+        "strict_evidence_policies": sorted(policies),
+    }
+
+
 def _contract_is_mf_parallel(contract_id: str, template_id: str) -> bool:
     return bool(
         str(contract_id or "").strip() in _MF_PARALLEL_CONTRACT_IDS
@@ -2951,6 +2991,61 @@ def _requirement_uses_strict_evidence_policy(
     return False
 
 
+def _candidate_commit_satisfies_requirement(
+    event: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+) -> bool:
+    policies = requirement.get("server_derived_evidence_policies")
+    if not isinstance(policies, Mapping):
+        policies = requirement.get("compiled_evidence_policies")
+    policy = (
+        policies.get("candidate_commit_evidence_policy")
+        if isinstance(policies, Mapping)
+        and isinstance(policies.get("candidate_commit_evidence_policy"), Mapping)
+        else {}
+    )
+    path = str(policy.get("candidate_commit_path") or "commit_sha").strip()
+    if not path or "." in path:
+        return False
+    value = str(event.get(path) or "").strip().lower()
+    return len(value) in {40, 64} and all(
+        char in "0123456789abcdef" for char in value
+    )
+
+
+def _event_time_order_value(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _strict_source_precedes(
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        return False
+    before_id = _event_numeric_id(before)
+    after_id = _event_numeric_id(after)
+    before_time = _event_time_order_value(before.get("event_created_at"))
+    after_time = _event_time_order_value(after.get("event_created_at"))
+    return bool(
+        before_id > 0
+        and after_id > before_id
+        and before_time is not None
+        and after_time is not None
+        and after_time > before_time
+    )
+
+
 def _current_full_reconcile_satisfies_requirement(
     event: Mapping[str, Any],
 ) -> bool:
@@ -2999,9 +3094,11 @@ def _current_full_reconcile_satisfies_requirement(
     marker = authority.get("current_full_reconcile_marker")
     provenance = authority.get("current_full_reconcile_provenance")
     try:
+        qa_event_id = int(authority.get("qa_event_id") or 0)
         merge_event_id = int(authority.get("merge_event_id") or 0)
         reconcile_event_id = int(authority.get("reconcile_event_id") or 0)
     except (TypeError, ValueError):
+        qa_event_id = 0
         merge_event_id = 0
         reconcile_event_id = 0
 
@@ -3023,6 +3120,9 @@ def _current_full_reconcile_satisfies_requirement(
             char in "0123456789abcdef" for char in text[7:]
         )
 
+    qa_event_created_at = str(
+        authority.get("qa_event_created_at") or ""
+    ).strip()
     merge_event_created_at = str(
         authority.get("merge_event_created_at") or ""
     ).strip()
@@ -3088,6 +3188,9 @@ def _current_full_reconcile_satisfies_requirement(
     ):
         return False
     commits = (target_commit, canonical_head, merged_head, active_graph_commit)
+    qa_time = _event_time_order_value(qa_event_created_at)
+    merge_time = _event_time_order_value(merge_event_created_at)
+    reconcile_time = _event_time_order_value(reconcile_event_created_at)
     return bool(
         current_full
         and snapshot_id
@@ -3095,11 +3198,18 @@ def _current_full_reconcile_satisfies_requirement(
         and authority.get("canonical_head_verified") is True
         and authority.get("active_snapshot_verified") is True
         and authority.get("provenance_verified") is True
+        and authority.get("provenance_scope_verified") is True
         and authority.get("durable_order_verified") is True
-        and merge_event_id > 0
+        and qa_event_id > 0
+        and merge_event_id > qa_event_id
         and reconcile_event_id > merge_event_id
+        and qa_event_created_at
         and merge_event_created_at
         and reconcile_event_created_at
+        and qa_time is not None
+        and merge_time is not None
+        and reconcile_time is not None
+        and qa_time < merge_time < reconcile_time
         and marker_verified
         and all(full_commit(value) for value in commits)
         and len(set(commits)) == 1
@@ -3150,6 +3260,14 @@ def _event_satisfies_requirement(
     if (
         _requirement_uses_strict_evidence_policy(
             requirement,
+            "candidate_commit_evidence_policy",
+        )
+        and not _candidate_commit_satisfies_requirement(event, requirement)
+    ):
+        return False, None
+    if (
+        _requirement_uses_strict_evidence_policy(
+            requirement,
             "bounded_qa_review_policy",
         )
         and not _bounded_qa_graph_context_satisfies_requirement(event)
@@ -3185,6 +3303,7 @@ def _event_satisfies_requirement(
         return False, None
     source = {
         "event_id": event.get("id") or event.get("event_id") or "",
+        "event_created_at": str(event.get("created_at") or "").strip(),
         "event_kind": event_kind,
         "status": str(event.get("status") or ""),
         "phase": str(event.get("phase") or ""),
@@ -3241,6 +3360,13 @@ def _completed_requirement_sources(
         requirements,
     )
     completed_sources: dict[str, dict[str, Any]] = {}
+    strict_lifecycle_order = any(
+        _requirement_uses_strict_evidence_policy(
+            requirement,
+            "current_full_reconcile_evidence_policy",
+        )
+        for requirement in requirements
+    )
     for requirement in requirements:
         requirement_id = str(requirement.get("id") or "")
         prerequisite_ids = _string_list(requirement.get("prerequisite_ids"))
@@ -3273,6 +3399,14 @@ def _completed_requirement_sources(
             matched, source = _event_satisfies_requirement(event, requirement)
             if not (matched and source):
                 continue
+            if strict_lifecycle_order and requirement_id == "observer_merge":
+                qa_source = completed_sources.get("qa_independent_verification")
+                if not _strict_source_precedes(qa_source, source):
+                    continue
+            if strict_lifecycle_order and requirement_id == "observer_reconcile":
+                merge_source = completed_sources.get("observer_merge")
+                if not _strict_source_precedes(merge_source, source):
+                    continue
             if (
                 best_source is None
                 or (prerequisite_ids and event_id < best_event_id)
@@ -4086,6 +4220,7 @@ def build_contract_state_projection(
     | None = None,
     default_required_evidence: list[Any] | None = None,
     schema_version: str = CONTRACT_STATE_PROJECTION_SCHEMA_VERSION,
+    pinned_source_definition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fold backlog contract JSON and timeline rows into a read-only state view."""
 
@@ -4116,6 +4251,18 @@ def build_contract_state_projection(
         binding,
         contract_templates=template_catalog,
     )
+    pinned_evidence_policies = _pinned_source_definition_evidence_policies(
+        pinned_source_definition
+    )
+    source_definition_policy = _pinned_source_definition_policy_summary(
+        pinned_source_definition,
+        pinned_evidence_policies,
+    )
+    if isinstance(pinned_source_definition, Mapping):
+        root = dict(root)
+        root.pop("server_derived_evidence_policies", None)
+        if pinned_evidence_policies:
+            root["server_derived_evidence_policies"] = pinned_evidence_policies
     template_id = str(
         binding.get("contract_template_id")
         or binding.get("contract_template")
@@ -5744,6 +5891,7 @@ def build_contract_state_projection(
         "contract_complete": contract_complete,
         "projection_watermark": projection_watermark,
         "contract_projection": projection,
+        "source_definition_policy": source_definition_policy,
         "close_ready_policy": {
             "source": "rule_gate_projection",
             "timeline_event_is_authoritative": False,

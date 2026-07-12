@@ -302,6 +302,10 @@
           "canonical_project_identity_hash",
           "repository_identity_hash"
         ],
+        "exact_candidate_query_root_clean_required": true,
+        "exact_candidate_query_root_tree_identity_required": true,
+        "exact_candidate_query_root_untracked_files_checked": true,
+        "assigned_target_project_root_required": true,
         "forged_or_mismatched_tuple_policy": "fail_closed",
         "line_ids": [
           "direct_fix_qa_graph_context"

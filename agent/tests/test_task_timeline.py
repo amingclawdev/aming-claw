@@ -341,6 +341,124 @@ def test_contract_state_projection_does_not_treat_plain_verification_as_independ
     assert projection["missing_evidence"][0] == "independent_verification_lane"
 
 
+def test_contract_state_projection_uses_only_pinned_source_definition_policy():
+    from agent.governance import task_timeline
+    from agent.governance.contracts.registry import ContractDefinitionRegistry
+
+    contract = {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev-policy-test",
+            "state": "bound",
+            "evidence_requirements": [
+                {"id": "worker_commit", "event_kind": "worker_commit"},
+                {"id": "qa_graph_context", "event_kind": "qa_graph_trace"},
+                {
+                    "id": "qa_independent_verification",
+                    "event_kind": "independent_verification",
+                    "requires": ["qa_graph_context"],
+                },
+                {
+                    "id": "observer_merge",
+                    "event_kind": "merge",
+                    "requires": ["qa_independent_verification"],
+                },
+                {
+                    "id": "observer_reconcile",
+                    "event_kind": "reconcile",
+                    "requires": ["observer_merge"],
+                },
+            ],
+        }
+    }
+    events = [
+        {
+            "id": 1,
+            "event_kind": "worker_commit",
+            "status": "passed",
+            "created_at": "2026-07-11T01:00:00Z",
+        },
+        {
+            "id": 2,
+            "event_kind": "qa_graph_trace",
+            "status": "passed",
+            "created_at": "2026-07-11T01:01:00Z",
+        },
+        {
+            "id": 3,
+            "event_kind": "independent_verification",
+            "status": "passed",
+            "created_at": "2026-07-11T01:02:00Z",
+        },
+        {
+            "id": 4,
+            "event_kind": "merge",
+            "status": "passed",
+            "created_at": "2026-07-11T01:03:00Z",
+        },
+        {
+            "id": 5,
+            "event_kind": "reconcile",
+            "status": "passed",
+            "created_at": "2026-07-11T01:04:00Z",
+        },
+    ]
+    registry = ContractDefinitionRegistry()
+    rev1 = registry.get("mf_parallel.v2", version="v2", revision="rev1")
+    rev2 = registry.get("mf_parallel.v2", version="v2", revision="rev2")
+
+    legacy = task_timeline.contract_state_projection(
+        events,
+        contract=contract,
+        backlog_row={"project_id": "proj", "bug_id": "AC-PINNED-REVISION"},
+        pinned_source_definition=rev1,
+    )
+    assert legacy["contract_complete"] is True
+    assert legacy["source_definition_policy"]["revision"] == "rev1"
+    assert legacy["source_definition_policy"]["strict_evidence_policies"] == []
+
+    strict = task_timeline.contract_state_projection(
+        events,
+        contract=contract,
+        backlog_row={"project_id": "proj", "bug_id": "AC-PINNED-REVISION"},
+        pinned_source_definition=rev2,
+    )
+    assert strict["contract_complete"] is False
+    assert strict["source_definition_policy"]["revision"] == "rev2"
+    assert set(strict["source_definition_policy"]["strict_evidence_policies"]) == {
+        "bounded_qa_review_policy",
+        "candidate_commit_evidence_policy",
+        "current_full_reconcile_evidence_policy",
+    }
+    assert {"worker_commit", "qa_graph_context", "observer_reconcile"}.issubset(
+        strict["missing_evidence"]
+    )
+
+
+def test_contract_state_projection_fails_closed_on_ambiguous_pinned_definition():
+    from agent.governance import task_timeline
+
+    projection = task_timeline.contract_state_projection(
+        [],
+        contract={"contract": {"contract_id": "mf_parallel.v2"}},
+        backlog_row={"project_id": "proj", "bug_id": "AC-PINNED-AMBIGUOUS"},
+        pinned_source_definition_resolution={
+            "status": "ambiguous_contract_runtime_execution",
+            "fail_closed": True,
+            "strict_policy_possible": True,
+        },
+    )
+
+    assert projection["contract_complete"] is False
+    assert projection["next_legal_action"]["id"] == (
+        "pinned_source_definition_policy"
+    )
+    assert projection["source_definition_policy"]["status"] == (
+        "unresolved_fail_closed"
+    )
+
+
 def _observer_hotfix_contract_events():
     return [
         {

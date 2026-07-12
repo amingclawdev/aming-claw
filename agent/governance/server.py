@@ -7220,6 +7220,50 @@ def _qa_checkout_root_identity(
             query_root_head_commit=query_head,
             accepted_commits=sorted(accepted_query_heads),
         )
+    query_root_clean: bool | None = None
+    query_root_status_hash = ""
+    query_root_tree_sha = ""
+    if require_query_candidate_head:
+        status = _qa_git_bytes(
+            query_root,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        if status.returncode != 0:
+            _qa_overlay_fail(
+                "exact_candidate_query_root_status_unavailable",
+                "exact candidate review requires a verifiable clean query root",
+                query_root=str(query_root),
+            )
+        query_root_clean = not bool(status.stdout)
+        query_root_status_hash = (
+            "sha256:" + hashlib.sha256(status.stdout).hexdigest()
+        )
+        if not query_root_clean:
+            _qa_overlay_fail(
+                "exact_candidate_query_root_dirty",
+                "exact candidate review requires a clean query worktree",
+                query_root=str(query_root),
+                dirty_entry_count=len(
+                    [item for item in status.stdout.split(b"\0") if item]
+                ),
+                untracked_files_checked=True,
+            )
+        tree = _qa_git_bytes(
+            query_root,
+            ["rev-parse", "--verify", f"{candidate_commit_sha}^{{tree}}"],
+        )
+        query_root_tree_sha = tree.stdout.decode(
+            "ascii", errors="ignore"
+        ).strip().lower()
+        if tree.returncode != 0 or not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", query_root_tree_sha
+        ):
+            _qa_overlay_fail(
+                "exact_candidate_query_root_tree_unavailable",
+                "exact candidate review requires the candidate Git tree identity",
+                query_root=str(query_root),
+                candidate_commit_sha=candidate_commit_sha,
+            )
     query_root_identity_hash = stable_sha256(
         {
             "execution_root": str(query.get("execution_root") or ""),
@@ -7236,7 +7280,7 @@ def _qa_checkout_root_identity(
             "repository_identity_hash": repository_identity_hash,
         }
     )
-    return {
+    identity = {
         "schema_version": "qa_review_graph.root_identity.v1",
         "query_root": str(Path(query_root).resolve()),
         "query_root_head_commit": query_head,
@@ -7248,6 +7292,16 @@ def _qa_checkout_root_identity(
         "repository_identity_hash": repository_identity_hash,
         "repository_identity_match": True,
     }
+    if require_query_candidate_head:
+        identity.update(
+            {
+                "query_root_clean": query_root_clean is True,
+                "query_root_status_hash": query_root_status_hash,
+                "query_root_tree_sha": query_root_tree_sha,
+                "query_root_untracked_files_checked": True,
+            }
+        )
+    return identity
 
 
 def _qa_exact_candidate_context(
@@ -7513,45 +7567,77 @@ def _qa_candidate_diff_context(
     }
 
 
+_QA_REVIEW_CLAIM_ALIASES = {
+    "graph_basis": ("graph_basis",),
+    "canonical_base_snapshot_id": (
+        "canonical_base_snapshot_id",
+        "base_snapshot_id",
+    ),
+    "base_commit_sha": (
+        "base_commit_sha",
+        "base_commit",
+    ),
+    "candidate_commit_sha": ("candidate_commit_sha", "candidate_commit"),
+    "changed_files": ("candidate_changed_files", "changed_files"),
+    "candidate_diff_hash": ("candidate_diff_hash", "diff_hash"),
+    "changed_files_source": ("changed_files_source",),
+    "candidate_overlay_hash": ("candidate_overlay_hash",),
+    "root_identity_hash": ("root_identity_hash",),
+    "query_root": ("query_root",),
+    "query_root_identity_hash": ("query_root_identity_hash",),
+    "canonical_project_root": ("canonical_project_root",),
+    "canonical_project_identity_hash": ("canonical_project_identity_hash",),
+    "repository_identity_hash": ("repository_identity_hash",),
+}
+_QA_REVIEW_AUTHORITY_CONTAINERS = {
+    "candidate_review_context",
+    "graph_context",
+    "graph_review_context",
+    "graph_trace_db_evidence",
+    "graph_trace_evidence",
+}
+_QA_REVIEW_AUTHORITY_NAMES = {
+    alias
+    for aliases in _QA_REVIEW_CLAIM_ALIASES.values()
+    for alias in aliases
+} | {
+    "candidate_overlay",
+    "root_identity",
+    "query_root_head_commit",
+    "query_root_clean",
+    "query_root_status_hash",
+    "query_root_tree_sha",
+    "query_root_untracked_files_checked",
+    "canonical_head_commit",
+    "active_snapshot_id",
+    "snapshot_id",
+    "snapshot_commit",
+    "snapshot_commit_sha",
+    "target_project_root",
+}
+
+
+def _qa_review_claim_containers(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        result: list[Mapping[str, Any]] = [value]
+        for child in value.values():
+            result.extend(_qa_review_claim_containers(child))
+        return result
+    if isinstance(value, list):
+        result = []
+        for child in value:
+            result.extend(_qa_review_claim_containers(child))
+        return result
+    return []
+
+
 def _qa_validate_candidate_review_claims(
     body: Mapping[str, Any],
     review_context: Mapping[str, Any],
 ) -> None:
-    containers = [body]
-    for parent_key in ("payload", "verification", "artifact_refs"):
-        parent = body.get(parent_key)
-        if isinstance(parent, Mapping):
-            containers.append(parent)
-    for container in list(containers):
-        for key in (
-            "candidate_review_context",
-            "graph_review_context",
-            "graph_trace_evidence",
-        ):
-            nested = container.get(key)
-            if isinstance(nested, Mapping):
-                containers.append(nested)
-    aliases = {
-        "graph_basis": ("graph_basis",),
-        "canonical_base_snapshot_id": (
-            "canonical_base_snapshot_id",
-            "base_snapshot_id",
-        ),
-        "base_commit_sha": ("base_commit_sha", "base_commit"),
-        "candidate_commit_sha": ("candidate_commit_sha", "candidate_commit"),
-        "changed_files": ("candidate_changed_files", "changed_files"),
-        "candidate_diff_hash": ("candidate_diff_hash", "diff_hash"),
-        "changed_files_source": ("changed_files_source",),
-        "candidate_overlay_hash": ("candidate_overlay_hash",),
-        "root_identity_hash": ("root_identity_hash",),
-        "query_root_identity_hash": ("query_root_identity_hash",),
-        "canonical_project_identity_hash": (
-            "canonical_project_identity_hash",
-        ),
-        "repository_identity_hash": ("repository_identity_hash",),
-    }
+    containers = _qa_review_claim_containers(body)
     mismatches: list[dict[str, Any]] = []
-    for field, field_aliases in aliases.items():
+    for field, field_aliases in _QA_REVIEW_CLAIM_ALIASES.items():
         expected = review_context.get(field)
         for container in containers:
             for alias in field_aliases:
@@ -11258,7 +11344,17 @@ def _runtime_context_service_qa_graph_trace_refs(
         if persisted_query_root:
             result["requested_target_project_root"] = requested_target_root
             result["target_project_root"] = persisted_query_root
-            if requested_target_root and (
+            if require_complete_authority and not requested_target_root:
+                result["identity_mismatches"].append(
+                    {
+                        "trace_id": "|".join(requested_trace_ids),
+                        "field": "target_project_root",
+                        "expected": persisted_query_root,
+                        "actual": "missing assigned target root",
+                    }
+                )
+                result["db_verified"] = False
+            elif requested_target_root and (
                 Path(requested_target_root).resolve()
                 != Path(persisted_query_root).resolve()
             ):
@@ -11266,8 +11362,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                     {
                         "trace_id": "|".join(requested_trace_ids),
                         "field": "target_project_root",
-                        "expected": persisted_query_root,
-                        "actual": requested_target_root,
+                        "expected": requested_target_root,
+                        "actual": persisted_query_root,
                     }
                 )
                 result["db_verified"] = False
@@ -30183,6 +30279,44 @@ def handle_graph_governance_query(ctx: RequestContext):
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )
+                if qa_proof.get("graph_basis") == "exact_candidate_snapshot":
+                    if root is None:
+                        raise GovernanceError(
+                            "qa_exact_candidate_root_required",
+                            "exact candidate query requires its persisted assigned root",
+                            409,
+                            {},
+                        )
+                    recomputed_exact = _qa_exact_candidate_context(
+                        Path(root),
+                        project_id=project_id,
+                        canonical_project_root=Path(
+                            project_service.resolve_project_root(
+                                project_id,
+                                None,
+                                fallback_self=True,
+                            )
+                        ),
+                        candidate_commit_sha=str(
+                            qa_proof.get("candidate_commit_sha") or ""
+                        ),
+                    )
+                    exact_mismatches = [
+                        field
+                        for field in (
+                            "root_identity_hash",
+                            "query_root_identity_hash",
+                            "repository_identity_hash",
+                        )
+                        if recomputed_exact.get(field) != qa_proof.get(field)
+                    ]
+                    if exact_mismatches:
+                        raise GovernanceError(
+                            "qa_exact_candidate_root_changed",
+                            "exact candidate root identity changed during the query",
+                            409,
+                            {"identity_mismatches": exact_mismatches},
+                        )
                 if str(body.get("query_source") or "") == "mf_subagent":
                     governance_project_id = str(
                         body.get("governance_project_id") or project_id
@@ -46626,6 +46760,7 @@ def _contract_runtime_projection_merge_authority(
     record: Mapping[str, Any],
     context: Any,
     merge_event: Mapping[str, Any],
+    qa_event: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_context_id, task_id, parent_task_id = (
         _contract_runtime_context_identity(context)
@@ -46646,9 +46781,25 @@ def _contract_runtime_projection_merge_authority(
     merge_event_created_at = _contract_runtime_projection_timeline_event_time(
         merge_event
     )
+    qa_event = qa_event if isinstance(qa_event, Mapping) else {}
+    qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
+    qa_event_created_at = _contract_runtime_projection_timeline_event_time(
+        qa_event
+    )
+    qa_time = _contract_runtime_close_authority_time_order_value(
+        qa_event_created_at
+    )
+    merge_time = _contract_runtime_close_authority_time_order_value(
+        merge_event_created_at
+    )
     timeline_verified = bool(
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
         and re.fullmatch(r"timeline:\d+", source_ref)
+        and qa_event_id > 0
+        and merge_event_id > qa_event_id
+        and qa_time is not None
+        and merge_time is not None
+        and qa_time < merge_time
         and merge_event_id > 0
         and merge_event_created_at
     )
@@ -46663,6 +46814,9 @@ def _contract_runtime_projection_merge_authority(
             or ""
         ),
         "merged_commit_sha": merged_commit,
+        "qa_source_ref": _runtime_context_event_ref(qa_event),
+        "qa_event_id": qa_event_id,
+        "qa_event_created_at": qa_event_created_at,
         "merge_source_ref": source_ref,
         "merge_event_id": merge_event_id,
         "merge_event_created_at": merge_event_created_at,
@@ -46822,11 +46976,41 @@ def _contract_runtime_projection_post_worker_lines(
         qa_authoritative = bool(
             qa_event_id > 0 and qa_graph_refs.get("db_verified") is True
         )
-        if not qa_authoritative or merge_event_id <= qa_event_id:
+        qa_event_created_at = _contract_runtime_projection_timeline_event_time(
+            qa_event
+        )
+        merge_event_created_at = _contract_runtime_projection_timeline_event_time(
+            merge_event
+        )
+        reconcile_event_created_at = (
+            _contract_runtime_projection_timeline_event_time(reconcile_event)
+        )
+        qa_time = _contract_runtime_close_authority_time_order_value(
+            qa_event_created_at
+        )
+        merge_time = _contract_runtime_close_authority_time_order_value(
+            merge_event_created_at
+        )
+        reconcile_time = _contract_runtime_close_authority_time_order_value(
+            reconcile_event_created_at
+        )
+        merge_order_valid = bool(
+            merge_event_id > qa_event_id > 0
+            and qa_time is not None
+            and merge_time is not None
+            and qa_time < merge_time
+        )
+        reconcile_order_valid = bool(
+            reconcile_event_id > merge_event_id > 0
+            and merge_time is not None
+            and reconcile_time is not None
+            and merge_time < reconcile_time
+        )
+        if not qa_authoritative or not merge_order_valid:
             merge_event = {}
             reconcile_event = {}
             close_ready_event = {}
-        elif reconcile_event_id <= merge_event_id:
+        elif reconcile_event and not reconcile_order_valid:
             reconcile_event = {}
             close_ready_event = {}
     reconcile_authority: dict[str, Any] = {}
@@ -46836,6 +47020,7 @@ def _contract_runtime_projection_post_worker_lines(
                 record=record,
                 context=context,
                 merge_event=merge_event,
+                qa_event=qa_event,
             ) if merge_event else {"timeline_verified": False}
             merge_event_id = _contract_runtime_projection_timeline_event_id(merge_event)
             reconcile_event_id = _contract_runtime_projection_timeline_event_id(
@@ -46846,6 +47031,9 @@ def _contract_runtime_projection_post_worker_lines(
                 and merge_event_id > 0
                 and reconcile_event_id > merge_event_id
             ):
+                reconcile_scope = _contract_runtime_projection_timeline_scope_values(
+                    reconcile_event
+                )
                 reconcile_projection = {
                     "timeline_verified": True,
                     "reconcile_source_ref": _runtime_context_event_ref(
@@ -46856,6 +47044,16 @@ def _contract_runtime_projection_post_worker_lines(
                         _contract_runtime_projection_timeline_event_time(
                             reconcile_event
                         )
+                    ),
+                    "reconcile_task_id": (
+                        reconcile_scope["task_ids"][0]
+                        if len(reconcile_scope["task_ids"]) == 1
+                        else ""
+                    ),
+                    "reconcile_runtime_context_id": (
+                        reconcile_scope["runtime_context_ids"][0]
+                        if len(reconcile_scope["runtime_context_ids"]) == 1
+                        else ""
                     ),
                 }
                 reconcile_authority = (
@@ -47169,6 +47367,42 @@ def _contract_runtime_projection_latest_timeline_event(
     return {}
 
 
+def _contract_runtime_projection_timeline_scope_values(
+    event: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    task_ids = {
+        str(event.get("task_id") or "").strip(),
+    }
+    runtime_context_ids: set[str] = set()
+    related_task_ids: set[str] = set()
+    for candidate in _contract_runtime_mapping_candidates(payload):
+        for key in ("task_id", "worker_task_id"):
+            task_ids.add(
+                _runtime_context_non_placeholder_text(candidate.get(key))
+            )
+        runtime_context_ids.add(
+            _runtime_context_non_placeholder_text(
+                candidate.get("runtime_context_id")
+            )
+        )
+        for key in (
+            "parent_task_id",
+            "contract_execution_id",
+            "observer_command_id",
+        ):
+            related_task_ids.add(
+                _runtime_context_non_placeholder_text(candidate.get(key))
+            )
+    return {
+        "task_ids": sorted(item for item in task_ids if item),
+        "runtime_context_ids": sorted(
+            item for item in runtime_context_ids if item
+        ),
+        "related_task_ids": sorted(item for item in related_task_ids if item),
+    }
+
+
 def _contract_runtime_projection_timeline_scope_matches(
     event: Mapping[str, Any],
     *,
@@ -47177,42 +47411,33 @@ def _contract_runtime_projection_timeline_scope_matches(
     related_task_ids: set[str],
     allow_taskless: bool,
 ) -> bool:
-    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
-    event_context = _runtime_context_non_placeholder_text(
-        _timeline_first_deep_text(payload, "runtime_context_id")
-    )
-    if runtime_context_id and event_context:
-        return event_context == runtime_context_id
-
     expected_task_id = str(task_id or "").strip()
     expected_related = {
         str(item or "").strip() for item in related_task_ids if str(item or "").strip()
     }
-    expected_ids = ({expected_task_id} if expected_task_id else set()) | expected_related
-    event_task_values = {
-        str(event.get("task_id") or "").strip(),
-        _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(payload, "task_id")
-        ),
-        _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(payload, "worker_task_id")
-        ),
-        _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(payload, "parent_task_id")
-        ),
-        _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(payload, "contract_execution_id")
-        ),
-        _runtime_context_non_placeholder_text(
-            _timeline_first_deep_text(payload, "observer_command_id")
-        ),
-    }
-    event_task_values = {item for item in event_task_values if item}
-    if expected_ids and event_task_values.intersection(expected_ids):
+    scope = _contract_runtime_projection_timeline_scope_values(event)
+    event_task_values = set(scope["task_ids"])
+    event_context_values = set(scope["runtime_context_ids"])
+    event_related_values = set(scope["related_task_ids"])
+    if expected_task_id and event_task_values and (
+        event_task_values != {expected_task_id}
+    ):
+        return False
+    if runtime_context_id and event_context_values and (
+        event_context_values != {runtime_context_id}
+    ):
+        return False
+    if expected_task_id and event_task_values == {expected_task_id}:
+        return True
+    if runtime_context_id and event_context_values == {runtime_context_id}:
+        return True
+    if expected_related and event_related_values.intersection(expected_related):
         return True
     if allow_taskless:
-        return True
-    return not event_task_values
+        return not (
+            event_task_values or event_context_values or event_related_values
+        )
+    return not (event_task_values or event_context_values or event_related_values)
 
 
 def _contract_runtime_projection_timeline_actor_role(
@@ -47256,6 +47481,10 @@ def _contract_runtime_projected_post_worker_line(
         "source": "runtime_context_post_worker_timeline_evidence",
         "source_key": source_key,
         "source_ref": source_ref,
+        "source_event_id": _contract_runtime_projection_timeline_event_id(event),
+        "source_event_created_at": (
+            _contract_runtime_projection_timeline_event_time(event)
+        ),
         "source_backed": True,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -49148,23 +49377,12 @@ def _contract_runtime_line_write_body(
     return write
 
 
-_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = {
+_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = set(_QA_REVIEW_AUTHORITY_NAMES) | {
     "active_snapshot_id",
     "authority_hash",
     "backlog_id",
-    "base_commit_sha",
-    "candidate_commit_sha",
-    "candidate_diff_hash",
-    "candidate_overlay",
-    "candidate_overlay_hash",
-    "canonical_base_snapshot_id",
-    "canonical_project_root",
-    "canonical_project_identity_hash",
-    "changed_files",
-    "changed_files_source",
     "contract_execution_id",
     "db_verified",
-    "graph_basis",
     "graph_query_trace_ids",
     "graph_trace_ids",
     "identity_mismatches",
@@ -49176,29 +49394,20 @@ _CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = {
     "qa_scope_binding_ref",
     "qa_session_id",
     "query_purpose",
-    "query_root",
-    "query_root_identity_hash",
     "query_source",
-    "repository_identity_hash",
     "requested_trace_ids",
-    "root_identity_hash",
     "runtime_context_id",
     "source",
     "source_details",
     "task_id",
-    "target_project_root",
     "trace_id",
     "trace_ids",
     "trace_status",
     "verified_trace_ids",
 }
-_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS = {
-    "candidate_review_context",
-    "graph_context",
-    "graph_review_context",
-    "graph_trace_db_evidence",
-    "graph_trace_evidence",
-}
+_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS = set(
+    _QA_REVIEW_AUTHORITY_CONTAINERS
+)
 _CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS = {
     "actor_role",
     "backlog_id",
@@ -49238,14 +49447,20 @@ _CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS = {
     "parent_task_id",
     "project_id",
     "provenance_verified",
+    "provenance_scope_verified",
+    "qa_event_created_at",
+    "qa_event_id",
+    "qa_source_ref",
     "reconciled_commit_sha",
     "reconcile_event_created_at",
     "reconcile_event_id",
     "reconcile_source_ref",
     "runtime_context_id",
+    "runtime_context_scope_verified",
     "source",
     "strategy",
     "task_id",
+    "task_scope_verified",
     "target_project_root",
     "authority_hash",
 }
@@ -49260,6 +49475,139 @@ def _contract_runtime_definition_for_record(
         revision=str(record.get("revision") or ""),
         include_deprecated=True,
     )
+
+
+def _contract_state_pinned_source_definition_resolution(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+    preferred_execution_id: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    records = _contract_runtime_store(conn).list_by_backlog(
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    by_execution_id = {
+        str(record.get("contract_execution_id") or "").strip(): record
+        for record in records
+        if str(record.get("contract_execution_id") or "").strip()
+    }
+
+    def strict_policy_possible(record: Mapping[str, Any]) -> bool:
+        if str(record.get("revision") or "").strip() == "rev2":
+            return True
+        try:
+            definition = _contract_runtime_definition_for_record(record)
+        except Exception:
+            return False
+        system_layer = (
+            definition.get("system_layer")
+            if isinstance(definition.get("system_layer"), Mapping)
+            else {}
+        )
+        graph_policy = (
+            system_layer.get("graph_binding_policy")
+            if isinstance(system_layer.get("graph_binding_policy"), Mapping)
+            else {}
+        )
+        return any(
+            isinstance(policy, Mapping) and policy.get("enabled") is True
+            for policy in graph_policy.values()
+        )
+
+    strict_possible = any(strict_policy_possible(record) for record in records)
+    base_resolution = {
+        "schema_version": "contract_state.source_definition_resolution.v1",
+        "authority": "ContractRuntime.pinned_source_definition",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "candidate_count": len(records),
+        "strict_policy_possible": strict_possible,
+    }
+    if not records:
+        return {}, {
+            **base_resolution,
+            "status": "no_contract_runtime_execution",
+            "fail_closed": False,
+        }
+
+    selected: Mapping[str, Any] | None = None
+    preferred_execution_id = str(preferred_execution_id or "").strip()
+    if preferred_execution_id in by_execution_id:
+        selected = by_execution_id[preferred_execution_id]
+    if selected is None:
+        for event in reversed(
+            [item for item in timeline_events if isinstance(item, Mapping)]
+        ):
+            event_execution_ids: set[str] = set()
+            event_task_id = str(event.get("task_id") or "").strip()
+            if event_task_id in by_execution_id:
+                event_execution_ids.add(event_task_id)
+            for candidate in _contract_runtime_mapping_candidates(event):
+                for key in (
+                    "contract_execution_id",
+                    "projection_contract_execution_id",
+                    "successor_contract_execution_id",
+                ):
+                    execution_id = str(candidate.get(key) or "").strip()
+                    if execution_id in by_execution_id:
+                        event_execution_ids.add(execution_id)
+            if len(event_execution_ids) == 1:
+                selected = by_execution_id[next(iter(event_execution_ids))]
+                break
+            if len(event_execution_ids) > 1:
+                return {}, {
+                    **base_resolution,
+                    "status": "ambiguous_timeline_execution_identity",
+                    "fail_closed": strict_possible,
+                    "matching_execution_ids": sorted(event_execution_ids),
+                }
+    if selected is None and len(records) == 1:
+        selected = records[0]
+    if selected is None:
+        return {}, {
+            **base_resolution,
+            "status": "ambiguous_contract_runtime_execution",
+            "fail_closed": strict_possible,
+            "matching_execution_ids": sorted(by_execution_id),
+        }
+
+    execution_id = str(selected.get("contract_execution_id") or "").strip()
+    try:
+        definition = _contract_runtime_definition_for_record(selected)
+    except Exception as exc:
+        return {}, {
+            **base_resolution,
+            "status": "pinned_definition_unavailable",
+            "fail_closed": strict_policy_possible(selected),
+            "contract_execution_id": execution_id,
+            "diagnostic": str(exc),
+        }
+    record_revision = str(selected.get("revision") or "").strip()
+    record_hash = str(selected.get("definition_hash") or "").strip()
+    definition_revision = str(definition.get("revision") or "").strip()
+    definition_hash = str(definition.get("definition_hash") or "").strip()
+    identity_matches = bool(
+        record_revision
+        and record_revision == definition_revision
+        and record_hash
+        and record_hash == definition_hash
+    )
+    resolution = {
+        **base_resolution,
+        "status": "pinned" if identity_matches else "definition_identity_mismatch",
+        "fail_closed": not identity_matches and strict_policy_possible(selected),
+        "contract_execution_id": execution_id,
+        "contract_id": str(selected.get("contract_id") or "").strip(),
+        "version": str(selected.get("version") or "").strip(),
+        "record_revision": record_revision,
+        "definition_revision": definition_revision,
+        "record_definition_hash": record_hash,
+        "definition_hash": definition_hash,
+    }
+    return (dict(definition), resolution) if identity_matches else ({}, resolution)
 
 
 def _contract_runtime_line_evidence_policy(
@@ -49322,6 +49670,85 @@ def _contract_runtime_server_line_identity(
         if identity["runtime_context_id"] and identity["task_id"]:
             break
     return identity
+
+
+def _contract_runtime_assigned_target_project_root(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    identity: Mapping[str, str],
+) -> dict[str, Any]:
+    roots: set[str] = set()
+    dispatch_line_ids = {
+        "observer_dispatch_bounded_workers",
+        "direct_fix_dispatch_context",
+    }
+    dispatch_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() in dispatch_line_ids
+    ]
+    for line in dispatch_lines:
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=line,
+        ):
+            runtime_context_id, task_id, _parent_task_id = (
+                _contract_runtime_context_identity(context)
+            )
+            if identity.get("runtime_context_id") and (
+                runtime_context_id != identity["runtime_context_id"]
+            ):
+                continue
+            if identity.get("task_id") and task_id != identity["task_id"]:
+                continue
+            target_root = _runtime_context_effective_target_project_root(context)
+            if target_root:
+                roots.add(str(Path(target_root).resolve()))
+
+        for candidate in _contract_runtime_mapping_candidates(line):
+            candidate_runtime_context_id = _contract_runtime_mapping_value(
+                candidate,
+                "runtime_context_id",
+            )
+            candidate_task_id = _contract_runtime_mapping_value(
+                candidate,
+                "task_id",
+                "worker_task_id",
+            )
+            identity_bound = False
+            if identity.get("runtime_context_id"):
+                if candidate_runtime_context_id != identity["runtime_context_id"]:
+                    continue
+                identity_bound = True
+            if identity.get("task_id"):
+                if candidate_task_id != identity["task_id"]:
+                    continue
+                identity_bound = True
+            if not identity_bound:
+                continue
+            target_root = _contract_runtime_mapping_value(
+                candidate,
+                "target_project_root",
+                "worktree_path",
+            )
+            if target_root:
+                roots.add(str(Path(target_root).resolve()))
+
+    if len(roots) == 1:
+        return {
+            "status": "resolved",
+            "target_project_root": next(iter(roots)),
+        }
+    return {
+        "status": "missing" if not roots else "ambiguous",
+        "target_project_root": "",
+        "candidate_roots": sorted(roots),
+    }
 
 
 def _contract_runtime_server_candidate_commit(record: Mapping[str, Any]) -> str:
@@ -49417,6 +49844,31 @@ def _contract_runtime_bind_qa_graph_authority(
 ) -> dict[str, Any]:
     requested_trace_ids = _contract_runtime_requested_trace_ids(body, policy)
     identity = _contract_runtime_server_line_identity(record)
+    assigned_root = _contract_runtime_assigned_target_project_root(
+        conn,
+        project_id=project_id,
+        record=record,
+        identity=identity,
+    )
+    target_project_root = str(
+        assigned_root.get("target_project_root") or ""
+    ).strip()
+    if not target_project_root:
+        raise GovernanceError(
+            "contract_runtime_target_project_root_required",
+            "bounded QA requires one assigned target_project_root from trusted dispatch identity",
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "runtime_context_id": identity.get("runtime_context_id") or "",
+                "task_id": identity.get("task_id") or "",
+                "root_resolution_status": assigned_root.get("status") or "missing",
+                "candidate_roots": assigned_root.get("candidate_roots") or [],
+            },
+        )
     session = ctx.require_auth(conn)
     expected_candidate_commit = _contract_runtime_server_candidate_commit(record)
     if not re.fullmatch(
@@ -49438,6 +49890,7 @@ def _contract_runtime_bind_qa_graph_authority(
         conn,
         project_id=project_id,
         explicit_trace_ids=requested_trace_ids,
+        target_project_root=target_project_root,
         expected_backlog_id=str(record.get("backlog_id") or ""),
         expected_task_id=identity["task_id"],
         expected_candidate_commit_sha=expected_candidate_commit,
@@ -49447,6 +49900,12 @@ def _contract_runtime_bind_qa_graph_authority(
         strict_bounded_qa=True,
     )
     evidence = dict(evidence)
+    evidence = _contract_runtime_strip_authority_claims(
+        evidence,
+        field_names=set(),
+        container_names=_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS,
+    )
+    evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
     evidence.update(
         {
             "contract_execution_id": str(
@@ -49568,6 +50027,24 @@ def _contract_runtime_trusted_merge_projection(
                 )
                 else {}
             )
+            qa_line = next(
+                (
+                    line
+                    for line in projected_lines
+                    if str(line.get("line_id") or "")
+                    == "qa_independent_verification"
+                ),
+                {},
+            )
+            qa_source_ref = str(qa_line.get("_source_ref") or "").strip()
+            qa_source_event = next(
+                (
+                    event
+                    for event in timeline_events
+                    if _runtime_context_event_ref(event) == qa_source_ref
+                ),
+                {},
+            )
             for line in projected_lines:
                 if str(line.get("line_id") or "") != "observer_merge":
                     continue
@@ -49592,6 +50069,17 @@ def _contract_runtime_trusted_merge_projection(
                         "parent_task_id": parent_task_id,
                         "backlog_id": backlog_id,
                         "merged_commit_sha": merged_commit,
+                        "qa_source_ref": qa_source_ref,
+                        "qa_event_id": (
+                            _contract_runtime_projection_timeline_event_id(
+                                qa_source_event
+                            )
+                        ),
+                        "qa_event_created_at": (
+                            _contract_runtime_projection_timeline_event_time(
+                                qa_source_event
+                            )
+                        ),
                         "merge_source_ref": source_ref,
                         "merge_event_id": (
                             _contract_runtime_projection_timeline_event_id(
@@ -49668,12 +50156,23 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         conn,
         project_id,
         merged_commit,
+        qa_event_id=int(merge.get("qa_event_id") or 0),
+        qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
         merge_event_id=int(merge.get("merge_event_id") or 0),
         merge_event_created_at=str(merge.get("merge_event_created_at") or ""),
         reconcile_event_id=int(reconcile.get("reconcile_event_id") or 0),
         reconcile_event_created_at=str(
             reconcile.get("reconcile_event_created_at") or ""
         ),
+        expected_task_id=str(merge.get("task_id") or ""),
+        expected_runtime_context_id=str(
+            merge.get("runtime_context_id") or ""
+        ),
+        reconcile_task_id=str(reconcile.get("reconcile_task_id") or ""),
+        reconcile_runtime_context_id=str(
+            reconcile.get("reconcile_runtime_context_id") or ""
+        ),
+        allow_taskless=True,
     )
     root = project_service.resolve_project_root(
         project_id,
@@ -57079,6 +57578,15 @@ def _observer_root_route_context_state(
         conn=conn,
         project_id=project_id,
     )
+    pinned_definition, pinned_definition_resolution = (
+        _contract_state_pinned_source_definition_resolution(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            timeline_events=events,
+            preferred_execution_id=str(task_id or "").strip(),
+        )
+    )
     contract_state = task_timeline.contract_state_projection(
         events,
         contract=contract,
@@ -57086,6 +57594,8 @@ def _observer_root_route_context_state(
             **(dict(row) if row else {"bug_id": backlog_id}),
             "project_id": project_id,
         },
+        pinned_source_definition=pinned_definition,
+        pinned_source_definition_resolution=pinned_definition_resolution,
     )
     row_target_files = (
         _string_list_field(_row_get(row, "target_files", ""))
@@ -60387,6 +60897,7 @@ def _contract_runtime_close_authority_source_event_time(
             containers.append(value)
     for container in containers:
         for key in (
+            "source_event_created_at",
             "source_event_time",
             "source_event_at",
             "event_time",
@@ -60423,6 +60934,7 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
     missing_id: str,
     before_line: Mapping[str, Any],
     after_line: Mapping[str, Any],
+    require_source_id_and_time: bool = False,
 ) -> dict[str, Any]:
     before_source_id = _contract_runtime_close_authority_source_event_id(before_line)
     after_source_id = _contract_runtime_close_authority_source_event_id(after_line)
@@ -60439,10 +60951,22 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
     before_semantic = _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER.get(before, -1)
     after_semantic = _MF_PARALLEL_CLOSE_AUTHORITY_SEMANTIC_ORDER.get(after, -1)
 
+    id_order_passed = bool(
+        before_source_id > 0 and after_source_id > before_source_id
+    )
+    timestamp_order_passed = bool(
+        before_time_order is not None
+        and after_time_order is not None
+        and after_time_order > before_time_order
+    )
     source = "completed_line_index_fallback"
     before_order: int | float = before_index
     after_order: int | float = after_index
-    if (
+    if require_source_id_and_time:
+        source = "source_event_id_and_time"
+        before_order = before_source_id
+        after_order = after_source_id
+    elif (
         before_source_id > 0
         and after_source_id > 0
         and before_source_id != after_source_id
@@ -60467,7 +60991,11 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
         before_order = before_semantic
         after_order = after_semantic
 
-    passed = after_order > before_order
+    passed = (
+        id_order_passed and timestamp_order_passed
+        if require_source_id_and_time
+        else after_order > before_order
+    )
     return {
         "requirement_id": missing_id,
         "before": before,
@@ -60484,6 +61012,9 @@ def _contract_runtime_mf_parallel_ordering_diagnostic(
         "after_source_event_id": after_source_id,
         "before_source_event_time": before_source_time,
         "after_source_event_time": after_source_time,
+        "source_event_id_order_passed": id_order_passed,
+        "source_event_timestamp_order_passed": timestamp_order_passed,
+        "source_event_id_and_timestamp_required": require_source_id_and_time,
     }
 
 
@@ -60504,6 +61035,15 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         return {}
 
     record = mf_parallel_records[-1]
+    strict_temporal_order = bool(
+        str(record.get("version") or "").strip()
+        and str(record.get("revision") or "").strip()
+        and _contract_runtime_line_evidence_policy(
+            record,
+            "current_full_reconcile_evidence_policy",
+            line_id="observer_reconcile",
+        )
+    )
     contract_execution_id = str(record.get("contract_execution_id") or "").strip()
     required_specs = {
         "worker_implementation": {
@@ -60652,6 +61192,14 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             missing_id=missing_id,
             before_line=before_line,
             after_line=after_line,
+            require_source_id_and_time=bool(
+                strict_temporal_order
+                and (before, after)
+                in {
+                    ("qa_independent_verification", "observer_merge"),
+                    ("observer_merge", "observer_reconcile"),
+                }
+            ),
         )
         ordering_diagnostics.append(ordering)
         if not bool(ordering.get("passed")):
@@ -69590,10 +70138,20 @@ def handle_backlog_contract_state(ctx: RequestContext):
         contract = backlog_runtime.parse_json_object(
             _row_get(row, "chain_trigger_json", "{}")
         )
+        pinned_definition, pinned_definition_resolution = (
+            _contract_state_pinned_source_definition_resolution(
+                conn,
+                project_id=pid,
+                backlog_id=bug_id,
+                timeline_events=events,
+            )
+        )
         projection = task_timeline.contract_state_projection(
             events,
             contract=contract,
             backlog_row={**dict(row), "project_id": pid},
+            pinned_source_definition=pinned_definition,
+            pinned_source_definition_resolution=pinned_definition_resolution,
         )
         return {
             "ok": True,
