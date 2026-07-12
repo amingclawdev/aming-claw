@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 
-from agent.governance.contract_state_runtime import build_contract_state_projection
+from agent.governance.contract_state_runtime import (
+    _bounded_qa_graph_context_satisfies_requirement,
+    _current_full_reconcile_satisfies_requirement,
+    build_contract_state_projection,
+)
 
 
 def _event(
@@ -38,6 +42,7 @@ def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
         "missing_trace_ids": [],
         "identity_mismatches": [],
         "qa_session_id": "ses-qa-bounded",
+        "qa_principal": "qa:bounded",
         "canonical_base_snapshot_id": "full-base",
         "base_commit_sha": "a" * 40,
         "changed_files_source": "server_exact_candidate_snapshot",
@@ -1676,6 +1681,57 @@ def test_bounded_qa_graph_context_requires_complete_candidate_review_tuple():
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
     assert complete["next_legal_action"]["id"] == "qa_independent_verification"
+
+
+def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
+    qa_evidence = _bounded_qa_graph_evidence(base_diff=True)
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": qa_evidence}}
+    ) is True
+    split_qa = dict(qa_evidence)
+    candidate_diff_hash = split_qa.pop("candidate_diff_hash")
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {
+            "payload": {
+                "graph_trace_evidence": split_qa,
+                "candidate_review_context": {
+                    "candidate_diff_hash": candidate_diff_hash,
+                },
+            }
+        }
+    ) is False
+
+    commit_sha = "c" * 40
+    reconcile_authority = {
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": True,
+        "live_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "active_snapshot_id": "full-coherent-reconcile",
+        "merged_commit_sha": commit_sha,
+        "reconciled_commit_sha": commit_sha,
+        "canonical_head_commit": commit_sha,
+        "active_snapshot_commit": commit_sha,
+        "graph_reconciled": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+    }
+    assert _current_full_reconcile_satisfies_requirement(
+        {"payload": {"reconcile_authority": reconcile_authority}}
+    ) is True
+    split_reconcile = dict(reconcile_authority)
+    active_snapshot_commit = split_reconcile.pop("active_snapshot_commit")
+    assert _current_full_reconcile_satisfies_requirement(
+        {
+            "payload": {
+                "reconcile_authority": split_reconcile,
+                "live_graph_state": {
+                    "active_snapshot_commit": active_snapshot_commit,
+                },
+            }
+        }
+    ) is False
 
 
 def test_builtin_mf_parallel_v2_req_2ff0e242e70f_requires_commit_after_implementation():

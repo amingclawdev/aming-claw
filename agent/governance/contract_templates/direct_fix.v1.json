@@ -171,8 +171,11 @@
                             "exact_candidate_snapshot",
                             "canonical_base_plus_candidate_diff"
                         ],
+                        "authority": "contract_definition.system_layer.graph_binding_policy.bounded_qa_review_policy",
+                        "caller_authority_fields_trusted": false,
                         "candidate_diff_derivation": "server_only",
                         "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
+                        "non_authoritative_template_mirror": true,
                         "unsafe_overlay_policy": "require_exact_candidate_snapshot",
                         "full_candidate_snapshot_required": false
                     }

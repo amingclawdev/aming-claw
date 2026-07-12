@@ -62,6 +62,7 @@ from .contracts.runtime import (
     upsert_contract_chain_successor_binding,
 )
 from .contracts.hash import stable_sha256
+from .contracts.write_gate import contract_line_evidence_policy
 
 import os
 import shutil
@@ -10771,7 +10772,13 @@ def _runtime_context_service_qa_graph_trace_refs(
     *,
     project_id: str,
     explicit_trace_ids: Sequence[str],
-    target_project_root: str,
+    target_project_root: str = "",
+    expected_backlog_id: str = "",
+    expected_task_id: str = "",
+    expected_candidate_commit_sha: str = "",
+    expected_qa_principal: str = "",
+    expected_qa_session_id: str = "",
+    require_complete_authority: bool = False,
 ) -> dict[str, Any]:
     requested_trace_ids = _runtime_context_service_dedupe(
         [str(trace_id or "").strip() for trace_id in explicit_trace_ids]
@@ -10783,8 +10790,10 @@ def _runtime_context_service_qa_graph_trace_refs(
         explicit_clause = ",".join("?" for _ in requested_trace_ids)
         rows = conn.execute(
             f"""
-            SELECT t.trace_id, t.query_source, t.query_purpose, t.actor,
-                   t.snapshot_id, t.commit_sha, t.qa_session_id,
+            SELECT t.trace_id, t.project_id, t.query_source, t.query_purpose,
+                   t.actor, t.snapshot_id, t.commit_sha, t.qa_session_id,
+                   t.backlog_id, t.task_id, t.parent_task_id,
+                   t.runtime_context_id, t.status,
                    t.graph_basis, t.canonical_base_snapshot_id,
                    t.base_commit_sha, t.candidate_commit_sha,
                    t.changed_files_json, t.candidate_diff_hash,
@@ -10830,12 +10839,12 @@ def _runtime_context_service_qa_graph_trace_refs(
         query_source = (
             str(row["query_source"] or "").strip()
             if isinstance(row, sqlite3.Row)
-            else str(row[1] or "").strip()
+            else str(row[2] or "").strip()
         )
         query_purpose = (
             str(row["query_purpose"] or "").strip()
             if isinstance(row, sqlite3.Row)
-            else str(row[2] or "").strip()
+            else str(row[3] or "").strip()
         )
         if query_source != "qa":
             identity_mismatches.append(
@@ -10879,6 +10888,53 @@ def _runtime_context_service_qa_graph_trace_refs(
                 }
             )
             continue
+        row_project_id = str(row["project_id"] or "").strip()
+        row_backlog_id = str(row["backlog_id"] or "").strip()
+        row_task_id = str(row["task_id"] or "").strip()
+        row_parent_task_id = str(row["parent_task_id"] or "").strip()
+        row_runtime_context_id = str(row["runtime_context_id"] or "").strip()
+        row_commit_sha = str(row["commit_sha"] or "").strip().lower()
+        row_status = str(row["status"] or "").strip().lower()
+        qa_scope_binding_ref = str(row["qa_scope_binding_ref"] or "").strip()
+        if require_complete_authority:
+            expected_fields = {
+                "project_id": str(project_id or "").strip(),
+                "backlog_id": str(expected_backlog_id or "").strip(),
+                "task_id": str(expected_task_id or "").strip(),
+                "candidate_commit_sha": str(
+                    expected_candidate_commit_sha or ""
+                ).strip().lower(),
+                "qa_principal": str(expected_qa_principal or "").strip(),
+                "qa_session_id": str(expected_qa_session_id or "").strip(),
+            }
+            actual_fields = {
+                "project_id": row_project_id,
+                "backlog_id": row_backlog_id,
+                "task_id": row_task_id,
+                "candidate_commit_sha": row_commit_sha,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+            }
+            for field, expected in expected_fields.items():
+                actual = actual_fields[field]
+                if not actual or (expected and actual != expected):
+                    identity_mismatches.append(
+                        {
+                            "trace_id": trace_id,
+                            "field": field,
+                            "expected": expected or "non-empty server identity",
+                            "actual": actual,
+                        }
+                    )
+            if row_status != "complete":
+                identity_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "status",
+                        "expected": "complete",
+                        "actual": row_status,
+                    }
+                )
         review_context, context_errors = _qa_reverify_candidate_trace_context(
             conn,
             project_id=project_id,
@@ -10887,14 +10943,36 @@ def _runtime_context_service_qa_graph_trace_refs(
         if context_errors:
             identity_mismatches.extend(context_errors)
             continue
+        if require_complete_authority:
+            canonical_scope_ref = _qa_scope_binding_ref(
+                project_id=row_project_id,
+                backlog_id=row_backlog_id,
+                task_id=row_task_id,
+                commit_sha=review_context["candidate_commit_sha"],
+            )
+            if qa_scope_binding_ref != canonical_scope_ref:
+                identity_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "qa_scope_binding_ref",
+                        "expected": canonical_scope_ref,
+                        "actual": qa_scope_binding_ref,
+                    }
+                )
+                continue
         bounded_review_contexts.append(review_context)
         bounded_qa_authorities.append(
             {
+                "project_id": row_project_id,
+                "backlog_id": row_backlog_id,
+                "task_id": row_task_id,
+                "parent_task_id": row_parent_task_id,
+                "runtime_context_id": row_runtime_context_id,
+                "candidate_commit_sha": review_context["candidate_commit_sha"],
                 "qa_session_id": qa_session_id,
                 "qa_principal": qa_principal,
-                "qa_scope_binding_ref": str(
-                    row["qa_scope_binding_ref"] or ""
-                ).strip(),
+                "qa_scope_binding_ref": qa_scope_binding_ref,
+                "trace_status": row_status,
             }
         )
         if trace_id not in verified:
@@ -10958,6 +11036,13 @@ def _runtime_context_service_qa_graph_trace_refs(
             result.update(next(iter(bounded_authorities_by_hash.values())))
         requested_target_root = str(target_project_root or "").strip()
         persisted_query_root = str(result.get("query_root") or "").strip()
+        if not persisted_query_root:
+            resolved_root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+            persisted_query_root = str(resolved_root or "").strip()
         if persisted_query_root:
             result["requested_target_project_root"] = requested_target_root
             result["target_project_root"] = persisted_query_root
@@ -12646,19 +12731,20 @@ def _qa_graph_context_evidence_shape(
         "actor_role": "qa",
         "graph_trace_ids": [trace_placeholder],
         "graph_query_trace_ids": [trace_placeholder],
-        "db_verified": True,
-        "query_source": "qa",
-        "query_purpose": "independent_verification",
-        "target_project_root": target_project_root,
-        "qa_principal": qa_principal_placeholder,
-        "qa_session_id": qa_principal_placeholder,
-        **candidate_review_context,
+        "authority_derivation": {
+            "source": "server_graph_query_trace_lookup",
+            "lookup_keys_only": [
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+            ],
+            "caller_authority_fields_trusted": False,
+            "replaces": "payload.graph_trace_evidence",
+        },
+        "server_derived_graph_trace_evidence": graph_trace_evidence,
         "payload": {
             "schema_version": "mf_parallel.qa_graph_context.v1",
             "graph_trace_ids": [trace_placeholder],
             "graph_query_trace_ids": [trace_placeholder],
-            "graph_trace_evidence": graph_trace_evidence,
-            "candidate_review_context": dict(candidate_review_context),
         },
     }
 
@@ -13077,20 +13163,9 @@ def _runtime_context_qa_verification_guide(
             "required_top_level_fields": [
                 "graph_trace_ids",
                 "graph_query_trace_ids",
-                "graph_basis",
-                "canonical_base_snapshot_id",
-                "base_commit_sha",
-                "candidate_commit_sha",
-                "changed_files",
-                "candidate_diff_hash",
-                "changed_files_source",
-                "candidate_overlay_hash",
-                "root_identity_hash",
-                "query_root_identity_hash",
-                "canonical_project_identity_hash",
-                "repository_identity_hash",
             ],
-            "required_nested_payload_field": "payload.graph_trace_evidence",
+            "server_derived_authority_path": "payload.graph_trace_evidence",
+            "caller_supplied_authority_fields_trusted": False,
         },
         "append_evidence": {
             "tool": "task_timeline_append",
@@ -30446,7 +30521,6 @@ def _record_pending_scope_reconcile_contract_event(
     scope = _contract_timeline_scope_from_graph_body(body)
     if not scope["backlog_id"]:
         return {}
-
     from . import task_timeline
 
     snapshot_id = str(
@@ -46288,6 +46362,60 @@ def _contract_runtime_projection_current_full_reconcile_matches_merge(
     )
 
 
+def _contract_runtime_projection_timeline_event_id(
+    event: Mapping[str, Any],
+) -> int:
+    try:
+        event_id = int(event.get("id") or 0)
+    except (TypeError, ValueError):
+        event_id = 0
+    if event_id > 0:
+        return event_id
+    source_ref = _runtime_context_event_ref(event)
+    match = re.fullmatch(r"timeline:(\d+)", source_ref)
+    return int(match.group(1)) if match else 0
+
+
+def _contract_runtime_projection_merge_authority(
+    *,
+    record: Mapping[str, Any],
+    context: Any,
+    merge_event: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    payload = (
+        merge_event.get("payload")
+        if isinstance(merge_event.get("payload"), Mapping)
+        else {}
+    )
+    merged_commit = str(
+        merge_event.get("commit_sha")
+        or payload.get("merge_commit")
+        or payload.get("target_head_after_merge")
+        or ""
+    ).strip().lower()
+    source_ref = _runtime_context_event_ref(merge_event)
+    timeline_verified = bool(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+        and re.fullmatch(r"timeline:\d+", source_ref)
+    )
+    return {
+        "timeline_verified": timeline_verified,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(
+            getattr(context, "backlog_id", "")
+            or record.get("backlog_id")
+            or ""
+        ),
+        "merged_commit_sha": merged_commit,
+        "merge_source_ref": source_ref,
+    }
+
+
 def _contract_runtime_projection_post_worker_lines(
     *,
     conn,
@@ -46300,6 +46428,16 @@ def _contract_runtime_projection_post_worker_lines(
         context
     )
     backlog_id = str(getattr(context, "backlog_id", "") or record.get("backlog_id") or "")
+    bounded_qa_policy = _contract_runtime_line_evidence_policy(
+        record,
+        "bounded_qa_review_policy",
+        line_id="qa_graph_context",
+    )
+    reconcile_policy = _contract_runtime_line_evidence_policy(
+        record,
+        "current_full_reconcile_evidence_policy",
+        line_id="observer_reconcile",
+    )
     related_task_ids = {
         str(parent_task_id or "").strip(),
         str(record.get("contract_execution_id") or "").strip(),
@@ -46326,6 +46464,10 @@ def _contract_runtime_projection_post_worker_lines(
     )
     qa_graph_refs: dict[str, Any] = {}
     if qa_event:
+        expected_candidate_commit = (
+            _contract_runtime_server_candidate_commit(record)
+            or str(getattr(context, "target_head_commit", "") or "").strip().lower()
+        )
         qa_graph_refs = _runtime_context_service_qa_graph_trace_refs(
             conn,
             project_id=project_id,
@@ -46337,6 +46479,12 @@ def _contract_runtime_projection_post_worker_lines(
                 or getattr(context, "worktree_path", "")
                 or ""
             ),
+            expected_backlog_id=backlog_id if bounded_qa_policy else "",
+            expected_task_id=task_id if bounded_qa_policy else "",
+            expected_candidate_commit_sha=(
+                expected_candidate_commit if bounded_qa_policy else ""
+            ),
+            require_complete_authority=bool(bounded_qa_policy),
         )
     merge_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
@@ -46369,14 +46517,47 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
     )
-    if reconcile_event and (
-        not merge_event
-        or not _contract_runtime_projection_current_full_reconcile_matches_merge(
-            reconcile_event,
-            merge_event,
-        )
-    ):
-        reconcile_event = {}
+    reconcile_authority: dict[str, Any] = {}
+    if reconcile_event:
+        if reconcile_policy:
+            merge_projection = _contract_runtime_projection_merge_authority(
+                record=record,
+                context=context,
+                merge_event=merge_event,
+            ) if merge_event else {"timeline_verified": False}
+            merge_event_id = _contract_runtime_projection_timeline_event_id(merge_event)
+            reconcile_event_id = _contract_runtime_projection_timeline_event_id(
+                reconcile_event
+            )
+            if (
+                merge_projection.get("timeline_verified") is True
+                and merge_event_id > 0
+                and reconcile_event_id > merge_event_id
+            ):
+                reconcile_authority = (
+                    _contract_runtime_current_full_reconcile_authority_from_merge(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        merge=merge_projection,
+                    )
+                )
+            if not (
+                reconcile_authority.get("db_verified") is True
+                and reconcile_authority.get("live_verified") is True
+                and reconcile_authority.get("active_snapshot_verified") is True
+                and reconcile_authority.get("graph_reconciled") is True
+            ):
+                reconcile_event = {}
+                reconcile_authority = {}
+        elif (
+            not merge_event
+            or not _contract_runtime_projection_current_full_reconcile_matches_merge(
+                reconcile_event,
+                merge_event,
+            )
+        ):
+            reconcile_event = {}
     if close_ready_event and not reconcile_event:
         close_ready_event = {}
 
@@ -46436,6 +46617,7 @@ def _contract_runtime_projection_post_worker_lines(
                 evidence_kind="reconcile",
                 actor_role="observer",
                 source_key="observer_reconcile",
+                server_authority=reconcile_authority,
             )
         )
     if close_ready_event:
@@ -46727,6 +46909,7 @@ def _contract_runtime_projected_post_worker_line(
     actor_role: str,
     source_key: str,
     derived_from: Sequence[str] | None = None,
+    server_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
         context
@@ -46753,6 +46936,8 @@ def _contract_runtime_projected_post_worker_line(
         projected_payload["derived_from"] = [
             str(item) for item in derived_from if str(item or "").strip()
         ]
+    if server_authority:
+        projected_payload["reconcile_authority"] = dict(server_authority)
     line = {
         "stage_id": stage_id,
         "line_id": line_id,
@@ -46774,7 +46959,8 @@ def _contract_runtime_projected_post_worker_line(
         "_source_ref": source_ref,
     }
     commit_sha = str(
-        event.get("commit_sha")
+        (server_authority or {}).get("merged_commit_sha")
+        or event.get("commit_sha")
         or payload.get("commit_sha")
         or payload.get("merge_commit")
         or payload.get("target_head_after_merge")
@@ -48625,6 +48811,509 @@ def _contract_runtime_line_write_body(
         write["changed_files"] = changed_files
         write["graph_trace_ids"] = graph_trace_ids
     return write
+
+
+_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = {
+    "active_snapshot_id",
+    "base_commit_sha",
+    "candidate_commit_sha",
+    "candidate_diff_hash",
+    "candidate_overlay_hash",
+    "canonical_base_snapshot_id",
+    "canonical_project_identity_hash",
+    "changed_files_source",
+    "db_verified",
+    "graph_basis",
+    "identity_mismatches",
+    "missing_trace_ids",
+    "producer",
+    "qa_principal",
+    "qa_scope_binding_ref",
+    "qa_session_id",
+    "query_purpose",
+    "query_root_identity_hash",
+    "query_source",
+    "repository_identity_hash",
+    "root_identity_hash",
+    "source_details",
+    "target_project_root",
+    "trace_status",
+    "verified_trace_ids",
+}
+_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS = {
+    "candidate_review_context",
+    "graph_context",
+    "graph_review_context",
+    "graph_trace_db_evidence",
+    "graph_trace_evidence",
+}
+_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS = {
+    "active_graph_commit",
+    "active_snapshot_commit",
+    "active_snapshot_id",
+    "active_snapshot_verified",
+    "canonical_head_commit",
+    "canonical_head_verified",
+    "current_full_reconcile",
+    "current_full_reconcile_marker",
+    "db_verified",
+    "graph_reconciled",
+    "live_verified",
+    "merged_commit_sha",
+    "reconciled_commit_sha",
+    "strategy",
+}
+
+
+def _contract_runtime_definition_for_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return ContractDefinitionRegistry().get(
+        str(record.get("contract_id") or ""),
+        version=str(record.get("version") or ""),
+        revision=str(record.get("revision") or ""),
+        include_deprecated=True,
+    )
+
+
+def _contract_runtime_line_evidence_policy(
+    record: Mapping[str, Any],
+    policy_name: str,
+    *,
+    line_id: str,
+) -> Mapping[str, Any]:
+    definition = _contract_runtime_definition_for_record(record)
+    return contract_line_evidence_policy(
+        definition,
+        policy_name,
+        line_id=line_id,
+    )
+
+
+def _contract_runtime_requested_trace_ids(
+    body: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> list[str]:
+    payload = body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
+    authority_path = str(policy.get("authority_object_path") or "")
+    authority_key = authority_path.split(".", 1)[1] if authority_path.startswith("payload.") else ""
+    authority = (
+        payload.get(authority_key)
+        if authority_key and isinstance(payload.get(authority_key), Mapping)
+        else {}
+    )
+    values: list[str] = []
+    lookup_keys = list(policy.get("lookup_key_fields") or [])
+    for source in (body, payload, authority):
+        values.extend(_runtime_context_service_query_values(source, *lookup_keys))
+    return _runtime_context_service_dedupe(values)
+
+
+def _contract_runtime_server_line_identity(
+    record: Mapping[str, Any],
+) -> dict[str, str]:
+    next_line = _contract_runtime_next_line(record)
+    identity = {
+        "runtime_context_id": str(next_line.get("runtime_context_id") or "").strip(),
+        "task_id": str(next_line.get("task_id") or "").strip(),
+        "parent_task_id": str(next_line.get("parent_task_id") or "").strip(),
+    }
+    if all(identity.values()):
+        return identity
+    for line in reversed(
+        [item for item in record.get("completed_lines") or [] if isinstance(item, Mapping)]
+    ):
+        for candidate in _contract_runtime_mapping_candidates(line):
+            identity["runtime_context_id"] = identity["runtime_context_id"] or (
+                _contract_runtime_mapping_value(candidate, "runtime_context_id")
+            )
+            identity["task_id"] = identity["task_id"] or (
+                _contract_runtime_mapping_value(candidate, "task_id", "worker_task_id")
+            )
+            identity["parent_task_id"] = identity["parent_task_id"] or (
+                _contract_runtime_mapping_value(candidate, "parent_task_id", "root_task_id")
+            )
+        if identity["runtime_context_id"] and identity["task_id"]:
+            break
+    return identity
+
+
+def _contract_runtime_server_candidate_commit(record: Mapping[str, Any]) -> str:
+    for line in reversed(
+        [item for item in record.get("completed_lines") or [] if isinstance(item, Mapping)]
+    ):
+        if str(line.get("line_id") or "").strip() not in {
+            "worker_commit",
+            "direct_fix_candidate_repair",
+            "worker_implementation",
+        }:
+            continue
+        for candidate in _contract_runtime_mapping_candidates(line):
+            value = _contract_runtime_mapping_value(
+                candidate,
+                "commit_sha",
+                "head_commit",
+                "worker_commit_sha",
+                "candidate_commit_sha",
+            ).lower()
+            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
+                return value
+    return ""
+
+
+def _contract_runtime_strip_authority_claims(
+    value: Any,
+    *,
+    field_names: set[str],
+    container_names: set[str] | None = None,
+) -> Any:
+    containers = container_names or set()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _contract_runtime_strip_authority_claims(
+                child,
+                field_names=field_names,
+                container_names=containers,
+            )
+            for key, child in value.items()
+            if str(key) not in field_names and str(key) not in containers
+        }
+    if isinstance(value, list):
+        return [
+            _contract_runtime_strip_authority_claims(
+                child,
+                field_names=field_names,
+                container_names=containers,
+            )
+            for child in value
+        ]
+    return value
+
+
+def _contract_runtime_bind_qa_graph_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    body: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested_trace_ids = _contract_runtime_requested_trace_ids(body, policy)
+    identity = _contract_runtime_server_line_identity(record)
+    session = ctx.require_auth(conn)
+    evidence = _runtime_context_service_qa_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        explicit_trace_ids=requested_trace_ids,
+        expected_backlog_id=str(record.get("backlog_id") or ""),
+        expected_task_id=identity["task_id"],
+        expected_candidate_commit_sha=_contract_runtime_server_candidate_commit(record),
+        expected_qa_principal=str(session.get("principal_id") or ""),
+        expected_qa_session_id=str(session.get("session_id") or ""),
+        require_complete_authority=True,
+    )
+    evidence = dict(evidence)
+    evidence.update(
+        {
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ),
+            "runtime_context_id": str(
+                evidence.get("runtime_context_id")
+                or identity["runtime_context_id"]
+                or ""
+            ),
+            "parent_task_id": str(
+                evidence.get("parent_task_id")
+                or identity["parent_task_id"]
+                or ""
+            ),
+        }
+    )
+    if evidence.get("graph_basis"):
+        _qa_validate_candidate_review_claims(body, evidence)
+    evidence["authority_hash"] = stable_sha256(evidence)
+
+    authority_key = str(policy.get("authority_object_path") or "").split(".", 1)[-1]
+    raw_payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    payload = _contract_runtime_strip_authority_claims(
+        raw_payload,
+        field_names=_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS,
+        container_names=_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS,
+    )
+    payload = dict(payload) if isinstance(payload, Mapping) else {}
+    payload["graph_trace_ids"] = list(requested_trace_ids)
+    payload["graph_query_trace_ids"] = list(requested_trace_ids)
+    payload[authority_key] = evidence
+
+    effective = dict(write)
+    effective["payload"] = payload
+    effective["graph_trace_ids"] = list(requested_trace_ids)
+    effective["graph_query_trace_ids"] = list(requested_trace_ids)
+    effective["db_verified"] = evidence.get("db_verified") is True
+    effective["query_source"] = str(evidence.get("query_source") or "")
+    effective["query_purpose"] = str(evidence.get("query_purpose") or "")
+    effective["target_project_root"] = str(
+        evidence.get("target_project_root") or ""
+    )
+    if requested_trace_ids:
+        effective["trace_id"] = requested_trace_ids[0]
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        value = str(evidence.get(field) or identity.get(field) or "").strip()
+        if value:
+            effective[field] = value
+    if isinstance(effective.get("artifact_refs"), Mapping):
+        effective["artifact_refs"] = _contract_runtime_strip_authority_claims(
+            effective["artifact_refs"],
+            field_names=_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS,
+            container_names=_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS,
+        )
+    return effective
+
+
+def _contract_runtime_trusted_merge_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_identity = _contract_runtime_server_line_identity(record)
+    candidates: list[dict[str, Any]] = []
+    dispatch_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+    ]
+    for dispatch_line in dispatch_lines:
+        contexts = _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        )
+        for context in contexts:
+            runtime_context_id, task_id, parent_task_id = (
+                _contract_runtime_context_identity(context)
+            )
+            if expected_identity["runtime_context_id"] and (
+                runtime_context_id != expected_identity["runtime_context_id"]
+            ):
+                continue
+            if expected_identity["task_id"] and task_id != expected_identity["task_id"]:
+                continue
+            backlog_id = str(
+                getattr(context, "backlog_id", "")
+                or record.get("backlog_id")
+                or ""
+            )
+            timeline_events = _runtime_context_service_timeline_events(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            for line in _contract_runtime_projection_post_worker_lines(
+                conn=conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                timeline_events=timeline_events,
+            ):
+                if str(line.get("line_id") or "") != "observer_merge":
+                    continue
+                source_ref = str(line.get("_source_ref") or "").strip()
+                merged_commit = str(line.get("commit_sha") or "").strip().lower()
+                if not source_ref.startswith("timeline:") or not re.fullmatch(
+                    r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit
+                ):
+                    continue
+                candidates.append(
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "parent_task_id": parent_task_id,
+                        "backlog_id": backlog_id,
+                        "merged_commit_sha": merged_commit,
+                        "merge_source_ref": source_ref,
+                    }
+                )
+    unique = {stable_sha256(item): item for item in candidates}
+    if len(unique) != 1:
+        return {
+            "timeline_verified": False,
+            "identity_mismatches": [
+                {
+                    "field": "observer_merge_projection",
+                    "expected": "one durable timeline-backed merge tuple",
+                    "actual": len(unique),
+                }
+            ],
+        }
+    return {"timeline_verified": True, **next(iter(unique.values()))}
+
+
+def _contract_runtime_current_full_reconcile_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    merge = _contract_runtime_trusted_merge_projection(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    return _contract_runtime_current_full_reconcile_authority_from_merge(
+        conn,
+        project_id=project_id,
+        record=record,
+        merge=merge,
+    )
+
+
+def _contract_runtime_current_full_reconcile_authority_from_merge(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    merge: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import graph_snapshot_store
+
+    merged_commit = str(merge.get("merged_commit_sha") or "").strip().lower()
+    state = graph_snapshot_store.current_full_reconcile_state(
+        conn,
+        project_id,
+        merged_commit,
+    )
+    root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    target_project_root = str(Path(root).resolve()) if root else ""
+    canonical_head_commit = _git_head_commit(Path(root)).strip().lower() if root else ""
+    canonical_head_verified = bool(
+        merged_commit and canonical_head_commit == merged_commit
+    )
+    db_verified = bool(
+        merge.get("timeline_verified") is True and state.get("db_verified") is True
+    )
+    live_verified = bool(target_project_root and canonical_head_verified)
+    active_snapshot_verified = state.get("active_snapshot_verified") is True
+    graph_reconciled = bool(db_verified and live_verified and active_snapshot_verified)
+    authority = {
+        **dict(state),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": db_verified,
+        "live_verified": live_verified,
+        "canonical_head_verified": canonical_head_verified,
+        "active_snapshot_verified": active_snapshot_verified,
+        "graph_reconciled": graph_reconciled,
+        "project_id": project_id,
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "runtime_context_id": str(merge.get("runtime_context_id") or ""),
+        "task_id": str(merge.get("task_id") or ""),
+        "parent_task_id": str(merge.get("parent_task_id") or ""),
+        "merged_commit_sha": merged_commit,
+        "reconciled_commit_sha": str(
+            state.get("active_snapshot_commit") or ""
+        ).strip().lower(),
+        "canonical_head_commit": canonical_head_commit,
+        "target_project_root": target_project_root,
+        "merge_source_ref": str(merge.get("merge_source_ref") or ""),
+        "merge_projection_verified": merge.get("timeline_verified") is True,
+        "identity_mismatches": list(merge.get("identity_mismatches") or []),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _contract_runtime_bind_reconcile_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority = _contract_runtime_current_full_reconcile_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    raw_payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    payload = _contract_runtime_strip_authority_claims(
+        raw_payload,
+        field_names=_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS,
+        container_names={"reconcile_authority"},
+    )
+    payload = dict(payload) if isinstance(payload, Mapping) else {}
+    authority_key = str(policy.get("authority_object_path") or "").split(".", 1)[-1]
+    payload[authority_key] = authority
+
+    effective = dict(write)
+    effective["payload"] = payload
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        value = str(authority.get(field) or "").strip()
+        if value:
+            effective[field] = value
+    merged_commit = str(authority.get("merged_commit_sha") or "").strip()
+    if merged_commit:
+        effective["commit_sha"] = merged_commit
+    if isinstance(effective.get("artifact_refs"), Mapping):
+        effective["artifact_refs"] = _contract_runtime_strip_authority_claims(
+            effective["artifact_refs"],
+            field_names=_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS,
+            container_names={"reconcile_authority"},
+        )
+    return effective
+
+
+def _contract_runtime_bind_server_line_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    line_id = str(write.get("line_id") or "").strip()
+    qa_policy = _contract_runtime_line_evidence_policy(
+        record,
+        "bounded_qa_review_policy",
+        line_id=line_id,
+    )
+    if qa_policy:
+        return _contract_runtime_bind_qa_graph_authority(
+            ctx,
+            conn,
+            project_id=project_id,
+            record=record,
+            write=write,
+            body=body,
+            policy=qa_policy,
+        )
+    reconcile_policy = _contract_runtime_line_evidence_policy(
+        record,
+        "current_full_reconcile_evidence_policy",
+        line_id=line_id,
+    )
+    if reconcile_policy:
+        return _contract_runtime_bind_reconcile_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            write=write,
+            policy=reconcile_policy,
+        )
+    return dict(write)
 
 
 def _dispatch_payload_worker_role(value: Any, *, depth: int = 0) -> str:
@@ -71588,6 +72277,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     write=write,
                     request_id=ctx.request_id,
                 )
+                write = _contract_runtime_bind_server_line_authority(
+                    ctx,
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
+                    body=body,
+                )
                 result = runtime.submit_line_write(
                     contract_execution_id,
                     write,
@@ -71696,6 +72393,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     actor_role=actor_role,
                     body=body,
                     worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
+                )
+                write = _contract_runtime_bind_server_line_authority(
+                    ctx,
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
+                    body=body,
                 )
                 result = runtime.precheck_line_write(
                     contract_execution_id,

@@ -2114,6 +2114,77 @@ def get_active_graph_snapshot(
     return dict(row) if row else None
 
 
+def current_full_reconcile_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merged_commit_sha: str,
+) -> dict[str, Any]:
+    """Return DB-backed current-full state for one merged canonical commit."""
+
+    ensure_schema(conn)
+    project_id = str(project_id or "").strip()
+    merged_commit_sha = str(merged_commit_sha or "").strip().lower()
+    active = get_active_graph_snapshot(conn, project_id) or {}
+    active_snapshot_id = str(active.get("snapshot_id") or "").strip()
+    active_snapshot_commit = str(active.get("commit_sha") or "").strip().lower()
+    marker = _snapshot_notes(active).get("current_full_reconcile")
+    marker = dict(marker) if isinstance(marker, Mapping) else {}
+    marker_target_commit = str(marker.get("target_commit_sha") or "").strip().lower()
+    pending_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM pending_scope_reconcile
+            WHERE project_id = ? AND status IN (?, ?, ?)
+            """,
+            (
+                project_id,
+                PENDING_STATUS_QUEUED,
+                PENDING_STATUS_RUNNING,
+                PENDING_STATUS_FAILED,
+            ),
+        ).fetchone()[0]
+    )
+    marker_verified = bool(
+        marker
+        and marker.get("normal_update_path") is True
+        and marker.get("activate") is True
+        and marker_target_commit == merged_commit_sha
+    )
+    active_snapshot_verified = bool(
+        active_snapshot_id
+        and str(active.get("status") or "").strip() == SNAPSHOT_STATUS_ACTIVE
+        and active_snapshot_commit == merged_commit_sha
+    )
+    db_verified = bool(
+        project_id
+        and merged_commit_sha
+        and marker_verified
+        and active_snapshot_verified
+        and pending_count == 0
+    )
+    return {
+        "schema_version": "graph_snapshot_store.current_full_reconcile_state.v1",
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": db_verified,
+        "project_id": project_id,
+        "merged_commit_sha": merged_commit_sha,
+        "active_snapshot_id": active_snapshot_id,
+        "active_snapshot_commit": active_snapshot_commit,
+        "active_snapshot_status": str(active.get("status") or "").strip(),
+        "active_snapshot_verified": active_snapshot_verified,
+        "current_full_reconcile": bool(marker),
+        "current_full_reconcile_marker": marker,
+        "current_full_reconcile_marker_verified": marker_verified,
+        "strategy": "current_full_reconcile" if marker else "",
+        "pending_scope_reconcile_count": pending_count,
+        "pending_scope_reconcile_zero": pending_count == 0,
+        "source_ref": (
+            f"graph_snapshot:{active_snapshot_id}" if active_snapshot_id else ""
+        ),
+    }
+
+
 def get_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,

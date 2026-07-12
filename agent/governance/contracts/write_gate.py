@@ -83,21 +83,8 @@ _GRAPH_TRACE_ID_KEYS = {
     "verified_trace_ids",
 }
 
-_QA_GRAPH_CONTEXT_LINE_IDS = {
-    "direct_fix_qa_graph_context",
-    "qa_graph_context",
-}
-_QA_GRAPH_BASES = {
-    "exact_candidate_snapshot",
-    "canonical_base_plus_candidate_diff",
-}
-_QA_BASE_DIFF_HASH_FIELDS = (
-    "candidate_overlay_hash",
-    "root_identity_hash",
-    "query_root_identity_hash",
-    "canonical_project_identity_hash",
-    "repository_identity_hash",
-)
+_BOUNDED_QA_POLICY_NAME = "bounded_qa_review_policy"
+_CURRENT_FULL_RECONCILE_POLICY_NAME = "current_full_reconcile_evidence_policy"
 
 
 @dataclass(frozen=True)
@@ -179,7 +166,32 @@ def validate_contract_write(
     elif require_next_action and next_action is None:
         errors.append("contract execution has no remaining next legal action")
 
-    _validate_graph_context(errors, write, line_id=line_id, actor_role=actor_role)
+    bounded_qa_policy = contract_line_evidence_policy(
+        definition,
+        _BOUNDED_QA_POLICY_NAME,
+        line_id=line_id,
+    )
+    _validate_graph_context(
+        errors,
+        write,
+        execution_state=execution_state,
+        line_id=line_id,
+        actor_role=actor_role,
+        bounded_qa_policy=bounded_qa_policy,
+    )
+    reconcile_policy = contract_line_evidence_policy(
+        definition,
+        _CURRENT_FULL_RECONCILE_POLICY_NAME,
+        line_id=line_id,
+    )
+    if reconcile_policy:
+        _validate_current_full_reconcile_evidence(
+            errors,
+            write,
+            execution_state=execution_state,
+            line_id=line_id,
+            policy=reconcile_policy,
+        )
 
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
 
@@ -188,8 +200,10 @@ def _validate_graph_context(
     errors: list[str],
     write: Mapping[str, Any],
     *,
+    execution_state: Mapping[str, Any],
     line_id: str,
     actor_role: str,
+    bounded_qa_policy: Mapping[str, Any],
 ) -> None:
     policy = _GRAPH_CONTEXT_POLICIES.get(line_id)
     if not policy:
@@ -237,12 +251,13 @@ def _validate_graph_context(
             continue
         if write_value and graph_value and write_value != graph_value:
             errors.append(f"{line_id} {field} does not match graph_trace_evidence")
-    if line_id in _QA_GRAPH_CONTEXT_LINE_IDS:
+    if bounded_qa_policy:
         _validate_bounded_qa_graph_context(
             errors,
             write,
+            execution_state=execution_state,
             line_id=line_id,
-            trace_ids=trace_ids,
+            policy=bounded_qa_policy,
         )
 
 
@@ -250,28 +265,26 @@ def _validate_bounded_qa_graph_context(
     errors: list[str],
     write: Mapping[str, Any],
     *,
+    execution_state: Mapping[str, Any],
     line_id: str,
-    trace_ids: list[str],
+    policy: Mapping[str, Any],
 ) -> None:
-    evidence_rows = [
-        candidate
-        for candidate in _graph_evidence_candidates(write)
-        if str(candidate.get("source") or "").strip() == "graph_query_traces"
-    ]
-    if len(evidence_rows) != 1:
-        errors.append(
-            f"{line_id} requires one source=graph_query_traces evidence object"
-        )
+    evidence = _canonical_authority_object(write, policy)
+    authority_source = str(policy.get("authority_source") or "graph_query_traces")
+    if not evidence:
+        errors.append(f"{line_id} requires one canonical server-derived evidence object")
         return
-    evidence = evidence_rows[0]
-    if _first_deep_value(evidence, "db_verified") is not True:
+    if str(evidence.get("source") or "").strip() != authority_source:
+        errors.append(f"{line_id} requires source={authority_source} evidence")
+    if evidence.get("db_verified") is not True:
         errors.append(f"{line_id} requires server DB-verified graph trace evidence")
-    qa_session_id = _first_deep_text(evidence, "qa_session_id")
-    if not qa_session_id:
-        errors.append(f"{line_id} requires qa_session_id")
+
+    trace_ids = _canonical_policy_trace_ids(write, policy)
+    if not trace_ids:
+        errors.append(f"{line_id} requires canonical graph trace lookup keys")
 
     verified_trace_ids = _flatten_graph_text_values(
-        _first_deep_value(evidence, "verified_trace_ids")
+        evidence.get("verified_trace_ids")
     )
     if not verified_trace_ids:
         errors.append(f"{line_id} requires verified_trace_ids")
@@ -280,29 +293,55 @@ def _validate_bounded_qa_graph_context(
             f"{line_id} verified_trace_ids must match graph_trace_ids"
         )
     missing_trace_ids = _flatten_graph_text_values(
-        _first_deep_value(evidence, "missing_trace_ids")
+        evidence.get("missing_trace_ids")
     )
     if missing_trace_ids:
         errors.append(f"{line_id} cannot contain missing_trace_ids")
-    identity_mismatches = _first_deep_value(evidence, "identity_mismatches")
+    identity_mismatches = evidence.get("identity_mismatches")
     if identity_mismatches:
         errors.append(f"{line_id} cannot contain graph trace identity_mismatches")
 
-    graph_basis = _first_deep_text(evidence, "graph_basis")
-    canonical_base_snapshot_id = _first_deep_text(
-        evidence, "canonical_base_snapshot_id"
-    )
-    base_commit_sha = _first_deep_text(evidence, "base_commit_sha").lower()
-    candidate_commit_sha = _first_deep_text(
-        evidence, "candidate_commit_sha"
-    ).lower()
-    changed_files = _first_deep_value(evidence, "changed_files")
-    candidate_diff_hash = _first_deep_text(
-        evidence, "candidate_diff_hash"
-    ).lower()
-    changed_files_source = _first_deep_text(evidence, "changed_files_source")
+    query_source = str(evidence.get("query_source") or "").strip()
+    query_sources = set(str(item) for item in policy.get("query_sources") or [])
+    if query_sources and query_source not in query_sources:
+        errors.append(f"{line_id} evidence query_source must be one of {sorted(query_sources)!r}")
+    query_purpose = str(evidence.get("query_purpose") or "").strip()
+    query_purposes = set(str(item) for item in policy.get("query_purposes") or [])
+    if query_purposes and query_purpose not in query_purposes:
+        errors.append(f"{line_id} evidence query_purpose must be one of {sorted(query_purposes)!r}")
 
-    if graph_basis not in _QA_GRAPH_BASES:
+    for field in policy.get("required_identity_fields") or ():
+        value = str(evidence.get(field) or "").strip()
+        if not value:
+            errors.append(f"{line_id} requires authority.{field}")
+    for field in ("project_id", "backlog_id", "contract_execution_id"):
+        expected = str(execution_state.get(field) or "").strip()
+        actual = str(evidence.get(field) or "").strip()
+        if expected and actual and actual != expected:
+            errors.append(f"{line_id} authority.{field} mismatch")
+    write_task_id = _write_field(write, "task_id")
+    authority_task_id = str(evidence.get("task_id") or "").strip()
+    if write_task_id and authority_task_id and write_task_id != authority_task_id:
+        errors.append(f"{line_id} authority.task_id mismatch")
+
+    graph_basis = str(evidence.get("graph_basis") or "").strip()
+    canonical_base_snapshot_id = str(
+        evidence.get("canonical_base_snapshot_id") or ""
+    ).strip()
+    base_commit_sha = str(evidence.get("base_commit_sha") or "").strip().lower()
+    candidate_commit_sha = str(
+        evidence.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    changed_files = evidence.get("changed_files")
+    candidate_diff_hash = str(
+        evidence.get("candidate_diff_hash") or ""
+    ).strip().lower()
+    changed_files_source = str(evidence.get("changed_files_source") or "").strip()
+
+    accepted_graph_basis = set(
+        str(item) for item in policy.get("accepted_graph_basis") or []
+    )
+    if graph_basis not in accepted_graph_basis:
         errors.append(f"{line_id} requires a supported graph_basis")
     if not canonical_base_snapshot_id:
         errors.append(f"{line_id} requires canonical_base_snapshot_id")
@@ -338,10 +377,112 @@ def _validate_bounded_qa_graph_context(
             errors.append(
                 f"{line_id} base-diff basis requires distinct base and candidate commits"
             )
-        for field in _QA_BASE_DIFF_HASH_FIELDS:
-            value = _first_deep_text(evidence, field).lower()
+        for field in policy.get("base_diff_required_hash_fields") or ():
+            value = str(evidence.get(field) or "").strip().lower()
             if not _is_sha256(value):
                 errors.append(f"{line_id} requires {field}")
+
+
+def _validate_current_full_reconcile_evidence(
+    errors: list[str],
+    write: Mapping[str, Any],
+    *,
+    execution_state: Mapping[str, Any],
+    line_id: str,
+    policy: Mapping[str, Any],
+) -> None:
+    authority = _canonical_authority_object(write, policy)
+    if not authority:
+        errors.append(f"{line_id} requires one canonical reconcile authority object")
+        return
+    expected_source = str(policy.get("authority_source") or "").strip()
+    if expected_source and str(authority.get("source") or "").strip() != expected_source:
+        errors.append(f"{line_id} requires source={expected_source} authority")
+    for field in policy.get("required_verification_fields") or ():
+        if authority.get(field) is not True:
+            errors.append(f"{line_id} requires authority.{field}=true")
+    if policy.get("current_full_reconcile_required") is True and authority.get(
+        "current_full_reconcile"
+    ) is not True:
+        errors.append(f"{line_id} requires current_full_reconcile=true")
+    expected_strategy = str(policy.get("strategy") or "").strip()
+    if expected_strategy and str(authority.get("strategy") or "").strip() != expected_strategy:
+        errors.append(f"{line_id} requires strategy={expected_strategy}")
+
+    for field in policy.get("required_identity_fields") or ():
+        if not str(authority.get(field) or "").strip():
+            errors.append(f"{line_id} requires authority.{field}")
+    for field in ("project_id", "backlog_id", "contract_execution_id"):
+        expected = str(execution_state.get(field) or "").strip()
+        actual = str(authority.get(field) or "").strip()
+        if expected and actual and actual != expected:
+            errors.append(f"{line_id} authority.{field} mismatch")
+    for field in ("runtime_context_id", "task_id"):
+        write_value = _write_field(write, field)
+        authority_value = str(authority.get(field) or "").strip()
+        if write_value and authority_value and write_value != authority_value:
+            errors.append(f"{line_id} authority.{field} mismatch")
+
+    commits = [
+        str(authority.get(field) or "").strip().lower()
+        for field in policy.get("required_commit_fields") or ()
+    ]
+    if not commits or not all(_is_full_commit(value) for value in commits):
+        errors.append(f"{line_id} requires full canonical reconcile commit identities")
+    elif len(set(commits)) != 1:
+        errors.append(f"{line_id} reconcile commit identities must match")
+    if not str(authority.get("active_snapshot_id") or "").strip():
+        errors.append(f"{line_id} requires authority.active_snapshot_id")
+    marker = authority.get("current_full_reconcile_marker")
+    if not isinstance(marker, Mapping):
+        errors.append(f"{line_id} requires current_full_reconcile_marker")
+    elif not (
+        marker.get("activate") is True
+        and marker.get("normal_update_path") is True
+        and str(marker.get("target_commit_sha") or "").strip().lower()
+        == str(authority.get("merged_commit_sha") or "").strip().lower()
+    ):
+        errors.append(f"{line_id} current_full_reconcile_marker is not canonical")
+
+
+def contract_line_evidence_policy(
+    definition: Mapping[str, Any],
+    policy_name: str,
+    *,
+    line_id: str,
+) -> Mapping[str, Any]:
+    """Return an enabled normalized source policy that applies to one line."""
+
+    system_layer = _mapping(definition.get("system_layer"))
+    graph_binding_policy = _mapping(system_layer.get("graph_binding_policy"))
+    policy = _mapping(graph_binding_policy.get(policy_name))
+    if policy.get("enabled") is not True:
+        return {}
+    line_ids = {str(item).strip() for item in policy.get("line_ids") or []}
+    return policy if line_id in line_ids else {}
+
+
+def _canonical_authority_object(
+    write: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    path = str(policy.get("authority_object_path") or "").strip()
+    if not path.startswith("payload.") or path.count(".") != 1:
+        return {}
+    payload = _mapping(write.get("payload"))
+    return _mapping(payload.get(path.split(".", 1)[1]))
+
+
+def _canonical_policy_trace_ids(
+    write: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> list[str]:
+    values: list[str] = []
+    payload = _mapping(write.get("payload"))
+    for source in (write, payload):
+        for key in policy.get("lookup_key_fields") or ():
+            values.extend(_flatten_graph_text_values(source.get(key)))
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _is_full_commit(value: str) -> bool:

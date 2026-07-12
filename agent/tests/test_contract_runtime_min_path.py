@@ -33,6 +33,10 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     assert policy["candidate_diff_derivation"] == "server_only"
     assert policy["full_candidate_snapshot_required"] is False
     assert policy["post_merge_graph_policy"] == {
+        "authority": (
+            "contract_definition.system_layer.graph_binding_policy."
+            "current_full_reconcile_evidence_policy"
+        ),
         "reconcile_mode": "current_full",
         "required_after": "observer_merge",
         "required_before": "observer_close_ready",
@@ -240,7 +244,13 @@ def _write_minimal_contract(tmp_path, *, status: str = "active"):
     return path
 
 
-def _write_contract_definition(tmp_path, *, contract_id: str, stages: list[dict]):
+def _write_contract_definition(
+    tmp_path,
+    *,
+    contract_id: str,
+    stages: list[dict],
+    system_layer: dict | None = None,
+):
     payload = {
         "schema_version": "contract_definition.v1",
         "contract_id": contract_id,
@@ -255,6 +265,8 @@ def _write_contract_definition(tmp_path, *, contract_id: str, stages: list[dict]
             "refs": [],
         },
     }
+    if system_layer is not None:
+        payload["system_layer"] = system_layer
     path = tmp_path / f"{contract_id}.v1.rev1.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -370,6 +382,9 @@ def _direct_fix_graph_payload(
     actor_role: str,
     trace_id: str,
     include_bounded_qa: bool = True,
+    project_id: str = "aming-claw",
+    backlog_id: str = "AC-CONTRACT-RUNTIME",
+    task_id: str = "direct-fix-worker-test",
 ):
     query_source = {
         "observer": "observer",
@@ -407,6 +422,10 @@ def _direct_fix_graph_payload(
         evidence.update(
             {
                 "qa_session_id": "ses-qa-contract-runtime",
+                "qa_principal": "qa-contract-runtime",
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
                 "graph_basis": "exact_candidate_snapshot",
                 "canonical_base_snapshot_id": "full-contract-runtime-qa",
                 "base_commit_sha": commit_sha,
@@ -775,6 +794,42 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
                 ],
             },
         ],
+        system_layer={
+            "graph_binding_policy": {
+                "bounded_qa_review_policy": {
+                    "schema_version": "contract_bounded_qa_review_policy.v1",
+                    "enabled": True,
+                    "line_ids": ["qa_graph_context"],
+                    "authority_object_path": "payload.graph_trace_evidence",
+                    "authority_source": "graph_query_traces",
+                    "lookup_key_fields": [
+                        "graph_trace_ids",
+                        "graph_query_trace_ids",
+                    ],
+                    "query_sources": ["qa"],
+                    "query_purposes": ["independent_verification"],
+                    "accepted_graph_basis": [
+                        "exact_candidate_snapshot",
+                        "canonical_base_plus_candidate_diff",
+                    ],
+                    "base_diff_required_hash_fields": [
+                        "candidate_overlay_hash",
+                        "root_identity_hash",
+                        "query_root_identity_hash",
+                        "canonical_project_identity_hash",
+                        "repository_identity_hash",
+                    ],
+                    "required_identity_fields": [
+                        "project_id",
+                        "backlog_id",
+                        "task_id",
+                        "qa_session_id",
+                        "qa_principal",
+                        "target_project_root",
+                    ],
+                }
+            }
+        },
     )
     runtime = ContractRuntime(
         ContractDefinitionRegistry(tmp_path),
@@ -884,6 +939,8 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
                 actor_role="qa",
                 trace_id="gqt-mf-parallel-v2-qa",
                 include_bounded_qa=False,
+                backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+                task_id="mf-parallel-v2-worker",
             ),
         },
         actor_role="qa",
@@ -909,6 +966,8 @@ def test_mf_parallel_v2_graph_context_gates_worker_and_qa(tmp_path):
             "payload": _direct_fix_graph_payload(
                 actor_role="qa",
                 trace_id="gqt-mf-parallel-v2-qa",
+                backlog_id="AC-MF-PARALLEL-V2-GRAPH-GATE",
+                task_id="mf-parallel-v2-worker",
             ),
         },
         actor_role="qa",

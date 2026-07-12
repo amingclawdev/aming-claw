@@ -506,6 +506,9 @@
   },
   "qa_graph_context_policy": {
     "schema_version": "mf_parallel.qa_graph_context_policy.v1",
+    "authority": "contract_definition.system_layer.graph_binding_policy.bounded_qa_review_policy",
+    "caller_authority_fields_trusted": false,
+    "non_authoritative_template_mirror": true,
     "accepted_graph_basis": [
       "exact_candidate_snapshot",
       "canonical_base_plus_candidate_diff"
@@ -530,6 +533,7 @@
     "full_candidate_snapshot_required": false,
     "forged_or_mismatched_tuple_policy": "fail_closed",
     "post_merge_graph_policy": {
+      "authority": "contract_definition.system_layer.graph_binding_policy.current_full_reconcile_evidence_policy",
       "reconcile_mode": "current_full",
       "required_after": "observer_merge",
       "required_before": "observer_close_ready",

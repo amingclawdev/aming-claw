@@ -2496,145 +2496,87 @@ def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int
 def _bounded_qa_graph_context_satisfies_requirement(
     event: Mapping[str, Any],
 ) -> bool:
-    candidates: list[Mapping[str, Any]] = []
-    db_verified = False
-    qa_session_present = False
-    verified_trace_present = False
-    verification_rejected = False
-
-    def collect(value: Any, *, depth: int = 0) -> None:
-        nonlocal db_verified, qa_session_present, verified_trace_present
-        nonlocal verification_rejected
-        if depth > 8:
-            return
-        if isinstance(value, Mapping):
-            keys = set(value)
-            if keys.intersection(
-                {
-                    "graph_basis",
-                    "canonical_base_snapshot_id",
-                    "base_commit_sha",
-                    "candidate_commit_sha",
-                    "candidate_diff_hash",
-                }
-            ):
-                candidates.append(value)
-            if str(value.get("qa_session_id") or "").strip():
-                qa_session_present = True
-            source = str(value.get("source") or "").strip()
-            if source == "graph_query_traces" and value.get("db_verified") is True:
-                db_verified = True
-            if _string_list(
-                value.get("verified_trace_ids") or value.get("graph_trace_ids")
-            ):
-                verified_trace_present = True
-            if _string_list(value.get("missing_trace_ids")) or value.get(
-                "identity_mismatches"
-            ):
-                verification_rejected = True
-            for child in value.values():
-                collect(child, depth=depth + 1)
-        elif isinstance(value, (list, tuple, set)):
-            for child in value:
-                collect(child, depth=depth + 1)
-
-    collect(event)
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    evidence = payload.get("graph_trace_evidence")
+    if not isinstance(evidence, Mapping):
+        evidence = event.get("graph_trace_evidence")
+    if not isinstance(evidence, Mapping):
+        return False
     if not (
-        candidates
-        and db_verified
-        and qa_session_present
-        and verified_trace_present
-        and not verification_rejected
+        str(evidence.get("source") or "").strip() == "graph_query_traces"
+        and evidence.get("db_verified") is True
+        and str(evidence.get("qa_session_id") or "").strip()
+        and str(evidence.get("qa_principal") or "").strip()
+        and _string_list(evidence.get("verified_trace_ids"))
+        and not _string_list(evidence.get("missing_trace_ids"))
+        and not evidence.get("identity_mismatches")
     ):
         return False
 
-    for candidate in candidates:
-        graph_basis = str(candidate.get("graph_basis") or "").strip()
-        base_snapshot_id = str(
-            candidate.get("canonical_base_snapshot_id") or ""
-        ).strip()
-        base_commit_sha = str(candidate.get("base_commit_sha") or "").strip().lower()
-        candidate_commit_sha = str(
-            candidate.get("candidate_commit_sha") or ""
-        ).strip().lower()
-        diff_hash = str(candidate.get("candidate_diff_hash") or "").strip().lower()
-        changed_files_source = str(
-            candidate.get("changed_files_source") or ""
-        ).strip()
-        changed_files = candidate.get("changed_files")
-        candidate_overlay_hash = str(
-            candidate.get("candidate_overlay_hash") or ""
-        ).strip().lower()
-        root_identity_hash = str(
-            candidate.get("root_identity_hash") or ""
-        ).strip().lower()
-        query_root_identity_hash = str(
-            candidate.get("query_root_identity_hash") or ""
-        ).strip().lower()
-        canonical_project_identity_hash = str(
-            candidate.get("canonical_project_identity_hash") or ""
-        ).strip().lower()
-        repository_identity_hash = str(
-            candidate.get("repository_identity_hash") or ""
-        ).strip().lower()
-        full_base = len(base_commit_sha) in {40, 64} and all(
-            char in "0123456789abcdef" for char in base_commit_sha
+    graph_basis = str(evidence.get("graph_basis") or "").strip()
+    base_snapshot_id = str(
+        evidence.get("canonical_base_snapshot_id") or ""
+    ).strip()
+    base_commit_sha = str(evidence.get("base_commit_sha") or "").strip().lower()
+    candidate_commit_sha = str(
+        evidence.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    diff_hash = str(evidence.get("candidate_diff_hash") or "").strip().lower()
+    changed_files_source = str(
+        evidence.get("changed_files_source") or ""
+    ).strip()
+    changed_files = evidence.get("changed_files")
+
+    def full_commit(value: str) -> bool:
+        return len(value) in {40, 64} and all(
+            char in "0123456789abcdef" for char in value
         )
-        full_candidate = len(candidate_commit_sha) in {40, 64} and all(
-            char in "0123456789abcdef" for char in candidate_commit_sha
-        )
-        valid_diff_hash = (
-            diff_hash.startswith("sha256:")
-            and len(diff_hash) == len("sha256:") + 64
+
+    def sha256(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        return (
+            text.startswith("sha256:")
+            and len(text) == len("sha256:") + 64
             and all(
                 char in "0123456789abcdef"
-                for char in diff_hash.removeprefix("sha256:")
+                for char in text.removeprefix("sha256:")
             )
         )
-        if not (
-            graph_basis
-            in {
-                "exact_candidate_snapshot",
-                "canonical_base_plus_candidate_diff",
-            }
-            and base_snapshot_id
-            and full_base
-            and full_candidate
-            and isinstance(changed_files, list)
-            and valid_diff_hash
-            and changed_files_source.startswith("server_")
-        ):
-            continue
-        if graph_basis == "exact_candidate_snapshot":
-            empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
-            if (
-                base_commit_sha == candidate_commit_sha
-                and not changed_files
-                and diff_hash == empty_diff_hash
-            ):
-                return True
-            continue
-        bounded_hashes = (
-            candidate_overlay_hash,
-            root_identity_hash,
-            query_root_identity_hash,
-            canonical_project_identity_hash,
-            repository_identity_hash,
+
+    if not (
+        graph_basis
+        in {
+            "exact_candidate_snapshot",
+            "canonical_base_plus_candidate_diff",
+        }
+        and base_snapshot_id
+        and full_commit(base_commit_sha)
+        and full_commit(candidate_commit_sha)
+        and isinstance(changed_files, list)
+        and sha256(diff_hash)
+        and changed_files_source.startswith("server_")
+    ):
+        return False
+    if graph_basis == "exact_candidate_snapshot":
+        empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
+        return bool(
+            base_commit_sha == candidate_commit_sha
+            and not changed_files
+            and diff_hash == empty_diff_hash
         )
-        if (
-            base_commit_sha != candidate_commit_sha
-            and all(
-                value.startswith("sha256:")
-                and len(value) == len("sha256:") + 64
-                and all(
-                    char in "0123456789abcdef"
-                    for char in value.removeprefix("sha256:")
-                )
-                for value in bounded_hashes
+    return bool(
+        base_commit_sha != candidate_commit_sha
+        and all(
+            sha256(evidence.get(field))
+            for field in (
+                "candidate_overlay_hash",
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
             )
-        ):
-            return True
-    return False
+        )
+    )
 
 
 def _qa_verification_event_satisfies_requirement(
@@ -2957,62 +2899,68 @@ def _requirement_requires_event_kind_match(requirement: Mapping[str, Any]) -> bo
 def _current_full_reconcile_satisfies_requirement(
     event: Mapping[str, Any],
 ) -> bool:
-    mappings: list[Mapping[str, Any]] = []
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    explicit_authority = payload.get("reconcile_authority")
+    if not isinstance(explicit_authority, Mapping):
+        explicit_authority = event.get("reconcile_authority")
+    authority = explicit_authority if isinstance(explicit_authority, Mapping) else payload
+    if not isinstance(authority, Mapping):
+        return False
 
-    def collect(value: Any, *, depth: int = 0) -> None:
-        if depth > 8:
-            return
-        if isinstance(value, Mapping):
-            mappings.append(value)
-            for child in value.values():
-                collect(child, depth=depth + 1)
-        elif isinstance(value, (list, tuple, set)):
-            for child in value:
-                collect(child, depth=depth + 1)
-
-    collect(event)
-
-    def first_text(*keys: str) -> str:
-        for mapping in mappings:
-            for key in keys:
-                text = str(mapping.get(key) or "").strip().lower()
-                if text:
-                    return text
-        return ""
-
-    def any_true(*keys: str) -> bool:
-        return any(mapping.get(key) is True for mapping in mappings for key in keys)
-
-    modes = {
-        str(mapping.get(key) or "")
-        .strip()
-        .lower()
-        .replace("-", "_")
-        for mapping in mappings
-        for key in ("reconcile_mode", "strategy", "scope_reconcile_strategy")
-        if str(mapping.get(key) or "").strip()
+    mode = str(
+        authority.get("reconcile_mode")
+        or authority.get("strategy")
+        or authority.get("scope_reconcile_strategy")
+        or ""
+    ).strip().lower().replace("-", "_")
+    current_full = authority.get("current_full_reconcile") is True or mode in {
+        "current_full",
+        "current_full_reconcile",
     }
-    current_full = any_true("current_full_reconcile") or bool(
-        modes.intersection({"current_full", "current_full_reconcile"})
-    )
-    target_commit = first_text("reconciled_commit_sha", "target_commit_sha")
-    canonical_head = first_text("canonical_head_commit", "head_commit")
-    merged_head = first_text("merged_head_commit", "merge_commit")
-    active_graph_commit = first_text("active_graph_commit")
-    snapshot_id = first_text("active_snapshot_id", "snapshot_id")
+    target_commit = str(
+        authority.get("reconciled_commit_sha")
+        or authority.get("target_commit_sha")
+        or ""
+    ).strip().lower()
+    canonical_head = str(
+        authority.get("canonical_head_commit")
+        or authority.get("head_commit")
+        or ""
+    ).strip().lower()
+    merged_head = str(
+        authority.get("merged_commit_sha")
+        or authority.get("merged_head_commit")
+        or authority.get("merge_commit")
+        or ""
+    ).strip().lower()
+    active_graph_commit = str(
+        authority.get("active_snapshot_commit")
+        or authority.get("active_graph_commit")
+        or ""
+    ).strip().lower()
+    snapshot_id = str(
+        authority.get("active_snapshot_id") or authority.get("snapshot_id") or ""
+    ).strip()
 
     def full_commit(value: str) -> bool:
         return len(value) in {40, 64} and all(
             char in "0123456789abcdef" for char in value
         )
 
+    if isinstance(explicit_authority, Mapping) and not (
+        str(authority.get("source") or "").strip()
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and authority.get("db_verified") is True
+        and authority.get("live_verified") is True
+    ):
+        return False
     commits = (target_commit, canonical_head, merged_head, active_graph_commit)
     return bool(
         current_full
         and snapshot_id
-        and any_true("graph_reconciled")
-        and any_true("canonical_head_verified")
-        and any_true("active_snapshot_verified")
+        and authority.get("graph_reconciled") is True
+        and authority.get("canonical_head_verified") is True
+        and authority.get("active_snapshot_verified") is True
         and all(full_commit(value) for value in commits)
         and len(set(commits)) == 1
     )

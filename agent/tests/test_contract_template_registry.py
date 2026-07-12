@@ -188,6 +188,28 @@ def test_mf_parallel_template_is_discoverable_by_runtime_filters():
     ] == "mf_parallel.v1"
     v2 = resolve_contract_template(template_id="mf_parallel.v2", task_type="mf_parallel")
     assert v2["template_id"] == "mf_parallel.v2"
+
+
+def test_qa_template_policies_are_non_authoritative_definition_mirrors():
+    parallel = get_contract_template("mf_parallel.v2")
+    v2 = parallel
+    qa_policy = parallel["qa_graph_context_policy"]
+    direct_fix = get_contract_template("direct_fix.v1")
+    qa_checkpoint = next(
+        item
+        for item in direct_fix["runtime_contract_hints"]["graph_query_checkpoints"]
+        if item["id"] == "qa_graph_context"
+    )
+
+    assert qa_policy["non_authoritative_template_mirror"] is True
+    assert qa_policy["caller_authority_fields_trusted"] is False
+    assert qa_policy["authority"].endswith("bounded_qa_review_policy")
+    assert qa_policy["post_merge_graph_policy"]["authority"].endswith(
+        "current_full_reconcile_evidence_policy"
+    )
+    graph_basis_policy = qa_checkpoint["packet"]["graph_basis_policy"]
+    assert graph_basis_policy["non_authoritative_template_mirror"] is True
+    assert graph_basis_policy["authority"].endswith("bounded_qa_review_policy")
     qa_graph = {
         item["id"]: item for item in v2["evidence_requirements"]
     }["qa_graph_trace_evidence"]

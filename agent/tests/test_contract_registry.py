@@ -224,6 +224,193 @@ def test_default_registry_migrated_definitions_expose_explicit_system_layer():
     ]
 
 
+def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven():
+    registry = ContractDefinitionRegistry()
+    direct_rev1 = registry.get("direct_fix", version="v1", revision="rev1")
+    direct_rev2 = registry.get("direct_fix", version="v1", revision="rev2")
+    parallel_rev1 = registry.get("mf_parallel.v2", version="v2", revision="rev1")
+    parallel_rev2 = registry.get("mf_parallel.v2", version="v2", revision="rev2")
+
+    assert registry.get("direct_fix", version="v1")["revision"] == "rev2"
+    assert registry.get("mf_parallel.v2", version="v2")["revision"] == "rev2"
+    assert direct_rev1["definition_hash"] == (
+        "sha256:aada5b4fd59b49bdfda85c17839194432e4b4d690d78bfe6a35cff138c96a383"
+    )
+    assert parallel_rev1["definition_hash"] == (
+        "sha256:0fd69197a4e62a6f600e5f746b78b5a57c2519c9b89fc015c0b6bdd0905a9c32"
+    )
+    assert direct_rev1["definition_hash"] != direct_rev2["definition_hash"]
+    assert parallel_rev1["definition_hash"] != parallel_rev2["definition_hash"]
+    assert direct_rev2["metadata"]["previous_revision"] == "direct_fix.v1.rev1"
+    assert parallel_rev2["metadata"]["previous_revision"] == "mf_parallel.v2.rev1"
+
+    direct_rev1_graph_policy = direct_rev1["system_layer"]["graph_binding_policy"]
+    direct_rev2_graph_policy = direct_rev2["system_layer"]["graph_binding_policy"]
+    parallel_rev1_graph_policy = parallel_rev1["system_layer"]["graph_binding_policy"]
+    parallel_rev2_graph_policy = parallel_rev2["system_layer"]["graph_binding_policy"]
+    assert "bounded_qa_review_policy" not in direct_rev1_graph_policy
+    assert direct_rev2_graph_policy["bounded_qa_review_policy"]["enabled"] is True
+    assert "current_full_reconcile_evidence_policy" not in parallel_rev1_graph_policy
+    assert parallel_rev2_graph_policy[
+        "current_full_reconcile_evidence_policy"
+    ]["enabled"] is True
+
+    def state_and_write(definition, *, stage_id, line_id, actor_role, evidence_kind):
+        state = build_execution_state(
+            definition,
+            project_id="aming-claw",
+            backlog_id="AC-REVISION-BOUNDARY",
+            contract_execution_id="cex-revision-boundary",
+            actor_role=actor_role,
+            instruction_bundle_hash="sha256:instruction-boundary",
+        )
+        write = {
+            "project_id": state["project_id"],
+            "backlog_id": state["backlog_id"],
+            "contract_execution_id": state["contract_execution_id"],
+            "definition_hash": state["definition_hash"],
+            "instruction_bundle_hash": state["instruction_bundle_hash"],
+            "execution_state_revision": state["execution_state_revision"],
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+        }
+        return state, write
+
+    rev1_state, rev1_qa_write = state_and_write(
+        direct_rev1,
+        stage_id="qa_graph_context",
+        line_id="direct_fix_qa_graph_context",
+        actor_role="qa",
+        evidence_kind="graph_trace",
+    )
+    rev1_qa_write["payload"] = {
+        "graph_trace_ids": ["gqt-revision-boundary"],
+        "graph_trace_evidence": {
+            "db_verified": True,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "target_project_root": "/tmp/revision-boundary",
+        },
+    }
+    rev1_qa_write["graph_trace_ids"] = ["gqt-revision-boundary"]
+    rev2_state, rev2_qa_write = state_and_write(
+        direct_rev2,
+        stage_id="qa_graph_context",
+        line_id="direct_fix_qa_graph_context",
+        actor_role="qa",
+        evidence_kind="graph_trace",
+    )
+    rev2_qa_write["payload"] = dict(rev1_qa_write["payload"])
+    rev2_qa_write["graph_trace_ids"] = ["gqt-revision-boundary"]
+    assert validate_contract_write(
+        direct_rev1,
+        rev1_state,
+        rev1_qa_write,
+        require_next_action=False,
+    ).ok is True
+    assert validate_contract_write(
+        direct_rev2,
+        rev2_state,
+        rev2_qa_write,
+        require_next_action=False,
+    ).ok is False
+
+    for graph_basis in (
+        "exact_candidate_snapshot",
+        "canonical_base_plus_candidate_diff",
+    ):
+        complete_write = dict(rev2_qa_write)
+        authority = {
+            "source": "graph_query_traces",
+            "db_verified": True,
+            "trace_ids": ["gqt-revision-boundary"],
+            "verified_trace_ids": ["gqt-revision-boundary"],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "project_id": "aming-claw",
+            "backlog_id": "AC-REVISION-BOUNDARY",
+            "task_id": "worker-revision-boundary",
+            "qa_session_id": "ses-revision-boundary",
+            "qa_principal": "qa-revision-boundary",
+            "target_project_root": "/tmp/revision-boundary",
+            "graph_basis": graph_basis,
+            "canonical_base_snapshot_id": "full-revision-boundary",
+            "base_commit_sha": "a" * 40,
+            "candidate_commit_sha": (
+                "a" * 40
+                if graph_basis == "exact_candidate_snapshot"
+                else "b" * 40
+            ),
+            "changed_files": (
+                []
+                if graph_basis == "exact_candidate_snapshot"
+                else ["agent/governance/server.py"]
+            ),
+            "candidate_diff_hash": (
+                "sha256:e3b0c44298fc1c149afbf4c8996fb924"
+                "27ae41e4649b934ca495991b7852b855"
+                if graph_basis == "exact_candidate_snapshot"
+                else "sha256:" + "1" * 64
+            ),
+            "changed_files_source": (
+                "server_exact_candidate_snapshot"
+                if graph_basis == "exact_candidate_snapshot"
+                else "server_candidate_diff"
+            ),
+        }
+        if graph_basis == "canonical_base_plus_candidate_diff":
+            authority.update(
+                {
+                    "candidate_overlay_hash": "sha256:" + "2" * 64,
+                    "root_identity_hash": "sha256:" + "3" * 64,
+                    "query_root_identity_hash": "sha256:" + "4" * 64,
+                    "canonical_project_identity_hash": "sha256:" + "5" * 64,
+                    "repository_identity_hash": "sha256:" + "6" * 64,
+                }
+            )
+        complete_write["payload"] = {
+            "graph_trace_ids": ["gqt-revision-boundary"],
+            "graph_trace_evidence": authority,
+        }
+        assert validate_contract_write(
+            direct_rev2,
+            rev2_state,
+            complete_write,
+            require_next_action=False,
+        ).ok is True
+
+    rev1_state, rev1_reconcile = state_and_write(
+        parallel_rev1,
+        stage_id="observer_integration",
+        line_id="observer_reconcile",
+        actor_role="observer",
+        evidence_kind="reconcile",
+    )
+    rev2_state, rev2_reconcile = state_and_write(
+        parallel_rev2,
+        stage_id="observer_integration",
+        line_id="observer_reconcile",
+        actor_role="observer",
+        evidence_kind="reconcile",
+    )
+    assert validate_contract_write(
+        parallel_rev1,
+        rev1_state,
+        rev1_reconcile,
+        require_next_action=False,
+    ).ok is True
+    assert validate_contract_write(
+        parallel_rev2,
+        rev2_state,
+        rev2_reconcile,
+        require_next_action=False,
+    ).ok is False
+
+
 def test_registry_rejects_non_object_system_layer(tmp_path):
     with pytest.raises(ContractDefinitionError, match="system_layer must be an object"):
         ContractDefinitionRegistry(tmp_path).validate_payload(
