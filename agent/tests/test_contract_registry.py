@@ -250,10 +250,17 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     parallel_rev2_graph_policy = parallel_rev2["system_layer"]["graph_binding_policy"]
     assert "bounded_qa_review_policy" not in direct_rev1_graph_policy
     assert direct_rev2_graph_policy["bounded_qa_review_policy"]["enabled"] is True
+    assert "candidate_commit_evidence_policy" not in direct_rev1_graph_policy
+    assert direct_rev2_graph_policy["candidate_commit_evidence_policy"][
+        "line_ids"
+    ] == ["direct_fix_candidate_repair"]
     assert "current_full_reconcile_evidence_policy" not in parallel_rev1_graph_policy
     assert parallel_rev2_graph_policy[
         "current_full_reconcile_evidence_policy"
     ]["enabled"] is True
+    assert parallel_rev2_graph_policy["candidate_commit_evidence_policy"][
+        "line_ids"
+    ] == ["worker_commit"]
 
     def state_and_write(definition, *, stage_id, line_id, actor_role, evidence_kind):
         state = build_execution_state(
@@ -277,6 +284,47 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
             "evidence_kind": evidence_kind,
         }
         return state, write
+
+    rev1_candidate_state, rev1_candidate_write = state_and_write(
+        direct_rev1,
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        actor_role="mf_sub",
+        evidence_kind="direct_fix_repair_evidence",
+    )
+    rev2_candidate_state, rev2_candidate_write = state_and_write(
+        direct_rev2,
+        stage_id="candidate_repair",
+        line_id="direct_fix_candidate_repair",
+        actor_role="mf_sub",
+        evidence_kind="direct_fix_repair_evidence",
+    )
+    assert validate_contract_write(
+        direct_rev1,
+        rev1_candidate_state,
+        rev1_candidate_write,
+        require_next_action=False,
+    ).ok is True
+    assert validate_contract_write(
+        direct_rev2,
+        rev2_candidate_state,
+        rev2_candidate_write,
+        require_next_action=False,
+    ).ok is False
+    rev2_candidate_write["payload"] = {"candidate_commit_sha": "a" * 40}
+    assert validate_contract_write(
+        direct_rev2,
+        rev2_candidate_state,
+        rev2_candidate_write,
+        require_next_action=False,
+    ).ok is False
+    rev2_candidate_write["commit_sha"] = "a" * 40
+    assert validate_contract_write(
+        direct_rev2,
+        rev2_candidate_state,
+        rev2_candidate_write,
+        require_next_action=False,
+    ).ok is True
 
     rev1_state, rev1_qa_write = state_and_write(
         direct_rev1,
@@ -361,15 +409,15 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
                 if graph_basis == "exact_candidate_snapshot"
                 else "server_candidate_diff"
             ),
+            "root_identity_hash": "sha256:" + "3" * 64,
+            "query_root_identity_hash": "sha256:" + "4" * 64,
+            "canonical_project_identity_hash": "sha256:" + "5" * 64,
+            "repository_identity_hash": "sha256:" + "6" * 64,
         }
         if graph_basis == "canonical_base_plus_candidate_diff":
             authority.update(
                 {
                     "candidate_overlay_hash": "sha256:" + "2" * 64,
-                    "root_identity_hash": "sha256:" + "3" * 64,
-                    "query_root_identity_hash": "sha256:" + "4" * 64,
-                    "canonical_project_identity_hash": "sha256:" + "5" * 64,
-                    "repository_identity_hash": "sha256:" + "6" * 64,
                 }
             )
         complete_write["payload"] = {

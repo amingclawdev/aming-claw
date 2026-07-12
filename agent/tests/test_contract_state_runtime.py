@@ -46,6 +46,10 @@ def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
         "canonical_base_snapshot_id": "full-base",
         "base_commit_sha": "a" * 40,
         "changed_files_source": "server_exact_candidate_snapshot",
+        "root_identity_hash": "sha256:" + "e" * 64,
+        "query_root_identity_hash": "sha256:" + "f" * 64,
+        "canonical_project_identity_hash": "sha256:" + "1" * 64,
+        "repository_identity_hash": "sha256:" + "2" * 64,
     }
     if not base_diff:
         evidence.update(
@@ -72,6 +76,27 @@ def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
         }
     )
     return evidence
+
+
+def _strict_mf_parallel_contract() -> dict:
+    return {
+        "contract": {
+            "contract_id": "mf_parallel.v2",
+            "contract_template_id": "mf_parallel.v2",
+            "contract_revision_id": "rev-mf-v2-strict",
+            "state": "bound",
+            "server_derived_evidence_policies": {
+                "bounded_qa_review_policy": {
+                    "enabled": True,
+                    "line_ids": ["qa_graph_context"],
+                },
+                "current_full_reconcile_evidence_policy": {
+                    "enabled": True,
+                    "line_ids": ["observer_reconcile"],
+                },
+            },
+        }
+    }
 
 
 def test_projection_keeps_generated_demo_requirements_conditional():
@@ -1593,7 +1618,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
-    assert qa["next_legal_action"]["id"] == "qa_graph_context"
+    assert qa["next_legal_action"]["id"] == "qa_independent_verification"
 
     bounded_qa = build_contract_state_projection(
         [
@@ -1613,7 +1638,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
                 payload={"graph_trace_evidence": _bounded_qa_graph_evidence()},
             ),
         ],
-        contract=contract,
+        contract=_strict_mf_parallel_contract(),
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
     )
     assert bounded_qa["next_legal_action"]["id"] == "qa_independent_verification"
@@ -1621,14 +1646,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
 
 
 def test_bounded_qa_graph_context_requires_complete_candidate_review_tuple():
-    contract = {
-        "contract": {
-            "contract_id": "mf_parallel.v2",
-            "contract_template_id": "mf_parallel.v2",
-            "contract_revision_id": "rev-mf-v2-bounded-qa-context",
-            "state": "bound",
-        }
-    }
+    contract = _strict_mf_parallel_contract()
     prefix = [
         _event(1, "contract_binding"),
         _event(2, "dispatch_bounded_worker"),
@@ -1702,6 +1720,27 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
     ) is False
 
     commit_sha = "c" * 40
+    marker = {
+        "schema_version": "current_full_reconcile.provenance.v2",
+        "protected_action": "graph_current_full_reconcile",
+        "protected_entrypoint": (
+            "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        ),
+        "provenance_id": "cfrp-contract-state",
+        "provenance_hash": "sha256:" + "9" * 64,
+        "request_id": "req-contract-state",
+        "request_started_at": "2026-07-11T01:00:30Z",
+        "marker_created_at": "2026-07-11T01:01:01Z",
+        "target_commit_sha": commit_sha,
+        "snapshot_id": "full-coherent-reconcile",
+        "reconcile_event_id": 12,
+        "reconcile_event_created_at": "2026-07-11T01:01:00Z",
+        "route_evidence": {
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+    }
     reconcile_authority = {
         "source": "graph_snapshot_store.current_full_reconcile_state",
         "db_verified": True,
@@ -1716,6 +1755,26 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
         "graph_reconciled": True,
         "canonical_head_verified": True,
         "active_snapshot_verified": True,
+        "provenance_verified": True,
+        "durable_order_verified": True,
+        "merge_event_id": 11,
+        "merge_event_created_at": "2026-07-11T01:00:00Z",
+        "reconcile_event_id": 12,
+        "reconcile_event_created_at": "2026-07-11T01:01:00Z",
+        "current_full_reconcile_marker": marker,
+        "current_full_reconcile_provenance": {
+            "provenance_id": marker["provenance_id"],
+            "provenance_hash": marker["provenance_hash"],
+            "protected_action": marker["protected_action"],
+            "protected_entrypoint": marker["protected_entrypoint"],
+            "request_id": marker["request_id"],
+            "request_started_at": marker["request_started_at"],
+            "marker_created_at": marker["marker_created_at"],
+            "reconcile_event_id": marker["reconcile_event_id"],
+            "reconcile_event_created_at": marker[
+                "reconcile_event_created_at"
+            ],
+        },
     }
     assert _current_full_reconcile_satisfies_requirement(
         {"payload": {"reconcile_authority": reconcile_authority}}

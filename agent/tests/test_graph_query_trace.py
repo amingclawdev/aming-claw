@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 
@@ -921,6 +922,55 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
             tool="query_schema",
             project_root=project_root,
         )
+
+
+def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    candidate_commit = "a" * 40
+    empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
+    common = {
+        "actor": "qa:exact",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "commit_sha": candidate_commit,
+        "graph_basis": "exact_candidate_snapshot",
+        "canonical_base_snapshot_id": snapshot_id,
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "changed_files": [],
+        "candidate_diff_hash": empty_diff_hash,
+        "changed_files_source": "server_exact_candidate_snapshot",
+    }
+    with pytest.raises(ValueError, match="requires root fields"):
+        graph_query_trace.start_trace(conn, PID, snapshot_id, **common)
+
+    root_identity = {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "query_root": str(project_root),
+        "query_root_head_commit": candidate_commit,
+        "query_root_identity_hash": "sha256:" + "1" * 64,
+        "canonical_project_root": str(project_root),
+        "canonical_head_commit": candidate_commit,
+        "canonical_project_identity_hash": "sha256:" + "2" * 64,
+        "repository_identity_hash": "sha256:" + "3" * 64,
+        "repository_identity_match": True,
+    }
+    trace = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        root_identity=root_identity,
+        root_identity_hash=stable_sha256(root_identity),
+        query_root_identity_hash=root_identity["query_root_identity_hash"],
+        canonical_project_identity_hash=root_identity[
+            "canonical_project_identity_hash"
+        ],
+        repository_identity_hash=root_identity["repository_identity_hash"],
+        **common,
+    )["trace"]
+    assert trace["root_identity"] == root_identity
+    assert trace["candidate_overlay"] == {}
+    assert trace["candidate_overlay_hash"] == ""
 
 
 def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):

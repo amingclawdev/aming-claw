@@ -2347,6 +2347,7 @@ def _requirement_steps(
             semantic_default_order=raw_from_default,
         )
         if step:
+            step = _attach_server_derived_evidence_policies(step, root)
             required.append(step)
 
     conditional_groups: list[dict[str, Any]] = []
@@ -2368,6 +2369,7 @@ def _requirement_steps(
                     conditional=True,
                 )
                 if step:
+                    step = _attach_server_derived_evidence_policies(step, root)
                     steps.append(step)
             active = _condition_matches(condition, root=root, backlog_row=backlog_row)
             conditional_groups.append(
@@ -2381,6 +2383,29 @@ def _requirement_steps(
             if active:
                 required.extend(steps)
     return required, conditional_groups
+
+
+def _attach_server_derived_evidence_policies(
+    requirement: Mapping[str, Any],
+    root: Mapping[str, Any],
+) -> dict[str, Any]:
+    step = dict(requirement)
+    requirement_id = str(step.get("id") or "").strip()
+    policies = root.get("server_derived_evidence_policies")
+    if not isinstance(policies, Mapping):
+        return step
+    applicable: dict[str, Any] = {}
+    for policy_name, raw_policy in policies.items():
+        if not isinstance(raw_policy, Mapping) or raw_policy.get("enabled") is not True:
+            continue
+        line_ids = {
+            str(item or "").strip() for item in raw_policy.get("line_ids") or []
+        }
+        if requirement_id in line_ids:
+            applicable[str(policy_name)] = dict(raw_policy)
+    if applicable:
+        step["server_derived_evidence_policies"] = applicable
+    return step
 
 
 def _contract_is_mf_parallel(contract_id: str, template_id: str) -> bool:
@@ -2563,6 +2588,15 @@ def _bounded_qa_graph_context_satisfies_requirement(
             base_commit_sha == candidate_commit_sha
             and not changed_files
             and diff_hash == empty_diff_hash
+            and all(
+                sha256(evidence.get(field))
+                for field in (
+                    "root_identity_hash",
+                    "query_root_identity_hash",
+                    "canonical_project_identity_hash",
+                    "repository_identity_hash",
+                )
+            )
         )
     return bool(
         base_commit_sha != candidate_commit_sha
@@ -2896,6 +2930,27 @@ def _requirement_requires_event_kind_match(requirement: Mapping[str, Any]) -> bo
     return bool(accepted_kinds.intersection(_DIRECT_TIMELINE_APPEND_EVENT_KINDS))
 
 
+def _requirement_uses_strict_evidence_policy(
+    requirement: Mapping[str, Any],
+    policy_name: str,
+) -> bool:
+    for key in (
+        "compiled_evidence_policies",
+        "server_derived_evidence_policies",
+        "strict_evidence_policies",
+    ):
+        value = requirement.get(key)
+        if isinstance(value, Mapping):
+            marker = value.get(policy_name)
+            if marker is True:
+                return True
+            if isinstance(marker, Mapping) and marker.get("enabled") is True:
+                return True
+        elif policy_name in _string_list(value):
+            return True
+    return False
+
+
 def _current_full_reconcile_satisfies_requirement(
     event: Mapping[str, Any],
 ) -> bool:
@@ -2941,11 +2996,89 @@ def _current_full_reconcile_satisfies_requirement(
     snapshot_id = str(
         authority.get("active_snapshot_id") or authority.get("snapshot_id") or ""
     ).strip()
+    marker = authority.get("current_full_reconcile_marker")
+    provenance = authority.get("current_full_reconcile_provenance")
+    try:
+        merge_event_id = int(authority.get("merge_event_id") or 0)
+        reconcile_event_id = int(authority.get("reconcile_event_id") or 0)
+    except (TypeError, ValueError):
+        merge_event_id = 0
+        reconcile_event_id = 0
 
     def full_commit(value: str) -> bool:
         return len(value) in {40, 64} and all(
             char in "0123456789abcdef" for char in value
         )
+
+    def positive_int(value: Any) -> int:
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed > 0 else 0
+
+    def sha256(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        return len(text) == 71 and text.startswith("sha256:") and all(
+            char in "0123456789abcdef" for char in text[7:]
+        )
+
+    merge_event_created_at = str(
+        authority.get("merge_event_created_at") or ""
+    ).strip()
+    reconcile_event_created_at = str(
+        authority.get("reconcile_event_created_at") or ""
+    ).strip()
+    protected_entrypoint = (
+        "POST /api/graph-governance/{project_id}/reconcile/current-full"
+    )
+    route_evidence = (
+        marker.get("route_evidence") if isinstance(marker, Mapping) else None
+    )
+    marker_verified = bool(
+        isinstance(marker, Mapping)
+        and isinstance(provenance, Mapping)
+        and str(marker.get("schema_version") or "").strip()
+        == "current_full_reconcile.provenance.v2"
+        and str(marker.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(marker.get("protected_entrypoint") or "").strip()
+        == protected_entrypoint
+        and str(provenance.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(provenance.get("protected_entrypoint") or "").strip()
+        == protected_entrypoint
+        and bool(str(marker.get("request_id") or "").strip())
+        and bool(str(marker.get("request_started_at") or "").strip())
+        and bool(str(marker.get("marker_created_at") or "").strip())
+        and str(marker.get("request_id") or "").strip()
+        == str(provenance.get("request_id") or "").strip()
+        and str(marker.get("request_started_at") or "").strip()
+        == str(provenance.get("request_started_at") or "").strip()
+        and str(marker.get("marker_created_at") or "").strip()
+        == str(provenance.get("marker_created_at") or "").strip()
+        and str(marker.get("provenance_id") or "").strip()
+        == str(provenance.get("provenance_id") or "").strip()
+        and sha256(marker.get("provenance_hash"))
+        and str(marker.get("provenance_hash") or "").strip()
+        == str(provenance.get("provenance_hash") or "").strip()
+        and str(marker.get("target_commit_sha") or "").strip().lower()
+        == merged_head
+        and str(marker.get("snapshot_id") or "").strip() == snapshot_id
+        and positive_int(marker.get("reconcile_event_id")) == reconcile_event_id
+        and positive_int(provenance.get("reconcile_event_id"))
+        == reconcile_event_id
+        and str(marker.get("reconcile_event_created_at") or "").strip()
+        == reconcile_event_created_at
+        and str(provenance.get("reconcile_event_created_at") or "").strip()
+        == reconcile_event_created_at
+        and isinstance(route_evidence, Mapping)
+        and route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and route_evidence.get("raw_route_token_persisted") is False
+        and route_evidence.get("protected_action")
+        == "graph_current_full_reconcile"
+    )
 
     if isinstance(explicit_authority, Mapping) and not (
         str(authority.get("source") or "").strip()
@@ -2961,6 +3094,13 @@ def _current_full_reconcile_satisfies_requirement(
         and authority.get("graph_reconciled") is True
         and authority.get("canonical_head_verified") is True
         and authority.get("active_snapshot_verified") is True
+        and authority.get("provenance_verified") is True
+        and authority.get("durable_order_verified") is True
+        and merge_event_id > 0
+        and reconcile_event_id > merge_event_id
+        and merge_event_created_at
+        and reconcile_event_created_at
+        and marker_verified
         and all(full_commit(value) for value in commits)
         and len(set(commits)) == 1
     )
@@ -3008,12 +3148,18 @@ def _event_satisfies_requirement(
     ):
         return False, None
     if (
-        requirement_id == "qa_graph_context"
+        _requirement_uses_strict_evidence_policy(
+            requirement,
+            "bounded_qa_review_policy",
+        )
         and not _bounded_qa_graph_context_satisfies_requirement(event)
     ):
         return False, None
     if (
-        requirement_id == "observer_reconcile"
+        _requirement_uses_strict_evidence_policy(
+            requirement,
+            "current_full_reconcile_evidence_policy",
+        )
         and not _current_full_reconcile_satisfies_requirement(event)
     ):
         return False, None

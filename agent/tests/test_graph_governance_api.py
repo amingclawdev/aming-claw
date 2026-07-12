@@ -868,6 +868,7 @@ def _direct_fix_graph_trace_payload(
     runtime_context_id: str = "",
     task_id: str = "",
     parent_task_id: str = "",
+    candidate_commit_sha: str = "",
 ) -> dict:
     query_source = {
         "observer": "observer",
@@ -889,7 +890,9 @@ def _direct_fix_graph_trace_payload(
         "target_project_root": target_project_root,
     }
     if actor_role == "qa":
-        candidate_commit = hashlib.sha1(trace_id.encode("utf-8")).hexdigest()
+        candidate_commit = candidate_commit_sha or hashlib.sha1(
+            trace_id.encode("utf-8")
+        ).hexdigest()
         evidence.update(
             {
                 "source": "graph_query_traces",
@@ -910,6 +913,16 @@ def _direct_fix_graph_trace_payload(
                     "sha256:" + hashlib.sha256(b"").hexdigest()
                 ),
                 "changed_files_source": "server_exact_candidate_snapshot",
+                "root_identity_hash": _fake_sha(f"{trace_id}:root"),
+                "query_root_identity_hash": _fake_sha(
+                    f"{trace_id}:query-root"
+                ),
+                "canonical_project_identity_hash": _fake_sha(
+                    f"{trace_id}:canonical-root"
+                ),
+                "repository_identity_hash": _fake_sha(
+                    f"{trace_id}:repository"
+                ),
             }
         )
     if actor_role == "mf_sub":
@@ -1006,13 +1019,14 @@ def _submit_direct_fix_qa_graph_context(
     backlog_id: str,
     task_id: str,
     target_project_root: str,
+    candidate_commit_sha: str,
 ):
     trace_id = f"gqt-qa-{contract_execution_id}"
     _insert_exact_qa_graph_query_trace(
         conn,
         trace_id=trace_id,
         snapshot_id=f"full-{trace_id}",
-        candidate_commit_sha="a" * 40,
+        candidate_commit_sha=candidate_commit_sha,
         backlog_id=backlog_id,
         task_id=task_id,
         target_project_root=target_project_root,
@@ -1184,22 +1198,49 @@ def _insert_exact_qa_graph_query_trace(
     backlog_id: str,
     task_id: str,
     target_project_root: str,
+    canonical_project_root: str = "",
     actor: str = "qa-principal",
     qa_session_id: str = "ses-qa",
     query_purpose: str = "independent_verification",
     created_at: str = "2026-07-04T10:00:00Z",
 ) -> dict[str, Any]:
     _activate_basic_graph(conn, snapshot_id, commit_sha=candidate_commit_sha)
-    _insert_observer_graph_query_trace(
-        conn,
-        trace_id=trace_id,
-        snapshot_id=snapshot_id,
-        actor=actor,
-        query_source="qa",
-        query_purpose=query_purpose,
-        task_id=task_id,
-        created_at=created_at,
-    )
+    query_root = Path(target_project_root).resolve()
+    canonical_root = Path(canonical_project_root or query_root).resolve()
+    if (query_root / ".git").exists():
+        root_context = server._qa_exact_candidate_context(
+            query_root,
+            project_id=PID,
+            canonical_project_root=canonical_root,
+            candidate_commit_sha=candidate_commit_sha,
+        )
+    else:
+        repository_identity_hash = _fake_sha(
+            f"exact-repository:{query_root}"
+        )
+        query_root_identity_hash = _fake_sha(f"exact-query-root:{query_root}")
+        canonical_project_identity_hash = _fake_sha(
+            f"exact-canonical-root:{query_root}"
+        )
+        root_identity = {
+            "schema_version": "qa_review_graph.root_identity.v1",
+            "query_root": str(query_root),
+            "query_root_head_commit": candidate_commit_sha,
+            "query_root_identity_hash": query_root_identity_hash,
+            "query_root_is_linked_worktree": False,
+            "canonical_project_root": str(query_root),
+            "canonical_head_commit": candidate_commit_sha,
+            "canonical_project_identity_hash": canonical_project_identity_hash,
+            "repository_identity_hash": repository_identity_hash,
+            "repository_identity_match": True,
+        }
+        root_context = {
+            "root_identity": root_identity,
+            "root_identity_hash": server.stable_sha256(root_identity),
+            "query_root_identity_hash": query_root_identity_hash,
+            "canonical_project_identity_hash": canonical_project_identity_hash,
+            "repository_identity_hash": repository_identity_hash,
+        }
     empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
     qa_scope_binding_ref = server._qa_scope_binding_ref(
         project_id=PID,
@@ -1207,39 +1248,42 @@ def _insert_exact_qa_graph_query_trace(
         task_id=task_id,
         commit_sha=candidate_commit_sha,
     )
-    conn.execute(
-        """
-        UPDATE graph_query_traces
-        SET backlog_id = ?, commit_sha = ?, qa_session_id = ?,
-            qa_scope_binding_ref = ?, graph_basis = ?,
-            canonical_base_snapshot_id = ?, base_commit_sha = ?,
-            candidate_commit_sha = ?, changed_files_json = ?,
-            candidate_diff_hash = ?, changed_files_source = ?,
-            root_identity_json = ?
-        WHERE project_id = ? AND trace_id = ?
-        """,
-        (
-            backlog_id,
-            candidate_commit_sha,
-            qa_session_id,
-            qa_scope_binding_ref,
-            "exact_candidate_snapshot",
-            snapshot_id,
-            candidate_commit_sha,
-            candidate_commit_sha,
-            "[]",
-            empty_diff_hash,
-            "server_exact_candidate_snapshot",
-            json.dumps(
-                {
-                    "query_root": target_project_root,
-                    "canonical_project_root": target_project_root,
-                }
-            ),
-            PID,
-            trace_id,
-        ),
+    graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        trace_id=trace_id,
+        actor=actor,
+        query_source="qa",
+        query_purpose=query_purpose,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=candidate_commit_sha,
+        graph_basis="exact_candidate_snapshot",
+        canonical_base_snapshot_id=snapshot_id,
+        base_commit_sha=candidate_commit_sha,
+        candidate_commit_sha=candidate_commit_sha,
+        changed_files=[],
+        candidate_diff_hash=empty_diff_hash,
+        changed_files_source="server_exact_candidate_snapshot",
+        root_identity=root_context["root_identity"],
+        root_identity_hash=root_context["root_identity_hash"],
+        query_root_identity_hash=root_context["query_root_identity_hash"],
+        canonical_project_identity_hash=root_context[
+            "canonical_project_identity_hash"
+        ],
+        repository_identity_hash=root_context["repository_identity_hash"],
+        qa_session_id=qa_session_id,
+        qa_scope_binding_ref=qa_scope_binding_ref,
     )
+    graph_query_trace.finish_trace(conn, PID, trace_id)
+    if created_at:
+        conn.execute(
+            "UPDATE graph_query_traces SET created_at = ?, updated_at = ? "
+            "WHERE project_id = ? AND trace_id = ?",
+            (created_at, created_at, PID, trace_id),
+        )
+    conn.commit()
     return {
         "schema_version": "qa_graph_trace_db_evidence.v1",
         "source": "graph_query_traces",
@@ -1268,6 +1312,15 @@ def _insert_exact_qa_graph_query_trace(
         "changed_files": [],
         "candidate_diff_hash": empty_diff_hash,
         "changed_files_source": "server_exact_candidate_snapshot",
+        **{
+            key: root_context[key]
+            for key in (
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+                "repository_identity_hash",
+            )
+        },
     }
 
 
@@ -1470,6 +1523,33 @@ def _git_repo(tmp_path):
     return create_parallel_fixture_project(tmp_path).root
 
 
+def _init_test_git_repo(root: Path, *, filename: str = "candidate.txt") -> str:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=root,
+        check=True,
+    )
+    (root / filename).write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", filename], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "candidate"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return batch_jobs.git_commit(root)
+
+
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
@@ -1627,6 +1707,250 @@ def _stub_current_full_reconcile(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: None,
     )
     return head, calls
+
+
+def test_lower_full_reconcile_strips_reserved_current_full_marker(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+
+    def fake_reconcile(_conn, project_id, root, **kwargs):
+        calls.append({"project_id": project_id, "root": root, **kwargs})
+        return {"ok": True, "snapshot_id": "full-lower-route"}
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    status, _result = server.handle_graph_governance_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "notes_extra": {
+                    "caller_note": "preserved",
+                    "current_full_reconcile": {
+                        "normal_update_path": True,
+                        "activate": True,
+                        "target_commit_sha": "a" * 40,
+                    },
+                }
+            },
+        )
+    )
+    assert status == 201
+    assert calls[0]["notes_extra"] == {"caller_note": "preserved"}
+
+
+def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
+    commit_sha = "c" * 40
+    snapshot_id = "full-notes-only-current-full"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    conn.execute(
+        "UPDATE graph_snapshots SET notes = ? "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (
+            json.dumps(
+                {
+                    "current_full_reconcile": {
+                        "schema_version": "current_full_reconcile.provenance.v2",
+                        "source": "graph_governance_api",
+                        "protected_action": "graph_current_full_reconcile",
+                        "protected_entrypoint": (
+                            "POST /api/graph-governance/{project_id}/"
+                            "reconcile/current-full"
+                        ),
+                        "provenance_id": "cfrp-incomplete",
+                        "provenance_hash": "sha256:" + "1" * 64,
+                        "target_commit_sha": commit_sha,
+                        "snapshot_id": snapshot_id,
+                        "normal_update_path": True,
+                        "activate": True,
+                    }
+                },
+                sort_keys=True,
+            ),
+            PID,
+            snapshot_id,
+        ),
+    )
+    notes_only = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        merge_event_id=1,
+        merge_event_created_at="2026-07-11T01:00:00Z",
+        reconcile_event_id=2,
+        reconcile_event_created_at="2026-07-11T01:01:00Z",
+    )
+    assert notes_only["db_verified"] is False
+    assert notes_only["provenance_verified"] is False
+
+    snapshot_id = "full-premerge-current-full"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id="req-premerge-current-full",
+        request_started_at="2026-07-11T00:00:00Z",
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=4,
+        reconcile_event_created_at="2026-07-11T02:01:00Z",
+        marker_created_at="2026-07-11T00:30:00Z",
+    )
+    predating = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        merge_event_id=3,
+        merge_event_created_at="2026-07-11T02:00:00Z",
+        reconcile_event_id=4,
+        reconcile_event_created_at="2026-07-11T02:01:00Z",
+    )
+    assert predating["provenance_verified"] is True
+    assert predating["durable_order_verified"] is False
+    assert predating["db_verified"] is False
+
+
+def test_protected_current_full_reconcile_records_authoritative_provenance(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head = "d" * 40
+    backlog_id = "AC-PROTECTED-CURRENT-FULL-PROVENANCE"
+    task_id = "cex-protected-current-full-provenance"
+    snapshot_id = "full-protected-current-full-provenance"
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="merge.live",
+        event_kind="merge",
+        phase="merge",
+        actor="observer",
+        status="passed",
+        commit_sha=head,
+        payload={"merge_commit": head, "target_head_after_merge": head},
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: head)
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+
+    def fake_reconcile(_conn, project_id, _root, **kwargs):
+        _activate_basic_graph(_conn, snapshot_id, commit_sha=head)
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "projection_id": "semproj-protected-current-full",
+            "snapshot_status": "active",
+            "run_id": kwargs.get("run_id", ""),
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "target_commit_sha": head,
+                "semantic_enrich": False,
+            },
+        )
+    )
+    assert status == 201
+    provenance = result["current_full_reconcile_provenance"]
+    assert provenance["protected_action"] == "graph_current_full_reconcile"
+    assert provenance["protected_entrypoint"].endswith("/reconcile/current-full")
+    assert provenance["request_id"] == "req-test"
+    assert provenance["snapshot_id"] == snapshot_id
+    assert provenance["target_commit_sha"] == head
+    assert provenance["route_evidence"]["raw_route_token_persisted"] is False
+
+    reconcile_event = next(
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        if int(event["id"]) == int(provenance["reconcile_event_id"])
+    )
+    state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        head,
+        merge_event_id=int(merge_event["id"]),
+        merge_event_created_at=str(merge_event["created_at"]),
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
+    )
+    assert state["provenance_verified"] is True
+    assert state["durable_order_verified"] is True
+    assert state["db_verified"] is True
+
+    authority = server._contract_runtime_current_full_reconcile_authority_from_merge(
+        conn,
+        project_id=PID,
+        record={
+            "backlog_id": backlog_id,
+            "contract_execution_id": task_id,
+        },
+        merge={
+            "timeline_verified": True,
+            "merged_commit_sha": head,
+            "merge_source_ref": f"timeline:{merge_event['id']}",
+            "merge_event_id": int(merge_event["id"]),
+            "merge_event_created_at": str(merge_event["created_at"]),
+            "runtime_context_id": "mfrctx-protected-current-full",
+            "task_id": task_id,
+        },
+        reconcile={
+            "timeline_verified": True,
+            "reconcile_source_ref": f"timeline:{reconcile_event['id']}",
+            "reconcile_event_id": int(reconcile_event["id"]),
+            "reconcile_event_created_at": str(reconcile_event["created_at"]),
+        },
+    )
+    assert authority["db_verified"] is True
+    assert authority["live_verified"] is True
+    assert authority["graph_reconciled"] is True
 
 
 def test_current_full_reconcile_accepts_observer_route_token_proof(
@@ -2465,6 +2789,98 @@ def _activate_basic_graph(
     )
     store.activate_graph_snapshot(conn, project_id, snapshot["snapshot_id"])
     conn.commit()
+
+
+def _record_test_current_full_reconcile_authority(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    target_project_root: str,
+    snapshot_id: str,
+    commit_sha: str,
+) -> dict[str, Any]:
+    common_payload = {
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+    }
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="merge.live",
+        event_kind="merge",
+        phase="merge",
+        actor="observer:current-full-fixture",
+        status="passed",
+        commit_sha=commit_sha,
+        payload={**common_payload, "merge_commit": commit_sha},
+    )
+    reconcile_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer:current-full-fixture",
+        status="passed",
+        commit_sha=commit_sha,
+        payload={**common_payload, "reconcile_mode": "current_full"},
+    )
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id=f"req-{contract_execution_id}",
+        request_started_at=str(merge_event["created_at"]),
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
+    )
+    state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        merge_event_id=int(merge_event["id"]),
+        merge_event_created_at=str(merge_event["created_at"]),
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
+    )
+    assert state["db_verified"] is True
+    return {
+        **state,
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": True,
+        "live_verified": True,
+        "canonical_head_verified": True,
+        "active_snapshot_verified": True,
+        "graph_reconciled": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "target_project_root": target_project_root,
+        "merged_commit_sha": commit_sha,
+        "reconciled_commit_sha": commit_sha,
+        "canonical_head_commit": commit_sha,
+        "merge_source_ref": f"timeline:{merge_event['id']}",
+        "merge_projection_verified": True,
+        "reconcile_source_ref": f"timeline:{reconcile_event['id']}",
+    }
 
 
 def _append_authenticated_qa_verification(
@@ -20435,10 +20851,22 @@ def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(con
     assert incomplete_exc.value.code == "observer_graph_query_route_scope_incomplete"
 
 
-def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn):
+def test_bounded_qa_session_can_query_graph_and_append_native_verification(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
     backlog_id = "AC-BOUNDED-QA-VERIFICATION"
     task_id = "bounded-qa-verification-task"
-    commit_sha = "a" * 40
+    project_root = tmp_path / "bounded-qa-exact-candidate"
+    commit_sha = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else project_root
+        ),
+    )
     _activate_basic_graph(
         conn,
         "full-query-bounded-qa",
@@ -20476,6 +20904,7 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
             "backlog_id": backlog_id,
             "task_id": task_id,
             "commit_sha": commit_sha,
+            "project_root": str(project_root),
         },
     )
     qa_ctx._session.update(
@@ -20508,6 +20937,16 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(conn)
     )
     assert trace["graph_query_identity"]["base_commit_sha"] == commit_sha
     assert trace["graph_query_identity"]["candidate_commit_sha"] == commit_sha
+    assert trace["root_identity"]["query_root"] == str(project_root.resolve())
+    assert trace["root_identity"]["query_root_head_commit"] == commit_sha
+    assert trace["root_identity"]["repository_identity_match"] is True
+    for field in (
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
+    ):
+        assert trace["graph_query_identity"][field].startswith("sha256:")
     assert trace["graph_query_identity"]["changed_files"] == []
     assert trace["graph_query_identity"]["candidate_diff_hash"] == (
         "sha256:" + hashlib.sha256(b"").hexdigest()
@@ -20822,6 +21261,82 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
     assert proof["candidate_diff_hash"] == identity["candidate_diff_hash"]
     assert proof["candidate_overlay_hash"] == identity["candidate_overlay_hash"]
     assert proof["repository_identity_hash"] == identity["repository_identity_hash"]
+
+
+def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-QA-TRACE-PINNED-CANDIDATE"
+    task_id = "qa-trace-pinned-candidate-task"
+    project_root = tmp_path / "qa-trace-pinned-candidate"
+    candidate_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else project_root
+        ),
+    )
+    trace_id = "gqt-qa-trace-pinned-candidate"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id="full-qa-trace-pinned-candidate",
+        candidate_commit_sha=candidate_commit,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_project_root=str(project_root),
+    )
+
+    def refs(expected_commit: str) -> dict[str, Any]:
+        return server._runtime_context_service_qa_graph_trace_refs(
+            conn,
+            project_id=PID,
+            explicit_trace_ids=[trace_id],
+            target_project_root=str(project_root),
+            expected_backlog_id=backlog_id,
+            expected_task_id=task_id,
+            expected_candidate_commit_sha=expected_commit,
+            expected_qa_principal="qa-principal",
+            expected_qa_session_id="ses-qa",
+            require_complete_authority=True,
+            strict_bounded_qa=True,
+        )
+
+    missing = refs("")
+    assert missing["db_verified"] is False
+    assert any(
+        item["field"] == "candidate_commit_sha"
+        and "preceding trusted" in item["expected"]
+        for item in missing["identity_mismatches"]
+    )
+
+    unrelated = refs("f" * 40)
+    assert unrelated["db_verified"] is False
+    assert any(
+        item["field"] == "candidate_commit_sha"
+        and item["actual"] == candidate_commit
+        for item in unrelated["identity_mismatches"]
+    )
+
+    matching = refs(candidate_commit)
+    assert matching["db_verified"] is True
+    assert matching["candidate_commit_sha"] == candidate_commit
+
+    conn.execute(
+        "UPDATE graph_query_traces SET root_identity_json = '{}' "
+        "WHERE project_id = ? AND trace_id = ?",
+        (PID, trace_id),
+    )
+    conn.commit()
+    rootless = refs(candidate_commit)
+    assert rootless["db_verified"] is False
+    assert any(
+        item["field"] in {"root_identity", "root_identity_hash"}
+        for item in rootless["identity_mismatches"]
+    )
 
 
 def test_bounded_qa_base_graph_candidate_diff_rejects_forged_tuple(
@@ -21275,6 +21790,108 @@ def test_qa_candidate_overlay_accepts_linked_candidate_worktree(tmp_path):
     assert identity["query_root_head_commit"] == candidate_commit
     assert identity["canonical_head_commit"] == fixture.main_head
     assert identity["repository_identity_match"] is True
+
+
+def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-exact-linked-canonical",
+    )
+    candidate_root = tmp_path / "qa-exact-linked-candidate"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "exact-candidate-linked-root",
+            str(candidate_root),
+            fixture.main_head,
+        ],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (candidate_root / "exact.txt").write_text("exact candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "exact.txt"], cwd=candidate_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "exact linked candidate"],
+        cwd=candidate_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(candidate_root)
+
+    context = server._qa_exact_candidate_context(
+        candidate_root,
+        project_id=PID,
+        canonical_project_root=fixture.root,
+        candidate_commit_sha=candidate_commit,
+    )
+
+    identity = context["root_identity"]
+    assert identity["query_root_is_linked_worktree"] is True
+    assert identity["query_root_head_commit"] == candidate_commit
+    assert identity["canonical_head_commit"] == fixture.main_head
+    assert identity["canonical_head_commit"] != candidate_commit
+    assert identity["repository_identity_match"] is True
+
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: fixture.root,
+    )
+    trace_id = "gqt-exact-linked-candidate-reuse"
+    backlog_id = "AC-EXACT-LINKED-CANDIDATE-REUSE"
+    task_id = "exact-linked-candidate-reuse-task"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id="full-exact-linked-candidate-reuse",
+        candidate_commit_sha=candidate_commit,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_project_root=str(candidate_root),
+        canonical_project_root=str(fixture.root),
+    )
+
+    def trace_refs() -> dict[str, Any]:
+        return server._runtime_context_service_qa_graph_trace_refs(
+            conn,
+            project_id=PID,
+            explicit_trace_ids=[trace_id],
+            target_project_root=str(candidate_root),
+            expected_backlog_id=backlog_id,
+            expected_task_id=task_id,
+            expected_candidate_commit_sha=candidate_commit,
+            expected_qa_principal="qa-principal",
+            expected_qa_session_id="ses-qa",
+            require_complete_authority=True,
+            strict_bounded_qa=True,
+        )
+
+    before_merge = trace_refs()
+    assert before_merge["db_verified"] is True, before_merge[
+        "identity_mismatches"
+    ]
+    subprocess.run(
+        ["git", "merge", "--ff-only", candidate_commit],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert batch_jobs.git_commit(fixture.root) == candidate_commit
+    after_merge = trace_refs()
+    assert after_merge["db_verified"] is True, after_merge[
+        "identity_mismatches"
+    ]
 
 
 def test_qa_candidate_overlay_rejects_wrong_repository_root(tmp_path):
@@ -23600,15 +24217,18 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
 )
 def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_failed_qa(
     conn,
+    monkeypatch,
     tmp_path,
     qa_status,
 ):
     backlog_id = "AC-RUNTIME-TOKEN-REJOIN-CONTRACT-FAILED-QA"
     target_root = tmp_path / "runtime-token-rejoin-contract-failed-qa"
-    target_root.mkdir()
-    worker_head_commit = hashlib.sha1(
-        b"contract-failed-qa-worker-head"
-    ).hexdigest()
+    worker_head_commit = _init_test_git_repo(target_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -30171,34 +30791,20 @@ def _complete_source_backed_mf_parallel_successor(
         if line_id == "observer_reconcile":
             write["payload"] = {
                 **payload,
-                "reconcile_authority": {
-                    "source": (
-                        "graph_snapshot_store.current_full_reconcile_state"
-                    ),
-                    "db_verified": True,
-                    "live_verified": True,
-                    "canonical_head_verified": True,
-                    "active_snapshot_verified": True,
-                    "graph_reconciled": True,
-                    "project_id": PID,
-                    "backlog_id": backlog_id,
-                    "contract_execution_id": contract_execution_id,
-                    "runtime_context_id": runtime_context.runtime_context_id,
-                    "task_id": runtime_context.task_id,
-                    "target_project_root": runtime_context.target_project_root,
-                    "current_full_reconcile": True,
-                    "strategy": "current_full_reconcile",
-                    "active_snapshot_id": current_full_snapshot_id,
-                    "merged_commit_sha": close_commit,
-                    "reconciled_commit_sha": close_commit,
-                    "canonical_head_commit": close_commit,
-                    "active_snapshot_commit": close_commit,
-                    "current_full_reconcile_marker": {
-                        "normal_update_path": True,
-                        "activate": True,
-                        "target_commit_sha": close_commit,
-                    },
-                },
+                "reconcile_authority": (
+                    _record_test_current_full_reconcile_authority(
+                        conn,
+                        backlog_id=backlog_id,
+                        task_id=runtime_context.task_id,
+                        contract_execution_id=contract_execution_id,
+                        runtime_context_id=runtime_context.runtime_context_id,
+                        target_project_root=(
+                            runtime_context.target_project_root
+                        ),
+                        snapshot_id=current_full_snapshot_id,
+                        commit_sha=close_commit,
+                    )
+                ),
             }
         if payload.get("worker_id"):
             write["worker_id"] = payload["worker_id"]
@@ -31132,7 +31738,6 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
 ):
     backlog_id = "AC-BACKLOG-CLOSE-RUNTIME-CONTEXT-PROJECTION"
     close_commit = "aa6275118745006c8324dfcbeecea62c39e91936"
-    worker_commit = "bb5d49fc962bd91e20b540b8f3ca5f06b27c293e"
     task_id = "timeline-gate-runtime-context-projection-parent"
     worker_task_id = "timeline-gate-runtime-context-projection-worker"
     worker_token = "timeline-gate-runtime-context-projection-token"
@@ -31149,7 +31754,14 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     }
     close_route_token_ref = "rtok-runtime-context-close-projection"
     worktree = tmp_path / "runtime-context-close-projection"
-    worktree.mkdir()
+    worker_commit = _init_test_git_repo(worktree)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else worktree
+        ),
+    )
 
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -31465,26 +32077,25 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         "observer_reconcile"
     )
 
-    conn.execute(
-        "UPDATE graph_snapshots SET notes = ? "
-        "WHERE project_id = ? AND snapshot_id = ?",
-        (
-            json.dumps(
-                {
-                    "current_full_reconcile": {
-                        "schema_version": "current_full_reconcile.v1",
-                        "source": "graph_governance_api",
-                        "normal_update_path": True,
-                        "target_commit_sha": close_commit,
-                        "activate": True,
-                    }
-                }
-            ),
-            PID,
-            current_full_snapshot_id,
-        ),
+    provenance = store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=current_full_snapshot_id,
+        target_commit_sha=close_commit,
+        request_id="req-runtime-context-close-projection",
+        request_started_at=str(merge_event["created_at"]),
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
     )
     conn.commit()
+    assert provenance["protected_action"] == "graph_current_full_reconcile"
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -32756,9 +33367,16 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
 def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     conn,
     monkeypatch,
+    tmp_path,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN"
-    close_commit = "fe6275118745006c8324dfcbeecea62c39e91936"
+    project_root = tmp_path / "parentless-direct-main"
+    close_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
     close_route_token_ref = "rtok-parentless-direct-main-close"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
@@ -33057,9 +33675,16 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
 def test_parentless_direct_main_rejects_loose_operator_approval_shape(
     conn,
     monkeypatch,
+    tmp_path,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-LOOSE-APPROVAL"
-    close_commit = "ee6275118745006c8324dfcbeecea62c39e91936"
+    project_root = tmp_path / "parentless-direct-main-loose-approval"
+    close_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
     close_route_token_ref = "rtok-parentless-direct-main-loose-approval-close"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
@@ -33254,9 +33879,16 @@ def test_parentless_direct_main_rejects_loose_operator_approval_shape(
 def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_gate(
     conn,
     monkeypatch,
+    tmp_path,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-ACTIVE-CHILD"
-    close_commit = "df6275118745006c8324dfcbeecea62c39e91936"
+    project_root = tmp_path / "parentless-direct-main-active-child"
+    close_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
     worker_commit = "e05d49fc962bd91e20b540b8f3ca5f06b27c293e"
     close_route_token_ref = "rtok-parentless-direct-main-active-child-close"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -38885,7 +39517,11 @@ def test_direct_fix_dispatch_materializes_missing_worker_identity_and_commits(
     assert worker_guide_result["raw_session_token_exposed"] is False
 
 
-def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_path):
+def test_direct_fix_requires_dispatch_context_before_worker_repair(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
     backlog_id = "AC-DIRECT-FIX-DISPATCH-CONTEXT-BINDING"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
@@ -38893,8 +39529,17 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     route_token_ref = "rtok-direct-fix-dispatch-context"
     worker_task_id = "direct-fix-worker-task"
     parent_task_id = direct_execution_id
-    target_root = str(tmp_path)
+    target_repo = tmp_path / "direct-fix-candidate-repo"
+    candidate_commit = _init_test_git_repo(target_repo)
+    target_root = str(target_repo)
     worktree_path = str(tmp_path / "direct-fix-worker")
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else target_repo
+        ),
+    )
     _persist_contract_runtime_observer_route_ref(
         conn,
         backlog_id=backlog_id,
@@ -39091,6 +39736,32 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
     next_action = worker_graph["contract_runtime_current_state"]["next_legal_action"]
     assert next_action["line_id"] == "direct_fix_candidate_repair"
 
+    missing_candidate_commit = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": direct_execution_id},
+            "coordinator",
+            method="POST",
+            body={
+                "stage_id": "candidate_repair",
+                "line_id": "direct_fix_candidate_repair",
+                "evidence_kind": "direct_fix_repair_evidence",
+                "runtime_context_id": runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": parent_task_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token_ref": session_token_ref,
+                "target_project_root": target_root,
+                "payload": {"status": "implemented"},
+            },
+        )
+    )
+    assert missing_candidate_commit["ok"] is False
+    assert any(
+        "requires top-level full commit_sha" in error
+        for error in missing_candidate_commit["decision"]["errors"]
+    )
+
     repaired = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": direct_execution_id},
@@ -39107,6 +39778,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
                 "fence_token": fence_token,
                 "session_token_ref": session_token_ref,
                 "target_project_root": target_root,
+                "commit_sha": candidate_commit,
                 "payload": {
                     "status": "implemented",
                     "changed_files": [
@@ -39134,6 +39806,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(conn, tmp_pat
         backlog_id=backlog_id,
         task_id=worker_task_id,
         target_project_root=target_root,
+        candidate_commit_sha=candidate_commit,
     )
     assert qa_graph["ok"] is True
     next_action = qa_graph["contract_runtime_current_state"]["next_legal_action"]
@@ -39441,6 +40114,9 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
     fence_token = "fence-direct-fix-runtime-timeline"
     worker_session_token = "worker-session-direct-fix-runtime-timeline"
     target_root = str(tmp_path)
+    candidate_commit = hashlib.sha1(
+        b"direct-fix-runtime-timeline-candidate"
+    ).hexdigest()
 
     entered = server.handle_project_direct_fix_enter(
         _ctx_with_role(
@@ -39616,10 +40292,12 @@ def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
         "fence_token": fence_token,
         "session_token": worker_session_token,
         "target_project_root": target_root,
+        "commit_sha": candidate_commit,
         "payload": {
             "status": "implemented",
             "changed_files": ["agent/governance/server.py"],
             "source_backed_runtime_timeline": True,
+            "commit_sha": candidate_commit,
         },
     }
 
@@ -39776,7 +40454,10 @@ def test_direct_fix_timeline_bridge_rejects_modern_dispatch_context_mismatch(con
     )
 
 
-def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn):
+def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
+    conn,
+    tmp_path,
+):
     backlog_id = "AC-DIRECT-FIX-GENERIC-QA-NO-PARENT-RESUME"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
@@ -39805,6 +40486,8 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
     )
     direct_execution_id = entered["contract_execution_id"]
     runtime = server._contract_runtime(conn)
+    target_root = tmp_path / "direct-fix-generic-qa"
+    candidate_commit = _init_test_git_repo(target_root)
 
     def _write_line(
         *,
@@ -39813,6 +40496,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         line_id: str,
         evidence_kind: str,
         payload: dict | None = None,
+        commit_sha: str = "",
     ) -> dict:
         runtime.current_guide(direct_execution_id, actor_role=actor_role)
         record = runtime.store.get(direct_execution_id)
@@ -39825,6 +40509,8 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         )
         if payload is not None:
             write["payload"] = payload
+        if commit_sha:
+            write["commit_sha"] = commit_sha
         result = runtime.submit_line_write(
             direct_execution_id,
             write,
@@ -39847,7 +40533,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         payload=_direct_fix_graph_trace_payload(
             actor_role="observer",
             trace_id=f"gqt-observer-{direct_execution_id}",
-            target_project_root="/tmp/aming-claw-test",
+            target_project_root=str(target_root),
         ),
     )
     _write_line(
@@ -39864,7 +40550,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         payload=_direct_fix_graph_trace_payload(
             actor_role="mf_sub",
             trace_id=f"gqt-worker-{direct_execution_id}",
-            target_project_root="/tmp/aming-claw-test",
+            target_project_root=str(target_root),
             runtime_context_id=f"mfrctx-{direct_execution_id}",
             task_id=f"worker-{direct_execution_id}",
             parent_task_id=direct_execution_id,
@@ -39875,6 +40561,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         stage_id="candidate_repair",
         line_id="direct_fix_candidate_repair",
         evidence_kind="direct_fix_repair_evidence",
+        commit_sha=candidate_commit,
     )
     _write_line(
         actor_role="qa",
@@ -39884,10 +40571,11 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(conn
         payload=_direct_fix_graph_trace_payload(
             actor_role="qa",
             trace_id=f"gqt-qa-{direct_execution_id}",
-            target_project_root="/tmp/aming-claw-test",
+            target_project_root=str(target_root),
             backlog_id=backlog_id,
             contract_execution_id=direct_execution_id,
             task_id=f"worker-{direct_execution_id}",
+            candidate_commit_sha=candidate_commit,
         ),
     )
     _write_line(
@@ -46840,6 +47528,265 @@ def test_mf_parallel_finish_projection_fails_closed_without_one_exact_commit(
     assert line["payload"]["observer_authored_worker_backfill"] is False
 
 
+def test_pinned_direct_fix_rev1_server_binding_preserves_legacy_qa_shape(conn):
+    write = {
+        "stage_id": "qa_graph_context",
+        "line_id": "direct_fix_qa_graph_context",
+        "evidence_kind": "graph_trace",
+        "graph_trace_ids": ["gqt-direct-fix-rev1-legacy"],
+        "payload": {
+            "graph_trace_evidence": {
+                "source": "legacy-caller-evidence",
+                "db_verified": True,
+            }
+        },
+    }
+    bound = server._contract_runtime_bind_server_line_authority(
+        _ctx_with_role({"project_id": PID}, "qa"),
+        conn,
+        project_id=PID,
+        record={
+            "contract_id": "direct_fix",
+            "version": "v1",
+            "revision": "rev1",
+            "contract_execution_id": "cex-direct-fix-rev1-legacy",
+        },
+        write=write,
+        body=write,
+    )
+
+    assert bound == write
+
+
+def test_pinned_mf_parallel_rev1_preserves_legacy_qa_and_reconcile_projection(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-REV1-LEGACY-PROJECTION"
+    task_id = "mf-parallel-rev1-legacy-worker"
+    runtime_context_id = "mfrctx-mf-parallel-rev1-legacy"
+    trace_id = "gqt-mf-parallel-rev1-legacy"
+    snapshot_id = "full-mf-parallel-rev1-legacy"
+    _activate_basic_graph(conn, snapshot_id, commit_sha="legacy-rev1-head")
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id=snapshot_id,
+        actor="qa-rev1-principal",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id=task_id,
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev1",
+        "contract_execution_id": "cex-mf-parallel-rev1-legacy",
+        "completed_lines": [],
+    }
+    context = SimpleNamespace(
+        backlog_id=backlog_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=record["contract_execution_id"],
+        target_project_root="/legacy/rev1/root",
+        worktree_path="/legacy/rev1/root",
+    )
+
+    events = []
+    for event_kind, actor, phase, payload in (
+        (
+            "independent_verification",
+            "qa-rev1-principal",
+            "qa",
+            {"graph_trace_ids": [trace_id]},
+        ),
+        (
+            "merge",
+            "observer-rev1-principal",
+            "merge",
+            {"merge_commit": "a" * 40},
+        ),
+        (
+            "reconcile",
+            "observer-rev1-principal",
+            "reconcile",
+            {"strategy": "legacy_incremental"},
+        ),
+    ):
+        events.append(
+            task_timeline.record_event(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                event_type=event_kind,
+                event_kind=event_kind,
+                phase=phase,
+                actor=actor,
+                status="passed",
+                commit_sha="a" * 40 if event_kind == "merge" else "",
+                payload={
+                    "contract_execution_id": record["contract_execution_id"],
+                    "runtime_context_id": runtime_context_id,
+                    **payload,
+                },
+            )
+        )
+
+    lines = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=events,
+    )
+    by_id = {line["line_id"]: line for line in lines}
+
+    assert {
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    }.issubset(by_id)
+    assert "graph_trace_evidence" in by_id["qa_graph_context"]["artifact_refs"]
+    assert "reconcile_authority" not in by_id["observer_reconcile"]["payload"]
+
+
+@pytest.mark.parametrize(
+    ("event_order", "expected_lines"),
+    [
+        (
+            ("merge", "reconcile", "qa"),
+            {"qa_graph_context", "qa_independent_verification"},
+        ),
+        (
+            ("reconcile", "qa", "merge"),
+            {
+                "qa_graph_context",
+                "qa_independent_verification",
+                "observer_merge",
+            },
+        ),
+        (
+            ("qa", "merge", "reconcile"),
+            {
+                "qa_graph_context",
+                "qa_independent_verification",
+                "observer_merge",
+                "observer_reconcile",
+                "observer_close_ready",
+            },
+        ),
+    ],
+)
+def test_rev2_projection_requires_durable_qa_merge_reconcile_order(
+    conn,
+    monkeypatch,
+    event_order,
+    expected_lines,
+):
+    suffix = "-".join(event_order)
+    backlog_id = f"AC-MF-PARALLEL-REV2-TEMPORAL-{suffix}"
+    task_id = f"mf-parallel-rev2-temporal-{suffix}"
+    runtime_context_id = f"mfrctx-mf-parallel-rev2-temporal-{suffix}"
+    trace_id = f"gqt-mf-parallel-rev2-temporal-{suffix}"
+    candidate_commit = "b" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev2",
+        "contract_execution_id": f"cex-mf-parallel-rev2-temporal-{suffix}",
+        "completed_lines": [
+            {
+                "line_id": "worker_commit",
+                "commit_sha": candidate_commit,
+            }
+        ],
+    }
+    context = SimpleNamespace(
+        backlog_id=backlog_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=record["contract_execution_id"],
+        target_project_root="/strict/rev2/root",
+        worktree_path="/strict/rev2/root",
+    )
+
+    def strict_trace_refs(_conn, **kwargs):
+        assert kwargs["expected_candidate_commit_sha"] == candidate_commit
+        assert kwargs["strict_bounded_qa"] is True
+        return {
+            "db_verified": True,
+            "verified_trace_ids": [trace_id],
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "target_project_root": context.target_project_root,
+            "candidate_commit_sha": candidate_commit,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        strict_trace_refs,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: {
+            "db_verified": True,
+            "live_verified": True,
+            "active_snapshot_verified": True,
+            "graph_reconciled": True,
+            "merged_commit_sha": candidate_commit,
+        },
+    )
+
+    events = []
+    for kind in event_order:
+        actor = "qa-temporal-principal" if kind == "qa" else "observer-temporal"
+        event_kind = "independent_verification" if kind == "qa" else kind
+        payload = {
+            "contract_execution_id": record["contract_execution_id"],
+            "runtime_context_id": runtime_context_id,
+        }
+        if kind == "qa":
+            payload["graph_trace_ids"] = [trace_id]
+        elif kind == "merge":
+            payload["merge_commit"] = candidate_commit
+        else:
+            payload["reconcile_mode"] = "current_full"
+        events.append(
+            task_timeline.record_event(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                event_type=event_kind,
+                event_kind=event_kind,
+                phase="qa" if kind == "qa" else kind,
+                actor=actor,
+                status="passed",
+                commit_sha=candidate_commit if kind == "merge" else "",
+                payload=payload,
+            )
+        )
+
+    lines = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=events,
+    )
+
+    assert {line["line_id"] for line in lines} == expected_lines
+
+
 def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     conn,
     tmp_path,
@@ -46851,9 +47798,15 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     worker_token = "parallel-runtime-context-projection-token"
     fence_token = "fence-runtime-context-projection"
     graph_trace_id = "gqt-runtime-context-projection-worker"
-    head_commit = "3752db90f311ef34e37d5f2debad9e69b8ec6f7c"
     worktree = tmp_path / "parallel-runtime-context-projection"
-    worktree.mkdir()
+    head_commit = _init_test_git_repo(worktree)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else worktree
+        ),
+    )
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
         _ctx_with_role(
@@ -47051,10 +48004,43 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
                 "evidence_kind": "graph_trace",
                 "graph_trace_ids": [qa_graph_trace_id],
                 "graph_query_trace_ids": [qa_graph_trace_id],
+                "qa_evidence_provenance": {
+                    "nested": [
+                        {
+                            "graph_trace_evidence": {
+                                "source": "caller",
+                                "db_verified": True,
+                            }
+                        },
+                        {
+                            "candidate_diff_hash": expected_graph_evidence[
+                                "candidate_diff_hash"
+                            ]
+                        },
+                    ]
+                },
+                "artifact_refs": {
+                    "verification": {
+                        "graph_review_context": {
+                            "candidate_diff_hash": expected_graph_evidence[
+                                "candidate_diff_hash"
+                            ],
+                            "authority_hash": "sha256:" + "f" * 64,
+                        }
+                    }
+                },
                 "payload": {
                     "schema_version": "mf_parallel.qa_graph_context.v1",
                     "graph_trace_ids": [qa_graph_trace_id],
                     "graph_query_trace_ids": [qa_graph_trace_id],
+                    "caller_claims": [
+                        {
+                            "graph_trace_db_evidence": {
+                                "qa_principal": "qa-principal",
+                                "db_verified": True,
+                            }
+                        }
+                    ],
                 },
             },
         )
@@ -47073,6 +48059,26 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         "candidate_diff_hash"
     ]
     assert stored_authority["authority_hash"].startswith("sha256:")
+    stored_without_canonical_authority = json.loads(json.dumps(stored_qa_line))
+    stored_without_canonical_authority["payload"].pop(
+        "graph_trace_evidence"
+    )
+    for source in (
+        stored_without_canonical_authority,
+        stored_without_canonical_authority["payload"],
+    ):
+        source.pop("graph_trace_ids", None)
+        source.pop("graph_query_trace_ids", None)
+    sanitized_json = json.dumps(stored_without_canonical_authority, sort_keys=True)
+    for forbidden_claim in (
+        "graph_trace_evidence",
+        "graph_trace_db_evidence",
+        "graph_review_context",
+        "candidate_diff_hash",
+        "db_verified",
+        "authority_hash",
+    ):
+        assert forbidden_claim not in sanitized_json
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -47356,23 +48362,60 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stale_graph["ok"] is False
 
     current_full_snapshot_id = "full-runtime-context-valid"
-    activate_current_full(current_full_snapshot_id, head_commit)
-    reconcile = server.handle_project_contract_runtime_line_write(
+    _activate_basic_graph(conn, current_full_snapshot_id, commit_sha=head_commit)
+    reconcile_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer-principal",
+        status="passed",
+        commit_sha=head_commit,
+        payload={
+            "contract_execution_id": successor["contract_execution_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "target_commit_sha": head_commit,
+            "reconcile_mode": "current_full",
+        },
+    )
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=current_full_snapshot_id,
+        target_commit_sha=head_commit,
+        request_id="req-runtime-context-valid",
+        request_started_at=str(merge_event["created_at"]),
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
+    )
+    conn.commit()
+    reconciled = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
-            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
-            "observer",
-            method="POST",
-            body={
-                "stage_id": "observer_integration",
-                "line_id": "observer_reconcile",
-                "evidence_kind": "reconcile",
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
             },
+            "observer",
         )
     )
-    assert reconcile["ok"] is True
-    reconcile_line = server._contract_runtime_store(conn).get(
-        successor["contract_execution_id"]
-    )["completed_lines"][-1]
+    reconcile_line = next(
+        line
+        for line in reconciled["runtime_guide"]["completed_lines_projection"][
+            "projected_completed_lines"
+        ]
+        if line["line_id"] == "observer_reconcile"
+    )
     reconcile_authority = reconcile_line["payload"]["reconcile_authority"]
     assert reconcile_authority["source"] == (
         "graph_snapshot_store.current_full_reconcile_state"
@@ -47384,6 +48427,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert reconcile_authority["merged_commit_sha"] == head_commit
     assert reconcile_authority["current_full_reconcile"] is True
     assert reconcile_authority["strategy"] == "current_full_reconcile"
+    assert reconcile_authority["provenance_verified"] is True
+    assert reconcile_authority["durable_order_verified"] is True
 
 
 def test_contract_runtime_current_blocks_stale_dispatch_runtime_context_mismatch(conn):

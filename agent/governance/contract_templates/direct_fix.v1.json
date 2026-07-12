@@ -221,7 +221,10 @@
         {
             "id": "direct_fix_candidate_repair",
             "owner_role": "mf_sub",
-            "event_kind": "direct_fix_repair_evidence"
+            "event_kind": "direct_fix_repair_evidence",
+            "required_fields": [
+                "commit_sha"
+            ]
         },
         {
             "id": "direct_fix_qa_graph_context",

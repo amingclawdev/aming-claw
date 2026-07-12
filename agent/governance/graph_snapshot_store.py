@@ -50,6 +50,29 @@ CREATE INDEX IF NOT EXISTS idx_graph_snapshots_commit
 CREATE INDEX IF NOT EXISTS idx_graph_snapshots_status
   ON graph_snapshots(project_id, status, commit_sha);
 
+CREATE TABLE IF NOT EXISTS graph_current_full_reconcile_provenance (
+  provenance_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  target_commit_sha TEXT NOT NULL,
+  protected_action TEXT NOT NULL,
+  protected_entrypoint TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  request_started_at TEXT NOT NULL,
+  marker_created_at TEXT NOT NULL,
+  reconcile_event_id INTEGER NOT NULL,
+  reconcile_event_created_at TEXT NOT NULL,
+  route_evidence_json TEXT NOT NULL DEFAULT '{}',
+  marker_json TEXT NOT NULL DEFAULT '{}',
+  provenance_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_current_full_reconcile_provenance_target
+  ON graph_current_full_reconcile_provenance(
+    project_id, target_commit_sha, snapshot_id, reconcile_event_id
+  );
+
 CREATE TABLE IF NOT EXISTS graph_snapshot_refs (
   project_id TEXT NOT NULL,
   ref_name TEXT NOT NULL,
@@ -2114,10 +2137,170 @@ def get_active_graph_snapshot(
     return dict(row) if row else None
 
 
+def _stable_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _timestamp_value(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def record_current_full_reconcile_provenance(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    snapshot_id: str,
+    target_commit_sha: str,
+    request_id: str,
+    request_started_at: str,
+    route_evidence: Mapping[str, Any],
+    reconcile_event_id: int,
+    reconcile_event_created_at: str,
+    marker_created_at: str | None = None,
+) -> dict[str, Any]:
+    """Seal one protected current-full completion to its durable reconcile event."""
+
+    ensure_schema(conn)
+    project_id = str(project_id or "").strip()
+    snapshot_id = str(snapshot_id or "").strip()
+    target_commit_sha = str(target_commit_sha or "").strip().lower()
+    request_id = str(request_id or "").strip()
+    request_started_at = str(request_started_at or "").strip()
+    reconcile_event_created_at = str(reconcile_event_created_at or "").strip()
+    try:
+        reconcile_event_id = int(reconcile_event_id)
+    except (TypeError, ValueError):
+        reconcile_event_id = 0
+    marker_created_at = str(marker_created_at or utc_now()).strip()
+    required = {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "target_commit_sha": target_commit_sha,
+        "request_id": request_id,
+        "request_started_at": request_started_at,
+        "marker_created_at": marker_created_at,
+        "reconcile_event_created_at": reconcile_event_created_at,
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing or reconcile_event_id <= 0:
+        missing_fields = [*missing]
+        if reconcile_event_id <= 0:
+            missing_fields.append("reconcile_event_id")
+        raise ValueError(
+            "current-full reconcile provenance requires: "
+            + ", ".join(missing_fields)
+        )
+    snapshot = get_graph_snapshot(conn, project_id, snapshot_id) or {}
+    if (
+        str(snapshot.get("status") or "").strip() != SNAPSHOT_STATUS_ACTIVE
+        or str(snapshot.get("commit_sha") or "").strip().lower()
+        != target_commit_sha
+    ):
+        raise ValueError(
+            "current-full reconcile provenance requires the active target snapshot"
+        )
+
+    protected_action = "graph_current_full_reconcile"
+    protected_entrypoint = (
+        "POST /api/graph-governance/{project_id}/reconcile/current-full"
+    )
+    safe_route_evidence = dict(route_evidence or {})
+    provenance_id = f"cfrp-{uuid.uuid4().hex[:24]}"
+    marker_core = {
+        "schema_version": "current_full_reconcile.provenance.v2",
+        "source": "graph_governance_api",
+        "protected_action": protected_action,
+        "protected_entrypoint": protected_entrypoint,
+        "provenance_id": provenance_id,
+        "request_id": request_id,
+        "request_started_at": request_started_at,
+        "marker_created_at": marker_created_at,
+        "target_commit_sha": target_commit_sha,
+        "snapshot_id": snapshot_id,
+        "activate": True,
+        "normal_update_path": True,
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": reconcile_event_created_at,
+        "route_evidence": safe_route_evidence,
+    }
+    provenance_hash = _stable_sha256(marker_core)
+    marker = {**marker_core, "provenance_hash": provenance_hash}
+    notes = _snapshot_notes(snapshot)
+    notes["current_full_reconcile"] = marker
+    conn.execute(
+        """
+        INSERT INTO graph_current_full_reconcile_provenance (
+          provenance_id, project_id, snapshot_id, target_commit_sha,
+          protected_action, protected_entrypoint, request_id,
+          request_started_at, marker_created_at, reconcile_event_id,
+          reconcile_event_created_at, route_evidence_json, marker_json,
+          provenance_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            provenance_id,
+            project_id,
+            snapshot_id,
+            target_commit_sha,
+            protected_action,
+            protected_entrypoint,
+            request_id,
+            request_started_at,
+            marker_created_at,
+            reconcile_event_id,
+            reconcile_event_created_at,
+            json.dumps(safe_route_evidence, sort_keys=True),
+            json.dumps(marker, sort_keys=True),
+            provenance_hash,
+            marker_created_at,
+        ),
+    )
+    conn.execute(
+        "UPDATE graph_snapshots SET notes = ? "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (json.dumps(notes, sort_keys=True), project_id, snapshot_id),
+    )
+    return {
+        "schema_version": "graph_current_full_reconcile_provenance.v1",
+        "provenance_id": provenance_id,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "target_commit_sha": target_commit_sha,
+        "protected_action": protected_action,
+        "protected_entrypoint": protected_entrypoint,
+        "request_id": request_id,
+        "request_started_at": request_started_at,
+        "marker_created_at": marker_created_at,
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": reconcile_event_created_at,
+        "route_evidence": safe_route_evidence,
+        "provenance_hash": provenance_hash,
+        "marker": marker,
+    }
+
+
 def current_full_reconcile_state(
     conn: sqlite3.Connection,
     project_id: str,
     merged_commit_sha: str,
+    *,
+    merge_event_id: int = 0,
+    merge_event_created_at: str = "",
+    reconcile_event_id: int = 0,
+    reconcile_event_created_at: str = "",
 ) -> dict[str, Any]:
     """Return DB-backed current-full state for one merged canonical commit."""
 
@@ -2145,11 +2328,113 @@ def current_full_reconcile_state(
             ),
         ).fetchone()[0]
     )
+    provenance_id = str(marker.get("provenance_id") or "").strip()
+    provenance_row = None
+    if provenance_id:
+        provenance_row = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE provenance_id = ? AND project_id = ?
+              AND snapshot_id = ? AND target_commit_sha = ?
+            """,
+            (
+                provenance_id,
+                project_id,
+                active_snapshot_id,
+                merged_commit_sha,
+            ),
+        ).fetchone()
+    provenance = dict(provenance_row) if provenance_row else {}
+    try:
+        stored_marker = json.loads(str(provenance.get("marker_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_marker = {}
+    try:
+        stored_route_evidence = json.loads(
+            str(provenance.get("route_evidence_json") or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_route_evidence = {}
+    marker_core = dict(marker)
+    marker_hash = str(marker_core.pop("provenance_hash", "") or "").strip()
+    provenance_hash = str(provenance.get("provenance_hash") or "").strip()
+    marker_reconcile_event_id = 0
+    provenance_reconcile_event_id = 0
+    try:
+        marker_reconcile_event_id = int(marker.get("reconcile_event_id") or 0)
+        provenance_reconcile_event_id = int(
+            provenance.get("reconcile_event_id") or 0
+        )
+    except (TypeError, ValueError):
+        pass
     marker_verified = bool(
         marker
+        and provenance
+        and marker == stored_marker
+        and marker_hash
+        and marker_hash == provenance_hash
+        and _stable_sha256(marker_core) == marker_hash
+        and str(marker.get("schema_version") or "").strip()
+        == "current_full_reconcile.provenance.v2"
         and marker.get("normal_update_path") is True
         and marker.get("activate") is True
         and marker_target_commit == merged_commit_sha
+        and str(marker.get("snapshot_id") or "").strip() == active_snapshot_id
+        and str(marker.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(marker.get("protected_entrypoint") or "").strip()
+        == "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        and str(provenance.get("protected_action") or "").strip()
+        == str(marker.get("protected_action") or "").strip()
+        and str(provenance.get("protected_entrypoint") or "").strip()
+        == str(marker.get("protected_entrypoint") or "").strip()
+        and str(provenance.get("request_id") or "").strip()
+        == str(marker.get("request_id") or "").strip()
+        and bool(str(marker.get("request_id") or "").strip())
+        and str(provenance.get("request_started_at") or "").strip()
+        == str(marker.get("request_started_at") or "").strip()
+        and _timestamp_value(marker.get("request_started_at")) is not None
+        and str(provenance.get("marker_created_at") or "").strip()
+        == str(marker.get("marker_created_at") or "").strip()
+        and provenance_reconcile_event_id > 0
+        and provenance_reconcile_event_id == marker_reconcile_event_id
+        and str(provenance.get("reconcile_event_created_at") or "").strip()
+        == str(marker.get("reconcile_event_created_at") or "").strip()
+        and isinstance(stored_route_evidence, Mapping)
+        and stored_route_evidence == marker.get("route_evidence")
+        and stored_route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and bool(
+            str(stored_route_evidence.get("authenticated_role") or "").strip()
+        )
+        and bool(
+            str(stored_route_evidence.get("authentication_source") or "").strip()
+        )
+        and stored_route_evidence.get("raw_route_token_persisted") is False
+        and stored_route_evidence.get("protected_action")
+        == "graph_current_full_reconcile"
+    )
+    try:
+        merge_event_id = int(merge_event_id)
+        reconcile_event_id = int(reconcile_event_id)
+    except (TypeError, ValueError):
+        merge_event_id = 0
+        reconcile_event_id = 0
+    merge_time = _timestamp_value(merge_event_created_at)
+    reconcile_time = _timestamp_value(reconcile_event_created_at)
+    marker_time = _timestamp_value(marker.get("marker_created_at"))
+    durable_order_verified = bool(
+        merge_event_id > 0
+        and reconcile_event_id > merge_event_id
+        and provenance_reconcile_event_id == reconcile_event_id
+        and str(provenance.get("reconcile_event_created_at") or "").strip()
+        == str(reconcile_event_created_at or "").strip()
+        and merge_time is not None
+        and reconcile_time is not None
+        and marker_time is not None
+        and reconcile_time >= merge_time
+        and marker_time >= reconcile_time
     )
     active_snapshot_verified = bool(
         active_snapshot_id
@@ -2160,6 +2445,7 @@ def current_full_reconcile_state(
         project_id
         and merged_commit_sha
         and marker_verified
+        and durable_order_verified
         and active_snapshot_verified
         and pending_count == 0
     )
@@ -2176,6 +2462,15 @@ def current_full_reconcile_state(
         "current_full_reconcile": bool(marker),
         "current_full_reconcile_marker": marker,
         "current_full_reconcile_marker_verified": marker_verified,
+        "current_full_reconcile_provenance": provenance,
+        "provenance_verified": marker_verified,
+        "durable_order_verified": durable_order_verified,
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": str(merge_event_created_at or "").strip(),
+        "reconcile_event_id": reconcile_event_id,
+        "reconcile_event_created_at": str(
+            reconcile_event_created_at or ""
+        ).strip(),
         "strategy": "current_full_reconcile" if marker else "",
         "pending_scope_reconcile_count": pending_count,
         "pending_scope_reconcile_zero": pending_count == 0,

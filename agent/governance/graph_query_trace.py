@@ -106,6 +106,8 @@ QUERY_PURPOSES = {
     "subagent_context_build",
     "gate_validation",
     "independent_verification",
+    "qa_context_build",
+    "qa_gate_validation",
     "subagent_gate_validation",
     "user_feedback",
     "backlog_filing",
@@ -481,41 +483,56 @@ def _normalize_candidate_review_context(
         empty_diff_hash = f"sha256:{hashlib.sha256(b'').hexdigest()}"
         if context["candidate_diff_hash"] != empty_diff_hash:
             raise ValueError("exact candidate graph basis requires the empty diff hash")
+        if context["candidate_overlay"] or context["candidate_overlay_hash"]:
+            raise ValueError("exact candidate graph basis does not use an overlay")
     elif context["base_commit_sha"] == context["candidate_commit_sha"]:
         raise ValueError("canonical base plus candidate diff requires distinct commits")
-    if context["graph_basis"] == store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF:
-        bounded_fields = (
-            "candidate_overlay_hash",
-            "root_identity_hash",
-            "query_root_identity_hash",
-            "canonical_project_identity_hash",
-            "repository_identity_hash",
+
+    root_fields = (
+        "root_identity_hash",
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
+    )
+    missing_root = [field for field in root_fields if not context[field]]
+    if not context["root_identity"]:
+        missing_root.append("root_identity")
+    if missing_root:
+        raise ValueError(
+            "candidate graph review context requires root fields: "
+            + ", ".join(missing_root)
         )
-        missing_bounded = [field for field in bounded_fields if not context[field]]
+    for field in root_fields:
+        if not _is_sha256(context[field]):
+            raise ValueError(f"{field} must be a sha256 digest")
+    if stable_sha256(context["root_identity"]) != context["root_identity_hash"]:
+        raise ValueError("root_identity_hash must hash the exact root identity")
+    for field in (
+        "query_root_identity_hash",
+        "canonical_project_identity_hash",
+        "repository_identity_hash",
+    ):
+        if (
+            str(context["root_identity"].get(field) or "").strip().lower()
+            != context[field]
+        ):
+            raise ValueError(f"root_identity.{field} must match the trace binding")
+
+    if context["graph_basis"] == store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF:
+        missing_bounded = [] if context["candidate_overlay_hash"] else [
+            "candidate_overlay_hash"
+        ]
         if not context["candidate_overlay"]:
             missing_bounded.append("candidate_overlay")
-        if not context["root_identity"]:
-            missing_bounded.append("root_identity")
         if missing_bounded:
             raise ValueError(
                 "canonical base candidate overlay requires fields: "
                 + ", ".join(missing_bounded)
             )
-        for field in bounded_fields:
-            if not _is_sha256(context[field]):
-                raise ValueError(f"{field} must be a sha256 digest")
+        if not _is_sha256(context["candidate_overlay_hash"]):
+            raise ValueError("candidate_overlay_hash must be a sha256 digest")
         if stable_sha256(context["candidate_overlay"]) != context["candidate_overlay_hash"]:
             raise ValueError("candidate_overlay_hash must hash the exact candidate overlay")
-        if stable_sha256(context["root_identity"]) != context["root_identity_hash"]:
-            raise ValueError("root_identity_hash must hash the exact root identity")
-        root_identity = context["root_identity"]
-        for field in (
-            "query_root_identity_hash",
-            "canonical_project_identity_hash",
-            "repository_identity_hash",
-        ):
-            if str(root_identity.get(field) or "").strip().lower() != context[field]:
-                raise ValueError(f"root_identity.{field} must match the trace binding")
     return context
 
 

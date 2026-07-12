@@ -84,6 +84,7 @@ _GRAPH_TRACE_ID_KEYS = {
 }
 
 _BOUNDED_QA_POLICY_NAME = "bounded_qa_review_policy"
+_CANDIDATE_COMMIT_POLICY_NAME = "candidate_commit_evidence_policy"
 _CURRENT_FULL_RECONCILE_POLICY_NAME = "current_full_reconcile_evidence_policy"
 
 
@@ -153,6 +154,19 @@ def validate_contract_write(
             elif write_evidence_kind != expected_evidence_kind:
                 errors.append("evidence_kind mismatch")
 
+    candidate_commit_policy = contract_line_evidence_policy(
+        definition,
+        _CANDIDATE_COMMIT_POLICY_NAME,
+        line_id=line_id,
+    )
+    if candidate_commit_policy:
+        _validate_candidate_commit_evidence(
+            errors,
+            write,
+            line_id=line_id,
+            policy=candidate_commit_policy,
+        )
+
     next_action = execution_state.get("next_action")
     if require_next_action and isinstance(next_action, Mapping):
         expected_stage = str(next_action.get("stage_id") or "")
@@ -194,6 +208,22 @@ def validate_contract_write(
         )
 
     return WriteGateDecision(ok=not errors, errors=tuple(errors))
+
+
+def _validate_candidate_commit_evidence(
+    errors: list[str],
+    write: Mapping[str, Any],
+    *,
+    line_id: str,
+    policy: Mapping[str, Any],
+) -> None:
+    path = str(policy.get("candidate_commit_path") or "commit_sha").strip()
+    if path != "commit_sha":
+        errors.append(f"{line_id} has unsupported candidate commit policy path")
+        return
+    candidate_commit = str(write.get(path) or "").strip().lower()
+    if not _is_full_commit(candidate_commit):
+        errors.append(f"{line_id} requires top-level full {path}")
 
 
 def _validate_graph_context(
@@ -370,6 +400,10 @@ def _validate_bounded_qa_graph_context(
             errors.append(
                 f"{line_id} exact candidate basis requires the empty diff hash"
             )
+        for field in policy.get("exact_candidate_required_hash_fields") or ():
+            value = str(evidence.get(field) or "").strip().lower()
+            if not _is_sha256(value):
+                errors.append(f"{line_id} requires {field}")
         return
 
     if graph_basis == "canonical_base_plus_candidate_diff":
@@ -433,16 +467,76 @@ def _validate_current_full_reconcile_evidence(
         errors.append(f"{line_id} reconcile commit identities must match")
     if not str(authority.get("active_snapshot_id") or "").strip():
         errors.append(f"{line_id} requires authority.active_snapshot_id")
+    for field in policy.get("required_temporal_fields") or ():
+        if not str(authority.get(field) or "").strip():
+            errors.append(f"{line_id} requires authority.{field}")
+    try:
+        merge_event_id = int(authority.get("merge_event_id") or 0)
+        reconcile_event_id = int(authority.get("reconcile_event_id") or 0)
+    except (TypeError, ValueError):
+        merge_event_id = 0
+        reconcile_event_id = 0
+    if merge_event_id <= 0 or reconcile_event_id <= merge_event_id:
+        errors.append(f"{line_id} requires durable merge before reconcile order")
     marker = authority.get("current_full_reconcile_marker")
+    route_evidence = (
+        marker.get("route_evidence") if isinstance(marker, Mapping) else None
+    )
     if not isinstance(marker, Mapping):
         errors.append(f"{line_id} requires current_full_reconcile_marker")
     elif not (
-        marker.get("activate") is True
+        str(marker.get("schema_version") or "").strip()
+        == "current_full_reconcile.provenance.v2"
+        and str(marker.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(marker.get("protected_entrypoint") or "").strip()
+        == "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        and str(marker.get("provenance_id") or "").strip()
+        and _is_sha256(str(marker.get("provenance_hash") or "").strip())
+        and str(marker.get("request_id") or "").strip()
+        and str(marker.get("request_started_at") or "").strip()
+        and str(marker.get("marker_created_at") or "").strip()
+        and marker.get("activate") is True
         and marker.get("normal_update_path") is True
         and str(marker.get("target_commit_sha") or "").strip().lower()
         == str(authority.get("merged_commit_sha") or "").strip().lower()
+        and str(marker.get("snapshot_id") or "").strip()
+        == str(authority.get("active_snapshot_id") or "").strip()
+        and _int_value(marker.get("reconcile_event_id")) == reconcile_event_id
+        and str(marker.get("reconcile_event_created_at") or "").strip()
+        == str(authority.get("reconcile_event_created_at") or "").strip()
+        and isinstance(route_evidence, Mapping)
+        and route_evidence.get("schema_version")
+        == "graph_current_full_reconcile.route_evidence.v1"
+        and route_evidence.get("raw_route_token_persisted") is False
+        and route_evidence.get("protected_action")
+        == "graph_current_full_reconcile"
     ):
         errors.append(f"{line_id} current_full_reconcile_marker is not canonical")
+    provenance = authority.get("current_full_reconcile_provenance")
+    if not isinstance(provenance, Mapping):
+        errors.append(f"{line_id} requires current_full_reconcile_provenance")
+    elif isinstance(marker, Mapping) and not (
+        str(provenance.get("provenance_id") or "").strip()
+        == str(marker.get("provenance_id") or "").strip()
+        and str(provenance.get("provenance_hash") or "").strip()
+        == str(marker.get("provenance_hash") or "").strip()
+        and str(provenance.get("protected_action") or "").strip()
+        == "graph_current_full_reconcile"
+        and str(provenance.get("protected_entrypoint") or "").strip()
+        == "POST /api/graph-governance/{project_id}/reconcile/current-full"
+        and str(provenance.get("request_id") or "").strip()
+        == str(marker.get("request_id") or "").strip()
+        and str(provenance.get("request_started_at") or "").strip()
+        == str(marker.get("request_started_at") or "").strip()
+        and str(provenance.get("marker_created_at") or "").strip()
+        == str(marker.get("marker_created_at") or "").strip()
+        and _int_value(provenance.get("reconcile_event_id"))
+        == reconcile_event_id
+        and str(provenance.get("reconcile_event_created_at") or "").strip()
+        == str(authority.get("reconcile_event_created_at") or "").strip()
+    ):
+        errors.append(f"{line_id} current-full provenance does not match marker")
 
 
 def contract_line_evidence_policy(
@@ -500,6 +594,13 @@ def _is_sha256(value: str) -> bool:
             for character in value.removeprefix("sha256:")
         )
     )
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _graph_trace_ids(write: Mapping[str, Any]) -> list[str]:

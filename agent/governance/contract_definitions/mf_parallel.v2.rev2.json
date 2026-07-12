@@ -156,6 +156,9 @@
                         "evidence_kind": "worker_commit",
                         "line_id": "worker_commit",
                         "owner_role": "mf_sub",
+                        "required_fields": [
+                            "commit_sha"
+                        ],
                         "requires": [
                             "worker_implementation"
                         ]
@@ -369,6 +372,15 @@
       "formatting_only_drift_must_remain_visible": true
     },
     "graph_binding_policy": {
+      "candidate_commit_evidence_policy": {
+        "candidate_commit_path": "commit_sha",
+        "enabled": true,
+        "line_ids": [
+          "worker_commit"
+        ],
+        "required_format": "full_git_object_id",
+        "schema_version": "contract_candidate_commit_evidence_policy.v1"
+      },
       "bounded_qa_review_policy": {
         "accepted_graph_basis": [
           "exact_candidate_snapshot",
@@ -387,6 +399,12 @@
         "caller_authority_fields_trusted": false,
         "candidate_diff_derivation": "server_only",
         "enabled": true,
+        "exact_candidate_required_hash_fields": [
+          "root_identity_hash",
+          "query_root_identity_hash",
+          "canonical_project_identity_hash",
+          "repository_identity_hash"
+        ],
         "forged_or_mismatched_tuple_policy": "fail_closed",
         "line_ids": [
           "qa_graph_context"
@@ -443,7 +461,15 @@
           "live_verified",
           "canonical_head_verified",
           "active_snapshot_verified",
-          "graph_reconciled"
+          "graph_reconciled",
+          "provenance_verified",
+          "durable_order_verified"
+        ],
+        "required_temporal_fields": [
+          "merge_event_id",
+          "merge_event_created_at",
+          "reconcile_event_id",
+          "reconcile_event_created_at"
         ],
         "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
         "strategy": "current_full_reconcile"
