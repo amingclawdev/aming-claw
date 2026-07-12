@@ -1828,6 +1828,163 @@ class TestTaskTimeline(unittest.TestCase):
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
 
+    def _cli_agent_receipt(
+        self,
+        state,
+        event_index,
+        *,
+        observed_at,
+        process_identity=None,
+        terminal=False,
+    ):
+        from agent.cli_agent_service.evidence import CliAgentRunReceipt, hash_text
+
+        return CliAgentRunReceipt(
+            run_id="run-task-timeline-a",
+            state=state,
+            event_index=event_index,
+            observed_at=observed_at,
+            ticket_id="caet-1234567890abcdef12345678",
+            ticket_hash=hash_text("ticket"),
+            profile_id="codex-profile-a",
+            runtime_context_id="mfrctx-task-timeline-a",
+            command_hash=hash_text("command"),
+            process_identity=process_identity or {},
+            output_hash=hash_text("output") if terminal else "",
+            duration_ms=1000 if terminal else None,
+        ).to_public_dict()
+
+    def test_cli_agent_run_receipt_ingestion_is_idempotent_and_non_close(self):
+        from agent.governance import server, task_timeline
+
+        accepted = self._cli_agent_receipt(
+            "accepted",
+            0,
+            observed_at="2026-07-12T12:00:00Z",
+        )
+        body = {
+            "backlog_id": "AC-CLI-RECEIPT",
+            "task_id": "cli-receipt-task",
+            "receipt": accepted,
+        }
+        first = server.handle_cli_agent_run_receipt(_ctx(body=body, method="POST"))
+        duplicate = server.handle_cli_agent_run_receipt(
+            _ctx(body=body, method="POST")
+        )
+
+        self.assertEqual(first["event_kind"], "worker_progress")
+        self.assertEqual(first["status"], "recorded")
+        self.assertFalse(
+            first["payload"]["cli_agent_run_receipt"]["governance_authority"]
+        )
+        self.assertEqual(duplicate["id"], first["id"])
+        self.assertTrue(duplicate["receipt_ingestion"]["idempotent"])
+        self.assertFalse(task_timeline.is_protected_close_evidence(first))
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE correlation_id = ?",
+            ("cli-agent-run:run-task-timeline-a",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+
+    def test_cli_agent_run_receipt_ingestion_accepts_normal_full_lifecycle(self):
+        from agent.governance import server, task_timeline
+
+        process_identity = {
+            "pid": 1234,
+            "process_group_id": 1234,
+            "process_start_identity": "pid:1234:start:99",
+        }
+        receipts = [
+            self._cli_agent_receipt(
+                "accepted",
+                0,
+                observed_at="2026-07-12T12:00:00Z",
+            ),
+            self._cli_agent_receipt(
+                "started",
+                1,
+                observed_at="2026-07-12T12:00:01Z",
+                process_identity=process_identity,
+            ),
+            self._cli_agent_receipt(
+                "heartbeat",
+                2,
+                observed_at="2026-07-12T12:00:02Z",
+                process_identity=process_identity,
+            ),
+            self._cli_agent_receipt(
+                "completed",
+                3,
+                observed_at="2026-07-12T12:00:03Z",
+                process_identity=process_identity,
+                terminal=True,
+            ),
+        ]
+
+        recorded = []
+        for receipt in receipts:
+            recorded.append(
+                server.handle_cli_agent_run_receipt(
+                    _ctx(
+                        body={
+                            "backlog_id": "AC-CLI-RECEIPT-LIFECYCLE",
+                            "task_id": "cli-receipt-lifecycle",
+                            "receipt": receipt,
+                        },
+                        method="POST",
+                    )
+                )
+            )
+
+        self.assertEqual(
+            [item["payload"]["cli_agent_run_receipt"]["state"] for item in recorded],
+            ["accepted", "started", "heartbeat", "completed"],
+        )
+        self.assertTrue(
+            all(not task_timeline.is_protected_close_evidence(item) for item in recorded)
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS c FROM task_timeline_events WHERE correlation_id = ?",
+                ("cli-agent-run:run-task-timeline-a",),
+            ).fetchone()["c"],
+            4,
+        )
+
+    def test_cli_agent_run_receipt_ingestion_rejects_out_of_order_fact(self):
+        from agent.governance import server
+        from agent.governance.errors import ValidationError
+
+        process_identity = {
+            "pid": 1234,
+            "process_group_id": 1234,
+            "process_start_identity": "pid:1234:start:99",
+        }
+        accepted = self._cli_agent_receipt(
+            "accepted",
+            0,
+            observed_at="2026-07-12T12:00:00Z",
+        )
+        server.handle_cli_agent_run_receipt(
+            _ctx(body={"receipt": accepted}, method="POST")
+        )
+        heartbeat = self._cli_agent_receipt(
+            "heartbeat",
+            2,
+            observed_at="2026-07-12T12:00:02Z",
+            process_identity=process_identity,
+        )
+
+        with self.assertRaisesRegex(ValidationError, "event_index is out of order"):
+            server.handle_cli_agent_run_receipt(
+                _ctx(body={"receipt": heartbeat}, method="POST")
+            )
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_timeline_events WHERE correlation_id = ?",
+            ("cli-agent-run:run-task-timeline-a",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+
     def _issue_route_token(
         self,
         bug_id,

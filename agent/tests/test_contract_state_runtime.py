@@ -287,6 +287,62 @@ def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
     assert "execution ticket hash was already consumed" in rejected_by_hash["errors"]
 
 
+def test_cli_agent_run_receipts_project_operational_state_without_evidence_credit():
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+
+    identity = {
+        "run_id": "run-contract-projection-a",
+        "ticket_id": "caet-1234567890abcdef12345678",
+        "ticket_hash": "sha256:" + hashlib.sha256(b"ticket").hexdigest(),
+        "profile_id": "codex-profile-a",
+        "runtime_context_id": "mfrctx-contract-projection-a",
+        "command_hash": "sha256:" + hashlib.sha256(b"command").hexdigest(),
+    }
+    accepted = CliAgentRunReceipt(
+        **identity,
+        state="accepted",
+        event_index=0,
+        observed_at="2026-07-12T12:00:00Z",
+    ).to_public_dict()
+    started = CliAgentRunReceipt(
+        **identity,
+        state="started",
+        event_index=1,
+        observed_at="2026-07-12T12:00:01Z",
+        process_identity={
+            "pid": 1234,
+            "process_group_id": 1234,
+            "process_start_identity": "pid:1234:start:99",
+        },
+    ).to_public_dict()
+    events = [
+        _event(
+            1,
+            "worker_progress",
+            status="recorded",
+            payload={"cli_agent_run_receipt": accepted},
+        ),
+        _event(
+            2,
+            "worker_progress",
+            status="recorded",
+            payload={"cli_agent_run_receipt": started},
+        ),
+    ]
+
+    projection = build_contract_state_projection(
+        events,
+        contract={"required_evidence": ["implementation"]},
+        backlog_row={"bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+
+    assert len(projection["cli_agent_run_receipts"]) == 2
+    assert projection["cli_agent_run_state"]["runs"][0]["state"] == "started"
+    assert projection["cli_agent_run_state"]["governance_authority"] is False
+    assert projection["completed_evidence"] == []
+    assert projection["missing_evidence"] == ["implementation"]
+
+
 def _strict_mf_parallel_contract() -> dict:
     return {
         "contract": {

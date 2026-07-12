@@ -109,6 +109,7 @@ MF_NON_CLOSE_COORDINATION_EVENT_KINDS = {
     "no_progress_timeout",
     "record_blocker",
     "route_identity_cleanup",
+    "worker_progress",
 }
 
 MF_CLOSE_PASS_STATUSES = {
@@ -1344,6 +1345,103 @@ def record_event(
     )
     _publish_timeline_event(inserted)
     return inserted
+
+
+def _cli_agent_run_receipt_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return {}
+    receipt = payload.get("cli_agent_run_receipt")
+    return dict(receipt) if isinstance(receipt, Mapping) else {}
+
+
+def project_cli_agent_run_receipt(
+    receipt: Mapping[str, Any],
+    existing_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate one service receipt and map it to non-close timeline vocabulary."""
+
+    from agent.cli_agent_service.evidence import (
+        CliAgentRunReceipt,
+        RUN_RECEIPT_TERMINAL_STATES,
+    )
+
+    normalized = CliAgentRunReceipt.from_public_dict(receipt).to_public_dict()
+    run_events: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for event in existing_events or []:
+        if not isinstance(event, dict):
+            continue
+        existing_receipt = _cli_agent_run_receipt_from_event(event)
+        if existing_receipt.get("run_id") == normalized["run_id"]:
+            run_events.append((event, existing_receipt))
+
+    for event, existing_receipt in run_events:
+        if existing_receipt.get("receipt_id") != normalized["receipt_id"]:
+            continue
+        if existing_receipt.get("receipt_hash") != normalized["receipt_hash"]:
+            raise ValueError("CLI agent run receipt id was reused with new content")
+        return {
+            "decision": "duplicate",
+            "receipt": normalized,
+            "existing_event": event,
+            "idempotent": True,
+        }
+
+    ordered = sorted(
+        run_events,
+        key=lambda item: int(item[1].get("event_index", -1)),
+    )
+    previous = ordered[-1][1] if ordered else {}
+    expected_index = int(previous.get("event_index", -1)) + 1
+    if normalized["event_index"] != expected_index:
+        raise ValueError("CLI agent run receipt event_index is out of order")
+    previous_state = str(previous.get("state") or "")
+    if previous_state in RUN_RECEIPT_TERMINAL_STATES:
+        raise ValueError("CLI agent run receipt follows a terminal state")
+    allowed_states = (
+        {"accepted"}
+        if not previous_state
+        else {"started"}
+        if previous_state == "accepted"
+        else {"heartbeat", *RUN_RECEIPT_TERMINAL_STATES}
+    )
+    if normalized["state"] not in allowed_states:
+        raise ValueError("CLI agent run receipt state is out of order")
+
+    return {
+        "decision": "append",
+        "idempotent": False,
+        "receipt": normalized,
+        "event": {
+            "event_type": "cli_agent.run_receipt",
+            "event_kind": "worker_progress",
+            "phase": "runtime",
+            "actor": "cli-agent-service",
+            "status": "recorded",
+            "correlation_id": "cli-agent-run:{}".format(normalized["run_id"]),
+            "payload": {
+                "cli_agent_run_receipt": normalized,
+                "runtime_context_id": normalized["runtime_context_id"],
+                "operational_state_only": True,
+                "governance_authority": False,
+                "close_authority": False,
+            },
+            "verification": {
+                "schema_version": "cli_agent_run_receipt_projection.v1",
+                "receipt_id": normalized["receipt_id"],
+                "receipt_hash": normalized["receipt_hash"],
+                "event_index": normalized["event_index"],
+                "state": normalized["state"],
+                "operational_state_only": True,
+                "governance_authority": False,
+            },
+            "artifact_refs": {
+                "ticket_id": normalized["ticket_id"],
+                "ticket_hash": normalized["ticket_hash"],
+                "runtime_context_id": normalized["runtime_context_id"],
+            },
+        },
+    }
 
 
 class _TimelineWriteQueue:

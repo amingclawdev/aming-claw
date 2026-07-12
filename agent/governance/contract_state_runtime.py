@@ -4687,6 +4687,54 @@ def _legacy_hotfix_post_action_step(
     }
 
 
+def _cli_agent_run_state_projection(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Project accepted CLI service facts without promoting evidence authority."""
+
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+
+    receipts: list[dict[str, Any]] = []
+    for event in events:
+        if str(event.get("event_kind") or "").strip() != "worker_progress":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        candidate = payload.get("cli_agent_run_receipt")
+        if not isinstance(candidate, Mapping):
+            continue
+        try:
+            receipt = CliAgentRunReceipt.from_public_dict(candidate).to_public_dict()
+        except (TypeError, ValueError):
+            continue
+        receipts.append(
+            {
+                **receipt,
+                "timeline_event_ref": _event_ref_id(event),
+            }
+        )
+    receipts.sort(
+        key=lambda item: (
+            str(item.get("run_id") or ""),
+            int(item.get("event_index") or 0),
+            str(item.get("timeline_event_ref") or ""),
+        )
+    )
+    latest_by_run: dict[str, dict[str, Any]] = {}
+    for receipt in receipts:
+        latest_by_run[str(receipt["run_id"])] = receipt
+    return {
+        "schema_version": "cli_agent_run_state_projection.v1",
+        "source": "task_timeline.worker_progress",
+        "operational_state_only": True,
+        "governance_authority": False,
+        "close_authority": False,
+        "receipts": receipts,
+        "runs": [latest_by_run[run_id] for run_id in sorted(latest_by_run)],
+    }
+
+
 def build_contract_state_projection(
     events: list[dict[str, Any]] | None,
     contract: Mapping[str, Any] | None = None,
@@ -6327,6 +6375,7 @@ def build_contract_state_projection(
         next_legal_action=next_legal_action,
         runtime_hints=runtime_contract_hints,
     )
+    cli_agent_run_state = _cli_agent_run_state_projection(rows)
 
     return {
         "schema_version": schema_version,
@@ -6355,6 +6404,8 @@ def build_contract_state_projection(
         "active_lane_contract": active_lane_contract,
         "runtime_contract_hints": runtime_contract_hints,
         "executable_contract": executable_contract,
+        "cli_agent_run_receipts": cli_agent_run_state["receipts"],
+        "cli_agent_run_state": cli_agent_run_state,
         "completed_contract_executions": completed_contract_executions,
         "required_evidence": [step["id"] for step in requirement_steps],
         "conditional_required_evidence": conditional_groups,

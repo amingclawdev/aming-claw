@@ -64098,6 +64098,70 @@ def _timeline_trusted_runtime_context_worker_proof(
     return bool(proof_worker and payload_worker and proof_worker == payload_worker)
 
 
+@route(
+    "POST",
+    "/api/graph-governance/{project_id}/cli-agent/run-receipts",
+)
+def handle_cli_agent_run_receipt(ctx: RequestContext):
+    """Ingest one public-safe service fact as non-close worker progress."""
+
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+    from . import task_timeline
+
+    project_id = ctx.get_project_id()
+    raw_receipt = ctx.body.get("receipt") or ctx.body.get("cli_agent_run_receipt")
+    if not isinstance(raw_receipt, Mapping):
+        raise ValidationError("receipt is required")
+    try:
+        receipt = CliAgentRunReceipt.from_public_dict(raw_receipt).to_public_dict()
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
+    correlation_id = "cli-agent-run:{}".format(receipt["run_id"])
+    conn = get_connection(project_id)
+    try:
+        existing = task_timeline.list_events(
+            conn,
+            project_id,
+            correlation_id=correlation_id,
+            limit=1000,
+        )
+        try:
+            projection = task_timeline.project_cli_agent_run_receipt(
+                receipt,
+                existing,
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        if projection["decision"] == "duplicate":
+            return {
+                **projection["existing_event"],
+                "receipt_ingestion": {
+                    "decision": "duplicate",
+                    "idempotent": True,
+                    "governance_authority": False,
+                },
+            }
+        event = projection["event"]
+        recorded = task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=str(ctx.body.get("backlog_id") or "").strip(),
+            task_id=str(ctx.body.get("task_id") or "").strip(),
+            **event,
+        )
+        conn.commit()
+        return {
+            **recorded,
+            "receipt_ingestion": {
+                "decision": "appended",
+                "idempotent": False,
+                "governance_authority": False,
+            },
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
