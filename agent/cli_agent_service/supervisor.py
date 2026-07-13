@@ -23,6 +23,12 @@ from .evidence import (
     hash_file,
     hash_text,
 )
+from .launchers import (
+    HostEnvelopeStore,
+    child_process_environment,
+    clear_worker_auth_environment,
+    default_host_envelope_store,
+)
 from .models import AgentRun, ReconciliationResult
 from .registry import AgentRegistry, process_start_identity
 
@@ -95,6 +101,7 @@ class CodexC0Supervisor:
         process_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
         process_identity_reader: Callable[[int], str | None] = process_start_identity,
         run_receipt_sink: Callable[[dict[str, Any]], Any] | None = None,
+        host_envelope_store: HostEnvelopeStore | None = None,
     ) -> None:
         self.registry = registry
         self.state_dir = Path(state_dir).expanduser()
@@ -106,6 +113,11 @@ class CodexC0Supervisor:
         self.cancellation_grace_seconds = max(float(cancellation_grace_seconds), 0.05)
         self.process_factory = process_factory
         self.process_identity_reader = process_identity_reader
+        self.host_envelope_store = (
+            host_envelope_store
+            if host_envelope_store is not None
+            else default_host_envelope_store()
+        )
         self.receipt_journal = RunReceiptJournal(self.state_dir / "run-receipts")
         self.run_receipt_sink = run_receipt_sink
         self.owner_id = "cli-agent-host-{}".format(os.getpid())
@@ -220,16 +232,25 @@ class CodexC0Supervisor:
             stderr_handle = stderr_path.open("w+", encoding="utf-8")
             os.chmod(stdout_path, 0o600)
             os.chmod(stderr_path, 0o600)
-            process = self.process_factory(
-                list(launch.command),
-                stdin=subprocess.PIPE,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-                cwd=launch.cwd,
-                env=launch.environment,
-                start_new_session=True,
-            )
+            spawn_environment = child_process_environment(launch.environment)
+            host_envelope = self.host_envelope_store.consume(run.run_id)
+            try:
+                if host_envelope is not None:
+                    host_envelope.apply_to(spawn_environment)
+                process = self.process_factory(
+                    list(launch.command),
+                    stdin=subprocess.PIPE,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    text=True,
+                    cwd=launch.cwd,
+                    env=spawn_environment,
+                    start_new_session=True,
+                )
+            finally:
+                clear_worker_auth_environment(spawn_environment)
+                if host_envelope is not None:
+                    host_envelope.discard()
             process_group_id = os.getpgid(process.pid) if os.name != "nt" else process.pid
             identity = self._process_identity(process.pid)
             self.registry.record_process_start(

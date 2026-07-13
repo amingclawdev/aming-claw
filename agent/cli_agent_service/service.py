@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .health import health_payload, stopped_payload
+from .launchers import (
+    HostEnvelopeError,
+    HostEnvelopeStore,
+    default_host_envelope_store,
+    scrub_host_envelope_payload,
+)
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -69,6 +75,12 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _wipe_buffer(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0
+    value.clear()
+
+
 def read_status(paths: ServicePaths) -> dict[str, Any]:
     try:
         value = json.loads(paths.status_path.read_text(encoding="utf-8"))
@@ -81,11 +93,19 @@ def request_service(
     paths: ServicePaths,
     operation: str,
     *,
+    payload: Mapping[str, Any] | None = None,
     timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    request = json.dumps({"operation": str(operation)}, separators=(",", ":")).encode("utf-8") + b"\n"
+    request_value: dict[str, Any] = {"operation": str(operation)}
+    if payload is not None:
+        request_value["payload"] = payload
+    serialized = json.dumps(request_value, separators=(",", ":")) + "\n"
+    request = bytearray(serialized.encode("utf-8"))
+    del serialized
     response = bytearray()
     try:
+        if len(request) > MAX_REQUEST_BYTES:
+            raise ServiceError("CLI Agent Service request exceeded the size limit")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(max(float(timeout_seconds), 0.05))
             client.connect(str(paths.socket_path))
@@ -99,15 +119,20 @@ def request_service(
                     break
     except (FileNotFoundError, ConnectionError, OSError, socket.timeout) as exc:
         raise ServiceUnavailableError("CLI Agent Service is not reachable") from exc
-    if len(response) > MAX_REQUEST_BYTES:
-        raise ServiceError("CLI Agent Service response exceeded the size limit")
+    finally:
+        _wipe_buffer(request)
+        scrub_host_envelope_payload(request_value)
     try:
-        payload = json.loads(bytes(response).split(b"\n", 1)[0].decode("utf-8"))
+        if len(response) > MAX_REQUEST_BYTES:
+            raise ServiceError("CLI Agent Service response exceeded the size limit")
+        result = json.loads(bytes(response).split(b"\n", 1)[0].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ServiceError("CLI Agent Service returned an invalid response") from exc
-    if not isinstance(payload, dict):
+    finally:
+        _wipe_buffer(response)
+    if not isinstance(result, dict):
         raise ServiceError("CLI Agent Service returned an invalid response object")
-    return payload
+    return result
 
 
 def current_status(paths: ServicePaths) -> dict[str, Any]:
@@ -123,12 +148,22 @@ def current_status(paths: ServicePaths) -> dict[str, Any]:
 class CliAgentService:
     """Foreground Unix-socket service intended to be supervised by launchd."""
 
-    def __init__(self, paths: ServicePaths) -> None:
+    def __init__(
+        self,
+        paths: ServicePaths,
+        *,
+        host_envelope_store: HostEnvelopeStore | None = None,
+    ) -> None:
         self.paths = paths
         self.started_at = datetime.now(timezone.utc)
         self.pid = os.getpid()
         self._stop_event = threading.Event()
         self._server: socket.socket | None = None
+        self.host_envelope_store = (
+            host_envelope_store
+            if host_envelope_store is not None
+            else default_host_envelope_store()
+        )
 
     def _snapshot(self, *, stopping: bool = False) -> dict[str, Any]:
         return health_payload(
@@ -150,16 +185,19 @@ class CliAgentService:
 
     def _read_request(self, connection: socket.socket) -> dict[str, Any]:
         data = bytearray()
-        while len(data) <= MAX_REQUEST_BYTES:
-            chunk = connection.recv(4096)
-            if not chunk:
-                break
-            data.extend(chunk)
-            if b"\n" in chunk:
-                break
-        if len(data) > MAX_REQUEST_BYTES:
-            raise ServiceError("request exceeded the size limit")
-        value = json.loads(bytes(data).split(b"\n", 1)[0].decode("utf-8"))
+        try:
+            while len(data) <= MAX_REQUEST_BYTES:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b"\n" in chunk:
+                    break
+            if len(data) > MAX_REQUEST_BYTES:
+                raise ServiceError("request exceeded the size limit")
+            value = json.loads(bytes(data).split(b"\n", 1)[0].decode("utf-8"))
+        finally:
+            _wipe_buffer(data)
         if not isinstance(value, dict):
             raise ServiceError("request must be a JSON object")
         return value
@@ -170,21 +208,56 @@ class CliAgentService:
             return self._snapshot(), False
         if operation == "stop":
             return self._snapshot(stopping=True), True
+        if operation == "host_envelope":
+            payload = request.get("payload")
+            if not isinstance(payload, Mapping):
+                raise ServiceError("host envelope payload must be an object")
+            action = str(payload.get("action") or "stage").strip().lower()
+            run_id = str(payload.get("run_id") or "").strip()
+            if action == "stage":
+                summary = self.host_envelope_store.stage(
+                    run_id,
+                    payload.get("host_envelope"),
+                    ttl_seconds=payload.get("ttl_seconds"),
+                    expires_at=payload.get("expires_at"),
+                )
+                return {"ok": True, **summary}, False
+            if action == "revoke":
+                summary = self.host_envelope_store.revoke(
+                    run_id,
+                    envelope_ref=str(payload.get("envelope_ref") or ""),
+                )
+                return {"ok": True, **summary}, False
+            raise ServiceError("unsupported host envelope action")
         return {
             "ok": False,
             "status": "invalid_request",
             "error": "unsupported operation",
-            "allowed_operations": ["health", "status", "stop"],
+            "allowed_operations": ["health", "status", "stop", "host_envelope"],
         }, False
 
     def _handle_connection(self, connection: socket.socket) -> None:
         should_stop = False
+        request: dict[str, Any] = {}
         try:
             request = self._read_request(connection)
             response, should_stop = self._dispatch(request)
-        except (ServiceError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        except (
+            HostEnvelopeError,
+            ServiceError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            OSError,
+        ) as exc:
             response = {"ok": False, "status": "invalid_request", "error": str(exc)}
-        connection.sendall(json.dumps(response, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+        finally:
+            scrub_host_envelope_payload(request)
+        serialized = json.dumps(
+            response,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        connection.sendall(serialized + b"\n")
         if should_stop:
             self._stop_event.set()
 
@@ -203,6 +276,7 @@ class CliAgentService:
             self._server = server
             _write_json(self.paths.status_path, self._snapshot())
             while not self._stop_event.is_set():
+                self.host_envelope_store.purge_expired()
                 try:
                     connection, _ = server.accept()
                 except socket.timeout:
@@ -210,6 +284,7 @@ class CliAgentService:
                 with connection:
                     self._handle_connection(connection)
         finally:
+            self.host_envelope_store.revoke_all()
             self._server = None
             server.close()
             self.paths.socket_path.unlink(missing_ok=True)

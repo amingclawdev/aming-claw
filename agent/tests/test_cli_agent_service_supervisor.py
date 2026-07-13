@@ -1,6 +1,9 @@
+import hmac
 import json
 import os
+import secrets
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -102,12 +105,23 @@ def _fake_codex(tmp_path):
     return path
 
 
-def _supervisor(tmp_path, *, run_receipt_sink=None):
+def _supervisor(
+    tmp_path,
+    *,
+    run_receipt_sink=None,
+    process_factory=None,
+    host_envelope_store=None,
+):
     from cli_agent_service.adapters.codex_cli import CodexCliAdapter
     from cli_agent_service.registry import AgentRegistry
     from cli_agent_service.supervisor import CodexC0Supervisor
 
     registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    kwargs = {}
+    if process_factory is not None:
+        kwargs["process_factory"] = process_factory
+    if host_envelope_store is not None:
+        kwargs["host_envelope_store"] = host_envelope_store
     supervisor = CodexC0Supervisor(
         registry,
         state_dir=tmp_path / "state",
@@ -116,6 +130,7 @@ def _supervisor(tmp_path, *, run_receipt_sink=None):
         lease_ttl_seconds=2,
         cancellation_grace_seconds=0.1,
         run_receipt_sink=run_receipt_sink,
+        **kwargs,
     )
     return registry, supervisor
 
@@ -252,6 +267,94 @@ def test_supervisor_emits_spawn_failure_when_process_identity_is_unobservable(
     stored = registry.get_run(run.run_id)
     assert stored.state == "failed"
     assert stored.failure_category == "spawn_error"
+
+
+def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeypatch):
+    from cli_agent_service.launchers import (
+        HostEnvelopeStore,
+        WORKER_FENCE_TOKEN_ENV,
+        WORKER_SESSION_TOKEN_ENV,
+    )
+
+    session_token = secrets.token_urlsafe(32)
+    fence_token = secrets.token_urlsafe(32)
+    monkeypatch.setenv(WORKER_SESSION_TOKEN_ENV, secrets.token_urlsafe(32))
+    monkeypatch.setenv(WORKER_FENCE_TOKEN_ENV, secrets.token_urlsafe(32))
+    class TrackingStore(HostEnvelopeStore):
+        last_delivery = None
+
+        def consume(self, run_id):
+            self.last_delivery = super().consume(run_id)
+            return self.last_delivery
+
+    store = TrackingStore()
+    envelope = {
+        "schema_version": "mf_subagent_initial_join_host_envelope.v1",
+        "runtime_context_id": "mfrctx-supervisor-envelope",
+        "task_id": "worker-supervisor-envelope",
+        "parent_task_id": "parent-supervisor-envelope",
+        "worker_role": "mf_sub",
+        "session_token_ref": "wstok-" + secrets.token_hex(16),
+        "env": {
+            WORKER_SESSION_TOKEN_ENV: session_token,
+            WORKER_FENCE_TOKEN_ENV: fence_token,
+        },
+    }
+    store.stage("run-host-envelope", envelope, ttl_seconds=30)
+    observed = {}
+
+    def recording_process_factory(*args, **kwargs):
+        environment = kwargs["env"]
+        observed["session_matches"] = hmac.compare_digest(
+            environment.get(WORKER_SESSION_TOKEN_ENV, ""),
+            session_token,
+        )
+        observed["fence_matches"] = hmac.compare_digest(
+            environment.get(WORKER_FENCE_TOKEN_ENV, ""),
+            fence_token,
+        )
+        observed["parent_environment"] = environment
+        return subprocess.Popen(*args, **kwargs)
+
+    registry, supervisor = _supervisor(
+        tmp_path,
+        process_factory=recording_process_factory,
+        host_envelope_store=store,
+    )
+    run = _run("run-host-envelope")
+    handle = supervisor.start_run(
+        run,
+        prompt="Use the copy-safe runtime context and token reference.",
+        worktree=tmp_path,
+        execution_ticket=_execution_ticket(run),
+    )
+
+    assert observed["session_matches"] is True
+    assert observed["fence_matches"] is True
+    assert WORKER_SESSION_TOKEN_ENV not in observed["parent_environment"]
+    assert WORKER_FENCE_TOKEN_ENV not in observed["parent_environment"]
+    assert store.pending_count() == 0
+    assert store.last_delivery is not None
+    assert not store.last_delivery._environment
+    receipt = handle.wait(timeout=5)
+    assert receipt.status == "completed"
+
+    public_artifacts = json.dumps(
+        {
+            "run": registry.get_run(run.run_id).to_public_dict(),
+            "receipt": receipt.to_public_dict(),
+            "run_receipts": supervisor.run_receipts(run.run_id),
+        },
+        sort_keys=True,
+    )
+    if session_token in public_artifacts or fence_token in public_artifacts:
+        raise AssertionError("raw worker auth escaped into a public artifact")
+    for path in tmp_path.rglob("*"):
+        if not path.is_file():
+            continue
+        contents = path.read_bytes()
+        if session_token.encode() in contents or fence_token.encode() in contents:
+            raise AssertionError("raw worker auth was persisted to disk")
 
 
 def test_restart_reconcile_emits_lost_run_receipt_from_durable_journal(tmp_path):
