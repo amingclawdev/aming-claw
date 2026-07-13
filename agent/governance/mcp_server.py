@@ -55,6 +55,13 @@ _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
 }
+_WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
+    {
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    }
+)
 
 
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -372,6 +379,20 @@ def _worker_auth_from_env(args: dict) -> dict:
             raise ValueError("worker tool auth conflicts with the host environment")
         enriched[field] = value
     return enriched
+
+
+def _worker_host_envelope_present() -> bool:
+    return any(env_key in os.environ for env_key in _WORKER_AUTH_ENV_FIELDS.values())
+
+
+def _tools_for_current_process() -> list[dict]:
+    if not _worker_host_envelope_present():
+        return TOOLS
+    return [
+        tool
+        for tool in TOOLS
+        if str(tool.get("name") or "") not in _WORKER_MCP_HOST_ONLY_TOOLS
+    ]
 
 
 def _runtime_context_schema_properties() -> dict[str, Any]:
@@ -2429,6 +2450,8 @@ def _http_with_optional_gov_token(
 # ---------------------------------------------------------------------------
 
 def _dispatch_tool(name: str, args: dict) -> Any:
+    if _worker_host_envelope_present() and name in _WORKER_MCP_HOST_ONLY_TOOLS:
+        raise ValueError("host-only authentication tool is unavailable in worker MCP")
     """Dispatch a tools/call to the governance HTTP API."""
     if name == "gov_node_list":
         pid = args["project_id"]
@@ -3001,7 +3024,7 @@ def _handle(raw: str) -> None:
     # tools/list
     # -----------------------------------------------------------------------
     if method == "tools/list":
-        _response(req_id, {"tools": TOOLS})
+        _response(req_id, {"tools": _tools_for_current_process()})
         return
 
     # -----------------------------------------------------------------------

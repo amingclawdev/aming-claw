@@ -31,7 +31,7 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from mcp.tools import TOOLS, ToolDispatcher
+from mcp.tools import TOOLS, ToolDispatcher, tools_for_current_process
 from mcp.executor import WorkerPool
 from mcp.events import EventBridge
 
@@ -712,7 +712,7 @@ class AmingClawMCP:
 
         # --- tools/list ---
         if method == "tools/list":
-            _response(req_id, {"tools": TOOLS})
+            _response(req_id, {"tools": tools_for_current_process(TOOLS)})
             return
 
         # --- resources/list ---

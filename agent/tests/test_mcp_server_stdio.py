@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,6 +23,7 @@ def _run_mcp_probe(
     messages: list[dict],
     *,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
     cwd: Path = ROOT,
 ) -> tuple[list[dict], str, int]:
     args = [
@@ -40,6 +42,7 @@ def _run_mcp_probe(
     proc = subprocess.Popen(
         args,
         cwd=cwd,
+        env={**os.environ, **(extra_env or {})},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -75,6 +78,110 @@ def test_mcp_stdio_initialize_and_health_survive_missing_governance():
     text = responses[1]["result"]["content"][0]["text"]
     payload = json.loads(text)
     assert "error" in payload
+
+
+def test_worker_mcp_hides_and_rejects_host_only_auth_tools():
+    raw_session = "worker-session-must-not-echo"
+    raw_fence = "worker-fence-must-not-echo"
+    responses, stderr, returncode = _run_mcp_probe(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_session_token_initial_join",
+                    "arguments": {
+                        "project_id": "aming-claw",
+                        "runtime_context_id": "mfrctx-worker-filter",
+                        "task_id": "worker-filter-task",
+                        "reason": "must be rejected before HTTP",
+                    },
+                },
+            },
+        ],
+        extra_env={
+            "AMING_WORKER_SESSION_TOKEN": raw_session,
+            "AMING_WORKER_FENCE_TOKEN": raw_fence,
+        },
+    )
+
+    assert returncode == 0
+    tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
+    assert not {
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    } & tool_names
+    assert responses[2]["error"]["message"] == (
+        "host-only authentication tool is unavailable in worker MCP"
+    )
+    serialized = json.dumps(responses, sort_keys=True) + stderr
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
+@pytest.mark.parametrize(
+    "present_env_key",
+    ["AMING_WORKER_SESSION_TOKEN", "AMING_WORKER_FENCE_TOKEN"],
+)
+def test_worker_mcp_filters_host_tools_when_auth_env_key_is_empty(present_env_key):
+    responses, stderr, returncode = _run_mcp_probe(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_session_token_initial_join",
+                    "arguments": {
+                        "project_id": "aming-claw",
+                        "runtime_context_id": "mfrctx-worker-filter",
+                        "task_id": "worker-filter-task",
+                        "reason": "must be rejected before HTTP",
+                    },
+                },
+            },
+        ],
+        extra_env={present_env_key: ""},
+    )
+
+    assert returncode == 0
+    tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
+    assert "runtime_context_session_token_initial_join" not in tool_names
+    assert responses[2]["error"]["message"] == (
+        "host-only authentication tool is unavailable in worker MCP"
+    )
+    assert stderr == ""
+
+
+def test_standalone_worker_mcp_filters_and_dispatch_rejects_host_only_tools(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "standalone-session")
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", "standalone-fence")
+
+    tool_names = {
+        tool["name"] for tool in governance_mcp_server._tools_for_current_process()
+    }
+    assert "runtime_context_session_token_initial_join" not in tool_names
+    with pytest.raises(
+        ValueError,
+        match="host-only authentication tool is unavailable in worker MCP",
+    ):
+        governance_mcp_server._dispatch_tool(
+            "runtime_context_session_token_initial_join",
+            {
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-worker-filter",
+                "task_id": "worker-filter-task",
+                "reason": "must be rejected before HTTP",
+            },
+        )
 
 
 def test_parallel_branch_merge_queue_apply_schemas_expose_branch_ref():

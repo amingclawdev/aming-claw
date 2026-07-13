@@ -30,6 +30,13 @@ _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
 }
+WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
+    {
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    }
+)
 
 
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -351,6 +358,20 @@ def _worker_auth_from_env(args: dict) -> dict:
             raise ValueError("worker tool auth conflicts with the host environment")
         enriched[field] = value
     return enriched
+
+
+def worker_host_envelope_present() -> bool:
+    return any(env_key in os.environ for env_key in _WORKER_AUTH_ENV_FIELDS.values())
+
+
+def tools_for_current_process(tools: list[dict]) -> list[dict]:
+    if not worker_host_envelope_present():
+        return tools
+    return [
+        tool
+        for tool in tools
+        if str(tool.get("name") or "") not in WORKER_MCP_HOST_ONLY_TOOLS
+    ]
 
 
 def _runtime_context_schema_properties() -> dict[str, Any]:
@@ -3784,6 +3805,8 @@ class ToolDispatcher:
 
     def dispatch(self, name: str, args: dict) -> Any:
         args = dict(args or {})
+        if worker_host_envelope_present() and name in WORKER_MCP_HOST_ONLY_TOOLS:
+            raise ValueError("host-only authentication tool is unavailable in worker MCP")
         # --- Task tools ---
         if name == "task_create":
             pid = args["project_id"]
