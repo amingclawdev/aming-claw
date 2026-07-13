@@ -330,13 +330,7 @@ class CliAgentService:
             raise ServiceError(
                 "Desktop ticket admission state revision is invalid"
             ) from exc
-        if expected_revision <= 0 or any(
-            not str(payload.get(field) or "").strip()
-            for field in (
-                "expected_execution_state_hash",
-                "expected_dispatch_identity_hash",
-            )
-        ):
+        if expected_revision <= 0:
             raise ServiceError(
                 "Desktop ticket admission requires current authority coordinates"
             )

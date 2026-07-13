@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,6 +145,58 @@ def test_daemon_socket_rejects_caller_owned_desktop_authority(tmp_path):
             except Exception:
                 process.terminate()
             process.wait(timeout=5)
+
+
+def test_daemon_socket_admits_when_optional_authority_hashes_are_omitted(tmp_path):
+    from agent.tests.test_cli_agent_service_desktop import (
+        _admission_payload,
+        _ticket,
+    )
+    from cli_agent_service.service import (
+        CliAgentService,
+        ServicePaths,
+        request_service,
+    )
+
+    paths = ServicePaths.from_state_dir(tmp_path / "private-state")
+    ticket = _ticket()
+    resolver_requests = []
+
+    def resolver(request):
+        resolver_requests.append(dict(request))
+        return dict(ticket)
+
+    service = CliAgentService(paths)
+    service._contract_runtime_authority_resolver = resolver
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _wait_for(paths.socket_path)
+        payload = _admission_payload()
+        payload.pop("expected_execution_state_hash")
+        payload.pop("expected_dispatch_identity_hash")
+
+        response = request_service(
+            paths,
+            "desktop_execution_ticket_admit",
+            payload=payload,
+        )
+
+        assert response["ok"] is True
+        assert response["status"] == "admitted"
+        assert response["execution_ticket"] == ticket
+        assert resolver_requests == [
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"host_kind", "now_iso"}
+            }
+        ]
+    finally:
+        if thread.is_alive():
+            request_service(paths, "stop")
+        thread.join(timeout=5)
+        assert thread.is_alive() is False
 
 
 def test_daemon_is_not_coupled_to_service_manager():

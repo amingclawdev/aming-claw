@@ -262,20 +262,100 @@ def test_service_resolves_canonical_ticket_and_preserves_desktop_lifecycle(tmp_p
     assert "session_token_surrogate" not in joined["registered_host_adapter_spawn"]
 
 
+@pytest.mark.parametrize(
+    "omitted_fields",
+    [
+        pytest.param((), id="matching-both"),
+        pytest.param(
+            ("expected_execution_state_hash",),
+            id="omit-state-hash",
+        ),
+        pytest.param(
+            ("expected_dispatch_identity_hash",),
+            id="omit-dispatch-hash",
+        ),
+        pytest.param(
+            (
+                "expected_execution_state_hash",
+                "expected_dispatch_identity_hash",
+            ),
+            id="omit-both",
+        ),
+    ],
+)
+def test_matching_or_omitted_optional_authority_hashes_use_resolver(
+    tmp_path,
+    omitted_fields,
+) -> None:
+    ticket = _ticket()
+    resolver_requests: list[dict[str, object]] = []
+
+    def resolver(request):
+        resolver_requests.append(dict(request))
+        return deepcopy(ticket)
+
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "optional-hashes"),
+    )
+    service._contract_runtime_authority_resolver = resolver
+    payload = _admission_payload()
+    for field in omitted_fields:
+        payload.pop(field)
+
+    admitted, _ = service._dispatch(
+        {"operation": "desktop_execution_ticket_admit", "payload": payload}
+    )
+
+    assert admitted["status"] == "admitted"
+    assert admitted["execution_ticket"] == ticket
+    assert resolver_requests == [
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"host_kind", "now_iso"}
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+    ],
+)
+def test_supplied_mismatched_optional_authority_hash_fails_closed(
+    tmp_path,
+    field,
+) -> None:
+    resolver_calls: list[dict[str, object]] = []
+
+    def resolver(request):
+        resolver_calls.append(dict(request))
+        return _ticket()
+
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / field),
+    )
+    service._contract_runtime_authority_resolver = resolver
+    payload = _admission_payload()
+    payload[field] = "sha256:" + "f" * 64
+
+    with pytest.raises(ServiceError, match="stale or mismatched authority"):
+        service._dispatch(
+            {"operation": "desktop_execution_ticket_admit", "payload": payload}
+        )
+    assert resolver_calls == [
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"host_kind", "now_iso"}
+        }
+    ]
+
+
 def test_missing_or_stale_server_authority_fails_closed(tmp_path) -> None:
     payload = _admission_payload()
-    missing_coordinates = CliAgentService(
-        ServicePaths.from_state_dir(tmp_path / "missing-coordinates")
-    )
-    incomplete_payload = dict(payload)
-    incomplete_payload.pop("expected_dispatch_identity_hash")
-    with pytest.raises(ServiceError, match="current authority coordinates"):
-        missing_coordinates._dispatch(
-            {
-                "operation": "desktop_execution_ticket_admit",
-                "payload": incomplete_payload,
-            }
-        )
 
     unavailable = CliAgentService(
         ServicePaths.from_state_dir(tmp_path / "unavailable"),
