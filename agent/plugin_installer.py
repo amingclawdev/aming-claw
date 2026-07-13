@@ -630,7 +630,7 @@ def install_codex_marketplace(
     root = Path(marketplace_root).expanduser() if marketplace_root else default_codex_marketplace_root()
     root = root.resolve()
     agents_root = root / ".agents" / "plugins"
-    plugin_target = agents_root / CODEX_PLUGIN_NAME
+    plugin_target = root / CODEX_PLUGIN_NAME
     if commands is not None:
         commands.append(CommandRecord(args=["install-codex-marketplace", str(root)], skipped=dry_run))
     if dry_run:
@@ -1877,7 +1877,8 @@ def _validate_codex_runtime_config(config_path: Path) -> tuple[bool, str]:
 
 
 def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
-    marketplace_path = root / ".agents" / "plugins" / "marketplace.json"
+    marketplace_root = root.expanduser().resolve()
+    marketplace_path = marketplace_root / ".agents" / "plugins" / "marketplace.json"
     try:
         marketplace = _read_json_file(marketplace_path)
     except Exception as exc:
@@ -1897,7 +1898,6 @@ def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
     raw_path = str(source.get("path") or "").strip()
     if not raw_path:
         return False, f"{marketplace_path}: missing source.path"
-    marketplace_root = marketplace_path.parent.resolve()
     resolved = (marketplace_root / raw_path).resolve()
     if not _is_relative_to(resolved, marketplace_root):
         return False, f"{marketplace_path}: source.path {raw_path!r} escapes marketplace root"

@@ -19,6 +19,7 @@ from agent.plugin_installer import (
     _check_claude_marketplace,
     _load_toml_text,
     _upsert_toml_table,
+    _validate_codex_marketplace_root,
     classify_plugin_changed_surfaces,
     configure_codex_plugin,
     default_plugin_update_state_path,
@@ -668,7 +669,11 @@ def test_install_codex_plugin_cache_replaces_existing_symlink_payload(tmp_path):
 def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
     _write_plugin_fixture(tmp_path)
     marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
-    plugin_target = marketplace_root / ".agents" / "plugins" / "aming-claw"
+    plugin_target = marketplace_root / "aming-claw"
+    marketplace = json.loads(
+        (marketplace_root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+    )
+    assert (marketplace_root / marketplace["plugins"][0]["source"]["path"]).resolve() == plugin_target
     linked_payload = tmp_path / "linked-marketplace-payload"
     linked_payload.mkdir()
     (plugin_target / "skills").rename(plugin_target / "skills-old")
@@ -684,6 +689,19 @@ def test_install_codex_marketplace_replaces_existing_symlink_payload(tmp_path):
     assert (plugin_target / "skills" / "aming-claw-onboard" / "SKILL.md").is_file()
     assert (plugin_target / "Archive" / "skills" / "index.json").is_file()
     assert (plugin_target / ".codex" / "config.toml").is_file()
+
+
+def test_codex_marketplace_validator_uses_registered_marketplace_root(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
+    plugin_target = marketplace_root / "aming-claw"
+    legacy_nested_target = marketplace_root / ".agents" / "plugins" / "aming-claw"
+    plugin_target.rename(legacy_nested_target)
+
+    ok, detail = _validate_codex_marketplace_root(marketplace_root)
+
+    assert ok is False
+    assert "source.path './aming-claw' has no .codex-plugin/plugin.json" in detail
 
 
 def test_doctor_plugin_fails_when_cache_payload_is_partial(tmp_path):
@@ -746,7 +764,7 @@ def test_doctor_plugin_fails_when_marketplace_codex_runtime_config_is_missing(tm
         codex_config=codex_home / "config.toml",
         marketplace_root=marketplace_root,
     )
-    (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".codex" / "config.toml").unlink()
+    (marketplace_target / "aming-claw" / ".codex" / "config.toml").unlink()
 
     result = doctor_plugin(
         plugin_root=tmp_path,
@@ -781,11 +799,11 @@ def test_codex_install_surfaces_do_not_write_external_project_cwd(tmp_path, monk
 
     assert (cache_target / ".mcp.json").is_file()
     assert (cache_target / ".codex" / "config.toml").is_file()
-    assert (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".mcp.json").is_file()
-    assert (marketplace_target / ".agents" / "plugins" / "aming-claw" / ".codex" / "config.toml").is_file()
+    assert (marketplace_target / "aming-claw" / ".mcp.json").is_file()
+    assert (marketplace_target / "aming-claw" / ".codex" / "config.toml").is_file()
     assert (cache_target / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs").is_file()
     assert (
-        marketplace_target / ".agents" / "plugins" / "aming-claw" / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs"
+        marketplace_target / "aming-claw" / "frontend" / "dashboard" / "scripts" / "e2e-hn-demo.mjs"
     ).is_file()
     for rel in (
         ".mcp.json",
