@@ -40,6 +40,19 @@ _FORBIDDEN_TARGETS = {"service_manager"}
 # Targets that are implemented
 _VALID_TARGETS = {"governance"}
 
+_PROFILE_AUTH_OPERATIONS = {
+    "/api/manager/agent-profile-login-prepare": "prepare_login",
+    "/api/manager/agent-profile-auth-status": "auth_status",
+    "/api/manager/agent-profile-activate": "activate",
+    "/api/manager/agent_profile_login_prepare": "prepare_login",
+    "/api/manager/agent_profile_auth_status": "auth_status",
+    "/api/manager/agent_profile_activate": "activate",
+    "/api/manager/agent-profiles/login/prepare": "prepare_login",
+    "/api/manager/agent-profiles/auth/status": "auth_status",
+    "/api/manager/agent-profiles/activate": "activate",
+}
+_PROFILE_AUTH_REQUEST_FIELDS = {"profile_id", "provider"}
+
 
 RUNTIME_DEPLOYMENT_VERIFICATION_SCHEMA_VERSION = "runtime_deployment_verification.v1"
 
@@ -92,6 +105,19 @@ def derive_runtime_deployment_verification_status(
 def _project_root() -> Path:
     """Return the project root directory (parent of agent/)."""
     return Path(__file__).resolve().parent.parent
+
+
+def _profile_auth_controller():
+    """Create the host-private controller used by fixed manager operations."""
+    from agent.cli_agent_service.auth import ProfileAuthController
+    from agent.cli_agent_service.service import default_state_dir
+
+    return ProfileAuthController(
+        default_state_dir() / "profiles",
+        claude_spike_decision=os.environ.get(
+            "AMING_CLAW_CLAUDE_AUTH_SPIKE_DECISION", ""
+        ),
+    )
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -610,7 +636,12 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Route POST requests."""
-        path = self.path.rstrip("/")
+        path = urlparse(self.path).path.rstrip("/")
+
+        profile_operation = _PROFILE_AUTH_OPERATIONS.get(path)
+        if profile_operation:
+            self._handle_profile_auth(profile_operation)
+            return
 
         # Match /api/manager/respawn-executor
         if path == "/api/manager/respawn-executor":
@@ -625,6 +656,75 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"ok": False, "detail": "Not found"}, 404)
+
+    def _handle_profile_auth(self, operation: str) -> None:
+        """Run one fixed profile operation; arbitrary commands are forbidden."""
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._send_json(
+                {
+                    "ok": False,
+                    "detail": "Profile operation body must be a JSON object",
+                    "error_code": "INVALID_PROFILE_OPERATION_BODY",
+                },
+                400,
+            )
+            return
+        unsupported = sorted(set(body) - _PROFILE_AUTH_REQUEST_FIELDS)
+        if unsupported:
+            self._send_json(
+                {
+                    "ok": False,
+                    "detail": "Profile operation contains unsupported fields",
+                    "error_code": "UNSUPPORTED_PROFILE_OPERATION_FIELDS",
+                    "unsupported_fields": unsupported,
+                },
+                400,
+            )
+            return
+        profile_id = str(body.get("profile_id") or "").strip()
+        provider = str(body.get("provider") or "").strip()
+        if not profile_id or not provider:
+            self._send_json(
+                {
+                    "ok": False,
+                    "detail": "profile_id and provider are required",
+                    "error_code": "PROFILE_OPERATION_IDENTITY_REQUIRED",
+                },
+                400,
+            )
+            return
+        try:
+            controller = _profile_auth_controller()
+            handler = getattr(controller, operation)
+            result = handler(profile_id=profile_id, provider=provider)
+            payload = (
+                result.to_public_dict()
+                if hasattr(result, "to_public_dict")
+                else dict(result)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "detail": str(exc),
+                    "error_code": "INVALID_PROFILE_OPERATION",
+                },
+                400,
+            )
+            return
+        except Exception:
+            log.exception("manager_http_server: profile auth operation failed")
+            self._send_json(
+                {
+                    "ok": False,
+                    "detail": "Profile auth operation failed",
+                    "error_code": "PROFILE_OPERATION_FAILED",
+                },
+                500,
+            )
+            return
+        self._send_json(payload)
 
     def do_GET(self):
         """Health endpoint for the manager HTTP server itself."""

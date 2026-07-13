@@ -176,3 +176,106 @@ def test_missing_chain_version_returns_400():
     assert status == 400
     assert body["ok"] is False
     assert "chain_version" in body["detail"]
+
+
+def test_profile_login_prepare_dispatches_only_fixed_identity_fields():
+    calls = []
+
+    class Result:
+        def to_public_dict(self):
+            return {
+                "ok": True,
+                "profile_id": "profile-codex-a",
+                "provider": "codex",
+                "state": "login_in_progress",
+            }
+
+    class Controller:
+        def prepare_login(self, *, profile_id, provider):
+            calls.append(("prepare_login", profile_id, provider))
+            return Result()
+
+    with patch.object(
+        manager_http_server,
+        "_profile_auth_controller",
+        return_value=Controller(),
+    ), _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/agent-profile-login-prepare",
+            {"profile_id": "profile-codex-a", "provider": "codex"},
+        )
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["state"] == "login_in_progress"
+    assert calls == [("prepare_login", "profile-codex-a", "codex")]
+
+
+def test_profile_auth_status_uses_fixed_operation_alias():
+    calls = []
+
+    class Controller:
+        def auth_status(self, *, profile_id, provider):
+            calls.append(("auth_status", profile_id, provider))
+            return {
+                "ok": True,
+                "profile_id": profile_id,
+                "provider": provider,
+                "state": "login_required",
+            }
+
+    with patch.object(
+        manager_http_server,
+        "_profile_auth_controller",
+        return_value=Controller(),
+    ), _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/agent-profiles/auth/status",
+            {"profile_id": "profile-claude-a", "provider": "claude"},
+        )
+
+    assert status == 200
+    assert body["state"] == "login_required"
+    assert calls == [("auth_status", "profile-claude-a", "claude")]
+
+
+def test_profile_login_endpoint_rejects_arbitrary_command_fields():
+    with patch.object(manager_http_server, "_profile_auth_controller") as factory, \
+            _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/agent-profile-login-prepare",
+            {
+                "profile_id": "profile-codex-a",
+                "provider": "codex",
+                "command": ["sh", "-c", "echo unsafe"],
+                "environment": {"PATH": "/tmp"},
+            },
+        )
+
+    assert status == 400
+    assert body["ok"] is False
+    assert body["error_code"] == "UNSUPPORTED_PROFILE_OPERATION_FIELDS"
+    assert body["unsupported_fields"] == ["command", "environment"]
+    factory.assert_not_called()
+
+
+def test_profile_login_endpoint_rejects_path_traversal_identity():
+    from agent.cli_agent_service.auth import ProfileAuthController
+
+    with patch.object(
+        manager_http_server,
+        "_profile_auth_controller",
+        return_value=ProfileAuthController(Path("/tmp/unused-profile-root")),
+    ), _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/agent-profile-auth-status",
+            {"profile_id": "../outside", "provider": "codex"},
+        )
+
+    assert status == 400
+    assert body["ok"] is False
+    assert body["error_code"] == "INVALID_PROFILE_OPERATION"
