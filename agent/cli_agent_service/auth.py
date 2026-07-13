@@ -242,6 +242,8 @@ def classify_auth_state(
 
     normalized_provider = _normalize_provider(provider)
     combined = (_text(stdout) + "\n" + _text(stderr)).casefold()
+    if timed_out:
+        return BLOCKED, "{}_status_probe_timed_out".format(normalized_provider)
     if launch_error:
         return ERROR, "{}_status_launch_failed".format(normalized_provider)
     if any(marker in combined for marker in _REVOKED_MARKERS):
@@ -255,8 +257,6 @@ def classify_auth_state(
         return json_state, "{}_status_{}".format(normalized_provider, json_state)
     if any(marker in combined for marker in _LOGIN_REQUIRED_MARKERS):
         return LOGIN_REQUIRED, "{}_login_required".format(normalized_provider)
-    if timed_out:
-        return BLOCKED, "{}_status_probe_timed_out".format(normalized_provider)
     if returncode == 0 and any(marker in combined for marker in _READY_MARKERS):
         return READY, "{}_status_ready".format(normalized_provider)
     if returncode == 0:
@@ -293,6 +293,11 @@ class ProfileAuthController:
     def _assert_managed_path(self, path: Path) -> Path:
         root = self.profiles_root.absolute()
         candidate = path.absolute()
+        resolved_root = root.resolve(strict=False)
+        if resolved_root != root:
+            raise ProfileAuthError(
+                "managed profiles root cannot contain symlinked ancestors"
+            )
         try:
             relative = candidate.relative_to(root)
         except ValueError as exc:
@@ -308,7 +313,6 @@ class ProfileAuthController:
             if current.is_symlink():
                 raise ProfileAuthError("managed profile path contains a symlink")
 
-        resolved_root = root.resolve(strict=False)
         resolved_candidate = candidate.resolve(strict=False)
         try:
             resolved_candidate.relative_to(resolved_root)
