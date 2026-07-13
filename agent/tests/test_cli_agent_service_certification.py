@@ -167,6 +167,84 @@ def test_certification_rejects_credential_shaped_evidence_refs(evidence_ref):
     assert evidence_ref not in str(rejected.value)
 
 
+@pytest.mark.parametrize(
+    "evidence_ref",
+    (
+        "probe:token:qa-private-evidence",
+        "probe.secret.qa-private-evidence",
+        "probe/credential/qa-private-evidence",
+        "probe@password@qa-private-evidence",
+        "probe+api+key+qa-private-evidence",
+        "probe-auth-token-qa-private-evidence",
+        "probe.access.token.qa-private-evidence",
+        "probe/session/token/qa-private-evidence",
+    ),
+)
+def test_certification_rejects_nested_delimiter_credential_refs(evidence_ref):
+    from cli_agent_service.certification import CapabilityResult
+
+    with pytest.raises(ValueError) as constructor_rejected:
+        CapabilityResult("structured_output", "passed", evidence_ref=evidence_ref)
+    assert evidence_ref not in str(constructor_rejected.value)
+
+    result = CapabilityResult(
+        "structured_output",
+        "passed",
+        evidence_ref="probe:structured-output",
+    )
+    object.__setattr__(result, "evidence_ref", evidence_ref)
+    with pytest.raises(ValueError) as projection_rejected:
+        result.to_public_dict()
+    assert evidence_ref not in str(projection_rejected.value)
+
+
+@pytest.mark.parametrize(
+    "evidence_ref",
+    (
+        "probe:route.token:qa-private-evidence",
+        "probe/bearer/token/qa-private-evidence",
+        "probe@client@key@qa-private-evidence",
+        "probe+private+key+qa-private-evidence",
+        "probe-raw-key-qa-private-evidence",
+        "probe.credential.ref.qa-private-evidence",
+        "probe.secretkey.qa-private-evidence",
+        "probe/bearer/qa-private-evidence",
+    ),
+)
+def test_certification_rejects_other_compound_credential_refs(evidence_ref):
+    from cli_agent_service.certification import CapabilityResult
+
+    with pytest.raises(ValueError) as rejected:
+        CapabilityResult("structured_output", "passed", evidence_ref=evidence_ref)
+    assert evidence_ref not in str(rejected.value)
+
+
+@pytest.mark.parametrize(
+    "evidence_ref",
+    (
+        "timeline:11644",
+        "graph-query:gqt-20260713-b780298ad8",
+        "sha256:d276596b8a620fc00efd7f93eee6b189",
+        "hash:8c554e141b6991b0",
+        "artifact:cli-agent/report-1",
+        "endpoint:local/v1",
+        "route:route-20260713-5a72f0b9bea8eebc",
+        "probe:tokenizer-secretariat-credentialed-passwordless",
+    ),
+)
+def test_certification_preserves_benign_opaque_evidence_refs(evidence_ref):
+    from cli_agent_service.certification import CapabilityResult
+
+    result = CapabilityResult(
+        "structured_output",
+        "passed",
+        evidence_ref=evidence_ref,
+    )
+
+    assert result.evidence_ref == evidence_ref
+    assert result.to_public_dict()["evidence_ref"] == evidence_ref
+
+
 def test_certification_public_receipt_refuses_tampered_credential_evidence():
     from cli_agent_service.certification import (
         CapabilityResult,

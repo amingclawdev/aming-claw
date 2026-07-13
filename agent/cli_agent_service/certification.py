@@ -51,23 +51,41 @@ ProbeStatus = CapabilityStatus
 
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_]{1,95}")
 _SAFE_EVIDENCE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,511}")
-_CREDENTIAL_EVIDENCE_REF_HEAD = re.compile(
-    r"(?:credential|credref|token|secret|password|api_?key|auth_token|"
-    r"access_token|session_token|route_token|bearer)(?:[:._/@+-]|$)"
+_EVIDENCE_REF_DELIMITER = re.compile(r"[:._/@+-]+")
+_CREDENTIAL_EVIDENCE_REF_SEGMENTS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "credref",
+        "bearer",
+        "password",
+        "passwords",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+    }
 )
-_CREDENTIAL_EVIDENCE_REF_MARKERS = (
-    "api_key",
-    "auth_token",
-    "access_token",
-    "bearer_token",
-    "client_secret",
-    "credential_ref",
-    "password",
-    "private_key",
-    "raw_secret",
-    "route_token",
-    "secret_key",
-    "session_token",
+_CREDENTIAL_EVIDENCE_REF_COMPOUNDS = frozenset(
+    {
+        ("api", "key"),
+        ("auth", "token"),
+        ("access", "token"),
+        ("bearer", "token"),
+        ("client", "key"),
+        ("client", "secret"),
+        ("credential", "ref"),
+        ("private", "key"),
+        ("private", "secret"),
+        ("raw", "key"),
+        ("raw", "secret"),
+        ("route", "token"),
+        ("secret", "key"),
+        ("session", "token"),
+    }
+)
+_CREDENTIAL_EVIDENCE_REF_COMPACT_SEGMENTS = frozenset(
+    "".join(compound) for compound in _CREDENTIAL_EVIDENCE_REF_COMPOUNDS
 )
 
 
@@ -108,11 +126,20 @@ def _safe_evidence_ref(value: Any) -> str:
     normalized = str(value or "").strip()
     if normalized and not _SAFE_EVIDENCE_REF.fullmatch(normalized):
         raise ValueError("evidence_ref must be a public-safe reference")
-    lowered = normalized.lower().replace("-", "_")
-    if normalized and (
-        _CREDENTIAL_EVIDENCE_REF_HEAD.match(lowered)
-        or any(marker in lowered for marker in _CREDENTIAL_EVIDENCE_REF_MARKERS)
-    ):
+    segments = tuple(
+        segment
+        for segment in _EVIDENCE_REF_DELIMITER.split(normalized.lower())
+        if segment
+    )
+    has_credential_marker = any(
+        segment in _CREDENTIAL_EVIDENCE_REF_SEGMENTS
+        or segment in _CREDENTIAL_EVIDENCE_REF_COMPACT_SEGMENTS
+        for segment in segments
+    ) or any(
+        tuple(segments[index : index + 2]) in _CREDENTIAL_EVIDENCE_REF_COMPOUNDS
+        for index in range(len(segments) - 1)
+    )
+    if has_credential_marker:
         raise ValueError("evidence_ref must not contain credential material")
     return normalized
 
