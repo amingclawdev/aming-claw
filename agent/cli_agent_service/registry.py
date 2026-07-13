@@ -22,6 +22,8 @@ from .models import (
     InferenceEndpoint,
     LauncherAdapter,
     ProcessObservation,
+    ProfileState,
+    ProfileStateRecord,
     ReconciliationResult,
     RegistryLease,
     RegistryRun,
@@ -50,6 +52,7 @@ class PersistenceRejectedError(ValueError):
 
 _SAFE_HASH = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_REF_KEY = re.compile(r"[a-z][a-z0-9_]{1,127}")
+_SAFE_REASON_CODE = re.compile(r"[a-z][a-z0-9_-]{0,127}")
 _SECRET_VALUE = re.compile(
     r"(?:^|\s)(?:bearer\s+|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|"
     r"github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|"
@@ -182,9 +185,11 @@ def _profile_from_dict(data: Mapping[str, Any]) -> AgentProfile:
             roles=tuple(policy.get("roles", ())), project_ids=tuple(policy.get("project_ids", ())),
             max_concurrency=int(policy.get("max_concurrency", 1)),
             timeout_sec=int(policy.get("timeout_sec", 120)),
+            cooldown_sec=int(policy.get("cooldown_sec", 0)),
             successor_budget=int(policy.get("successor_budget", 0)),
         ),
         output_policy=data.get("output_policy", "hash_and_summary_only"),
+        privacy_mode=data.get("privacy_mode", "host_private"),
     )
 
 
@@ -270,11 +275,27 @@ class AgentRegistry:
                 "SELECT profile_version, profile_json FROM agent_profiles WHERE profile_id=?",
                 (profile.profile_id,),
             ).fetchone()
-            if existing and (existing["profile_version"] != profile.version or existing["profile_json"] != serialized):
-                raise RegistryError("registered profile identity is immutable")
+            if existing:
+                existing_profile = _profile_from_dict(json.loads(existing["profile_json"]))
+                if existing["profile_version"] != profile.version or existing_profile != profile:
+                    raise RegistryError("registered profile identity is immutable")
+                if existing["profile_json"] != serialized:
+                    conn.execute(
+                        "UPDATE agent_profiles SET profile_json=?, max_concurrency=?, updated_at=? WHERE profile_id=?",
+                        (
+                            serialized,
+                            profile.role_policy.max_concurrency,
+                            now,
+                            profile.profile_id,
+                        ),
+                    )
             conn.execute(
                 "INSERT OR IGNORE INTO agent_profiles(profile_id, profile_version, profile_json, max_concurrency, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
                 (profile.profile_id, profile.version, serialized, profile.role_policy.max_concurrency, now, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_profile_states(profile_id, state, updated_at) VALUES(?, 'ready', ?)",
+                (profile.profile_id, now),
             )
         return profile
 
@@ -282,6 +303,330 @@ class AgentRegistry:
         with self._connect() as conn:
             row = conn.execute("SELECT profile_json FROM agent_profiles WHERE profile_id=?", (profile_id,)).fetchone()
         return _profile_from_dict(json.loads(row["profile_json"])) if row else None
+
+    def list_profiles(self) -> tuple[AgentProfile, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT profile_json FROM agent_profiles ORDER BY profile_id"
+            ).fetchall()
+        return tuple(_profile_from_dict(json.loads(row["profile_json"])) for row in rows)
+
+    @staticmethod
+    def _profile_state_from_row(row: Any) -> ProfileStateRecord:
+        return ProfileStateRecord(
+            profile_id=row["profile_id"],
+            state=row["state"],
+            reason_code=row["reason_code"],
+            cooldown_until=row["cooldown_until"],
+            quota_reset_at=row["quota_reset_at"],
+            consecutive_crashes=int(row["consecutive_crashes"]),
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _deadline_elapsed(value: str, current: datetime) -> bool:
+        if not str(value or "").strip():
+            return False
+        try:
+            return _as_datetime(value) <= current
+        except (TypeError, ValueError):
+            return False
+
+    def _expire_leases_tx(
+        self,
+        conn: Any,
+        *,
+        current_text: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE agent_leases SET status='expired', released_at=? "
+            "WHERE status='active' AND expires_at<=?",
+            (current_text, current_text),
+        )
+
+    def _profile_state_snapshot_tx(
+        self,
+        conn: Any,
+        profile_id: str,
+        *,
+        current: datetime,
+        current_text: str,
+    ) -> tuple[ProfileStateRecord, int, int]:
+        profile = conn.execute(
+            "SELECT max_concurrency FROM agent_profiles WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()
+        if not profile:
+            raise KeyError(profile_id)
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_profile_states(profile_id, state, updated_at) "
+            "VALUES(?, 'ready', ?)",
+            (profile_id, current_text),
+        )
+        row = conn.execute(
+            "SELECT * FROM agent_profile_states WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()
+        active_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_leases "
+                "WHERE profile_id=? AND status='active' AND expires_at>?",
+                (profile_id, current_text),
+            ).fetchone()[0]
+        )
+        max_concurrency = int(profile["max_concurrency"])
+        state = str(row["state"])
+        deadline_elapsed = (
+            state in {ProfileState.COOLING_DOWN.value, ProfileState.UNHEALTHY.value}
+            and self._deadline_elapsed(row["cooldown_until"], current)
+        ) or (
+            state == ProfileState.QUOTA_EXHAUSTED.value
+            and self._deadline_elapsed(row["quota_reset_at"], current)
+        )
+        next_state = state
+        clear_temporary = False
+        if deadline_elapsed:
+            next_state = ProfileState.READY.value
+            clear_temporary = True
+        if next_state == ProfileState.BUSY.value and active_count < max_concurrency:
+            next_state = ProfileState.READY.value
+        elif next_state == ProfileState.READY.value and active_count >= max_concurrency:
+            next_state = ProfileState.BUSY.value
+        if next_state != state or clear_temporary:
+            conn.execute(
+                "UPDATE agent_profile_states SET state=?, reason_code=?, "
+                "cooldown_until=?, quota_reset_at=?, consecutive_crashes=?, updated_at=? "
+                "WHERE profile_id=?",
+                (
+                    next_state,
+                    "" if clear_temporary else row["reason_code"],
+                    "" if clear_temporary else row["cooldown_until"],
+                    "" if clear_temporary else row["quota_reset_at"],
+                    0 if clear_temporary else int(row["consecutive_crashes"]),
+                    current_text,
+                    profile_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_profile_states WHERE profile_id=?",
+                (profile_id,),
+            ).fetchone()
+        return self._profile_state_from_row(row), active_count, max_concurrency
+
+    def get_profile_state(
+        self,
+        profile_id: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> ProfileStateRecord:
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
+        with self._connect() as conn, immediate_transaction(conn):
+            self._expire_leases_tx(conn, current_text=current_text)
+            state, _, _ = self._profile_state_snapshot_tx(
+                conn,
+                profile_id,
+                current=current,
+                current_text=current_text,
+            )
+        return state
+
+    def list_profile_states(
+        self,
+        *,
+        now: datetime | str | None = None,
+    ) -> tuple[ProfileStateRecord, ...]:
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
+        with self._connect() as conn, immediate_transaction(conn):
+            self._expire_leases_tx(conn, current_text=current_text)
+            profile_ids = [
+                row["profile_id"]
+                for row in conn.execute(
+                    "SELECT profile_id FROM agent_profiles ORDER BY profile_id"
+                ).fetchall()
+            ]
+            states = tuple(
+                self._profile_state_snapshot_tx(
+                    conn,
+                    profile_id,
+                    current=current,
+                    current_text=current_text,
+                )[0]
+                for profile_id in profile_ids
+            )
+        return states
+
+    def profile_capacity(
+        self,
+        profile_id: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
+        with self._connect() as conn, immediate_transaction(conn):
+            self._expire_leases_tx(conn, current_text=current_text)
+            state, active_count, max_concurrency = self._profile_state_snapshot_tx(
+                conn,
+                profile_id,
+                current=current,
+                current_text=current_text,
+            )
+        return {
+            "profile_state": state,
+            "active_lease_count": active_count,
+            "max_concurrency": max_concurrency,
+            "available": (
+                state.state == ProfileState.READY.value
+                and active_count < max_concurrency
+            ),
+        }
+
+    def set_profile_state(
+        self,
+        profile_id: str,
+        state: ProfileState | str,
+        *,
+        reason_code: str = "",
+        cooldown_until: datetime | str | None = None,
+        quota_reset_at: datetime | str | None = None,
+        consecutive_crashes: int | None = None,
+        now: datetime | str | None = None,
+    ) -> ProfileStateRecord:
+        normalized_state = (
+            state.value if isinstance(state, ProfileState) else str(state or "").strip().lower()
+        )
+        if normalized_state not in {item.value for item in ProfileState}:
+            raise ValueError("invalid profile state: {}".format(state))
+        normalized_reason = str(reason_code or "").strip().lower()
+        if normalized_reason and not _SAFE_REASON_CODE.fullmatch(normalized_reason):
+            raise PersistenceRejectedError("profile reason_code must be a structured category")
+        _validate_persisted_value(normalized_reason, key="reason_code")
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
+        cooldown_text = _timestamp(cooldown_until) if cooldown_until else ""
+        quota_text = _timestamp(quota_reset_at) if quota_reset_at else ""
+        with self._connect() as conn, immediate_transaction(conn):
+            self._expire_leases_tx(conn, current_text=current_text)
+            current_state, _, _ = self._profile_state_snapshot_tx(
+                conn,
+                profile_id,
+                current=current,
+                current_text=current_text,
+            )
+            crash_count = (
+                int(consecutive_crashes)
+                if consecutive_crashes is not None
+                else current_state.consecutive_crashes
+            )
+            if crash_count < 0:
+                raise ValueError("consecutive_crashes cannot be negative")
+            if normalized_state in {ProfileState.READY.value, ProfileState.BUSY.value}:
+                normalized_reason = ""
+                cooldown_text = ""
+                quota_text = ""
+                crash_count = 0
+            conn.execute(
+                "UPDATE agent_profile_states SET state=?, reason_code=?, "
+                "cooldown_until=?, quota_reset_at=?, consecutive_crashes=?, updated_at=? "
+                "WHERE profile_id=?",
+                (
+                    normalized_state,
+                    normalized_reason,
+                    cooldown_text,
+                    quota_text,
+                    crash_count,
+                    current_text,
+                    profile_id,
+                ),
+            )
+            result, _, _ = self._profile_state_snapshot_tx(
+                conn,
+                profile_id,
+                current=current,
+                current_text=current_text,
+            )
+        return result
+
+    def record_profile_signal(
+        self,
+        profile_id: str,
+        signal: str,
+        *,
+        reason_code: str = "",
+        retry_at: datetime | str | None = None,
+        cooldown_seconds: int | None = None,
+        now: datetime | str | None = None,
+    ) -> ProfileStateRecord:
+        normalized = str(signal or "").strip().lower().replace("-", "_")
+        current = _as_datetime(now) if now is not None else self._clock()
+        profile = self.get_profile(profile_id)
+        if profile is None:
+            raise KeyError(profile_id)
+        seconds = profile.role_policy.cooldown_sec if cooldown_seconds is None else int(cooldown_seconds)
+        if seconds < 0:
+            raise ValueError("cooldown_seconds cannot be negative")
+        deadline = retry_at or (current + timedelta(seconds=seconds) if seconds else None)
+        current_state = self.get_profile_state(profile_id, now=current)
+        reason = reason_code or normalized
+        if normalized in {"ready", "healthy", "auth_restored", "quota_restored"}:
+            return self.set_profile_state(profile_id, ProfileState.READY, now=current)
+        if normalized in {"cooldown", "cooling_down", "rate_limited"}:
+            return self.set_profile_state(
+                profile_id,
+                ProfileState.COOLING_DOWN,
+                reason_code=reason,
+                cooldown_until=deadline,
+                now=current,
+            )
+        if normalized in {"quota", "quota_exhausted"}:
+            return self.set_profile_state(
+                profile_id,
+                ProfileState.QUOTA_EXHAUSTED,
+                reason_code=reason,
+                quota_reset_at=deadline,
+                now=current,
+            )
+        if normalized in {"auth", "auth_required", "auth_expired", "auth_revoked"}:
+            return self.set_profile_state(
+                profile_id,
+                ProfileState.AUTH_REQUIRED,
+                reason_code=reason,
+                now=current,
+            )
+        if normalized in {
+            "crash",
+            "process_crash",
+            "heartbeat_timeout",
+            "endpoint_unavailable",
+            "unhealthy",
+        }:
+            return self.set_profile_state(
+                profile_id,
+                ProfileState.UNHEALTHY,
+                reason_code=reason,
+                cooldown_until=deadline,
+                consecutive_crashes=current_state.consecutive_crashes + 1,
+                now=current,
+            )
+        if normalized in {"disable", "disabled"}:
+            return self.set_profile_state(
+                profile_id,
+                ProfileState.DISABLED,
+                reason_code=reason,
+                now=current,
+            )
+        raise ValueError("unsupported profile signal: {}".format(signal))
+
+    def record_quota_exhausted(self, profile_id: str, **kwargs: Any) -> ProfileStateRecord:
+        return self.record_profile_signal(profile_id, "quota_exhausted", **kwargs)
+
+    def record_auth_required(self, profile_id: str, **kwargs: Any) -> ProfileStateRecord:
+        return self.record_profile_signal(profile_id, "auth_required", **kwargs)
+
+    def record_profile_crash(self, profile_id: str, **kwargs: Any) -> ProfileStateRecord:
+        return self.record_profile_signal(profile_id, "process_crash", **kwargs)
 
     def register_run(
         self,
@@ -321,6 +666,20 @@ class AgentRegistry:
             expires_at=row["expires_at"], heartbeat_at=row["heartbeat_at"], released_at=row["released_at"],
         )
 
+    @staticmethod
+    def _lease_from_direct_row(row: Any) -> RegistryLease:
+        return RegistryLease(
+            lease_id=row["lease_id"],
+            run_id=row["run_id"],
+            profile_id=row["profile_id"],
+            owner_id=row["owner_id"],
+            status=row["status"],
+            acquired_at=row["acquired_at"],
+            expires_at=row["expires_at"],
+            heartbeat_at=row["heartbeat_at"],
+            released_at=row["released_at"],
+        )
+
     def get_run(self, run_id: str) -> RegistryRun | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -340,6 +699,159 @@ class AgentRegistry:
             failure_category=row["failure_category"], updated_at=row["updated_at"],
         )
 
+    def _acquire_lease_tx(
+        self,
+        conn: Any,
+        run_id: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+        current: datetime,
+        idempotent_owner: bool = False,
+    ) -> RegistryLease:
+        current_text = _timestamp(current)
+        expires_text = _timestamp(current + timedelta(seconds=ttl_seconds))
+        self._expire_leases_tx(conn, current_text=current_text)
+        row = conn.execute(
+            "SELECT r.profile_id, r.state, p.max_concurrency "
+            "FROM agent_runs r JOIN agent_profiles p ON p.profile_id=r.profile_id "
+            "WHERE r.run_id=?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(run_id)
+        if row["state"] in {
+            RunState.COMPLETED.value,
+            RunState.FAILED.value,
+            RunState.LOST.value,
+        }:
+            raise LeaseConflictError("terminal run cannot be leased")
+        duplicate = conn.execute(
+            "SELECT * FROM agent_leases "
+            "WHERE run_id=? AND status='active' AND expires_at>?",
+            (run_id, current_text),
+        ).fetchone()
+        if duplicate:
+            if idempotent_owner and duplicate["owner_id"] == owner_id:
+                return self._lease_from_direct_row(duplicate)
+            raise LeaseConflictError("run already has an active lease")
+        profile_state, active_count, max_concurrency = self._profile_state_snapshot_tx(
+            conn,
+            row["profile_id"],
+            current=current,
+            current_text=current_text,
+        )
+        if profile_state.state != ProfileState.READY.value:
+            raise LeaseConflictError(
+                "profile state '{}' is not schedulable".format(profile_state.state)
+            )
+        if active_count >= max_concurrency:
+            raise LeaseConflictError("profile has no available active lease capacity")
+        lease_id = "lease-{}".format(uuid.uuid4().hex)
+        conn.execute(
+            "INSERT INTO agent_leases(lease_id, run_id, profile_id, owner_id, status, acquired_at, expires_at, heartbeat_at) "
+            "VALUES(?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                lease_id,
+                run_id,
+                row["profile_id"],
+                owner_id,
+                current_text,
+                expires_text,
+                current_text,
+            ),
+        )
+        conn.execute(
+            "UPDATE agent_runs SET state=?, last_heartbeat_at=?, updated_at=? WHERE run_id=?",
+            (RunState.LEASED.value, current_text, current_text, run_id),
+        )
+        self._profile_state_snapshot_tx(
+            conn,
+            row["profile_id"],
+            current=current,
+            current_text=current_text,
+        )
+        return RegistryLease(
+            lease_id,
+            run_id,
+            row["profile_id"],
+            owner_id,
+            "active",
+            current_text,
+            expires_text,
+            current_text,
+        )
+
+    def register_run_and_acquire_lease(
+        self,
+        run: AgentRun,
+        owner_id: str,
+        *,
+        ttl_seconds: int = 60,
+        evidence_refs: Mapping[str, str] | None = None,
+        now: datetime | str | None = None,
+    ) -> RegistryLease:
+        """Atomically pin one run and reserve its selected profile capacity."""
+        if run.profile is None:
+            raise ValueError("registry runs require their immutable AgentProfile")
+        if ttl_seconds < 1:
+            raise ValueError("ttl_seconds must be positive")
+        owner_id = str(owner_id or "").strip()
+        if not owner_id:
+            raise ValueError("owner_id is required")
+        _validate_persisted_value(owner_id, key="owner_id")
+        self.register_profile(run.profile)
+        refs = sanitize_evidence_refs(evidence_refs)
+        payload = run.to_public_dict()
+        _validate_persisted_value(payload)
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        refs_json = json.dumps(
+            {item.name: item.value for item in refs},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
+        with self._connect() as conn, immediate_transaction(conn):
+            existing = conn.execute(
+                "SELECT run_json, evidence_refs_json FROM agent_runs WHERE run_id=?",
+                (run.run_id,),
+            ).fetchone()
+            if existing and (
+                existing["run_json"] != serialized
+                or existing["evidence_refs_json"] != refs_json
+            ):
+                raise RegistryError("registered run identity is immutable")
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_runs(run_id, profile_id, profile_version, project_id, role, run_json, state, parent_run_id, successor_of_run_id, evidence_refs_json, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run.run_id,
+                    run.profile.profile_id,
+                    run.profile.version,
+                    run.config.project_id,
+                    run.config.role,
+                    serialized,
+                    RunState.REGISTERED.value,
+                    run.parent_run_id,
+                    run.successor_of_run_id,
+                    refs_json,
+                    current_text,
+                    current_text,
+                ),
+            )
+            lease = self._acquire_lease_tx(
+                conn,
+                run.run_id,
+                owner_id,
+                ttl_seconds=ttl_seconds,
+                current=current,
+                idempotent_owner=True,
+            )
+        return lease
+
+    reserve_run = register_run_and_acquire_lease
+
     def acquire_lease(
         self,
         run_id: str,
@@ -355,38 +867,15 @@ class AgentRegistry:
             raise ValueError("owner_id is required")
         _validate_persisted_value(owner_id, key="owner_id")
         current = _as_datetime(now) if now is not None else self._clock()
-        current_text = _timestamp(current)
-        expires_text = _timestamp(current + timedelta(seconds=ttl_seconds))
-        lease_id = "lease-{}".format(uuid.uuid4().hex)
         with self._connect() as conn, immediate_transaction(conn):
-            conn.execute(
-                "UPDATE agent_leases SET status='expired', released_at=? WHERE status='active' AND expires_at<=?",
-                (current_text, current_text),
+            lease = self._acquire_lease_tx(
+                conn,
+                run_id,
+                owner_id,
+                ttl_seconds=ttl_seconds,
+                current=current,
             )
-            row = conn.execute(
-                "SELECT r.profile_id, r.state, p.max_concurrency FROM agent_runs r JOIN agent_profiles p ON p.profile_id=r.profile_id WHERE r.run_id=?",
-                (run_id,),
-            ).fetchone()
-            if not row:
-                raise KeyError(run_id)
-            if row["state"] in {RunState.COMPLETED.value, RunState.FAILED.value, RunState.LOST.value}:
-                raise LeaseConflictError("terminal run cannot be leased")
-            duplicate = conn.execute("SELECT 1 FROM agent_leases WHERE run_id=? AND status='active'", (run_id,)).fetchone()
-            active_count = conn.execute(
-                "SELECT COUNT(*) FROM agent_leases WHERE profile_id=? AND status='active' AND expires_at>?",
-                (row["profile_id"], current_text),
-            ).fetchone()[0]
-            if duplicate or active_count >= int(row["max_concurrency"]):
-                raise LeaseConflictError("profile has no available active lease capacity")
-            conn.execute(
-                "INSERT INTO agent_leases(lease_id, run_id, profile_id, owner_id, status, acquired_at, expires_at, heartbeat_at) VALUES(?, ?, ?, ?, 'active', ?, ?, ?)",
-                (lease_id, run_id, row["profile_id"], owner_id, current_text, expires_text, current_text),
-            )
-            conn.execute(
-                "UPDATE agent_runs SET state=?, last_heartbeat_at=?, updated_at=? WHERE run_id=?",
-                (RunState.LEASED.value, current_text, current_text, run_id),
-            )
-        return RegistryLease(lease_id, run_id, row["profile_id"], owner_id, "active", current_text, expires_text, current_text)
+        return lease
 
     def heartbeat(
         self,
@@ -424,8 +913,16 @@ class AgentRegistry:
 
     def release_lease(self, run_id: str, owner_id: str, *, now: datetime | str | None = None) -> None:
         _validate_persisted_value(owner_id, key="owner_id")
-        current_text = _timestamp(now if now is not None else self._clock())
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
         with self._connect() as conn, immediate_transaction(conn):
+            lease_row = conn.execute(
+                "SELECT profile_id FROM agent_leases "
+                "WHERE run_id=? AND owner_id=? AND status='active'",
+                (run_id, owner_id),
+            ).fetchone()
+            if not lease_row:
+                raise LeaseNotOwnedError("active lease is not owned by caller")
             cursor = conn.execute(
                 "UPDATE agent_leases SET status='released', released_at=? WHERE run_id=? AND owner_id=? AND status='active'",
                 (current_text, run_id, owner_id),
@@ -433,6 +930,12 @@ class AgentRegistry:
             if cursor.rowcount != 1:
                 raise LeaseNotOwnedError("active lease is not owned by caller")
             conn.execute("UPDATE agent_runs SET state=?, updated_at=? WHERE run_id=?", (RunState.REGISTERED.value, current_text, run_id))
+            self._profile_state_snapshot_tx(
+                conn,
+                lease_row["profile_id"],
+                current=current,
+                current_text=current_text,
+            )
 
     def record_process_start(
         self,
@@ -478,9 +981,16 @@ class AgentRegistry:
         now: datetime | str | None = None,
     ) -> RegistryRun:
         _validate_persisted_value(failure_category, key="failure_category")
-        current_text = _timestamp(now if now is not None else self._clock())
+        current = _as_datetime(now) if now is not None else self._clock()
+        current_text = _timestamp(current)
         state = RunState.COMPLETED.value if int(exit_code) == 0 else RunState.FAILED.value
         with self._connect() as conn, immediate_transaction(conn):
+            run_row = conn.execute(
+                "SELECT profile_id FROM agent_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run_row:
+                raise KeyError(run_id)
             cursor = conn.execute(
                 "UPDATE agent_runs SET state=?, exit_code=?, failure_category=?, updated_at=? WHERE run_id=?",
                 (state, int(exit_code), str(failure_category or "").strip(), current_text, run_id),
@@ -488,6 +998,12 @@ class AgentRegistry:
             if cursor.rowcount != 1:
                 raise KeyError(run_id)
             conn.execute("UPDATE agent_leases SET status=?, released_at=? WHERE run_id=? AND status='active'", (state, current_text, run_id))
+            self._profile_state_snapshot_tx(
+                conn,
+                run_row["profile_id"],
+                current=current,
+                current_text=current_text,
+            )
         record = self.get_run(run_id)
         assert record is not None
         return record
@@ -562,6 +1078,12 @@ class AgentRegistry:
                         "UPDATE agent_leases SET status=?, released_at=? WHERE run_id=? AND status='active'",
                         (classification, current_text, row["run_id"]),
                     )
+                self._profile_state_snapshot_tx(
+                    conn,
+                    row["profile_id"],
+                    current=current,
+                    current_text=current_text,
+                )
             results.append(ReconciliationResult(row["run_id"], classification, previous, matched, detail))
         return tuple(results)
 
