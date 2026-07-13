@@ -64130,6 +64130,26 @@ def _cli_agent_timeline_ref_event(
     }
 
 
+def _cli_agent_persisted_receipt_event(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    backlog_id: str,
+    receipt_id: str,
+) -> dict[str, Any]:
+    for event in events:
+        if str(event.get("backlog_id") or "").strip() != backlog_id:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        receipt = payload.get("cli_agent_run_receipt")
+        if not isinstance(receipt, Mapping):
+            continue
+        if str(receipt.get("receipt_id") or "").strip() == receipt_id:
+            return dict(event)
+    return {}
+
+
 @route(
     "POST",
     "/api/graph-governance/{project_id}/cli-agent/successor-tickets",
@@ -64175,18 +64195,10 @@ def handle_cli_agent_successor_ticket(ctx: RequestContext):
             run_id=receipt["run_id"],
             receipt_id=receipt["receipt_id"],
         )
-        persisted = next(
-            (
-                event
-                for event in receipt_events
-                if (
-                    (event.get("payload") or {})
-                    .get("cli_agent_run_receipt", {})
-                    .get("receipt_id")
-                    == receipt["receipt_id"]
-                )
-            ),
-            {},
+        persisted = _cli_agent_persisted_receipt_event(
+            receipt_events,
+            backlog_id=backlog_id,
+            receipt_id=receipt["receipt_id"],
         )
         lost_receipt_event_ref = (
             "timeline:{}".format(persisted["id"]) if persisted.get("id") else ""

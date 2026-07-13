@@ -7,6 +7,7 @@ from agent.cli_agent_service.evidence import CliAgentRunReceipt
 from agent.governance.contract_state_runtime import (
     build_cli_agent_successor_ticket,
 )
+from agent.governance.server import _cli_agent_persisted_receipt_event
 
 
 def _authority_and_launch():
@@ -226,3 +227,31 @@ def test_successor_budget_profile_and_authority_fail_closed():
     inputs["contract_runtime_current_state"]["source_of_authority"] = "timeline"
     wrong_authority = build_cli_agent_successor_ticket(**inputs)
     assert "successor authority must be ContractRuntime" in wrong_authority["errors"]
+
+
+def test_persisted_lost_receipt_must_belong_to_the_authority_backlog():
+    receipt = _lost_receipt()
+    wrong_backlog_event = {
+        "id": 12,
+        "backlog_id": "AC-OTHER-BACKLOG",
+        "payload": {"cli_agent_run_receipt": receipt},
+    }
+    assert (
+        _cli_agent_persisted_receipt_event(
+            [wrong_backlog_event],
+            backlog_id="AC-CLI-SUCCESSOR",
+            receipt_id=receipt["receipt_id"],
+        )
+        == {}
+    )
+
+    matching_event = {
+        **wrong_backlog_event,
+        "id": 13,
+        "backlog_id": "AC-CLI-SUCCESSOR",
+    }
+    assert _cli_agent_persisted_receipt_event(
+        [wrong_backlog_event, matching_event],
+        backlog_id="AC-CLI-SUCCESSOR",
+        receipt_id=receipt["receipt_id"],
+    )["id"] == 13
