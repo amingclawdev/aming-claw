@@ -24372,6 +24372,22 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
     assert saved is not None
     assert saved.status == STATE_WORKTREE_READY
     assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
+    revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        context=saved,
+        runtime_context_id=saved.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=saved.task_id,
+            backlog_id=saved.backlog_id,
+            limit=1000,
+        ),
+    )
+    assert revision_marker["source"] == "accepted_runtime_context_rejoin_event"
+    assert revision_marker["runtime_context_id"] == saved.runtime_context_id
+    assert revision_marker["task_id"] == saved.task_id
+    assert revision_marker["revision_event_ref"].startswith("timeline:")
+    assert revision_marker["evidence_backfill"] is False
 
     current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx_with_role(
@@ -24719,6 +24735,155 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert revised_record["completed_lines"][-1]["commit_sha"] == hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
     ).hexdigest()
+
+
+def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_backfill(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-TIMELINE-FAILED-QA-ROUTE-REVISION"
+    target_root = tmp_path / "timeline-failed-qa-route-revision"
+    worker_head_commit = _init_test_git_repo(target_root)
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="timeline-failed-qa-route-parent",
+        worker_task_id="timeline-failed-qa-route-worker",
+        fence_token="fence-timeline-failed-qa-route",
+        token="lost-timeline-failed-qa-route-token",
+        worktree_path=str(target_root),
+    )
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token="fence-timeline-failed-qa-route",
+        graph_trace_id="gqt-timeline-failed-qa-route-worker",
+        head_commit=worker_head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-timeline-failed-qa-route-worker",
+        head_commit=worker_head_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+        route_token_ref="rtok-prior-revision",
+    )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            status=STATE_VALIDATED,
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso="2026-07-13T14:00:00Z",
+    )
+    failed_qa = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_type="independent_verification.completed",
+        event_kind="independent_verification",
+        phase="verification",
+        status="failed",
+        actor="qa:independent-route-revision",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "reviewer_role": "independent_qa",
+            "requirement_id": "independent_verification_lane",
+            "verdict": "FAIL",
+        },
+        verification={"verdict": "FAIL", "acceptance_failed": [3]},
+    )
+    conn.commit()
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": f"Revise after failed QA timeline:{failed_qa['id']}",
+                "now_iso": "2999-01-01T00:00:00Z",
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is True
+
+    projection_gate = server._contract_runtime_completed_line_projection_preflight_gate(
+        conn,
+        body={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": runtime_context.task_id,
+            "contract_execution_id": successor["contract_execution_id"],
+            "route_token_ref": "rtok-active-revision",
+            "contract_runtime_line": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+            },
+        },
+        event_kind="implementation",
+        trusted_actor_role="mf_sub",
+    )
+    assert projection_gate == {}
+
+    saved = get_branch_context(conn, PID, runtime_context.task_id)
+    canonical = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=saved,
+        contract_execution_id=successor["contract_execution_id"],
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+        evidence_kind="implementation",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "worker_role": "mf_sub",
+            "route_token_ref": "rtok-active-revision",
+            "failed_qa_revision_rejoin_marker": {
+                "revision_event_ref": "timeline:forged-by-worker",
+            },
+            "changed_files": ["agent/governance/server.py"],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+        },
+    )
+    assert canonical["status"] == "completed"
+
+    record = server._contract_runtime(conn).store.get(
+        successor["contract_execution_id"]
+    )
+    latest = record["completed_lines"][-1]
+    assert latest["line_id"] == "worker_implementation"
+    marker = latest["payload"]["failed_qa_revision_rejoin_marker"]
+    assert marker["revision_event_ref"].startswith("timeline:")
+    assert marker["revision_event_ref"] != "timeline:forged-by-worker"
+    assert marker["evidence_backfill"] is False
+    assert marker["route_token_ref"] == ""
+    assert not any(
+        line.get("line_id") == "qa_independent_verification"
+        for line in record["completed_lines"]
+    )
+
+    current = server._contract_runtime_read(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    assert current["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_commit"
+    )
 
 
 def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(
@@ -44908,6 +45073,7 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
     head_commit: str,
     implementation_event_ref: str,
     include_worker_commit: bool = True,
+    route_token_ref: str = "",
 ) -> None:
     implementation, worker_commit = _mf_parallel_worker_proof_payloads(
         runtime_context,
@@ -44917,6 +45083,10 @@ def _record_mf_parallel_contract_runtime_worker_prefix(
         implementation_event_ref=implementation_event_ref,
     )
     common = dict(implementation)
+    if route_token_ref:
+        implementation["route_token_ref"] = route_token_ref
+        worker_commit["route_token_ref"] = route_token_ref
+        common["route_token_ref"] = route_token_ref
     specs = [
         ("worker_read", "worker_read_runtime_guide", "read_receipt", common, ""),
         ("worker_startup", "worker_startup", "mf_subagent_startup", common, ""),

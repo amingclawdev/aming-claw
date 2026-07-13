@@ -10,6 +10,7 @@ import pytest
 from agent.governance.contracts import ContractDefinitionRegistry, ContractRuntime
 from agent.governance.contracts.hash import file_sha256
 from agent.governance.contracts.runtime import (
+    _contract_completion_satisfying_lines,
     _mf_parallel_worker_commit_errors,
     ContractRuntimeError,
     read_backlog_contract_chain_current,
@@ -18,6 +19,81 @@ from agent.governance.contracts.runtime import (
     StalePinnedContractExecutionError,
     upsert_contract_chain_successor_binding,
 )
+
+
+def test_failed_qa_rejoin_marker_resets_only_prior_revision_proof_lines():
+    runtime_context_id = "mfrctx-failed-qa-route-rebind"
+    task_id = "worker-failed-qa-route-rebind"
+    context_keys = {
+        ("runtime_context_id", runtime_context_id),
+        ("task_id", task_id),
+        ("line_instance_id", f"runtime_context:{runtime_context_id}"),
+        ("line_instance_id", f"task:{task_id}"),
+    }
+    common = {
+        "actor_role": "mf_sub",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "status": "passed",
+    }
+    old_implementation = {
+        **common,
+        "line_id": "worker_implementation",
+        "payload": {"revision": "old", "runtime_context_id": runtime_context_id},
+    }
+    fresh_implementation = {
+        **common,
+        "line_id": "worker_implementation",
+        "payload": {
+            "revision": "fresh",
+            "runtime_context_id": runtime_context_id,
+            "failed_qa_revision_rejoin_marker": {
+                "revision_event_ref": "timeline:200",
+            },
+        },
+    }
+    old_qa = {
+        **common,
+        "line_id": "qa_independent_verification",
+        "payload": {"revision": "old", "runtime_context_id": runtime_context_id},
+    }
+    fresh_qa = {
+        **common,
+        "line_id": "qa_independent_verification",
+        "payload": {"revision": "fresh", "runtime_context_id": runtime_context_id},
+    }
+    lines = [
+        {
+            **common,
+            "line_id": "worker_read_runtime_guide",
+            "payload": {"runtime_context_id": runtime_context_id},
+        },
+        old_implementation,
+        {
+            **common,
+            "line_id": "worker_commit",
+            "payload": {"revision": "old", "runtime_context_id": runtime_context_id},
+        },
+        old_qa,
+        fresh_implementation,
+        fresh_qa,
+    ]
+
+    satisfying = _contract_completion_satisfying_lines(
+        lines,
+        failed_qa_rejoin_contexts=context_keys,
+        failed_qa_rejoin_markers=[
+            {"source_ref": "timeline:200", "context_keys": context_keys}
+        ],
+    )
+
+    assert lines[0] in satisfying
+    assert old_implementation not in satisfying
+    assert lines[2] not in satisfying
+    assert old_qa not in satisfying
+    assert fresh_implementation in satisfying
+    assert fresh_qa in satisfying
 
 
 def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():

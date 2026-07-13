@@ -20074,6 +20074,97 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
     return False
 
 
+def _runtime_context_failed_qa_revision_rejoin_marker(
+    *,
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return the latest accepted same-context failed-QA revision boundary."""
+
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    expected_attempt = int(getattr(context, "attempt", 0) or 0)
+    expected_retry_round = int(getattr(context, "retry_round", 0) or 0)
+    if (
+        not runtime_context_id
+        or not task_id
+        or expected_attempt <= 1
+        or expected_retry_round <= 0
+    ):
+        return {}
+    for event in reversed(list(timeline_events)):
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        event_type = str(event.get("event_type") or "").strip().lower()
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        status = str(event.get("status") or "").strip().lower()
+        if status not in {"accepted", "passed", "succeeded"}:
+            continue
+        if not (
+            event_type == "observer.runtime_context_session_token_rejoin"
+            or (
+                event_kind == "observer_command"
+                and str(payload.get("action") or "").strip()
+                == "runtime_context_session_token_rejoin"
+            )
+        ):
+            continue
+        if not (
+            _truthy_flag(payload.get("reopen_for_revision"))
+            and _truthy_flag(payload.get("timeline_reopen_for_revision"))
+        ):
+            continue
+        if str(payload.get("runtime_context_id") or "").strip() != runtime_context_id:
+            continue
+        if str(payload.get("task_id") or "").strip() != task_id:
+            continue
+        if (
+            parent_task_id
+            and str(payload.get("parent_task_id") or "").strip()
+            != parent_task_id
+        ):
+            continue
+        if int(payload.get("attempt") or 0) != expected_attempt:
+            continue
+        if int(payload.get("retry_round") or 0) != expected_retry_round:
+            continue
+        if str(payload.get("current_status") or "").strip() != "worktree_ready":
+            continue
+        event_backlog_id = str(
+            event.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        if backlog_id and event_backlog_id != backlog_id:
+            continue
+        event_id = int(event.get("id") or 0)
+        if event_id <= 0:
+            continue
+        route_identity = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
+        route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+        return {
+            "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
+            "source": "accepted_runtime_context_rejoin_event",
+            "revision_event_id": event_id,
+            "revision_event_ref": f"timeline:{event_id}",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "backlog_id": backlog_id,
+            "attempt": expected_attempt,
+            "retry_round": expected_retry_round,
+            "route_token_ref": route_token_ref,
+            "route_identity_rebound": bool(payload.get("route_identity_rebound")),
+            "evidence_backfill": False,
+        }
+    return {}
+
+
 def _runtime_context_contract_runtime_qa_verification_evidence(
     conn,
     *,
@@ -21393,6 +21484,39 @@ def _runtime_context_submit_canonical_contract_line(
         evidence_kind=evidence_kind,
     )
     canonical_payload = dict(payload)
+    canonical_payload.pop("failed_qa_revision_rejoin_marker", None)
+    if use_failed_qa_rejoin_projection:
+        revision_marker = next(
+            (
+                dict(item)
+                for item in (failed_qa_rejoin_contexts or [])
+                if isinstance(item, Mapping)
+                and str(item.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(item.get("revision_event_ref") or "").strip()
+            ),
+            {},
+        )
+        if revision_marker:
+            canonical_payload["failed_qa_revision_rejoin_marker"] = {
+                key: value
+                for key, value in revision_marker.items()
+                if key
+                in {
+                    "schema_version",
+                    "source",
+                    "revision_event_id",
+                    "revision_event_ref",
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "attempt",
+                    "retry_round",
+                    "route_token_ref",
+                    "route_identity_rebound",
+                    "evidence_backfill",
+                }
+            }
     write["payload"] = canonical_payload
     protected_write_fields = {
         "actor_role",
@@ -46100,6 +46224,24 @@ def _contract_runtime_mf_parallel_context_projection(
             "runtime_context_id": str(item.get("runtime_context_id") or ""),
             "task_id": str(item.get("task_id") or ""),
             "parent_task_id": str(item.get("parent_task_id") or ""),
+            **{
+                key: value
+                for key, value in dict(
+                    item.get("failed_qa_revision_rejoin_marker") or {}
+                ).items()
+                if key
+                in {
+                    "schema_version",
+                    "source",
+                    "revision_event_id",
+                    "revision_event_ref",
+                    "attempt",
+                    "retry_round",
+                    "route_token_ref",
+                    "route_identity_rebound",
+                    "evidence_backfill",
+                }
+            },
         }
         for item in expected_context_summaries
         if item.get("failed_qa_revision_rejoin")
@@ -46340,13 +46482,24 @@ def _contract_runtime_projection_for_context(
         graph_refs=graph_refs,
         finish_payload=finish_payload,
     )
-    failed_qa_revision_rejoin = bool(
-        str(getattr(context, "status", "") or "") == "worktree_ready"
-        and _runtime_context_failed_qa_revision_contract_runtime_evidence(
+    contract_runtime_failed_qa = (
+        _runtime_context_failed_qa_revision_contract_runtime_evidence(
             conn,
             project_id=project_id,
             context=context,
         )
+    )
+    failed_qa_revision_rejoin_marker = {}
+    if not contract_runtime_failed_qa:
+        failed_qa_revision_rejoin_marker = (
+            _runtime_context_failed_qa_revision_rejoin_marker(
+                context=context,
+                runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events,
+            )
+        )
+    failed_qa_revision_rejoin = bool(
+        contract_runtime_failed_qa or failed_qa_revision_rejoin_marker
     )
 
     projected_lines: list[dict[str, Any]] = []
@@ -46463,6 +46616,7 @@ def _contract_runtime_projection_for_context(
         "projected_line_refs": projected_line_refs,
         "source_refs": source_refs,
         "failed_qa_revision_rejoin": failed_qa_revision_rejoin,
+        "failed_qa_revision_rejoin_marker": failed_qa_revision_rejoin_marker,
     }
 
 
@@ -46517,6 +46671,15 @@ def _contract_runtime_projection_context_summary(
         "failed_qa_revision_rejoin": bool(
             isinstance(projection, Mapping)
             and projection.get("failed_qa_revision_rejoin")
+        ),
+        "failed_qa_revision_rejoin_marker": (
+            dict(projection.get("failed_qa_revision_rejoin_marker") or {})
+            if isinstance(projection, Mapping)
+            and isinstance(
+                projection.get("failed_qa_revision_rejoin_marker"),
+                Mapping,
+            )
+            else {}
         ),
     }
 

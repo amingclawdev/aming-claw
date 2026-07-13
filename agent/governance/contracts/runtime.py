@@ -1756,6 +1756,7 @@ def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
     *,
     failed_qa_rejoin_contexts: set[tuple[str, str]] | None = None,
+    failed_qa_rejoin_markers: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[Mapping[str, Any]]:
     last_failed_qa_index = _last_failed_qa_line_index(lines)
     post_failed_retry_contexts = _post_failed_qa_retry_context_keys(
@@ -1763,10 +1764,29 @@ def _contract_completion_satisfying_lines(
         failed_qa_index=last_failed_qa_index,
     )
     post_failed_retry_contexts.update(failed_qa_rejoin_contexts or set())
+    failed_qa_rejoin_boundaries = _failed_qa_rejoin_boundaries(
+        lines,
+        failed_qa_rejoin_markers or [],
+    )
     satisfying: list[Mapping[str, Any]] = []
     for index, line in enumerate(lines):
         if isinstance(line, Mapping) and not _line_shape_allows_contract_completion(
             line
+        ):
+            continue
+        if (
+            last_failed_qa_index < 0
+            and failed_qa_rejoin_markers
+            and str(line.get("line_id") or "").strip()
+            in _FAILED_QA_RETRY_PROOF_LINE_IDS
+            and _line_retry_context_keys(line).intersection(
+                failed_qa_rejoin_contexts or set()
+            )
+            and not _line_survives_failed_qa_rejoin_boundary(
+                line,
+                index=index,
+                boundaries=failed_qa_rejoin_boundaries,
+            )
         ):
             continue
         if last_failed_qa_index >= 0 and index <= last_failed_qa_index:
@@ -2035,6 +2055,119 @@ def _failed_qa_rejoin_context_keys_from_projection(
             contexts.add(("task_id", task_id))
             contexts.add(("line_instance_id", f"task:{task_id}"))
     return contexts
+
+
+def _failed_qa_rejoin_markers_from_projection(
+    projection: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(projection, Mapping):
+        return []
+    markers: list[dict[str, Any]] = []
+    for item in projection.get("failed_qa_revision_rejoin_contexts") or []:
+        if not isinstance(item, Mapping):
+            continue
+        source_ref = str(
+            item.get("revision_event_ref") or item.get("source_ref") or ""
+        ).strip()
+        if not source_ref:
+            continue
+        context_keys: set[tuple[str, str]] = set()
+        runtime_context_id = str(item.get("runtime_context_id") or "").strip()
+        task_id = str(item.get("task_id") or "").strip()
+        if runtime_context_id:
+            context_keys.add(("runtime_context_id", runtime_context_id))
+            context_keys.add(
+                ("line_instance_id", f"runtime_context:{runtime_context_id}")
+            )
+        if task_id:
+            context_keys.add(("task_id", task_id))
+            context_keys.add(("line_instance_id", f"task:{task_id}"))
+        if context_keys:
+            markers.append(
+                {
+                    "source_ref": source_ref,
+                    "context_keys": context_keys,
+                }
+            )
+    return markers
+
+
+def _line_matches_failed_qa_rejoin_marker(
+    line: Mapping[str, Any],
+    markers: Sequence[Mapping[str, Any]],
+) -> bool:
+    marker = _first_deep_contract_value(
+        line,
+        "failed_qa_revision_rejoin_marker",
+    )
+    if not isinstance(marker, Mapping):
+        return False
+    source_ref = str(
+        marker.get("revision_event_ref") or marker.get("source_ref") or ""
+    ).strip()
+    if not source_ref:
+        return False
+    line_contexts = _line_retry_context_keys(line)
+    for expected in markers:
+        expected_contexts = expected.get("context_keys")
+        if not isinstance(expected_contexts, set):
+            continue
+        if (
+            source_ref == str(expected.get("source_ref") or "").strip()
+            and line_contexts.intersection(expected_contexts)
+        ):
+            return True
+    return False
+
+
+def _failed_qa_rejoin_boundaries(
+    lines: Sequence[Mapping[str, Any]],
+    markers: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    boundaries: list[dict[str, Any]] = []
+    for marker in markers:
+        context_keys = marker.get("context_keys")
+        if not isinstance(context_keys, set):
+            continue
+        boundary_index = -1
+        for index, line in enumerate(lines):
+            if isinstance(line, Mapping) and _line_matches_failed_qa_rejoin_marker(
+                line,
+                [marker],
+            ):
+                boundary_index = index
+                break
+        boundaries.append(
+            {
+                "source_ref": str(marker.get("source_ref") or "").strip(),
+                "context_keys": context_keys,
+                "line_index": boundary_index,
+            }
+        )
+    return boundaries
+
+
+def _line_survives_failed_qa_rejoin_boundary(
+    line: Mapping[str, Any],
+    *,
+    index: int,
+    boundaries: Sequence[Mapping[str, Any]],
+) -> bool:
+    line_contexts = _line_retry_context_keys(line)
+    applicable = [
+        boundary
+        for boundary in boundaries
+        if isinstance(boundary.get("context_keys"), set)
+        and line_contexts.intersection(boundary["context_keys"])
+    ]
+    if not applicable:
+        return True
+    return all(
+        isinstance(boundary.get("line_index"), int)
+        and boundary["line_index"] >= 0
+        and index >= boundary["line_index"]
+        for boundary in applicable
+    )
 
 
 def _line_retry_context_keys(line: Mapping[str, Any]) -> set[tuple[str, str]]:
@@ -3214,6 +3347,9 @@ class ContractRuntime:
             completion_input_lines,
             failed_qa_rejoin_contexts=(
                 _failed_qa_rejoin_context_keys_from_projection(projection)
+            ),
+            failed_qa_rejoin_markers=(
+                _failed_qa_rejoin_markers_from_projection(projection)
             ),
         )
         state = build_execution_state(
