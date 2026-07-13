@@ -10,6 +10,11 @@ from pathlib import Path
 from ..models import AgentRun
 
 
+CODEX_PROFILE_ENV_KEY = "CODEX_HOME"
+CODEX_LOGIN_ARGS = ("login", "--device-auth")
+CODEX_AUTH_STATUS_ARGS = ("login", "status")
+
+
 class CodexAdapterError(ValueError):
     pass
 
@@ -22,7 +27,7 @@ class CodexLaunchSpec:
 
 
 class CodexCliAdapter:
-    """Build a bounded `codex exec` command without login or account rotation."""
+    """Build bounded Codex commands for one explicitly selected profile."""
 
     def __init__(
         self,
@@ -37,9 +42,9 @@ class CodexCliAdapter:
         self.sandbox = str(sandbox or "workspace-write").strip()
         self.stream_json = bool(stream_json)
 
-    def _resolve_executable(self, run: AgentRun) -> str:
+    def resolve_executable(self, executable_ref: str = "") -> str:
         configured = self.executable or os.environ.get("CODEX_BIN", "").strip()
-        executable_ref = str(run.profile.harness_runtime.executable_ref or "").strip()
+        executable_ref = str(executable_ref or "").strip()
         if not configured and executable_ref.startswith("path:"):
             configured = executable_ref.removeprefix("path:")
         configured = configured or "codex"
@@ -52,6 +57,35 @@ class CodexCliAdapter:
         if not resolved:
             raise CodexAdapterError("Codex executable is unavailable")
         return resolved
+
+    def _resolve_executable(self, run: AgentRun) -> str:
+        executable_ref = str(run.profile.harness_runtime.executable_ref or "").strip()
+        return self.resolve_executable(executable_ref)
+
+    @staticmethod
+    def profile_environment(
+        profile_home: str | os.PathLike[str],
+    ) -> dict[str, str]:
+        home = Path(profile_home).expanduser().resolve()
+        if not home.is_dir():
+            raise CodexAdapterError("managed Codex profile home is unavailable")
+        return {CODEX_PROFILE_ENV_KEY: str(home)}
+
+    def build_login_command(
+        self,
+        *,
+        profile_home: str | os.PathLike[str],
+    ) -> tuple[str, ...]:
+        self.profile_environment(profile_home)
+        return (self.resolve_executable(), *CODEX_LOGIN_ARGS)
+
+    def build_auth_status_command(
+        self,
+        *,
+        profile_home: str | os.PathLike[str],
+    ) -> tuple[str, ...]:
+        self.profile_environment(profile_home)
+        return (self.resolve_executable(), *CODEX_AUTH_STATUS_ARGS)
 
     def validate_run(self, run: AgentRun) -> None:
         if run.profile is None:
@@ -72,6 +106,7 @@ class CodexCliAdapter:
         *,
         worktree: str | os.PathLike[str],
         output_path: str | os.PathLike[str],
+        profile_home: str | os.PathLike[str] | None = None,
     ) -> CodexLaunchSpec:
         self.validate_run(run)
         cwd = Path(worktree).expanduser().resolve()
@@ -88,4 +123,13 @@ class CodexCliAdapter:
         if self.stream_json:
             command.append("--json")
         command.extend(["-C", str(cwd), "-o", str(Path(output_path))])
-        return CodexLaunchSpec(command=tuple(command), cwd=str(cwd), environment=None)
+        environment = (
+            self.profile_environment(profile_home)
+            if profile_home is not None
+            else None
+        )
+        return CodexLaunchSpec(
+            command=tuple(command),
+            cwd=str(cwd),
+            environment=environment,
+        )
