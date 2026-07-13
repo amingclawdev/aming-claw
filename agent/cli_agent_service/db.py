@@ -28,6 +28,27 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_profile_states (
+    profile_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'ready',
+            'busy',
+            'cooling_down',
+            'quota_exhausted',
+            'auth_required',
+            'unhealthy',
+            'disabled'
+        )
+    ),
+    reason_code TEXT NOT NULL DEFAULT '',
+    cooldown_until TEXT NOT NULL DEFAULT '',
+    quota_reset_at TEXT NOT NULL DEFAULT '',
+    consecutive_crashes INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_crashes >= 0),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (profile_id) REFERENCES agent_profiles(profile_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_runs (
     run_id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
@@ -71,6 +92,8 @@ CREATE INDEX IF NOT EXISTS active_profile_leases
     ON agent_leases(profile_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS run_successor_lineage
     ON agent_runs(successor_of_run_id);
+CREATE INDEX IF NOT EXISTS profile_scheduler_state
+    ON agent_profile_states(state, cooldown_until, quota_reset_at);
 """
 
 
@@ -119,6 +142,10 @@ def initialize_registry_db(conn: sqlite3.Connection) -> None:
         "INSERT INTO registry_meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(SCHEMA_VERSION),),
+    )
+    conn.execute(
+        "INSERT INTO registry_meta(key, value) VALUES('scheduler_schema_version', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
 
 

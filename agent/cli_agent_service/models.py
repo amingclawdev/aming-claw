@@ -20,6 +20,11 @@ GOVERNANCE_REF_SCHEMA_VERSION = "cli_agent_service.governance_ref.v1"
 REGISTRY_LEASE_SCHEMA_VERSION = "cli_agent_service.registry_lease.v1"
 REGISTRY_RUN_SCHEMA_VERSION = "cli_agent_service.registry_run.v1"
 RECONCILIATION_SCHEMA_VERSION = "cli_agent_service.reconciliation.v1"
+PROFILE_STATE_SCHEMA_VERSION = "cli_agent_service.profile_state.v1"
+PROFILE_REQUIREMENTS_SCHEMA_VERSION = "cli_agent_service.profile_requirements.v1"
+PROFILE_EVALUATION_SCHEMA_VERSION = "cli_agent_service.profile_evaluation.v1"
+PROFILE_SELECTION_SCHEMA_VERSION = "cli_agent_service.profile_selection.v1"
+SCHEDULED_AGENT_RUN_SCHEMA_VERSION = "cli_agent_service.scheduled_run.v1"
 
 PUBLIC_CONFIGURATION_FIELDS = (
     "profile_id",
@@ -290,6 +295,7 @@ class RolePolicy:
     project_ids: tuple[str, ...] = ()
     max_concurrency: int = 1
     timeout_sec: int = 120
+    cooldown_sec: int = 0
     successor_budget: int = 0
     schema_version: str = field(default=ROLE_POLICY_SCHEMA_VERSION, init=False)
 
@@ -302,6 +308,8 @@ class RolePolicy:
             raise ValueError("max_concurrency must be at least 1")
         if self.timeout_sec < 1:
             raise ValueError("timeout_sec must be at least 1")
+        if self.cooldown_sec < 0:
+            raise ValueError("cooldown_sec cannot be negative")
         if self.successor_budget < 0:
             raise ValueError("successor_budget cannot be negative")
 
@@ -314,6 +322,7 @@ class RolePolicy:
             "project_ids": list(self.project_ids),
             "max_concurrency": self.max_concurrency,
             "timeout_sec": self.timeout_sec,
+            "cooldown_sec": self.cooldown_sec,
             "successor_budget": self.successor_budget,
         }
 
@@ -328,6 +337,7 @@ class AgentProfile:
     role_policy: RolePolicy
     version: str = "1"
     output_policy: str = "hash_and_summary_only"
+    privacy_mode: str = "host_private"
     schema_version: str = field(default=AGENT_PROFILE_SCHEMA_VERSION, init=False)
 
     def __post_init__(self) -> None:
@@ -337,6 +347,11 @@ class AgentProfile:
             self,
             "output_policy",
             _required(self.output_policy, "output_policy"),
+        )
+        object.__setattr__(
+            self,
+            "privacy_mode",
+            _required(self.privacy_mode, "privacy_mode").lower(),
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -350,6 +365,83 @@ class AgentProfile:
             "launcher_adapter": self.launcher_adapter.to_public_dict(),
             "role_policy": self.role_policy.to_public_dict(),
             "output_policy": self.output_policy,
+            "privacy_mode": self.privacy_mode,
+            "raw_credential_material_exposed": False,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileRequirements:
+    """Public scheduling constraints supplied by an authorized run request."""
+
+    profile_id: str = ""
+    harness: str = ""
+    runtime_id: str = ""
+    runtime_version: str = ""
+    provider: str = ""
+    endpoint_id: str = ""
+    endpoint_version: str = ""
+    model: str = ""
+    backend_mode: str = ""
+    auth_mode: str = ""
+    role: str = ""
+    project_id: str = ""
+    privacy_mode: str = ""
+    output_policy: str = ""
+    required_capabilities: tuple[str, ...] = ()
+    excluded_profile_ids: tuple[str, ...] = ()
+    preferred_profile_ids: tuple[str, ...] = ()
+    schema_version: str = field(
+        default=PROFILE_REQUIREMENTS_SCHEMA_VERSION,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        for name in (
+            "profile_id",
+            "harness",
+            "runtime_id",
+            "runtime_version",
+            "provider",
+            "endpoint_id",
+            "endpoint_version",
+            "model",
+            "backend_mode",
+            "auth_mode",
+            "role",
+            "project_id",
+            "privacy_mode",
+            "output_policy",
+        ):
+            object.__setattr__(self, name, str(getattr(self, name) or "").strip())
+        for name in (
+            "required_capabilities",
+            "excluded_profile_ids",
+            "preferred_profile_ids",
+        ):
+            values = tuple(dict.fromkeys(_strings(getattr(self, name))))
+            object.__setattr__(self, name, values)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "harness": self.harness,
+            "runtime_id": self.runtime_id,
+            "runtime_version": self.runtime_version,
+            "provider": self.provider,
+            "endpoint_id": self.endpoint_id,
+            "endpoint_version": self.endpoint_version,
+            "model": self.model,
+            "backend_mode": self.backend_mode,
+            "auth_mode": self.auth_mode,
+            "role": self.role,
+            "project_id": self.project_id,
+            "privacy_mode": self.privacy_mode,
+            "output_policy": self.output_policy,
+            "required_capabilities": list(self.required_capabilities),
+            "excluded_profile_ids": list(self.excluded_profile_ids),
+            "preferred_profile_ids": list(self.preferred_profile_ids),
             "raw_credential_material_exposed": False,
         }
 
@@ -509,6 +601,139 @@ class RunState(str, Enum):
     ORPHANED = "orphaned"
 
 
+class ProfileState(str, Enum):
+    """Host-private availability states used only for future scheduling."""
+
+    READY = "ready"
+    BUSY = "busy"
+    COOLING_DOWN = "cooling_down"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    AUTH_REQUIRED = "auth_required"
+    UNHEALTHY = "unhealthy"
+    DISABLED = "disabled"
+
+
+PROFILE_STATES = tuple(item.value for item in ProfileState)
+
+
+@dataclass(frozen=True)
+class ProfileStateRecord:
+    profile_id: str
+    state: str
+    reason_code: str = ""
+    cooldown_until: str = ""
+    quota_reset_at: str = ""
+    consecutive_crashes: int = 0
+    updated_at: str = ""
+    schema_version: str = field(default=PROFILE_STATE_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        profile_id = _required(self.profile_id, "profile_id")
+        state = str(self.state or "").strip().lower()
+        if state not in PROFILE_STATES:
+            raise ValueError("invalid profile state: {}".format(self.state))
+        if self.consecutive_crashes < 0:
+            raise ValueError("consecutive_crashes cannot be negative")
+        object.__setattr__(self, "profile_id", profile_id)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "reason_code", str(self.reason_code or "").strip())
+        object.__setattr__(self, "cooldown_until", str(self.cooldown_until or "").strip())
+        object.__setattr__(self, "quota_reset_at", str(self.quota_reset_at or "").strip())
+        object.__setattr__(self, "updated_at", str(self.updated_at or "").strip())
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "state": self.state,
+            "reason_code": self.reason_code,
+            "cooldown_until": self.cooldown_until,
+            "quota_reset_at": self.quota_reset_at,
+            "consecutive_crashes": self.consecutive_crashes,
+            "updated_at": self.updated_at,
+            "operational_state_only": True,
+            "governance_authority": False,
+            "raw_provider_output_persisted": False,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileEvaluation:
+    profile_id: str
+    state: str
+    eligible: bool
+    rejection_reasons: tuple[str, ...] = ()
+    active_lease_count: int = 0
+    max_concurrency: int = 1
+    schema_version: str = field(default=PROFILE_EVALUATION_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profile_id", _required(self.profile_id, "profile_id"))
+        object.__setattr__(self, "state", str(self.state or "").strip().lower())
+        object.__setattr__(
+            self,
+            "rejection_reasons",
+            tuple(dict.fromkeys(_strings(self.rejection_reasons))),
+        )
+        if self.active_lease_count < 0 or self.max_concurrency < 1:
+            raise ValueError("profile lease counts are invalid")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "state": self.state,
+            "eligible": self.eligible,
+            "rejection_reasons": list(self.rejection_reasons),
+            "active_lease_count": self.active_lease_count,
+            "max_concurrency": self.max_concurrency,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileSelection:
+    profile_id: str
+    selection_reason: str
+    evaluation: ProfileEvaluation
+    evaluations: tuple[ProfileEvaluation, ...] = ()
+    same_profile_qa_fallback: bool = False
+    qa_profile_distinct: bool | None = None
+    qa_principal_distinct: bool | None = None
+    evidence_flags: tuple[str, ...] = ()
+    schema_version: str = field(default=PROFILE_SELECTION_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profile_id", _required(self.profile_id, "profile_id"))
+        object.__setattr__(
+            self,
+            "selection_reason",
+            _required(self.selection_reason, "selection_reason"),
+        )
+        object.__setattr__(self, "evaluations", tuple(self.evaluations))
+        object.__setattr__(
+            self,
+            "evidence_flags",
+            tuple(dict.fromkeys(_strings(self.evidence_flags))),
+        )
+        if self.evaluation.profile_id != self.profile_id:
+            raise ValueError("selected profile does not match its evaluation")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "selection_reason": self.selection_reason,
+            "evaluation": self.evaluation.to_public_dict(),
+            "evaluations": [item.to_public_dict() for item in self.evaluations],
+            "same_profile_qa_fallback": self.same_profile_qa_fallback,
+            "qa_profile_distinct": self.qa_profile_distinct,
+            "qa_principal_distinct": self.qa_principal_distinct,
+            "evidence_flags": list(self.evidence_flags),
+            "operational_state_only": True,
+            "governance_authority": False,
+        }
+
+
 @dataclass(frozen=True)
 class RegistryLease:
     lease_id: str
@@ -581,6 +806,30 @@ class RegistryRun:
 
 
 @dataclass(frozen=True)
+class ScheduledAgentRun:
+    run: AgentRun
+    lease: RegistryLease
+    selection: ProfileSelection
+    schema_version: str = field(default=SCHEDULED_AGENT_RUN_SCHEMA_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        if self.run.run_id != self.lease.run_id:
+            raise ValueError("scheduled run and lease identities do not match")
+        if self.run.config.profile_id != self.selection.profile_id:
+            raise ValueError("scheduled run and profile selection do not match")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run": self.run.to_public_dict(),
+            "lease": self.lease.to_public_dict(),
+            "selection": self.selection.to_public_dict(),
+            "operational_state_only": True,
+            "governance_authority": False,
+        }
+
+
+@dataclass(frozen=True)
 class ProcessObservation:
     alive: bool
     start_identity: str = ""
@@ -623,3 +872,8 @@ class ReconciliationResult:
 # Descriptive aliases retained for callers that name the persisted shape explicitly.
 RegistryRunRecord = RegistryRun
 LeaseState = RegistryLease
+ProfileAvailabilityState = ProfileState
+AgentProfileState = ProfileStateRecord
+ProfileRuntimeState = ProfileStateRecord
+SchedulingRequirements = ProfileRequirements
+SchedulingDecision = ProfileSelection
