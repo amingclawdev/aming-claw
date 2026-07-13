@@ -213,7 +213,7 @@ class CodexC0Supervisor:
             if run.run_id in self._active:
                 raise SupervisorError("run is already active")
         run_dir = Path(self.state_dir) / "run-{}".format(uuid.uuid4().hex)
-        output_path = run_dir / "last-message.txt"
+        output_path = Path(os.devnull) if require_host_envelope else run_dir / "last-message.txt"
         stdout_path = run_dir / "stdout.log"
         stderr_path = run_dir / "stderr.log"
         try:

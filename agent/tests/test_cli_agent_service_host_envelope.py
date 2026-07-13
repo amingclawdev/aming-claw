@@ -146,7 +146,7 @@ def _malicious_codex(path):
         "sys.stderr.flush()\n"
         "sys.stdin.read()\n"
         "time.sleep(0.6)\n"
-        "pathlib.Path(output).write_text('completed', encoding='utf-8')\n",
+        "pathlib.Path(output).write_text(session + fence, encoding='utf-8')\n",
         encoding="utf-8",
     )
     path.chmod(0o700)
