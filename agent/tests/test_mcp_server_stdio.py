@@ -4,7 +4,10 @@ import json
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
+
+import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp.server import AmingClawMCP
@@ -1173,6 +1176,155 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
             None,
         )
     ]
+
+
+def test_worker_auth_env_is_added_only_at_runtime_mcp_http_boundary(monkeypatch):
+    session_token = "worker-session-secret"
+    fence_token = "worker-fence-secret"
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", fence_token)
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "trace_id": "gqt-worker-env"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    arguments = {
+        "project_id": "aming-claw",
+        "tool": "function_index",
+        "args": {"query": "probe_executable"},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "worker_role": "mf_sub",
+        "runtime_context_id": "mfrctx-worker-env",
+    }
+
+    result = dispatcher.dispatch("graph_query", arguments)
+
+    assert result == {"ok": True, "trace_id": "gqt-worker-env"}
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
+    assert calls[0][2]["session_token"] == session_token
+    assert calls[0][2]["fence_token"] == fence_token
+    assert session_token not in json.dumps(result)
+    assert fence_token not in json.dumps(result)
+
+
+def test_worker_auth_env_reaches_standalone_worker_guide_without_mutating_args(
+    monkeypatch,
+):
+    session_token = "standalone-worker-session-secret"
+    fence_token = "standalone-worker-fence-secret"
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", fence_token)
+    calls = []
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {"ok": True, "guide": {"next_legal_action": "read"}}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    arguments = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-worker-env",
+        "parent_task_id": "cex-parent",
+        "target_project_root": "/repo/worker",
+    }
+
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide",
+        arguments,
+    )
+
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
+    assert urllib.parse.quote(session_token, safe="") in calls[0][1]
+    assert urllib.parse.quote(fence_token, safe="") in calls[0][1]
+    assert session_token not in json.dumps(result)
+    assert fence_token not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_path"),
+    [
+        (
+            "runtime_context_read_receipt",
+            {
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-worker-env",
+                "task_id": "worker-env-task",
+            },
+            "/runtime-contexts/mfrctx-worker-env/read-receipts",
+        ),
+        (
+            "parallel_branch_startup",
+            {
+                "project_id": "aming-claw",
+                "task_id": "worker-env-task",
+                "worker_role": "mf_sub",
+            },
+            "/parallel-branches/startup",
+        ),
+    ],
+)
+def test_worker_auth_env_is_added_to_worker_write_facades(
+    monkeypatch,
+    tool_name,
+    arguments,
+    expected_path,
+):
+    session_token = "write-worker-session-secret"
+    fence_token = "write-worker-fence-secret"
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", fence_token)
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "status": "accepted"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(tool_name, arguments)
+
+    assert result == {"ok": True, "status": "accepted"}
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert expected_path in calls[0][1]
+    assert calls[0][2]["session_token"] == session_token
+    assert calls[0][2]["fence_token"] == fence_token
+
+
+def test_worker_auth_env_conflict_fails_closed_without_echo(monkeypatch):
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "authoritative-session")
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", "authoritative-fence")
+
+    with pytest.raises(ValueError) as caught:
+        governance_mcp_server._dispatch_tool(
+            "runtime_context_worker_guide",
+            {
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-worker-env",
+                "session_token": "conflicting-session",
+            },
+        )
+
+    assert str(caught.value) == "worker tool auth conflicts with the host environment"
+    assert "authoritative" not in str(caught.value)
+    assert "conflicting" not in str(caught.value)
 
 
 def test_mcp_dispatcher_runtime_context_initial_join_posts_canonical_facade():

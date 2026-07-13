@@ -51,6 +51,10 @@ _RECONCILE_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_RECONCILE_MCP_TIMEOUT_SECONDS",
 )
 _RECONCILE_PROGRESS_POLL_TIMEOUT_SECONDS = 10
+_WORKER_AUTH_ENV_FIELDS = {
+    "session_token": "AMING_WORKER_SESSION_TOKEN",
+    "fence_token": "AMING_WORKER_FENCE_TOKEN",
+}
 
 
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -348,6 +352,26 @@ def _runtime_context_query(args: dict) -> dict:
         for key in _RUNTIME_CONTEXT_QUERY_FIELDS
         if args.get(key)
     }
+
+
+def _worker_auth_from_env(args: dict) -> dict:
+    """Add host-only worker auth at the HTTP boundary without mutating tool args."""
+
+    enriched = dict(args)
+    environment = {
+        field: str(os.environ.get(env_key) or "").strip()
+        for field, env_key in _WORKER_AUTH_ENV_FIELDS.items()
+    }
+    if not any(environment.values()):
+        return enriched
+    if not all(environment.values()):
+        raise ValueError("worker host auth environment is incomplete")
+    for field, value in environment.items():
+        supplied = str(enriched.get(field) or "").strip()
+        if supplied and supplied != value:
+            raise ValueError("worker tool auth conflicts with the host environment")
+        enriched[field] = value
+    return enriched
 
 
 def _runtime_context_schema_properties() -> dict[str, Any]:
@@ -2757,7 +2781,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
         pid = args["project_id"]
         runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
-        query = _runtime_context_query(args)
+        query = _runtime_context_query(_worker_auth_from_env(args))
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
         return _http(
@@ -2792,11 +2816,21 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             "runtime_context_session_token_reissue": "session-token/reissue",
             "runtime_context_session_token_rejoin": "session-token/rejoin",
         }
+        request_args = (
+            _worker_auth_from_env(args)
+            if name
+            not in {
+                "runtime_context_session_token_initial_join",
+                "runtime_context_session_token_reissue",
+                "runtime_context_session_token_rejoin",
+            }
+            else args
+        )
         return _http(
             "POST",
             f"/api/graph-governance/{pid}/runtime-contexts/"
             f"{runtime_context_id}/{suffix_by_name[name]}",
-            _runtime_context_write_body(args),
+            _runtime_context_write_body(request_args),
         )
 
     if name == "parallel_branch_allocate":
