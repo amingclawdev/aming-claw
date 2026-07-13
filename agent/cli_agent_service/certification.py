@@ -51,6 +51,24 @@ ProbeStatus = CapabilityStatus
 
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_]{1,95}")
 _SAFE_EVIDENCE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/@+-]{1,511}")
+_CREDENTIAL_EVIDENCE_REF_HEAD = re.compile(
+    r"(?:credential|credref|token|secret|password|api_?key|auth_token|"
+    r"access_token|session_token|route_token|bearer)(?:[:._/@+-]|$)"
+)
+_CREDENTIAL_EVIDENCE_REF_MARKERS = (
+    "api_key",
+    "auth_token",
+    "access_token",
+    "bearer_token",
+    "client_secret",
+    "credential_ref",
+    "password",
+    "private_key",
+    "raw_secret",
+    "route_token",
+    "secret_key",
+    "session_token",
+)
 
 
 def _required(value: Any, field_name: str) -> str:
@@ -92,11 +110,8 @@ def _safe_evidence_ref(value: Any) -> str:
         raise ValueError("evidence_ref must be a public-safe reference")
     lowered = normalized.lower().replace("-", "_")
     if normalized and (
-        lowered.startswith(("credential:", "credref_"))
-        or any(
-            marker in lowered
-            for marker in ("api_key", "password", "raw_secret", "session_token")
-        )
+        _CREDENTIAL_EVIDENCE_REF_HEAD.match(lowered)
+        or any(marker in lowered for marker in _CREDENTIAL_EVIDENCE_REF_MARKERS)
     ):
         raise ValueError("evidence_ref must not contain credential material")
     return normalized
@@ -236,12 +251,13 @@ class CapabilityResult:
         return expiry > current
 
     def to_public_dict(self) -> dict[str, Any]:
+        evidence_ref = _safe_evidence_ref(self.evidence_ref)
         return {
             "schema_version": self.schema_version,
             "capability": self.capability.value,
             "status": self.status.value,
             "reason_code": self.reason_code,
-            "evidence_ref": self.evidence_ref,
+            "evidence_ref": evidence_ref,
             "observed_at": self.observed_at,
             "expires_at": self.expires_at,
             "raw_probe_output_exposed": False,

@@ -16,6 +16,9 @@ from ..models import CredentialRef, InferenceEndpoint, validate_credential_ref_i
 
 CLAUDE_GATEWAY_URL_ENV_KEY = "ANTHROPIC_BASE_URL"
 CLAUDE_GATEWAY_CREDENTIAL_ENV_KEY = "ANTHROPIC_AUTH_TOKEN"
+_CLAUDE_GATEWAY_SECRET_ENVIRONMENT_KEYS = (
+    CLAUDE_GATEWAY_CREDENTIAL_ENV_KEY,
+)
 
 
 class ClaudeGatewayAdapterError(ValueError):
@@ -42,6 +45,34 @@ def _gateway_url(value: str) -> str:
     return normalized
 
 
+def _public_launch_environment(
+    value: Mapping[str, str],
+    *,
+    reject_private_keys: bool,
+) -> dict[str, str]:
+    try:
+        items = dict(value).items()
+    except Exception:
+        raise ClaudeGatewayAdapterError(
+            "gateway launch environment is invalid"
+        ) from None
+    public: dict[str, str] = {}
+    for raw_key, raw_value in items:
+        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+            raise ClaudeGatewayAdapterError(
+                "gateway launch environment is invalid"
+            )
+        key = raw_key.strip()
+        if key != CLAUDE_GATEWAY_URL_ENV_KEY:
+            if reject_private_keys:
+                raise ClaudeGatewayAdapterError(
+                    "gateway launch environment contains a private key"
+                )
+            continue
+        public[key] = _gateway_url(raw_value)
+    return public
+
+
 @dataclass(frozen=True)
 class ClaudeGatewayLaunchSpec:
     """Public launch material; credentials are applied after this object is built."""
@@ -49,21 +80,66 @@ class ClaudeGatewayLaunchSpec:
     command: tuple[str, ...]
     cwd: str
     environment: Mapping[str, str]
-    secret_environment_keys: tuple[str, ...] = (CLAUDE_GATEWAY_CREDENTIAL_ENV_KEY,)
+    secret_environment_keys: tuple[str, ...] = (
+        CLAUDE_GATEWAY_CREDENTIAL_ENV_KEY,
+    )
 
     def __post_init__(self) -> None:
+        try:
+            declared_secret_keys = tuple(self.secret_environment_keys)
+        except Exception:
+            raise ClaudeGatewayAdapterError(
+                "gateway secret environment declaration is invalid"
+            ) from None
+        if declared_secret_keys != _CLAUDE_GATEWAY_SECRET_ENVIRONMENT_KEYS:
+            raise ClaudeGatewayAdapterError(
+                "gateway secret environment declaration is invalid"
+            )
         object.__setattr__(
             self,
             "environment",
-            MappingProxyType(dict(self.environment)),
+            MappingProxyType(
+                _public_launch_environment(
+                    self.environment,
+                    reject_private_keys=True,
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "secret_environment_keys",
+            _CLAUDE_GATEWAY_SECRET_ENVIRONMENT_KEYS,
+        )
+
+    def __repr__(self) -> str:
+        try:
+            public_environment = _public_launch_environment(
+                self.environment,
+                reject_private_keys=False,
+            )
+        except ClaudeGatewayAdapterError:
+            public_environment = {}
+        return (
+            "ClaudeGatewayLaunchSpec(command={!r}, cwd={!r}, "
+            "environment_keys={!r}, secret_environment_keys={!r})"
+        ).format(
+            self.command,
+            self.cwd,
+            tuple(sorted(public_environment)),
+            _CLAUDE_GATEWAY_SECRET_ENVIRONMENT_KEYS,
         )
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "command": list(self.command),
             "cwd": self.cwd,
-            "environment": dict(self.environment),
-            "secret_environment_keys": list(self.secret_environment_keys),
+            "environment": _public_launch_environment(
+                self.environment,
+                reject_private_keys=False,
+            ),
+            "secret_environment_keys": list(
+                _CLAUDE_GATEWAY_SECRET_ENVIRONMENT_KEYS
+            ),
             "endpoint_adapter": "claude_gateway",
             "credential_ref_exposed": False,
             "raw_credentials_exposed": False,

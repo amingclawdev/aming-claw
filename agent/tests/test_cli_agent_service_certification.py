@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AGENT_DIR))
@@ -145,3 +147,41 @@ def test_certification_projection_is_structured_and_public_safe():
     assert "session_token" not in rendered
     assert "route_token" not in rendered
     assert record.to_public_dict()["role_eligibility"]["utility"]["eligible"] is True
+
+
+@pytest.mark.parametrize(
+    "evidence_ref",
+    (
+        "token:qa-private-evidence",
+        "secret:qa-private-evidence",
+        "access-token:qa-private-evidence",
+        "probe:client_secret:qa-private-evidence",
+    ),
+)
+def test_certification_rejects_credential_shaped_evidence_refs(evidence_ref):
+    from cli_agent_service.certification import CapabilityResult
+
+    with pytest.raises(ValueError) as rejected:
+        CapabilityResult("structured_output", "passed", evidence_ref=evidence_ref)
+
+    assert evidence_ref not in str(rejected.value)
+
+
+def test_certification_public_receipt_refuses_tampered_credential_evidence():
+    from cli_agent_service.certification import (
+        CapabilityResult,
+        LocalModelCertification,
+    )
+
+    private_ref = "token:qa-private-receipt-value"
+    result = CapabilityResult(
+        "structured_output",
+        "passed",
+        evidence_ref="probe:structured-output",
+    )
+    object.__setattr__(result, "evidence_ref", private_ref)
+    record = LocalModelCertification(_scope(), (result,))
+
+    with pytest.raises(ValueError) as rejected:
+        record.to_public_dict()
+    assert private_ref not in str(rejected.value)

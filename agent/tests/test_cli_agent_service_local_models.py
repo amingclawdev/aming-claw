@@ -123,6 +123,61 @@ def test_claude_gateway_spec_never_contains_credential_ref_or_value(tmp_path):
     assert secret_value not in repr(launch)
 
 
+def test_claude_gateway_launch_spec_rejects_private_environment_without_echo():
+    from cli_agent_service.adapters.claude_gateway import (
+        ClaudeGatewayAdapterError,
+        ClaudeGatewayLaunchSpec,
+    )
+
+    private_value = "qa-private-environment-value"
+    with pytest.raises(ClaudeGatewayAdapterError) as rejected:
+        ClaudeGatewayLaunchSpec(
+            command=("claude",),
+            cwd="/assigned/worktree",
+            environment={"ANTHROPIC_AUTH_TOKEN": private_value},
+        )
+
+    assert private_value not in str(rejected.value)
+    assert private_value not in repr(rejected.value)
+
+
+def test_claude_gateway_launch_spec_repr_omits_environment_values():
+    from cli_agent_service.adapters.claude_gateway import ClaudeGatewayLaunchSpec
+
+    public_url = "http://127.0.0.1:8080/private-looking-path"
+    launch = ClaudeGatewayLaunchSpec(
+        command=("claude",),
+        cwd="/assigned/worktree",
+        environment={"ANTHROPIC_BASE_URL": public_url},
+    )
+
+    assert public_url not in repr(launch)
+
+
+def test_claude_gateway_launch_spec_public_dict_filters_private_environment():
+    from cli_agent_service.adapters.claude_gateway import ClaudeGatewayLaunchSpec
+
+    private_value = "qa-private-public-dict-value"
+    launch = ClaudeGatewayLaunchSpec(
+        command=("claude",),
+        cwd="/assigned/worktree",
+        environment={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"},
+    )
+    object.__setattr__(
+        launch,
+        "environment",
+        {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+            "ANTHROPIC_AUTH_TOKEN": private_value,
+        },
+    )
+
+    public = launch.to_public_dict()
+    rendered = json.dumps(public, sort_keys=True)
+    assert private_value not in rendered
+    assert "ANTHROPIC_AUTH_TOKEN" not in public["environment"]
+
+
 def test_gateway_errors_and_urls_do_not_echo_credential_material(tmp_path):
     from cli_agent_service.adapters.claude_gateway import (
         ClaudeGatewayAdapter,
