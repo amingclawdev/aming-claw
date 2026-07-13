@@ -269,6 +269,9 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
             contract_execution_id="cex-runtime-text-a1",
             contract_runtime_current_state={
                 "source_of_authority": "ContractRuntime",
+                "authority_decision_source": (
+                    "contract_runtime_completed_dispatch_line"
+                ),
                 "project_id": "aming-claw",
                 "backlog_id": "AC-RUNTIME-TEXT-A1",
                 "contract_execution_id": "cex-runtime-text-a1",
@@ -458,14 +461,16 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     )
 
 
-def test_runtime_text_ticket_authority_is_read_from_contract_runtime(monkeypatch):
+def test_runtime_text_ticket_authority_rejects_mf_parallel_without_dispatch(
+    monkeypatch,
+):
     from agent.governance import server
 
     record = {
         "project_id": "aming-claw",
         "backlog_id": "AC-RUNTIME-TEXT-AUTHORITY",
         "contract_execution_id": "cex-runtime-text-authority",
-        "contract_id": "mf_parallel",
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
         "revision": "rev-runtime-text-authority",
         "execution_state_revision": 5,
         "execution_state": {
@@ -500,8 +505,12 @@ def test_runtime_text_ticket_authority_is_read_from_contract_runtime(monkeypatch
         contract_execution_id="cex-runtime-text-authority",
     )
 
-    assert current["ticket_authority_status"] == "current"
+    assert current["ticket_authority_status"] == "invalid"
+    assert current["ticket_authority_error"] == (
+        "canonical ContractRuntime has no accepted mf_parallel dispatch authority"
+    )
     assert current["source_of_authority"] == "ContractRuntime"
+    assert current["authority_decision_source"] == "contract_runtime_current_state"
     assert current["contract_revision_id"] == "rev-runtime-text-authority"
     assert current["execution_state_revision"] == 5
     assert current["next_legal_action"]["action"] == "dispatch_bounded_worker"

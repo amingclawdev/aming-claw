@@ -66907,7 +66907,13 @@ def _contract_runtime_dispatch_ticket_authority(
         ):
             dispatch_lines.append((index, line, payload))
     if not dispatch_lines:
-        return {}
+        return {
+            "status": "invalid",
+            "error": (
+                "canonical ContractRuntime has no accepted mf_parallel "
+                "dispatch authority"
+            ),
+        }
     if len(dispatch_lines) != 1:
         return {
             "status": "invalid",

@@ -3825,6 +3825,12 @@ def build_cli_agent_execution_ticket(
         errors.append(str(authority.get("error") or "contract runtime authority is invalid"))
     if authority.get("source_of_authority") != "ContractRuntime":
         errors.append("execution ticket authority must be ContractRuntime")
+    if authority.get("authority_decision_source") != (
+        "contract_runtime_completed_dispatch_line"
+    ):
+        errors.append(
+            "execution ticket authority must come from accepted ContractRuntime dispatch line"
+        )
     if int(authority.get("execution_state_revision") or 0) <= 0:
         errors.append("execution_state_revision is required")
     if not authority.get("next_legal_action"):

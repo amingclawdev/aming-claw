@@ -108,7 +108,7 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
     current = {
         "schema_version": "contract_runtime_current_state.v1",
         "source_of_authority": "ContractRuntime",
-        "authority_decision_source": "contract_runtime_current_state",
+        "authority_decision_source": "contract_runtime_completed_dispatch_line",
         "project_id": "aming-claw",
         "backlog_id": "AC-CLI-TICKET",
         "contract_execution_id": "cex-cli-ticket",
@@ -246,6 +246,22 @@ def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
     assert "next_legal_action.runtime_context_id" in unbound[
         "missing_authority_fields"
     ]
+
+
+def test_cli_agent_execution_ticket_rejects_non_dispatch_decision_source():
+    current, launch = _cli_agent_ticket_fixture()
+    current["authority_decision_source"] = "contract_runtime_current_state"
+
+    rejected = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert rejected["status"] == "rejected"
+    assert (
+        "execution ticket authority must come from accepted ContractRuntime dispatch line"
+        in rejected["errors"]
+    )
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():

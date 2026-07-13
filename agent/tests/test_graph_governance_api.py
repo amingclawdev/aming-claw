@@ -45282,6 +45282,125 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     return successor, runtime_context
 
 
+def test_source_backed_mf_parallel_without_dispatch_rejects_ticket_authority(conn):
+    backlog_id = "AC-SOURCE-BACKED-NO-DISPATCH-TICKET"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-source-backed-no-dispatch-root",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Exercise canonical pre-dispatch ticket rejection.",
+                "backlog_id": backlog_id,
+                "task_id": "source-backed-no-dispatch-parent",
+                "route_token_ref": "rtok-source-backed-no-dispatch-root",
+                "worker_fence": {
+                    "fence_token": "fence-source-backed-no-dispatch",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+
+    authority = server._observer_runtime_text_contract_runtime_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+
+    assert authority["ticket_authority_status"] == "invalid"
+    assert authority["authority_decision_source"] == (
+        "contract_runtime_current_state"
+    )
+    assert authority["ticket_authority_error"] == (
+        "canonical ContractRuntime has no accepted mf_parallel dispatch authority"
+    )
+
+
+def test_mf_parallel_dispatch_ticket_authority_rejects_ambiguous_dispatch():
+    dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "payload": {},
+    }
+
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "completed_lines": [dispatch, dict(dispatch)],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority == {
+        "status": "invalid",
+        "error": "canonical ContractRuntime dispatch authority is ambiguous",
+    }
+
+
+def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "route_id": "route-dispatch",
+                        "route_identity": {"route_id": "route-nested"},
+                    },
+                }
+            ],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority == {
+        "status": "invalid",
+        "error": (
+            "canonical ContractRuntime dispatch contains conflicting ticket "
+            "authority: route_id"
+        ),
+    }
+
+
 def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_read(
     conn,
     tmp_path,
@@ -52727,7 +52846,7 @@ def test_cli_agent_successor_ticket_binds_persisted_evidence_and_runtime_authori
     }
     authority = {
         "source_of_authority": "ContractRuntime",
-        "authority_decision_source": "contract_runtime_current_state",
+        "authority_decision_source": "contract_runtime_completed_dispatch_line",
         "project_id": PID,
         "backlog_id": backlog_id,
         "contract_execution_id": "cex-handler-successor",
