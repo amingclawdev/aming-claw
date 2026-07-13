@@ -6,6 +6,13 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
+from .certification import (
+    CertificationCatalog,
+    LocalModelCertification,
+    RoleEligibility,
+    certification_role,
+    is_local_endpoint,
+)
 from .config import resolve_agent_config
 from .models import (
     AgentProfile,
@@ -172,8 +179,77 @@ def _matches_harness(profile: AgentProfile, requested: str) -> bool:
 class AgentScheduler:
     """Select and reserve host profiles without deciding governance progression."""
 
-    def __init__(self, registry: AgentRegistry) -> None:
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        certification_catalog: CertificationCatalog
+        | Iterable[LocalModelCertification]
+        | Mapping[Any, LocalModelCertification]
+        | LocalModelCertification
+        | None = None,
+        *,
+        certifications: CertificationCatalog
+        | Iterable[LocalModelCertification]
+        | Mapping[Any, LocalModelCertification]
+        | LocalModelCertification
+        | None = None,
+    ) -> None:
         self.registry = registry
+        if certification_catalog is not None and certifications is not None:
+            raise SchedulerError(
+                "provide certification_catalog or certifications, not both"
+            )
+        source = certifications if certifications is not None else certification_catalog
+        if isinstance(source, CertificationCatalog):
+            self.certifications = source
+        elif isinstance(source, LocalModelCertification):
+            self.certifications = CertificationCatalog((source,))
+        else:
+            self.certifications = CertificationCatalog(source or ())
+
+    def certification_eligibility(
+        self,
+        profile: AgentProfile,
+        role: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> RoleEligibility | None:
+        """Return the exact-scope role assessment for a certifiable endpoint."""
+
+        if not is_local_endpoint(profile.inference_endpoint):
+            return None
+        record = self.certifications.resolve_profile(profile)
+        if record is None:
+            return None
+        return record.role_eligibility(certification_role(role), now=now)
+
+    def _certification_rejection_reasons(
+        self,
+        profile: AgentProfile,
+        role: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> tuple[str, ...]:
+        if not is_local_endpoint(profile.inference_endpoint):
+            return ()
+        if not _text(role):
+            return ("certification_role_required",)
+        eligibility = self.certification_eligibility(profile, role, now=now)
+        if eligibility is None:
+            return ("certification_missing", "role_not_certified")
+        if eligibility.eligible:
+            return ()
+        details = tuple(
+            "certification_{}_missing".format(capability)
+            for capability in eligibility.missing_capabilities
+        ) + tuple(
+            "certification_{}_failed".format(capability)
+            for capability in eligibility.failed_capabilities
+        ) + tuple(
+            "certification_{}_revoked".format(capability)
+            for capability in eligibility.revoked_capabilities
+        )
+        return tuple(dict.fromkeys(("role_not_certified", *details)))
 
     @staticmethod
     def _profile_order(
@@ -251,6 +327,13 @@ class AgentScheduler:
         )
         if missing_capabilities:
             reasons.append("required_capabilities_missing")
+        reasons.extend(
+            self._certification_rejection_reasons(
+                profile,
+                requirements.role,
+                now=now,
+            )
+        )
 
         if state.state == ProfileState.BUSY.value:
             reasons.append("profile_busy")

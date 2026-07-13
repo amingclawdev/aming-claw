@@ -513,3 +513,179 @@ def test_scheduler_state_database_is_structured_private_and_non_authoritative(tm
     assert registry.get_profile_state("profile-private").to_public_dict()[
         "governance_authority"
     ] is False
+
+
+def _local_requirements(**overrides):
+    values = _requirements(
+        provider="ollama",
+        endpoint_id="endpoint-local",
+        model="qwen3-coder",
+        backend_mode="codex_oss",
+        auth_mode="none",
+    )
+    values.update(overrides)
+    return values
+
+
+def _local_profile(profile_id="profile-local", **overrides):
+    return _profile(
+        profile_id,
+        account="local",
+        provider="ollama",
+        endpoint_id="endpoint-local",
+        model="qwen3-coder",
+        backend_mode="codex_oss",
+        auth_mode="none",
+        **overrides,
+    )
+
+
+def _certification(profile, *, extra=(), omit=()):
+    from cli_agent_service.certification import (
+        CapabilityResult,
+        CertificationScope,
+        LocalModelCertification,
+        ROLE_CAPABILITY_REQUIREMENTS,
+    )
+
+    required = {
+        item.value for item in ROLE_CAPABILITY_REQUIREMENTS["worker"]
+    }
+    required.update(extra)
+    required.difference_update(omit)
+    return LocalModelCertification(
+        CertificationScope.from_profile(profile),
+        tuple(
+            CapabilityResult(item, "passed", evidence_ref="probe:{}".format(item))
+            for item in sorted(required)
+        ),
+    )
+
+
+def test_local_endpoint_requires_capability_certification_not_health(tmp_path):
+    from cli_agent_service.certification import (
+        CapabilityResult,
+        CertificationCatalog,
+        CertificationScope,
+        LocalModelCertification,
+    )
+    from cli_agent_service.scheduler import AgentScheduler, NoEligibleProfileError
+
+    registry = _registry(tmp_path)
+    profile = _local_profile()
+    registry.register_profile(profile)
+
+    with pytest.raises(NoEligibleProfileError) as missing:
+        AgentScheduler(registry).select_profile(_local_requirements(), now=NOW)
+    assert missing.value.evaluations[0].rejection_reasons == (
+        "certification_missing",
+        "role_not_certified",
+    )
+
+    discovery_only = LocalModelCertification(
+        CertificationScope.from_profile(profile),
+        (
+            CapabilityResult("health", "passed"),
+            CapabilityResult("model_discovery", "passed"),
+        ),
+    )
+    with pytest.raises(NoEligibleProfileError) as uncertified:
+        AgentScheduler(
+            registry,
+            certifications=CertificationCatalog((discovery_only,)),
+        ).select_profile(_local_requirements(), now=NOW)
+    assert "role_not_certified" in (
+        uncertified.value.evaluations[0].rejection_reasons
+    )
+
+
+def test_scheduler_adds_certification_without_weakening_profile_policy(tmp_path):
+    from cli_agent_service.certification import CertificationCatalog
+    from cli_agent_service.scheduler import AgentScheduler, NoEligibleProfileError
+
+    registry = _registry(tmp_path)
+    profile = _local_profile()
+    registry.register_profile(profile)
+    catalog = CertificationCatalog((_certification(profile),))
+    scheduler = AgentScheduler(registry, catalog)
+
+    selected = scheduler.select_profile(_local_requirements(), now=NOW)
+    assert selected.profile_id == profile.profile_id
+    assert scheduler.certification_eligibility(profile, "dev", now=NOW).eligible
+
+    with pytest.raises(NoEligibleProfileError) as provider_mismatch:
+        scheduler.select_profile(
+            _local_requirements(provider="openai_compatible"),
+            now=NOW,
+        )
+    assert "provider_mismatch" in (
+        provider_mismatch.value.evaluations[0].rejection_reasons
+    )
+
+    with pytest.raises(NoEligibleProfileError) as policy_denied:
+        scheduler.select_profile(
+            _local_requirements(role="observer"),
+            now=NOW,
+        )
+    assert "role_not_allowed" in policy_denied.value.evaluations[0].rejection_reasons
+    assert "role_not_certified" in policy_denied.value.evaluations[0].rejection_reasons
+
+
+def test_scheduler_derives_qa_and_worker_eligibility_independently(tmp_path):
+    from cli_agent_service.certification import CertificationCatalog
+    from cli_agent_service.scheduler import AgentScheduler, NoEligibleProfileError
+
+    registry = _registry(tmp_path)
+    profile = _local_profile()
+    registry.register_profile(profile)
+    worker_only = _certification(profile)
+    catalog = CertificationCatalog((worker_only,))
+    scheduler = AgentScheduler(registry, catalog)
+
+    assert scheduler.select_profile(_local_requirements(), now=NOW).profile_id == (
+        profile.profile_id
+    )
+    with pytest.raises(NoEligibleProfileError) as qa_denied:
+        scheduler.select_profile(
+            _local_requirements(role="qa"),
+            now=NOW,
+        )
+    assert "certification_read_only_tools_missing" in (
+        qa_denied.value.evaluations[0].rejection_reasons
+    )
+
+    catalog.upsert(worker_only.with_capability("read_only_tools", "passed"))
+    assert scheduler.select_profile(
+        _local_requirements(role="qa"),
+        now=NOW,
+    ).profile_id == profile.profile_id
+
+
+def test_scheduler_revokes_future_local_selection_after_degraded_outcome(tmp_path):
+    from cli_agent_service.certification import CertificationCatalog
+    from cli_agent_service.scheduler import AgentScheduler, NoEligibleProfileError
+
+    registry = _registry(tmp_path)
+    profile = _local_profile()
+    registry.register_profile(profile)
+    record = _certification(profile)
+    catalog = CertificationCatalog((record,))
+    scheduler = AgentScheduler(registry, certifications=catalog)
+    assert scheduler.select_profile(_local_requirements(), now=NOW).profile_id == (
+        profile.profile_id
+    )
+
+    catalog.upsert(
+        record.with_capability(
+            "reliability",
+            "failed",
+            reason_code="reliability_degraded",
+            evidence_ref="probe:outcome-regression",
+        )
+    )
+    with pytest.raises(NoEligibleProfileError) as denied:
+        scheduler.select_profile(_local_requirements(), now=NOW)
+    assert denied.value.evaluations[0].rejection_reasons == (
+        "role_not_certified",
+        "certification_reliability_failed",
+    )
