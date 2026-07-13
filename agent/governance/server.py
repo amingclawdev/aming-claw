@@ -66886,6 +66886,194 @@ def _contract_runtime_execution_ticket_consumption(
     }
 
 
+def _contract_runtime_dispatch_ticket_authority(
+    record: Mapping[str, Any],
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+
+    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_CONTRACT_ID:
+        return {}
+    dispatch_lines: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+    for index, line in _contract_runtime_completed_lines(record):
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        if (
+            str(line.get("stage_id") or "").strip() == "dispatch"
+            and str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+            and str(line.get("evidence_kind") or "").strip()
+            == "dispatch_bounded_worker"
+            and str(line.get("actor_role") or "").strip() == "observer"
+        ):
+            dispatch_lines.append((index, line, payload))
+    if not dispatch_lines:
+        return {}
+    if len(dispatch_lines) != 1:
+        return {
+            "status": "invalid",
+            "error": "canonical ContractRuntime dispatch authority is ambiguous",
+        }
+
+    dispatch_index, line, payload = dispatch_lines[0]
+    actual_next = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    actual_next_line = str(
+        actual_next.get("line_id") or actual_next.get("id") or ""
+    ).strip()
+    if actual_next_line != "worker_read_runtime_guide":
+        return {
+            "status": "invalid",
+            "error": (
+                "execution ticket authority window closed after worker read/startup "
+                "or ContractRuntime state advance"
+            ),
+        }
+
+    dispatch_runtime_context_id = str(
+        line.get("runtime_context_id") or payload.get("runtime_context_id") or ""
+    ).strip()
+    dispatch_task_id = str(
+        line.get("task_id")
+        or payload.get("task_id")
+        or payload.get("worker_task_id")
+        or ""
+    ).strip()
+    dispatch_parent_task_id = str(
+        line.get("parent_task_id") or payload.get("parent_task_id") or ""
+    ).strip()
+    for index, candidate in _contract_runtime_completed_lines(record):
+        if index <= dispatch_index:
+            continue
+        candidate_line_id = str(candidate.get("line_id") or "").strip()
+        if candidate_line_id not in {"worker_read_runtime_guide", "worker_startup"}:
+            continue
+        candidate_payload = (
+            candidate.get("payload")
+            if isinstance(candidate.get("payload"), Mapping)
+            else {}
+        )
+        candidate_identity = (
+            str(
+                candidate.get("runtime_context_id")
+                or candidate_payload.get("runtime_context_id")
+                or ""
+            ).strip(),
+            str(
+                candidate.get("task_id")
+                or candidate_payload.get("task_id")
+                or candidate_payload.get("worker_task_id")
+                or ""
+            ).strip(),
+            str(
+                candidate.get("parent_task_id")
+                or candidate_payload.get("parent_task_id")
+                or ""
+            ).strip(),
+        )
+        dispatch_identity = (
+            dispatch_runtime_context_id,
+            dispatch_task_id,
+            dispatch_parent_task_id,
+        )
+        if all(dispatch_identity) and candidate_identity == dispatch_identity:
+            return {
+                "status": "invalid",
+                "error": "execution ticket authority window closed after worker read/startup",
+            }
+
+    route_identity = (
+        payload.get("route_identity")
+        if isinstance(payload.get("route_identity"), Mapping)
+        else {}
+    )
+
+    def canonical_text(field: str, *aliases: str) -> tuple[str, str]:
+        keys = (field, *aliases)
+        sources = (line, payload, route_identity)
+        values = {
+            str(source.get(key) or "").strip()
+            for source in sources
+            for key in keys
+            if str(source.get(key) or "").strip()
+        }
+        if len(values) > 1:
+            return "", field
+        return (next(iter(values)) if values else ""), ""
+
+    action: dict[str, Any] = {
+        "id": "worker_dispatch",
+        "action": "dispatch_bounded_worker",
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "owner_role": "observer",
+    }
+    conflicts: list[str] = []
+    field_aliases = {
+        "runtime_context_id": (),
+        "task_id": ("worker_task_id",),
+        "parent_task_id": (),
+        "worker_role": (),
+        "target_project_root": ("worktree_path", "project_root", "repo_root"),
+        "branch_ref": ("branch",),
+        "base_commit": (),
+        "target_head_commit": (),
+        "merge_queue_id": (),
+        "route_id": (),
+        "route_context_hash": (),
+        "prompt_contract_id": (),
+        "prompt_contract_hash": (),
+        "route_token_ref": (),
+        "visible_injection_manifest_hash": (),
+    }
+    for field, aliases in field_aliases.items():
+        value, conflict = canonical_text(field, *aliases)
+        if conflict:
+            conflicts.append(conflict)
+        elif value:
+            action[field] = value
+
+    owned_sources = []
+    for source in (line, payload):
+        values = _runtime_context_service_query_values(
+            source,
+            "owned_files",
+            "target_files",
+        )
+        if values:
+            owned_sources.append(tuple(sorted(set(values))))
+    if len(set(owned_sources)) > 1:
+        conflicts.append("owned_files")
+    elif owned_sources:
+        action["owned_files"] = list(owned_sources[0])
+
+    for field in ("profile_requirements", "retry_policy"):
+        value = payload.get(field)
+        if isinstance(value, Mapping):
+            action[field] = dict(value)
+        elif field in payload:
+            conflicts.append(field)
+    if conflicts:
+        return {
+            "status": "invalid",
+            "error": (
+                "canonical ContractRuntime dispatch contains conflicting ticket authority: "
+                + ", ".join(sorted(set(conflicts)))
+            ),
+        }
+    return {
+        "status": "projected",
+        "source_ref": (
+            f"contract_runtime:{record.get('contract_execution_id', '')}:"
+            f"completed_lines:{dispatch_index}"
+        ),
+        "next_legal_action": action,
+    }
+
+
 def _observer_runtime_text_contract_runtime_authority(
     conn,
     *,
@@ -66924,6 +67112,26 @@ def _observer_runtime_text_contract_runtime_authority(
             **_contract_runtime_execution_ticket_consumption(record),
         }
     )
+    dispatch_authority = _contract_runtime_dispatch_ticket_authority(
+        record,
+        current_state,
+    )
+    if dispatch_authority.get("status") == "projected":
+        current_state["next_legal_action"] = dict(
+            dispatch_authority.get("next_legal_action") or {}
+        )
+        current_state["authority_decision_source"] = (
+            "contract_runtime_completed_dispatch_line"
+        )
+        current_state["ticket_authority_status"] = "post_dispatch_pre_worker"
+        current_state["ticket_authority_source_ref"] = str(
+            dispatch_authority.get("source_ref") or ""
+        )
+    elif dispatch_authority.get("status") == "invalid":
+        current_state["ticket_authority_status"] = "invalid"
+        current_state["ticket_authority_error"] = str(
+            dispatch_authority.get("error") or "invalid dispatch ticket authority"
+        )
     errors: list[str] = []
     if current_state["project_id"] != str(project_id or ""):
         errors.append("ContractRuntime project_id does not match launch project")

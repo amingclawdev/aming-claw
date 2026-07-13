@@ -45223,8 +45223,20 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
         fence_token=fence_token,
         token=token,
         worktree_path=worktree_path,
+        base_commit=f"base-{worker_task_id}",
+        target_head_commit=f"head-{worker_task_id}",
+        merge_queue_id=f"mq-{worker_task_id}",
+        owned_files=("agent/governance/server.py",),
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
@@ -45248,12 +45260,172 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
                     "worker_role": "mf_sub",
                     "worker_id": worker_identity,
                     "worker_slot_id": worker_identity,
+                    "target_project_root": runtime_context.target_project_root,
+                    "worktree_path": runtime_context.worktree_path,
+                    "branch_ref": runtime_context.branch_ref,
+                    "base_commit": runtime_context.base_commit,
+                    "target_head_commit": runtime_context.target_head_commit,
+                    "merge_queue_id": runtime_context.merge_queue_id,
+                    "owned_files": list(runtime_context.owned_files),
+                    "route_identity": route_identity,
+                    "profile_requirements": {
+                        "profile_id": "codex-mf-sub",
+                        "harness": "codex",
+                        "provider": "openai",
+                    },
+                    "retry_policy": {"attempt": 1, "max_attempts": 2},
                 },
             },
         )
     )
     assert dispatch["ok"] is True
     return successor, runtime_context
+
+
+def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_read(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-SOURCE-BACKED-EXECUTION-TICKET"
+    worker_task_id = "source-backed-execution-ticket-worker"
+    fence_token = "fence-source-backed-execution-ticket"
+    worker_token = "source-backed-execution-ticket-token"
+    worktree = tmp_path / "source-backed-execution-ticket-worker"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="source-backed-execution-ticket-parent",
+        worker_task_id=worker_task_id,
+        fence_token=fence_token,
+        token=worker_token,
+        worktree_path=str(worktree),
+    )
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        **route_identity,
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        payload={
+            "observer_command_id": successor["contract_execution_id"],
+            "owned_files": ["agent/governance/server.py"],
+            "target_files": ["agent/governance/server.py"],
+        },
+        route_identity=route_identity,
+        route_gate={"decision": "prepared", **route_identity},
+        actor="observer_runtime_text_prepare",
+        now_iso="2026-07-13T07:30:00Z",
+    )
+    conn.commit()
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+        )
+    )
+    assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
+
+    prepare_body = {
+        "backlog_id": backlog_id,
+        "contract_execution_id": successor["contract_execution_id"],
+        "observer_command_id": successor["contract_execution_id"],
+        "task_id": worker_task_id,
+        "parent_task_id": backlog_id,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "branch_runtime_registration_ref": runtime_context.runtime_context_id,
+        "worker_id": runtime_context.worker_id,
+        "fence_token": fence_token,
+        "worktree_path": str(worktree),
+        "main_worktree": str(tmp_path),
+        "workspace_root": str(tmp_path),
+        "base_commit": runtime_context.base_commit,
+        "target_head_commit": runtime_context.target_head_commit,
+        "merge_queue_id": runtime_context.merge_queue_id,
+        "owned_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-source-backed-execution-ticket"],
+        "profile_requirements": {
+            "profile_id": "codex-mf-sub",
+            "harness": "codex",
+            "provider": "openai",
+        },
+        "retry_policy": {"attempt": 1, "max_attempts": 2},
+        **route_identity,
+    }
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx({"project_id": PID}, method="POST", body=prepare_body)
+    )
+
+    assert prepared["ok"] is True
+    ticket = prepared["execution_ticket"]
+    assert ticket["status"] == "issued"
+    assert ticket["issue_allowed"] is True
+    assert ticket["authority_decision_source"] == (
+        "contract_runtime_completed_dispatch_line"
+    )
+    assert ticket["dispatch_identity"]["runtime_context_id"] == (
+        runtime_context.runtime_context_id
+    )
+    assert ticket["dispatch_identity"]["branch_ref"] == runtime_context.branch_ref
+    assert ticket["profile_requirements"]["profile_id"] == "codex-mf-sub"
+    assert ticket["retry_policy"] == {"attempt": 1, "max_attempts": 2}
+    assert "route_identity" not in ticket["next_legal_action"]
+
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": fence_token,
+                "session_token_ref": runtime_context_session_token_ref(runtime_context),
+                "target_project_root": str(worktree),
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "payload": {
+                    "schema_version": "mf_parallel.worker_read_receipt.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": worker_task_id,
+                    "parent_task_id": backlog_id,
+                },
+            },
+        )
+    )
+    assert worker_read["ok"] is True
+    assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+
+    rejected = server.handle_observer_runtime_text_prepare(
+        _ctx({"project_id": PID}, method="POST", body=prepare_body)
+    )
+    assert rejected["ok"] is False
+    assert rejected["execution_ticket"]["status"] == "rejected"
+    assert any(
+        "worker read/startup" in error
+        for error in rejected["execution_ticket"]["errors"]
+    )
 
 
 def _clone_contract_runtime_record_for_resolution_test(
