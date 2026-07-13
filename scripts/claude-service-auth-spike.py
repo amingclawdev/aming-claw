@@ -7,9 +7,11 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -20,8 +22,11 @@ AUTH_STATUS_ARGS = ("auth", "status", "--json")
 PROFILE_IDS = ("inherited", "clean-1", "clean-2")
 DIRECT_AUTH_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
 )
+PROCESS_GROUP_TERM_GRACE_SECONDS = 0.25
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
 
 AUTHENTICATED = "authenticated"
 CONFIGURATION_MISMATCH = "configuration_mismatch"
@@ -73,6 +78,107 @@ def _output_hash(stdout: Any, stderr: Any) -> str:
         "utf-8", errors="replace"
     )
     return "sha256:" + hashlib.sha256(output).hexdigest()
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_process_group(process: subprocess.Popen[str], signal_number: int) -> None:
+    try:
+        os.killpg(process.pid, signal_number)
+    except ProcessLookupError:
+        if process.poll() is None:
+            try:
+                process.send_signal(signal_number)
+            except ProcessLookupError:
+                pass
+
+
+def _wait_for_process_group_exit(process_group_id: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str],
+) -> tuple[Any, Any]:
+    """Terminate the probe session, escalating and reaping the direct child."""
+
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        stdout, stderr = process.communicate(
+            timeout=PROCESS_GROUP_TERM_GRACE_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        stdout = stderr = ""
+
+    group_exited = _wait_for_process_group_exit(
+        process.pid, PROCESS_GROUP_TERM_GRACE_SECONDS
+    )
+    if not group_exited:
+        _signal_process_group(process, signal.SIGKILL)
+
+    try:
+        stdout, stderr = process.communicate(
+            timeout=PROCESS_GROUP_KILL_GRACE_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        _signal_process_group(process, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        stdout, stderr = process.communicate()
+        if not stdout:
+            stdout = exc.stdout
+        if not stderr:
+            stderr = exc.stderr
+
+    if not _wait_for_process_group_exit(
+        process.pid, PROCESS_GROUP_KILL_GRACE_SECONDS
+    ):
+        _signal_process_group(process, signal.SIGKILL)
+        _wait_for_process_group_exit(
+            process.pid, PROCESS_GROUP_KILL_GRACE_SECONDS
+        )
+    return stdout, stderr
+
+
+def _run_probe_process(
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process_group(process)
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _json_auth_state(output: str) -> bool | None:
@@ -173,7 +279,7 @@ def probe_profile(
     environment: Mapping[str, str],
     config_dir: Path | None = None,
     timeout_seconds: float = 5.0,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Run one prompt-free, noninteractive authentication status probe."""
 
@@ -189,17 +295,25 @@ def probe_profile(
         child_env["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
     command = (executable, *AUTH_STATUS_ARGS)
+    timeout = max(float(timeout_seconds), 0.01)
     try:
-        completed = runner(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=max(float(timeout_seconds), 0.01),
-            stdin=subprocess.DEVNULL,
-            env=child_env,
-            start_new_session=True,
-        )
+        if runner is None:
+            completed = _run_probe_process(
+                command,
+                environment=child_env,
+                timeout=timeout,
+            )
+        else:
+            completed = runner(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+                env=child_env,
+                start_new_session=True,
+            )
     except subprocess.TimeoutExpired as exc:
         classification, reason = classify_auth_status(
             None,
@@ -300,7 +414,7 @@ def run_spike(
     executable: str = "",
     timeout_seconds: float = 5.0,
     environment: Mapping[str, str] | None = None,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Probe inherited auth and two temporary, initially empty config dirs."""
 

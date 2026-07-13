@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,6 +168,74 @@ def test_probe_profile_classifies_timeout_without_partial_output(tmp_path):
     assert "private-sentinel" not in json.dumps(result)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_probe_timeout_terminates_descendant_process_group(tmp_path):
+    ready_path = tmp_path / "descendant-ready"
+    child_program = "\n".join(
+        (
+            "import os",
+            "import pathlib",
+            "import signal",
+            "import time",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            f"pathlib.Path({str(ready_path)!r}).write_text(",
+            "    f'{os.getpid()} {os.getpgrp()}', encoding='utf-8'",
+            ")",
+            "while True:",
+            "    time.sleep(1)",
+        )
+    )
+    provider = tmp_path / "claude-test"
+    provider.write_text(
+        "\n".join(
+            (
+                f"#!{sys.executable}",
+                "import pathlib",
+                "import subprocess",
+                "import sys",
+                "import time",
+                f"ready_path = pathlib.Path({str(ready_path)!r})",
+                f"child_program = {child_program!r}",
+                "subprocess.Popen([sys.executable, '-c', child_program])",
+                "deadline = time.monotonic() + 2",
+                "while not ready_path.exists() and time.monotonic() < deadline:",
+                "    time.sleep(0.01)",
+                "print('provider-private-sentinel', flush=True)",
+                "print('provider-private-sentinel', file=sys.stderr, flush=True)",
+                "while True:",
+                "    time.sleep(1)",
+            )
+        ),
+        encoding="utf-8",
+    )
+    provider.chmod(0o700)
+
+    result = spike.probe_profile(
+        profile_id="inherited",
+        profile_kind="inherited",
+        executable=str(provider),
+        environment={},
+        timeout_seconds=0.75,
+    )
+
+    assert result["classification"] == spike.KEYCHAIN_OR_GUI
+    assert result["timed_out"] is True
+    assert "provider-private-sentinel" not in json.dumps(result)
+    descendant_pid, process_group_id = map(
+        int, ready_path.read_text(encoding="utf-8").split()
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("timed-out provider descendant is still running")
+    assert not spike._process_group_exists(process_group_id)
+
+
 def test_run_spike_uses_inherited_and_two_distinct_empty_profiles():
     calls = []
     clean_paths = []
@@ -189,6 +260,7 @@ def test_run_spike_uses_inherited_and_two_distinct_empty_profiles():
         environment={
             "CLAUDE_CONFIG_DIR": "/inherited-profile",
             "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_AUTH_TOKEN": "",
             "CLAUDE_CODE_OAUTH_TOKEN": "",
         },
         runner=runner,
@@ -206,7 +278,38 @@ def test_run_spike_uses_inherited_and_two_distinct_empty_profiles():
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["start_new_session"] is True
         assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+        assert "ANTHROPIC_AUTH_TOKEN" not in kwargs["env"]
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in kwargs["env"]
+
+
+def test_anthropic_auth_token_is_scrubbed_from_all_profile_environments():
+    token_presence = []
+
+    def runner(_command, **kwargs):
+        token_present = "ANTHROPIC_AUTH_TOKEN" in kwargs["env"]
+        token_presence.append(token_present)
+        return SimpleNamespace(
+            returncode=0 if token_present else 1,
+            stdout=(
+                '{"loggedIn": true}'
+                if token_present
+                else '{"loggedIn": false}'
+            ),
+            stderr="",
+        )
+
+    report = spike.run_spike(
+        executable="claude-test",
+        environment={"ANTHROPIC_AUTH_TOKEN": ""},
+        runner=runner,
+    )
+
+    assert token_presence == [False, False, False]
+    assert report["decision"] == "reject"
+    assert report["decision"] != "unattended-safe"
+    assert {
+        result["classification"] for result in report["profiles"]
+    } == {spike.UNAUTHENTICATED}
 
 
 def test_missing_cli_rejects_with_public_safe_results(monkeypatch):

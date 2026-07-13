@@ -18,8 +18,11 @@ service identity that would launch Claude. The script:
 - creates two distinct, initially empty temporary configuration directories;
 - sets `CLAUDE_CONFIG_DIR` separately for each clean profile and never copies
   files, Keychain items, cookies, or authentication material into either one;
-- removes direct provider authentication variables from all three child
-  environments so the result measures CLI profile/Keychain access;
+- removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and
+  `CLAUDE_CODE_OAUTH_TOKEN` from all three child environments so the result
+  measures CLI profile/Keychain access;
+- runs each probe in a new process group and, on timeout, terminates the whole
+  group, waits for it to exit, and escalates to forced termination if needed;
 - deletes both temporary directories after the probe; and
 - emits only classifications, reason codes, exit codes, and output hashes.
 
@@ -53,8 +56,9 @@ around this command. The script's JSON report is the only intended output.
 | `provider_cli_failure` | The executable was unavailable, failed to launch, returned an unrecognized successful response, or failed without a more specific classification. |
 
 Timeouts deliberately fail closed into the Keychain/GUI category. A timeout
-cannot prove unattended access, and this probe does not inspect GUI state to
-disambiguate a blocked permission dialog from another hang.
+causes the complete probe process group to be terminated and the direct child
+to be reaped. It cannot prove unattended access, and this probe does not inspect
+GUI state to disambiguate a blocked permission dialog from another hang.
 
 ## Decision matrix
 
