@@ -295,19 +295,25 @@ class CodexC0Supervisor:
             shutil.rmtree(run_dir, ignore_errors=True)
             self.registry.record_exit(run.run_id, 127, failure_category="spawn_error")
             if receipt_emitter is not None:
-                process_identity_payload = (
-                    self._receipt_process_identity(
-                        pid=process.pid,
-                        process_group_id=(
-                            os.getpgid(process.pid) if os.name != "nt" else process.pid
-                        ),
-                        process_start_identity_value=(
-                            self.process_identity_reader(process.pid) or "unavailable"
-                        ),
-                    )
-                    if process is not None
-                    else {}
-                )
+                process_identity_payload: dict[str, Any] = {}
+                if process is not None:
+                    try:
+                        process_group_id = (
+                            os.getpgid(process.pid)
+                            if os.name != "nt"
+                            else process.pid
+                        )
+                        process_start_identity = self.process_identity_reader(
+                            process.pid
+                        )
+                        if process_start_identity:
+                            process_identity_payload = self._receipt_process_identity(
+                                pid=process.pid,
+                                process_group_id=process_group_id,
+                                process_start_identity_value=process_start_identity,
+                            )
+                    except OSError:
+                        pass
                 try:
                     receipt_emitter.emit(
                         "failed",

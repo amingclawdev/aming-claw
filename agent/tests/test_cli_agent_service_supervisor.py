@@ -225,6 +225,35 @@ def test_supervisor_emits_failed_run_receipt(tmp_path):
     assert registry.get_run(run.run_id).state == "failed"
 
 
+def test_supervisor_emits_spawn_failure_when_process_identity_is_unobservable(
+    tmp_path,
+):
+    import pytest
+
+    from cli_agent_service.supervisor import SupervisorError
+
+    registry, supervisor = _supervisor(tmp_path)
+    supervisor.process_identity_reader = lambda _pid: None
+    run = _run("run-spawn-failure")
+
+    with pytest.raises(SupervisorError, match="process identity is not observable"):
+        supervisor.start_run(
+            run,
+            prompt="private prompt",
+            worktree=tmp_path,
+            execution_ticket=_execution_ticket(run),
+        )
+
+    receipts = supervisor.run_receipts(run.run_id)
+    assert [item["state"] for item in receipts] == ["accepted", "failed"]
+    assert receipts[-1]["failure_category"] == "spawn_error"
+    assert receipts[-1]["exit_code"] == 127
+    assert receipts[-1]["process_identity"] == {}
+    stored = registry.get_run(run.run_id)
+    assert stored.state == "failed"
+    assert stored.failure_category == "spawn_error"
+
+
 def test_restart_reconcile_emits_lost_run_receipt_from_durable_journal(tmp_path):
     from cli_agent_service.adapters.codex_cli import CodexCliAdapter
     from cli_agent_service.evidence import RunReceiptEmitter, hash_text
