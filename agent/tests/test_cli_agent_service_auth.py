@@ -84,6 +84,20 @@ def test_auth_state_classification_is_bounded(
         assert stderr not in reason
 
 
+def test_timeout_precedes_partial_authenticated_json():
+    from cli_agent_service.auth import classify_auth_state
+
+    state, reason = classify_auth_state(
+        "codex",
+        None,
+        stdout='{"authenticated": true}',
+        timed_out=True,
+    )
+
+    assert state == "blocked"
+    assert reason == "codex_status_probe_timed_out"
+
+
 def test_prepare_codex_login_creates_clean_private_home_and_copy_safe_actions(
     tmp_path,
 ):
@@ -173,6 +187,34 @@ def test_unauthenticated_status_returns_provider_specific_login_required(tmp_pat
     assert "Not logged in" not in json.dumps(status_result.to_public_dict())
 
 
+def test_activation_fails_closed_on_timed_out_authenticated_output(tmp_path):
+    from cli_agent_service.auth import ProfileAuthController
+
+    executable = _fake_cli(tmp_path, "codex")
+
+    def timed_out_authenticated_runner(command, **kwargs):
+        raise subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output='{"authenticated": true}',
+            stderr="",
+        )
+
+    controller = ProfileAuthController(
+        tmp_path / "profiles",
+        codex_executable=str(executable),
+        runner=timed_out_authenticated_runner,
+    )
+    controller.prepare_login("profile-codex-a", "codex")
+
+    activated = controller.activate("profile-codex-a", "codex")
+
+    assert activated.state == "blocked"
+    assert activated.activated is False
+    assert activated.reason_code == "codex_status_probe_timed_out"
+    assert activated.evidence["timed_out"] is True
+
+
 def test_claude_activation_requires_spike_and_never_claims_subscription_isolation(
     tmp_path,
 ):
@@ -252,6 +294,23 @@ def test_existing_profile_home_symlink_escape_is_rejected(tmp_path):
 
     assert calls == []
     assert not any(outside.iterdir())
+
+
+def test_configured_profiles_root_rejects_escaping_ancestor_symlink(tmp_path):
+    from cli_agent_service.auth import ProfileAuthController, ProfileAuthError
+
+    safe_root = tmp_path / "safe"
+    outside = tmp_path / "outside"
+    safe_root.mkdir()
+    outside.mkdir()
+    redirect = safe_root / "redirect"
+    redirect.symlink_to(outside, target_is_directory=True)
+    controller = ProfileAuthController(redirect / "profiles")
+
+    with pytest.raises(ProfileAuthError, match="profiles root.*symlink"):
+        controller.ensure_profile_home("profile-codex-a", "codex")
+
+    assert not (outside / "profiles").exists()
 
 
 def test_status_timeout_terminates_cli_process_group_descendants(
