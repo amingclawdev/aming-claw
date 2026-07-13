@@ -5412,12 +5412,27 @@ def _runtime_text_worker_launch_pack(
         "source_of_authority": "ContractRuntime",
     }
     if execution_ticket_requested:
+        dispatch_worker_id = str(
+            request.worker_id
+            or getattr(context, "worker_id", "")
+            or getattr(context, "worker_slot_id", "")
+            or ""
+        ).strip()
+        dispatch_worker_slot_id = str(
+            getattr(context, "worker_slot_id", "")
+            or request.worker_id
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
         execution_ticket = build_cli_agent_execution_ticket(
             contract_runtime_current_state=request.contract_runtime_current_state,
             launch_identity={
                 "project_id": request.project_id,
                 "backlog_id": request.backlog_id,
                 "task_id": context.task_id,
+                "worker_id": dispatch_worker_id,
+                "worker_slot_id": dispatch_worker_slot_id,
+                "observer_command_id": observer_command_id,
                 "parent_task_id": parent_task_id,
                 "runtime_context_id": runtime_context_id,
                 "worker_role": "mf_sub",
@@ -5539,6 +5554,41 @@ def _runtime_text_worker_launch_pack(
     if execution_ticket_requested:
         pack["execution_ticket"] = execution_ticket
         pack["execution_ticket_requested"] = True
+        if execution_ticket.get("issue_allowed") is True:
+            dispatch_identity = execution_ticket.get("dispatch_identity")
+            dispatch_identity = (
+                dispatch_identity
+                if isinstance(dispatch_identity, Mapping)
+                else {}
+            )
+            pack["desktop_execution_ticket_admission_request"] = {
+                "host_kind": "codex_desktop",
+                "project_id": request.project_id,
+                "backlog_id": request.backlog_id,
+                "contract_execution_id": str(
+                    execution_ticket.get("contract_execution_id") or ""
+                ),
+                "runtime_context_id": str(
+                    dispatch_identity.get("runtime_context_id") or ""
+                ),
+                "task_id": str(dispatch_identity.get("task_id") or ""),
+                "worker_id": str(dispatch_identity.get("worker_id") or ""),
+                "worker_slot_id": str(
+                    dispatch_identity.get("worker_slot_id") or ""
+                ),
+                "observer_command_id": str(
+                    dispatch_identity.get("observer_command_id") or ""
+                ),
+                "expected_execution_state_revision": int(
+                    execution_ticket.get("execution_state_revision") or 0
+                ),
+                "expected_execution_state_hash": str(
+                    execution_ticket.get("execution_state_hash") or ""
+                ),
+                "expected_dispatch_identity_hash": str(
+                    execution_ticket.get("dispatch_identity_hash") or ""
+                ),
+            }
     pack["worker_launch_pack_hash"] = _stable_json_hash(
         {key: value for key, value in pack.items() if key != "worker_launch_pack_hash"}
     )

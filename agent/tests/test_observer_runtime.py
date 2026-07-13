@@ -285,6 +285,9 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                     "action": "dispatch_bounded_worker",
                     "runtime_context_id": "mfrctx-runtime-text-a1",
                     "task_id": "task-a1",
+                    "worker_id": "worker-a1",
+                    "worker_slot_id": "worker-a1",
+                    "observer_command_id": "cmd-a1",
                     "parent_task_id": "AC-RUNTIME-TEXT-A1",
                     "worker_role": "mf_sub",
                     "target_project_root": str(worktree),
@@ -339,8 +342,27 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert ticket["issue_allowed"] is True
     assert ticket["contract_execution_id"] == "cex-runtime-text-a1"
     assert ticket["dispatch_identity"]["worktree_path"] == str(worktree)
+    assert ticket["dispatch_identity"]["worker_id"] == "worker-a1"
+    assert ticket["dispatch_identity"]["worker_slot_id"] == "worker-a1"
+    assert ticket["dispatch_identity"]["observer_command_id"] == "cmd-a1"
     assert ticket["profile_requirements"]["profile_id"] == "inherited-current"
     assert prepared["worker_launch_pack"]["execution_ticket"] == ticket
+    admission_request = prepared["worker_launch_pack"][
+        "desktop_execution_ticket_admission_request"
+    ]
+    assert admission_request["worker_id"] == "worker-a1"
+    assert admission_request["worker_slot_id"] == "worker-a1"
+    assert admission_request["observer_command_id"] == "cmd-a1"
+    assert admission_request["expected_dispatch_identity_hash"] == ticket[
+        "dispatch_identity_hash"
+    ]
+    assert not {
+        "contract_runtime_current_state",
+        "launch_identity",
+        "profile_requirements",
+        "retry_policy",
+        "execution_ticket",
+    }.intersection(admission_request)
     assert revision_payload["execution_ticket"] == ticket
     assert prepared["runtime_context"]["worktree_path"] == str(worktree)
     assert prepared["runtime_context"]["fence_token"] == "fence-runtime-text-a1"

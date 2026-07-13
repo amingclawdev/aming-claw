@@ -96,6 +96,56 @@ def test_health_projection_is_deterministic_and_public_safe():
     }
 
 
+def test_daemon_socket_rejects_caller_owned_desktop_authority(tmp_path):
+    from cli_agent_service.service import ServicePaths, request_service
+
+    state_dir = tmp_path / "private-state"
+    paths = ServicePaths.from_state_dir(state_dir)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "cli_agent_service",
+            "start",
+            "--state-dir",
+            str(state_dir),
+        ],
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for(paths.socket_path)
+        response = request_service(
+            paths,
+            "desktop_execution_ticket_admit",
+            payload={
+                "host_kind": "codex_desktop",
+                "project_id": "aming-claw",
+                "backlog_id": "AC-FORGED",
+                "contract_execution_id": "cex-forged",
+                "runtime_context_id": "mfrctx-forged",
+                "task_id": "task-forged",
+                "worker_id": "worker-forged",
+                "worker_slot_id": "slot-forged",
+                "observer_command_id": "command-forged",
+                "contract_runtime_current_state": {"source_of_authority": "ContractRuntime"},
+                "execution_ticket": {"status": "issued", "issue_allowed": True},
+            },
+        )
+        assert response["ok"] is False
+        assert response["status"] == "invalid_request"
+        assert "unsupported authority fields" in response["error"]
+    finally:
+        if process.poll() is None:
+            try:
+                request_service(paths, "stop")
+            except Exception:
+                process.terminate()
+            process.wait(timeout=5)
+
+
 def test_daemon_is_not_coupled_to_service_manager():
     for name in ("service.py", "health.py", "__main__.py"):
         source = (AGENT_DIR / "cli_agent_service" / name).read_text(encoding="utf-8")
