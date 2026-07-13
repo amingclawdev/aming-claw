@@ -417,11 +417,17 @@ def test_qa_prefers_distinct_profile_and_requires_explicit_fallback_evidence(tmp
     )
     assert distinct.profile_id == "profile-b"
     assert distinct.qa_profile_distinct is True
+    assert distinct.qa_principal_distinct is True
     assert distinct.same_profile_qa_fallback is False
 
     registry.set_profile_state("profile-b", "disabled", reason_code="disabled")
     with pytest.raises(NoEligibleProfileError):
-        scheduler.select_qa_profile("profile-a", _requirements(role="qa"))
+        scheduler.select_qa_profile(
+            "profile-a",
+            _requirements(role="qa"),
+            implementation_principal_id="worker-principal",
+            qa_principal_id="qa-principal",
+        )
     fallback = scheduler.select_qa_profile(
         "profile-a",
         _requirements(role="qa"),
@@ -431,8 +437,45 @@ def test_qa_prefers_distinct_profile_and_requires_explicit_fallback_evidence(tmp
     )
     assert fallback.profile_id == "profile-a"
     assert fallback.same_profile_qa_fallback is True
+    assert fallback.qa_principal_distinct is True
     assert fallback.evidence_flags == ("same_profile_qa_fallback_explicit",)
     assert fallback.to_public_dict()["governance_authority"] is False
+
+
+@pytest.mark.parametrize(
+    ("implementation_principal_id", "qa_principal_id"),
+    (("", ""), ("worker-principal", ""), ("", "qa-principal")),
+)
+@pytest.mark.parametrize(
+    "allow_same_profile_fallback",
+    (False, True),
+    ids=("distinct-profile", "same-profile-fallback"),
+)
+def test_qa_profile_selection_requires_both_principals(
+    tmp_path,
+    implementation_principal_id,
+    qa_principal_id,
+    allow_same_profile_fallback,
+):
+    from cli_agent_service.scheduler import AgentScheduler, SchedulerError
+
+    registry = _registry(tmp_path)
+    registry.register_profile(_profile("profile-a", account="qa-a"))
+    if not allow_same_profile_fallback:
+        registry.register_profile(_profile("profile-b", account="qa-b"))
+    scheduler = AgentScheduler(registry)
+
+    with pytest.raises(
+        SchedulerError,
+        match="implementation_principal_id and qa_principal_id are required",
+    ):
+        scheduler.select_qa_profile(
+            "profile-a",
+            _requirements(role="qa"),
+            implementation_principal_id=implementation_principal_id,
+            qa_principal_id=qa_principal_id,
+            allow_same_profile_fallback=allow_same_profile_fallback,
+        )
 
 
 def test_scheduler_state_database_is_structured_private_and_non_authoritative(tmp_path):

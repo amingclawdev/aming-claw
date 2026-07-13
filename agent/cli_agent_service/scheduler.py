@@ -338,11 +338,15 @@ class AgentScheduler:
         implementation_profile_id = _text(implementation_profile_id)
         if not implementation_profile_id:
             raise ValueError("implementation_profile_id is required")
-        principal_distinct: bool | None = None
-        if implementation_principal_id and qa_principal_id:
-            principal_distinct = implementation_principal_id != qa_principal_id
-            if not principal_distinct:
-                raise SchedulerError("QA must use a distinct governed principal")
+        implementation_principal_id = _text(implementation_principal_id)
+        qa_principal_id = _text(qa_principal_id)
+        if not implementation_principal_id or not qa_principal_id:
+            raise SchedulerError(
+                "implementation_principal_id and qa_principal_id are required"
+            )
+        if implementation_principal_id == qa_principal_id:
+            raise SchedulerError("QA must use a distinct governed principal")
+        principal_distinct = True
         resolved = _mapping_requirements(
             requirements,
             role="qa",
