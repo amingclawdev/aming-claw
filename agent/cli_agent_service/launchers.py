@@ -171,6 +171,7 @@ def _expiration(
 class _StoredHostEnvelope:
     run_id: str
     envelope_ref: str
+    lease_owner_id: str
     public_refs: dict[str, Any]
     environment: dict[str, bytearray] = field(repr=False)
     expires_monotonic: float
@@ -187,6 +188,7 @@ class _StoredHostEnvelope:
             "env_keys": list(WORKER_AUTH_ENV_KEYS),
             "session_token_redacted": True,
             "fence_token_redacted": True,
+            "lease_bound": True,
             "single_use": True,
             "raw_worker_auth_exposed": False,
         }
@@ -265,8 +267,10 @@ class HostEnvelopeStore:
         run_id: str,
         envelope: Mapping[str, Any],
         *,
+        lease_owner_id: str,
         ttl_seconds: Any = None,
         expires_at: Any = None,
+        public_text: str = "",
     ) -> dict[str, Any]:
         if not isinstance(envelope, Mapping):
             raise HostEnvelopeError("host envelope must be an object")
@@ -276,6 +280,9 @@ class HostEnvelopeStore:
             normalized_run_id = str(run_id or "").strip()
             if not _SAFE_REF.fullmatch(normalized_run_id):
                 raise HostEnvelopeError("host envelope run_id is invalid")
+            normalized_owner_id = str(lease_owner_id or "").strip()
+            if not _SAFE_REF.fullmatch(normalized_owner_id):
+                raise HostEnvelopeError("host envelope lease owner is invalid")
             envelope_run_id = str(envelope.get("run_id") or "").strip()
             if envelope_run_id and envelope_run_id != normalized_run_id:
                 raise HostEnvelopeError(
@@ -285,6 +292,13 @@ class HostEnvelopeStore:
                 bytes(environment[key]).decode("utf-8")
                 for key in WORKER_AUTH_ENV_KEYS
             )
+            if any(
+                raw_value and raw_value in str(public_text or "")
+                for raw_value in raw_values
+            ):
+                raise HostEnvelopeError(
+                    "public launch material contains raw worker auth"
+                )
             public_refs = _safe_refs(envelope, raw_values)
             now = self._wall_clock()
             now = (
@@ -301,6 +315,7 @@ class HostEnvelopeStore:
             entry = _StoredHostEnvelope(
                 run_id=normalized_run_id,
                 envelope_ref="clihe-{}".format(uuid.uuid4().hex),
+                lease_owner_id=normalized_owner_id,
                 public_refs=public_refs,
                 environment=environment,
                 expires_monotonic=self._monotonic_clock() + ttl,
@@ -320,17 +335,36 @@ class HostEnvelopeStore:
             self._entries[normalized_run_id] = entry
         return entry.summary("staged")
 
-    def consume(self, run_id: str) -> HostEnvelopeDelivery | None:
+    def consume(
+        self,
+        run_id: str,
+        *,
+        lease_owner_id: str,
+        lease_id: str,
+    ) -> HostEnvelopeDelivery | None:
+        normalized_owner_id = str(lease_owner_id or "").strip()
+        normalized_lease_id = str(lease_id or "").strip()
+        if not _SAFE_REF.fullmatch(normalized_lease_id):
+            raise HostEnvelopeError("host envelope lease binding is invalid")
         with self._lock:
             self._purge_expired_locked()
             entry = self._entries.pop(str(run_id or "").strip(), None)
         if entry is None:
             return None
+        if entry.lease_owner_id != normalized_owner_id:
+            entry.wipe()
+            raise HostEnvelopeError("host envelope lease owner does not match")
         environment = entry.environment
         entry.environment = {}
         return HostEnvelopeDelivery(environment)
 
-    def revoke(self, run_id: str, *, envelope_ref: str = "") -> dict[str, Any]:
+    def revoke(
+        self,
+        run_id: str,
+        *,
+        envelope_ref: str = "",
+        lease_owner_id: str = "",
+    ) -> dict[str, Any]:
         normalized_run_id = str(run_id or "").strip()
         with self._lock:
             self._purge_expired_locked()
@@ -346,6 +380,9 @@ class HostEnvelopeStore:
             requested_ref = str(envelope_ref or "").strip()
             if requested_ref and requested_ref != entry.envelope_ref:
                 raise HostEnvelopeError("host envelope ref does not match delivery scope")
+            requested_owner = str(lease_owner_id or "").strip()
+            if requested_owner and requested_owner != entry.lease_owner_id:
+                raise HostEnvelopeError("host envelope lease owner does not match")
             self._entries.pop(normalized_run_id)
         summary = entry.summary("revoked")
         entry.wipe()

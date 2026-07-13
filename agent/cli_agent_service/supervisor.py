@@ -84,6 +84,7 @@ class _ActiveRun:
     receipt_emitter: RunReceiptEmitter | None
     handle: RunHandle
     cancel_requested: threading.Event
+    output_suppressed: bool
 
 
 class CodexC0Supervisor:
@@ -189,6 +190,15 @@ class CodexC0Supervisor:
             time.sleep(0.01)
         raise SupervisorError("spawned process identity is not observable")
 
+    def _revoke_host_envelope(self, run_id: str, owner_id: str = "") -> None:
+        try:
+            self.host_envelope_store.revoke(
+                run_id,
+                lease_owner_id=owner_id or self.owner_id,
+            )
+        except Exception:
+            pass
+
     def start_run(
         self,
         run: AgentRun,
@@ -197,6 +207,7 @@ class CodexC0Supervisor:
         worktree: str | os.PathLike[str],
         evidence_refs: Mapping[str, str] | None = None,
         execution_ticket: Mapping[str, Any] | None = None,
+        require_host_envelope: bool = False,
     ) -> RunHandle:
         with self._lock:
             if run.run_id in self._active:
@@ -205,43 +216,72 @@ class CodexC0Supervisor:
         output_path = run_dir / "last-message.txt"
         stdout_path = run_dir / "stdout.log"
         stderr_path = run_dir / "stderr.log"
-        launch = self.adapter.build_launch_spec(run, worktree=worktree, output_path=output_path)
-        command_hash = hash_command(launch.command)
-        prompt_hash = hash_text(prompt)
-        receipt_emitter = self._run_receipt_emitter(
-            run,
-            execution_ticket,
-            command_hash,
-        )
-        self.registry.register_run(run, evidence_refs=evidence_refs)
-        self.registry.acquire_lease(
-            run.run_id,
-            self.owner_id,
-            ttl_seconds=self.lease_ttl_seconds,
-        )
+        try:
+            launch = self.adapter.build_launch_spec(
+                run,
+                worktree=worktree,
+                output_path=output_path,
+            )
+            command_hash = hash_command(launch.command)
+            prompt_hash = hash_text(prompt)
+            receipt_emitter = self._run_receipt_emitter(
+                run,
+                execution_ticket,
+                command_hash,
+            )
+            self.registry.register_run(run, evidence_refs=evidence_refs)
+            lease = self.registry.acquire_lease(
+                run.run_id,
+                self.owner_id,
+                ttl_seconds=self.lease_ttl_seconds,
+            )
+        except BaseException:
+            self._revoke_host_envelope(run.run_id)
+            raise
         handle = RunHandle(run.run_id)
         process: subprocess.Popen[str] | None = None
         stdout_handle: Any = None
         stderr_handle: Any = None
+        host_envelope = None
+        output_suppressed = False
         accepted_monotonic = time.monotonic()
         try:
             if receipt_emitter is not None:
                 receipt_emitter.emit("accepted", observed_at=_timestamp())
+            if (
+                lease.run_id != run.run_id
+                or lease.owner_id != self.owner_id
+                or lease.status != "active"
+            ):
+                raise SupervisorError("acquired lease identity does not match the run")
+            host_envelope = self.host_envelope_store.consume(
+                run.run_id,
+                lease_owner_id=self.owner_id,
+                lease_id=lease.lease_id,
+            )
+            if require_host_envelope and host_envelope is None:
+                raise SupervisorError("required host envelope is unavailable")
+            output_suppressed = host_envelope is not None
             run_dir.mkdir(mode=0o700)
-            stdout_handle = stdout_path.open("w+", encoding="utf-8")
-            stderr_handle = stderr_path.open("w+", encoding="utf-8")
-            os.chmod(stdout_path, 0o600)
-            os.chmod(stderr_path, 0o600)
+            if output_suppressed:
+                stdout_target: Any = subprocess.DEVNULL
+                stderr_target: Any = subprocess.DEVNULL
+            else:
+                stdout_handle = stdout_path.open("w+", encoding="utf-8")
+                stderr_handle = stderr_path.open("w+", encoding="utf-8")
+                os.chmod(stdout_path, 0o600)
+                os.chmod(stderr_path, 0o600)
+                stdout_target = stdout_handle
+                stderr_target = stderr_handle
             spawn_environment = child_process_environment(launch.environment)
-            host_envelope = self.host_envelope_store.consume(run.run_id)
             try:
                 if host_envelope is not None:
                     host_envelope.apply_to(spawn_environment)
                 process = self.process_factory(
                     list(launch.command),
                     stdin=subprocess.PIPE,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
                     text=True,
                     cwd=launch.cwd,
                     env=spawn_environment,
@@ -295,6 +335,7 @@ class CodexC0Supervisor:
                 receipt_emitter=receipt_emitter,
                 handle=handle,
                 cancel_requested=threading.Event(),
+                output_suppressed=output_suppressed,
             )
             with self._lock:
                 self._active[run.run_id] = active
@@ -306,6 +347,9 @@ class CodexC0Supervisor:
             ).start()
             return handle
         except BaseException as exc:
+            if host_envelope is not None:
+                host_envelope.discard()
+            self._revoke_host_envelope(run.run_id)
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
@@ -424,18 +468,26 @@ class CodexC0Supervisor:
             failure_category = "process_error"
         effective_exit_code = 130 if failure_category == "cancelled" else returncode
         status = "cancelled" if failure_category == "cancelled" else "completed" if effective_exit_code == 0 else "failed"
+        self._revoke_host_envelope(active.run.run_id, active.owner_id)
         self.registry.record_exit(
             active.run.run_id,
             effective_exit_code,
             failure_category=failure_category,
         )
-        active.stdout_handle.flush()
-        active.stderr_handle.flush()
-        active.stdout_handle.close()
-        active.stderr_handle.close()
-        output_hash = hash_file(active.output_path)
-        stdout_hash = hash_file(active.stdout_path)
-        stderr_hash = hash_file(active.stderr_path)
+        if active.stdout_handle is not None:
+            active.stdout_handle.flush()
+            active.stdout_handle.close()
+        if active.stderr_handle is not None:
+            active.stderr_handle.flush()
+            active.stderr_handle.close()
+        if active.output_suppressed:
+            output_hash = hash_text("")
+            stdout_hash = hash_text("")
+            stderr_hash = hash_text("")
+        else:
+            output_hash = hash_file(active.output_path)
+            stdout_hash = hash_file(active.stdout_path)
+            stderr_hash = hash_file(active.stderr_path)
         if active.receipt_emitter is not None:
             terminal_failure_category = failure_category
             if status == "failed" and not terminal_failure_category:
@@ -481,10 +533,17 @@ class CodexC0Supervisor:
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
+            self._revoke_host_envelope(run_id)
             return False
+        self._revoke_host_envelope(run_id, active.owner_id)
         active.cancel_requested.set()
         self._terminate(active)
         return True
+
+    def cancel_all(self) -> None:
+        for run_id in self.active_run_ids():
+            self.cancel_run(run_id)
+        self.host_envelope_store.revoke_all()
 
     def result(self, run_id: str) -> ExecutionReceipt | None:
         with self._lock:

@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AGENT_DIR))
@@ -79,6 +81,35 @@ def _execution_ticket(run):
             "runtime_context_id": "mfrctx-supervisor-receipt"
         },
     }
+
+
+def _auth_values_for_test():
+    return secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+
+
+def _worker_envelope(session_token, fence_token, *, suffix):
+    return {
+        "schema_version": "mf_subagent_initial_join_host_envelope.v1",
+        "runtime_context_id": "mfrctx-supervisor-{}".format(suffix),
+        "task_id": "worker-supervisor-{}".format(suffix),
+        "parent_task_id": "parent-supervisor-envelope",
+        "worker_role": "mf_sub",
+        "session_token_ref": "wstok-" + secrets.token_hex(16),
+        "env": {
+            "AMING_WORKER_SESSION_TOKEN": session_token,
+            "AMING_WORKER_FENCE_TOKEN": fence_token,
+        },
+    }
+
+
+def _assert_secret_absent(root, *values):
+    encoded = tuple(value.encode() for value in values)
+    for path in Path(root).rglob("*"):
+        if not path.is_file():
+            continue
+        contents = path.read_bytes()
+        if any(value in contents for value in encoded):
+            raise AssertionError("raw worker auth was persisted to disk")
 
 
 def _fake_codex(tmp_path):
@@ -283,8 +314,8 @@ def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeyp
     class TrackingStore(HostEnvelopeStore):
         last_delivery = None
 
-        def consume(self, run_id):
-            self.last_delivery = super().consume(run_id)
+        def consume(self, run_id, **kwargs):
+            self.last_delivery = super().consume(run_id, **kwargs)
             return self.last_delivery
 
     store = TrackingStore()
@@ -300,7 +331,6 @@ def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeyp
             WORKER_FENCE_TOKEN_ENV: fence_token,
         },
     }
-    store.stage("run-host-envelope", envelope, ttl_seconds=30)
     observed = {}
 
     def recording_process_factory(*args, **kwargs):
@@ -321,12 +351,19 @@ def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeyp
         process_factory=recording_process_factory,
         host_envelope_store=store,
     )
+    store.stage(
+        "run-host-envelope",
+        envelope,
+        lease_owner_id=supervisor.owner_id,
+        ttl_seconds=30,
+    )
     run = _run("run-host-envelope")
     handle = supervisor.start_run(
         run,
         prompt="Use the copy-safe runtime context and token reference.",
         worktree=tmp_path,
         execution_ticket=_execution_ticket(run),
+        require_host_envelope=True,
     )
 
     assert observed["session_matches"] is True
@@ -338,6 +375,9 @@ def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeyp
     assert not store.last_delivery._environment
     receipt = handle.wait(timeout=5)
     assert receipt.status == "completed"
+    assert receipt.output_hash == receipt.stdout_hash == receipt.stderr_hash
+    assert not tuple((tmp_path / "state").glob("run-*/stdout.log"))
+    assert not tuple((tmp_path / "state").glob("run-*/stderr.log"))
 
     public_artifacts = json.dumps(
         {
@@ -355,6 +395,172 @@ def test_supervisor_injects_single_run_host_auth_only_at_spawn(tmp_path, monkeyp
         contents = path.read_bytes()
         if session_token.encode() in contents or fence_token.encode() in contents:
             raise AssertionError("raw worker auth was persisted to disk")
+
+
+def test_envelope_run_never_persists_malicious_child_stdout_or_stderr(tmp_path):
+    from cli_agent_service.evidence import hash_text
+    from cli_agent_service.launchers import HostEnvelopeStore
+
+    marker = tmp_path / "malicious-child-ready"
+    code = (
+        "import os,pathlib,sys,time;"
+        "sys.stdout.write(os.environ.get('AMING_WORKER_SESSION_TOKEN',''));"
+        "sys.stdout.flush();"
+        "sys.stderr.write(os.environ.get('AMING_WORKER_FENCE_TOKEN',''));"
+        "sys.stderr.flush();"
+        "pathlib.Path({!r}).write_text('ready',encoding='utf-8');"
+        "sys.stdin.read();time.sleep(0.5)"
+    ).format(str(marker))
+
+    def malicious_factory(_command, **kwargs):
+        return subprocess.Popen([sys.executable, "-c", code], **kwargs)
+
+    store = HostEnvelopeStore()
+    registry, supervisor = _supervisor(
+        tmp_path,
+        process_factory=malicious_factory,
+        host_envelope_store=store,
+    )
+    run = _run("run-malicious-output")
+    session_token = secrets.token_urlsafe(32)
+    fence_token = secrets.token_urlsafe(32)
+    store.stage(
+        run.run_id,
+        _worker_envelope(session_token, fence_token, suffix="malicious-output"),
+        lease_owner_id=supervisor.owner_id,
+    )
+
+    handle = supervisor.start_run(
+        run,
+        prompt="Copy-safe prompt only.",
+        worktree=tmp_path,
+        execution_ticket=_execution_ticket(run),
+        require_host_envelope=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.02)
+    assert marker.exists()
+    assert registry.get_run(run.run_id).state == "running"
+    assert not tuple((tmp_path / "state").rglob("stdout.log"))
+    assert not tuple((tmp_path / "state").rglob("stderr.log"))
+    _assert_secret_absent(tmp_path / "state", session_token, fence_token)
+
+    receipt = handle.wait(timeout=5)
+    empty_hash = hash_text("")
+    assert receipt.output_hash == empty_hash
+    assert receipt.stdout_hash == empty_hash
+    assert receipt.stderr_hash == empty_hash
+    assert not tuple((tmp_path / "state").rglob("stdout.log"))
+    assert not tuple((tmp_path / "state").rglob("stderr.log"))
+    _assert_secret_absent(tmp_path / "state", session_token, fence_token)
+
+
+def test_lease_acquire_failure_revokes_and_zeroizes_staged_envelope(tmp_path):
+    from cli_agent_service.launchers import HostEnvelopeStore
+    from cli_agent_service.registry import LeaseConflictError
+
+    store = HostEnvelopeStore()
+    registry, supervisor = _supervisor(tmp_path, host_envelope_store=store)
+    blocker = _run("run-lease-blocker")
+    registry.register_run(blocker)
+    registry.acquire_lease(blocker.run_id, "other-host-owner", ttl_seconds=30)
+
+    run = _run("run-lease-rejected")
+    store.stage(
+        run.run_id,
+        _worker_envelope(*_auth_values_for_test(), suffix="lease-rejected"),
+        lease_owner_id=supervisor.owner_id,
+    )
+    buffers = tuple(store._entries[run.run_id].environment.values())
+
+    with pytest.raises(LeaseConflictError):
+        supervisor.start_run(
+            run,
+            prompt="Copy-safe prompt only.",
+            worktree=tmp_path,
+            require_host_envelope=True,
+        )
+
+    assert all(not value for value in buffers)
+    assert store.pending_count() == 0
+    assert registry.get_run(run.run_id).state == "registered"
+
+
+def test_spawn_failure_discards_consumed_envelope(tmp_path):
+    from cli_agent_service.launchers import HostEnvelopeStore
+    from cli_agent_service.supervisor import SupervisorError
+
+    class TrackingStore(HostEnvelopeStore):
+        last_delivery = None
+
+        def consume(self, run_id, **kwargs):
+            self.last_delivery = super().consume(run_id, **kwargs)
+            return self.last_delivery
+
+    def failing_factory(*_args, **_kwargs):
+        raise OSError("spawn unavailable")
+
+    store = TrackingStore()
+    registry, supervisor = _supervisor(
+        tmp_path,
+        process_factory=failing_factory,
+        host_envelope_store=store,
+    )
+    run = _run("run-envelope-spawn-failure")
+    store.stage(
+        run.run_id,
+        _worker_envelope(*_auth_values_for_test(), suffix="spawn-failure"),
+        lease_owner_id=supervisor.owner_id,
+    )
+
+    with pytest.raises(SupervisorError, match="could not be started"):
+        supervisor.start_run(
+            run,
+            prompt="Copy-safe prompt only.",
+            worktree=tmp_path,
+            require_host_envelope=True,
+        )
+
+    assert store.last_delivery is not None
+    assert not store.last_delivery._environment
+    assert store.pending_count() == 0
+    assert registry.get_run(run.run_id).failure_category == "spawn_error"
+
+
+@pytest.mark.parametrize("terminal_mode", ["cancel", "complete"])
+def test_cancel_and_terminal_revoke_replacement_envelope(tmp_path, terminal_mode):
+    from cli_agent_service.launchers import HostEnvelopeStore
+
+    store = HostEnvelopeStore()
+    registry, supervisor = _supervisor(tmp_path, host_envelope_store=store)
+    run = _run("run-envelope-{}".format(terminal_mode))
+    store.stage(
+        run.run_id,
+        _worker_envelope(*_auth_values_for_test(), suffix=terminal_mode),
+        lease_owner_id=supervisor.owner_id,
+    )
+    handle = supervisor.start_run(
+        run,
+        prompt=("sleep until cancelled" if terminal_mode == "cancel" else "complete"),
+        worktree=tmp_path,
+        require_host_envelope=True,
+    )
+    _wait_running(registry, run.run_id)
+    store.stage(
+        run.run_id,
+        _worker_envelope(*_auth_values_for_test(), suffix=terminal_mode + "-pending"),
+        lease_owner_id=supervisor.owner_id,
+    )
+    buffers = tuple(store._entries[run.run_id].environment.values())
+
+    if terminal_mode == "cancel":
+        assert supervisor.cancel_run(run.run_id) is True
+    receipt = handle.wait(timeout=5)
+
+    assert receipt.status == ("cancelled" if terminal_mode == "cancel" else "completed")
+    assert all(not value for value in buffers)
+    assert store.pending_count() == 0
 
 
 def test_restart_reconcile_emits_lost_run_receipt_from_durable_journal(tmp_path):
