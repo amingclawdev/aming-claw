@@ -52466,3 +52466,192 @@ def test_finish_gate_server_flags_caller_supplied_ignored(conn):
     assert result["ok"] is True
     # Transparency flag must be present since caller did supply the key.
     assert result["gate"].get("caller_supplied_real_startup_events_ignored") is True
+
+
+def test_cli_agent_successor_ticket_binds_persisted_evidence_and_runtime_authority(
+    conn,
+    monkeypatch,
+):
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+
+    backlog_id = "AC-CLI-SUCCESSOR-HANDLER"
+    run_id = "run-handler-lost"
+    profile_id = "codex-profile-handler"
+    receipt = CliAgentRunReceipt(
+        run_id=run_id,
+        state="lost",
+        event_index=2,
+        observed_at="2026-07-13T00:00:00Z",
+        ticket_id="caet-abcdef1234567890abcdef12",
+        ticket_hash="sha256:" + hashlib.sha256(b"ticket-handler").hexdigest(),
+        profile_id=profile_id,
+        runtime_context_id="mfrctx-handler-lost",
+        command_hash="sha256:" + hashlib.sha256(b"command-handler").hexdigest(),
+        process_identity={
+            "pid": 5252,
+            "process_group_id": 5252,
+            "process_start_identity_hash": "sha256:"
+            + hashlib.sha256(b"process-handler").hexdigest(),
+        },
+        output_hash="sha256:" + hashlib.sha256(b"").hexdigest(),
+        duration_ms=9000,
+        failure_category="lost",
+    ).to_public_dict()
+    receipt_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="task-handler",
+        event_type="cli_agent.run_receipt",
+        event_kind="worker_progress",
+        phase="cli_agent_service",
+        status="recorded",
+        correlation_id=f"cli-agent-run:{run_id}",
+        payload={"cli_agent_run_receipt": receipt},
+    )
+    checkpoint_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="task-handler",
+        event_type="cli_agent.checkpoint",
+        event_kind="worker_progress",
+        phase="cli_agent_service",
+        status="passed",
+        payload={"checkpoint_id": "checkpoint-handler"},
+    )
+    notification_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="task-handler",
+        event_type="cli_agent.requester_notification",
+        event_kind="worker_progress",
+        phase="cli_agent_service",
+        status="recorded",
+        payload={"notification_id": "notification-handler"},
+    )
+    conn.commit()
+
+    launch = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": "task-handler-successor",
+        "parent_task_id": "observer-handler",
+        "runtime_context_id": "mfrctx-handler-successor",
+        "worker_role": "mf_sub",
+        "worktree_path": "/tmp/handler-successor",
+        "branch_ref": "refs/heads/codex/handler-successor",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "merge_queue_id": "mq-handler-successor",
+        "owned_files": ["agent/worker.py"],
+        "route_id": "route-handler-successor",
+        "route_context_hash": "sha256:route-handler-successor",
+        "prompt_contract_id": "rprompt-handler-successor",
+        "prompt_contract_hash": "sha256:prompt-handler-successor",
+        "route_token_ref": "rtok-handler-successor",
+        "visible_injection_manifest_hash": "sha256:manifest-handler-successor",
+    }
+    authority = {
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": "contract_runtime_current_state",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": "cex-handler-successor",
+        "contract_revision_id": "rev-handler-successor",
+        "execution_state_revision": 4,
+        "execution_state_hash": "sha256:state-handler-successor",
+        "runtime_guide_hash": "sha256:guide-handler-successor",
+        "readiness_state": "contract_active",
+        "next_legal_action": {
+            "id": "successor_worker_dispatch",
+            "action": "dispatch_successor",
+            **{
+                key: value
+                for key, value in launch.items()
+                if key not in {"project_id", "backlog_id", "worktree_path"}
+            },
+            "target_project_root": launch["worktree_path"],
+            "profile_requirements": {
+                "profile_id": profile_id,
+                "role": "observer",
+                "successor_budget": 2,
+            },
+            "retry_policy": {
+                "attempt": 1,
+                "max_attempts": 3,
+                "successor_required": True,
+            },
+        },
+    }
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_contract_runtime_authority",
+        lambda _conn, **_kwargs: authority,
+    )
+
+    result = server.handle_cli_agent_successor_ticket(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "contract_execution_id": "cex-handler-successor",
+                "lost_run_receipt": receipt,
+                "failed_run": {
+                    "run_id": run_id,
+                    "profile_id": profile_id,
+                    "role": "observer",
+                    "parent_run_id": "jb-handler",
+                    "principal_id": "observer-handler-1",
+                },
+                "successor_run": {
+                    "run_id": "run-handler-successor",
+                    "profile_id": profile_id,
+                    "role": "observer",
+                    "parent_run_id": "jb-handler",
+                    "successor_of_run_id": run_id,
+                    "principal_id": "observer-handler-2",
+                },
+                "successor_launch_identity": launch,
+                "role_policy": {"successor_budget": 2},
+                "failure_evidence": {"category": "heartbeat_timeout"},
+                "checkpoint_evidence": {
+                    "checkpoint_id": "checkpoint-handler",
+                    "checkpoint_hash": "sha256:checkpoint-handler",
+                    "evidence_ref": f"timeline:{checkpoint_event['id']}",
+                    "status": "passed",
+                },
+                "retry_state": {
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "successor_count": 0,
+                    "loop_count": 0,
+                    "max_loops": 2,
+                },
+                "requester_notification": {
+                    "notification_id": "notification-handler",
+                    "notification_ref": f"timeline:{notification_event['id']}",
+                    "status": "recorded",
+                    "target_role": "requester",
+                },
+                "expected_execution_state_revision": 4,
+                "expected_execution_state_hash": "sha256:state-handler-successor",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["successor_ticket"]["status"] == "issued"
+    assert result["successor_ticket"]["lost_receipt_event_ref"] == (
+        f"timeline:{receipt_event['id']}"
+    )
+    assert result["evidence_binding"] == {
+        "lost_receipt_persisted": True,
+        "lost_receipt_event_ref": f"timeline:{receipt_event['id']}",
+        "checkpoint_ref_verified": True,
+        "notification_ref_verified": True,
+        "source_of_authority": "ContractRuntime",
+    }

@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
 CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION = "cli_agent_execution_ticket.v1"
+CLI_AGENT_SUCCESSOR_TICKET_SCHEMA_VERSION = "cli_agent_successor_ticket.v1"
 
 CONTRACT_PASS_STATUSES = {
     "accepted",
@@ -3456,6 +3457,7 @@ _CLI_AGENT_TICKET_ROUTE_FIELDS = (
 _CLI_AGENT_TICKET_PROFILE_FIELDS = (
     "profile_id",
     "profile_kind",
+    "role",
     "harness",
     "provider",
     "model",
@@ -3463,6 +3465,7 @@ _CLI_AGENT_TICKET_PROFILE_FIELDS = (
     "endpoint_id",
     "launcher_id",
     "independent_qa_required",
+    "successor_budget",
 )
 
 _CLI_AGENT_TICKET_RETRY_FIELDS = (
@@ -3525,7 +3528,12 @@ def _ticket_profile_requirements(value: Mapping[str, Any] | None) -> dict[str, A
     result: dict[str, Any] = {}
     for key in _CLI_AGENT_TICKET_PROFILE_FIELDS:
         field_value = source.get(key)
-        if isinstance(field_value, bool):
+        if key == "successor_budget":
+            try:
+                result[key] = max(0, int(field_value))
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(field_value, bool):
             result[key] = field_value
         else:
             text = _ticket_public_text(field_value)
@@ -3910,6 +3918,349 @@ def build_cli_agent_execution_ticket(
             "raw_private_context_persisted": False,
         }
     return ticket
+
+
+_CLI_AGENT_SUCCESSOR_RUN_FIELDS = (
+    "run_id",
+    "profile_id",
+    "role",
+    "parent_run_id",
+    "successor_of_run_id",
+    "principal_id",
+)
+
+
+def _successor_public_fields(
+    value: Mapping[str, Any] | None,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        field: _ticket_public_text(source.get(field))
+        for field in fields
+        if _ticket_public_text(source.get(field))
+    }
+
+
+def _successor_nonnegative_int(
+    value: Any,
+    field_name: str,
+    errors: list[str],
+) -> int:
+    if isinstance(value, bool):
+        errors.append(f"{field_name} must be a non-negative integer")
+        return 0
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        errors.append(f"{field_name} must be a non-negative integer")
+        return 0
+    if normalized < 0:
+        errors.append(f"{field_name} must be a non-negative integer")
+        return 0
+    return normalized
+
+
+def build_cli_agent_successor_ticket(
+    *,
+    contract_runtime_current_state: Mapping[str, Any] | None,
+    lost_run_receipt: Mapping[str, Any] | None,
+    lost_receipt_event_ref: str,
+    failed_run: Mapping[str, Any] | None,
+    successor_run: Mapping[str, Any] | None = None,
+    successor_launch_identity: Mapping[str, Any] | None = None,
+    role_policy: Mapping[str, Any] | None = None,
+    failure_evidence: Mapping[str, Any] | None = None,
+    checkpoint_evidence: Mapping[str, Any] | None = None,
+    retry_state: Mapping[str, Any] | None = None,
+    requester_notification: Mapping[str, Any] | None = None,
+    expected_execution_state_revision: int = 0,
+    expected_execution_state_hash: str = "",
+) -> dict[str, Any]:
+    """Authorize one explicit lost-run successor from current ContractRuntime."""
+
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+    from .role_config import cli_agent_successor_role_policy
+
+    errors: list[str] = []
+    authority = _ticket_current_authority(contract_runtime_current_state)
+    failed = _successor_public_fields(failed_run, _CLI_AGENT_SUCCESSOR_RUN_FIELDS)
+    successor = _successor_public_fields(
+        successor_run,
+        _CLI_AGENT_SUCCESSOR_RUN_FIELDS,
+    )
+    action = authority.get("next_legal_action") or {}
+    canonical_profile = _ticket_profile_requirements(
+        action.get("profile_requirements")
+    )
+    authority_role = _ticket_public_text(
+        canonical_profile.get("role") or action.get("worker_role")
+    )
+    canonical_budget = int(canonical_profile.get("successor_budget") or 0)
+    policy = cli_agent_successor_role_policy(
+        authority_role,
+        successor_budget=canonical_budget,
+    )
+    failed_role_policy = cli_agent_successor_role_policy(failed.get("role", ""))
+    if failed_role_policy["canonical_role"] != policy["canonical_role"]:
+        errors.append("failed run role does not match ContractRuntime policy")
+    requested_role_policy = (
+        role_policy if isinstance(role_policy, Mapping) else {}
+    )
+    if (
+        "successor_budget" in requested_role_policy
+        and _successor_nonnegative_int(
+            requested_role_policy.get("successor_budget"),
+            "role_policy.successor_budget",
+            errors,
+        )
+        != canonical_budget
+    ):
+        errors.append("requested successor budget does not match ContractRuntime")
+
+    receipt: dict[str, Any] = {}
+    try:
+        receipt = CliAgentRunReceipt.from_public_dict(
+            lost_run_receipt or {}
+        ).to_public_dict()
+    except (TypeError, ValueError) as exc:
+        errors.append(f"lost run receipt is invalid: {exc}")
+    if receipt and receipt.get("state") != "lost":
+        errors.append("successor handshake requires a lost terminal receipt")
+    if receipt and receipt.get("failure_category") != "lost":
+        errors.append("lost receipt must use failure_category lost")
+    if not (
+        _ticket_public_text(lost_receipt_event_ref).startswith("timeline:")
+        and _ticket_public_text(lost_receipt_event_ref)[9:].isdigit()
+    ):
+        errors.append("lost receipt must be bound to a persisted timeline event")
+    if receipt and failed.get("run_id") != receipt.get("run_id"):
+        errors.append("failed run does not match the lost receipt")
+    if receipt and failed.get("profile_id") != receipt.get("profile_id"):
+        errors.append("failed run profile does not match the lost receipt")
+
+    if authority.get("source_of_authority") != "ContractRuntime":
+        errors.append("successor authority must be ContractRuntime")
+    if int(authority.get("execution_state_revision") or 0) <= 0:
+        errors.append("current ContractRuntime execution_state_revision is required")
+    if expected_execution_state_revision and int(
+        authority.get("execution_state_revision") or 0
+    ) != int(expected_execution_state_revision):
+        errors.append("stale execution_state_revision")
+    if expected_execution_state_hash and _ticket_public_text(
+        authority.get("execution_state_hash")
+    ) != _ticket_public_text(expected_execution_state_hash):
+        errors.append("stale execution_state_hash")
+
+    failure_source = (
+        failure_evidence if isinstance(failure_evidence, Mapping) else {}
+    )
+    failure_category = _ticket_public_text(
+        failure_source.get("category") or "unknown_lost"
+    ).lower()
+    allowed_failures = set(policy["allowed_failure_categories"])
+    if failure_category not in allowed_failures:
+        errors.append("lost run failure category is outside the public taxonomy")
+    public_failure = _successor_public_fields(
+        failure_source,
+        ("evidence_ref", "observed_at"),
+    )
+    public_failure["category"] = failure_category
+
+    notification_source = (
+        requester_notification
+        if isinstance(requester_notification, Mapping)
+        else {}
+    )
+    notification = _successor_public_fields(
+        notification_source,
+        (
+            "notification_id",
+            "notification_ref",
+            "status",
+            "channel",
+            "target_role",
+        ),
+    )
+    if notification.get("status", "").lower() not in {
+        "delivered",
+        "recorded",
+        "sent",
+    }:
+        errors.append("requester notification must be recorded before successor policy")
+    if not (
+        notification.get("notification_id")
+        or notification.get("notification_ref")
+    ):
+        errors.append("requester notification evidence is required")
+
+    common = {
+        "schema_version": CLI_AGENT_SUCCESSOR_TICKET_SCHEMA_VERSION,
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": authority.get("authority_decision_source"),
+        "contract_execution_id": authority.get("contract_execution_id"),
+        "contract_revision_id": authority.get("contract_revision_id"),
+        "execution_state_revision": authority.get("execution_state_revision"),
+        "execution_state_hash": authority.get("execution_state_hash"),
+        "runtime_guide_hash": authority.get("runtime_guide_hash"),
+        "lost_receipt_event_ref": _ticket_public_text(lost_receipt_event_ref),
+        "lost_run_receipt": receipt,
+        "failed_run": failed,
+        "role_policy": policy,
+        "failure_evidence": public_failure,
+        "requester_notification": notification,
+        "raw_credentials_persisted": False,
+        "raw_route_token_persisted": False,
+        "raw_private_context_persisted": False,
+    }
+
+    if policy["canonical_role"] == "mf_sub":
+        if not failed.get("parent_run_id"):
+            errors.append("L3 lost-run report requires a parent L2 run")
+        if notification.get("target_role", "").lower() not in {
+            "l2",
+            "observer",
+            "parent_l2",
+        }:
+            errors.append("L3 lost-run notification must target its parent L2")
+        result = {
+            **common,
+            "status": "reported" if not errors else "rejected",
+            "issue_allowed": False,
+            "decision": "report_to_parent_l2",
+            "successor_run": {},
+            "execution_ticket": {},
+            "errors": errors,
+        }
+        result["successor_ticket_hash"] = _stable_json_hash(result)
+        return result
+
+    if policy["may_issue"] is not True:
+        errors.append("role policy does not authorize a successor")
+
+    action_marker = " ".join(
+        [
+            _ticket_public_text(action.get("id")),
+            _ticket_public_text(action.get("action")),
+        ]
+    ).lower()
+    action_retry = _ticket_retry_policy(action.get("retry_policy"))
+    successor_authorized = (
+        "successor" in action_marker
+        or action_retry.get("successor_required") is True
+        or action_retry.get("on_quota_failure") == "create_successor"
+        or action_retry.get("on_crash") == "create_successor"
+    )
+    if not successor_authorized:
+        errors.append("current ContractRuntime action does not authorize a successor")
+
+    checkpoint_source = (
+        checkpoint_evidence
+        if isinstance(checkpoint_evidence, Mapping)
+        else {}
+    )
+    checkpoint = _successor_public_fields(
+        checkpoint_source,
+        ("checkpoint_id", "checkpoint_hash", "evidence_ref", "status"),
+    )
+    if policy["require_checkpoint"]:
+        if checkpoint.get("status", "").lower() not in CONTRACT_PASS_STATUSES:
+            errors.append("accepted checkpoint evidence is required")
+        if not (
+            checkpoint.get("checkpoint_id")
+            and (checkpoint.get("checkpoint_hash") or checkpoint.get("evidence_ref"))
+        ):
+            errors.append("checkpoint identity and evidence ref/hash are required")
+
+    retry_source = retry_state if isinstance(retry_state, Mapping) else {}
+    retry = {
+        "attempt": _successor_nonnegative_int(
+            retry_source.get("attempt"), "retry_state.attempt", errors
+        ),
+        "max_attempts": _successor_nonnegative_int(
+            retry_source.get("max_attempts"),
+            "retry_state.max_attempts",
+            errors,
+        ),
+        "successor_count": _successor_nonnegative_int(
+            retry_source.get("successor_count"),
+            "retry_state.successor_count",
+            errors,
+        ),
+        "loop_count": _successor_nonnegative_int(
+            retry_source.get("loop_count"),
+            "retry_state.loop_count",
+            errors,
+        ),
+        "max_loops": _successor_nonnegative_int(
+            retry_source.get("max_loops"),
+            "retry_state.max_loops",
+            errors,
+        ),
+    }
+    if policy["successor_budget"] <= retry["successor_count"]:
+        errors.append("successor budget is exhausted")
+    if retry["max_attempts"] <= retry["attempt"]:
+        errors.append("retry attempt budget is exhausted")
+    if retry["max_loops"] <= retry["loop_count"]:
+        errors.append("successor loop budget is exhausted")
+
+    if not successor.get("run_id"):
+        errors.append("successor run_id is required")
+    if successor.get("run_id") == failed.get("run_id"):
+        errors.append("successor must receive a new run_id")
+    if successor.get("successor_of_run_id") != failed.get("run_id"):
+        errors.append("successor_of_run_id must identify the failed run")
+    if successor.get("profile_id") != failed.get("profile_id"):
+        errors.append("successor cannot silently change profile")
+    if successor.get("parent_run_id", "") != failed.get("parent_run_id", ""):
+        errors.append("successor must preserve explicit parent lineage")
+    successor_role_policy = cli_agent_successor_role_policy(
+        successor.get("role", "")
+    )
+    if successor_role_policy["canonical_role"] != policy["canonical_role"]:
+        errors.append("successor role does not match ContractRuntime policy")
+    if policy["require_independent_principal"] and (
+        not successor.get("principal_id")
+        or successor.get("principal_id") == failed.get("principal_id")
+    ):
+        errors.append("QA successor requires an independent replacement principal")
+
+    execution_ticket = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=contract_runtime_current_state,
+        launch_identity=successor_launch_identity,
+        expected_execution_state_revision=expected_execution_state_revision,
+        expected_execution_state_hash=expected_execution_state_hash,
+    )
+    if execution_ticket.get("issue_allowed") is not True:
+        errors.extend(
+            f"execution ticket: {error}"
+            for error in execution_ticket.get("errors") or ["rejected"]
+        )
+
+    material = {
+        **common,
+        "status": "issued" if not errors else "rejected",
+        "issue_allowed": not errors,
+        "decision": policy["decision"],
+        "successor_run": successor,
+        "lineage": {
+            "failed_run_id": failed.get("run_id", ""),
+            "successor_run_id": successor.get("run_id", ""),
+            "parent_run_id": successor.get("parent_run_id", ""),
+            "successor_of_run_id": successor.get("successor_of_run_id", ""),
+        },
+        "checkpoint_evidence": checkpoint,
+        "retry_state": retry,
+        "execution_ticket": execution_ticket,
+        "errors": errors,
+    }
+    material_hash = _stable_json_hash(material)
+    material["successor_ticket_id"] = (
+        "cast-" + material_hash.removeprefix("sha256:")[:24]
+    )
+    material["successor_ticket_hash"] = _stable_json_hash(material)
+    return material
 
 
 def _execution_id(

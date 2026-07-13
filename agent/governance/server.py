@@ -64098,6 +64098,201 @@ def _timeline_trusted_runtime_context_worker_proof(
     return bool(proof_worker and payload_worker and proof_worker == payload_worker)
 
 
+def _cli_agent_timeline_ref_event(
+    conn,
+    project_id: str,
+    event_ref: str,
+    *,
+    backlog_id: str = "",
+) -> dict[str, Any]:
+    match = re.fullmatch(r"timeline:(\d+)", str(event_ref or "").strip())
+    if match is None:
+        return {}
+    row = conn.execute(
+        "SELECT id, backlog_id, event_type, status, payload_json "
+        "FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (project_id, int(match.group(1))),
+    ).fetchone()
+    if row is None or (
+        backlog_id and str(row["backlog_id"] or "") != backlog_id
+    ):
+        return {}
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    return {
+        "id": int(row["id"]),
+        "backlog_id": str(row["backlog_id"] or ""),
+        "event_type": str(row["event_type"] or ""),
+        "status": str(row["status"] or "").lower(),
+        "payload": payload if isinstance(payload, Mapping) else {},
+    }
+
+
+@route(
+    "POST",
+    "/api/graph-governance/{project_id}/cli-agent/successor-tickets",
+)
+def handle_cli_agent_successor_ticket(ctx: RequestContext):
+    """Issue one ContractRuntime-owned ticket for a persisted lost run."""
+
+    from agent.cli_agent_service.evidence import CliAgentRunReceipt
+    from . import task_timeline
+    from .contract_state_runtime import build_cli_agent_successor_ticket
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    contract_execution_id = str(
+        body.get("contract_execution_id") or ""
+    ).strip()
+    if not contract_execution_id:
+        raise ValidationError("contract_execution_id is required")
+    raw_receipt = body.get("lost_run_receipt") or body.get("receipt")
+    if not isinstance(raw_receipt, Mapping):
+        raise ValidationError("lost_run_receipt is required")
+    try:
+        receipt = CliAgentRunReceipt.from_public_dict(
+            raw_receipt
+        ).to_public_dict()
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("backlog_id is required")
+    conn = get_connection(project_id)
+    try:
+        authority = _observer_runtime_text_contract_runtime_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+        receipt_events = task_timeline.cli_agent_run_receipt_events_for_ingest(
+            conn,
+            project_id,
+            run_id=receipt["run_id"],
+            receipt_id=receipt["receipt_id"],
+        )
+        persisted = next(
+            (
+                event
+                for event in receipt_events
+                if (
+                    (event.get("payload") or {})
+                    .get("cli_agent_run_receipt", {})
+                    .get("receipt_id")
+                    == receipt["receipt_id"]
+                )
+            ),
+            {},
+        )
+        lost_receipt_event_ref = (
+            "timeline:{}".format(persisted["id"]) if persisted.get("id") else ""
+        )
+
+        checkpoint_source = body.get("checkpoint_evidence")
+        checkpoint = (
+            dict(checkpoint_source)
+            if isinstance(checkpoint_source, Mapping)
+            else {}
+        )
+        checkpoint_ref = str(checkpoint.get("evidence_ref") or "").strip()
+        checkpoint_event = _cli_agent_timeline_ref_event(
+            conn,
+            project_id,
+            checkpoint_ref,
+            backlog_id=backlog_id,
+        )
+        checkpoint_verified = bool(
+            checkpoint_event
+            and checkpoint_event["status"]
+            in {"accepted", "complete", "completed", "ok", "passed", "succeeded"}
+            and str(
+                checkpoint_event["payload"].get("checkpoint_id") or ""
+            ).strip()
+            == str(checkpoint.get("checkpoint_id") or "").strip()
+        )
+        if not checkpoint_verified:
+            checkpoint["status"] = "unverified"
+
+        notification_source = body.get("requester_notification")
+        notification = (
+            dict(notification_source)
+            if isinstance(notification_source, Mapping)
+            else {}
+        )
+        notification_ref = str(
+            notification.get("notification_ref") or ""
+        ).strip()
+        notification_event = _cli_agent_timeline_ref_event(
+            conn,
+            project_id,
+            notification_ref,
+            backlog_id=backlog_id,
+        )
+        notification_verified = bool(
+            notification_event
+            and notification_event["status"]
+            in {"accepted", "delivered", "ok", "passed", "recorded", "sent"}
+            and str(
+                notification_event["payload"].get("notification_id") or ""
+            ).strip()
+            == str(notification.get("notification_id") or "").strip()
+        )
+        if not notification_verified:
+            notification["status"] = "unverified"
+
+        failure_source = body.get("failure_evidence")
+        failure = (
+            dict(failure_source)
+            if isinstance(failure_source, Mapping)
+            else {}
+        )
+        failure.setdefault("evidence_ref", lost_receipt_event_ref)
+        try:
+            expected_revision = int(
+                body.get("expected_execution_state_revision") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "expected_execution_state_revision must be an integer"
+            ) from exc
+        ticket = build_cli_agent_successor_ticket(
+            contract_runtime_current_state=authority,
+            lost_run_receipt=receipt,
+            lost_receipt_event_ref=lost_receipt_event_ref,
+            failed_run=body.get("failed_run"),
+            successor_run=body.get("successor_run"),
+            successor_launch_identity=body.get("successor_launch_identity"),
+            role_policy=body.get("role_policy"),
+            failure_evidence=failure,
+            checkpoint_evidence=checkpoint,
+            retry_state=body.get("retry_state"),
+            requester_notification=notification,
+            expected_execution_state_revision=expected_revision,
+            expected_execution_state_hash=str(
+                body.get("expected_execution_state_hash") or ""
+            ).strip(),
+        )
+        return {
+            "ok": ticket.get("issue_allowed") is True
+            or ticket.get("status") == "reported",
+            "schema_version": "cli_agent_successor_ticket_response.v1",
+            "successor_ticket": ticket,
+            "evidence_binding": {
+                "lost_receipt_persisted": bool(lost_receipt_event_ref),
+                "lost_receipt_event_ref": lost_receipt_event_ref,
+                "checkpoint_ref_verified": checkpoint_verified,
+                "notification_ref_verified": notification_verified,
+                "source_of_authority": "ContractRuntime",
+            },
+        }
+    finally:
+        conn.close()
+
+
 @route(
     "POST",
     "/api/graph-governance/{project_id}/cli-agent/run-receipts",

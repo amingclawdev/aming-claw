@@ -26,6 +26,56 @@ _CONFIG_BASE = Path(os.getenv("ROLE_CONFIG_DIR", str(_PROJECT_ROOT / "config" / 
 # All known roles
 KNOWN_ROLES = ("coordinator", "pm", "dev", "qa", "gatekeeper", "observer", "mf_sub")
 
+CLI_AGENT_SUCCESSOR_FAILURE_CATEGORIES = (
+    "heartbeat_timeout",
+    "host_session_lost",
+    "process_missing",
+    "quota_exhausted",
+    "unknown_lost",
+)
+
+_CLI_AGENT_SUCCESSOR_ROLE_ALIASES = {
+    "coordinator": "observer",
+    "l2": "observer",
+    "observer": "observer",
+    "pm": "observer",
+    "dev": "mf_sub",
+    "l3": "mf_sub",
+    "mf_sub": "mf_sub",
+    "qa": "qa",
+}
+
+_CLI_AGENT_SUCCESSOR_ROLE_DEFAULTS = {
+    "observer": {
+        "decision": "issue_evidence_first_successor",
+        "may_issue": True,
+        "require_checkpoint": True,
+        "require_parent_report": False,
+        "require_independent_principal": False,
+    },
+    "mf_sub": {
+        "decision": "report_to_parent_l2",
+        "may_issue": False,
+        "require_checkpoint": False,
+        "require_parent_report": True,
+        "require_independent_principal": False,
+    },
+    "qa": {
+        "decision": "issue_independent_qa_successor",
+        "may_issue": True,
+        "require_checkpoint": True,
+        "require_parent_report": False,
+        "require_independent_principal": True,
+    },
+    "deferred": {
+        "decision": "defer_to_requester",
+        "may_issue": False,
+        "require_checkpoint": False,
+        "require_parent_report": False,
+        "require_independent_principal": False,
+    },
+}
+
 # Required fields in every YAML config
 _REQUIRED_FIELDS = {"version", "role", "max_turns", "permissions", "prompt_template"}
 
@@ -105,6 +155,36 @@ class RoleConfig:
             verify_limits=verify_limits,
             task_type_alias=task_type_alias,
         )
+
+
+def cli_agent_successor_role_policy(
+    role: str,
+    *,
+    successor_budget: int = 0,
+) -> Dict[str, Any]:
+    """Return the public governance policy for replacing one lost CLI run."""
+
+    requested_role = str(role or "").strip().lower().replace("-", "_")
+    canonical_role = _CLI_AGENT_SUCCESSOR_ROLE_ALIASES.get(
+        requested_role,
+        "deferred",
+    )
+    try:
+        normalized_budget = max(0, int(successor_budget))
+    except (TypeError, ValueError):
+        normalized_budget = 0
+    return {
+        "schema_version": "cli_agent_service.successor_role_policy.v1",
+        "requested_role": requested_role,
+        "canonical_role": canonical_role,
+        **_CLI_AGENT_SUCCESSOR_ROLE_DEFAULTS[canonical_role],
+        "successor_budget": normalized_budget,
+        "require_requester_notification": True,
+        "allowed_failure_categories": list(
+            CLI_AGENT_SUCCESSOR_FAILURE_CATEGORIES
+        ),
+        "governance_authority": "ContractRuntime",
+    }
 
 
 def _load_yaml_file(path: Path) -> Optional[Dict[str, Any]]:
