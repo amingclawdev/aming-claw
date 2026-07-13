@@ -12,6 +12,7 @@ import pytest
 from agent.plugin_installer import (
     AI_CLI_REQUIREMENTS,
     CODEX_PLUGIN_ID,
+    CODEX_WORKER_MCP_ENV_VARS,
     PluginInstallError,
     _check_ai_cli,
     _check_claude_manifest,
@@ -87,6 +88,7 @@ def _write_plugin_fixture(root: Path) -> None:
                         "0",
                     ],
                     "cwd": ".",
+                    "env_vars": list(CODEX_WORKER_MCP_ENV_VARS),
                     "env": {"PYTHONDONTWRITEBYTECODE": "1"},
                 }
             }
@@ -617,12 +619,30 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     assert server["cwd"] == str(tmp_path.resolve())
     assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(os.pathsep)
     assert server["args"][:2] == ["-m", "agent.mcp.server"]
+    assert server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
 
     codex_config = _load_toml_text((target / ".codex" / "config.toml").read_text(encoding="utf-8"))
     codex_server = codex_config["mcp_servers"]["aming-claw"]
     assert codex_server["command"] == "python3.12"
     assert codex_server["args"][:2] == ["-m", "agent.mcp.server"]
     assert str(tmp_path.resolve()) in codex_server["env"]["PYTHONPATH"].split(os.pathsep)
+    assert codex_server["env_vars"] == list(CODEX_WORKER_MCP_ENV_VARS)
+
+
+def test_install_codex_plugin_cache_never_materializes_worker_auth_values(tmp_path, monkeypatch):
+    _write_plugin_fixture(tmp_path)
+    session_value = "session-secret-must-not-be-persisted"
+    fence_value = "fence-secret-must-not-be-persisted"
+    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_value)
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", fence_value)
+
+    target = install_codex_plugin_cache(tmp_path, codex_home=tmp_path / "codex-home")
+
+    generated = (target / ".mcp.json").read_text(encoding="utf-8")
+    generated += (target / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert session_value not in generated
+    assert fence_value not in generated
+    assert all(name in generated for name in CODEX_WORKER_MCP_ENV_VARS)
 
 
 def test_install_codex_plugin_cache_replaces_existing_symlink_payload(tmp_path):

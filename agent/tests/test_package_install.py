@@ -190,6 +190,10 @@ class TestLocalPluginPackaging:
         assert "--workers" in server["args"]
         assert server["args"][server["args"].index("--workers") + 1] == "0"
         assert server["cwd"] == "."
+        assert server["env_vars"] == [
+            "AMING_WORKER_SESSION_TOKEN",
+            "AMING_WORKER_FENCE_TOKEN",
+        ]
         assert "C:\\Users\\" not in config_text
 
     def test_plugin_doctor_reports_parent_mcp_bridge_without_rewriting_repo_config(self, tmp_path):

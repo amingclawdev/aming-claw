@@ -50,6 +50,14 @@ class TestMcpJsonConfig(unittest.TestCase):
         self.assertIn("agent.mcp.server", " ".join(self.server_cfg.get("args", [])))
         self.assertTrue(self.server_cfg.get("cwd"), "cwd must be set in .mcp.json")
 
+    def test_worker_auth_is_forwarded_by_name_without_values(self):
+        self.assertEqual(
+            self.server_cfg.get("env_vars"),
+            ["AMING_WORKER_SESSION_TOKEN", "AMING_WORKER_FENCE_TOKEN"],
+        )
+        self.assertNotIn("AMING_WORKER_SESSION_TOKEN", self.env)
+        self.assertNotIn("AMING_WORKER_FENCE_TOKEN", self.env)
+
 
 class TestGovernanceServerDefaults(unittest.TestCase):
     """Verify governance server.py default port matches host setup."""

@@ -4,6 +4,10 @@
       "command": "./.venv/bin/python",
       "args": ["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0", "--governance-url", "http://localhost:40000"],
       "cwd": ".",
+      "env_vars": [
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN"
+      ],
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",

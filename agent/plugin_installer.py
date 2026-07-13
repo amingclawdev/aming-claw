@@ -24,6 +24,10 @@ CODEX_MARKETPLACE_NAME = "aming-claw-local"
 CODEX_PLUGIN_NAME = "aming-claw"
 CODEX_PLUGIN_ID = f"{CODEX_PLUGIN_NAME}@{CODEX_MARKETPLACE_NAME}"
 DEFAULT_PLUGIN_VERSION = "0.1.1"
+CODEX_WORKER_MCP_ENV_VARS = (
+    "AMING_WORKER_SESSION_TOKEN",
+    "AMING_WORKER_FENCE_TOKEN",
+)
 REQUIRED_PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
@@ -531,6 +535,7 @@ def _cache_runtime_mcp_config(plugin_root: Path, *, python_executable: Optional[
             "http://localhost:40000",
         ]
     server["cwd"] = runtime_root
+    server["env_vars"] = list(CODEX_WORKER_MCP_ENV_VARS)
 
     env = server.get("env") if isinstance(server.get("env"), dict) else {}
     env = dict(env)
@@ -669,6 +674,7 @@ def _codex_runtime_config_toml(plugin_root: Path, *, python_executable: Optional
         "[mcp_servers.aming-claw]",
         f"command = {_toml_quote(str(server.get('command') or 'python'))}",
         f"args = {_toml_array([str(arg) for arg in server.get('args') or []])}",
+        f"env_vars = {_toml_array([str(item) for item in server.get('env_vars') or []])}",
     ]
     env = server.get("env") if isinstance(server.get("env"), dict) else {}
     if env:
@@ -1819,6 +1825,9 @@ def _validate_mcp_runtime_entrypoint(mcp_path: Path) -> tuple[bool, str]:
     args = server.get("args")
     if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
         return False, f"{mcp_path}: mcpServers.aming-claw.args must launch agent.mcp.server"
+    env_vars = server.get("env_vars")
+    if env_vars != list(CODEX_WORKER_MCP_ENV_VARS):
+        return False, f"{mcp_path}: mcpServers.aming-claw.env_vars must be the worker auth allowlist"
 
     cwd = Path(str(server.get("cwd") or ".")).expanduser()
     if not cwd.is_absolute():
@@ -1850,6 +1859,9 @@ def _validate_codex_runtime_config(config_path: Path) -> tuple[bool, str]:
     args = server.get("args")
     if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
         return False, f"{config_path}: mcp_servers.aming-claw.args must launch agent.mcp.server"
+    env_vars = server.get("env_vars")
+    if env_vars != list(CODEX_WORKER_MCP_ENV_VARS):
+        return False, f"{config_path}: mcp_servers.aming-claw.env_vars must be the worker auth allowlist"
 
     env = server.get("env") if isinstance(server.get("env"), dict) else {}
     runtime_paths = [

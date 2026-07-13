@@ -34,6 +34,11 @@ Each server entry contains:
 - **Type:** `object`
 - **Description:** Environment variables to set for the MCP server process.
 
+##### `env_vars` (optional)
+
+- **Type:** `array` of environment variable names
+- **Description:** Names of variables that Codex may copy from its local parent environment into the MCP stdio process. Aming Claw uses this for `AMING_WORKER_SESSION_TOKEN` and `AMING_WORKER_FENCE_TOKEN`; values must never be stored in `.mcp.json`, generated TOML, logs, or fixtures.
+
 ##### `cwd` (optional)
 
 - **Type:** `string`
@@ -56,6 +61,10 @@ Each server entry contains:
         "--governance-url",
         "http://localhost:40000"
       ],
+      "env_vars": [
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN"
+      ],
       "env": {
         "GOVERNANCE_URL": "http://localhost:40000",
         "MANAGER_URL": "http://127.0.0.1:40101",
@@ -70,6 +79,7 @@ Each server entry contains:
 ## Notes
 
 - The active MCP server entrypoint is `agent.mcp.server`. The older `agent.governance.mcp_server` is retained only for compatibility.
+- `env` contains fixed non-secret process settings. `env_vars` is a names-only allowlist: Codex reads current values from its own local environment when it starts the MCP child. A normal host/observer session with neither variable set remains unauthenticated as a worker.
 - The MCP server provides governance tools as MCP tool calls: task management, workflow impact, backlog filing, graph governance queries, operations queue checks, version checks, manager-sidecar host operations, and optional MCP-local executor control.
 - Use `--workers 0` for normal editor/plugin sessions so opening MCP does not spawn duplicate queue consumers. Start workers only from an explicit executor-owned session.
 - Redis event notifications are disabled by default for editor/plugin sessions to keep stdio startup quiet and resilient. Set `MCP_ENABLE_EVENTS=1` or pass `--enable-events` only for sessions that need push notifications.
