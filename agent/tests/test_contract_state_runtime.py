@@ -312,7 +312,8 @@ def test_cli_agent_run_receipts_project_operational_state_without_evidence_credi
         process_identity={
             "pid": 1234,
             "process_group_id": 1234,
-            "process_start_identity": "pid:1234:start:99",
+            "process_start_identity_hash": "sha256:"
+            + hashlib.sha256(b"pid:1234:start:99").hexdigest(),
         },
     ).to_public_dict()
     events = [

@@ -61,6 +61,23 @@ def _run(run_id):
     )
 
 
+def _execution_ticket(run):
+    import hashlib
+
+    ticket_material = hashlib.sha256(run.run_id.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": "cli_agent_execution_ticket.v1",
+        "status": "issued",
+        "issue_allowed": True,
+        "ticket_id": "caet-" + ticket_material[:24],
+        "ticket_hash": "sha256:" + ticket_material,
+        "profile_requirements": {"profile_id": run.config.profile_id},
+        "dispatch_identity": {
+            "runtime_context_id": "mfrctx-supervisor-receipt"
+        },
+    }
+
+
 def _fake_codex(tmp_path):
     path = tmp_path / "codex"
     path.write_text(
@@ -71,6 +88,8 @@ def _fake_codex(tmp_path):
         "output = args[args.index('-o') + 1]\n"
         "prompt = sys.stdin.read()\n"
         "pathlib.Path(output).with_suffix('.ready').write_text('ready', encoding='utf-8')\n"
+        "if prompt.startswith('fail'):\n"
+        "    sys.exit(7)\n"
         "if prompt.startswith('sleep'):\n"
         "    time.sleep(10)\n"
         "else:\n"
@@ -83,7 +102,7 @@ def _fake_codex(tmp_path):
     return path
 
 
-def _supervisor(tmp_path):
+def _supervisor(tmp_path, *, run_receipt_sink=None):
     from cli_agent_service.adapters.codex_cli import CodexCliAdapter
     from cli_agent_service.registry import AgentRegistry
     from cli_agent_service.supervisor import CodexC0Supervisor
@@ -96,6 +115,7 @@ def _supervisor(tmp_path):
         heartbeat_interval_seconds=0.03,
         lease_ttl_seconds=2,
         cancellation_grace_seconds=0.1,
+        run_receipt_sink=run_receipt_sink,
     )
     return registry, supervisor
 
@@ -122,7 +142,12 @@ def _wait_probe_ready(state_dir, timeout=5):
 def test_supervisor_owns_process_group_lease_heartbeat_and_receipt(tmp_path):
     registry, supervisor = _supervisor(tmp_path)
     run = _run("run-success")
-    handle = supervisor.start_run(run, prompt="private prompt", worktree=tmp_path)
+    handle = supervisor.start_run(
+        run,
+        prompt="private prompt",
+        worktree=tmp_path,
+        execution_ticket=_execution_ticket(run),
+    )
     receipt = handle.wait(timeout=5)
     assert receipt.status == "completed"
     assert receipt.exit_code == 0
@@ -148,12 +173,23 @@ def test_supervisor_owns_process_group_lease_heartbeat_and_receipt(tmp_path):
         ).fetchone()
     assert heartbeat_at >= acquired_at
     assert supervisor.active_run_ids() == ()
+    run_receipts = supervisor.run_receipts(run.run_id)
+    assert run_receipts[0]["state"] == "accepted"
+    assert run_receipts[1]["state"] == "started"
+    assert any(item["state"] == "heartbeat" for item in run_receipts)
+    assert run_receipts[-1]["state"] == "completed"
+    assert "private prompt" not in json.dumps(run_receipts)
 
 
 def test_supervisor_cancels_owned_process_group(tmp_path):
     registry, supervisor = _supervisor(tmp_path)
     run = _run("run-cancel")
-    handle = supervisor.start_run(run, prompt="sleep until cancelled", worktree=tmp_path)
+    handle = supervisor.start_run(
+        run,
+        prompt="sleep until cancelled",
+        worktree=tmp_path,
+        execution_ticket=_execution_ticket(run),
+    )
     _wait_running(registry, run.run_id)
     _wait_probe_ready(tmp_path / "state")
     assert supervisor.cancel_run(run.run_id) is True
@@ -165,6 +201,82 @@ def test_supervisor_cancels_owned_process_group(tmp_path):
     assert stored.state == "failed"
     assert stored.failure_category == "cancelled"
     assert stored.lease is None
+    assert supervisor.run_receipts(run.run_id)[-1]["state"] == "cancelled"
+    assert supervisor.run_receipts(run.run_id)[-1]["exit_code"] == 130
+
+
+def test_supervisor_emits_failed_run_receipt(tmp_path):
+    registry, supervisor = _supervisor(tmp_path)
+    run = _run("run-failed")
+
+    receipt = supervisor.start_run(
+        run,
+        prompt="fail normally",
+        worktree=tmp_path,
+        execution_ticket=_execution_ticket(run),
+    ).wait(timeout=5)
+
+    assert receipt.status == "failed"
+    assert receipt.exit_code == 7
+    terminal = supervisor.run_receipts(run.run_id)[-1]
+    assert terminal["state"] == "failed"
+    assert terminal["exit_code"] == 7
+    assert terminal["failure_category"] == "process_error"
+    assert registry.get_run(run.run_id).state == "failed"
+
+
+def test_restart_reconcile_emits_lost_run_receipt_from_durable_journal(tmp_path):
+    from cli_agent_service.adapters.codex_cli import CodexCliAdapter
+    from cli_agent_service.evidence import RunReceiptEmitter, hash_text
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.supervisor import CodexC0Supervisor
+
+    registry = AgentRegistry(
+        tmp_path / "registry" / "runs.db",
+        process_identity_reader=lambda _pid: "different-process-start",
+    )
+    supervisor = CodexC0Supervisor(
+        registry,
+        state_dir=tmp_path / "state",
+        adapter=CodexCliAdapter(executable=str(_fake_codex(tmp_path))),
+    )
+    run = _run("run-lost")
+    registry.register_run(run)
+    registry.acquire_lease(run.run_id, "test-owner", ttl_seconds=30)
+    registry.record_process_start(
+        run.run_id,
+        pid=424242,
+        process_start_identity="original-process-start",
+        process_group_id=424242,
+        argv_hash=hash_text("command"),
+    )
+    ticket = _execution_ticket(run)
+    emitter = RunReceiptEmitter(
+        run_id=run.run_id,
+        ticket_id=ticket["ticket_id"],
+        ticket_hash=ticket["ticket_hash"],
+        profile_id=run.config.profile_id,
+        runtime_context_id=ticket["dispatch_identity"]["runtime_context_id"],
+        command_hash=hash_text("command"),
+        sink=supervisor.receipt_journal.append,
+    )
+    emitter.emit("accepted", observed_at="2026-07-12T12:00:00Z")
+    emitter.emit(
+        "started",
+        observed_at="2026-07-12T12:00:01Z",
+        process_identity={
+            "pid": 424242,
+            "process_group_id": 424242,
+            "process_start_identity_hash": hash_text("original-process-start"),
+        },
+    )
+
+    result = supervisor.reconcile_restart()
+
+    assert [(item.run_id, item.classification) for item in result] == [
+        (run.run_id, "lost")
+    ]
+    assert supervisor.run_receipts(run.run_id)[-1]["state"] == "lost"
 
 
 def test_restart_reconcile_observes_live_run_without_rewriting_identity(tmp_path):

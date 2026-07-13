@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .adapters.codex_cli import CodexCliAdapter
-from .evidence import ExecutionReceipt, hash_command, hash_file, hash_text
+from .evidence import (
+    ExecutionReceipt,
+    RunReceiptEmitter,
+    RunReceiptJournal,
+    hash_command,
+    hash_file,
+    hash_text,
+)
 from .models import AgentRun, ReconciliationResult
 from .registry import AgentRegistry, process_start_identity
 
@@ -66,6 +73,9 @@ class _ActiveRun:
     stderr_handle: Any
     run_dir: Path
     started_at: str
+    started_monotonic: float
+    process_start_identity: str
+    receipt_emitter: RunReceiptEmitter | None
     handle: RunHandle
     cancel_requested: threading.Event
 
@@ -84,6 +94,7 @@ class CodexC0Supervisor:
         cancellation_grace_seconds: float = 3.0,
         process_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
         process_identity_reader: Callable[[int], str | None] = process_start_identity,
+        run_receipt_sink: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.state_dir = Path(state_dir).expanduser()
@@ -95,10 +106,68 @@ class CodexC0Supervisor:
         self.cancellation_grace_seconds = max(float(cancellation_grace_seconds), 0.05)
         self.process_factory = process_factory
         self.process_identity_reader = process_identity_reader
+        self.receipt_journal = RunReceiptJournal(self.state_dir / "run-receipts")
+        self.run_receipt_sink = run_receipt_sink
         self.owner_id = "cli-agent-host-{}".format(os.getpid())
         self._active: dict[str, _ActiveRun] = {}
         self._results: dict[str, ExecutionReceipt] = {}
+        self._receipt_sink_errors: list[str] = []
         self._lock = threading.RLock()
+
+    def _emit_run_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        persisted = self.receipt_journal.append(receipt)
+        if self.run_receipt_sink is not None:
+            try:
+                self.run_receipt_sink(dict(persisted))
+            except Exception as exc:
+                with self._lock:
+                    self._receipt_sink_errors.append(type(exc).__name__)
+        return persisted
+
+    def _run_receipt_emitter(
+        self,
+        run: AgentRun,
+        execution_ticket: Mapping[str, Any] | None,
+        command_hash: str,
+    ) -> RunReceiptEmitter | None:
+        if execution_ticket is None:
+            return None
+        if not isinstance(execution_ticket, Mapping):
+            raise SupervisorError("execution_ticket must be an issued ticket object")
+        if (
+            execution_ticket.get("status") != "issued"
+            or execution_ticket.get("issue_allowed") is not True
+        ):
+            raise SupervisorError("execution_ticket is not issued")
+        profile = execution_ticket.get("profile_requirements")
+        dispatch = execution_ticket.get("dispatch_identity")
+        if not isinstance(profile, Mapping) or not isinstance(dispatch, Mapping):
+            raise SupervisorError("execution_ticket is missing run identity")
+        profile_id = str(profile.get("profile_id") or "").strip()
+        if profile_id != run.config.profile_id:
+            raise SupervisorError("execution_ticket profile does not match the run")
+        return RunReceiptEmitter(
+            run_id=run.run_id,
+            ticket_id=execution_ticket.get("ticket_id", ""),
+            ticket_hash=execution_ticket.get("ticket_hash", ""),
+            profile_id=profile_id,
+            runtime_context_id=dispatch.get("runtime_context_id", ""),
+            command_hash=command_hash,
+            sink=self._emit_run_receipt,
+        )
+
+    @staticmethod
+    def _receipt_process_identity(
+        *,
+        pid: int,
+        process_group_id: int,
+        process_start_identity_value: str,
+    ) -> dict[str, Any]:
+        return {
+            "pid": int(pid),
+            "process_group_id": int(process_group_id),
+            "process_start_identity_hash": hash_text(process_start_identity_value),
+        }
 
     def _process_identity(self, pid: int) -> str:
         for _ in range(20):
@@ -115,6 +184,7 @@ class CodexC0Supervisor:
         prompt: str,
         worktree: str | os.PathLike[str],
         evidence_refs: Mapping[str, str] | None = None,
+        execution_ticket: Mapping[str, Any] | None = None,
     ) -> RunHandle:
         with self._lock:
             if run.run_id in self._active:
@@ -126,6 +196,11 @@ class CodexC0Supervisor:
         launch = self.adapter.build_launch_spec(run, worktree=worktree, output_path=output_path)
         command_hash = hash_command(launch.command)
         prompt_hash = hash_text(prompt)
+        receipt_emitter = self._run_receipt_emitter(
+            run,
+            execution_ticket,
+            command_hash,
+        )
         self.registry.register_run(run, evidence_refs=evidence_refs)
         self.registry.acquire_lease(
             run.run_id,
@@ -136,7 +211,10 @@ class CodexC0Supervisor:
         process: subprocess.Popen[str] | None = None
         stdout_handle: Any = None
         stderr_handle: Any = None
+        accepted_monotonic = time.monotonic()
         try:
+            if receipt_emitter is not None:
+                receipt_emitter.emit("accepted", observed_at=_timestamp())
             run_dir.mkdir(mode=0o700)
             stdout_handle = stdout_path.open("w+", encoding="utf-8")
             stderr_handle = stderr_path.open("w+", encoding="utf-8")
@@ -161,6 +239,16 @@ class CodexC0Supervisor:
                 process_group_id=process_group_id,
                 argv_hash=command_hash,
             )
+            receipt_process_identity = self._receipt_process_identity(
+                pid=process.pid,
+                process_group_id=process_group_id,
+                process_start_identity_value=identity,
+            )
+            receipt_emitter and receipt_emitter.emit(
+                "started",
+                observed_at=_timestamp(),
+                process_identity=receipt_process_identity,
+            )
             if process.stdin is not None:
                 try:
                     process.stdin.write(prompt)
@@ -181,6 +269,9 @@ class CodexC0Supervisor:
                 stderr_handle=stderr_handle,
                 run_dir=run_dir,
                 started_at=_timestamp(),
+                started_monotonic=accepted_monotonic,
+                process_start_identity=identity,
+                receipt_emitter=receipt_emitter,
                 handle=handle,
                 cancel_requested=threading.Event(),
             )
@@ -203,6 +294,35 @@ class CodexC0Supervisor:
                 stderr_handle.close()
             shutil.rmtree(run_dir, ignore_errors=True)
             self.registry.record_exit(run.run_id, 127, failure_category="spawn_error")
+            if receipt_emitter is not None:
+                process_identity_payload = (
+                    self._receipt_process_identity(
+                        pid=process.pid,
+                        process_group_id=(
+                            os.getpgid(process.pid) if os.name != "nt" else process.pid
+                        ),
+                        process_start_identity_value=(
+                            self.process_identity_reader(process.pid) or "unavailable"
+                        ),
+                    )
+                    if process is not None
+                    else {}
+                )
+                try:
+                    receipt_emitter.emit(
+                        "failed",
+                        observed_at=_timestamp(),
+                        process_identity=process_identity_payload,
+                        output_hash=hash_text(""),
+                        duration_ms=max(
+                            0,
+                            int((time.monotonic() - accepted_monotonic) * 1000),
+                        ),
+                        exit_code=127,
+                        failure_category="spawn_error",
+                    )
+                except Exception:
+                    pass
             if isinstance(exc, SupervisorError):
                 raise
             raise SupervisorError("Codex process could not be started") from exc
@@ -249,6 +369,23 @@ class CodexC0Supervisor:
                     failure_category = "lease_heartbeat_failed"
                     self._terminate(active)
                     break
+                try:
+                    if active.receipt_emitter is not None:
+                        active.receipt_emitter.emit(
+                            "heartbeat",
+                            observed_at=_timestamp(),
+                            process_identity=self._receipt_process_identity(
+                                pid=active.process.pid,
+                                process_group_id=active.process_group_id,
+                                process_start_identity_value=(
+                                    active.process_start_identity
+                                ),
+                            ),
+                        )
+                except Exception:
+                    failure_category = "receipt_heartbeat_failed"
+                    self._terminate(active)
+                    break
                 next_heartbeat = now + self.heartbeat_interval_seconds
             active.cancel_requested.wait(
                 min(self.heartbeat_interval_seconds, max(0.01, next_heartbeat - now))
@@ -258,7 +395,7 @@ class CodexC0Supervisor:
             failure_category = "cancelled"
         elif not failure_category and returncode != 0:
             failure_category = "process_error"
-        effective_exit_code = 130 if failure_category == "cancelled" and returncode == 0 else returncode
+        effective_exit_code = 130 if failure_category == "cancelled" else returncode
         status = "cancelled" if failure_category == "cancelled" else "completed" if effective_exit_code == 0 else "failed"
         self.registry.record_exit(
             active.run.run_id,
@@ -269,6 +406,29 @@ class CodexC0Supervisor:
         active.stderr_handle.flush()
         active.stdout_handle.close()
         active.stderr_handle.close()
+        output_hash = hash_file(active.output_path)
+        stdout_hash = hash_file(active.stdout_path)
+        stderr_hash = hash_file(active.stderr_path)
+        if active.receipt_emitter is not None:
+            terminal_failure_category = failure_category
+            if status == "failed" and not terminal_failure_category:
+                terminal_failure_category = "process_error"
+            active.receipt_emitter.emit(
+                status,
+                observed_at=_timestamp(),
+                process_identity=self._receipt_process_identity(
+                    pid=active.process.pid,
+                    process_group_id=active.process_group_id,
+                    process_start_identity_value=active.process_start_identity,
+                ),
+                output_hash=output_hash,
+                duration_ms=max(
+                    0,
+                    int((time.monotonic() - active.started_monotonic) * 1000),
+                ),
+                exit_code=effective_exit_code,
+                failure_category=terminal_failure_category,
+            )
         receipt = ExecutionReceipt(
             run_id=active.run.run_id,
             status=status,
@@ -277,9 +437,9 @@ class CodexC0Supervisor:
             process_group_id=active.process_group_id,
             command_hash=active.command_hash,
             prompt_hash=active.prompt_hash,
-            output_hash=hash_file(active.output_path),
-            stdout_hash=hash_file(active.stdout_path),
-            stderr_hash=hash_file(active.stderr_path),
+            output_hash=output_hash,
+            stdout_hash=stdout_hash,
+            stderr_hash=stderr_hash,
             started_at=active.started_at,
             finished_at=_timestamp(),
             failure_category=failure_category,
@@ -308,4 +468,49 @@ class CodexC0Supervisor:
             return tuple(sorted(self._active))
 
     def reconcile_restart(self) -> tuple[ReconciliationResult, ...]:
-        return self.registry.reconcile_runs()
+        results = self.registry.reconcile_runs()
+        for result in results:
+            if result.classification != "lost":
+                continue
+            previous = self.receipt_journal.latest(result.run_id)
+            if not previous or previous["state"] in {
+                "completed",
+                "failed",
+                "cancelled",
+                "lost",
+            }:
+                continue
+            emitter = RunReceiptEmitter(
+                run_id=previous["run_id"],
+                ticket_id=previous["ticket_id"],
+                ticket_hash=previous["ticket_hash"],
+                profile_id=previous["profile_id"],
+                runtime_context_id=previous["runtime_context_id"],
+                command_hash=previous["command_hash"],
+                sink=self._emit_run_receipt,
+                previous_receipt=previous,
+            )
+            record = self.registry.get_run(result.run_id)
+            process_identity_payload = dict(previous.get("process_identity") or {})
+            if record and record.pid and record.process_start_identity:
+                process_identity_payload = self._receipt_process_identity(
+                    pid=record.pid,
+                    process_group_id=record.process_group_id or record.pid,
+                    process_start_identity_value=record.process_start_identity,
+                )
+            emitter.emit(
+                "lost",
+                observed_at=_timestamp(),
+                process_identity=process_identity_payload,
+                output_hash=hash_text(""),
+                duration_ms=0,
+                failure_category="lost",
+            )
+        return results
+
+    def run_receipts(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        return self.receipt_journal.receipts(run_id)
+
+    def receipt_sink_errors(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._receipt_sink_errors)

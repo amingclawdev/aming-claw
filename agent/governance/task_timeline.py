@@ -1355,6 +1355,45 @@ def _cli_agent_run_receipt_from_event(event: Mapping[str, Any]) -> dict[str, Any
     return dict(receipt) if isinstance(receipt, Mapping) else {}
 
 
+def cli_agent_run_receipt_events_for_ingest(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    receipt_id: str,
+) -> list[dict[str, Any]]:
+    """Read only the duplicate candidate and latest fact for one run."""
+
+    ensure_schema(conn)
+    correlation_id = "cli-agent-run:{}".format(run_id)
+    duplicate = conn.execute(
+        """SELECT * FROM task_timeline_events
+           WHERE project_id = ? AND correlation_id = ?
+             AND event_type = 'cli_agent.run_receipt'
+             AND json_extract(
+                 payload_json,
+                 '$.cli_agent_run_receipt.receipt_id'
+             ) = ?
+           ORDER BY id DESC LIMIT 1""",
+        (project_id, correlation_id, receipt_id),
+    ).fetchone()
+    latest = conn.execute(
+        """SELECT * FROM task_timeline_events
+           WHERE project_id = ? AND correlation_id = ?
+             AND event_type = 'cli_agent.run_receipt'
+           ORDER BY id DESC LIMIT 1""",
+        (project_id, correlation_id),
+    ).fetchone()
+    rows = []
+    if latest is not None:
+        rows.append(_row_to_dict(latest))
+    if duplicate is not None and (
+        latest is None or int(duplicate["id"]) != int(latest["id"])
+    ):
+        rows.append(_row_to_dict(duplicate))
+    return rows
+
+
 def project_cli_agent_run_receipt(
     receipt: Mapping[str, Any],
     existing_events: list[dict[str, Any]] | None = None,

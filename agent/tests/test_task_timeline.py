@@ -1828,6 +1828,11 @@ class TestTaskTimeline(unittest.TestCase):
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
 
+    def _cli_agent_process_hash(self):
+        from agent.cli_agent_service.evidence import hash_text
+
+        return hash_text("pid:1234:start:99")
+
     def _cli_agent_receipt(
         self,
         state,
@@ -1852,6 +1857,7 @@ class TestTaskTimeline(unittest.TestCase):
             process_identity=process_identity or {},
             output_hash=hash_text("output") if terminal else "",
             duration_ms=1000 if terminal else None,
+            exit_code=0 if terminal else None,
         ).to_public_dict()
 
     def test_cli_agent_run_receipt_ingestion_is_idempotent_and_non_close(self):
@@ -1892,7 +1898,7 @@ class TestTaskTimeline(unittest.TestCase):
         process_identity = {
             "pid": 1234,
             "process_group_id": 1234,
-            "process_start_identity": "pid:1234:start:99",
+            "process_start_identity_hash": self._cli_agent_process_hash(),
         }
         receipts = [
             self._cli_agent_receipt(
@@ -1958,7 +1964,7 @@ class TestTaskTimeline(unittest.TestCase):
         process_identity = {
             "pid": 1234,
             "process_group_id": 1234,
-            "process_start_identity": "pid:1234:start:99",
+            "process_start_identity_hash": self._cli_agent_process_hash(),
         }
         accepted = self._cli_agent_receipt(
             "accepted",
@@ -1984,6 +1990,79 @@ class TestTaskTimeline(unittest.TestCase):
             ("cli-agent-run:run-task-timeline-a",),
         ).fetchone()["c"]
         self.assertEqual(count, 1)
+
+    def test_cli_agent_run_receipt_ingestion_uses_latest_and_dedupes_old_fact(self):
+        from agent.governance import server, task_timeline
+
+        process_identity = {
+            "pid": 1234,
+            "process_group_id": 1234,
+            "process_start_identity_hash": self._cli_agent_process_hash(),
+        }
+        receipts = []
+        for event_index in range(1001):
+            state = "accepted" if event_index == 0 else "started" if event_index == 1 else "heartbeat"
+            receipts.append(
+                self._cli_agent_receipt(
+                    state,
+                    event_index,
+                    observed_at="2026-07-12T12:{:02d}:{:02d}Z".format(
+                        (event_index // 60) % 60,
+                        event_index % 60,
+                    ),
+                    process_identity=(
+                        None if state == "accepted" else process_identity
+                    ),
+                )
+            )
+        task_timeline.ensure_schema(self.conn)
+        self.conn.executemany(
+            """INSERT INTO task_timeline_events
+               (project_id, event_type, event_kind, phase, correlation_id,
+                actor, status, payload_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    "proj",
+                    "cli_agent.run_receipt",
+                    "worker_progress",
+                    "runtime",
+                    "cli-agent-run:run-task-timeline-a",
+                    "cli-agent-service",
+                    "recorded",
+                    json.dumps({"cli_agent_run_receipt": receipt}),
+                    receipt["observed_at"],
+                )
+                for receipt in receipts
+            ],
+        )
+        self.conn.commit()
+        next_receipt = self._cli_agent_receipt(
+            "heartbeat",
+            1001,
+            observed_at="2026-07-12T12:16:41Z",
+            process_identity=process_identity,
+        )
+
+        appended = server.handle_cli_agent_run_receipt(
+            _ctx(body={"receipt": next_receipt}, method="POST")
+        )
+        old_duplicate = server.handle_cli_agent_run_receipt(
+            _ctx(body={"receipt": receipts[0]}, method="POST")
+        )
+
+        self.assertEqual(
+            appended["payload"]["cli_agent_run_receipt"]["event_index"],
+            1001,
+        )
+        self.assertTrue(old_duplicate["receipt_ingestion"]["idempotent"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS c FROM task_timeline_events WHERE correlation_id = ?",
+                ("cli-agent-run:run-task-timeline-a",),
+            ).fetchone()["c"],
+            1002,
+        )
 
     def _issue_route_token(
         self,
