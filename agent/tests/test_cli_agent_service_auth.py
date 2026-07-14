@@ -129,6 +129,47 @@ def test_prepare_codex_login_creates_clean_private_home_and_copy_safe_actions(
     assert "token" not in result.copy_command.casefold()
 
 
+def test_codex_auth_operations_share_desktop_bundle_discovery(
+    tmp_path, monkeypatch
+):
+    from cli_agent_service.adapters import codex_cli
+    from cli_agent_service.auth import ProfileAuthController
+
+    executable = _fake_cli(tmp_path, "desktop-codex")
+    calls = []
+
+    def desktop_codex_ready_runner(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        return subprocess.CompletedProcess(command, 0, "Logged in", "")
+
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(codex_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        codex_cli,
+        "MACOS_CODEX_APP_BUNDLE_EXECUTABLES",
+        (str(executable),),
+    )
+    controller = ProfileAuthController(
+        tmp_path / "profiles",
+        runner=desktop_codex_ready_runner,
+    )
+
+    prepared = controller.prepare_login("profile-codex-a", "codex")
+    status = controller.auth_status("profile-codex-a", "codex")
+    activated = controller.activate("profile-codex-a", "codex")
+
+    assert prepared.state == "login_in_progress"
+    assert str(executable) in prepared.copy_command
+    assert status.state == "ready"
+    assert activated.state == "ready"
+    assert activated.activated is True
+    assert [command[0] for command, _kwargs in calls] == [
+        str(executable),
+        str(executable),
+    ]
+
+
 def test_codex_status_and_activation_are_profile_scoped_and_redacted(tmp_path):
     from cli_agent_service.auth import ProfileAuthController
 

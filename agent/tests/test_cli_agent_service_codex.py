@@ -79,6 +79,117 @@ def _fake_codex(tmp_path):
     return path
 
 
+def _fake_resolver_executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def _enable_desktop_fallback(monkeypatch, codex_cli, executable):
+    monkeypatch.setattr(codex_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        codex_cli,
+        "MACOS_CODEX_APP_BUNDLE_EXECUTABLES",
+        (str(executable),),
+    )
+
+
+def test_codex_executable_explicit_precedes_env_path_and_desktop(
+    tmp_path, monkeypatch
+):
+    from cli_agent_service.adapters import codex_cli
+
+    explicit = _fake_resolver_executable(tmp_path / "explicit" / "codex")
+    configured = _fake_resolver_executable(tmp_path / "configured" / "codex")
+    path_codex = _fake_resolver_executable(tmp_path / "path" / "codex")
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.setenv("CODEX_BIN", str(configured))
+    monkeypatch.setenv("PATH", str(path_codex.parent))
+    _enable_desktop_fallback(monkeypatch, codex_cli, desktop)
+
+    assert codex_cli.CodexCliAdapter(
+        executable=str(explicit)
+    ).resolve_executable() == str(explicit)
+
+
+def test_codex_executable_env_precedes_path_and_desktop(tmp_path, monkeypatch):
+    from cli_agent_service.adapters import codex_cli
+
+    configured = _fake_resolver_executable(tmp_path / "configured" / "codex")
+    path_codex = _fake_resolver_executable(tmp_path / "path" / "codex")
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.setenv("CODEX_BIN", str(configured))
+    monkeypatch.setenv("PATH", str(path_codex.parent))
+    _enable_desktop_fallback(monkeypatch, codex_cli, desktop)
+
+    assert codex_cli.CodexCliAdapter().resolve_executable() == str(configured)
+
+
+def test_codex_executable_path_precedes_desktop(tmp_path, monkeypatch):
+    from cli_agent_service.adapters import codex_cli
+
+    path_codex = _fake_resolver_executable(tmp_path / "path" / "codex")
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(path_codex.parent))
+    _enable_desktop_fallback(monkeypatch, codex_cli, desktop)
+
+    assert codex_cli.CodexCliAdapter().resolve_executable() == str(path_codex)
+
+
+def test_invalid_explicit_codex_executable_fails_closed(tmp_path, monkeypatch):
+    from cli_agent_service.adapters import codex_cli
+
+    configured = _fake_resolver_executable(tmp_path / "configured" / "codex")
+    path_codex = _fake_resolver_executable(tmp_path / "path" / "codex")
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.setenv("CODEX_BIN", str(configured))
+    monkeypatch.setenv("PATH", str(path_codex.parent))
+    _enable_desktop_fallback(monkeypatch, codex_cli, desktop)
+
+    with pytest.raises(codex_cli.CodexAdapterError, match="configured.*unavailable"):
+        codex_cli.CodexCliAdapter(
+            executable=str(tmp_path / "missing-codex")
+        ).resolve_executable()
+
+
+def test_codex_managed_launch_uses_chatgpt_desktop_fallback(
+    tmp_path, monkeypatch
+):
+    from cli_agent_service.adapters import codex_cli
+
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", "")
+    _enable_desktop_fallback(monkeypatch, codex_cli, desktop)
+
+    launch = codex_cli.CodexCliAdapter().build_launch_spec(
+        _run(),
+        worktree=tmp_path,
+        output_path=tmp_path / "last.txt",
+    )
+
+    assert launch.command[0] == str(desktop)
+
+
+def test_codex_desktop_fallback_is_not_used_off_macos(tmp_path, monkeypatch):
+    from cli_agent_service.adapters import codex_cli
+
+    desktop = _fake_resolver_executable(tmp_path / "desktop" / "codex")
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(codex_cli.sys, "platform", "linux")
+    monkeypatch.setattr(
+        codex_cli,
+        "MACOS_CODEX_APP_BUNDLE_EXECUTABLES",
+        (str(desktop),),
+    )
+
+    with pytest.raises(codex_cli.CodexAdapterError, match="unavailable"):
+        codex_cli.CodexCliAdapter().resolve_executable()
+
+
 def test_codex_adapter_builds_bounded_inherited_profile_command(tmp_path):
     from cli_agent_service.adapters.codex_cli import CodexCliAdapter
 

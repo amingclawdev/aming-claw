@@ -1,9 +1,10 @@
-"""Codex CLI adapter for one explicitly imported inherited profile."""
+"""Bounded Codex CLI discovery and launch adapter."""
 
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,10 +14,66 @@ from ..models import AgentRun
 CODEX_PROFILE_ENV_KEY = "CODEX_HOME"
 CODEX_LOGIN_ARGS = ("login", "--device-auth")
 CODEX_AUTH_STATUS_ARGS = ("login", "status")
+MACOS_CODEX_APP_BUNDLE_EXECUTABLES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+)
 
 
 class CodexAdapterError(ValueError):
     pass
+
+
+def _resolve_configured_executable(configured: str) -> str:
+    if os.path.isabs(configured) or os.sep in configured:
+        path = Path(configured).expanduser()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise CodexAdapterError("configured Codex executable is unavailable")
+        return str(path)
+    resolved = shutil.which(configured)
+    if not resolved:
+        raise CodexAdapterError("configured Codex executable is unavailable")
+    return resolved
+
+
+def _resolve_supported_app_bundle_executable() -> str:
+    if sys.platform != "darwin":
+        return ""
+    for candidate in MACOS_CODEX_APP_BUNDLE_EXECUTABLES:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return ""
+
+
+def resolve_codex_executable(
+    *,
+    explicit: str = "",
+    executable_ref: str = "",
+) -> str:
+    """Apply the server-owned Codex executable discovery policy."""
+
+    configured = str(explicit or "").strip()
+    if configured:
+        return _resolve_configured_executable(configured)
+
+    configured = os.environ.get("CODEX_BIN", "").strip()
+    if configured:
+        return _resolve_configured_executable(configured)
+
+    executable_ref = str(executable_ref or "").strip()
+    if executable_ref.startswith("path:"):
+        return _resolve_configured_executable(
+            executable_ref.removeprefix("path:")
+        )
+
+    resolved = shutil.which("codex")
+    if resolved:
+        return resolved
+
+    resolved = _resolve_supported_app_bundle_executable()
+    if resolved:
+        return resolved
+    raise CodexAdapterError("Codex executable is unavailable")
 
 
 @dataclass(frozen=True)
@@ -43,20 +100,10 @@ class CodexCliAdapter:
         self.stream_json = bool(stream_json)
 
     def resolve_executable(self, executable_ref: str = "") -> str:
-        configured = self.executable or os.environ.get("CODEX_BIN", "").strip()
-        executable_ref = str(executable_ref or "").strip()
-        if not configured and executable_ref.startswith("path:"):
-            configured = executable_ref.removeprefix("path:")
-        configured = configured or "codex"
-        if os.path.isabs(configured) or os.sep in configured:
-            path = Path(configured).expanduser()
-            if not path.is_file() or not os.access(path, os.X_OK):
-                raise CodexAdapterError("configured Codex executable is unavailable")
-            return str(path)
-        resolved = shutil.which(configured)
-        if not resolved:
-            raise CodexAdapterError("Codex executable is unavailable")
-        return resolved
+        return resolve_codex_executable(
+            explicit=self.executable,
+            executable_ref=executable_ref,
+        )
 
     def _resolve_executable(self, run: AgentRun) -> str:
         executable_ref = str(run.profile.harness_runtime.executable_ref or "").strip()
