@@ -854,7 +854,9 @@ def test_dogfood_execute_forwards_governed_service_admission(monkeypatch, tmp_pa
         "direct_invocation_fallback"
     ] is False
     assert "read_receipt_submission" not in result
-    assert "worker-session-token-test" not in json.dumps(result)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "worker-session-token-test" not in serialized
+    assert request.fence_token not in serialized
 
 
 def test_dogfood_execute_requires_canonical_service_admission(
@@ -882,7 +884,9 @@ def test_dogfood_execute_requires_canonical_service_admission(
     assert blocker["raw_fence_token_exposed"] is False
     assert "observer_run" not in result
     assert "read_receipt_submission" not in result
-    assert "worker-session-token-test" not in json.dumps(result)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "worker-session-token-test" not in serialized
+    assert request.fence_token not in serialized
 
 
 def test_timeline_startup_status_ignores_superseded_runtime_lineage(monkeypatch):

@@ -450,7 +450,7 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
     _wait_for(paths.socket_path.exists)
     private_memory = "PRIVATE-JB-MEMORY-{}".format(secrets.token_hex(16))
     raw_values = []
-    service_dispatches = []
+    responses = []
     try:
         for role, suffix in cases:
             main, worktree, head, context, evidence = branches[suffix]
@@ -510,6 +510,7 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
                 ),
                 execute=True,
             )
+            responses.append(response)
             failure_context = {
                 key: response.get(key)
                 for key in (
@@ -537,7 +538,6 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
             invocation = observer_run["invocation"]
             assert invocation["backend_mode"] == "cli_agent_service"
             service_dispatch = invocation["service_dispatch"]
-            service_dispatches.append(service_dispatch)
             assert service_dispatch["run_id"] == runs[suffix].run_id
             assert service_dispatch["role"] == role
             assert service_dispatch["profile_id"] == selectors["profile_id"]
@@ -598,7 +598,7 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
         for item in governance.receipts
     )
 
-    serialized_dispatches = json.dumps(service_dispatches, sort_keys=True)
+    serialized_responses = json.dumps(responses, sort_keys=True)
     persisted = b"".join(
         path.read_bytes()
         for root in (state_dir, *(tmp_path / suffix for _role, suffix in cases))
@@ -606,7 +606,7 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
         if path.is_file()
     )
     for raw in (*raw_values, private_memory):
-        assert raw not in serialized_dispatches
+        assert raw not in serialized_responses
         assert raw.encode("utf-8") not in persisted
 
 

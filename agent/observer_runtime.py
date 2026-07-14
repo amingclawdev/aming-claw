@@ -7976,11 +7976,19 @@ def build_dogfood_observer_run_plan(
             ),
         },
     }
+
+    def copy_safe_result() -> dict[str, Any]:
+        return _dogfood_secret_redacted_copy(
+            result,
+            session_token=str(os.environ.get("AMING_WORKER_SESSION_TOKEN") or ""),
+            fence_token=str(context.fence_token or ""),
+        )
+
     route_identity_validation = _dogfood_route_identity_validation(request)
     result["route_identity_validation"] = route_identity_validation
     if not route_identity_validation["allowed"]:
         result["error"] = "observer dogfood requires complete route identity evidence"
-        return result
+        return copy_safe_result()
     allocation_required = bool(branch_runtime_evidence.get("allocation_required"))
     if allocation_required:
         result["status"] = "allocation_required"
@@ -7995,7 +8003,7 @@ def build_dogfood_observer_run_plan(
             "branch_runtime_evidence": branch_runtime_evidence,
         }
         result["error"] = "branch runtime allocation is required before dispatch-ready runtime text evidence"
-        return result
+        return copy_safe_result()
 
     try:
         gate_validation = validate_mf_subagent_dispatch_gate(
@@ -8008,7 +8016,7 @@ def build_dogfood_observer_run_plan(
             "allowed": False,
             "error": str(exc),
         }
-        return result
+        return copy_safe_result()
     result["dispatch_gate_validation"] = gate_validation
     runtime_text = build_observer_runtime_text_context(runtime_text_request)
     result["runtime_text"] = runtime_text
@@ -8050,7 +8058,7 @@ def build_dogfood_observer_run_plan(
                     "worktree": context.worktree_path,
                 }
                 result["error"] = launch_backend_blocker["reason"]
-                return result
+                return copy_safe_result()
         result["dispatch_gate_validation"] = (
             runtime_text.get("dispatch_gate_validation") or gate_validation
         )
@@ -8059,7 +8067,7 @@ def build_dogfood_observer_run_plan(
             or (runtime_text.get("dispatch_gate_validation") or {}).get("error")
             or "observer runtime text preparation failed"
         )
-        return result
+        return copy_safe_result()
 
     if execute:
         launch_backend_blocker = _dogfood_launch_backend_blocker(
@@ -8092,7 +8100,7 @@ def build_dogfood_observer_run_plan(
                 "worktree": context.worktree_path,
             }
             result["error"] = launch_backend_blocker["reason"]
-            return result
+            return copy_safe_result()
 
     worker_worktree = Path(context.worktree_path).expanduser().resolve()
     worker_status = _git_worktree_status(worker_worktree, main_worktree=main_worktree)
@@ -8116,7 +8124,7 @@ def build_dogfood_observer_run_plan(
             "error": "materialize_worktree requested but the gated worker worktree was not created",
             "worktree": str(worker_worktree),
         }
-        return result
+        return copy_safe_result()
     if execute and not materialization.get("materialized"):
         result["execute_preflight"] = {
             "allowed": False,
@@ -8126,7 +8134,7 @@ def build_dogfood_observer_run_plan(
             "executable_worker_launch": dict(executable_worker_launch),
             "missing_fields": ["worktree_path.real_git_worktree"],
         }
-        return result
+        return copy_safe_result()
     observer_command_id = request.task_id or context.task_id
     launch_env = _dogfood_execute_launch_env(
         request=request,
@@ -8158,7 +8166,7 @@ def build_dogfood_observer_run_plan(
                 "error": blocker["reason"],
             }
         )
-        return result
+        return copy_safe_result()
 
     guided_service_admission = (
         dict(request.guided_service_admission)
@@ -8197,7 +8205,7 @@ def build_dogfood_observer_run_plan(
                 "error": blocker["reason"],
             }
         )
-        return result
+        return copy_safe_result()
 
     observer_request = ObserverRunRequest(
         project_id=request.project_id,
@@ -8237,7 +8245,7 @@ def build_dogfood_observer_run_plan(
         result["calls_models"] = False
         result["direct_invocation_fallback"] = False
         result["service_dispatch_blocker"] = invocation.get("service_dispatch") or {}
-    return result
+    return copy_safe_result()
 
 
 def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[str, Any]:
