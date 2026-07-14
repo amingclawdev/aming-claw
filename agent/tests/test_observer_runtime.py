@@ -194,7 +194,12 @@ def _enable_canonical_dogfood_admission(request):
         "worker_slot_id": request.worker_id,
         "observer_command_id": request.task_id,
         "parent_task_id": request.backlog_id,
-        "target_project_root": branch_context["worktree_path"],
+        "target_project_root": (
+            request.target_project_root
+            or branch_context.get("target_project_root")
+            or request.main_worktree
+        ),
+        "worktree_path": branch_context["worktree_path"],
         "branch_ref": branch_context["branch_ref"],
         "base_commit": request.base_commit,
         "target_head_commit": request.target_head_commit,
@@ -276,6 +281,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         stage_type="mf_sub",
         worker_id="worker-a1",
         worker_slot_id="worker-a1",
+        target_project_root=str(main),
         fence_token="fence-runtime-text-a1",
         branch_ref="refs/heads/codex/task-a1",
         worktree_id="wt-task-a1",
@@ -301,6 +307,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                 route_token_ref="rtok-runtime-text-a1",
             ),
             main_worktree=str(main),
+            target_project_root=str(main),
             owned_files=("agent/observer_runtime.py",),
             observer_command_id="cmd-a1",
             task_id="task-a1",
@@ -335,7 +342,8 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                     "observer_command_id": "cmd-a1",
                     "parent_task_id": "AC-RUNTIME-TEXT-A1",
                     "worker_role": "mf_sub",
-                    "target_project_root": str(worktree),
+                    "target_project_root": str(main),
+                    "worktree_path": str(worktree),
                     "branch_ref": "refs/heads/codex/task-a1",
                     "base_commit": "base-a1",
                     "target_head_commit": "target-a1",
@@ -386,12 +394,15 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert ticket["status"] == "issued"
     assert ticket["issue_allowed"] is True
     assert ticket["contract_execution_id"] == "cex-runtime-text-a1"
+    assert ticket["dispatch_identity"]["target_project_root"] == str(main)
     assert ticket["dispatch_identity"]["worktree_path"] == str(worktree)
     assert ticket["dispatch_identity"]["worker_id"] == "worker-a1"
     assert ticket["dispatch_identity"]["worker_slot_id"] == "worker-a1"
     assert ticket["dispatch_identity"]["observer_command_id"] == "cmd-a1"
     assert ticket["profile_requirements"]["profile_id"] == "inherited-current"
     assert prepared["worker_launch_pack"]["execution_ticket"] == ticket
+    assert prepared["worker_launch_pack"]["target_project_root"] == str(main)
+    assert prepared["worker_launch_pack"]["worktree_path"] == str(worktree)
     admission_request = prepared["worker_launch_pack"][
         "desktop_execution_ticket_admission_request"
     ]
@@ -428,7 +439,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
         "observer_command_id": "cmd-a1",
         "governance_project_id": "aming-claw",
         "target_project_id": "aming-claw",
-        "target_project_root": str(worktree),
+        "target_project_root": str(main),
         "task_id": "task-a1",
         "parent_task_id": "AC-RUNTIME-TEXT-A1",
         "worker_role": "mf_sub",

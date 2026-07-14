@@ -54,6 +54,11 @@
     "shared_backlog_close_token_allowed": false,
     "description": "mf_parallel.v2 remains scoped to one backlog row. For multiple backlog rows, create an mf_batch_parallel.v1 parent route that fans out to one mf_parallel successor per row."
   },
+  "runtime_contract_hints": {
+    "schema_version": "contract_template.runtime_hints.v1",
+    "contract_definition_id": "mf_parallel.v2",
+    "contract_definition_revision": "rev3"
+  },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",
     "classification_service_id": "route.prompt_alert_bundle",
@@ -279,13 +284,17 @@
         "description": "Observer must run and record this dispatch gate before spawn_agent. Passing evidence proves the local mf_sub worker has an isolated branch/worktree/file fence before non-blocking handoff."
       },
       "required_dispatch_fields": [
-        "branch",
-        "worktree",
+        "target_project_root",
+        "worktree_path",
+        "branch_ref",
         "base_commit",
         "target_head_commit",
         "merge_queue_id",
         "fence_token",
         "owned_files",
+        "profile_requirements",
+        "retry_policy",
+        "route_identity",
         "dirty_scope_check"
       ],
       "override_policy": {
@@ -367,6 +376,19 @@
         "safe_route_identity_only": true
       },
       "description": "Worker and observer lanes query the shared runtime/contract view by task/fence identity instead of treating generated runtime text as the source of truth. Observer changes must append contract revisions; workers poll this service for current bounded execution state."
+    },
+    "dispatch_ticket_authority": {
+      "schema_version": "mf_parallel.dispatch_ticket_authority_policy.v1",
+      "source_revision": "rev3",
+      "validate_before_precheck_and_submit": true,
+      "server_resolved_child_route_identity_required": true,
+      "mixed_parent_child_identity_policy": "fail_closed",
+      "atomic_rejection_required": true,
+      "shared_builder_owns_ticket_hashes_and_replay_checks": true,
+      "distinct_root_fields": [
+        "target_project_root",
+        "worktree_path"
+      ]
     },
     "parent_child_prefill_policy": {
       "schema_version": "mf_parallel.parent_child_prefill_policy.v1",

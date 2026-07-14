@@ -44915,6 +44915,8 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
         "root_contract_execution_id": str(record.get("root_contract_execution_id") or ""),
         "contract_chain_id": str(record.get("contract_chain_id") or ""),
         "contract_id": str(record.get("contract_id") or ""),
+        "contract_revision_id": str(record.get("revision") or ""),
+        "contract_hash": str(record.get("definition_hash") or ""),
         "execution_state_revision": int(
             record.get("execution_state_revision")
             or state.get("execution_state_revision")
@@ -46105,6 +46107,11 @@ def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "backlog_id": str(record.get("backlog_id") or ""),
         "contract_execution_id": str(record.get("contract_execution_id") or ""),
         "contract_id": str(record.get("contract_id") or ""),
+        "contract_revision_id": str(record.get("revision") or ""),
+        "contract_hash": str(record.get("definition_hash") or ""),
+        "execution_state_revision": current_state["execution_state_revision"],
+        "execution_state_hash": current_state["execution_state_hash"],
+        "runtime_guide_hash": current_state["runtime_guide_hash"],
         "contract_runtime_current_state": current_state,
         "runtime_guide": guide,
         "next_legal_action": _runtime_next_action_from_guide(guide),
@@ -51043,6 +51050,381 @@ def _contract_runtime_bind_reconcile_authority(
     if merged_commit:
         effective["commit_sha"] = merged_commit
     return effective
+
+
+def _contract_runtime_is_rev3_mf_parallel_dispatch(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> bool:
+    return bool(
+        _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "").strip()
+        )
+        and str(record.get("revision") or "").strip() == "rev3"
+        and str(write.get("stage_id") or "").strip() == "dispatch"
+        and str(write.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+        and str(write.get("evidence_kind") or "").strip()
+        == "dispatch_bounded_worker"
+    )
+
+
+def _contract_runtime_rev3_dispatch_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Bind one rev3 dispatch to persisted worker and child-route authority."""
+
+    effective = dict(write)
+    if not _contract_runtime_is_rev3_mf_parallel_dispatch(record, effective):
+        return effective, []
+
+    payload = (
+        dict(effective.get("payload"))
+        if isinstance(effective.get("payload"), Mapping)
+        else {}
+    )
+    errors: list[str] = []
+    bounded_worker: dict[str, Any] = {}
+    bounded_workers = payload.get("bounded_workers")
+    if bounded_workers is not None:
+        if (
+            not isinstance(bounded_workers, list)
+            or len(bounded_workers) != 1
+            or not isinstance(bounded_workers[0], Mapping)
+        ):
+            errors.append(
+                "mf_parallel rev3 dispatch must identify exactly one bounded worker"
+            )
+        else:
+            bounded_worker = dict(bounded_workers[0])
+    sources = tuple(
+        source for source in (effective, payload, bounded_worker) if source
+    )
+
+    def supplied_text(field: str, *aliases: str) -> str:
+        values = {
+            str(source.get(key) or "").strip()
+            for source in sources
+            for key in (field, *aliases)
+            if str(source.get(key) or "").strip()
+        }
+        if len(values) > 1:
+            errors.append(f"dispatch contains conflicting {field} values")
+            return ""
+        return next(iter(values)) if values else ""
+
+    runtime_context_id = supplied_text("runtime_context_id")
+    task_id = supplied_text("task_id", "worker_task_id")
+    parent_task_id = supplied_text("parent_task_id")
+    worker_id = supplied_text("worker_id")
+    worker_slot_id = supplied_text("worker_slot_id")
+    supplied_observer_command_id = supplied_text("observer_command_id")
+    observer_command_id = supplied_observer_command_id or str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    worker_role = supplied_text("worker_role", "role")
+    target_project_root = supplied_text(
+        "target_project_root", "project_root", "repo_root"
+    )
+    worktree_path = supplied_text(
+        "worktree_path", "worker_worktree_path", "assigned_worktree"
+    )
+    branch_ref = supplied_text("branch_ref", "branch")
+    base_commit = supplied_text("base_commit")
+    target_head_commit = supplied_text("target_head_commit")
+    merge_queue_id = supplied_text("merge_queue_id")
+
+    required_text = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "observer_command_id": observer_command_id,
+        "worker_role": worker_role,
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": branch_ref,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "merge_queue_id": merge_queue_id,
+    }
+    missing = [field for field, value in required_text.items() if not value]
+
+    owned_sources = [
+        tuple(
+            sorted(
+                set(
+                    _runtime_context_service_query_values(
+                        source,
+                        "owned_files",
+                        "target_files",
+                    )
+                )
+            )
+        )
+        for source in sources
+        if _runtime_context_service_query_values(
+            source,
+            "owned_files",
+            "target_files",
+        )
+    ]
+    if len(set(owned_sources)) > 1:
+        errors.append("dispatch contains conflicting owned_files values")
+    owned_files = list(owned_sources[0]) if owned_sources else []
+    if not owned_files:
+        missing.append("owned_files")
+
+    def supplied_mapping(field: str) -> dict[str, Any]:
+        values = [
+            dict(source[field])
+            for source in sources
+            if isinstance(source.get(field), Mapping) and source.get(field)
+        ]
+        if any(value != values[0] for value in values[1:]):
+            errors.append(f"dispatch contains conflicting {field} values")
+        return values[0] if values else {}
+
+    profile_requirements = supplied_mapping("profile_requirements")
+    retry_policy = supplied_mapping("retry_policy")
+    if not profile_requirements:
+        missing.append("profile_requirements")
+    if not retry_policy:
+        missing.append("retry_policy")
+    if missing:
+        errors.append(
+            "mf_parallel rev3 dispatch is missing required authority: "
+            + ", ".join(sorted(set(missing)))
+        )
+
+    context = None
+    if runtime_context_id:
+        from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+        context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+    if context is None:
+        errors.append("mf_parallel rev3 dispatch requires a persisted runtime context")
+    else:
+        canonical_worker_id = str(
+            getattr(context, "worker_id", "")
+            or getattr(context, "worker_slot_id", "")
+            or ""
+        ).strip()
+        canonical_worker_slot_id = str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
+        expected = {
+            "runtime_context_id": str(
+                getattr(context, "runtime_context_id", "") or ""
+            ).strip(),
+            "task_id": str(getattr(context, "task_id", "") or "").strip(),
+            "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+            "worker_id": canonical_worker_id,
+            "worker_slot_id": canonical_worker_slot_id,
+            "worker_role": "mf_sub",
+            "target_project_root": str(
+                getattr(context, "target_project_root", "") or ""
+            ).strip(),
+            "worktree_path": str(
+                getattr(context, "worktree_path", "") or ""
+            ).strip(),
+            "branch_ref": str(getattr(context, "branch_ref", "") or "").strip(),
+            "base_commit": str(getattr(context, "base_commit", "") or "").strip(),
+            "target_head_commit": str(
+                getattr(context, "target_head_commit", "") or ""
+            ).strip(),
+            "merge_queue_id": str(
+                getattr(context, "merge_queue_id", "") or ""
+            ).strip(),
+        }
+        for field, actual in required_text.items():
+            if field == "observer_command_id":
+                continue
+            canonical = expected.get(field, "")
+            if not canonical:
+                errors.append(f"persisted runtime context is missing {field}")
+            elif actual and actual != canonical:
+                errors.append(
+                    f"dispatch {field} does not match persisted runtime context"
+                )
+        canonical_owned_files = sorted(
+            set(
+                getattr(context, "owned_files", ())
+                or getattr(context, "target_files", ())
+                or ()
+            )
+        )
+        if not canonical_owned_files:
+            errors.append("persisted runtime context is missing owned_files")
+        elif owned_files and owned_files != canonical_owned_files:
+            errors.append("dispatch owned_files do not match persisted runtime context")
+
+    route_sources: list[Mapping[str, Any]] = list(sources)
+    for source in sources:
+        for field in ("route_identity", "child_route_lineage"):
+            nested = source.get(field)
+            if isinstance(nested, Mapping):
+                route_sources.append(nested)
+
+    def route_values(field: str) -> set[str]:
+        return {
+            str(source.get(field) or "").strip()
+            for source in route_sources
+            if str(source.get(field) or "").strip()
+        }
+
+    route_token_refs = route_values("route_token_ref")
+    if len(route_token_refs) > 1:
+        errors.append("dispatch route identity mixes parent and child route_token_ref")
+    route_token_ref = next(iter(route_token_refs)) if route_token_refs else ""
+    canonical_route_identity: dict[str, str] = {}
+    resolved = None
+    if not route_token_ref:
+        errors.append("mf_parallel rev3 dispatch is missing route_token_ref")
+    else:
+        from . import observer_route_context
+
+        try:
+            resolved = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_token_ref,
+                backlog_id=str(record.get("backlog_id") or ""),
+                task_id=task_id,
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            errors.append(f"dispatch child route identity could not be resolved: {exc}")
+        if not resolved:
+            errors.append("dispatch child route_token_ref is not server registered")
+
+    if resolved:
+        allowed_actions = {
+            str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+            for action in (resolved.get("allowed_actions") or [])
+        }
+        if "task_timeline_append" not in allowed_actions:
+            errors.append("dispatch route_token_ref is not append scoped")
+        registered_child = (
+            resolved.get("child_route_lineage")
+            if isinstance(resolved.get("child_route_lineage"), Mapping)
+            else {}
+        )
+        canonical_route_identity = {
+            field: str(
+                registered_child.get(field)
+                or resolved.get(field)
+                or (route_token_ref if field == "route_token_ref" else "")
+            ).strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        incomplete_route = [
+            field for field, value in canonical_route_identity.items() if not value
+        ]
+        if incomplete_route:
+            errors.append(
+                "server-resolved child route identity is incomplete: "
+                + ", ".join(incomplete_route)
+            )
+        for field, canonical in canonical_route_identity.items():
+            supplied = route_values(field)
+            if len(supplied) > 1 or any(value != canonical for value in supplied):
+                errors.append(
+                    f"dispatch route identity mixes parent and child {field}"
+                )
+
+    if errors:
+        return effective, list(dict.fromkeys(errors))
+
+    assert context is not None
+    canonical_values = {
+        "runtime_context_id": str(context.runtime_context_id),
+        "task_id": str(context.task_id),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": str(context.worker_id or context.worker_slot_id),
+        "worker_slot_id": str(context.worker_slot_id or context.worker_id),
+        "worker_role": "mf_sub",
+        "target_project_root": str(context.target_project_root),
+        "worktree_path": str(context.worktree_path),
+        "branch_ref": str(context.branch_ref),
+        "base_commit": str(context.base_commit),
+        "target_head_commit": str(context.target_head_commit),
+        "merge_queue_id": str(context.merge_queue_id),
+    }
+    if supplied_observer_command_id:
+        canonical_values["observer_command_id"] = observer_command_id
+    for field, value in canonical_values.items():
+        effective[field] = value
+        payload[field] = value
+    effective["owned_files"] = owned_files
+    payload["owned_files"] = owned_files
+    payload["profile_requirements"] = dict(profile_requirements)
+    payload["retry_policy"] = dict(retry_policy)
+    payload["route_identity"] = dict(canonical_route_identity)
+    for field, value in canonical_route_identity.items():
+        effective[field] = value
+        payload[field] = value
+    if bounded_worker:
+        for field, value in canonical_values.items():
+            bounded_worker[field] = value
+        bounded_worker["owned_files"] = list(owned_files)
+        bounded_worker["profile_requirements"] = dict(profile_requirements)
+        bounded_worker["retry_policy"] = dict(retry_policy)
+        bounded_worker["route_identity"] = dict(canonical_route_identity)
+        for field, value in canonical_route_identity.items():
+            bounded_worker[field] = value
+        payload["bounded_workers"] = [bounded_worker]
+    payload["dispatch_ticket_authority"] = {
+        "schema_version": "mf_parallel.dispatch_ticket_authority.v1",
+        "source": "observer_route_token_refs",
+        "server_resolved_child_route_identity": True,
+        "runtime_context_bound": True,
+    }
+    effective["payload"] = payload
+    return effective, []
+
+
+def _contract_runtime_unchanged_line_rejection(
+    record: Mapping[str, Any],
+    errors: Sequence[str],
+) -> dict[str, Any]:
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    return {
+        "ok": False,
+        "record": dict(record),
+        "decision": {
+            "schema_version": "contract_write_gate_decision.v1",
+            "ok": False,
+            "errors": list(errors),
+        },
+        "completed_lines_count": len(record.get("completed_lines") or []),
+        "execution_state_revision": int(
+            record.get("execution_state_revision")
+            or state.get("execution_state_revision")
+            or 0
+        ),
+        "execution_state_hash": str(state.get("execution_state_hash") or ""),
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+    }
 
 
 def _contract_runtime_bind_server_line_authority(
@@ -66239,6 +66621,30 @@ def _observer_runtime_text_prepare_worker_route_identity(
             )
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         }
+        missing_child_identity = [
+            field for field, value in child_identity.items() if not value
+        ]
+        mixed_identity = [
+            {
+                "field": field,
+                "expected": child_identity.get(field, ""),
+                "actual": supplied_identity.get(field, ""),
+            }
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if supplied_identity.get(field)
+            and child_identity.get(field)
+            and supplied_identity[field] != child_identity[field]
+        ]
+        if missing_child_identity or mixed_identity:
+            proof.update(
+                {
+                    "status": "rejected_mixed_or_incomplete_child_route_identity",
+                    "reason": "worker route identity must be one complete server-resolved child identity",
+                    "missing_fields": missing_child_identity,
+                    "mismatches": mixed_identity,
+                }
+            )
+            return effective_body, proof
         for field, value in child_identity.items():
             if value:
                 effective_body[field] = value
@@ -67754,7 +68160,9 @@ def _contract_runtime_dispatch_ticket_authority(
 ) -> dict[str, Any]:
     """Project the accepted mf_parallel dispatch during the pre-worker window."""
 
-    if str(record.get("contract_id") or "").strip() != MF_PARALLEL_CONTRACT_ID:
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "").strip()
+    ):
         return {}
     dispatch_lines: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
     for index, line in _contract_runtime_completed_lines(record):
@@ -67942,6 +68350,51 @@ def _contract_runtime_dispatch_ticket_authority(
             action[field] = dict(value)
         elif field in payload:
             conflicts.append(field)
+    if str(record.get("revision") or "").strip() == "rev3":
+        missing = [
+            field
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "worker_id",
+                "worker_slot_id",
+                "observer_command_id",
+                "parent_task_id",
+                "worker_role",
+                "target_project_root",
+                "worktree_path",
+                "branch_ref",
+                "base_commit",
+                "target_head_commit",
+                "merge_queue_id",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+            )
+            if not action.get(field)
+        ]
+        if not action.get("owned_files"):
+            missing.append("owned_files")
+        if not action.get("profile_requirements"):
+            missing.append("profile_requirements")
+        if not action.get("retry_policy"):
+            missing.append("retry_policy")
+        dispatch_ticket_authority = (
+            payload.get("dispatch_ticket_authority")
+            if isinstance(payload.get("dispatch_ticket_authority"), Mapping)
+            else {}
+        )
+        if dispatch_ticket_authority.get(
+            "server_resolved_child_route_identity"
+        ) is not True:
+            missing.append("server_resolved_child_route_identity")
+        if missing:
+            return {
+                "status": "invalid",
+                "error": (
+                    "canonical ContractRuntime dispatch is missing rev3 ticket "
+                    "authority: "
+                    + ", ".join(sorted(set(missing)))
+                ),
+            }
     if conflicts:
         return {
             "status": "invalid",
@@ -68203,27 +68656,10 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
         expected_revision = int(body.get("expected_execution_state_revision") or 0)
     except (TypeError, ValueError):
         expected_revision = -1
-    from .contract_state_runtime import (
-        _stable_json_hash,
-        build_cli_agent_execution_ticket,
-    )
-
-    canonical_root = str(launch_identity.get("target_project_root") or "").strip()
-    launch_worktree = str(launch_identity.get("worktree_path") or "").strip()
-    distinct_launch_worktree = bool(
-        canonical_root and launch_worktree and canonical_root != launch_worktree
-    )
-    ticket_authority = authority
-    if distinct_launch_worktree:
-        ticket_action = dict(action)
-        ticket_action.pop("target_project_root", None)
-        ticket_authority = {
-            **dict(authority),
-            "next_legal_action": ticket_action,
-        }
+    from .contract_state_runtime import build_cli_agent_execution_ticket
 
     execution_ticket = build_cli_agent_execution_ticket(
-        contract_runtime_current_state=ticket_authority,
+        contract_runtime_current_state=authority,
         launch_identity=launch_identity,
         expected_execution_state_revision=expected_revision,
         expected_execution_state_hash=str(
@@ -68233,49 +68669,6 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
             body.get("expected_dispatch_identity_hash") or ""
         ),
     )
-    if distinct_launch_worktree and execution_ticket.get("status") == "issued":
-        ticket_action = dict(execution_ticket.get("next_legal_action") or {})
-        ticket_action["target_project_root"] = canonical_root
-        execution_ticket["next_legal_action"] = ticket_action
-        execution_ticket["next_legal_action_hash"] = _stable_json_hash(ticket_action)
-        ticket_material = {
-            key: value
-            for key, value in execution_ticket.items()
-            if key not in {"ticket_id", "status", "issue_allowed", "ticket_hash"}
-        }
-        material_hash = _stable_json_hash(ticket_material)
-        execution_ticket["ticket_id"] = (
-            "caet-" + material_hash.removeprefix("sha256:")[:24]
-        )
-        execution_ticket.pop("ticket_hash", None)
-        execution_ticket["ticket_hash"] = _stable_json_hash(execution_ticket)
-        consumption_errors = []
-        if execution_ticket["ticket_id"] in set(
-            authority.get("consumed_ticket_ids") or []
-        ):
-            consumption_errors.append("execution ticket id was already consumed")
-        if execution_ticket["ticket_hash"] in set(
-            authority.get("consumed_ticket_hashes") or []
-        ):
-            consumption_errors.append("execution ticket hash was already consumed")
-        if consumption_errors:
-            execution_ticket = {
-                "schema_version": "cli_agent_execution_ticket.v1",
-                "status": "rejected",
-                "issue_allowed": False,
-                "source_of_authority": "ContractRuntime",
-                "dispatch_identity_hash": execution_ticket[
-                    "dispatch_identity_hash"
-                ],
-                "candidate_ticket_id": execution_ticket["ticket_id"],
-                "candidate_ticket_hash": execution_ticket["ticket_hash"],
-                "missing_authority_fields": [],
-                "mismatches": [],
-                "errors": consumption_errors,
-                "raw_credentials_persisted": False,
-                "raw_route_token_persisted": False,
-                "raw_private_context_persisted": False,
-            }
     if selector_mismatches:
         execution_ticket = {
             "schema_version": "cli_agent_execution_ticket.v1",
@@ -68409,6 +68802,15 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         target_head_commit=str(
             body.get("target_head_commit")
             or resolved_context.get("target_head_commit")
+            or ""
+        ),
+        target_project_root=str(
+            body.get("target_project_root")
+            or body.get("project_root")
+            or body.get("repo_root")
+            or resolved_context.get("target_project_root")
+            or body.get("main_worktree")
+            or body.get("workspace")
             or ""
         ),
         prompt=str(body.get("prompt") or ""),
@@ -75134,15 +75536,27 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     write=write,
                     body=body,
                 )
-                result = runtime.submit_line_write(
-                    contract_execution_id,
-                    write,
-                    actor_role=actor_role,
-                    projected_completed_lines=(
-                        _contract_runtime_projection_completed_lines(projection)
-                    ),
-                    projection=projection,
+                write, dispatch_errors = _contract_runtime_rev3_dispatch_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
                 )
+                if dispatch_errors:
+                    result = _contract_runtime_unchanged_line_rejection(
+                        record,
+                        dispatch_errors,
+                    )
+                else:
+                    result = runtime.submit_line_write(
+                        contract_execution_id,
+                        write,
+                        actor_role=actor_role,
+                        projected_completed_lines=(
+                            _contract_runtime_projection_completed_lines(projection)
+                        ),
+                        projection=projection,
+                    )
                 dispatch_timeline_event = (
                     _record_contract_runtime_mf_parallel_dispatch_event(
                         conn,
@@ -75251,15 +75665,27 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     write=write,
                     body=body,
                 )
-                result = runtime.precheck_line_write(
-                    contract_execution_id,
-                    write,
-                    actor_role=actor_role,
-                    projected_completed_lines=(
-                        _contract_runtime_projection_completed_lines(projection)
-                    ),
-                    projection=projection,
+                write, dispatch_errors = _contract_runtime_rev3_dispatch_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    write=write,
                 )
+                if dispatch_errors:
+                    result = _contract_runtime_unchanged_line_rejection(
+                        record,
+                        dispatch_errors,
+                    )
+                else:
+                    result = runtime.precheck_line_write(
+                        contract_execution_id,
+                        write,
+                        actor_role=actor_role,
+                        projected_completed_lines=(
+                            _contract_runtime_projection_completed_lines(projection)
+                        ),
+                        projection=projection,
+                    )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,

@@ -3662,6 +3662,17 @@ def _ticket_current_authority(
 
 def _ticket_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = value if isinstance(value, Mapping) else {}
+    target_project_root = _ticket_public_text(
+        source.get("target_project_root")
+        or source.get("project_root")
+        or source.get("repo_root")
+    )
+    worktree_path = _ticket_public_text(
+        source.get("worktree_path")
+        or source.get("worker_worktree_path")
+        or source.get("assigned_worktree")
+        or target_project_root
+    )
     identity = {
         "project_id": _ticket_public_text(source.get("project_id")),
         "backlog_id": _ticket_public_text(source.get("backlog_id")),
@@ -3674,9 +3685,8 @@ def _ticket_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "parent_task_id": _ticket_public_text(source.get("parent_task_id")),
         "runtime_context_id": _ticket_public_text(source.get("runtime_context_id")),
         "worker_role": _ticket_public_text(source.get("worker_role")),
-        "worktree_path": _ticket_public_text(
-            source.get("worktree_path") or source.get("target_project_root")
-        ),
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
         "branch_ref": _ticket_public_text(
             source.get("branch_ref") or source.get("branch")
         ),
@@ -3702,6 +3712,17 @@ def _ticket_authority_mismatches(
         if isinstance(authority.get("next_legal_action"), Mapping)
         else {}
     )
+    expected_target_project_root = (
+        action.get("target_project_root")
+        or action.get("project_root")
+        or action.get("repo_root")
+    )
+    expected_worktree_path = (
+        action.get("worktree_path")
+        or action.get("worker_worktree_path")
+        or action.get("assigned_worktree")
+        or expected_target_project_root
+    )
     comparisons = {
         "project_id": authority.get("project_id"),
         "backlog_id": authority.get("backlog_id"),
@@ -3712,10 +3733,8 @@ def _ticket_authority_mismatches(
         "parent_task_id": action.get("parent_task_id"),
         "runtime_context_id": action.get("runtime_context_id"),
         "worker_role": action.get("worker_role"),
-        "worktree_path": action.get("target_project_root")
-        or action.get("worktree_path")
-        or action.get("project_root")
-        or action.get("repo_root"),
+        "target_project_root": expected_target_project_root,
+        "worktree_path": expected_worktree_path,
         "branch_ref": action.get("branch_ref") or action.get("branch"),
         "base_commit": action.get("base_commit"),
         "target_head_commit": action.get("target_head_commit"),
@@ -3777,18 +3796,27 @@ def _ticket_authority_missing_fields(authority: Mapping[str, Any]) -> list[str]:
             missing.append(f"next_legal_action.{field}")
     if not (action.get("branch_ref") or action.get("branch")):
         missing.append("next_legal_action.branch_ref")
-    if not (
+    target_project_root = (
         action.get("target_project_root")
-        or action.get("worktree_path")
         or action.get("project_root")
         or action.get("repo_root")
-    ):
+    )
+    worktree_path = (
+        action.get("worktree_path")
+        or action.get("worker_worktree_path")
+        or action.get("assigned_worktree")
+        or target_project_root
+    )
+    if not target_project_root:
         missing.append("next_legal_action.target_project_root")
+    if not worktree_path:
+        missing.append("next_legal_action.worktree_path")
     if not _ticket_string_items(action.get("owned_files") or action.get("target_files")):
         missing.append("next_legal_action.owned_files")
-    for field in ("profile_requirements", "retry_policy"):
-        if field not in action:
-            missing.append(f"next_legal_action.{field}")
+    if not _ticket_profile_requirements(action.get("profile_requirements")):
+        missing.append("next_legal_action.profile_requirements")
+    if not _ticket_retry_policy(action.get("retry_policy")):
+        missing.append("next_legal_action.retry_policy")
     return missing
 
 

@@ -5074,6 +5074,13 @@ def _runtime_text_worker_launch_pack(
     launch_text_hash: str,
     runtime_context_worker_envelope_claim: Mapping[str, Any],
 ) -> dict[str, Any]:
+    target_project_root = str(
+        request.target_project_root
+        or getattr(context, "target_project_root", "")
+        or request.main_worktree
+        or context.worktree_path
+        or ""
+    ).strip()
     context_pack_refs, context_pack_status, context_pack_resolution = (
         _runtime_text_context_pack_status(request)
     )
@@ -5361,6 +5368,7 @@ def _runtime_text_worker_launch_pack(
             "task_id": context.task_id,
             "parent_task_id": parent_task_id,
             "branch": context.branch_ref,
+            "target_project_root": target_project_root,
             "worktree_path": context.worktree_path,
             "owned_files": list(owned_files),
         },
@@ -5551,6 +5559,7 @@ def _runtime_text_worker_launch_pack(
                 "parent_task_id": parent_task_id,
                 "runtime_context_id": runtime_context_id,
                 "worker_role": "mf_sub",
+                "target_project_root": target_project_root,
                 "worktree_path": context.worktree_path,
                 "branch_ref": context.branch_ref,
                 "base_commit": context.base_commit,
@@ -5614,6 +5623,7 @@ def _runtime_text_worker_launch_pack(
         "worker_role": "mf_sub",
         "branch": context.branch_ref,
         "branch_ref": context.branch_ref,
+        "target_project_root": target_project_root,
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,

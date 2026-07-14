@@ -91,6 +91,7 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
         "parent_task_id": "observer-cli-ticket",
         "runtime_context_id": "mfrctx-cli-ticket",
         "worker_role": "mf_sub",
+        "target_project_root": "/tmp/aming-claw",
         "worktree_path": "/tmp/cli-ticket-worker",
         "branch_ref": "refs/heads/codex/cli-ticket",
         "base_commit": "a" * 40,
@@ -124,7 +125,8 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
             "task_id": "task-cli-ticket",
             "parent_task_id": "observer-cli-ticket",
             "worker_role": "mf_sub",
-            "target_project_root": "/tmp/cli-ticket-worker",
+            "target_project_root": "/tmp/aming-claw",
+            "worktree_path": "/tmp/cli-ticket-worker",
             "branch_ref": "refs/heads/codex/cli-ticket",
             "base_commit": "a" * 40,
             "target_head_commit": "a" * 40,
@@ -183,6 +185,10 @@ def test_cli_agent_execution_ticket_is_idempotent_and_public_only():
     assert first["contract_execution_id"] == "cex-cli-ticket"
     assert first["execution_state_revision"] == 7
     assert first["dispatch_identity"]["runtime_context_id"] == "mfrctx-cli-ticket"
+    assert first["dispatch_identity"]["target_project_root"] == "/tmp/aming-claw"
+    assert first["dispatch_identity"]["worktree_path"] == "/tmp/cli-ticket-worker"
+    assert first["next_legal_action_hash"] == second["next_legal_action_hash"]
+    assert first["ticket_hash"] == second["ticket_hash"]
     assert first["profile_requirements"]["profile_id"] == "codex-current"
     encoded = json.dumps(first, sort_keys=True)
     assert "must-not-appear" not in encoded
@@ -207,6 +213,16 @@ def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
     )
     assert mismatched["status"] == "rejected"
     assert mismatched["mismatches"][0]["field"] == "worktree_path"
+
+    mismatched_root = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity={**launch, "target_project_root": "/tmp/other-root"},
+    )
+    assert mismatched_root["status"] == "rejected"
+    assert any(
+        item["field"] == "target_project_root"
+        for item in mismatched_root["mismatches"]
+    )
 
     mismatched_branch = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
@@ -246,6 +262,36 @@ def test_cli_agent_execution_ticket_rejects_stale_or_mismatched_authority():
     assert "next_legal_action.runtime_context_id" in unbound[
         "missing_authority_fields"
     ]
+
+
+def test_cli_agent_execution_ticket_accepts_equal_root_and_requires_policy_maps():
+    current, launch = _cli_agent_ticket_fixture()
+    equal_root = "/tmp/equal-cli-ticket"
+    current["next_legal_action"]["target_project_root"] = equal_root
+    current["next_legal_action"]["worktree_path"] = equal_root
+    launch["target_project_root"] = equal_root
+    launch["worktree_path"] = equal_root
+
+    issued = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert issued["status"] == "issued"
+    assert issued["dispatch_identity"]["target_project_root"] == equal_root
+    assert issued["dispatch_identity"]["worktree_path"] == equal_root
+
+    for field in ("profile_requirements", "retry_policy"):
+        incomplete = json.loads(json.dumps(current))
+        incomplete["next_legal_action"][field] = {}
+        rejected = build_cli_agent_execution_ticket(
+            contract_runtime_current_state=incomplete,
+            launch_identity=launch,
+        )
+        assert rejected["status"] == "rejected"
+        assert f"next_legal_action.{field}" in rejected[
+            "missing_authority_fields"
+        ]
 
 
 def test_cli_agent_execution_ticket_rejects_non_dispatch_decision_source():
