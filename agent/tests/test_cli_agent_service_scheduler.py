@@ -401,6 +401,45 @@ def test_existing_run_reacquires_expired_lease_without_profile_rotation(tmp_path
     assert resumed.selection.evidence_flags == ("live_run_profile_identity_immutable",)
 
 
+def test_scheduler_strict_new_run_preserves_default_idempotence(tmp_path):
+    from cli_agent_service.scheduler import AgentScheduler, RunIdentityConflictError
+
+    registry = _registry(tmp_path)
+    registry.register_profile(_profile("profile-a", account="account-a"))
+    scheduler = AgentScheduler(registry)
+    first = scheduler.schedule_run(
+        run_id="run-strict",
+        owner_id="stable-session",
+        role="dev",
+        project_id="aming-claw",
+        requirements=_requirements(),
+        require_new_run=True,
+        now=NOW,
+    )
+
+    retained = scheduler.schedule_run(
+        run_id="run-strict",
+        owner_id="stable-session",
+        role="dev",
+        project_id="aming-claw",
+        requirements=_requirements(),
+        now=NOW,
+    )
+    assert retained.lease.lease_id == first.lease.lease_id
+    assert retained.selection.selection_reason == "existing_run_identity_retained"
+
+    with pytest.raises(RunIdentityConflictError, match="already registered"):
+        scheduler.schedule_run(
+            run_id="run-strict",
+            owner_id="stable-session",
+            role="dev",
+            project_id="aming-claw",
+            requirements=_requirements(),
+            require_new_run=True,
+            now=NOW,
+        )
+
+
 def test_qa_prefers_distinct_profile_and_requires_explicit_fallback_evidence(tmp_path):
     from cli_agent_service.scheduler import AgentScheduler, NoEligibleProfileError
 

@@ -69,7 +69,12 @@ class _RecordingSupervisor:
         return object()
 
 
-def _guided_profile(*, profile_id="profile-codex-a", backend_mode="codex_cli"):
+def _guided_profile(
+    *,
+    profile_id="profile-codex-a",
+    backend_mode="codex_cli",
+    max_concurrency=1,
+):
     from cli_agent_service.models import (
         AgentProfile,
         CredentialRef,
@@ -103,6 +108,7 @@ def _guided_profile(*, profile_id="profile-codex-a", backend_mode="codex_cli"):
             policy_id="policy-codex-guided",
             roles=("mf_sub",),
             project_ids=("aming-claw",),
+            max_concurrency=max_concurrency,
         ),
     )
 
@@ -124,6 +130,7 @@ def _guided_ticket_and_selectors(
     *,
     profile_id="profile-codex-a",
     profile_role="mf_sub",
+    retry_policy=None,
 ):
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
     from cli_agent_service.service import _stable_json_hash
@@ -165,7 +172,9 @@ def _guided_ticket_and_selectors(
         "owned_files": ["agent/owned.py"],
         **route_identity,
         "profile_requirements": profile_requirements,
-        "retry_policy": {"attempt": 1, "max_attempts": 1},
+        "retry_policy": dict(
+            retry_policy or {"attempt": 1, "max_attempts": 1}
+        ),
     }
     launch_identity = {
         "project_id": "aming-claw",
@@ -585,6 +594,226 @@ def test_daemon_admits_absent_profile_role_and_passes_canonical_role_to_schedule
     assert schedule_requests[0]["role"] == "mf_sub"
     assert schedule_requests[0]["profile_requirements"]["role"] == "mf_sub"
     assert "role" not in ticket["profile_requirements"]
+
+
+def test_daemon_retries_terminal_run_with_same_profile_and_lineage(tmp_path):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile())
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        retry_policy={
+            "attempt": 1,
+            "max_attempts": 2,
+            "on_crash": "retry_same_profile",
+            "successor_required": True,
+        },
+    )
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+
+    first = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "host_envelope": _guided_host_envelope(
+                "worker-session-first",
+                "worker-fence-first",
+            ),
+        }
+    )
+    registry.record_exit(
+        first["run_id"],
+        1,
+        failure_category="process_crash",
+    )
+    retried = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "host_envelope": _guided_host_envelope(
+                "worker-session-retry",
+                "worker-fence-retry",
+            ),
+        }
+    )
+
+    canonical_run_id = "run-{}".format(ticket["ticket_id"])
+    assert first["run_id"] == canonical_run_id
+    assert retried["run_id"] == canonical_run_id + "-attempt-2"
+    assert retried["run_id"] != first["run_id"]
+    assert retried["profile_id"] == first["profile_id"] == "profile-codex-a"
+    assert len(supervisor.starts) == 2
+    assert supervisor.starts[0][0].profile == supervisor.starts[1][0].profile
+
+    failed = registry.get_run(first["run_id"])
+    successor = registry.get_run(retried["run_id"])
+    assert failed is not None
+    assert failed.state == "failed"
+    assert successor is not None
+    assert successor.run.parent_run_id == first["run_id"]
+    assert successor.run.successor_of_run_id == first["run_id"]
+    assert successor.run.config.profile_id == failed.run.config.profile_id
+
+    privacy_fields = {
+        key
+        for key in first
+        if key.startswith("raw_")
+        or key.startswith("caller_")
+        or key.startswith("transient_host_envelope_")
+        or key in {"host_envelope_run_authority", "provider_output_suppressed"}
+    }
+    assert {key: retried[key] for key in privacy_fields} == {
+        key: first[key] for key in privacy_fields
+    }
+    assert retried["raw_credentials_persisted"] is False
+    assert retried["raw_prompt_persisted"] is False
+    assert retried["raw_provider_output_persisted"] is False
+    assert retried["provider_output_suppressed"] is True
+
+
+def test_daemon_blocks_retry_exhaustion_before_schedule_or_spawn(
+    tmp_path,
+    monkeypatch,
+):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile())
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        retry_policy={
+            "attempt": 1,
+            "max_attempts": 2,
+            "on_crash": "retry_same_profile",
+            "successor_required": True,
+        },
+    )
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+
+    def admission_payload():
+        return {
+            "authority_selectors": selectors,
+            "host_envelope": _guided_host_envelope(),
+        }
+
+    first = service._admit_governed_host_envelope_run(admission_payload())
+    registry.record_exit(first["run_id"], 1, failure_category="process_crash")
+    retried = service._admit_governed_host_envelope_run(admission_payload())
+    registry.record_exit(retried["run_id"], 1, failure_category="process_crash")
+
+    def unexpected_call(*_args, **_kwargs):
+        pytest.fail("retry exhaustion must stop before scheduling or staging")
+
+    monkeypatch.setattr(service.scheduler, "schedule_run", unexpected_call)
+    monkeypatch.setattr(service.host_envelope_store, "stage", unexpected_call)
+
+    with pytest.raises(ServiceError, match="retry attempts exhausted"):
+        service._admit_governed_host_envelope_run(admission_payload())
+
+    assert len(supervisor.starts) == 2
+    with sqlite3.connect(registry.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0] == 2
+
+
+def test_daemon_concurrent_retry_admits_one_successor_and_spawns_once(tmp_path):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile(max_concurrency=2))
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        retry_policy={
+            "attempt": 1,
+            "max_attempts": 2,
+            "on_crash": "retry_same_profile",
+            "successor_required": True,
+        },
+    )
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+
+    first = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "host_envelope": _guided_host_envelope(
+                "worker-session-first",
+                "worker-fence-first",
+            ),
+        }
+    )
+    registry.record_exit(first["run_id"], 1, failure_category="process_crash")
+
+    schedule_barrier = threading.Barrier(2)
+    schedule_run = service.scheduler.schedule_run
+
+    def contended_schedule_run(**kwargs):
+        schedule_barrier.wait(timeout=5)
+        return schedule_run(**kwargs)
+
+    service.scheduler.schedule_run = contended_schedule_run
+    outcomes = []
+    errors = []
+
+    def retry(suffix):
+        try:
+            outcomes.append(
+                service._admit_governed_host_envelope_run(
+                    {
+                        "authority_selectors": selectors,
+                        "host_envelope": _guided_host_envelope(
+                            "worker-session-{}".format(suffix),
+                            "worker-fence-{}".format(suffix),
+                        ),
+                    }
+                )
+            )
+        except ServiceError as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=retry, args=("a",)),
+        threading.Thread(target=retry, args=("b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(outcomes) == 1
+    assert len(errors) == 1
+    assert "already admitted" in str(errors[0])
+    assert outcomes[0]["run_id"] == first["run_id"] + "-attempt-2"
+    assert len(supervisor.starts) == 2
+    assert [item[0].run_id for item in supervisor.starts] == [
+        first["run_id"],
+        first["run_id"] + "-attempt-2",
+    ]
+    with sqlite3.connect(registry.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM agent_leases WHERE run_id=?",
+            (first["run_id"] + "-attempt-2",),
+        ).fetchone()[0] == 1
 
 
 def test_daemon_rejects_explicit_conflicting_profile_role(tmp_path):

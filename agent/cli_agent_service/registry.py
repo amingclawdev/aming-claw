@@ -38,6 +38,10 @@ class RegistryError(RuntimeError):
     pass
 
 
+class RunRegistrationConflictError(RegistryError):
+    """A caller requiring a fresh run found an existing immutable run id."""
+
+
 class LeaseConflictError(RegistryError):
     pass
 
@@ -789,6 +793,7 @@ class AgentRegistry:
         *,
         ttl_seconds: int = 60,
         evidence_refs: Mapping[str, str] | None = None,
+        require_new_run: bool = False,
         now: datetime | str | None = None,
     ) -> RegistryLease:
         """Atomically pin one run and reserve its selected profile capacity."""
@@ -822,6 +827,8 @@ class AgentRegistry:
                 or existing["evidence_refs_json"] != refs_json
             ):
                 raise RegistryError("registered run identity is immutable")
+            if existing and require_new_run:
+                raise RunRegistrationConflictError("run is already registered")
             conn.execute(
                 "INSERT OR IGNORE INTO agent_runs(run_id, profile_id, profile_version, project_id, role, run_json, state, parent_run_id, successor_of_run_id, evidence_refs_json, created_at, updated_at) "
                 "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

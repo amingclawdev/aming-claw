@@ -27,8 +27,9 @@ from .launchers import (
     HostEnvelopeStore,
     scrub_host_envelope_payload,
 )
+from .models import RunState
 from .registry import AgentRegistry, RegistryError
-from .scheduler import AgentScheduler, SchedulerError
+from .scheduler import AgentScheduler, RunIdentityConflictError, SchedulerError
 from .profile_control import (
     ManagedProfileControl,
     PROFILE_OPERATIONS,
@@ -725,6 +726,7 @@ class CliAgentService:
             raise ServiceError("ContractRuntime resolver returned an invalid ticket")
         dispatch = ticket.get("dispatch_identity")
         profile_requirements = ticket.get("profile_requirements")
+        retry_policy = ticket.get("retry_policy")
         next_legal_action = ticket.get("next_legal_action")
         if (
             ticket.get("status") != "issued"
@@ -736,6 +738,7 @@ class CliAgentService:
             or ticket.get("consumed") is not False
             or not isinstance(dispatch, Mapping)
             or not isinstance(profile_requirements, Mapping)
+            or not isinstance(retry_policy, Mapping)
             or not isinstance(next_legal_action, Mapping)
         ):
             raise ServiceError("ContractRuntime resolver did not issue a canonical ticket")
@@ -757,6 +760,10 @@ class CliAgentService:
             ticket.get("profile_requirements_hash") or ""
         ).strip():
             integrity_mismatches.append("profile_requirements_hash")
+        if _stable_json_hash(dict(retry_policy)) != str(
+            ticket.get("retry_policy_hash") or ""
+        ).strip():
+            integrity_mismatches.append("retry_policy_hash")
         if _stable_json_hash(dict(next_legal_action)) != str(
             ticket.get("next_legal_action_hash") or ""
         ).strip():
@@ -848,12 +855,109 @@ class CliAgentService:
             "task_id": str(dispatch.get("task_id") or ""),
         }
         principal_id = str(dispatch.get("worker_id") or "")
-        run_id = "run-{}".format(ticket_id)
+        canonical_run_id = "run-{}".format(ticket_id)
+        run_id = canonical_run_id
+        parent_run_id = ""
+        successor_of_run_id = ""
         expected_backend = str(selectors.get("backend_mode") or "").strip()
         scheduler_requirements = dict(profile_requirements)
         scheduler_requirements["role"] = role
         if expected_backend:
             scheduler_requirements["backend_mode"] = expected_backend
+
+        try:
+            ticket_attempt = int(retry_policy.get("attempt") or 0)
+            max_attempts = int(retry_policy.get("max_attempts") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError("canonical execution ticket retry policy is invalid") from exc
+        if ticket_attempt < 1 or max_attempts < ticket_attempt:
+            raise ServiceError("canonical execution ticket retry policy is invalid")
+
+        terminal_failure_states = {
+            RunState.FAILED.value,
+            RunState.LOST.value,
+        }
+        canonical_run = self.registry.get_run(canonical_run_id)
+        expected_profile_id = str(
+            profile_requirements.get("profile_id") or ""
+        ).strip()
+        if canonical_run is not None:
+            canonical_refs = {
+                ref.name: ref.value for ref in canonical_run.evidence_refs
+            }
+            if (
+                canonical_run.run.config.profile_id != expected_profile_id
+                or canonical_run.run.config.role != role
+                or canonical_run.run.config.project_id != project_id
+                or any(
+                    canonical_refs.get(name) != value
+                    for name, value in evidence_refs.items()
+                )
+            ):
+                raise ServiceError(
+                    "canonical execution run identity does not match the ticket"
+                )
+            if canonical_run.state == RunState.COMPLETED.value:
+                raise ServiceError("canonical execution run is already complete")
+            if canonical_run.state not in terminal_failure_states:
+                raise ServiceError("canonical execution run is already admitted")
+        if canonical_run is not None and canonical_run.state in terminal_failure_states:
+            retry_allowed = (
+                str(retry_policy.get("on_crash") or "").strip()
+                == "retry_same_profile"
+                and retry_policy.get("successor_required") is True
+            )
+            if not retry_allowed:
+                raise ServiceError(
+                    "canonical execution ticket does not permit a same-profile retry"
+                )
+
+            predecessor_run_id = canonical_run_id
+            for operational_attempt in range(ticket_attempt + 1, max_attempts + 1):
+                candidate_run_id = "{}-attempt-{}".format(
+                    canonical_run_id,
+                    operational_attempt,
+                )
+                candidate = self.registry.get_run(candidate_run_id)
+                if candidate is not None:
+                    candidate_refs = {
+                        ref.name: ref.value for ref in candidate.evidence_refs
+                    }
+                    if (
+                        candidate.run.config.profile_id != expected_profile_id
+                        or candidate.run.config.role != role
+                        or candidate.run.config.project_id != project_id
+                        or candidate.run.parent_run_id != canonical_run_id
+                        or candidate.run.successor_of_run_id != predecessor_run_id
+                        or any(
+                            candidate_refs.get(name) != value
+                            for name, value in evidence_refs.items()
+                        )
+                    ):
+                        raise ServiceError(
+                            "canonical execution retry lineage is invalid"
+                        )
+                    if candidate.state == RunState.COMPLETED.value:
+                        raise ServiceError("canonical execution run is already complete")
+                    if candidate.state in terminal_failure_states:
+                        predecessor_run_id = candidate_run_id
+                        continue
+                    raise ServiceError(
+                        "canonical execution retry attempt is already admitted"
+                    )
+                run_id = candidate_run_id
+                parent_run_id = canonical_run_id
+                successor_of_run_id = predecessor_run_id
+                break
+            else:
+                raise ServiceError("canonical execution ticket retry attempts exhausted")
+
+        schedule_kwargs: dict[str, Any] = {}
+        if successor_of_run_id:
+            schedule_kwargs = {
+                "parent_run_id": parent_run_id,
+                "successor_of_run_id": successor_of_run_id,
+            }
         try:
             scheduled = self.scheduler.schedule_run(
                 run_id=run_id,
@@ -863,11 +967,17 @@ class CliAgentService:
                 profile_requirements=scheduler_requirements,
                 governance_refs=evidence_refs,
                 evidence_refs=evidence_refs,
+                **schedule_kwargs,
+                require_new_run=True,
                 ttl_seconds=max(
                     1,
                     int(getattr(self.supervisor, "lease_ttl_seconds", 60) or 60),
                 ),
             )
+        except RunIdentityConflictError as exc:
+            raise ServiceError(
+                "canonical execution run is already admitted"
+            ) from exc
         except (RegistryError, SchedulerError, TypeError, ValueError) as exc:
             raise ServiceError(
                 "canonical execution ticket has no eligible registered profile"
