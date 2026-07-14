@@ -234,6 +234,19 @@ def test_runtime_context_finish_time_worker_attestation_schema_requires_harness_
     assert "copy_safe_body" in harness_type["description"]
 
 
+def test_runtime_context_worker_commit_schemas_expose_optional_lineage_authority():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        worker_commit = next(
+            tool for tool in tools if tool["name"] == "runtime_context_worker_commit"
+        )
+        schema = worker_commit["inputSchema"]
+        properties = schema["properties"]
+        assert properties["implementation_event_ref"] == {"type": "string"}
+        assert properties["implementation_lineage_ref"] == {"type": "string"}
+        assert properties["worker_implementation_lineage"] == {"type": "object"}
+        assert "implementation_event_ref" not in schema["required"]
+
+
 def test_observer_hotfix_enter_schemas_require_backlog_scope():
     for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
         hotfix_enter = next(
@@ -351,6 +364,7 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
         {**common, "task_id": "worker-demo", "parent_task_id": "AC-DEMO"},
     )["ok"] is True
 
+    assert "implementation_event_ref" not in calls[1][2]
     assert calls == [
         (
             "POST",

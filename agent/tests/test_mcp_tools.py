@@ -18,15 +18,25 @@ def _tool_properties(name: str) -> dict:
 
 def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
     assert "runtime_context_worker_commit" in _tool_names()
-    properties = _tool_properties("runtime_context_worker_commit")
+    tool = next(
+        tool for tool in TOOLS if tool.get("name") == "runtime_context_worker_commit"
+    )
+    schema = tool["inputSchema"]
+    properties = schema["properties"]
     assert {
         "contract_execution_id",
         "implementation_event_ref",
+        "implementation_lineage_ref",
+        "worker_implementation_lineage",
         "worker_commit_sha",
         "owned_files",
         "changed_files",
         "graph_trace_ids",
     }.issubset(properties)
+    assert properties["implementation_event_ref"] == {"type": "string"}
+    assert properties["implementation_lineage_ref"] == {"type": "string"}
+    assert properties["worker_implementation_lineage"] == {"type": "object"}
+    assert "implementation_event_ref" not in schema["required"]
 
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)
@@ -37,8 +47,11 @@ def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
             "runtime_context_id": "mfrctx-worker-commit",
             "contract_execution_id": "cex-worker-commit",
             "worker_commit_sha": "a" * 40,
+            "implementation_lineage_ref": "implementation-lineage:worker-commit",
+            "worker_implementation_lineage": {"source": "contract_runtime"},
         },
     )
+    assert "implementation_event_ref" not in recorder.calls[-1][2]
     assert recorder.calls[-1] == (
         "POST",
         (
@@ -49,6 +62,8 @@ def test_runtime_context_worker_commit_tool_routes_to_canonical_facade():
             "runtime_context_id": "mfrctx-worker-commit",
             "contract_execution_id": "cex-worker-commit",
             "worker_commit_sha": "a" * 40,
+            "implementation_lineage_ref": "implementation-lineage:worker-commit",
+            "worker_implementation_lineage": {"source": "contract_runtime"},
         },
     )
 
