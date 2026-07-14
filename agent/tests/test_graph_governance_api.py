@@ -38151,10 +38151,14 @@ def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(co
         "parallel_branch_startup",
         "graph_query",
         "runtime_context_implementation_evidence",
+        "git_commit",
+        "runtime_context_worker_commit",
         "runtime_context_finish_time_worker_attestation",
         "runtime_context_finish_gate",
     ]
-    assert handoff["git_commit_after_finish_gate"] is True
+    assert handoff["git_commit_before_worker_commit"] is True
+    assert "git_commit_after_finish_gate" not in handoff
+    assert handoff["worker_owned_sequence"][-1] == "runtime_context_finish_gate"
     assert handoff["observer_must_not_author_worker_evidence"] is True
 
     next_action = result["next_legal_action"]

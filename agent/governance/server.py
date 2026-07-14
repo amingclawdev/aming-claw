@@ -52584,10 +52584,12 @@ def _onboard_contract_route_guide(
                 "parallel_branch_startup",
                 "graph_query",
                 "runtime_context_implementation_evidence",
+                "git_commit",
+                "runtime_context_worker_commit",
                 "runtime_context_finish_time_worker_attestation",
                 "runtime_context_finish_gate",
             ],
-            "git_commit_after_finish_gate": True,
+            "git_commit_before_worker_commit": True,
             "observer_must_not_author_worker_evidence": True,
         },
         "diagnostics": {
