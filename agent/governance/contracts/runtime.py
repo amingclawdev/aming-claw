@@ -2306,6 +2306,62 @@ def _worker_commit_completed_implementation(
     return None
 
 
+def _worker_implementation_lineage(
+    record: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the stable public identity of a canonical implementation line."""
+
+    lineage = {
+        "schema_version": "contract_runtime.worker_implementation_lineage.v1",
+        "source_of_authority": (
+            "ContractRuntime.completed_lines.worker_implementation"
+        ),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "runtime_context_id": _worker_commit_text(
+            implementation,
+            "runtime_context_id",
+        ),
+        "task_id": _worker_commit_text(implementation, "task_id"),
+        "stage_id": str(
+            implementation.get("stage_id") or "worker_implementation"
+        ).strip(),
+        "line_id": "worker_implementation",
+        "line_instance_id": str(
+            implementation.get("line_instance_id") or ""
+        ).strip(),
+        "evidence_kind": str(
+            implementation.get("evidence_kind") or "implementation"
+        ).strip(),
+        "worker_id": _worker_commit_text(implementation, "worker_id"),
+        "worker_slot_id": _worker_commit_text(
+            implementation,
+            "worker_slot_id",
+            "lane_id",
+        ),
+        "changed_files": sorted(
+            set(_worker_commit_strings(implementation, "changed_files"))
+        ),
+        "graph_trace_ids": sorted(
+            set(
+                _worker_commit_strings(
+                    implementation,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "verified_trace_ids",
+                )
+            )
+        ),
+    }
+    lineage["implementation_lineage_ref"] = (
+        "contract-runtime:worker-implementation:" + stable_sha256(lineage)
+    )
+    return lineage
+
+
 def _mf_parallel_worker_commit_errors(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
@@ -2334,7 +2390,6 @@ def _mf_parallel_worker_commit_errors(
         "worker_slot_id": ("worker_slot_id", "lane_id"),
         "worker_session_id": ("worker_session_id",),
         "actor_session_principal": ("actor_session_principal",),
-        "implementation_event_ref": ("implementation_event_ref",),
         "target_project_root": ("target_project_root",),
         "session_token_ref": ("session_token_ref", "evidence_owner_session_ref"),
         "fence_token_hash": ("fence_token_hash",),
@@ -2404,6 +2459,23 @@ def _mf_parallel_worker_commit_errors(
     if implementation is None:
         errors.append("worker_commit requires matching worker_implementation lineage")
     else:
+        implementation_lineage = _worker_implementation_lineage(
+            record,
+            implementation,
+        )
+        supplied_lineage_ref = _worker_commit_text(
+            write,
+            "implementation_lineage_ref",
+        )
+        if (
+            supplied_lineage_ref
+            and supplied_lineage_ref
+            != implementation_lineage["implementation_lineage_ref"]
+        ):
+            errors.append(
+                "worker_commit implementation_lineage_ref does not match "
+                "canonical worker_implementation"
+            )
         implementation_changed_files = set(
             _worker_commit_strings(implementation, "changed_files")
         )
@@ -3443,7 +3515,12 @@ class ContractRuntime:
         )
         refreshed = self.store.get(contract_execution_id)
         gate_record = refreshed
-        if projected_completed_lines is not None:
+        use_completed_line_projection = (
+            projected_completed_lines is not None
+            and str(effective_write.get("line_id") or "").strip()
+            != "worker_commit"
+        )
+        if use_completed_line_projection:
             gate_record = self.projected_record(
                 contract_execution_id,
                 actor_role=effective_actor_role,
@@ -3471,7 +3548,7 @@ class ContractRuntime:
         gate_decision = _gate_decision_with_additional_errors(
             gate_decision,
             _mf_parallel_worker_commit_errors(
-                gate_record,
+                refreshed,
                 effective_write,
                 actor_role=effective_actor_role,
             ),
@@ -3522,7 +3599,7 @@ class ContractRuntime:
         updated["runtime_guide"] = next_guide
         self.store.update(contract_execution_id, updated)
         result_record = self.store.get(contract_execution_id)
-        if projected_completed_lines is not None:
+        if use_completed_line_projection:
             projected_after_write = list(projected_completed_lines)
             projected_after_write.append(written_line)
             result_record = self.projected_record(
@@ -3565,7 +3642,12 @@ class ContractRuntime:
         )
         refreshed = self.store.get(contract_execution_id)
         gate_record = refreshed
-        if projected_completed_lines is not None:
+        use_completed_line_projection = (
+            projected_completed_lines is not None
+            and str(effective_write.get("line_id") or "").strip()
+            != "worker_commit"
+        )
+        if use_completed_line_projection:
             gate_record = self.projected_record(
                 contract_execution_id,
                 actor_role=effective_actor_role,
@@ -3593,7 +3675,7 @@ class ContractRuntime:
         gate_decision = _gate_decision_with_additional_errors(
             gate_decision,
             _mf_parallel_worker_commit_errors(
-                gate_record,
+                refreshed,
                 effective_write,
                 actor_role=effective_actor_role,
             ),
@@ -3857,6 +3939,8 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "head_commit",
     "immutable_head_commit",
     "validated_head_commit",
+    "implementation_lineage_ref",
+    "worker_implementation_lineage",
     "implementation_event_ref",
     "worker_session_id",
     "filer_principal",

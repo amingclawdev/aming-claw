@@ -53,6 +53,8 @@ from .contracts.runtime import (
     ContractRuntime,
     ContractRuntimeError,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
+    _worker_commit_completed_implementation,
+    _worker_implementation_lineage,
     is_legacy_primary_contract_route,
     read_backlog_contract_chain_current,
     rebuild_backlog_contract_chain_projection,
@@ -12157,6 +12159,11 @@ def _runtime_context_projection_response(
         contract_revision_id=contract_identity["contract_revision_id"],
         contract_hash=contract_identity["contract_hash"],
         context_hash=str(scoped_content_address.get("projection_hash") or ""),
+        worker_implementation_lineage=(
+            contract_runtime_projection.get("worker_implementation_lineage")
+            if isinstance(contract_runtime_projection, Mapping)
+            else {}
+        ),
     )
     _runtime_context_patch_actionable_payload_worker_scope(
         current_actionable_payloads,
@@ -12369,23 +12376,28 @@ def _runtime_context_contract_runtime_worker_projection(
     runtime = _contract_runtime(conn)
     try:
         runtime.current_guide(execution_id, actor_role="mf_sub")
-        record = runtime.store.get(execution_id)
-        record, _context_projection = (
-            _contract_runtime_apply_mf_parallel_context_projection(
-                conn,
-                project_id=str(record.get("project_id") or ""),
-                record=record,
-                actor_role="mf_sub",
+        canonical_record = runtime.store.get(execution_id)
+        canonical_implementation = _worker_commit_completed_implementation(
+            canonical_record,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        worker_implementation_lineage = (
+            _worker_implementation_lineage(
+                canonical_record,
+                canonical_implementation,
             )
+            if canonical_implementation is not None
+            else {}
         )
     except ContractRuntimeError:
         return {}
     guide = (
-        record.get("runtime_guide")
-        if isinstance(record.get("runtime_guide"), Mapping)
+        canonical_record.get("runtime_guide")
+        if isinstance(canonical_record.get("runtime_guide"), Mapping)
         else {}
     )
-    current_state = _runtime_current_state_from_record(record)
+    current_state = _runtime_current_state_from_record(canonical_record)
     next_action = _runtime_next_action_from_guide(
         guide,
         source="contract_runtime_current_state",
@@ -12401,6 +12413,10 @@ def _runtime_context_contract_runtime_worker_projection(
             if not str(next_action.get("task_id") or "").strip():
                 next_action["task_id"] = task_id
         current_state["next_legal_action"] = dict(next_action)
+    if worker_implementation_lineage:
+        current_state["worker_implementation_lineage"] = dict(
+            worker_implementation_lineage
+        )
     return {
         "schema_version": "runtime_context.contract_runtime_projection.v1",
         "source_of_authority": "contract_runtime_current_state",
@@ -12410,6 +12426,10 @@ def _runtime_context_contract_runtime_worker_projection(
         "task_id": task_id,
         "contract_runtime_current_state": current_state,
         "contract_runtime_next_legal_action": next_action,
+        "worker_implementation_lineage": dict(
+            worker_implementation_lineage
+        ),
+        "timeline_projection_authoritative": False,
     }
 
 
@@ -12435,6 +12455,10 @@ def _runtime_context_project_contract_runtime_into_worker_views(
         "contract_runtime_source_of_authority": (
             "contract_runtime_current_state"
         ),
+        "worker_implementation_lineage": dict(
+            projection.get("worker_implementation_lineage") or {}
+        ),
+        "timeline_projection_authoritative": False,
     }
     for container in (
         worker_view,
@@ -14685,13 +14709,21 @@ def _runtime_context_worker_guide_response(
                 "parent_task_id",
                 "worker_session_id",
                 "filer_principal",
-                "implementation_event_ref",
+                "implementation_lineage_ref",
                 "worker_commit_sha",
                 "owned_files",
                 "changed_files",
                 "graph_trace_ids",
             ],
             "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+            "implementation_lineage_source_of_authority": (
+                "ContractRuntime.completed_lines.worker_implementation"
+            ),
+            "implementation_event_ref": {
+                "required": False,
+                "compatibility_alias_only": True,
+                "must_project_same_canonical_line": True,
+            },
             "timeline_projection_authoritative": False,
             "auth": _auth_guide("body.session_token"),
         },
@@ -14759,7 +14791,7 @@ def _runtime_context_worker_guide_response(
                 "target_project_root",
                 "changed_files",
                 "tests",
-                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+                "route_token_ref",
             ],
             "server_derived_fields": [
                 "actor",
@@ -14773,10 +14805,11 @@ def _runtime_context_worker_guide_response(
             ],
             "route_identity_policy": {
                 "top_level_route_identity_source": (
-                    "copy_safe_body route_* fields are the current worker/child "
-                    "route identity for this runtime_context_id."
+                    "copy_safe_body supplies route_token_ref; the server resolves "
+                    "the current worker route identity for this runtime_context_id."
                 ),
-                "do_not_replace_top_level_route_fields_with_parent_identity": True,
+                "copy_safe_body_uses_route_token_ref_only": True,
+                "server_derives_route_identity_from_route_token_ref": True,
                 "parent_route_lineage_location": (
                     "Only use parent_route_lineage when a server error or "
                     "route-token binding response explicitly asks for it; keep "
@@ -14955,6 +14988,11 @@ def _runtime_context_worker_guide_response(
         ),
         contract_hash=str(contract_execution_identity.get("contract_hash") or ""),
         context_hash=str(contract_read_receipt.get("context_hash") or ""),
+        worker_implementation_lineage=(
+            contract_runtime_current_state.get("worker_implementation_lineage")
+            if isinstance(contract_runtime_current_state, Mapping)
+            else {}
+        ),
     )
     if not contract_worker_commit_required:
         actionable_payloads.pop("worker_commit_facade_payload_skeleton", None)
@@ -15616,6 +15654,7 @@ def _runtime_context_worker_recovery_payloads(
     contract_hash: str = "",
     context_hash: str = "",
     graph_trace_id: str = "",
+    worker_implementation_lineage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_route_identity = {
         field: str((route_identity or {}).get(field) or "").strip()
@@ -15624,6 +15663,20 @@ def _runtime_context_worker_recovery_payloads(
     present_route_identity = {
         field: value for field, value in safe_route_identity.items() if value
     }
+    implementation_route_reference = {
+        "route_token_ref": (
+            safe_route_identity.get("route_token_ref")
+            or "<current worker route_token_ref>"
+        )
+    }
+    canonical_implementation_lineage = dict(
+        worker_implementation_lineage
+        if isinstance(worker_implementation_lineage, Mapping)
+        else {}
+    )
+    implementation_lineage_ref = str(
+        canonical_implementation_lineage.get("implementation_lineage_ref") or ""
+    ).strip()
     required_route_identity_fields = list(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
@@ -16241,7 +16294,7 @@ def _runtime_context_worker_recovery_payloads(
         "write_authorization_policy": dict(write_authorization_policy),
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
-        **safe_route_identity,
+        **implementation_route_reference,
     }
     implementation_evidence_body = {
         "runtime_context_id": runtime_context_id,
@@ -16262,7 +16315,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
         "payload": implementation_evidence_payload,
-        **safe_route_identity,
+        **implementation_route_reference,
     }
     implementation_evidence_field_pointers = {
         "top_level_post_json": (
@@ -16308,7 +16361,21 @@ def _runtime_context_worker_recovery_payloads(
         "session_token": session_token_placeholder,
         "session_token_ref": session_token_ref_placeholder,
         "fence_token": fence_token_placeholder,
-        "implementation_event_ref": "<accepted implementation timeline ref>",
+        "implementation_lineage_ref": (
+            implementation_lineage_ref
+            or "<ContractRuntime worker_implementation lineage ref>"
+        ),
+        "worker_implementation_lineage": (
+            canonical_implementation_lineage
+            or {
+                "source_of_authority": (
+                    "ContractRuntime.completed_lines.worker_implementation"
+                ),
+                "implementation_lineage_ref": (
+                    "<ContractRuntime worker_implementation lineage ref>"
+                ),
+            }
+        ),
         "worker_commit_sha": "<exact full clean git HEAD after implementation commit>",
         "owned_files": ["<all runtime-context owned files>"],
         "changed_files": ["<exact base..worker_commit_sha changed file>"],
@@ -16723,7 +16790,7 @@ def _runtime_context_worker_recovery_payloads(
                 "target_project_root",
                 "changed_files",
                 "tests",
-                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+                "route_token_ref",
             ],
             "forbidden_shapes": [
                 "nested_payload_only_identity",
@@ -16753,8 +16820,13 @@ def _runtime_context_worker_recovery_payloads(
                     "route_token_ref",
                     "",
                 ),
-                "copy_safe_body_route_fields_are_current_worker_identity": True,
-                "do_not_replace_top_level_route_fields_with_parent_identity": True,
+                "copy_safe_body_route_identity_fields_omitted": [
+                    field
+                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                    if field != "route_token_ref"
+                ],
+                "copy_safe_body_uses_route_token_ref_only": True,
+                "server_derives_route_identity_from_route_token_ref": True,
                 "parent_route_token_ref": safe_route_identity.get(
                     "route_token_ref",
                     "",
@@ -16786,7 +16858,7 @@ def _runtime_context_worker_recovery_payloads(
                 "parent_task_id",
                 "worker_session_id",
                 "filer_principal",
-                "implementation_event_ref",
+                "implementation_lineage_ref",
                 "worker_commit_sha",
                 "owned_files",
                 "changed_files",
@@ -16795,6 +16867,14 @@ def _runtime_context_worker_recovery_payloads(
             "body": worker_commit_body,
             "copy_safe_body": dict(worker_commit_body),
             "source_of_authority": "ContractRuntime.completed_lines.worker_commit",
+            "implementation_lineage_source_of_authority": (
+                "ContractRuntime.completed_lines.worker_implementation"
+            ),
+            "implementation_event_ref": {
+                "required": False,
+                "compatibility_alias_only": True,
+                "must_project_same_canonical_line": True,
+            },
             "timeline_projection_authoritative": False,
         },
         "session_token_rejoin_submission": session_token_rejoin_submission,
@@ -17752,10 +17832,11 @@ def _runtime_context_raise_child_route_lineage_error(
             "summary": "<worker-authored implementation summary>",
         },
     }
-    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
-        value = str(parent_route_identity.get(field) or "").strip()
-        if value:
-            retry_parent_ref_body[field] = value
+    parent_route_token_ref = str(
+        parent_route_identity.get("route_token_ref") or ""
+    ).strip()
+    if parent_route_token_ref:
+        retry_parent_ref_body["route_token_ref"] = parent_route_token_ref
     hotfix_exception_boundary = {
         "schema_version": "runtime_context.hotfix_exception_boundary_guidance.v1",
         "applies_when": (
@@ -17813,6 +17894,9 @@ def _runtime_context_raise_child_route_lineage_error(
                 "next_protected_action": "runtime_context_implementation_evidence",
                 "mcp_tool": "runtime_context_implementation_evidence",
                 "protected_payload": retry_parent_ref_body,
+                "route_identity_resolution": (
+                    "server derives current route identity from route_token_ref"
+                ),
                 "omit_stale_child_route_token_when_using_parent_route_token_ref": True,
             },
             "retry_implementation_evidence_parent_route_ref_body": (
@@ -21191,6 +21275,160 @@ def _runtime_context_worker_commit_contract_execution_id(
     return expected or supplied
 
 
+def _runtime_context_actual_worker_implementation_line(
+    conn,
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    try:
+        record = _contract_runtime(conn).store.get(contract_execution_id)
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_worker_implementation_required",
+            str(exc),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "next_legal_action": "record_implementation_evidence",
+            },
+        ) from exc
+    implementation = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if implementation is None:
+        raise GovernanceError(
+            "contract_worker_implementation_required",
+            (
+                "worker_commit requires the matching source-backed "
+                "ContractRuntime worker_implementation line"
+            ),
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "source_of_authority": (
+                    "ContractRuntime.completed_lines.worker_implementation"
+                ),
+                "timeline_projection_authoritative": False,
+                "next_legal_action": "record_implementation_evidence",
+            },
+        )
+    payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    return (
+        dict(implementation),
+        dict(payload),
+        _worker_implementation_lineage(record, implementation),
+    )
+
+
+def _runtime_context_worker_commit_timeline_alias(
+    timeline_events: Sequence[Mapping[str, Any]],
+    *,
+    implementation_event_ref: str,
+    worker_implementation_lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate an optional timeline alias without using it as authority."""
+
+    event_ref = str(implementation_event_ref or "").strip()
+    if not event_ref:
+        return {}
+    event = next(
+        (
+            item
+            for item in timeline_events
+            if f"timeline:{str(item.get('id') or '').strip()}" == event_ref
+        ),
+        None,
+    )
+    if event is None:
+        raise ValidationError(
+            "implementation_event_ref does not name a current worker timeline event"
+        )
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    canonical_line = (
+        payload.get("contract_runtime_canonical_line")
+        if isinstance(payload.get("contract_runtime_canonical_line"), Mapping)
+        else {}
+    )
+    expected_lineage_ref = str(
+        worker_implementation_lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    projected_lineage_ref = str(
+        payload.get("implementation_lineage_ref") or ""
+    ).strip()
+    marker_matches = bool(projected_lineage_ref == expected_lineage_ref)
+    if canonical_line:
+        marker_matches = all(
+            not str(worker_implementation_lineage.get(field) or "").strip()
+            or str(canonical_line.get(field) or "").strip()
+            == str(worker_implementation_lineage.get(field) or "").strip()
+            for field in (
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "stage_id",
+                "line_id",
+                "line_instance_id",
+                "evidence_kind",
+            )
+        )
+    alias_files = sorted(
+        set(
+            _runtime_context_service_query_values(
+                payload,
+                "changed_files",
+                "worker_changed_files",
+            )
+        )
+    )
+    alias_trace_ids = sorted(
+        set(
+            _runtime_context_service_query_values(
+                payload,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+    )
+    expected_files = sorted(
+        set(worker_implementation_lineage.get("changed_files") or [])
+    )
+    expected_trace_ids = sorted(
+        set(worker_implementation_lineage.get("graph_trace_ids") or [])
+    )
+    if (
+        not marker_matches
+        or alias_files != expected_files
+        or alias_trace_ids != expected_trace_ids
+    ):
+        raise ValidationError(
+            "implementation_event_ref does not project the canonical "
+            "worker_implementation lineage"
+        )
+    return {
+        "schema_version": "runtime_context.worker_implementation_timeline_alias.v1",
+        "implementation_event_ref": event_ref,
+        "implementation_lineage_ref": expected_lineage_ref,
+        "status": "matching_projection",
+        "source_of_authority": (
+            "ContractRuntime.completed_lines.worker_implementation"
+        ),
+        "timeline_projection_authoritative": False,
+    }
+
+
 def _runtime_context_actual_worker_commit_line(
     conn,
     *,
@@ -21970,6 +22208,14 @@ def _runtime_context_contract_worker_commit_projection(
         "implementation_event_ref": str(
             payload.get("implementation_event_ref") or ""
         ),
+        "implementation_lineage_ref": str(
+            payload.get("implementation_lineage_ref") or ""
+        ),
+        "worker_implementation_lineage": (
+            dict(payload.get("worker_implementation_lineage") or {})
+            if isinstance(payload.get("worker_implementation_lineage"), Mapping)
+            else {}
+        ),
         "worker_session_id": str(payload.get("worker_session_id") or ""),
         "changed_files": recorded_files,
         "commit_diff_files": recorded_diff_files,
@@ -22021,6 +22267,28 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             if supplied != expected:
                 raise ValidationError(f"{field} must exactly match the active runtime")
 
+        (
+            _implementation_line,
+            _implementation_payload,
+            worker_implementation_lineage,
+        ) = _runtime_context_actual_worker_implementation_line(
+            conn,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=context.task_id,
+        )
+        expected_lineage_ref = str(
+            worker_implementation_lineage.get("implementation_lineage_ref") or ""
+        ).strip()
+        supplied_lineage_ref = str(
+            body.get("implementation_lineage_ref") or ""
+        ).strip()
+        if supplied_lineage_ref and supplied_lineage_ref != expected_lineage_ref:
+            raise ValidationError(
+                "implementation_lineage_ref must match the canonical "
+                "worker_implementation lineage"
+            )
+
         timeline_events = _runtime_context_service_timeline_events(
             conn,
             project_id=project_id,
@@ -22039,30 +22307,18 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
         implementation_event_ref = str(
             body.get("implementation_event_ref") or ""
         ).strip()
-        latest_implementation_ref = str(
-            timeline_refs.get("latest_implementation_event_ref") or ""
-        ).strip()
-        if not implementation_event_ref or implementation_event_ref != latest_implementation_ref:
-            raise ValidationError(
-                "implementation_event_ref must equal the latest worker implementation evidence"
+        implementation_timeline_alias = (
+            _runtime_context_worker_commit_timeline_alias(
+                timeline_events,
+                implementation_event_ref=implementation_event_ref,
+                worker_implementation_lineage=worker_implementation_lineage,
             )
-        implementation_payload = (
-            timeline_refs.get("latest_implementation_payload")
-            if isinstance(timeline_refs.get("latest_implementation_payload"), Mapping)
-            else {}
         )
-        implementation_files = _runtime_context_service_query_values(
-            implementation_payload,
-            "changed_files",
-            "worker_changed_files",
+        implementation_files = list(
+            worker_implementation_lineage.get("changed_files") or []
         )
-        implementation_trace_ids = _runtime_context_service_dedupe(
-            _runtime_context_service_query_values(
-                implementation_payload,
-                "graph_trace_ids",
-                "graph_query_trace_ids",
-                "verified_trace_ids",
-            )
+        implementation_trace_ids = list(
+            worker_implementation_lineage.get("graph_trace_ids") or []
         )
         supplied_trace_ids = _runtime_context_service_dedupe(
             _runtime_context_service_query_values(
@@ -22197,7 +22453,10 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "actor_session_principal": worker_session_id,
             "filer_principal": filer_principal,
             "submitter_principal": filer_principal,
-            "implementation_event_ref": implementation_event_ref,
+            "implementation_lineage_ref": expected_lineage_ref,
+            "worker_implementation_lineage": dict(
+                worker_implementation_lineage
+            ),
             "target_project_root": _runtime_context_effective_target_project_root(context),
             "session_token_ref": session_token_ref,
             "fence_token_hash": fence_token_hash,
@@ -22222,6 +22481,11 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
         }
+        if implementation_event_ref:
+            payload["implementation_event_ref"] = implementation_event_ref
+            payload["implementation_timeline_alias"] = dict(
+                implementation_timeline_alias
+            )
         second_head = batch_jobs.git_commit(worktree_path)
         second_dirty_files = _runtime_context_git_dirty_files(worktree_path)
         second_revision_diff = _runtime_context_worker_commit_revision_diff(
