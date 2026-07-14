@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -174,7 +175,7 @@ def _canonical_ticket(
         "task_id": "task-guided-{}".format(suffix),
         "worker_id": worker_id,
         "worker_slot_id": worker_id,
-        "observer_command_id": "command-guided-{}".format(suffix),
+        "observer_command_id": "task-guided-{}".format(suffix),
         "parent_task_id": "AC-GUIDED-E2E",
         "target_project_root": str(worktree),
         "branch_ref": branch_ref or "refs/heads/guided/{}".format(suffix),
@@ -193,6 +194,8 @@ def _canonical_ticket(
             "profile_kind": "governed",
             "role": role,
             "harness": "codex",
+            "provider": "openai",
+            "model": "gpt-5.4-codex",
             "independent_qa_required": role != "qa",
             "successor_budget": 1,
         },
@@ -260,50 +263,37 @@ def _canonical_ticket(
         "principal_id": worker_id,
         "expected_execution_state_revision": 1,
         "expected_execution_state_hash": authority["execution_state_hash"],
+        "expected_dispatch_identity_hash": ticket["dispatch_identity_hash"],
+        "route_id": action["route_id"],
+        "route_context_hash": action["route_context_hash"],
+        "prompt_contract_id": action["prompt_contract_id"],
+        "prompt_contract_hash": action["prompt_contract_hash"],
+        "route_token_ref": action["route_token_ref"],
+        "visible_injection_manifest_hash": action[
+            "visible_injection_manifest_hash"
+        ],
+        "harness": "codex",
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "backend_mode": "codex_cli",
     }
     return ticket, selectors
 
 
-def _host_envelope(selectors, *, session_token, fence_token):
+def _contract_runtime_authority(ticket):
+    dispatch = ticket["dispatch_identity"]
     return {
-        "schema_version": "mf_subagent_initial_join_host_envelope.v1",
-        "project_id": selectors["project_id"],
-        "runtime_context_id": selectors["runtime_context_id"],
-        "task_id": selectors["task_id"],
-        "parent_task_id": "AC-GUIDED-E2E",
-        "worker_role": selectors["role"],
-        "worker_id": selectors["worker_id"],
-        "worker_slot_id": selectors["worker_slot_id"],
-        "session_token_ref": "wstok-guided-{}".format(
-            selectors["runtime_context_id"]
-        ),
-        "fence_token_redacted": True,
-        "route_identity": {
-            "route_id": "route-guided-envelope",
-            "route_context_hash": "sha256:" + ("f" * 64),
-            "prompt_contract_id": "rprompt-guided-envelope",
-            "prompt_contract_hash": "sha256:" + ("0" * 64),
-        },
-        "env": {
-            "AMING_WORKER_SESSION_TOKEN": session_token,
-            "AMING_WORKER_FENCE_TOKEN": fence_token,
-        },
-        "raw_tokens_persisted_to_timeline": False,
-    }
-
-
-def _host_envelope_refs(selectors):
-    return {
-        "project_id": selectors["project_id"],
-        "runtime_context_id": selectors["runtime_context_id"],
-        "task_id": selectors["task_id"],
-        "parent_task_id": "AC-GUIDED-E2E",
-        "worker_role": selectors["role"],
-        "worker_id": selectors["worker_id"],
-        "worker_slot_id": selectors["worker_slot_id"],
-        "session_token_ref": "wstok-guided-{}".format(
-            selectors["runtime_context_id"]
-        ),
+        "source_of_authority": ticket["source_of_authority"],
+        "authority_decision_source": ticket["authority_decision_source"],
+        "project_id": dispatch["project_id"],
+        "backlog_id": dispatch["backlog_id"],
+        "contract_execution_id": ticket["contract_execution_id"],
+        "contract_revision_id": ticket["contract_revision_id"],
+        "execution_state_revision": ticket["execution_state_revision"],
+        "execution_state_hash": ticket["execution_state_hash"],
+        "runtime_guide_hash": ticket["runtime_guide_hash"],
+        "readiness_state": "contract_active",
+        "next_legal_action": ticket["next_legal_action"],
     }
 
 
@@ -386,7 +376,7 @@ class _GovernanceFixture:
         self.server.server_close()
 
 
-def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
+def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
     tmp_path, monkeypatch
 ):
     import observer_runtime
@@ -404,11 +394,7 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
 
     state_dir = tmp_path / "state"
     executable = _fake_codex(tmp_path / "codex")
-    cases = (
-        ("observer", "l2"),
-        ("mf_sub", "l3"),
-        ("qa", "qa"),
-    )
+    cases = (("mf_sub", "l3"),)
     fence_tokens = {
         suffix: "fence-{}-{}".format(suffix, secrets.token_urlsafe(24))
         for _role, suffix in cases
@@ -445,6 +431,8 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
 
     paths = ServicePaths.from_state_dir(state_dir)
     service = CliAgentService(paths)
+    for run in runs.values():
+        service.registry.register_profile(run.profile)
     service_thread = threading.Thread(target=service.serve_forever, daemon=True)
     service_thread.start()
     _wait_for(paths.socket_path.exists)
@@ -462,12 +450,6 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
             fence_token = fence_tokens[suffix]
             raw_values.extend((session_token, fence_token))
             monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
-            admission = {
-                "run": runs[suffix].to_public_dict(),
-                "authority_selectors": selectors,
-                "host_envelope": _host_envelope_refs(selectors),
-                "ttl_seconds": 30,
-            }
             response = build_dogfood_observer_run_plan(
                 DogfoodObserverPlanRequest(
                     project_id=selectors["project_id"],
@@ -505,8 +487,22 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
                     visible_injection_manifest_hash=dispatch[
                         "visible_injection_manifest_hash"
                     ],
-                    guided_service_admission=admission,
                     cli_agent_service_state_dir=str(state_dir),
+                    contract_execution_id=ticket["contract_execution_id"],
+                    contract_runtime_current_state=(
+                        _contract_runtime_authority(ticket)
+                    ),
+                    expected_execution_state_revision=ticket[
+                        "execution_state_revision"
+                    ],
+                    expected_execution_state_hash=ticket[
+                        "execution_state_hash"
+                    ],
+                    expected_dispatch_identity_hash=ticket[
+                        "dispatch_identity_hash"
+                    ],
+                    profile_requirements=ticket["profile_requirements"],
+                    retry_policy=ticket["retry_policy"],
                 ),
                 execute=True,
             )
@@ -538,7 +534,9 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
             invocation = observer_run["invocation"]
             assert invocation["backend_mode"] == "cli_agent_service"
             service_dispatch = invocation["service_dispatch"]
-            assert service_dispatch["run_id"] == runs[suffix].run_id
+            assert service_dispatch["run_id"] == "run-{}".format(
+                ticket["ticket_id"]
+            )
             assert service_dispatch["role"] == role
             assert service_dispatch["profile_id"] == selectors["profile_id"]
             assert service_dispatch["principal_id"] == selectors["principal_id"]
@@ -546,10 +544,21 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
                 selectors["runtime_context_id"]
             )
             assert service_dispatch["direct_invocation_fallback"] is False
+            assert service_dispatch["caller_run_accepted"] is False
+            assert service_dispatch["caller_prompt_accepted"] is False
+            assert service_dispatch["caller_environment_accepted"] is False
+            assert service.registry.get_run(runs[suffix].run_id) is None
             _wait_for(
-                lambda run_id=runs[suffix].run_id: (
+                lambda run_id=service_dispatch["run_id"]: (
                     service.registry.get_run(run_id)
                     and service.registry.get_run(run_id).state == "completed"
+                )
+            )
+            _wait_for(
+                lambda run_id=service_dispatch["run_id"]: any(
+                    item["receipt"]["run_id"] == run_id
+                    and item["receipt"]["state"] == "completed"
+                    for item in governance.receipts
                 )
             )
             assert ticket["source_of_authority"] == "ContractRuntime"
@@ -560,20 +569,14 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
         governance.stop()
 
     assert service._restart_reconciled is True
-    assert len(governance.ticket_requests) == 3
+    assert len(governance.ticket_requests) == len(cases)
     assert all("execution_ticket" not in request for request in governance.ticket_requests)
     assert all("profile_requirements" not in request for request in governance.ticket_requests)
     assert all("launch_identity" not in request for request in governance.ticket_requests)
-    assert len({request["principal_id"] for request in governance.ticket_requests}) == 3
-    assert len({request["profile_id"] for request in governance.ticket_requests}) == 3
-    qa_request = next(
-        request for request in governance.ticket_requests if request["role"] == "qa"
-    )
-    l3_request = next(
-        request for request in governance.ticket_requests if request["role"] == "mf_sub"
-    )
-    assert qa_request["principal_id"] != l3_request["principal_id"]
-    assert qa_request["profile_id"] != l3_request["profile_id"]
+    assert all("run" not in request for request in governance.ticket_requests)
+    assert all("prompt" not in request for request in governance.ticket_requests)
+    assert all("environment" not in request for request in governance.ticket_requests)
+    assert all("host_envelope" not in request for request in governance.ticket_requests)
 
     spawn_records = []
     for _role, suffix in cases:
@@ -585,6 +588,14 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
         spawn_records.append(json.loads(spawn_lines[0]))
     assert all(record["spawned"] is True for record in spawn_records)
     assert all(len(record["prompt_sha256"]) == 64 for record in spawn_records)
+
+    with sqlite3.connect(state_dir / "registry" / "runs.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0] == len(
+            cases
+        )
+        assert connection.execute("SELECT COUNT(*) FROM agent_leases").fetchone()[0] == len(
+            cases
+        )
 
     assert governance.receipts
     assert {item["receipt"]["state"] for item in governance.receipts} >= {
@@ -608,9 +619,14 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
     for raw in (*raw_values, private_memory):
         assert raw not in serialized_responses
         assert raw.encode("utf-8") not in persisted
+    service_persisted = b"".join(
+        path.read_bytes() for path in state_dir.rglob("*") if path.is_file()
+    )
+    assert b"public-safe intent role=" not in service_persisted
+    assert b"Proceed as the allocated Aming Claw" not in service_persisted
 
 
-def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
+def test_restart_projects_lost_and_service_owns_selector_only_successor(
     tmp_path, monkeypatch
 ):
     from cli_agent_service.evidence import RunReceiptEmitter, hash_text
@@ -693,6 +709,7 @@ def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
         suffix="successor",
         worktree=worktree,
     )
+    registry.register_profile(successor_run.profile)
     governance = _GovernanceFixture(
         {successor_ticket["contract_execution_id"]: successor_ticket}
     )
@@ -707,8 +724,6 @@ def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
             item["receipt"]["state"] == "lost" for item in governance.receipts
         )
     )
-    session_token = "session-successor-{}".format(secrets.token_urlsafe(24))
-    fence_token = "fence-successor-{}".format(secrets.token_urlsafe(24))
     try:
         rejected = request_service(
             paths,
@@ -718,11 +733,6 @@ def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
                 "worktree": str(worktree),
                 "prompt": "public-safe successor intent",
                 "execution_ticket": successor_ticket,
-                "host_envelope": _host_envelope(
-                    successor_selectors,
-                    session_token=session_token,
-                    fence_token=fence_token,
-                ),
             },
         )
         assert rejected["ok"] is False
@@ -731,27 +741,19 @@ def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
         response = request_service(
             paths,
             "start_host_envelope_run",
-            payload={
-                "run": successor_run.to_public_dict(),
-                "worktree": str(worktree),
-                "prompt": "public-safe successor intent",
-                "authority_selectors": successor_selectors,
-                "host_envelope": _host_envelope(
-                    successor_selectors,
-                    session_token=session_token,
-                    fence_token=fence_token,
-                ),
-            },
+            payload={"authority_selectors": successor_selectors},
         )
-        assert response == {
-            "ok": True,
-            "run_id": successor_run.run_id,
-            "status": "started",
-        }
+        successor_run_id = "run-{}".format(successor_ticket["ticket_id"])
+        assert response["ok"] is True
+        assert response["status"] == "started"
+        assert response["run_id"] == successor_run_id
+        assert response["profile_id"] == successor_run.config.profile_id
+        assert response["caller_run_accepted"] is False
+        assert response["caller_prompt_accepted"] is False
         _wait_for(
             lambda: (
-                registry.get_run(successor_run.run_id)
-                and registry.get_run(successor_run.run_id).state == "completed"
+                registry.get_run(successor_run_id)
+                and registry.get_run(successor_run_id).state == "completed"
             )
         )
     finally:
@@ -775,5 +777,4 @@ def test_restart_projects_lost_and_existing_successor_reuses_same_operation(
     persisted = b"".join(
         path.read_bytes() for path in state_dir.rglob("*") if path.is_file()
     )
-    assert session_token.encode("utf-8") not in persisted
-    assert fence_token.encode("utf-8") not in persisted
+    assert b"public-safe successor intent" not in persisted

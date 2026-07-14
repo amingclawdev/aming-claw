@@ -161,27 +161,78 @@ def _guided_service_admission(*, role="mf_sub"):
         "profile_id": "profile-guided-a3",
         "principal_id": "worker-a3",
         "expected_execution_state_revision": 1,
+        "expected_execution_state_hash": "sha256:" + ("a" * 64),
+        "expected_dispatch_identity_hash": "sha256:" + ("b" * 64),
+        "route_id": "route-20260605-a3",
+        "route_context_hash": "sha256:route-a3",
+        "prompt_contract_id": "rprompt-a3",
+        "prompt_contract_hash": "sha256:prompt-a3",
+        "route_token_ref": "route-token-a3",
+        "visible_injection_manifest_hash": "sha256:visible-a3",
+        "harness": "codex",
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "backend_mode": "codex_cli",
     }
-    return {
-        "run": {
-            "run_id": "run-guided-a3",
-            "profile": {"profile_id": "profile-guided-a3"},
-            "config": {
-                "project_id": "aming-claw",
-                "role": role,
-                "profile_id": "profile-guided-a3",
-            },
+    return {"authority_selectors": selectors}
+
+
+def _enable_canonical_dogfood_admission(request):
+    evidence = request.branch_runtime_evidence
+    branch_context = evidence["context"]
+    action = {
+        "id": "worker_dispatch",
+        "action": "dispatch_bounded_worker",
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "owner_role": "observer",
+        "worker_role": "mf_sub",
+        "runtime_context_id": request.runtime_context_id,
+        "task_id": request.task_id,
+        "worker_id": request.worker_id,
+        "worker_slot_id": request.worker_id,
+        "observer_command_id": request.task_id,
+        "parent_task_id": request.backlog_id,
+        "target_project_root": branch_context["worktree_path"],
+        "branch_ref": branch_context["branch_ref"],
+        "base_commit": request.base_commit,
+        "target_head_commit": request.target_head_commit,
+        "merge_queue_id": request.merge_queue_id,
+        "owned_files": list(request.owned_files),
+        "route_id": request.route_id,
+        "route_context_hash": request.route.route_context_hash,
+        "prompt_contract_id": request.route.prompt_contract_id,
+        "prompt_contract_hash": request.route.prompt_contract_hash,
+        "route_token_ref": request.route.route_token_ref,
+        "visible_injection_manifest_hash": request.visible_injection_manifest_hash,
+        "profile_requirements": {
+            "profile_id": "profile-guided-a3",
+            "role": "mf_sub",
+            "harness": "codex",
+            "provider": "openai",
+            "model": "gpt-5.4-codex",
         },
-        "authority_selectors": selectors,
-        "host_envelope": {
-            "runtime_context_id": "mfrctx-guided-a3",
-            "task_id": "task-a3",
-            "worker_role": role,
-            "worker_id": "worker-a3",
-            "worker_slot_id": "worker-a3",
-            "session_token_ref": "wstok-guided-a3",
-        },
+        "retry_policy": {"attempt": 1, "max_attempts": 1},
     }
+    request.contract_execution_id = "cex-guided-a3"
+    request.contract_runtime_current_state = {
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": "contract_runtime_completed_dispatch_line",
+        "project_id": request.project_id,
+        "backlog_id": request.backlog_id,
+        "contract_execution_id": request.contract_execution_id,
+        "contract_revision_id": "revision-guided-a3",
+        "execution_state_revision": 1,
+        "execution_state_hash": "sha256:" + ("a" * 64),
+        "runtime_guide_hash": "sha256:" + ("c" * 64),
+        "readiness_state": "contract_active",
+        "next_legal_action": action,
+    }
+    request.expected_execution_state_revision = 1
+    request.expected_execution_state_hash = "sha256:" + ("a" * 64)
+    request.profile_requirements = action["profile_requirements"]
+    request.retry_policy = action["retry_policy"]
 
 
 def _patch_timeline_events(monkeypatch, events):
@@ -798,10 +849,11 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
     assert validation["status"] == "missing_runtime_context_projection_fields"
 
 
-def test_dogfood_execute_forwards_governed_service_admission(monkeypatch, tmp_path):
+def test_dogfood_execute_derives_selector_only_service_admission(
+    monkeypatch, tmp_path
+):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
-    admission = _guided_service_admission()
-    request.guided_service_admission = admission
+    _enable_canonical_dogfood_admission(request)
     request.cli_agent_service_state_dir = str(tmp_path / "service-state")
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
     observed = []
@@ -839,16 +891,26 @@ def test_dogfood_execute_forwards_governed_service_admission(monkeypatch, tmp_pa
     assert result["status"] == "started"
     assert len(observed) == 1
     observer_request = observed[0]
-    assert observer_request.guided_service_admission == admission
+    admission = observer_request.guided_service_admission
+    assert set(admission) == {"authority_selectors"}
+    selectors = admission["authority_selectors"]
+    assert selectors["contract_execution_id"] == "cex-guided-a3"
+    assert selectors["profile_id"] == "profile-guided-a3"
+    assert selectors["backend_mode"] == "codex_cli"
+    assert selectors["route_id"] == request.route_id
+    assert not {
+        "run",
+        "prompt",
+        "argv",
+        "environment",
+        "env",
+        "host_envelope",
+        "execution_ticket",
+    }.intersection(admission)
     assert observer_request.cli_agent_service_state_dir == str(
         tmp_path / "service-state"
     )
-    assert observer_request.env["AMING_WORKER_SESSION_TOKEN"] == (
-        "worker-session-token-test"
-    )
-    assert observer_request.env["AMING_WORKER_FENCE_TOKEN"] == (
-        "fence-route-gate-fixture-parity-a3"
-    )
+    assert observer_request.env == {}
     assert result["planned_invocation"]["backend_mode"] == "cli_agent_service"
     assert result["planned_invocation"]["service_dispatch"][
         "direct_invocation_fallback"
@@ -863,7 +925,6 @@ def test_dogfood_execute_requires_canonical_service_admission(
     monkeypatch, tmp_path
 ):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
-    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
 
     def fail_run_observer(observer_request, *, execute=False):
         raise AssertionError("governed execution must fail before local invocation")
@@ -885,7 +946,6 @@ def test_dogfood_execute_requires_canonical_service_admission(
     assert "observer_run" not in result
     assert "read_receipt_submission" not in result
     serialized = json.dumps(result, sort_keys=True)
-    assert "worker-session-token-test" not in serialized
     assert request.fence_token not in serialized
 
 
@@ -1040,19 +1100,36 @@ def test_run_observer_guided_service_unavailable_fails_closed(
     assert fence_token not in serialized
 
 
-def test_dogfood_execute_blocks_missing_worker_session_token_env(tmp_path):
+def test_dogfood_execute_does_not_forward_worker_session_environment(
+    monkeypatch, tmp_path
+):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    _enable_canonical_dogfood_admission(request)
+    monkeypatch.delenv("AMING_WORKER_SESSION_TOKEN", raising=False)
+    observed = []
+
+    def fake_run_observer(observer_request, *, execute=False):
+        observed.append(observer_request)
+        return {
+            "ok": True,
+            "status": "started",
+            "invocation": {
+                "status": "started",
+                "backend_mode": "cli_agent_service",
+                "calls_models": True,
+                "auth_status": "service_owned",
+            },
+        }
+
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
 
     result = build_dogfood_observer_run_plan(request, execute=True)
 
-    assert result["ok"] is False
-    assert result["status"] == "blocked"
-    blocker = result["execute_env_blocker"]
-    assert blocker["blocker_id"] == "worker_session_token_env_missing_before_cli_launch"
-    assert blocker["missing_env"] == ["AMING_WORKER_SESSION_TOKEN"]
-    assert blocker["raw_session_token_persisted"] is False
-    assert result["calls_models"] is False
-    assert result["auth_status"] == "not_invoked"
+    assert result["ok"] is True
+    assert result["status"] == "started"
+    assert len(observed) == 1
+    assert observed[0].env == {}
+    assert "execute_launch_env" not in result
 
 
 def test_observer_prompt_says_startup_is_not_progress(tmp_path):

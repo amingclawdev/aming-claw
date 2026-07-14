@@ -437,6 +437,13 @@ class DogfoodObserverPlanRequest:
     visible_injection_manifest_hash: str = ""
     guided_service_admission: Mapping[str, Any] = field(default_factory=dict)
     cli_agent_service_state_dir: str = ""
+    contract_execution_id: str = ""
+    contract_runtime_current_state: Mapping[str, Any] = field(default_factory=dict)
+    expected_execution_state_revision: int = 0
+    expected_execution_state_hash: str = ""
+    expected_dispatch_identity_hash: str = ""
+    profile_requirements: Mapping[str, Any] = field(default_factory=dict)
+    retry_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1134,79 +1141,99 @@ def _runtime_monitor_summary(monitor: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _dogfood_execute_launch_env(
-    *,
-    request: "DogfoodObserverPlanRequest",
-    context: Any,
-    runtime_context_id: str,
-    observer_command_id: str,
-) -> dict[str, Any]:
-    """Build child-process env additions without persisting raw secret values."""
-
-    session_token = str(os.environ.get("AMING_WORKER_SESSION_TOKEN") or "").strip()
-    env = {
-        "AMING_GOVERNANCE_URL": str(os.environ.get("AMING_GOVERNANCE_URL") or "http://localhost:40000"),
-        "AMING_RUNTIME_CONTEXT_ID": runtime_context_id,
-        "AMING_OBSERVER_COMMAND_ID": observer_command_id,
-        "AMING_WORKER_TASK_ID": str(getattr(context, "task_id", "") or request.task_id or ""),
-        "AMING_WORKER_FENCE_TOKEN": str(getattr(context, "fence_token", "") or request.fence_token or ""),
+_GUIDED_RUNTIME_SELECTOR_FIELDS = frozenset(
+    {
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "role",
+        "profile_id",
+        "principal_id",
+        "expected_execution_state_revision",
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+        "harness",
+        "provider",
+        "model",
+        "runtime_id",
+        "endpoint_id",
+        "launcher_id",
+        "backend_mode",
     }
-    if session_token:
-        env["AMING_WORKER_SESSION_TOKEN"] = session_token
+)
+_GUIDED_RUNTIME_REQUIRED_SELECTOR_FIELDS = (
+    "project_id",
+    "backlog_id",
+    "contract_execution_id",
+    "runtime_context_id",
+    "task_id",
+    "worker_id",
+    "worker_slot_id",
+    "observer_command_id",
+    "role",
+    "profile_id",
+    "principal_id",
+    "expected_execution_state_revision",
+    "expected_execution_state_hash",
+    "expected_dispatch_identity_hash",
+    *OBSERVER_POLL_TIMELINE_ROUTE_FIELDS,
+    "backend_mode",
+)
+
+
+def _guided_service_admission_from_runtime_text(
+    runtime_text: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Project one selector-only admission from the issued runtime ticket."""
+
+    worker_launch_pack = runtime_text.get("worker_launch_pack")
+    worker_launch_pack = (
+        worker_launch_pack if isinstance(worker_launch_pack, Mapping) else {}
+    )
+    execution_ticket = worker_launch_pack.get("execution_ticket")
+    execution_ticket = (
+        execution_ticket if isinstance(execution_ticket, Mapping) else {}
+    )
+    admission_request = worker_launch_pack.get(
+        "desktop_execution_ticket_admission_request"
+    )
+    admission_request = (
+        admission_request if isinstance(admission_request, Mapping) else {}
+    )
+    if (
+        execution_ticket.get("status") != "issued"
+        or execution_ticket.get("issue_allowed") is not True
+    ):
+        return {}, ["worker_launch_pack.execution_ticket.issued"]
+    selectors = {
+        field_name: admission_request.get(field_name)
+        for field_name in _GUIDED_RUNTIME_SELECTOR_FIELDS
+        if admission_request.get(field_name) not in (None, "")
+    }
     missing = [
-        key
-        for key in (
-            "AMING_WORKER_SESSION_TOKEN",
-            "AMING_WORKER_FENCE_TOKEN",
-            "AMING_RUNTIME_CONTEXT_ID",
-        )
-        if not str(env.get(key) or "").strip()
+        field_name
+        for field_name in _GUIDED_RUNTIME_REQUIRED_SELECTOR_FIELDS
+        if not str(selectors.get(field_name) or "").strip()
     ]
-    return {
-        "schema_version": "observer_dogfood_execute_launch_env.v1",
-        "allowed": not missing,
-        "env": env,
-        "env_keys": sorted(env),
-        "missing_env": missing,
-        "session_token_present": bool(session_token),
-        "raw_session_token_persisted": False,
-        "raw_fence_token_persisted": False,
-    }
-
-
-def _dogfood_execute_env_blocker(
-    *,
-    request: "DogfoodObserverPlanRequest",
-    context: Any,
-    launch_env: Mapping[str, Any],
-    executable_worker_launch: Mapping[str, Any],
-) -> dict[str, Any]:
-    return {
-        "schema_version": "observer_dogfood_execute_env_blocker.v1",
-        "ok": False,
-        "status": "blocked",
-        "terminal_dispatch_blocker": True,
-        "blocker_id": "worker_session_token_env_missing_before_cli_launch",
-        "project_id": request.project_id,
-        "backlog_id": request.backlog_id,
-        "task_id": str(getattr(context, "task_id", "") or request.task_id or ""),
-        "runtime_context_id": request.runtime_context_id
-        or runtime_context_id_for_branch_context(context),
-        "missing_env": list(launch_env.get("missing_env") or []),
-        "env_keys": list(launch_env.get("env_keys") or []),
-        "executable_worker_launch": dict(executable_worker_launch),
-        "raw_session_token_persisted": False,
-        "raw_fence_token_persisted": False,
-        "reason": (
-            "execute requested for a bounded CLI worker, but the parent observer "
-            "process did not provide the server-issued AMING_WORKER_SESSION_TOKEN "
-            "needed for worker read-receipt/startup facades."
-        ),
-        "next_action": (
-            "mint/allocate the worker session token, then launch observer dogfood "
-            "with AMING_WORKER_SESSION_TOKEN set only in process env."
-        ),
-    }
+    if missing:
+        return {}, [
+            "worker_launch_pack.desktop_execution_ticket_admission_request.{}".format(
+                field_name
+            )
+            for field_name in missing
+        ]
+    return {"authority_selectors": selectors}, []
 
 
 def _dogfood_secret_redacted_copy(
@@ -5591,7 +5618,13 @@ def _runtime_text_worker_launch_pack(
                 if isinstance(dispatch_identity, Mapping)
                 else {}
             )
-            pack["desktop_execution_ticket_admission_request"] = {
+            profile_requirements = execution_ticket.get("profile_requirements")
+            profile_requirements = (
+                profile_requirements
+                if isinstance(profile_requirements, Mapping)
+                else {}
+            )
+            admission_request = {
                 "host_kind": "codex_desktop",
                 "project_id": request.project_id,
                 "backlog_id": request.backlog_id,
@@ -5618,7 +5651,33 @@ def _runtime_text_worker_launch_pack(
                 "expected_dispatch_identity_hash": str(
                     execution_ticket.get("dispatch_identity_hash") or ""
                 ),
+                "role": str(
+                    profile_requirements.get("role")
+                    or dispatch_identity.get("worker_role")
+                    or ""
+                ),
+                "principal_id": str(dispatch_identity.get("worker_id") or ""),
             }
+            for field_name in OBSERVER_POLL_TIMELINE_ROUTE_FIELDS:
+                value = str(dispatch_identity.get(field_name) or "").strip()
+                if value:
+                    admission_request[field_name] = value
+            for field_name in (
+                "profile_id",
+                "harness",
+                "provider",
+                "model",
+                "runtime_id",
+                "endpoint_id",
+                "launcher_id",
+            ):
+                value = str(profile_requirements.get(field_name) or "").strip()
+                if value:
+                    admission_request[field_name] = value
+            backend_mode = str(request.backend_mode or "").strip()
+            if backend_mode:
+                admission_request["backend_mode"] = backend_mode
+            pack["desktop_execution_ticket_admission_request"] = admission_request
     pack["worker_launch_pack_hash"] = _stable_json_hash(
         {key: value for key, value in pack.items() if key != "worker_launch_pack_hash"}
     )
@@ -7857,6 +7916,13 @@ def build_dogfood_observer_run_plan(
         precheck_run_id=request.precheck_run_id,
         visible_injection_manifest_hash=request.visible_injection_manifest_hash,
         backend_mode=request.backend_mode,
+        contract_execution_id=request.contract_execution_id,
+        contract_runtime_current_state=request.contract_runtime_current_state,
+        expected_execution_state_revision=request.expected_execution_state_revision,
+        expected_execution_state_hash=request.expected_execution_state_hash,
+        expected_dispatch_identity_hash=request.expected_dispatch_identity_hash,
+        profile_requirements=request.profile_requirements,
+        retry_policy=request.retry_policy,
     )
     parent_route_lineage = _runtime_text_parent_route_lineage(runtime_text_request)
     prelaunch_graph_context = _runtime_text_prelaunch_graph_context(
@@ -8135,62 +8201,53 @@ def build_dogfood_observer_run_plan(
             "missing_fields": ["worktree_path.real_git_worktree"],
         }
         return copy_safe_result()
-    observer_command_id = request.task_id or context.task_id
-    launch_env = _dogfood_execute_launch_env(
-        request=request,
-        context=context,
-        runtime_context_id=request.runtime_context_id
-        or runtime_context_id_for_branch_context(context),
-        observer_command_id=observer_command_id,
+    guided_service_admission, guided_admission_missing = (
+        _guided_service_admission_from_runtime_text(runtime_text)
     )
-    result["execute_launch_env"] = {
-        key: value for key, value in launch_env.items() if key != "env"
-    }
-    if execute and not launch_env.get("allowed"):
-        blocker = _dogfood_execute_env_blocker(
-            request=request,
-            context=context,
-            launch_env=launch_env,
-            executable_worker_launch=executable_worker_launch,
-        )
+    result["guided_service_admission"] = dict(guided_service_admission)
+    if execute and request.guided_service_admission:
+        blocker = {
+            "schema_version": "observer_guided_service_admission_blocker.v1",
+            "ok": False,
+            "status": "blocked",
+            "blocker_id": "caller_owned_guided_service_admission_rejected",
+            "unsupported_fields": sorted(request.guided_service_admission),
+            "service_operation": "start_host_envelope_run",
+            "direct_invocation_fallback": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "reason": (
+                "observer dogfood derives CLI Agent Service admission from the "
+                "canonical runtime execution ticket"
+            ),
+        }
         result.update(
             {
                 "ok": False,
                 "status": "blocked",
                 "calls_models": False,
                 "auth_status": "not_invoked",
-                "execute_env_blocker": blocker,
+                "service_admission_blocker": blocker,
                 "terminal_dispatch_blocker": True,
-                "command_projection_status": "failed",
-                "canonical_contract_state": "blocked",
+                "direct_invocation_fallback": False,
                 "error": blocker["reason"],
             }
         )
         return copy_safe_result()
-
-    guided_service_admission = (
-        dict(request.guided_service_admission)
-        if isinstance(request.guided_service_admission, Mapping)
-        else {}
-    )
-    if execute and not guided_service_admission:
+    if execute and guided_admission_missing:
         blocker = {
             "schema_version": "observer_guided_service_admission_blocker.v1",
             "ok": False,
             "status": "blocked",
             "blocker_id": "canonical_cli_agent_service_admission_missing",
-            "missing_fields": [
-                "guided_service_admission.run",
-                "guided_service_admission.authority_selectors",
-                "guided_service_admission.host_envelope",
-            ],
+            "missing_fields": guided_admission_missing,
             "service_operation": "start_host_envelope_run",
             "direct_invocation_fallback": False,
             "raw_session_token_exposed": False,
             "raw_fence_token_exposed": False,
             "reason": (
-                "governed dogfood execution requires public run data, "
-                "ContractRuntime selectors, and copy-safe host envelope references"
+                "governed dogfood execution requires an issued canonical runtime "
+                "ticket with complete public admission selectors"
             ),
         }
         result.update(
@@ -8220,7 +8277,7 @@ def build_dogfood_observer_run_plan(
         early_progress_timeout_sec=request.early_progress_timeout_sec,
         dispatch_gate=dispatch_gate,
         main_worktree=str(main_worktree),
-        env=launch_env.get("env") if isinstance(launch_env.get("env"), Mapping) else {},
+        env={},
         guided_service_admission=guided_service_admission,
         cli_agent_service_state_dir=request.cli_agent_service_state_dir,
     )
@@ -8299,9 +8356,6 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
                 admission=request.guided_service_admission,
                 project_id=request.project_id,
                 backlog_id=request.backlog_id,
-                prompt=invocation_request.prompt_text(),
-                worktree=request.workspace or invocation_request.cwd,
-                environment=request.env,
                 state_dir=request.cli_agent_service_state_dir,
             )
         except GuidedRuntimeDispatchError as exc:

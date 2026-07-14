@@ -21,13 +21,15 @@ from .adapters.codex_desktop import (
     DesktopHostAdapterError,
 )
 from .auth import ProfileAuthController
+from .config import resolve_agent_config
 from .health import health_payload, stopped_payload
 from .launchers import (
     HostEnvelopeError,
     HostEnvelopeStore,
     scrub_host_envelope_payload,
 )
-from .registry import AgentRegistry, _profile_from_dict, _run_from_dict
+from .registry import AgentRegistry
+from .scheduler import AgentScheduler, SchedulerError
 from .profile_control import (
     ManagedProfileControl,
     PROFILE_OPERATIONS,
@@ -68,7 +70,7 @@ _DESKTOP_ADMISSION_IDENTITY_FIELDS = (
     "observer_command_id",
 )
 
-_GUIDED_RUNTIME_AUTHORITY_FIELDS = frozenset(
+_GUIDED_RUNTIME_RESOLVER_FIELDS = frozenset(
     {
         "project_id",
         "backlog_id",
@@ -86,6 +88,31 @@ _GUIDED_RUNTIME_AUTHORITY_FIELDS = frozenset(
         "expected_dispatch_identity_hash",
     }
 )
+_GUIDED_RUNTIME_ROUTE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+_GUIDED_RUNTIME_PROFILE_FIELDS = (
+    "profile_id",
+    "harness",
+    "provider",
+    "model",
+    "runtime_id",
+    "endpoint_id",
+    "launcher_id",
+)
+_GUIDED_RUNTIME_AUTHORITY_FIELDS = frozenset(
+    {
+        *_GUIDED_RUNTIME_RESOLVER_FIELDS,
+        *_GUIDED_RUNTIME_ROUTE_FIELDS,
+        *_GUIDED_RUNTIME_PROFILE_FIELDS,
+        "backend_mode",
+    }
+)
 _GUIDED_RUNTIME_REQUIRED_SELECTORS = (
     "project_id",
     "backlog_id",
@@ -98,7 +125,21 @@ _GUIDED_RUNTIME_REQUIRED_SELECTORS = (
     "role",
     "profile_id",
     "principal_id",
+    "expected_execution_state_hash",
+    "expected_dispatch_identity_hash",
+    *_GUIDED_RUNTIME_ROUTE_FIELDS,
+    "backend_mode",
 )
+
+
+def _stable_json_hash(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 class ServiceError(RuntimeError):
@@ -345,6 +386,7 @@ class CliAgentService:
                 state_dir=self.paths.state_dir / "supervisor",
                 host_envelope_store=self.host_envelope_store,
             )
+        self.scheduler = AgentScheduler(self.registry)
         if profile_control is not None:
             if profile_control.registry is not self.registry:
                 raise ServiceError("profile control registry does not match service registry")
@@ -651,16 +693,7 @@ class CliAgentService:
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        caller_fields = {
-            "run",
-            "worktree",
-            "prompt",
-            "authority_selectors",
-            "host_envelope",
-            "ttl_seconds",
-            "expires_at",
-        }
-        if set(payload) - caller_fields:
+        if set(payload) - {"authority_selectors"}:
             raise ServiceError("governed run request contains unsupported fields")
         selectors = payload.get("authority_selectors")
         if not isinstance(selectors, Mapping):
@@ -682,24 +715,9 @@ class CliAgentService:
         if expected_revision <= 0:
             raise ServiceError("governed run requires current authority coordinates")
 
-        run_value = payload.get("run")
-        if not isinstance(run_value, Mapping):
-            raise ServiceError("host envelope run must be a public run object")
-        profile_value = run_value.get("profile")
-        if not isinstance(profile_value, Mapping):
-            raise ServiceError("host envelope run requires an immutable profile")
-        try:
-            profile = _profile_from_dict(profile_value)
-            run = _run_from_dict(run_value, profile)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ServiceError("host envelope run identity is invalid") from exc
-        worktree = str(payload.get("worktree") or "").strip()
-        if not worktree:
-            raise ServiceError("host envelope run worktree is required")
-
         authority_request = {
             field: selectors.get(field)
-            for field in _GUIDED_RUNTIME_AUTHORITY_FIELDS
+            for field in _GUIDED_RUNTIME_RESOLVER_FIELDS
             if selectors.get(field) not in (None, "")
         }
         authority_request["expected_execution_state_revision"] = expected_revision
@@ -708,17 +726,52 @@ class CliAgentService:
             raise ServiceError("ContractRuntime resolver returned an invalid ticket")
         dispatch = ticket.get("dispatch_identity")
         profile_requirements = ticket.get("profile_requirements")
+        next_legal_action = ticket.get("next_legal_action")
         if (
             ticket.get("status") != "issued"
             or ticket.get("issue_allowed") is not True
+            or ticket.get("source_of_authority") != "ContractRuntime"
+            or ticket.get("authority_decision_source")
+            != "contract_runtime_completed_dispatch_line"
+            or ticket.get("immutable") is not True
+            or ticket.get("consumed") is not False
             or not isinstance(dispatch, Mapping)
             or not isinstance(profile_requirements, Mapping)
+            or not isinstance(next_legal_action, Mapping)
         ):
             raise ServiceError("ContractRuntime resolver did not issue a canonical ticket")
+
+        ticket_id = str(ticket.get("ticket_id") or "").strip()
+        ticket_hash = str(ticket.get("ticket_hash") or "").strip()
+        ticket_material = dict(ticket)
+        ticket_material.pop("ticket_hash", None)
+        integrity_mismatches: list[str] = []
+        if not ticket_id:
+            integrity_mismatches.append("ticket_id")
+        if not ticket_hash or _stable_json_hash(ticket_material) != ticket_hash:
+            integrity_mismatches.append("ticket_hash")
+        if _stable_json_hash(dict(dispatch)) != str(
+            ticket.get("dispatch_identity_hash") or ""
+        ).strip():
+            integrity_mismatches.append("dispatch_identity_hash")
+        if _stable_json_hash(dict(profile_requirements)) != str(
+            ticket.get("profile_requirements_hash") or ""
+        ).strip():
+            integrity_mismatches.append("profile_requirements_hash")
+        if _stable_json_hash(dict(next_legal_action)) != str(
+            ticket.get("next_legal_action_hash") or ""
+        ).strip():
+            integrity_mismatches.append("next_legal_action_hash")
+        if integrity_mismatches:
+            raise ServiceError(
+                "ContractRuntime ticket integrity is invalid: "
+                + ", ".join(sorted(set(integrity_mismatches)))
+            )
 
         selector_comparisons = {
             "project_id": dispatch.get("project_id"),
             "backlog_id": dispatch.get("backlog_id"),
+            "contract_execution_id": ticket.get("contract_execution_id"),
             "runtime_context_id": dispatch.get("runtime_context_id"),
             "task_id": dispatch.get("task_id"),
             "worker_id": dispatch.get("worker_id"),
@@ -727,6 +780,10 @@ class CliAgentService:
             "principal_id": dispatch.get("worker_id"),
             "role": dispatch.get("worker_role"),
             "profile_id": profile_requirements.get("profile_id"),
+            **{
+                field: dispatch.get(field)
+                for field in _GUIDED_RUNTIME_ROUTE_FIELDS
+            },
         }
         mismatches = [
             field
@@ -734,24 +791,23 @@ class CliAgentService:
             if str(canonical or "").strip()
             != str(selectors.get(field) or "").strip()
         ]
-        run_role = str(getattr(run.config.role, "value", run.config.role)).strip()
-        if str(dispatch.get("worktree_path") or "").strip() != worktree:
+        for field in _GUIDED_RUNTIME_PROFILE_FIELDS:
+            expected = str(selectors.get(field) or "").strip()
+            if expected and expected != str(
+                profile_requirements.get(field) or ""
+            ).strip():
+                mismatches.append(field)
+        role = str(dispatch.get("worker_role") or "").strip().lower()
+        if str(profile_requirements.get("role") or "").strip().lower() != role:
+            mismatches.append("profile_requirements.role")
+        worktree = str(dispatch.get("worktree_path") or "").strip()
+        if not worktree:
             mismatches.append("worktree")
-        if str(run.config.project_id or "").strip() != str(
-            dispatch.get("project_id") or ""
-        ).strip():
-            mismatches.append("run.project_id")
-        if run.config.profile_id != str(
-            profile_requirements.get("profile_id") or ""
-        ).strip():
-            mismatches.append("run.profile_id")
-        if run_role != str(profile_requirements.get("role") or "").strip():
-            mismatches.append("run.role")
-        if str(ticket.get("contract_execution_id") or "").strip() != str(
-            selectors.get("contract_execution_id") or ""
-        ).strip():
-            mismatches.append("contract_execution_id")
-        if int(ticket.get("execution_state_revision") or 0) != expected_revision:
+        try:
+            ticket_revision = int(ticket.get("execution_state_revision") or 0)
+        except (TypeError, ValueError):
+            ticket_revision = -1
+        if ticket_revision != expected_revision:
             mismatches.append("execution_state_revision")
         for field in (
             "expected_execution_state_hash",
@@ -761,10 +817,50 @@ class CliAgentService:
             ticket_field = field.removeprefix("expected_")
             if expected and str(ticket.get(ticket_field) or "").strip() != expected:
                 mismatches.append(ticket_field)
+        for field in _GUIDED_RUNTIME_ROUTE_FIELDS:
+            if str(next_legal_action.get(field) or "").strip() != str(
+                dispatch.get(field) or ""
+            ).strip():
+                mismatches.append("next_legal_action.{}".format(field))
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "observer_command_id",
+        ):
+            if str(next_legal_action.get(field) or "").strip() != str(
+                dispatch.get(field) or ""
+            ).strip():
+                mismatches.append("next_legal_action.{}".format(field))
         if mismatches:
             raise ServiceError(
                 "ContractRuntime ticket does not match run admission: "
                 + ", ".join(sorted(set(mismatches)))
+            )
+
+        project_id = str(dispatch.get("project_id") or "").strip()
+        try:
+            selection = self.scheduler.select_profile(
+                profile_requirements,
+                role=role,
+                project_id=project_id,
+            )
+        except (SchedulerError, TypeError, ValueError) as exc:
+            raise ServiceError(
+                "canonical execution ticket has no eligible registered profile"
+            ) from exc
+        profile = self.registry.get_profile(selection.profile_id)
+        if profile is None:
+            raise ServiceError("scheduler selected an unregistered profile")
+        if profile.profile_id != str(
+            profile_requirements.get("profile_id") or ""
+        ).strip():
+            raise ServiceError("scheduler selection does not match the canonical ticket")
+        expected_backend = str(selectors.get("backend_mode") or "").strip()
+        if expected_backend and profile.inference_endpoint.backend_mode != expected_backend:
+            raise ServiceError(
+                "selected profile backend does not match canonical runtime selectors"
             )
 
         evidence_refs = {
@@ -774,91 +870,73 @@ class CliAgentService:
             "runtime_context_id": str(dispatch.get("runtime_context_id") or ""),
             "task_id": str(dispatch.get("task_id") or ""),
         }
-        return self._start_host_envelope_run(
-            {
-                **{
-                    field: value
-                    for field, value in payload.items()
-                    if field != "authority_selectors"
-                },
-                "execution_ticket": dict(ticket),
-                "evidence_refs": evidence_refs,
-            }
-        )
-
-    def _start_host_envelope_run(
-        self,
-        payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        allowed_fields = {
-            "run",
-            "worktree",
-            "prompt",
-            "execution_ticket",
-            "evidence_refs",
-            "host_envelope",
-            "ttl_seconds",
-            "expires_at",
-        }
-        if set(payload) - allowed_fields:
-            raise ServiceError("host envelope run request contains unsupported fields")
-        run_value = payload.get("run")
-        if not isinstance(run_value, Mapping):
-            raise ServiceError("host envelope run must be a public run object")
-        profile_value = run_value.get("profile")
-        if not isinstance(profile_value, Mapping):
-            raise ServiceError("host envelope run requires an immutable profile")
-        prompt = payload.get("prompt")
-        if not isinstance(prompt, str):
-            raise ServiceError("host envelope run prompt must be text")
-        worktree = str(payload.get("worktree") or "").strip()
-        if not worktree:
-            raise ServiceError("host envelope run worktree is required")
-        execution_ticket = payload.get("execution_ticket")
-        if not isinstance(execution_ticket, Mapping):
-            raise ServiceError("host envelope run requires an execution ticket")
-        evidence_refs = payload.get("evidence_refs")
-        if evidence_refs is not None and not isinstance(evidence_refs, Mapping):
-            raise ServiceError("host envelope evidence_refs must be an object")
+        principal_id = str(dispatch.get("worker_id") or "")
+        run_id = "run-{}".format(ticket_id)
         try:
-            profile = _profile_from_dict(profile_value)
-            run = _run_from_dict(run_value, profile)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ServiceError("host envelope run identity is invalid") from exc
-
-        public_text = json.dumps(
-            {
-                "run": run_value,
-                "worktree": worktree,
-                "prompt": prompt,
-                "execution_ticket": execution_ticket,
-                "evidence_refs": evidence_refs or {},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+            run = resolve_agent_config(
+                run_id=run_id,
+                role=role,
+                project_id=project_id,
+                profile=profile,
+                governance_refs=evidence_refs,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ServiceError("canonical run configuration could not be resolved") from exc
+        prompt = (
+            "Proceed as the allocated Aming Claw {role} worker.\n"
+            "Runtime context: {runtime_context_id}\n"
+            "Task: {task_id}\n"
+            "Contract execution: {contract_execution_id}\n"
+            "Read the current worker guide and follow ContractRuntime's current "
+            "next legal action. ContractRuntime, not this operational prompt, is "
+            "the authority."
+        ).format(
+            role=role,
+            runtime_context_id=evidence_refs["runtime_context_id"],
+            task_id=evidence_refs["task_id"],
+            contract_execution_id=evidence_refs["contract_execution_id"],
         )
-        self.host_envelope_store.stage(
-            run.run_id,
-            payload.get("host_envelope"),
-            lease_owner_id=self.supervisor.owner_id,
-            ttl_seconds=payload.get("ttl_seconds"),
-            expires_at=payload.get("expires_at"),
-            public_text=public_text,
-        )
-        del public_text
         try:
             self.supervisor.start_run(
                 run,
                 prompt=prompt,
                 worktree=worktree,
                 evidence_refs=evidence_refs,
-                execution_ticket=execution_ticket,
-                require_host_envelope=True,
+                execution_ticket=ticket,
+                require_host_envelope=False,
             )
-        except BaseException as exc:
-            self.supervisor.cancel_run(run.run_id)
-            raise ServiceError("host envelope run could not be started") from exc
-        return {"ok": True, "status": "started", "run_id": run.run_id}
+        except Exception as exc:
+            raise ServiceError("governed run could not be started") from exc
+        return {
+            "ok": True,
+            "status": "started",
+            "run_id": run.run_id,
+            "profile_id": profile.profile_id,
+            "role": role,
+            "principal_id": principal_id,
+            "runtime_context_id": evidence_refs["runtime_context_id"],
+            "task_id": evidence_refs["task_id"],
+            "contract_execution_id": evidence_refs["contract_execution_id"],
+            "execution_ticket_id": ticket_id,
+            "execution_ticket_hash": ticket_hash,
+            "selection_reason": selection.selection_reason,
+            "direct_invocation_fallback": False,
+            "caller_run_accepted": False,
+            "caller_prompt_accepted": False,
+            "caller_environment_accepted": False,
+            "caller_host_envelope_accepted": False,
+            "raw_argv_persisted": False,
+            "raw_environment_persisted": False,
+            "provider_home_path_persisted": False,
+            "raw_credentials_persisted": False,
+            "raw_route_token_persisted": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "raw_prompt_persisted": False,
+            "raw_provider_output_persisted": False,
+            "governance_authority": False,
+            "operational_dispatch_only": True,
+        }
 
     def _dispatch(self, request: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         operation = str(request.get("operation") or "").strip().lower()
