@@ -21512,6 +21512,7 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
     def refs(
         expected_commit: str,
         target_root: str | Path | None = project_root,
+        expected_session_id: str = "ses-qa",
     ) -> dict[str, Any]:
         return server._runtime_context_service_qa_graph_trace_refs(
             conn,
@@ -21522,7 +21523,7 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
             expected_task_id=task_id,
             expected_candidate_commit_sha=expected_commit,
             expected_qa_principal="qa-principal",
-            expected_qa_session_id="ses-qa",
+            expected_qa_session_id=expected_session_id,
             require_complete_authority=True,
             strict_bounded_qa=True,
         )
@@ -21546,6 +21547,15 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
     matching = refs(candidate_commit)
     assert matching["db_verified"] is True
     assert matching["candidate_commit_sha"] == candidate_commit
+
+    wrong_session = refs(candidate_commit, expected_session_id="ses-other")
+    assert wrong_session["db_verified"] is False
+    assert any(
+        item["field"] == "qa_session_id"
+        and item["expected"] == "ses-other"
+        and item["actual"] == "ses-qa"
+        for item in wrong_session["identity_mismatches"]
+    )
 
     missing_assigned_root = refs(candidate_commit, "")
     assert missing_assigned_root["db_verified"] is False
@@ -22124,7 +22134,7 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
             conn,
             project_id=PID,
             explicit_trace_ids=[trace_id],
-            target_project_root=str(candidate_root),
+            target_project_root=str(fixture.root),
             expected_backlog_id=backlog_id,
             expected_task_id=task_id,
             expected_candidate_commit_sha=candidate_commit,
@@ -22138,6 +22148,13 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
     assert before_merge["db_verified"] is True, before_merge[
         "identity_mismatches"
     ]
+    assert before_merge["assigned_target_project_root"] == str(
+        fixture.root.resolve()
+    )
+    assert before_merge["canonical_project_root"] == str(fixture.root.resolve())
+    assert before_merge["target_project_root"] == str(fixture.root.resolve())
+    assert before_merge["query_root"] == str(candidate_root.resolve())
+    assert before_merge["candidate_query_root"] == str(candidate_root.resolve())
     subprocess.run(
         ["git", "merge", "--ff-only", candidate_commit],
         cwd=fixture.root,
@@ -49984,13 +50001,42 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     worker_token = "parallel-runtime-context-projection-token"
     fence_token = "fence-runtime-context-projection"
     graph_trace_id = "gqt-runtime-context-projection-worker"
-    worktree = tmp_path / "parallel-runtime-context-projection"
-    head_commit = _init_test_git_repo(worktree)
+    canonical_root = tmp_path / "parallel-runtime-context-projection-canonical"
+    base_commit = _init_test_git_repo(canonical_root)
+    worktree = tmp_path / "parallel-runtime-context-projection-candidate"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "parallel-runtime-context-projection-candidate",
+            str(worktree),
+            base_commit,
+        ],
+        cwd=canonical_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (worktree / "exact-candidate.txt").write_text(
+        "exact candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "exact-candidate.txt"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "runtime context projection candidate"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_commit = batch_jobs.git_commit(worktree)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
         lambda _project_id, raw=None, **_kwargs: (
-            Path(raw).resolve() if raw else worktree
+            Path(raw).resolve() if raw else canonical_root
         ),
     )
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -50045,7 +50091,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         fence_token=fence_token,
         token=worker_token,
         worktree_path=str(worktree),
-        base_commit="base-runtime-context-projection",
+        target_project_root=str(canonical_root),
+        base_commit=base_commit,
         target_head_commit=head_commit,
         merge_queue_id="mq-runtime-context-projection",
         owned_files=("agent/governance/server.py",),
@@ -50107,7 +50154,8 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         candidate_commit_sha=head_commit,
         backlog_id=backlog_id,
         task_id=runtime_context.task_id,
-        target_project_root=runtime_context.target_project_root,
+        target_project_root=str(worktree),
+        canonical_project_root=str(canonical_root),
     )
     lines_before_qa = len(
         server._contract_runtime_store(conn)
@@ -50254,6 +50302,14 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stored_authority["target_project_root"] == str(
         Path(runtime_context.target_project_root).resolve()
     )
+    assert stored_authority["assigned_target_project_root"] == str(
+        canonical_root.resolve()
+    )
+    assert stored_authority["canonical_project_root"] == str(
+        canonical_root.resolve()
+    )
+    assert stored_authority["query_root"] == str(worktree.resolve())
+    assert stored_authority["candidate_query_root"] == str(worktree.resolve())
     assert stored_authority["candidate_diff_hash"] == expected_graph_evidence[
         "candidate_diff_hash"
     ]
@@ -50573,7 +50629,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
-        lambda *_args, **_kwargs: worktree,
+        lambda *_args, **_kwargs: canonical_root,
     )
     monkeypatch.setattr(server, "_git_head_commit", lambda _root: head_commit)
     activate_current_full("full-runtime-context-stale", "d" * 40)

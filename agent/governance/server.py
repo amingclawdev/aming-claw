@@ -11334,7 +11334,7 @@ def _runtime_context_service_qa_graph_trace_refs(
         result.update(next(iter(bounded_contexts_by_hash.values())))
         if len(bounded_authorities_by_hash) == 1:
             result.update(next(iter(bounded_authorities_by_hash.values())))
-        requested_target_root = str(target_project_root or "").strip()
+        assigned_target_root = str(target_project_root or "").strip()
         persisted_query_root = str(result.get("query_root") or "").strip()
         if not persisted_query_root:
             resolved_root = project_service.resolve_project_root(
@@ -11343,29 +11343,45 @@ def _runtime_context_service_qa_graph_trace_refs(
                 fallback_self=True,
             )
             persisted_query_root = str(resolved_root or "").strip()
+        persisted_canonical_root = str(
+            result.get("canonical_project_root") or ""
+        ).strip()
+        if not persisted_canonical_root:
+            resolved_root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+            persisted_canonical_root = str(resolved_root or "").strip()
         if persisted_query_root:
-            result["requested_target_project_root"] = requested_target_root
-            result["target_project_root"] = persisted_query_root
-            if require_complete_authority and not requested_target_root:
+            result["query_root"] = persisted_query_root
+            result["candidate_query_root"] = persisted_query_root
+        if persisted_canonical_root:
+            result["canonical_project_root"] = persisted_canonical_root
+            result["target_project_root"] = persisted_canonical_root
+        result["requested_target_project_root"] = assigned_target_root
+        result["assigned_target_project_root"] = assigned_target_root
+        if persisted_canonical_root:
+            if require_complete_authority and not assigned_target_root:
                 result["identity_mismatches"].append(
                     {
                         "trace_id": "|".join(requested_trace_ids),
                         "field": "target_project_root",
-                        "expected": persisted_query_root,
+                        "expected": persisted_canonical_root,
                         "actual": "missing assigned target root",
                     }
                 )
                 result["db_verified"] = False
-            elif requested_target_root and (
-                Path(requested_target_root).resolve()
-                != Path(persisted_query_root).resolve()
+            elif assigned_target_root and (
+                Path(assigned_target_root).resolve()
+                != Path(persisted_canonical_root).resolve()
             ):
                 result["identity_mismatches"].append(
                     {
                         "trace_id": "|".join(requested_trace_ids),
                         "field": "target_project_root",
-                        "expected": requested_target_root,
-                        "actual": persisted_query_root,
+                        "expected": assigned_target_root,
+                        "actual": persisted_canonical_root,
                     }
                 )
                 result["db_verified"] = False
@@ -50633,10 +50649,10 @@ def _contract_runtime_bind_qa_graph_authority(
         record=record,
         identity=identity,
     )
-    target_project_root = str(
+    canonical_target_project_root = str(
         assigned_root.get("target_project_root") or ""
     ).strip()
-    if not target_project_root:
+    if not canonical_target_project_root:
         raise GovernanceError(
             "contract_runtime_target_project_root_required",
             "bounded QA requires one assigned target_project_root from trusted dispatch identity",
@@ -50673,7 +50689,7 @@ def _contract_runtime_bind_qa_graph_authority(
         conn,
         project_id=project_id,
         explicit_trace_ids=requested_trace_ids,
-        target_project_root=target_project_root,
+        target_project_root=canonical_target_project_root,
         expected_backlog_id=str(record.get("backlog_id") or ""),
         expected_task_id=identity["task_id"],
         expected_candidate_commit_sha=expected_candidate_commit,
