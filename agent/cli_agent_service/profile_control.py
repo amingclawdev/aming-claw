@@ -6,6 +6,11 @@ import hashlib
 from pathlib import Path
 from typing import Any, Mapping
 
+from .adapters.codex_cli import (
+    CODEX_CLI_DEFAULT_MODEL,
+    CODEX_LEGACY_MANAGED_DEFAULT_MODELS,
+    CODEX_MANAGED_LAUNCHER_ID,
+)
 from .auth import ProfileAuthController, ProfileAuthError, ProfileAuthResult, READY
 from .models import (
     AgentProfile,
@@ -57,7 +62,11 @@ def _credential_ref(profile_id: str) -> str:
     return "credential:codex-home:{}".format(suffix)
 
 
-def _bounded_codex_profile(profile_id: str) -> AgentProfile:
+def _bounded_codex_profile(
+    profile_id: str,
+    *,
+    model: str = CODEX_CLI_DEFAULT_MODEL,
+) -> AgentProfile:
     """Materialize the only profile shape this control surface can register."""
 
     return AgentProfile(
@@ -74,7 +83,7 @@ def _bounded_codex_profile(profile_id: str) -> AgentProfile:
             endpoint_id="endpoint-openai-managed-codex",
             version="1",
             provider="openai",
-            model="gpt-5.4-codex",
+            model=model,
             backend_mode="codex_cli",
             auth_mode="cli_auth",
         ),
@@ -85,7 +94,7 @@ def _bounded_codex_profile(profile_id: str) -> AgentProfile:
             ref_kind="provider_home",
         ),
         launcher_adapter=LauncherAdapter(
-            launcher_id="launcher-codex-managed",
+            launcher_id=CODEX_MANAGED_LAUNCHER_ID,
             version="1",
             environment_keys=("CODEX_HOME",),
             supports_host_handoff=True,
@@ -97,6 +106,14 @@ def _bounded_codex_profile(profile_id: str) -> AgentProfile:
             max_concurrency=1,
             timeout_sec=300,
         ),
+    )
+
+
+def _is_bounded_codex_profile(profile: AgentProfile) -> bool:
+    models = (CODEX_CLI_DEFAULT_MODEL, *CODEX_LEGACY_MANAGED_DEFAULT_MODELS)
+    return any(
+        profile == _bounded_codex_profile(profile.profile_id, model=model)
+        for model in models
     )
 
 
@@ -196,12 +213,19 @@ class ManagedProfileControl:
         if result.state != READY or not result.activated:
             return self._auth_payload(PROFILE_ACTIVATE_OPERATION, result)
         profile = _bounded_codex_profile(result.profile_id)
-        try:
-            registered = self.registry.register_profile(profile)
-        except RegistryError as exc:
-            raise ProfileControlError(
-                "managed profile conflicts with an existing immutable profile"
-            ) from exc
+        registered = self.registry.get_profile(result.profile_id)
+        if registered is not None:
+            if not _is_bounded_codex_profile(registered):
+                raise ProfileControlError(
+                    "managed profile conflicts with an existing immutable profile"
+                )
+        else:
+            try:
+                registered = self.registry.register_profile(profile)
+            except RegistryError as exc:
+                raise ProfileControlError(
+                    "managed profile conflicts with an existing immutable profile"
+                ) from exc
         return self._auth_payload(
             PROFILE_ACTIVATE_OPERATION,
             result,
@@ -218,8 +242,7 @@ class ManagedProfileControl:
             raise ProfileControlError(
                 "managed profile is not the registered immutable profile"
             )
-        expected = _bounded_codex_profile(profile.profile_id)
-        if registered != expected:
+        if not _is_bounded_codex_profile(registered):
             raise ProfileControlError("registered profile is not server managed")
         status = self.auth_controller.discover(profile.profile_id, "codex")
         if status.state != READY or not status.activated:

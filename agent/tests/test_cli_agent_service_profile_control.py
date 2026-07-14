@@ -38,6 +38,7 @@ def _control(tmp_path, *, ready=True):
 
 
 def test_fixed_login_status_activate_and_list_register_only_ready_profile(tmp_path):
+    from cli_agent_service.adapters.codex_cli import CODEX_CLI_DEFAULT_MODEL
     from cli_agent_service.config import resolve_agent_config
 
     registry, _auth, control = _control(tmp_path)
@@ -73,6 +74,7 @@ def test_fixed_login_status_activate_and_list_register_only_ready_profile(tmp_pa
     assert profile is not None
     assert profile == registry.register_profile(profile)
     assert profile.credential_ref.ref_kind == "provider_home"
+    assert profile.inference_endpoint.model == CODEX_CLI_DEFAULT_MODEL
     assert profile.launcher_adapter.environment_keys == ("CODEX_HOME",)
     assert profile.role_policy.max_concurrency == 1
     assert {"observer", "mf_sub", "qa"}.issubset(profile.role_policy.roles)
@@ -85,6 +87,7 @@ def test_fixed_login_status_activate_and_list_register_only_ready_profile(tmp_pa
     )
     assert observer_run.config.role == "observer"
     assert observer_run.config.profile_id == profile.profile_id
+    assert observer_run.config.model == CODEX_CLI_DEFAULT_MODEL
 
     listed = control.dispatch("profile_list", {})
     assert listed["profile_count"] == 1
@@ -103,6 +106,28 @@ def test_activation_does_not_register_when_auth_is_not_ready(tmp_path):
     assert result["activated"] is False
     assert result["profile_registered"] is False
     assert registry.list_profiles() == ()
+
+
+def test_legacy_managed_profile_remains_usable_after_default_model_change(tmp_path):
+    from cli_agent_service.adapters.codex_cli import (
+        CODEX_LEGACY_MANAGED_DEFAULT_MODELS,
+    )
+    from cli_agent_service.profile_control import _bounded_codex_profile
+
+    registry, _auth, control = _control(tmp_path)
+    legacy_model = next(iter(CODEX_LEGACY_MANAGED_DEFAULT_MODELS))
+    legacy_profile = _bounded_codex_profile(
+        "profile-codex-legacy",
+        model=legacy_model,
+    )
+    registry.register_profile(legacy_profile)
+    control.prepare_login(legacy_profile.profile_id)
+
+    activated = control.activate(legacy_profile.profile_id)
+
+    assert activated["profile_registered"] is True
+    assert registry.get_profile(legacy_profile.profile_id) == legacy_profile
+    assert control.resolve_profile_home(legacy_profile).is_dir()
 
 
 @pytest.mark.parametrize(

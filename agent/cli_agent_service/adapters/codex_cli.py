@@ -14,6 +14,9 @@ from ..models import AgentRun
 CODEX_PROFILE_ENV_KEY = "CODEX_HOME"
 CODEX_LOGIN_ARGS = ("login", "--device-auth")
 CODEX_AUTH_STATUS_ARGS = ("login", "status")
+CODEX_CLI_DEFAULT_MODEL = "codex-cli-default"
+CODEX_MANAGED_LAUNCHER_ID = "launcher-codex-managed"
+CODEX_LEGACY_MANAGED_DEFAULT_MODELS = frozenset({"gpt-5.4-codex"})
 MACOS_CODEX_APP_BUNDLE_EXECUTABLES = (
     "/Applications/ChatGPT.app/Contents/Resources/codex",
 )
@@ -147,6 +150,20 @@ class CodexCliAdapter:
         if profile.credential_ref.provider not in {"", "openai"}:
             raise CodexAdapterError("credential reference provider is not OpenAI")
 
+    @staticmethod
+    def _explicit_model(run: AgentRun) -> str:
+        model = str(run.config.model or "").strip()
+        if not model or model == CODEX_CLI_DEFAULT_MODEL:
+            return ""
+        resolution = run.config.resolution_for("model")
+        if (
+            run.profile.launcher_adapter.launcher_id == CODEX_MANAGED_LAUNCHER_ID
+            and resolution.source == "agent_profile"
+            and model in CODEX_LEGACY_MANAGED_DEFAULT_MODELS
+        ):
+            return ""
+        return model
+
     def build_launch_spec(
         self,
         run: AgentRun,
@@ -160,8 +177,9 @@ class CodexCliAdapter:
         if not cwd.is_dir():
             raise CodexAdapterError("assigned worktree is unavailable")
         command = [self._resolve_executable(run), "exec"]
-        if run.config.model:
-            command.extend(["--model", run.config.model])
+        explicit_model = self._explicit_model(run)
+        if explicit_model:
+            command.extend(["--model", explicit_model])
         if self.dangerous:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         else:
