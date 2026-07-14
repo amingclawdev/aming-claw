@@ -45747,6 +45747,111 @@ def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identit
     }
 
 
+def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_root_aliases():
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "target_project_root": "/repo/canonical",
+                        "project_root": "/repo/conflicting",
+                    },
+                }
+            ],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority == {
+        "status": "invalid",
+        "error": (
+            "canonical ContractRuntime dispatch contains conflicting ticket "
+            "authority: target_project_root"
+        ),
+    }
+
+
+def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_worktrees():
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "worktree_path": "/repo/.worktrees/worker-a",
+                        "worker_worktree_path": "/repo/.worktrees/worker-b",
+                    },
+                }
+            ],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority == {
+        "status": "invalid",
+        "error": (
+            "canonical ContractRuntime dispatch contains conflicting ticket "
+            "authority: worktree_path"
+        ),
+    }
+
+
+def test_mf_parallel_dispatch_ticket_authority_accepts_equal_root_and_worktree():
+    root = "/repo/equal-root"
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "target_project_root": root,
+                        "worktree_path": root,
+                    },
+                }
+            ],
+        },
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+
+    assert authority["status"] == "projected"
+    action = authority["next_legal_action"]
+    assert action["target_project_root"] == root
+    assert action["worktree_path"] == root
+    launch = server._contract_runtime_desktop_launch_identity(
+        {"project_id": PID, "backlog_id": "AC-EQUAL-ROOT", "next_legal_action": action}
+    )
+    assert launch["target_project_root"] == root
+    assert launch["worktree_path"] == root
+
+
+def test_contract_runtime_desktop_launch_identity_falls_back_to_canonical_root():
+    root = "/repo/legacy-root"
+
+    launch = server._contract_runtime_desktop_launch_identity(
+        {
+            "project_id": PID,
+            "backlog_id": "AC-LEGACY-ROOT",
+            "next_legal_action": {"target_project_root": root},
+        }
+    )
+
+    assert launch["target_project_root"] == root
+    assert launch["worktree_path"] == root
+
+
 def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_read(
     conn,
     tmp_path,
@@ -53739,34 +53844,52 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
         def close(self):
             pass
 
-    action = {
-        "id": "worker_dispatch",
-        "action": "dispatch_bounded_worker",
-        "runtime_context_id": "mfrctx-desktop-resolver",
-        "task_id": "desktop-resolver-worker",
-        "worker_id": "desktop-resolver-worker",
-        "worker_slot_id": "desktop-resolver-slot",
-        "observer_command_id": "desktop-resolver-command",
-        "parent_task_id": "desktop-resolver-parent",
-        "worker_role": "mf_sub",
-        "target_project_root": "/tmp/desktop-resolver-worker",
-        "branch_ref": "refs/heads/desktop-resolver-worker",
-        "base_commit": "a" * 40,
-        "target_head_commit": "a" * 40,
-        "merge_queue_id": "mq-desktop-resolver",
-        "owned_files": ["agent/observer_runtime.py"],
-        "route_id": "route-desktop-resolver",
-        "route_context_hash": "sha256:" + "1" * 64,
-        "prompt_contract_id": "prompt-desktop-resolver",
-        "prompt_contract_hash": "sha256:" + "2" * 64,
-        "route_token_ref": "rtref-desktop-resolver",
-        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
-        "profile_requirements": {
-            "profile_id": "codex-desktop-resolver",
-            "harness": "codex",
+    canonical_root = "/tmp/desktop-resolver"
+    worktree_path = "/tmp/desktop-resolver/.worktrees/desktop-resolver-worker"
+    dispatch_authority = server._contract_runtime_dispatch_ticket_authority(
+        {
+            "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+            "contract_execution_id": "cex-desktop-resolver",
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "actor_role": "observer",
+                    "payload": {
+                        "runtime_context_id": "mfrctx-desktop-resolver",
+                        "task_id": "desktop-resolver-worker",
+                        "worker_id": "desktop-resolver-worker",
+                        "worker_slot_id": "desktop-resolver-slot",
+                        "observer_command_id": "desktop-resolver-command",
+                        "parent_task_id": "desktop-resolver-parent",
+                        "worker_role": "mf_sub",
+                        "target_project_root": canonical_root,
+                        "worktree_path": worktree_path,
+                        "branch_ref": "refs/heads/desktop-resolver-worker",
+                        "base_commit": "a" * 40,
+                        "target_head_commit": "a" * 40,
+                        "merge_queue_id": "mq-desktop-resolver",
+                        "owned_files": ["agent/observer_runtime.py"],
+                        "route_id": "route-desktop-resolver",
+                        "route_context_hash": "sha256:" + "1" * 64,
+                        "prompt_contract_id": "prompt-desktop-resolver",
+                        "prompt_contract_hash": "sha256:" + "2" * 64,
+                        "route_token_ref": "rtref-desktop-resolver",
+                        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+                        "profile_requirements": {
+                            "profile_id": "codex-desktop-resolver",
+                            "harness": "codex",
+                        },
+                        "retry_policy": {"attempt": 1, "max_attempts": 2},
+                    },
+                }
+            ],
         },
-        "retry_policy": {"attempt": 1, "max_attempts": 2},
-    }
+        {"next_legal_action": {"line_id": "worker_read_runtime_guide"}},
+    )
+    assert dispatch_authority["status"] == "projected"
+    action = dispatch_authority["next_legal_action"]
     authority = {
         "source_of_authority": "ContractRuntime",
         "authority_decision_source": "contract_runtime_completed_dispatch_line",
@@ -53780,6 +53903,9 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
         "readiness_state": "contract_active",
         "next_legal_action": action,
     }
+    launch_identity = server._contract_runtime_desktop_launch_identity(authority)
+    assert launch_identity["target_project_root"] == canonical_root
+    assert launch_identity["worktree_path"] == worktree_path
     monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
     monkeypatch.setattr(
         server,
@@ -53812,6 +53938,9 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
     assert ticket["dispatch_identity"]["observer_command_id"] == (
         "desktop-resolver-command"
     )
+    assert ticket["next_legal_action"]["target_project_root"] == canonical_root
+    assert ticket["next_legal_action"]["worktree_path"] == worktree_path
+    assert ticket["dispatch_identity"]["worktree_path"] == worktree_path
 
     with pytest.raises(ValidationError, match="caller-owned authority fields"):
         server.handle_cli_agent_desktop_execution_ticket_resolve(

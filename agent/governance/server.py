@@ -67888,7 +67888,8 @@ def _contract_runtime_dispatch_ticket_authority(
         "observer_command_id": (),
         "parent_task_id": (),
         "worker_role": (),
-        "target_project_root": ("worktree_path", "project_root", "repo_root"),
+        "target_project_root": ("project_root", "repo_root"),
+        "worktree_path": ("worker_worktree_path", "assigned_worktree"),
         "branch_ref": ("branch",),
         "base_commit": (),
         "target_head_commit": (),
@@ -68070,9 +68071,16 @@ def _contract_runtime_desktop_launch_identity(
         "parent_task_id": ("parent_task_id",),
         "runtime_context_id": ("runtime_context_id",),
         "worker_role": ("worker_role",),
-        "worktree_path": (
+        "target_project_root": (
             "target_project_root",
+            "project_root",
+            "repo_root",
+        ),
+        "worktree_path": (
             "worktree_path",
+            "worker_worktree_path",
+            "assigned_worktree",
+            "target_project_root",
             "project_root",
             "repo_root",
         ),
@@ -68195,10 +68203,27 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
         expected_revision = int(body.get("expected_execution_state_revision") or 0)
     except (TypeError, ValueError):
         expected_revision = -1
-    from .contract_state_runtime import build_cli_agent_execution_ticket
+    from .contract_state_runtime import (
+        _stable_json_hash,
+        build_cli_agent_execution_ticket,
+    )
+
+    canonical_root = str(launch_identity.get("target_project_root") or "").strip()
+    launch_worktree = str(launch_identity.get("worktree_path") or "").strip()
+    distinct_launch_worktree = bool(
+        canonical_root and launch_worktree and canonical_root != launch_worktree
+    )
+    ticket_authority = authority
+    if distinct_launch_worktree:
+        ticket_action = dict(action)
+        ticket_action.pop("target_project_root", None)
+        ticket_authority = {
+            **dict(authority),
+            "next_legal_action": ticket_action,
+        }
 
     execution_ticket = build_cli_agent_execution_ticket(
-        contract_runtime_current_state=authority,
+        contract_runtime_current_state=ticket_authority,
         launch_identity=launch_identity,
         expected_execution_state_revision=expected_revision,
         expected_execution_state_hash=str(
@@ -68208,6 +68233,49 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
             body.get("expected_dispatch_identity_hash") or ""
         ),
     )
+    if distinct_launch_worktree and execution_ticket.get("status") == "issued":
+        ticket_action = dict(execution_ticket.get("next_legal_action") or {})
+        ticket_action["target_project_root"] = canonical_root
+        execution_ticket["next_legal_action"] = ticket_action
+        execution_ticket["next_legal_action_hash"] = _stable_json_hash(ticket_action)
+        ticket_material = {
+            key: value
+            for key, value in execution_ticket.items()
+            if key not in {"ticket_id", "status", "issue_allowed", "ticket_hash"}
+        }
+        material_hash = _stable_json_hash(ticket_material)
+        execution_ticket["ticket_id"] = (
+            "caet-" + material_hash.removeprefix("sha256:")[:24]
+        )
+        execution_ticket.pop("ticket_hash", None)
+        execution_ticket["ticket_hash"] = _stable_json_hash(execution_ticket)
+        consumption_errors = []
+        if execution_ticket["ticket_id"] in set(
+            authority.get("consumed_ticket_ids") or []
+        ):
+            consumption_errors.append("execution ticket id was already consumed")
+        if execution_ticket["ticket_hash"] in set(
+            authority.get("consumed_ticket_hashes") or []
+        ):
+            consumption_errors.append("execution ticket hash was already consumed")
+        if consumption_errors:
+            execution_ticket = {
+                "schema_version": "cli_agent_execution_ticket.v1",
+                "status": "rejected",
+                "issue_allowed": False,
+                "source_of_authority": "ContractRuntime",
+                "dispatch_identity_hash": execution_ticket[
+                    "dispatch_identity_hash"
+                ],
+                "candidate_ticket_id": execution_ticket["ticket_id"],
+                "candidate_ticket_hash": execution_ticket["ticket_hash"],
+                "missing_authority_fields": [],
+                "mismatches": [],
+                "errors": consumption_errors,
+                "raw_credentials_persisted": False,
+                "raw_route_token_persisted": False,
+                "raw_private_context_persisted": False,
+            }
     if selector_mismatches:
         execution_ticket = {
             "schema_version": "cli_agent_execution_ticket.v1",
