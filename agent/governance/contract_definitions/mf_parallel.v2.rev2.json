@@ -203,24 +203,6 @@
         "stage_id": "worker_finish"
       },
       {
-        "description": "The bounded mf_sub worker explicitly hands the finished lane to QA after review_ready or waiting_merge.",
-        "lines": [
-          {
-            "allowed_writer_roles": [
-              "mf_sub"
-            ],
-            "description": "Worker-authored handoff that confirms the lane stopped at review_ready or waiting_merge and is ready for independent QA; observer must not synthesize this evidence.",
-            "evidence_kind": "review_ready",
-            "line_id": "worker_review_ready_handoff",
-            "owner_role": "mf_sub",
-            "requires": [
-              "worker_finish_gate"
-            ]
-          }
-        ],
-        "stage_id": "qa_handoff"
-      },
-      {
         "description": "Independent QA gathers graph context with QA identity before verification.",
         "lines": [
           {
@@ -232,14 +214,14 @@
             "line_id": "qa_graph_context",
             "owner_role": "qa",
             "requires": [
-              "worker_review_ready_handoff"
+              "worker_finish_gate"
             ]
           }
         ],
         "stage_id": "qa_graph_context"
       },
       {
-        "description": "Independent QA verifies the worker result after explicit handoff evidence exists.",
+        "description": "Independent QA verifies the worker result after finish-gate evidence exists.",
         "lines": [
           {
             "allowed_writer_roles": [

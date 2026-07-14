@@ -1810,7 +1810,7 @@ def test_builtin_mf_parallel_requirements_drive_role_bound_next_action_order():
     )
 
 
-def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_context():
+def test_builtin_mf_parallel_v2_requirements_transition_finish_directly_to_qa_graph():
     contract = {
         "contract": {
             "contract_id": "mf_parallel.v2",
@@ -1836,7 +1836,6 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
         "worker_commit",
         "worker_finish_time_attestation",
         "worker_finish_gate",
-        "worker_review_ready_handoff",
         "qa_graph_context",
         "qa_independent_verification",
         "observer_merge_queue_item_materialize",
@@ -1844,24 +1843,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
         "observer_reconcile",
         "observer_close_ready",
     ]
-
-    handoff = build_contract_state_projection(
-        [
-            _event(1, "contract_binding"),
-            _event(2, "dispatch_bounded_worker"),
-            _event(3, "mf_subagent_read_receipt"),
-            _event(4, "mf_subagent_startup"),
-            _event(5, "graph_trace"),
-            _event(6, "implementation"),
-            _event(7, "worker_commit"),
-            _event(8, "record_finish_time_worker_attestation"),
-            _event(9, "mf_subagent_finish_gate"),
-        ],
-        contract=contract,
-        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
-    )
-    assert handoff["next_legal_action"]["id"] == "worker_review_ready_handoff"
-    assert handoff["next_legal_action"]["timeline_append_hint"]["actor_role"] == "mf_sub"
+    assert "worker_review_ready_handoff" not in projection["required_evidence"]
 
     qa_graph = build_contract_state_projection(
         [
@@ -1874,7 +1856,6 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(7, "worker_commit"),
             _event(8, "record_finish_time_worker_attestation"),
             _event(9, "mf_subagent_finish_gate"),
-            _event(10, "review_ready"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
@@ -1894,8 +1875,7 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(7, "worker_commit"),
             _event(8, "record_finish_time_worker_attestation"),
             _event(9, "mf_subagent_finish_gate"),
-            _event(10, "review_ready"),
-            _event(11, "qa_graph_trace"),
+            _event(10, "qa_graph_trace"),
         ],
         contract=contract,
         backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
@@ -1913,9 +1893,8 @@ def test_builtin_mf_parallel_v2_requirements_add_worker_handoff_and_qa_graph_con
             _event(7, "worker_commit"),
             _event(8, "record_finish_time_worker_attestation"),
             _event(9, "mf_subagent_finish_gate"),
-            _event(10, "review_ready"),
             _event(
-                11,
+                10,
                 "qa_graph_trace",
                 payload={"graph_trace_evidence": _bounded_qa_graph_evidence()},
             ),

@@ -2496,19 +2496,6 @@ def _mf_parallel_default_requirements(
                 "order": 525,
             },
             {
-                "id": "worker_review_ready_handoff",
-                "action": "record_worker_review_ready_handoff",
-                "detail": (
-                    "mf_sub worker records review_ready handoff before independent "
-                    "QA begins; observer must not synthesize this evidence"
-                ),
-                "accepted_event_kinds": ["review_ready"],
-                "owner_role": "mf_sub",
-                "allowed_writer_roles": ["mf_sub"],
-                "requires": ["worker_finish_gate"],
-                "order": 650,
-            },
-            {
                 "id": "qa_graph_context",
                 "action": "record_qa_graph_trace",
                 "detail": (
@@ -2525,7 +2512,7 @@ def _mf_parallel_default_requirements(
                 "accepted_event_kinds": ["qa_graph_trace"],
                 "owner_role": "qa",
                 "allowed_writer_roles": ["qa"],
-                "requires": ["worker_review_ready_handoff"],
+                "requires": ["worker_finish_gate"],
                 "order": 680,
             },
         ]
