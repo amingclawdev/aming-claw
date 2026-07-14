@@ -342,6 +342,13 @@ class ProfileAuthController:
         created = self._prepare_private_directory(home)
         return home.resolve(), created
 
+    def managed_profile_home(self, profile_id: str, provider: str) -> Path:
+        """Return the canonical server-owned home without accepting a path."""
+
+        profile_dir, home = self._profile_paths(profile_id, provider)
+        self._assert_managed_path(profile_dir)
+        return self._assert_managed_path(home)
+
     @staticmethod
     def _state_path(profile_dir: Path) -> Path:
         return profile_dir / "auth-state.json"
@@ -363,6 +370,7 @@ class ProfileAuthController:
             "state": result.state,
             "reason_code": result.reason_code,
             "login_session_id": result.login_session_id,
+            "activated": result.activated,
             "evidence": dict(result.evidence),
             "raw_credential_material_persisted": False,
             "raw_provider_output_persisted": False,
@@ -472,6 +480,7 @@ class ProfileAuthController:
             reason_code=str(previous.get("reason_code") or "profile_discovered"),
             profile_home=str(resolved_home),
             login_session_id=str(previous.get("login_session_id") or ""),
+            activated=bool(previous.get("activated")),
             evidence=(
                 previous.get("evidence")
                 if isinstance(previous.get("evidence"), Mapping)
@@ -715,6 +724,9 @@ class ProfileAuthController:
             reason_code=reason_code,
             profile_home=str(home),
             login_session_id=str(previous.get("login_session_id") or ""),
+            activated=(
+                state == READY and bool(previous.get("activated"))
+            ),
             evidence=self._operation_evidence(
                 profile_id=safe_profile_id,
                 provider=safe_provider,

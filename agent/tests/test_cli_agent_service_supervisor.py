@@ -228,6 +228,104 @@ def test_supervisor_owns_process_group_lease_heartbeat_and_receipt(tmp_path):
     assert "private prompt" not in json.dumps(run_receipts)
 
 
+def test_managed_profile_launch_uses_exact_server_home_and_strips_provider_env(
+    tmp_path,
+    monkeypatch,
+):
+    from cli_agent_service.adapters.codex_cli import CodexCliAdapter
+    from cli_agent_service.auth import ProfileAuthController
+    from cli_agent_service.config import resolve_agent_config
+    from cli_agent_service.profile_control import ManagedProfileControl
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.supervisor import CodexC0Supervisor
+
+    executable = _fake_codex(tmp_path)
+
+    def ready_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, "Logged in", "")
+
+    registry = AgentRegistry(tmp_path / "managed-registry" / "runs.db")
+    auth = ProfileAuthController(
+        tmp_path / "managed-profiles",
+        codex_executable=str(executable),
+        runner=ready_runner,
+    )
+    control = ManagedProfileControl(registry, auth)
+    control.prepare_login("profile-codex-managed")
+    control.activate("profile-codex-managed")
+    profile = registry.get_profile("profile-codex-managed")
+    assert profile is not None
+    run = resolve_agent_config(
+        run_id="run-managed-profile",
+        role="dev",
+        project_id="aming-claw",
+        profile=profile,
+        created_at="2026-07-14T12:00:00Z",
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/ambient/claude")
+    monkeypatch.setenv("CODEX_HOME", "/ambient/codex")
+    monkeypatch.setenv("UNRELATED_MARKER", "preserved")
+    observed = {}
+
+    def recording_factory(*args, **kwargs):
+        observed.update(kwargs["env"])
+        return subprocess.Popen(*args, **kwargs)
+
+    supervisor = CodexC0Supervisor(
+        registry,
+        state_dir=tmp_path / "managed-state",
+        adapter=CodexCliAdapter(executable=str(executable)),
+        process_factory=recording_factory,
+        managed_profile_home_resolver=control.resolve_profile_home,
+        heartbeat_interval_seconds=0.03,
+    )
+    receipt = supervisor.start_run(
+        run,
+        prompt="managed prompt",
+        worktree=tmp_path,
+    ).wait(timeout=5)
+
+    expected_home = str(
+        auth.managed_profile_home("profile-codex-managed", "codex")
+    )
+    assert receipt.status == "completed"
+    assert observed["CODEX_HOME"] == expected_home
+    assert observed["UNRELATED_MARKER"] == "preserved"
+    assert "OPENAI_API_KEY" not in observed
+    assert "ANTHROPIC_API_KEY" not in observed
+    assert "CLAUDE_CONFIG_DIR" not in observed
+
+
+def test_inherited_current_launch_keeps_existing_provider_environment(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-inherited-key")
+    monkeypatch.setenv("CODEX_HOME", "/ambient/inherited-home")
+    observed = {}
+
+    def recording_factory(*args, **kwargs):
+        observed.update(kwargs["env"])
+        return subprocess.Popen(*args, **kwargs)
+
+    _registry_value, supervisor = _supervisor(
+        tmp_path,
+        process_factory=recording_factory,
+    )
+    receipt = supervisor.start_run(
+        _run("run-inherited-environment"),
+        prompt="inherited prompt",
+        worktree=tmp_path,
+    ).wait(timeout=5)
+
+    assert receipt.status == "completed"
+    assert observed["OPENAI_API_KEY"] == "ambient-inherited-key"
+    assert observed["CODEX_HOME"] == "/ambient/inherited-home"
+
+
 def test_supervisor_cancels_owned_process_group(tmp_path):
     registry, supervisor = _supervisor(tmp_path)
     run = _run("run-cancel")

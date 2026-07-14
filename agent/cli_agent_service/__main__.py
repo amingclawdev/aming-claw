@@ -23,7 +23,38 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("start", "health", "status", "stop"):
         command = subparsers.add_parser(name)
         command.add_argument("--state-dir", type=Path, default=None)
+
+    profile = subparsers.add_parser("profile")
+    profile_actions = profile.add_subparsers(
+        dest="profile_action",
+        required=True,
+    )
+    profile_list = profile_actions.add_parser("list")
+    profile_list.add_argument("--state-dir", type=Path, default=None)
+
+    login = profile_actions.add_parser("login")
+    login_actions = login.add_subparsers(dest="login_action", required=True)
+    login_prepare = login_actions.add_parser("prepare")
+    _add_profile_selector_arguments(login_prepare)
+
+    auth = profile_actions.add_parser("auth")
+    auth_actions = auth.add_subparsers(dest="auth_action", required=True)
+    auth_status = auth_actions.add_parser("status")
+    _add_profile_selector_arguments(auth_status)
+
+    activate = profile_actions.add_parser("activate")
+    _add_profile_selector_arguments(activate)
     return parser
+
+
+def _add_profile_selector_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("profile_id")
+    parser.add_argument(
+        "--provider",
+        choices=("codex", "openai"),
+        default="codex",
+    )
+    parser.add_argument("--state-dir", type=Path, default=None)
 
 
 def _print(payload: dict) -> None:
@@ -44,6 +75,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = current_status(paths)
         _print(payload)
         return 0 if payload.get("status") == "running" else 1
+    if args.command == "profile":
+        operations = {
+            "list": "profile_list",
+            "login": "profile_login_prepare",
+            "auth": "profile_auth_status",
+            "activate": "profile_activate",
+        }
+        operation = operations[args.profile_action]
+        request_payload = None
+        if args.profile_action != "list":
+            request_payload = {
+                "profile_id": args.profile_id,
+                "provider": args.provider,
+            }
+        try:
+            payload = request_service(
+                paths,
+                operation,
+                payload=request_payload,
+            )
+        except ServiceUnavailableError as exc:
+            payload = {**current_status(paths), "error": str(exc)}
+            _print(payload)
+            return 1
+        _print(payload)
+        return 0 if payload.get("ok") is True else 1
     try:
         payload = request_service(paths, args.command)
     except ServiceUnavailableError as exc:

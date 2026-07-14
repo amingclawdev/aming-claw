@@ -29,12 +29,16 @@ from .launchers import (
     clear_worker_auth_environment,
     default_host_envelope_store,
 )
-from .models import AgentRun, ReconciliationResult
+from .models import AgentProfile, AgentRun, ReconciliationResult
 from .registry import AgentRegistry, process_start_identity
 
 
 class SupervisorError(RuntimeError):
     pass
+
+
+_PROVIDER_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "CODEX_", "OPENAI_")
+_PROVIDER_HOME_ENV_KEYS = {"CLAUDE_CONFIG_DIR", "CODEX_HOME"}
 
 
 def _timestamp(value: datetime | None = None) -> str:
@@ -103,6 +107,9 @@ class CodexC0Supervisor:
         process_identity_reader: Callable[[int], str | None] = process_start_identity,
         run_receipt_sink: Callable[[dict[str, Any]], Any] | None = None,
         host_envelope_store: HostEnvelopeStore | None = None,
+        managed_profile_home_resolver: (
+            Callable[[AgentProfile], str | os.PathLike[str]] | None
+        ) = None,
     ) -> None:
         self.registry = registry
         self.state_dir = Path(state_dir).expanduser()
@@ -119,6 +126,7 @@ class CodexC0Supervisor:
             if host_envelope_store is not None
             else default_host_envelope_store()
         )
+        self.managed_profile_home_resolver = managed_profile_home_resolver
         self.receipt_journal = RunReceiptJournal(self.state_dir / "run-receipts")
         self.run_receipt_sink = run_receipt_sink
         self.owner_id = "cli-agent-host-{}".format(os.getpid())
@@ -190,6 +198,45 @@ class CodexC0Supervisor:
             time.sleep(0.01)
         raise SupervisorError("spawned process identity is not observable")
 
+    def _profile_home_for_run(self, run: AgentRun) -> Path | None:
+        profile = run.profile
+        if profile is None:
+            return None
+        ref_kind = str(profile.credential_ref.ref_kind or "").strip()
+        if ref_kind == "inherited_current":
+            return None
+        if ref_kind != "provider_home":
+            raise SupervisorError("Codex profile credential mode is unsupported")
+        if self.managed_profile_home_resolver is None:
+            raise SupervisorError("managed Codex profile home resolver is unavailable")
+        try:
+            home = Path(self.managed_profile_home_resolver(profile)).resolve()
+        except BaseException as exc:
+            raise SupervisorError("managed Codex profile home is unavailable") from exc
+        if not home.is_dir():
+            raise SupervisorError("managed Codex profile home is unavailable")
+        return home
+
+    @staticmethod
+    def _spawn_environment(
+        launch_environment: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        if launch_environment is None:
+            return child_process_environment(None)
+        if set(launch_environment) != {"CODEX_HOME"}:
+            raise SupervisorError("managed Codex launch environment is invalid")
+        codex_home = str(launch_environment.get("CODEX_HOME") or "").strip()
+        if not codex_home:
+            raise SupervisorError("managed Codex launch environment is invalid")
+        environment = child_process_environment(None)
+        for key in tuple(environment):
+            if key in _PROVIDER_HOME_ENV_KEYS or key.startswith(
+                _PROVIDER_ENV_PREFIXES
+            ):
+                environment.pop(key, None)
+        environment["CODEX_HOME"] = codex_home
+        return environment
+
     def _revoke_host_envelope(self, run_id: str, owner_id: str = "") -> None:
         try:
             self.host_envelope_store.revoke(
@@ -217,10 +264,12 @@ class CodexC0Supervisor:
         stdout_path = run_dir / "stdout.log"
         stderr_path = run_dir / "stderr.log"
         try:
+            profile_home = self._profile_home_for_run(run)
             launch = self.adapter.build_launch_spec(
                 run,
                 worktree=worktree,
                 output_path=output_path,
+                profile_home=profile_home,
             )
             command_hash = hash_command(launch.command)
             prompt_hash = hash_text(prompt)
@@ -273,7 +322,7 @@ class CodexC0Supervisor:
                 os.chmod(stderr_path, 0o600)
                 stdout_target = stdout_handle
                 stderr_target = stderr_handle
-            spawn_environment = child_process_environment(launch.environment)
+            spawn_environment = self._spawn_environment(launch.environment)
             try:
                 if host_envelope is not None:
                     host_envelope.apply_to(spawn_environment)

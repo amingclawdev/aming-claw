@@ -20,6 +20,7 @@ from .adapters.codex_desktop import (
     CodexDesktopAdapter,
     DesktopHostAdapterError,
 )
+from .auth import ProfileAuthController
 from .health import health_payload, stopped_payload
 from .launchers import (
     HostEnvelopeError,
@@ -27,6 +28,11 @@ from .launchers import (
     scrub_host_envelope_payload,
 )
 from .registry import AgentRegistry, _profile_from_dict, _run_from_dict
+from .profile_control import (
+    ManagedProfileControl,
+    PROFILE_OPERATIONS,
+    ProfileControlError,
+)
 from .supervisor import CodexC0Supervisor
 
 
@@ -309,6 +315,8 @@ class CliAgentService:
         host_envelope_store: HostEnvelopeStore | None = None,
         registry: AgentRegistry | None = None,
         supervisor: CodexC0Supervisor | None = None,
+        profile_auth_controller: ProfileAuthController | None = None,
+        profile_control: ManagedProfileControl | None = None,
     ) -> None:
         self.paths = paths
         self.paths.prepare()
@@ -337,6 +345,28 @@ class CliAgentService:
                 state_dir=self.paths.state_dir / "supervisor",
                 host_envelope_store=self.host_envelope_store,
             )
+        if profile_control is not None:
+            if profile_control.registry is not self.registry:
+                raise ServiceError("profile control registry does not match service registry")
+            if (
+                profile_auth_controller is not None
+                and profile_control.auth_controller is not profile_auth_controller
+            ):
+                raise ServiceError("profile control auth controller does not match")
+            self.profile_control = profile_control
+            self.profile_auth_controller = profile_control.auth_controller
+        else:
+            self.profile_auth_controller = (
+                profile_auth_controller
+                or ProfileAuthController(self.paths.state_dir / "profiles")
+            )
+            self.profile_control = ManagedProfileControl(
+                self.registry,
+                self.profile_auth_controller,
+            )
+        self.supervisor.managed_profile_home_resolver = (
+            self.profile_control.resolve_profile_home
+        )
         self._receipt_sink_delegate = self.supervisor.run_receipt_sink
         self.supervisor.run_receipt_sink = self._project_run_receipt
         self._restart_reconciled = False
@@ -838,6 +868,16 @@ class CliAgentService:
             return self._snapshot(accepting_agent_runs=False), False
         if operation == "stop":
             return self._snapshot(stopping=True), True
+        if operation in PROFILE_OPERATIONS:
+            payload = request.get("payload")
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, Mapping):
+                raise ServiceError("profile operation payload must be an object")
+            try:
+                return self.profile_control.dispatch(operation, payload), False
+            except ProfileControlError as exc:
+                raise ServiceError(str(exc)) from exc
         if operation == "start_host_envelope_run":
             payload = request.get("payload")
             if not isinstance(payload, Mapping):
@@ -888,6 +928,7 @@ class CliAgentService:
                 "stop",
                 "host_envelope",
                 "start_host_envelope_run",
+                *sorted(PROFILE_OPERATIONS),
                 "desktop_host_register",
                 "desktop_host_heartbeat",
                 "desktop_execution_ticket_admit",

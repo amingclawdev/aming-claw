@@ -199,6 +199,70 @@ def test_daemon_socket_admits_when_optional_authority_hashes_are_omitted(tmp_pat
         assert thread.is_alive() is False
 
 
+def test_daemon_exposes_only_fixed_managed_profile_operations(tmp_path):
+    from cli_agent_service.auth import ProfileAuthController
+    from cli_agent_service.service import (
+        CliAgentService,
+        ServicePaths,
+        request_service,
+    )
+
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    def ready_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, "Logged in", "")
+
+    paths = ServicePaths.from_state_dir(tmp_path / "private-state")
+    auth = ProfileAuthController(
+        tmp_path / "private-state" / "profiles",
+        codex_executable=str(executable),
+        runner=ready_runner,
+    )
+    service = CliAgentService(paths, profile_auth_controller=auth)
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _wait_for(paths.socket_path)
+        selector = {"profile_id": "profile-codex-a", "provider": "codex"}
+
+        prepared = request_service(
+            paths,
+            "profile_login_prepare",
+            payload=selector,
+        )
+        assert prepared["state"] == "login_in_progress"
+        assert all(item["user_triggered"] for item in prepared["actions"])
+
+        activated = request_service(
+            paths,
+            "profile_activate",
+            payload=selector,
+        )
+        assert activated["activated"] is True
+        assert activated["profile_registered"] is True
+
+        listed = request_service(paths, "profile_list")
+        assert [item["profile_id"] for item in listed["profiles"]] == [
+            "profile-codex-a"
+        ]
+
+        refused = request_service(
+            paths,
+            "profile_auth_status",
+            payload={**selector, "environment": {"CODEX_HOME": "/caller"}},
+        )
+        assert refused["ok"] is False
+        assert refused["status"] == "invalid_request"
+        assert "unsupported fields" in refused["error"]
+    finally:
+        if thread.is_alive():
+            request_service(paths, "stop")
+        thread.join(timeout=5)
+        assert thread.is_alive() is False
+
+
 def test_daemon_is_not_coupled_to_service_manager():
     for name in ("service.py", "health.py", "__main__.py"):
         source = (AGENT_DIR / "cli_agent_service" / name).read_text(encoding="utf-8")
