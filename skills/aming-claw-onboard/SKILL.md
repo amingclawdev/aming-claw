@@ -68,15 +68,16 @@ instructions.
 - For QA evidence that is materialized by a parent observer, keep the QA owner,
   submitter, materialized-from, and authorization provenance fields returned by
   the runtime guide; do not collapse it into observer-authored QA.
-- For `mf_parallel` workers, finish-time worker attestation and finish gate
-  must happen before the worker creates a git commit. Finish gate is the
-  worker's last governance write; after `mf_subagent_finish_gate`, commit only
-  if the gate passed, then resume the parent contract with independent QA and
-  call `parallel_branch_merge_queue_materialize` (or HTTP
+- For `mf_parallel.v2` workers, record implementation evidence, create one
+  clean git commit, record that exact immutable HEAD through canonical
+  `runtime_context_worker_commit`, then submit finish-time worker attestation
+  and finish gate. Finish gate is the worker's last governance write; after it
+  passes, resume the parent contract with independent QA and call
+  `parallel_branch_merge_queue_materialize` (or HTTP
   `parallel-branches/merge-queue/materialize`) with the finish checkpoint before
-  `parallel_branch_merge_queue_apply`. If the branch was already committed
-  before finish gate, stop unless the guide returns an explicit committed-branch
-  evidence lane.
+  `parallel_branch_merge_queue_apply`. Timeline implementation events are
+  append-only compatibility projections and never override canonical
+  ContractRuntime worker implementation or worker commit state.
 - Route-token-ref renewal must preserve or narrow the existing project,
   backlog/task, allowed-actions, target-files, and owned-files scope. If the
   observer session is stale, heartbeat or register an observer session before

@@ -11,7 +11,7 @@ from agent.governance.contracts import ContractDefinitionRegistry, ContractRunti
 from agent.governance.contracts.hash import file_sha256
 from agent.governance.contracts.runtime import (
     _contract_completion_satisfying_lines,
-    _mf_parallel_worker_commit_errors,
+    _worker_implementation_lineage,
     ContractRuntimeError,
     read_backlog_contract_chain_current,
     rebuild_backlog_contract_chain_projection,
@@ -159,7 +159,7 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     ] is True
 
 
-def test_projected_record_exposes_non_persistent_lines_to_worker_commit_lineage(
+def test_projected_record_cannot_override_canonical_worker_commit_lineage(
     tmp_path,
 ):
     _write_contract_definition(
@@ -262,13 +262,62 @@ def test_projected_record_exposes_non_persistent_lines_to_worker_commit_lineage(
         "payload": identity,
     }
 
-    assert projected["completed_lines"] == [projected_line]
-    assert runtime.store.get(record["contract_execution_id"])["completed_lines"] == []
-    assert _mf_parallel_worker_commit_errors(
-        projected,
+    projected_precheck = runtime.precheck_line_write(
+        record["contract_execution_id"],
         write,
         actor_role="mf_sub",
-    ) == ()
+        projected_completed_lines=[projected_line],
+    )
+    assert projected["completed_lines"] == [projected_line]
+    assert runtime.store.get(record["contract_execution_id"])["completed_lines"] == []
+    assert projected_precheck["ok"] is False
+    assert any(
+        "requires matching worker_implementation lineage" in error
+        for error in projected_precheck["decision"]["errors"]
+    )
+
+    canonical_write = {
+        **_write_from(
+            runtime.store.get(record["contract_execution_id"]),
+            actor_role="mf_sub",
+            stage_id="worker_implementation",
+            line_id="worker_implementation",
+            evidence_kind="implementation",
+        ),
+        "runtime_context_id": identity["runtime_context_id"],
+        "task_id": identity["task_id"],
+        "payload": projected_line["payload"],
+    }
+    implementation_result = runtime.submit_line_write(
+        record["contract_execution_id"],
+        canonical_write,
+        actor_role="mf_sub",
+    )
+    assert implementation_result["ok"] is True
+    canonical_record = runtime.store.get(record["contract_execution_id"])
+    canonical_implementation = canonical_record["completed_lines"][-1]
+    identity["implementation_lineage_ref"] = _worker_implementation_lineage(
+        canonical_record,
+        canonical_implementation,
+    )["implementation_lineage_ref"]
+    canonical_commit_write = {
+        **_write_from(
+            canonical_record,
+            actor_role="mf_sub",
+            stage_id="worker_commit",
+            line_id="worker_commit",
+            evidence_kind="worker_commit",
+        ),
+        "commit_sha": identity["commit_sha"],
+        "payload": identity,
+    }
+
+    canonical_precheck = runtime.precheck_line_write(
+        record["contract_execution_id"],
+        canonical_commit_write,
+        actor_role="mf_sub",
+    )
+    assert canonical_precheck["ok"] is True
 
 
 def _write_minimal_contract(tmp_path, *, status: str = "active"):

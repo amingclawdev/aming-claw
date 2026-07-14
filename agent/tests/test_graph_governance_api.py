@@ -35,6 +35,7 @@ from agent.governance import task_timeline
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     _mf_parallel_worker_commit_errors,
+    _worker_implementation_lineage,
 )
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
@@ -525,6 +526,7 @@ def test_worker_commit_startup_principal_uses_only_non_placeholder_authority(
         ("wrong_commit", "head_commit must equal commit_sha"),
         ("dirty", "rejects dirty worktree evidence"),
         ("out_of_fence", "contains out-of-fence files"),
+        ("wrong_lineage", "implementation_lineage_ref does not match"),
         ("observer_impersonation", "rejects observer impersonation"),
         ("observer_actor", "requires actor_role=mf_sub"),
     ],
@@ -552,6 +554,10 @@ def test_contract_runtime_worker_commit_proof_rejects_invalid_evidence(
             "outside-owned-fence.py",
         ]
         payload["commit_diff_files"] = list(payload["changed_files"])
+    elif mutation == "wrong_lineage":
+        payload["implementation_lineage_ref"] = (
+            "contract-runtime:worker-implementation:sha256:wrong"
+        )
     elif mutation == "observer_impersonation":
         payload["observer_impersonation"] = True
     elif mutation == "observer_actor":
@@ -559,6 +565,71 @@ def test_contract_runtime_worker_commit_proof_rejects_invalid_evidence(
 
     errors = _mf_parallel_worker_commit_errors(record, write, actor_role=actor_role)
     assert any(expected_error in error for error in errors)
+
+
+def test_worker_commit_timeline_alias_only_projects_same_canonical_line():
+    lineage = {
+        "contract_execution_id": "cex-worker-alias",
+        "runtime_context_id": "mfrctx-worker-alias",
+        "task_id": "worker-alias-task",
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": "runtime_context:mfrctx-worker-alias",
+        "evidence_kind": "implementation",
+        "implementation_lineage_ref": (
+            "contract-runtime:worker-implementation:sha256:canonical"
+        ),
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-worker-alias"],
+    }
+    canonical_line = {
+        field: lineage[field]
+        for field in (
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "stage_id",
+            "line_id",
+            "line_instance_id",
+            "evidence_kind",
+        )
+    }
+    matching_event = {
+        "id": 101,
+        "payload": {
+            "contract_runtime_canonical_line": canonical_line,
+            "changed_files": ["agent/governance/server.py"],
+            "graph_trace_ids": ["gqt-worker-alias"],
+        },
+    }
+    conflicting_event = {
+        "id": 102,
+        "payload": {
+            "contract_runtime_canonical_line": {
+                **canonical_line,
+                "line_instance_id": "runtime_context:other",
+            },
+            "changed_files": ["outside-canonical-line.py"],
+            "graph_trace_ids": ["gqt-other-line"],
+        },
+    }
+
+    assert server._runtime_context_worker_commit_timeline_alias(
+        [matching_event],
+        implementation_event_ref="timeline:101",
+        worker_implementation_lineage=lineage,
+    )["status"] == "matching_projection"
+    assert server._runtime_context_worker_commit_timeline_alias(
+        [matching_event, conflicting_event],
+        implementation_event_ref="",
+        worker_implementation_lineage=lineage,
+    ) == {}
+    with pytest.raises(ValidationError, match="does not project the canonical"):
+        server._runtime_context_worker_commit_timeline_alias(
+            [matching_event, conflicting_event],
+            implementation_event_ref="timeline:102",
+            worker_implementation_lineage=lineage,
+        )
 
 
 def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift(
@@ -11499,6 +11570,10 @@ def test_runtime_context_parent_route_lineage_error_retry_body_succeeds(
     )
     assert retry_body["route_token_ref"] == parent_issue["route_token_ref"]
     assert "route_token" not in retry_body
+    assert not (
+        set(retry_body)
+        & (set(server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS) - {"route_token_ref"})
+    )
     retry_body.update(
         {
             "fence_token": "fence-parent-lineage-retry",
@@ -25726,6 +25801,10 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     )
     assert implementation_skeleton["copy_safe_body"]["route_token_ref"] == (
         route_identity["route_token_ref"]
+    )
+    assert not (
+        set(implementation_skeleton["copy_safe_body"])
+        & (set(server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS) - {"route_token_ref"})
     )
     assert implementation_skeleton["route_token_policy"][
         "omit_stale_child_route_token_when_using_parent_route_token_ref"
@@ -47031,7 +47110,7 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
-def test_runtime_context_startup_and_implementation_advance_canonical_contract(
+def test_worker_commit_succeeds_without_implementation_timeline_event(
     conn,
     tmp_path,
 ):
@@ -47247,26 +47326,6 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     assert graph_line["accepted"] is True
 
     worker_file.write_text("implementation\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "agent/governance/server.py"],
-        cwd=worker_root,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "implementation"],
-        cwd=worker_root,
-        check=True,
-        capture_output=True,
-    )
-    worker_commit = batch_jobs.git_commit(worker_root)
-    runtime_context = upsert_branch_context(
-        conn,
-        replace(
-            runtime_context,
-            head_commit=worker_commit,
-            target_head_commit=worker_commit,
-        ),
-    )
 
     child_route = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
@@ -47317,7 +47376,6 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
                     "graph_trace_ids": [graph_trace_id],
                     "test_results": {"passed": True},
                     "summary": "canonical worker bridge implementation",
-                    "commit_sha": worker_commit,
                     "route_token_ref": child_route["route_token_ref"],
                     **child_route_identity,
                 },
@@ -47333,6 +47391,25 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
         "worker_implementation"
     )
     implementation_line = contract_record["completed_lines"][-1]
+    implementation_lineage = _worker_implementation_lineage(
+        contract_record,
+        implementation_line,
+    )
+    assert implementation_lineage["source_of_authority"] == (
+        "ContractRuntime.completed_lines.worker_implementation"
+    )
+    worker_projection = (
+        server._runtime_context_contract_runtime_worker_projection(
+            conn,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=worker_task_id,
+        )
+    )
+    assert worker_projection["worker_implementation_lineage"] == (
+        implementation_lineage
+    )
+    assert worker_projection["timeline_projection_authoritative"] is False
     assert implementation_line["payload"]["changed_files"] == [
         "agent/governance/server.py"
     ]
@@ -47363,6 +47440,39 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     assert implementation_event["payload"]["resolved_route_scope"]["task_id"] == (
         contract_execution_id
     )
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE id = ?",
+        (implementation_event["id"],),
+    )
+    conn.commit()
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="implementation",
+    ) == []
+
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=worker_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "implementation"],
+        cwd=worker_root,
+        check=True,
+        capture_output=True,
+    )
+    worker_commit = batch_jobs.git_commit(worker_root)
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            head_commit=worker_commit,
+            target_head_commit=worker_commit,
+        ),
+    )
+    conn.commit()
 
     worker_commit_response = (
         server.handle_graph_governance_runtime_context_worker_commit(
@@ -47385,7 +47495,9 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
                     "worker_session_id": actual_worker_id,
                     "filer_principal": actual_worker_id,
                     "actor": actual_worker_id,
-                    "implementation_event_ref": f"timeline:{implementation_event['id']}",
+                    "implementation_lineage_ref": implementation_lineage[
+                        "implementation_lineage_ref"
+                    ],
                     "worker_commit_sha": worker_commit,
                     "commit_sha": worker_commit,
                     "head_commit": worker_commit,
@@ -47401,6 +47513,10 @@ def test_runtime_context_startup_and_implementation_advance_canonical_contract(
     assert worker_commit_response["worker_commit"]["changed_files"] == [
         "agent/governance/server.py"
     ]
+    assert worker_commit_response["worker_commit"][
+        "implementation_lineage_ref"
+    ] == implementation_lineage["implementation_lineage_ref"]
+    assert "implementation_event_ref" not in worker_commit_response["worker_commit"]
     committed_record = server._contract_runtime_store(conn).get(
         contract_execution_id
     )
@@ -48129,6 +48245,14 @@ def test_mf_parallel_merge_route_scope_mismatch_blocks_contract_ref_before_mater
 
 
 def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs():
+    implementation_lineage = {
+        "source_of_authority": (
+            "ContractRuntime.completed_lines.worker_implementation"
+        ),
+        "implementation_lineage_ref": (
+            "contract-runtime:worker-implementation:sha256:guide-scope"
+        ),
+    }
     payloads = server._runtime_context_worker_recovery_payloads(
         project_id=PID,
         runtime_context_id="mfrctx-guide-scope",
@@ -48148,6 +48272,7 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
             "visible_injection_manifest_hash": "sha256:visible-guide-scope",
         },
         successor_contract_execution_id="cex-guide-scope-contract",
+        worker_implementation_lineage=implementation_lineage,
     )
 
     merge_payloads = payloads["merge_gate_evidence_payloads"]
@@ -48157,6 +48282,11 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "copy_safe_body"
     ]
     apply_body = merge_payloads["apply_merge_queue_item"]["copy_safe_body"]
+    implementation_body = payloads[
+        "implementation_evidence_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    worker_commit_skeleton = payloads["worker_commit_facade_payload_skeleton"]
+    worker_commit_body = worker_commit_skeleton["copy_safe_body"]
 
     assert contract_refs["route_token_ref"] == "rtok-contract-runtime-guide-scope"
     assert "parallel_branch_merge_queue_materialize" in contract_refs["not_valid_for"]
@@ -48173,6 +48303,44 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "worker_task_id"
     )
     assert apply_body["route_token_task_id_scope"].startswith("worker_task_id")
+    assert set(implementation_body) & set(
+        server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ) == {"route_token_ref"}
+    assert worker_commit_body["implementation_lineage_ref"] == (
+        implementation_lineage["implementation_lineage_ref"]
+    )
+    assert worker_commit_body["worker_implementation_lineage"] == (
+        implementation_lineage
+    )
+    assert "implementation_event_ref" not in worker_commit_body
+    assert worker_commit_skeleton["implementation_event_ref"] == {
+        "required": False,
+        "compatibility_alias_only": True,
+        "must_project_same_canonical_line": True,
+    }
+
+
+def test_active_onboard_skill_uses_canonical_mf_parallel_finish_order():
+    skill_text = (
+        Path(__file__).resolve().parents[2]
+        / "skills"
+        / "aming-claw-onboard"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    sequence = [
+        "record implementation evidence",
+        "create one\n  clean git commit",
+        "runtime_context_worker_commit",
+        "finish-time worker attestation",
+        "finish gate",
+    ]
+    positions = [skill_text.index(item) for item in sequence]
+    assert positions == sorted(positions)
+    assert (
+        "finish gate\n  must happen before the worker creates a git commit"
+        not in skill_text
+    )
 
 
 def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_command(
