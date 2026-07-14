@@ -52094,7 +52094,10 @@ def _onboard_contract_route_guide(
         },
         {
             "id": "parallel_worker",
-            "entry": "agent_onboard_guidance.onboard_route_guide.role_entries.worker",
+            "entry": (
+                "agent_onboard_guidance.onboard_route_guide.role_entries."
+                "observer.parallel_worker"
+            ),
         },
         {
             "id": "qa_verification",
@@ -52521,6 +52524,92 @@ def _onboard_contract_route_guide(
     direct_fix_guidance = _direct_fix_topology_guidance()
     runtime_authority_preference = _runtime_authority_preference_guidance()
     legacy_operator_recovery = _legacy_operator_recovery_guidance()
+    parallel_worker_discovery_path = (
+        "agent_onboard_guidance.onboard_route_guide.role_entries."
+        "observer.parallel_worker"
+    )
+    parallel_worker_discovery = {
+        "schema_version": "onboard_route_guide.parallel_worker_discovery.v1",
+        "work_type": "parallel_worker",
+        "owner_role": "observer",
+        "required_before": "mf_parallel_enter",
+        "worker_host_selection": {
+            "required": True,
+            "selected_by_role": "observer",
+            "observer_as_worker_allowed": False,
+            "options": [
+                {
+                    "id": "cli_agent_service",
+                    "label": "CLI Agent Service",
+                    "separate_from_observer": True,
+                },
+                {
+                    "id": "host_created_bounded_subagent",
+                    "label": "host-created bounded subagent",
+                    "separate_from_observer": True,
+                },
+            ],
+            "selection_rule": (
+                "select one separate CLI Agent Service or host-created bounded "
+                "subagent; the observer session must never act as the worker"
+            ),
+        },
+        "executor_availability_policy": {
+            "service_manager_or_executor_absence": {
+                "components": ["ServiceManager", "executor"],
+                "default": "blocking",
+                "nonblocking_only_when": {
+                    "all_of": [
+                        "core_contract_runtime_usable",
+                        "advanced_executor_drift_explicitly_waived",
+                    ],
+                    "fallback_worker_host": "host_created_bounded_subagent",
+                    "waiver_field": "advanced_executor_drift_waived",
+                },
+            },
+            "core_contract_runtime_remains_authoritative": True,
+            "adds_executor": False,
+            "adds_gate": False,
+            "adds_authority": False,
+        },
+        "worker_handoff": {
+            "initial_join": {
+                "owner_role": "observer_or_host_adapter",
+                "tool": "runtime_context_session_token_initial_join",
+                "produces": "worker_host_envelope",
+            },
+            "worker_owned_sequence": [
+                "runtime_context_worker_guide",
+                "runtime_context_read_receipt",
+                "parallel_branch_startup",
+                "graph_query",
+                "runtime_context_implementation_evidence",
+                "runtime_context_finish_time_worker_attestation",
+                "runtime_context_finish_gate",
+            ],
+            "git_commit_after_finish_gate": True,
+            "observer_must_not_author_worker_evidence": True,
+        },
+        "diagnostics": {
+            "missing_executor_manager": {
+                "code": "executor_manager_missing",
+                "category": "worker_host_discovery",
+                "blocking": "conditional",
+                "nonblocking_only_when": [
+                    "core_contract_runtime_usable",
+                    "advanced_executor_drift_explicitly_waived",
+                ],
+                "next_action": "select_host_created_bounded_subagent",
+            },
+            "missing_worker_host_envelope": {
+                "code": "worker_host_envelope_missing",
+                "category": "worker_runtime_identity",
+                "blocking": True,
+                "next_action": "runtime_context_session_token_initial_join",
+            },
+        },
+        "source_of_authority": "ContractRuntime",
+    }
     return {
         "schema_version": "onboard_contract.route_guide_service.v1",
         "service": {
@@ -52587,6 +52676,7 @@ def _onboard_contract_route_guide(
                     "requires_role": "observer",
                     "requires_route_token_ref": True,
                     "single_backlog_scoped": True,
+                    "pre_enter_discovery": parallel_worker_discovery_path,
                 },
                 "mf_batch_parallel": {
                     "interface": "mf_batch_parallel_enter",
@@ -52633,6 +52723,7 @@ def _onboard_contract_route_guide(
                 "current_route_token_ref_present": bool(route_token_ref),
                 "next_action": "follow next_legal_action or create a successor contract/runtime",
                 "observer_session_route_token_checklist": observer_route_checklist,
+                "parallel_worker": parallel_worker_discovery,
                 "next_contracts": [
                     {
                         "contract_id": DIRECT_FIX_CONTRACT_ID,
@@ -52645,6 +52736,7 @@ def _onboard_contract_route_guide(
                         "contract_id": "mf_parallel",
                         "interface": "mf_parallel_enter",
                         "single_backlog_scoped": True,
+                        "pre_enter_discovery": parallel_worker_discovery_path,
                     },
                     {
                         "contract_id": "mf_batch_parallel",
@@ -52691,6 +52783,7 @@ def _onboard_contract_route_guide(
                 "direct_fix_topology_guidance",
                 "runtime_authority_preference",
                 "legacy_operator_recovery",
+                "parallel_worker_discovery",
             ],
             "interfaces": [
                 "graph_query",
@@ -52747,6 +52840,7 @@ def _onboard_contract_route_guide(
                     "agent_onboard_guidance.onboard_route_guide."
                     "legacy_operator_recovery"
                 ),
+                "parallel_worker_discovery": parallel_worker_discovery_path,
             },
         },
         "system_operation_index": {
@@ -52862,6 +52956,7 @@ def _onboard_contract_route_guide(
         "direct_fix_topology_guidance": direct_fix_guidance,
         "runtime_authority_preference": runtime_authority_preference,
         "legacy_operator_recovery": legacy_operator_recovery,
+        "parallel_worker_discovery": parallel_worker_discovery,
         "next_legal_action": dict(next_legal_action),
         "route_token_ref": route_token_ref,
         "route_token_ref_present": bool(route_token_ref),
@@ -53657,11 +53752,18 @@ def _onboard_route_guide_completed_next_action(
             "single_backlog_scoped": True,
             "requires_observer_dispatch": True,
             "worker_direct_entry_allowed": False,
+            "requires_worker_host_discovery": True,
+            "worker_host_discovery_path": (
+                "agent_onboard_guidance.onboard_route_guide.role_entries."
+                "observer.parallel_worker"
+            ),
+            "observer_as_worker_allowed": False,
             "worker_runtime_guide_after_dispatch": "runtime_context_worker_guide",
             "next_step": (
-                "use mf_parallel_enter from an observer route to create the "
-                "row-scoped worker runtime; the worker then reads "
-                "runtime_context_worker_guide"
+                "select a separate CLI Agent Service or host-created bounded "
+                "subagent, then use mf_parallel_enter from the observer route to "
+                "create the row-scoped worker runtime; the observer must never act "
+                "as the worker"
             ),
         }
     return {

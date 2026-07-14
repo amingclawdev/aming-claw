@@ -38070,6 +38070,99 @@ def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_rol
     )
 
 
+def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(conn):
+    backlog_id = "AC-ONBOARD-OBSERVER-PARALLEL-WORKER-DISCOVERY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+                "route_token_ref": "rtok-onboard-observer-parallel-worker",
+            },
+        )
+    )
+
+    guide = result["onboard_route_guide"]
+    parallel_option = next(
+        option for option in guide["work_type_options"]
+        if option["id"] == "parallel_worker"
+    )
+    discovery_path = (
+        "agent_onboard_guidance.onboard_route_guide.role_entries."
+        "observer.parallel_worker"
+    )
+    assert parallel_option["entry"] == discovery_path
+    discovery = guide["role_entries"]["observer"]["parallel_worker"]
+    assert result["agent_onboard_guidance"]["selected_role_guidance"][
+        "parallel_worker"
+    ] == discovery
+    assert guide["parallel_worker_discovery"] == discovery
+    assert discovery["required_before"] == "mf_parallel_enter"
+
+    host_selection = discovery["worker_host_selection"]
+    assert host_selection["observer_as_worker_allowed"] is False
+    assert {option["id"] for option in host_selection["options"]} == {
+        "cli_agent_service",
+        "host_created_bounded_subagent",
+    }
+    assert all(
+        option["separate_from_observer"] is True
+        for option in host_selection["options"]
+    )
+
+    availability = discovery["executor_availability_policy"][
+        "service_manager_or_executor_absence"
+    ]
+    assert availability["components"] == ["ServiceManager", "executor"]
+    assert availability["default"] == "blocking"
+    assert availability["nonblocking_only_when"]["all_of"] == [
+        "core_contract_runtime_usable",
+        "advanced_executor_drift_explicitly_waived",
+    ]
+    assert availability["nonblocking_only_when"]["waiver_field"] == (
+        "advanced_executor_drift_waived"
+    )
+
+    diagnostics = discovery["diagnostics"]
+    assert diagnostics["missing_executor_manager"]["code"] == (
+        "executor_manager_missing"
+    )
+    assert diagnostics["missing_executor_manager"]["blocking"] == "conditional"
+    assert diagnostics["missing_worker_host_envelope"]["code"] == (
+        "worker_host_envelope_missing"
+    )
+    assert diagnostics["missing_worker_host_envelope"]["blocking"] is True
+    assert diagnostics["missing_worker_host_envelope"]["next_action"] == (
+        "runtime_context_session_token_initial_join"
+    )
+
+    handoff = discovery["worker_handoff"]
+    assert handoff["initial_join"]["tool"] == (
+        "runtime_context_session_token_initial_join"
+    )
+    assert handoff["worker_owned_sequence"] == [
+        "runtime_context_worker_guide",
+        "runtime_context_read_receipt",
+        "parallel_branch_startup",
+        "graph_query",
+        "runtime_context_implementation_evidence",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+    ]
+    assert handoff["git_commit_after_finish_gate"] is True
+    assert handoff["observer_must_not_author_worker_evidence"] is True
+
+    next_action = result["next_legal_action"]
+    assert next_action["requires_worker_host_discovery"] is True
+    assert next_action["worker_host_discovery_path"] == discovery_path
+    assert next_action["observer_as_worker_allowed"] is False
+
+
 def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(conn):
     result = server.handle_project_onboard_route_guide(
         _ctx(
