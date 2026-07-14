@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -39,9 +40,31 @@ class _RecordingSupervisor:
         self.owner_id = "daemon-guided-owner"
         self.run_receipt_sink = None
         self.managed_profile_home_resolver = None
+        self.lease_ttl_seconds = 60
         self.starts = []
+        self.start_leases = []
+        self.host_envelope_consumed = []
+        self.consumed_environment_keys = []
 
     def start_run(self, run, **kwargs):
+        record = self.registry.get_run(run.run_id)
+        assert record is not None
+        assert record.lease is not None
+        assert record.lease.status == "active"
+        assert record.lease.owner_id == self.owner_id
+        self.start_leases.append(record.lease)
+        delivery = self.host_envelope_store.consume(
+            run.run_id,
+            lease_owner_id=self.owner_id,
+            lease_id=record.lease.lease_id,
+        )
+        self.host_envelope_consumed.append(delivery is not None)
+        environment = {}
+        if delivery is not None:
+            delivery.apply_to(environment)
+            delivery.discard()
+        self.consumed_environment_keys.append(tuple(sorted(environment)))
+        environment.clear()
         self.starts.append((run, dict(kwargs)))
         return object()
 
@@ -82,6 +105,18 @@ def _guided_profile(*, profile_id="profile-codex-a", backend_mode="codex_cli"):
             project_ids=("aming-claw",),
         ),
     )
+
+
+def _guided_host_envelope(
+    session_token="worker-session-guided",
+    fence_token="worker-fence-guided",
+):
+    return {
+        "env": {
+            "AMING_WORKER_SESSION_TOKEN": session_token,
+            "AMING_WORKER_FENCE_TOKEN": fence_token,
+        }
+    }
 
 
 def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
@@ -377,10 +412,31 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
         return dict(ticket)
 
     service._contract_runtime_authority_resolver = resolver
+    schedule_calls = []
+    schedule_run = service.scheduler.schedule_run
+
+    def recording_schedule_run(**kwargs):
+        scheduled = schedule_run(**kwargs)
+        record = registry.get_run(scheduled.run.run_id)
+        assert record is not None
+        assert record.run.to_public_dict() == scheduled.run.to_public_dict()
+        assert record.lease == scheduled.lease
+        schedule_calls.append((dict(kwargs), scheduled))
+        return scheduled
+
+    service.scheduler.schedule_run = recording_schedule_run
+    session_token = "worker-session-guided-success"
+    fence_token = "worker-fence-guided-success"
     response, should_stop = service._dispatch(
         {
             "operation": "start_host_envelope_run",
-            "payload": {"authority_selectors": selectors},
+            "payload": {
+                "authority_selectors": selectors,
+                "host_envelope": _guided_host_envelope(
+                    session_token,
+                    fence_token,
+                ),
+            },
         }
     )
 
@@ -403,6 +459,17 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
         "model",
         "harness",
     }.intersection(resolver_requests[0])
+    assert len(schedule_calls) == 1
+    schedule_request, scheduled = schedule_calls[0]
+    assert schedule_request["run_id"] == response["run_id"]
+    assert schedule_request["owner_id"] == supervisor.owner_id
+    assert schedule_request["profile_requirements"]["profile_id"] == (
+        "profile-codex-a"
+    )
+    assert schedule_request["profile_requirements"]["backend_mode"] == (
+        "codex_cli"
+    )
+    assert scheduled.lease.status == "active"
     assert len(supervisor.starts) == 1
     run, start = supervisor.starts[0]
     assert run.run_id == response["run_id"]
@@ -413,8 +480,26 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert run.config.backend_mode == "codex_cli"
     assert start["worktree"] == str(tmp_path)
     assert start["execution_ticket"] == ticket
-    assert start["require_host_envelope"] is False
+    assert start["require_host_envelope"] is True
     assert "ContractRuntime" in start["prompt"]
+    assert supervisor.start_leases == [scheduled.lease]
+    assert supervisor.host_envelope_consumed == [True]
+    assert supervisor.consumed_environment_keys == [
+        ("AMING_WORKER_FENCE_TOKEN", "AMING_WORKER_SESSION_TOKEN")
+    ]
+    registered = registry.get_run(response["run_id"])
+    assert registered is not None
+    assert registered.run.to_public_dict() == run.to_public_dict()
+    assert registered.lease == scheduled.lease
+    with sqlite3.connect(registry.db_path) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM agent_leases").fetchone()[0]
+            == 1
+        )
 
     public = json.dumps(response, sort_keys=True)
     for forbidden in (
@@ -429,7 +514,15 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert response["caller_run_accepted"] is False
     assert response["caller_prompt_accepted"] is False
     assert response["caller_environment_accepted"] is False
+    assert response["transient_host_envelope_required"] is True
+    assert response["transient_host_envelope_accepted"] is True
+    assert response["transient_host_envelope_consumed"] is True
+    assert response["transient_host_envelope_persisted"] is False
+    assert response["host_envelope_run_authority"] is False
     assert response["raw_provider_output_persisted"] is False
+    assert response["provider_output_suppressed"] is True
+    assert session_token not in public
+    assert fence_token not in public
 
 
 @pytest.mark.parametrize(
@@ -468,6 +561,50 @@ def test_daemon_rejects_stale_or_mismatched_selectors_before_start(
         )
 
     assert supervisor.starts == []
+    assert registry.get_run("run-{}".format(ticket["ticket_id"])) is None
+
+
+@pytest.mark.parametrize(
+    "host_envelope",
+    (
+        None,
+        {
+            "env": {
+                "AMING_WORKER_SESSION_TOKEN": "worker-session-invalid",
+                "AMING_WORKER_FENCE_TOKEN": "worker-fence-invalid",
+                "PATH": "/caller",
+            }
+        },
+    ),
+)
+def test_daemon_rejects_missing_or_invalid_host_envelope_before_start(
+    tmp_path, host_envelope
+):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile())
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(tmp_path)
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+    payload = {"authority_selectors": selectors}
+    if host_envelope is not None:
+        payload["host_envelope"] = host_envelope
+
+    with pytest.raises(ServiceError, match="governed run could not be started"):
+        service._admit_governed_host_envelope_run(payload)
+
+    assert supervisor.starts == []
+    failed = registry.get_run("run-{}".format(ticket["ticket_id"]))
+    assert failed is not None
+    assert failed.state == "failed"
+    assert failed.lease is None
 
 
 def test_daemon_rejects_caller_run_prompt_environment_before_resolution(tmp_path):
@@ -486,15 +623,19 @@ def test_daemon_rejects_caller_run_prompt_environment_before_resolution(tmp_path
     resolver_requests = []
     service._contract_runtime_authority_resolver = resolver_requests.append
 
-    with pytest.raises(ServiceError, match="unsupported fields"):
-        service._admit_governed_host_envelope_run(
-            {
-                "authority_selectors": selectors,
-                "run": {"run_id": "caller-owned"},
-                "prompt": "private prompt",
-                "environment": {"AMING_WORKER_SESSION_TOKEN": "secret"},
-            }
-        )
+    for field_name, value in (
+        ("run", {"run_id": "caller-owned"}),
+        ("prompt", "private prompt"),
+        ("environment", {"AMING_WORKER_SESSION_TOKEN": "secret"}),
+    ):
+        with pytest.raises(ServiceError, match="unsupported fields"):
+            service._admit_governed_host_envelope_run(
+                {
+                    "authority_selectors": selectors,
+                    "host_envelope": _guided_host_envelope(),
+                    field_name: value,
+                }
+            )
 
     assert resolver_requests == []
     assert supervisor.starts == []

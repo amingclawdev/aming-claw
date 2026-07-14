@@ -450,6 +450,7 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
             fence_token = fence_tokens[suffix]
             raw_values.extend((session_token, fence_token))
             monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
+            monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", fence_token)
             response = build_dogfood_observer_run_plan(
                 DogfoodObserverPlanRequest(
                     project_id=selectors["project_id"],
@@ -547,6 +548,12 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
             assert service_dispatch["caller_run_accepted"] is False
             assert service_dispatch["caller_prompt_accepted"] is False
             assert service_dispatch["caller_environment_accepted"] is False
+            assert service_dispatch["transient_host_envelope_required"] is True
+            assert service_dispatch["transient_host_envelope_accepted"] is True
+            assert service_dispatch["transient_host_envelope_consumed"] is True
+            assert service_dispatch["transient_host_envelope_persisted"] is False
+            assert service_dispatch["raw_provider_output_persisted"] is False
+            assert service_dispatch["provider_output_suppressed"] is True
             assert service.registry.get_run(runs[suffix].run_id) is None
             _wait_for(
                 lambda run_id=service_dispatch["run_id"]: (
@@ -624,6 +631,7 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
     )
     assert b"public-safe intent role=" not in service_persisted
     assert b"Proceed as the allocated Aming Claw" not in service_persisted
+    assert b"public-safe result" not in service_persisted
 
 
 def test_restart_projects_lost_and_service_owns_selector_only_successor(
@@ -738,10 +746,20 @@ def test_restart_projects_lost_and_service_owns_selector_only_successor(
         assert rejected["ok"] is False
         assert not (worktree / "spawns.jsonl").exists()
 
+        successor_session_token = "worker-session-successor"
+        successor_fence_token = "worker-fence-successor"
         response = request_service(
             paths,
             "start_host_envelope_run",
-            payload={"authority_selectors": successor_selectors},
+            payload={
+                "authority_selectors": successor_selectors,
+                "host_envelope": {
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": successor_session_token,
+                        "AMING_WORKER_FENCE_TOKEN": successor_fence_token,
+                    }
+                },
+            },
         )
         successor_run_id = "run-{}".format(successor_ticket["ticket_id"])
         assert response["ok"] is True
@@ -750,6 +768,8 @@ def test_restart_projects_lost_and_service_owns_selector_only_successor(
         assert response["profile_id"] == successor_run.config.profile_id
         assert response["caller_run_accepted"] is False
         assert response["caller_prompt_accepted"] is False
+        assert response["transient_host_envelope_consumed"] is True
+        assert response["raw_provider_output_persisted"] is False
         _wait_for(
             lambda: (
                 registry.get_run(successor_run_id)
@@ -778,3 +798,5 @@ def test_restart_projects_lost_and_service_owns_selector_only_successor(
         path.read_bytes() for path in state_dir.rglob("*") if path.is_file()
     )
     assert b"public-safe successor intent" not in persisted
+    assert successor_session_token.encode("utf-8") not in persisted
+    assert successor_fence_token.encode("utf-8") not in persisted

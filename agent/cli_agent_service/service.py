@@ -21,14 +21,13 @@ from .adapters.codex_desktop import (
     DesktopHostAdapterError,
 )
 from .auth import ProfileAuthController
-from .config import resolve_agent_config
 from .health import health_payload, stopped_payload
 from .launchers import (
     HostEnvelopeError,
     HostEnvelopeStore,
     scrub_host_envelope_payload,
 )
-from .registry import AgentRegistry
+from .registry import AgentRegistry, RegistryError
 from .scheduler import AgentScheduler, SchedulerError
 from .profile_control import (
     ManagedProfileControl,
@@ -448,7 +447,7 @@ class CliAgentService:
                 "governance_authority"
             ) is not False:
                 raise ServiceError("run receipt projection was not non-authoritative")
-        except BaseException as exc:
+        except Exception as exc:
             failure = exc
         if self._receipt_sink_delegate is not None:
             self._receipt_sink_delegate(dict(receipt))
@@ -693,7 +692,7 @@ class CliAgentService:
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if set(payload) - {"authority_selectors"}:
+        if set(payload) - {"authority_selectors", "host_envelope"}:
             raise ServiceError("governed run request contains unsupported fields")
         selectors = payload.get("authority_selectors")
         if not isinstance(selectors, Mapping):
@@ -840,29 +839,6 @@ class CliAgentService:
             )
 
         project_id = str(dispatch.get("project_id") or "").strip()
-        try:
-            selection = self.scheduler.select_profile(
-                profile_requirements,
-                role=role,
-                project_id=project_id,
-            )
-        except (SchedulerError, TypeError, ValueError) as exc:
-            raise ServiceError(
-                "canonical execution ticket has no eligible registered profile"
-            ) from exc
-        profile = self.registry.get_profile(selection.profile_id)
-        if profile is None:
-            raise ServiceError("scheduler selected an unregistered profile")
-        if profile.profile_id != str(
-            profile_requirements.get("profile_id") or ""
-        ).strip():
-            raise ServiceError("scheduler selection does not match the canonical ticket")
-        expected_backend = str(selectors.get("backend_mode") or "").strip()
-        if expected_backend and profile.inference_endpoint.backend_mode != expected_backend:
-            raise ServiceError(
-                "selected profile backend does not match canonical runtime selectors"
-            )
-
         evidence_refs = {
             "project_id": str(dispatch.get("project_id") or ""),
             "backlog_id": str(dispatch.get("backlog_id") or ""),
@@ -872,16 +848,47 @@ class CliAgentService:
         }
         principal_id = str(dispatch.get("worker_id") or "")
         run_id = "run-{}".format(ticket_id)
+        expected_backend = str(selectors.get("backend_mode") or "").strip()
+        scheduler_requirements = dict(profile_requirements)
+        if expected_backend:
+            scheduler_requirements["backend_mode"] = expected_backend
         try:
-            run = resolve_agent_config(
+            scheduled = self.scheduler.schedule_run(
                 run_id=run_id,
+                owner_id=self.supervisor.owner_id,
                 role=role,
                 project_id=project_id,
-                profile=profile,
+                profile_requirements=scheduler_requirements,
                 governance_refs=evidence_refs,
+                evidence_refs=evidence_refs,
+                ttl_seconds=max(
+                    1,
+                    int(getattr(self.supervisor, "lease_ttl_seconds", 60) or 60),
+                ),
             )
-        except (TypeError, ValueError) as exc:
-            raise ServiceError("canonical run configuration could not be resolved") from exc
+        except (RegistryError, SchedulerError, TypeError, ValueError) as exc:
+            raise ServiceError(
+                "canonical execution ticket has no eligible registered profile"
+            ) from exc
+        run = scheduled.run
+        profile = run.profile
+        lease = scheduled.lease
+        if (
+            profile is None
+            or profile.profile_id
+            != str(profile_requirements.get("profile_id") or "").strip()
+            or profile.inference_endpoint.backend_mode != expected_backend
+            or lease.run_id != run.run_id
+            or lease.profile_id != profile.profile_id
+            or lease.owner_id != self.supervisor.owner_id
+            or lease.status != "active"
+        ):
+            self.registry.record_exit(
+                run.run_id,
+                127,
+                failure_category="scheduled_identity_mismatch",
+            )
+            raise ServiceError("scheduler result does not match the canonical ticket")
         prompt = (
             "Proceed as the allocated Aming Claw {role} worker.\n"
             "Runtime context: {runtime_context_id}\n"
@@ -896,16 +903,73 @@ class CliAgentService:
             task_id=evidence_refs["task_id"],
             contract_execution_id=evidence_refs["contract_execution_id"],
         )
+        supplied_host_envelope = payload.get("host_envelope")
+        canonical_host_envelope: dict[str, Any] = {
+            "project_id": evidence_refs["project_id"],
+            "backlog_id": evidence_refs["backlog_id"],
+            "runtime_context_id": evidence_refs["runtime_context_id"],
+            "task_id": evidence_refs["task_id"],
+            "parent_task_id": str(dispatch.get("parent_task_id") or ""),
+            "worker_role": role,
+            "worker_id": principal_id,
+            "worker_slot_id": str(dispatch.get("worker_slot_id") or ""),
+        }
         try:
+            if not isinstance(supplied_host_envelope, Mapping) or set(
+                supplied_host_envelope
+            ) != {"env"}:
+                raise HostEnvelopeError(
+                    "governed run requires one transient worker host envelope"
+                )
+            canonical_host_envelope["env"] = supplied_host_envelope.get("env")
+            public_text = json.dumps(
+                {
+                    "run": run.to_public_dict(),
+                    "worktree": worktree,
+                    "execution_ticket_id": ticket_id,
+                    "execution_ticket_hash": ticket_hash,
+                    "evidence_refs": evidence_refs,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self.host_envelope_store.stage(
+                run.run_id,
+                canonical_host_envelope,
+                lease_owner_id=lease.owner_id,
+                public_text=public_text,
+            )
+            del public_text
             self.supervisor.start_run(
                 run,
                 prompt=prompt,
                 worktree=worktree,
                 evidence_refs=evidence_refs,
                 execution_ticket=ticket,
-                require_host_envelope=False,
+                require_host_envelope=True,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            try:
+                self.host_envelope_store.revoke(
+                    run.run_id,
+                    lease_owner_id=lease.owner_id,
+                )
+            except Exception:
+                pass
+            try:
+                self.supervisor.cancel_run(run.run_id)
+            except Exception:
+                pass
+            record = self.registry.get_run(run.run_id)
+            if record is not None and record.lease is not None:
+                try:
+                    self.registry.record_exit(
+                        run.run_id,
+                        127,
+                        failure_category="governed_admission_failed",
+                    )
+                except Exception:
+                    pass
             raise ServiceError("governed run could not be started") from exc
         return {
             "ok": True,
@@ -919,12 +983,16 @@ class CliAgentService:
             "contract_execution_id": evidence_refs["contract_execution_id"],
             "execution_ticket_id": ticket_id,
             "execution_ticket_hash": ticket_hash,
-            "selection_reason": selection.selection_reason,
+            "selection_reason": scheduled.selection.selection_reason,
             "direct_invocation_fallback": False,
             "caller_run_accepted": False,
             "caller_prompt_accepted": False,
             "caller_environment_accepted": False,
-            "caller_host_envelope_accepted": False,
+            "transient_host_envelope_required": True,
+            "transient_host_envelope_accepted": True,
+            "transient_host_envelope_consumed": True,
+            "transient_host_envelope_persisted": False,
+            "host_envelope_run_authority": False,
             "raw_argv_persisted": False,
             "raw_environment_persisted": False,
             "provider_home_path_persisted": False,
@@ -934,6 +1002,7 @@ class CliAgentService:
             "raw_fence_token_persisted": False,
             "raw_prompt_persisted": False,
             "raw_provider_output_persisted": False,
+            "provider_output_suppressed": True,
             "governance_authority": False,
             "operational_dispatch_only": True,
         }

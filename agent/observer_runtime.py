@@ -370,6 +370,7 @@ class ObserverRunRequest:
     heartbeat_interval_sec: float = 0.0
     env: Mapping[str, str] = field(default_factory=dict)
     guided_service_admission: Mapping[str, Any] = field(default_factory=dict)
+    transient_host_envelope: Mapping[str, Any] = field(default_factory=dict)
     cli_agent_service_state_dir: str = ""
 
     @classmethod
@@ -1190,6 +1191,10 @@ _GUIDED_RUNTIME_REQUIRED_SELECTOR_FIELDS = (
     *OBSERVER_POLL_TIMELINE_ROUTE_FIELDS,
     "backend_mode",
 )
+_GUIDED_RUNTIME_WORKER_AUTH_ENV_KEYS = (
+    "AMING_WORKER_SESSION_TOKEN",
+    "AMING_WORKER_FENCE_TOKEN",
+)
 
 
 def _guided_service_admission_from_runtime_text(
@@ -1234,6 +1239,59 @@ def _guided_service_admission_from_runtime_text(
             for field_name in missing
         ]
     return {"authority_selectors": selectors}, []
+
+
+def _dogfood_transient_host_envelope(
+    *,
+    canonical_fence_token: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    session_token = str(
+        os.environ.get("AMING_WORKER_SESSION_TOKEN") or ""
+    ).strip()
+    fence_token = str(os.environ.get("AMING_WORKER_FENCE_TOKEN") or "").strip()
+    canonical_fence_token = str(canonical_fence_token or "").strip()
+    missing = [
+        field_name
+        for field_name, value in (
+            ("AMING_WORKER_SESSION_TOKEN", session_token),
+            ("AMING_WORKER_FENCE_TOKEN", fence_token),
+            ("runtime_context.fence_token", canonical_fence_token),
+        )
+        if not value
+    ]
+    mismatch = bool(
+        fence_token
+        and canonical_fence_token
+        and fence_token != canonical_fence_token
+    )
+    if missing or mismatch:
+        return {}, {
+            "schema_version": "observer_worker_host_envelope_blocker.v1",
+            "ok": False,
+            "status": "blocked",
+            "blocker_id": (
+                "worker_host_envelope_fence_mismatch"
+                if mismatch
+                else "worker_host_envelope_missing"
+            ),
+            "missing_fields": missing,
+            "service_operation": "start_host_envelope_run",
+            "transient_host_envelope_required": True,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "reason": (
+                "observer dogfood requires the current worker host envelope "
+                "before CLI Agent Service dispatch"
+            ),
+        }
+    return {
+        "env": {
+            "AMING_WORKER_SESSION_TOKEN": session_token,
+            "AMING_WORKER_FENCE_TOKEN": fence_token,
+        }
+    }, {}
 
 
 def _dogfood_secret_redacted_copy(
@@ -8264,6 +8322,28 @@ def build_dogfood_observer_run_plan(
         )
         return copy_safe_result()
 
+    transient_host_envelope: dict[str, Any] = {}
+    if execute:
+        transient_host_envelope, host_envelope_blocker = (
+            _dogfood_transient_host_envelope(
+                canonical_fence_token=context.fence_token,
+            )
+        )
+        if host_envelope_blocker:
+            result.update(
+                {
+                    "ok": False,
+                    "status": "blocked",
+                    "calls_models": False,
+                    "auth_status": "not_invoked",
+                    "service_admission_blocker": host_envelope_blocker,
+                    "terminal_dispatch_blocker": True,
+                    "direct_invocation_fallback": False,
+                    "error": host_envelope_blocker["reason"],
+                }
+            )
+            return copy_safe_result()
+
     observer_request = ObserverRunRequest(
         project_id=request.project_id,
         backlog_id=request.backlog_id,
@@ -8279,6 +8359,7 @@ def build_dogfood_observer_run_plan(
         main_worktree=str(main_worktree),
         env={},
         guided_service_admission=guided_service_admission,
+        transient_host_envelope=transient_host_envelope,
         cli_agent_service_state_dir=request.cli_agent_service_state_dir,
     )
 
@@ -8352,10 +8433,17 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
                     request_guided_runtime,
                 )
 
+            if request.env:
+                raise GuidedRuntimeDispatchError(
+                    "guided runtime rejects caller environment maps",
+                    status="rejected",
+                )
+
             service_dispatch = request_guided_runtime(
                 admission=request.guided_service_admission,
                 project_id=request.project_id,
                 backlog_id=request.backlog_id,
+                transient_host_envelope=request.transient_host_envelope,
                 state_dir=request.cli_agent_service_state_dir,
             )
         except GuidedRuntimeDispatchError as exc:

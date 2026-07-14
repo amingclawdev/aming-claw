@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .launchers import WORKER_AUTH_ENV_KEYS, scrub_host_envelope_payload
 from .service import (
     DEFAULT_SOCKET_TIMEOUT_SECONDS,
     ServiceError,
@@ -73,6 +74,8 @@ _REQUIRED_AUTHORITY_FIELDS = (
     "visible_injection_manifest_hash",
     "backend_mode",
 )
+
+
 class GuidedRuntimeDispatchError(RuntimeError):
     """A governed service dispatch failed without invoking a local fallback."""
 
@@ -142,11 +145,34 @@ def _authority_selectors(
     return selectors
 
 
+def _transient_host_envelope(value: Any) -> dict[str, Any]:
+    envelope = _mapping(value, "one transient worker host envelope")
+    if set(envelope) != {"env"}:
+        raise GuidedRuntimeDispatchError(
+            "guided runtime accepts only a transient worker auth envelope"
+        )
+    environment = _mapping(envelope.get("env"), "worker host envelope auth")
+    if set(environment) != set(WORKER_AUTH_ENV_KEYS):
+        raise GuidedRuntimeDispatchError(
+            "guided runtime worker host envelope has invalid auth fields"
+        )
+    normalized = {key: environment.get(key) for key in WORKER_AUTH_ENV_KEYS}
+    if any(
+        not isinstance(value, str) or not value or "\x00" in value
+        for value in normalized.values()
+    ):
+        raise GuidedRuntimeDispatchError(
+            "guided runtime worker host envelope is incomplete"
+        )
+    return {"env": normalized}
+
+
 def request_guided_runtime(
     *,
     admission: Mapping[str, Any],
     project_id: str,
     backlog_id: str,
+    transient_host_envelope: Mapping[str, Any],
     state_dir: str = "",
     timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
@@ -162,23 +188,32 @@ def request_guided_runtime(
         project_id=project_id,
         backlog_id=backlog_id,
     )
+    envelope: dict[str, Any] = {}
     try:
-        response = request_service(
-            ServicePaths.from_state_dir(state_dir or None),
-            "start_host_envelope_run",
-            payload={"authority_selectors": selectors},
-            timeout_seconds=timeout_seconds,
-        )
-    except ServiceUnavailableError as exc:
-        raise GuidedRuntimeDispatchError(
-            "CLI Agent Service is unavailable",
-            status="unavailable",
-        ) from exc
-    except ServiceError as exc:
-        raise GuidedRuntimeDispatchError(
-            "CLI Agent Service rejected the governed run: {}".format(exc),
-            status="rejected",
-        ) from exc
+        envelope = _transient_host_envelope(transient_host_envelope)
+        try:
+            response = request_service(
+                ServicePaths.from_state_dir(state_dir or None),
+                "start_host_envelope_run",
+                payload={
+                    "authority_selectors": selectors,
+                    "host_envelope": envelope,
+                },
+                timeout_seconds=timeout_seconds,
+            )
+        except ServiceUnavailableError as exc:
+            raise GuidedRuntimeDispatchError(
+                "CLI Agent Service is unavailable",
+                status="unavailable",
+            ) from exc
+        except ServiceError as exc:
+            raise GuidedRuntimeDispatchError(
+                "CLI Agent Service rejected the governed run: {}".format(exc),
+                status="rejected",
+            ) from exc
+    finally:
+        scrub_host_envelope_payload(envelope)
+        scrub_host_envelope_payload(transient_host_envelope)
     if response.get("ok") is not True or response.get("status") != "started":
         raise GuidedRuntimeDispatchError(
             _text(response.get("error"))
@@ -205,7 +240,23 @@ def request_guided_runtime(
         "caller_run_accepted",
         "caller_prompt_accepted",
         "caller_environment_accepted",
-        "caller_host_envelope_accepted",
+    ):
+        if response.get(field_name) is not False:
+            mismatches.append(field_name)
+    for field_name in (
+        "transient_host_envelope_required",
+        "transient_host_envelope_accepted",
+        "transient_host_envelope_consumed",
+        "provider_output_suppressed",
+    ):
+        if response.get(field_name) is not True:
+            mismatches.append(field_name)
+    for field_name in (
+        "transient_host_envelope_persisted",
+        "host_envelope_run_authority",
+        "raw_session_token_persisted",
+        "raw_fence_token_persisted",
+        "raw_provider_output_persisted",
     ):
         if response.get(field_name) is not False:
             mismatches.append(field_name)
@@ -236,7 +287,15 @@ def request_guided_runtime(
         "caller_run_accepted": False,
         "caller_prompt_accepted": False,
         "caller_environment_accepted": False,
-        "caller_host_envelope_accepted": False,
+        "transient_host_envelope_required": True,
+        "transient_host_envelope_accepted": True,
+        "transient_host_envelope_consumed": True,
+        "transient_host_envelope_persisted": False,
+        "host_envelope_run_authority": False,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "raw_provider_output_persisted": False,
+        "provider_output_suppressed": True,
         "governance_authority": False,
         "operational_dispatch_only": True,
     }

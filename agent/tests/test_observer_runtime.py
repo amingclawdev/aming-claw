@@ -856,6 +856,7 @@ def test_dogfood_execute_derives_selector_only_service_admission(
     _enable_canonical_dogfood_admission(request)
     request.cli_agent_service_state_dir = str(tmp_path / "service-state")
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
+    monkeypatch.setenv("AMING_WORKER_FENCE_TOKEN", request.fence_token)
     observed = []
 
     def fail_worker_evidence(**_kwargs):
@@ -911,6 +912,15 @@ def test_dogfood_execute_derives_selector_only_service_admission(
         tmp_path / "service-state"
     )
     assert observer_request.env == {}
+    assert set(observer_request.transient_host_envelope) == {"env"}
+    assert set(observer_request.transient_host_envelope["env"]) == {
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN",
+    }
+    assert observer_request.transient_host_envelope["env"] == {
+        "AMING_WORKER_SESSION_TOKEN": "worker-session-token-test",
+        "AMING_WORKER_FENCE_TOKEN": request.fence_token,
+    }
     assert result["planned_invocation"]["backend_mode"] == "cli_agent_service"
     assert result["planned_invocation"]["service_dispatch"][
         "direct_invocation_fallback"
@@ -1073,9 +1083,11 @@ def test_run_observer_guided_service_unavailable_fails_closed(
             provider="openai",
             backend_mode="codex_cli",
             workspace=str(tmp_path),
-            env={
-                "AMING_WORKER_SESSION_TOKEN": session_token,
-                "AMING_WORKER_FENCE_TOKEN": fence_token,
+            transient_host_envelope={
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": session_token,
+                    "AMING_WORKER_FENCE_TOKEN": fence_token,
+                }
             },
             guided_service_admission=_guided_service_admission(),
             cli_agent_service_state_dir=str(tmp_path / "missing-service"),
@@ -1100,35 +1112,35 @@ def test_run_observer_guided_service_unavailable_fails_closed(
     assert fence_token not in serialized
 
 
-def test_dogfood_execute_does_not_forward_worker_session_environment(
+def test_dogfood_execute_requires_current_worker_host_envelope(
     monkeypatch, tmp_path
 ):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
     _enable_canonical_dogfood_admission(request)
     monkeypatch.delenv("AMING_WORKER_SESSION_TOKEN", raising=False)
-    observed = []
+    monkeypatch.delenv("AMING_WORKER_FENCE_TOKEN", raising=False)
 
     def fake_run_observer(observer_request, *, execute=False):
-        observed.append(observer_request)
-        return {
-            "ok": True,
-            "status": "started",
-            "invocation": {
-                "status": "started",
-                "backend_mode": "cli_agent_service",
-                "calls_models": True,
-                "auth_status": "service_owned",
-            },
-        }
+        raise AssertionError("missing worker auth must fail before dispatch")
 
     monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
 
     result = build_dogfood_observer_run_plan(request, execute=True)
 
-    assert result["ok"] is True
-    assert result["status"] == "started"
-    assert len(observed) == 1
-    assert observed[0].env == {}
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["calls_models"] is False
+    assert result["auth_status"] == "not_invoked"
+    assert result["direct_invocation_fallback"] is False
+    blocker = result["service_admission_blocker"]
+    assert blocker["blocker_id"] == "worker_host_envelope_missing"
+    assert set(blocker["missing_fields"]) == {
+        "AMING_WORKER_SESSION_TOKEN",
+        "AMING_WORKER_FENCE_TOKEN",
+    }
+    assert blocker["transient_host_envelope_required"] is True
+    assert blocker["raw_session_token_persisted"] is False
+    assert blocker["raw_fence_token_persisted"] is False
     assert "execute_launch_env" not in result
 
 
