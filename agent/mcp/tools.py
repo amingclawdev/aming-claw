@@ -420,6 +420,8 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "task_id": {"type": "string"},
             "contract_execution_id": {"type": "string"},
             "implementation_event_ref": {"type": "string"},
+            "implementation_lineage_ref": {"type": "string"},
+            "worker_implementation_lineage": {"type": "object"},
             "worker_commit_sha": {"type": "string"},
             "agent_id": {"type": "string"},
             "actual_host_worker_id": {
@@ -2821,7 +2823,6 @@ TOOLS: list[dict] = [
                 "parent_task_id",
                 "worker_session_id",
                 "filer_principal",
-                "implementation_event_ref",
                 "worker_commit_sha",
                 "owned_files",
                 "changed_files",
