@@ -278,11 +278,11 @@ class CodexC0Supervisor:
                 execution_ticket,
                 command_hash,
             )
-            self.registry.register_run(run, evidence_refs=evidence_refs)
-            lease = self.registry.acquire_lease(
-                run.run_id,
+            lease = self.registry.register_run_and_acquire_lease(
+                run,
                 self.owner_id,
                 ttl_seconds=self.lease_ttl_seconds,
+                evidence_refs=evidence_refs,
             )
         except BaseException:
             self._revoke_host_envelope(run.run_id)
