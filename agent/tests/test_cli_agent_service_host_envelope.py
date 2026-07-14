@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -114,19 +115,101 @@ def _daemon_run(executable):
     )
 
 
-def _execution_ticket(run, runtime_context_id):
+def _execution_ticket(run, runtime_context_id, worktree):
     import hashlib
 
     digest = hashlib.sha256(run.run_id.encode()).hexdigest()
-    return {
+    selectors = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DAEMON-ENVELOPE",
+        "contract_execution_id": "cex-daemon-envelope",
+        "runtime_context_id": runtime_context_id,
+        "task_id": "task-daemon-envelope",
+        "worker_id": "principal-daemon-envelope",
+        "worker_slot_id": "principal-daemon-envelope",
+        "observer_command_id": "command-daemon-envelope",
+        "role": "dev",
+        "profile_id": run.config.profile_id,
+        "principal_id": "principal-daemon-envelope",
+        "expected_execution_state_revision": 1,
+        "expected_execution_state_hash": "sha256:" + ("a" * 64),
+    }
+    ticket = {
         "schema_version": "cli_agent_execution_ticket.v1",
         "status": "issued",
         "issue_allowed": True,
         "ticket_id": "caet-" + digest[:24],
         "ticket_hash": "sha256:" + digest,
-        "profile_requirements": {"profile_id": run.config.profile_id},
-        "dispatch_identity": {"runtime_context_id": runtime_context_id},
+        "source_of_authority": "ContractRuntime",
+        "contract_execution_id": selectors["contract_execution_id"],
+        "execution_state_revision": 1,
+        "execution_state_hash": selectors["expected_execution_state_hash"],
+        "profile_requirements": {
+            "profile_id": run.config.profile_id,
+            "role": selectors["role"],
+        },
+        "dispatch_identity": {
+            "project_id": selectors["project_id"],
+            "backlog_id": selectors["backlog_id"],
+            "runtime_context_id": runtime_context_id,
+            "task_id": selectors["task_id"],
+            "worker_id": selectors["worker_id"],
+            "worker_slot_id": selectors["worker_slot_id"],
+            "observer_command_id": selectors["observer_command_id"],
+            "worker_role": selectors["role"],
+            "worktree_path": str(worktree),
+        },
     }
+    return ticket, selectors
+
+
+class _GovernanceFixture:
+    def __init__(self, ticket):
+        fixture = self
+        self.ticket = ticket
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                size = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(size)
+                if self.path.endswith("/execution-ticket/resolve"):
+                    response = {
+                        "ok": True,
+                        "execution_ticket": fixture.ticket,
+                        "source_of_authority": "ContractRuntime",
+                    }
+                elif self.path.endswith("/run-receipts"):
+                    response = {
+                        "ok": True,
+                        "receipt_ingestion": {"governance_authority": False},
+                    }
+                else:
+                    self.send_error(404)
+                    return
+                encoded = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *_args):
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:{}".format(self.server.server_port)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
 
 
 def _malicious_codex(path):
@@ -384,8 +467,16 @@ def test_real_daemon_atomically_starts_envelope_run_without_output_leak(tmp_path
         suffix="daemon",
     )
     paths = ServicePaths.from_state_dir(state_dir)
+    ticket, authority_selectors = _execution_ticket(
+        run,
+        runtime_context_id,
+        worker_dir,
+    )
+    governance = _GovernanceFixture(ticket)
+    governance.start()
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(AGENT_DIR)
+    environment["AMING_CLAW_GOVERNANCE_URL"] = governance.url
     daemon = subprocess.Popen(
         [
             sys.executable,
@@ -410,11 +501,7 @@ def test_real_daemon_atomically_starts_envelope_run_without_output_leak(tmp_path
                 "run": run.to_public_dict(),
                 "worktree": str(worker_dir),
                 "prompt": "Use only the copy-safe runtime references.",
-                "execution_ticket": _execution_ticket(run, runtime_context_id),
-                "evidence_refs": {
-                    "runtime_context_id": runtime_context_id,
-                    "session_token_ref": envelope["session_token_ref"],
-                },
+                "authority_selectors": authority_selectors,
                 "host_envelope": envelope,
                 "ttl_seconds": 30,
             },
@@ -476,6 +563,7 @@ def test_real_daemon_atomically_starts_envelope_run_without_output_leak(tmp_path
             daemon.terminate()
             daemon.wait(timeout=5)
         daemon_stdout, daemon_stderr = daemon.communicate(timeout=5)
+        governance.stop()
     if session_token.encode() in daemon_stdout or fence_token.encode() in daemon_stdout:
         raise AssertionError("raw worker auth escaped through daemon stdout")
     if session_token.encode() in daemon_stderr or fence_token.encode() in daemon_stderr:

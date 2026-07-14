@@ -34,7 +34,7 @@ def _authority_and_launch():
     authority = {
         "schema_version": "contract_runtime_current_state.v1",
         "source_of_authority": "ContractRuntime",
-        "authority_decision_source": "contract_runtime_current_state",
+        "authority_decision_source": "contract_runtime_completed_dispatch_line",
         "project_id": "aming-claw",
         "backlog_id": "AC-CLI-SUCCESSOR",
         "contract_execution_id": "cex-cli-successor",

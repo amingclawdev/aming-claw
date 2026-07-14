@@ -68041,6 +68041,9 @@ _DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS = frozenset(
         "expected_execution_state_revision",
         "expected_execution_state_hash",
         "expected_dispatch_identity_hash",
+        "role",
+        "profile_id",
+        "principal_id",
     }
 )
 
@@ -68111,18 +68114,22 @@ def _contract_runtime_desktop_launch_identity(
     "POST",
     "/api/projects/{project_id}/cli-agent/desktop-execution-ticket/resolve",
 )
+@route(
+    "POST",
+    "/api/projects/{project_id}/cli-agent/execution-ticket/resolve",
+)
 def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
-    """Resolve a Desktop ticket from server-owned ContractRuntime authority."""
+    """Resolve a role-generic ticket from server-owned ContractRuntime authority."""
 
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
     unsupported = sorted(set(body) - _DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS)
     if unsupported:
         raise ValidationError(
-            "Desktop ticket resolution contains caller-owned authority fields"
+            "execution ticket resolution contains caller-owned authority fields"
         )
     if str(body.get("project_id") or project_id).strip() != project_id:
-        raise ValidationError("Desktop ticket project_id does not match request path")
+        raise ValidationError("execution ticket project_id does not match request path")
     required = (
         "backlog_id",
         "contract_execution_id",
@@ -68134,7 +68141,7 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
     )
     if any(not str(body.get(field) or "").strip() for field in required):
         raise ValidationError(
-            "Desktop ticket resolution requires canonical authority selectors"
+            "execution ticket resolution requires canonical authority selectors"
         )
     conn = get_connection(project_id)
     try:
@@ -68161,6 +68168,29 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
         if str(launch_identity.get(field) or "").strip()
         != str(body.get(field) or (project_id if field == "project_id" else "")).strip()
     ]
+    role = str(body.get("role") or "").strip()
+    if role and role != str(launch_identity.get("worker_role") or "").strip():
+        selector_mismatches.append("role")
+    principal_id = str(body.get("principal_id") or "").strip()
+    if principal_id and principal_id != str(
+        launch_identity.get("worker_id") or ""
+    ).strip():
+        selector_mismatches.append("principal_id")
+    action = (
+        authority.get("next_legal_action")
+        if isinstance(authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    canonical_profile = (
+        action.get("profile_requirements")
+        if isinstance(action.get("profile_requirements"), Mapping)
+        else {}
+    )
+    profile_id = str(body.get("profile_id") or "").strip()
+    if profile_id and profile_id != str(
+        canonical_profile.get("profile_id") or ""
+    ).strip():
+        selector_mismatches.append("profile_id")
     try:
         expected_revision = int(body.get("expected_execution_state_revision") or 0)
     except (TypeError, ValueError):

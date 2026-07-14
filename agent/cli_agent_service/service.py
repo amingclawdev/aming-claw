@@ -61,6 +61,38 @@ _DESKTOP_ADMISSION_IDENTITY_FIELDS = (
     "observer_command_id",
 )
 
+_GUIDED_RUNTIME_AUTHORITY_FIELDS = frozenset(
+    {
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "role",
+        "profile_id",
+        "principal_id",
+        "expected_execution_state_revision",
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+    }
+)
+_GUIDED_RUNTIME_REQUIRED_SELECTORS = (
+    "project_id",
+    "backlog_id",
+    "contract_execution_id",
+    "runtime_context_id",
+    "task_id",
+    "worker_id",
+    "worker_slot_id",
+    "observer_command_id",
+    "role",
+    "profile_id",
+    "principal_id",
+)
+
 
 class ServiceError(RuntimeError):
     pass
@@ -181,35 +213,27 @@ def current_status(paths: ServicePaths) -> dict[str, Any]:
         return payload
 
 
-def resolve_governance_desktop_execution_ticket(
-    authority_request: Mapping[str, Any],
+def _governance_json_post(
+    path: str,
+    payload: Mapping[str, Any],
     *,
     governance_url: str = "",
     timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Resolve one ticket through the governance-owned ContractRuntime store."""
-
-    project_id = str(authority_request.get("project_id") or "").strip()
-    if not project_id:
-        raise ServiceError("Desktop authority request requires project_id")
     base_url = str(
         governance_url
         or os.environ.get("AMING_CLAW_GOVERNANCE_URL")
         or DEFAULT_GOVERNANCE_URL
     ).rstrip("/")
-    url = "{}/api/projects/{}/cli-agent/desktop-execution-ticket/resolve".format(
-        base_url,
-        urllib.parse.quote(project_id, safe=""),
-    )
     request_bytes = json.dumps(
-        dict(authority_request),
+        dict(payload),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     if len(request_bytes) > MAX_REQUEST_BYTES:
-        raise ServiceError("Desktop authority request exceeded the size limit")
+        raise ServiceError("governance request exceeded the size limit")
     request = urllib.request.Request(
-        url,
+        base_url + path,
         data=request_bytes,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -221,25 +245,57 @@ def resolve_governance_desktop_execution_ticket(
         ) as response:
             response_bytes = response.read(MAX_REQUEST_BYTES + 1)
     except (OSError, urllib.error.URLError) as exc:
-        raise ServiceUnavailableError(
-            "ContractRuntime authority resolver is unavailable"
-        ) from exc
+        raise ServiceUnavailableError("governance service is unavailable") from exc
     if len(response_bytes) > MAX_REQUEST_BYTES:
-        raise ServiceError("Desktop authority response exceeded the size limit")
+        raise ServiceError("governance response exceeded the size limit")
     try:
         resolved = json.loads(response_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ServiceError(
-            "ContractRuntime authority resolver returned an invalid response"
-        ) from exc
+        raise ServiceError("governance service returned an invalid response") from exc
     if not isinstance(resolved, Mapping):
-        raise ServiceError(
-            "ContractRuntime authority resolver returned an invalid response"
-        )
+        raise ServiceError("governance service returned an invalid response")
+    return dict(resolved)
+
+
+def resolve_governance_execution_ticket(
+    authority_request: Mapping[str, Any],
+    *,
+    governance_url: str = "",
+    timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Resolve one role-generic ticket from governance-owned ContractRuntime state."""
+
+    project_id = str(authority_request.get("project_id") or "").strip()
+    if not project_id:
+        raise ServiceError("authority request requires project_id")
+    path = "/api/projects/{}/cli-agent/execution-ticket/resolve".format(
+        urllib.parse.quote(project_id, safe=""),
+    )
+    resolved = _governance_json_post(
+        path,
+        authority_request,
+        governance_url=governance_url,
+        timeout_seconds=timeout_seconds,
+    )
     ticket = resolved.get("execution_ticket")
     if resolved.get("ok") is not True or not isinstance(ticket, Mapping):
-        raise ServiceError("ContractRuntime authority rejected Desktop admission")
+        raise ServiceError("ContractRuntime authority rejected run admission")
     return dict(ticket)
+
+
+def resolve_governance_desktop_execution_ticket(
+    authority_request: Mapping[str, Any],
+    *,
+    governance_url: str = "",
+    timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Compatibility alias for the role-generic ContractRuntime resolver."""
+
+    return resolve_governance_execution_ticket(
+        authority_request,
+        governance_url=governance_url,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 class CliAgentService:
@@ -280,12 +336,51 @@ class CliAgentService:
                 state_dir=self.paths.state_dir / "supervisor",
                 host_envelope_store=self.host_envelope_store,
             )
+        self._receipt_sink_delegate = self.supervisor.run_receipt_sink
+        self.supervisor.run_receipt_sink = self._project_run_receipt
+        self._restart_reconciled = False
         self._desktop_adapters: dict[str, CodexDesktopAdapter] = {
             "codex_desktop": CodexDesktopAdapter(),
         }
-        self._contract_runtime_authority_resolver = (
-            resolve_governance_desktop_execution_ticket
-        )
+        self._contract_runtime_authority_resolver = resolve_governance_execution_ticket
+
+    def _project_run_receipt(self, receipt: dict[str, Any]) -> None:
+        """Project one daemon fact without granting it contract authority."""
+
+        failure: BaseException | None = None
+        try:
+            record = self.registry.get_run(str(receipt.get("run_id") or ""))
+            if record is None:
+                raise ServiceError("run receipt has no registry identity")
+            refs = {ref.name: ref.value for ref in record.evidence_refs}
+            project_id = str(
+                refs.get("project_id") or record.run.config.project_id or ""
+            ).strip()
+            backlog_id = str(refs.get("backlog_id") or "").strip()
+            task_id = str(refs.get("task_id") or "").strip()
+            if not project_id or not backlog_id or not task_id:
+                raise ServiceError("run receipt lacks governance projection selectors")
+            projected = _governance_json_post(
+                "/api/graph-governance/{}/cli-agent/run-receipts".format(
+                    urllib.parse.quote(project_id, safe="")
+                ),
+                {
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "receipt": receipt,
+                },
+            )
+            ingestion = projected.get("receipt_ingestion")
+            if not isinstance(ingestion, Mapping) or ingestion.get(
+                "governance_authority"
+            ) is not False:
+                raise ServiceError("run receipt projection was not non-authoritative")
+        except BaseException as exc:
+            failure = exc
+        if self._receipt_sink_delegate is not None:
+            self._receipt_sink_delegate(dict(receipt))
+        if failure is not None:
+            raise failure
 
     def _desktop_adapter(self, payload: Mapping[str, Any]) -> CodexDesktopAdapter:
         host_kind = str(payload.get("host_kind") or "").strip().lower()
@@ -521,6 +616,145 @@ class CliAgentService:
             raise ServiceError("request must be a JSON object")
         return value
 
+    def _admit_governed_host_envelope_run(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        caller_fields = {
+            "run",
+            "worktree",
+            "prompt",
+            "authority_selectors",
+            "host_envelope",
+            "ttl_seconds",
+            "expires_at",
+        }
+        if set(payload) - caller_fields:
+            raise ServiceError("governed run request contains unsupported fields")
+        selectors = payload.get("authority_selectors")
+        if not isinstance(selectors, Mapping):
+            raise ServiceError("governed run requires ContractRuntime selectors")
+        unsupported = sorted(set(selectors) - _GUIDED_RUNTIME_AUTHORITY_FIELDS)
+        if unsupported:
+            raise ServiceError("governed run contains caller-owned authority fields")
+        if any(
+            not str(selectors.get(field) or "").strip()
+            for field in _GUIDED_RUNTIME_REQUIRED_SELECTORS
+        ):
+            raise ServiceError("governed run is missing canonical authority selectors")
+        try:
+            expected_revision = int(
+                selectors.get("expected_execution_state_revision") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ServiceError("governed run state revision is invalid") from exc
+        if expected_revision <= 0:
+            raise ServiceError("governed run requires current authority coordinates")
+
+        run_value = payload.get("run")
+        if not isinstance(run_value, Mapping):
+            raise ServiceError("host envelope run must be a public run object")
+        profile_value = run_value.get("profile")
+        if not isinstance(profile_value, Mapping):
+            raise ServiceError("host envelope run requires an immutable profile")
+        try:
+            profile = _profile_from_dict(profile_value)
+            run = _run_from_dict(run_value, profile)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ServiceError("host envelope run identity is invalid") from exc
+        worktree = str(payload.get("worktree") or "").strip()
+        if not worktree:
+            raise ServiceError("host envelope run worktree is required")
+
+        authority_request = {
+            field: selectors.get(field)
+            for field in _GUIDED_RUNTIME_AUTHORITY_FIELDS
+            if selectors.get(field) not in (None, "")
+        }
+        authority_request["expected_execution_state_revision"] = expected_revision
+        ticket = self._contract_runtime_authority_resolver(authority_request)
+        if not isinstance(ticket, Mapping):
+            raise ServiceError("ContractRuntime resolver returned an invalid ticket")
+        dispatch = ticket.get("dispatch_identity")
+        profile_requirements = ticket.get("profile_requirements")
+        if (
+            ticket.get("status") != "issued"
+            or ticket.get("issue_allowed") is not True
+            or not isinstance(dispatch, Mapping)
+            or not isinstance(profile_requirements, Mapping)
+        ):
+            raise ServiceError("ContractRuntime resolver did not issue a canonical ticket")
+
+        selector_comparisons = {
+            "project_id": dispatch.get("project_id"),
+            "backlog_id": dispatch.get("backlog_id"),
+            "runtime_context_id": dispatch.get("runtime_context_id"),
+            "task_id": dispatch.get("task_id"),
+            "worker_id": dispatch.get("worker_id"),
+            "worker_slot_id": dispatch.get("worker_slot_id"),
+            "observer_command_id": dispatch.get("observer_command_id"),
+            "principal_id": dispatch.get("worker_id"),
+            "role": dispatch.get("worker_role"),
+            "profile_id": profile_requirements.get("profile_id"),
+        }
+        mismatches = [
+            field
+            for field, canonical in selector_comparisons.items()
+            if str(canonical or "").strip()
+            != str(selectors.get(field) or "").strip()
+        ]
+        run_role = str(getattr(run.config.role, "value", run.config.role)).strip()
+        if str(dispatch.get("worktree_path") or "").strip() != worktree:
+            mismatches.append("worktree")
+        if str(run.config.project_id or "").strip() != str(
+            dispatch.get("project_id") or ""
+        ).strip():
+            mismatches.append("run.project_id")
+        if run.config.profile_id != str(
+            profile_requirements.get("profile_id") or ""
+        ).strip():
+            mismatches.append("run.profile_id")
+        if run_role != str(profile_requirements.get("role") or "").strip():
+            mismatches.append("run.role")
+        if str(ticket.get("contract_execution_id") or "").strip() != str(
+            selectors.get("contract_execution_id") or ""
+        ).strip():
+            mismatches.append("contract_execution_id")
+        if int(ticket.get("execution_state_revision") or 0) != expected_revision:
+            mismatches.append("execution_state_revision")
+        for field in (
+            "expected_execution_state_hash",
+            "expected_dispatch_identity_hash",
+        ):
+            expected = str(selectors.get(field) or "").strip()
+            ticket_field = field.removeprefix("expected_")
+            if expected and str(ticket.get(ticket_field) or "").strip() != expected:
+                mismatches.append(ticket_field)
+        if mismatches:
+            raise ServiceError(
+                "ContractRuntime ticket does not match run admission: "
+                + ", ".join(sorted(set(mismatches)))
+            )
+
+        evidence_refs = {
+            "project_id": str(dispatch.get("project_id") or ""),
+            "backlog_id": str(dispatch.get("backlog_id") or ""),
+            "contract_execution_id": str(ticket.get("contract_execution_id") or ""),
+            "runtime_context_id": str(dispatch.get("runtime_context_id") or ""),
+            "task_id": str(dispatch.get("task_id") or ""),
+        }
+        return self._start_host_envelope_run(
+            {
+                **{
+                    field: value
+                    for field, value in payload.items()
+                    if field != "authority_selectors"
+                },
+                "execution_ticket": dict(ticket),
+                "evidence_refs": evidence_refs,
+            }
+        )
+
     def _start_host_envelope_run(
         self,
         payload: Mapping[str, Any],
@@ -607,7 +841,7 @@ class CliAgentService:
             payload = request.get("payload")
             if not isinstance(payload, Mapping):
                 raise ServiceError("host envelope run payload must be an object")
-            return self._start_host_envelope_run(payload), False
+            return self._admit_governed_host_envelope_run(payload), False
         if operation in {
             "desktop_host_register",
             "desktop_host_heartbeat",
@@ -695,6 +929,9 @@ class CliAgentService:
     def serve_forever(self) -> None:
         self.paths.prepare()
         self._remove_stale_socket()
+        if not self._restart_reconciled:
+            self.supervisor.reconcile_restart()
+            self._restart_reconciled = True
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(self.paths.socket_path))
