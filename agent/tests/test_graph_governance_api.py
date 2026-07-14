@@ -45750,10 +45750,25 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
     assert ticket["dispatch_identity"]["runtime_context_id"] == (
         runtime_context.runtime_context_id
     )
+    assert ticket["dispatch_identity"]["worker_id"] == runtime_context.worker_id
+    assert ticket["dispatch_identity"]["worker_slot_id"] == (
+        runtime_context.worker_slot_id
+    )
+    assert ticket["dispatch_identity"]["observer_command_id"] == (
+        successor["contract_execution_id"]
+    )
     assert ticket["dispatch_identity"]["branch_ref"] == runtime_context.branch_ref
     assert ticket["profile_requirements"]["profile_id"] == "codex-mf-sub"
     assert ticket["retry_policy"] == {"attempt": 1, "max_attempts": 2}
     assert "route_identity" not in ticket["next_legal_action"]
+    admission_request = prepared["worker_launch_pack"][
+        "desktop_execution_ticket_admission_request"
+    ]
+    assert admission_request["worker_id"] == runtime_context.worker_id
+    assert admission_request["worker_slot_id"] == runtime_context.worker_slot_id
+    assert admission_request["observer_command_id"] == (
+        successor["contract_execution_id"]
+    )
 
     worker_read = server.handle_project_contract_runtime_line_write(
         _ctx(
@@ -53284,3 +53299,156 @@ def test_cli_agent_successor_ticket_binds_persisted_evidence_and_runtime_authori
         "notification_ref_verified": True,
         "source_of_authority": "ContractRuntime",
     }
+
+
+def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch):
+    class Connection:
+        def close(self):
+            pass
+
+    action = {
+        "id": "worker_dispatch",
+        "action": "dispatch_bounded_worker",
+        "runtime_context_id": "mfrctx-desktop-resolver",
+        "task_id": "desktop-resolver-worker",
+        "worker_id": "desktop-resolver-worker",
+        "worker_slot_id": "desktop-resolver-slot",
+        "observer_command_id": "desktop-resolver-command",
+        "parent_task_id": "desktop-resolver-parent",
+        "worker_role": "mf_sub",
+        "target_project_root": "/tmp/desktop-resolver-worker",
+        "branch_ref": "refs/heads/desktop-resolver-worker",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "merge_queue_id": "mq-desktop-resolver",
+        "owned_files": ["agent/observer_runtime.py"],
+        "route_id": "route-desktop-resolver",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "prompt-desktop-resolver",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtref-desktop-resolver",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+        "profile_requirements": {
+            "profile_id": "codex-desktop-resolver",
+            "harness": "codex",
+        },
+        "retry_policy": {"attempt": 1, "max_attempts": 2},
+    }
+    authority = {
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": "contract_runtime_completed_dispatch_line",
+        "project_id": PID,
+        "backlog_id": "AC-DESKTOP-RESOLVER",
+        "contract_execution_id": "cex-desktop-resolver",
+        "contract_revision_id": "rev-desktop-resolver",
+        "execution_state_revision": 4,
+        "execution_state_hash": "sha256:" + "4" * 64,
+        "runtime_guide_hash": "sha256:" + "5" * 64,
+        "readiness_state": "contract_active",
+        "next_legal_action": action,
+    }
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_contract_runtime_authority",
+        lambda _conn, **_kwargs: authority,
+    )
+    body = {
+        "project_id": PID,
+        "backlog_id": "AC-DESKTOP-RESOLVER",
+        "contract_execution_id": "cex-desktop-resolver",
+        "runtime_context_id": "mfrctx-desktop-resolver",
+        "task_id": "desktop-resolver-worker",
+        "worker_id": "desktop-resolver-worker",
+        "worker_slot_id": "desktop-resolver-slot",
+        "observer_command_id": "desktop-resolver-command",
+        "expected_execution_state_revision": 4,
+        "expected_execution_state_hash": "sha256:" + "4" * 64,
+    }
+
+    result = server.handle_cli_agent_desktop_execution_ticket_resolve(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert result["ok"] is True
+    assert result["server_owned_authority_resolution"] is True
+    ticket = result["execution_ticket"]
+    assert ticket["status"] == "issued"
+    assert ticket["dispatch_identity"]["worker_id"] == "desktop-resolver-worker"
+    assert ticket["dispatch_identity"]["worker_slot_id"] == "desktop-resolver-slot"
+    assert ticket["dispatch_identity"]["observer_command_id"] == (
+        "desktop-resolver-command"
+    )
+
+    with pytest.raises(ValidationError, match="caller-owned authority fields"):
+        server.handle_cli_agent_desktop_execution_ticket_resolve(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    **body,
+                    "contract_runtime_current_state": authority,
+                    "launch_identity": ticket["dispatch_identity"],
+                    "profile_requirements": action["profile_requirements"],
+                    "retry_policy": action["retry_policy"],
+                    "execution_ticket": ticket,
+                },
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("worker_id", "forged-worker"),
+        ("worker_slot_id", "forged-slot"),
+        ("observer_command_id", "forged-command"),
+    ],
+)
+def test_desktop_ticket_resolver_rejects_dispatch_selector_mutation(
+    monkeypatch,
+    field,
+    replacement,
+):
+    class Connection:
+        def close(self):
+            pass
+
+    action = {
+        "runtime_context_id": "mfrctx-selector",
+        "task_id": "task-selector",
+        "worker_id": "worker-selector",
+        "worker_slot_id": "slot-selector",
+        "observer_command_id": "command-selector",
+    }
+    authority = {
+        "project_id": PID,
+        "backlog_id": "AC-SELECTOR",
+        "next_legal_action": action,
+        "ticket_authority_status": "invalid",
+        "ticket_authority_error": "fixture omits non-selector authority",
+    }
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_contract_runtime_authority",
+        lambda _conn, **_kwargs: authority,
+    )
+    body = {
+        "project_id": PID,
+        "backlog_id": "AC-SELECTOR",
+        "contract_execution_id": "cex-selector",
+        "runtime_context_id": "mfrctx-selector",
+        "task_id": "task-selector",
+        "worker_id": "worker-selector",
+        "worker_slot_id": "slot-selector",
+        "observer_command_id": "command-selector",
+        field: replacement,
+    }
+
+    result = server.handle_cli_agent_desktop_execution_ticket_resolve(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert result["ok"] is False
+    assert result["execution_ticket"]["selector_mismatches"] == [field]

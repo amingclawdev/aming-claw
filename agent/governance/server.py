@@ -49718,6 +49718,7 @@ def _contract_runtime_line_write_body(
         "lane_id",
         "worker_slot_id",
         "worker_id",
+        "observer_command_id",
         "base_commit",
         "target_head_commit",
         "merge_queue_id",
@@ -67448,6 +67449,9 @@ def _contract_runtime_dispatch_ticket_authority(
     field_aliases = {
         "runtime_context_id": (),
         "task_id": ("worker_task_id",),
+        "worker_id": (),
+        "worker_slot_id": (),
+        "observer_command_id": (),
         "parent_task_id": (),
         "worker_role": (),
         "target_project_root": ("worktree_path", "project_root", "repo_root"),
@@ -67468,6 +67472,20 @@ def _contract_runtime_dispatch_ticket_authority(
             conflicts.append(conflict)
         elif value:
             action[field] = value
+
+    canonical_worker_id = str(
+        action.get("worker_id")
+        or action.get("worker_slot_id")
+        or action.get("task_id")
+        or ""
+    ).strip()
+    if canonical_worker_id:
+        action.setdefault("worker_id", canonical_worker_id)
+        action.setdefault("worker_slot_id", canonical_worker_id)
+    action.setdefault(
+        "observer_command_id",
+        str(record.get("contract_execution_id") or "").strip(),
+    )
 
     owned_sources = []
     for source in (line, payload):
@@ -67574,6 +67592,177 @@ def _observer_runtime_text_contract_runtime_authority(
         current_state["ticket_authority_status"] = "invalid"
         current_state["ticket_authority_error"] = "; ".join(errors)
     return current_state
+
+
+_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS = frozenset(
+    {
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "expected_execution_state_revision",
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+    }
+)
+
+
+def _contract_runtime_desktop_launch_identity(
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive Desktop dispatch solely from the canonical ContractRuntime line."""
+
+    action = (
+        authority.get("next_legal_action")
+        if isinstance(authority.get("next_legal_action"), Mapping)
+        else {}
+    )
+    launch = {
+        "project_id": str(authority.get("project_id") or "").strip(),
+        "backlog_id": str(authority.get("backlog_id") or "").strip(),
+    }
+    aliases = {
+        "task_id": ("task_id",),
+        "worker_id": ("worker_id",),
+        "worker_slot_id": ("worker_slot_id",),
+        "observer_command_id": ("observer_command_id",),
+        "parent_task_id": ("parent_task_id",),
+        "runtime_context_id": ("runtime_context_id",),
+        "worker_role": ("worker_role",),
+        "worktree_path": (
+            "target_project_root",
+            "worktree_path",
+            "project_root",
+            "repo_root",
+        ),
+        "branch_ref": ("branch_ref", "branch"),
+        "base_commit": ("base_commit",),
+        "target_head_commit": ("target_head_commit",),
+        "merge_queue_id": ("merge_queue_id",),
+        "route_id": ("route_id",),
+        "route_context_hash": ("route_context_hash",),
+        "prompt_contract_id": ("prompt_contract_id",),
+        "prompt_contract_hash": ("prompt_contract_hash",),
+        "route_token_ref": ("route_token_ref",),
+        "visible_injection_manifest_hash": (
+            "visible_injection_manifest_hash",
+        ),
+    }
+    for output_field, candidates in aliases.items():
+        value = next(
+            (
+                str(action.get(candidate) or "").strip()
+                for candidate in candidates
+                if str(action.get(candidate) or "").strip()
+            ),
+            "",
+        )
+        if value:
+            launch[output_field] = value
+    owned_files = _runtime_context_service_query_values(
+        action,
+        "owned_files",
+        "target_files",
+    )
+    if owned_files:
+        launch["owned_files"] = owned_files
+    return launch
+
+
+@route(
+    "POST",
+    "/api/projects/{project_id}/cli-agent/desktop-execution-ticket/resolve",
+)
+def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
+    """Resolve a Desktop ticket from server-owned ContractRuntime authority."""
+
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    unsupported = sorted(set(body) - _DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS)
+    if unsupported:
+        raise ValidationError(
+            "Desktop ticket resolution contains caller-owned authority fields"
+        )
+    if str(body.get("project_id") or project_id).strip() != project_id:
+        raise ValidationError("Desktop ticket project_id does not match request path")
+    required = (
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+    )
+    if any(not str(body.get(field) or "").strip() for field in required):
+        raise ValidationError(
+            "Desktop ticket resolution requires canonical authority selectors"
+        )
+    conn = get_connection(project_id)
+    try:
+        authority = _observer_runtime_text_contract_runtime_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=str(body.get("backlog_id") or ""),
+            contract_execution_id=str(body.get("contract_execution_id") or ""),
+        )
+    finally:
+        conn.close()
+    launch_identity = _contract_runtime_desktop_launch_identity(authority)
+    selector_mismatches = [
+        field
+        for field in (
+            "project_id",
+            "backlog_id",
+            "runtime_context_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "observer_command_id",
+        )
+        if str(launch_identity.get(field) or "").strip()
+        != str(body.get(field) or (project_id if field == "project_id" else "")).strip()
+    ]
+    try:
+        expected_revision = int(body.get("expected_execution_state_revision") or 0)
+    except (TypeError, ValueError):
+        expected_revision = -1
+    from .contract_state_runtime import build_cli_agent_execution_ticket
+
+    execution_ticket = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=authority,
+        launch_identity=launch_identity,
+        expected_execution_state_revision=expected_revision,
+        expected_execution_state_hash=str(
+            body.get("expected_execution_state_hash") or ""
+        ),
+        expected_dispatch_identity_hash=str(
+            body.get("expected_dispatch_identity_hash") or ""
+        ),
+    )
+    if selector_mismatches:
+        execution_ticket = {
+            "schema_version": "cli_agent_execution_ticket.v1",
+            "status": "rejected",
+            "issue_allowed": False,
+            "source_of_authority": "ContractRuntime",
+            "errors": ["authority selectors do not match canonical dispatch"],
+            "selector_mismatches": selector_mismatches,
+            "raw_credentials_persisted": False,
+            "raw_route_token_persisted": False,
+            "raw_private_context_persisted": False,
+        }
+    return {
+        "ok": execution_ticket.get("status") == "issued",
+        "status": str(execution_ticket.get("status") or "rejected"),
+        "execution_ticket": execution_ticket,
+        "source_of_authority": "ContractRuntime",
+        "server_owned_authority_resolution": True,
+    }
 
 
 @route("POST", "/api/projects/{project_id}/observer/worker-launch-pack/prepare")

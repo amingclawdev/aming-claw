@@ -8,11 +8,18 @@ import os
 import signal
 import socket
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .adapters.codex_desktop import (
+    CodexDesktopAdapter,
+    DesktopHostAdapterError,
+)
 from .health import health_payload, stopped_payload
 from .launchers import (
     HostEnvelopeError,
@@ -25,6 +32,34 @@ from .supervisor import CodexC0Supervisor
 
 MAX_REQUEST_BYTES = 64 * 1024
 DEFAULT_SOCKET_TIMEOUT_SECONDS = 3.0
+DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
+
+_DESKTOP_ADMISSION_PUBLIC_FIELDS = frozenset(
+    {
+        "host_kind",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "expected_execution_state_revision",
+        "expected_execution_state_hash",
+        "expected_dispatch_identity_hash",
+        "now_iso",
+    }
+)
+_DESKTOP_ADMISSION_IDENTITY_FIELDS = (
+    "project_id",
+    "backlog_id",
+    "runtime_context_id",
+    "task_id",
+    "worker_id",
+    "worker_slot_id",
+    "observer_command_id",
+)
 
 
 class ServiceError(RuntimeError):
@@ -146,6 +181,67 @@ def current_status(paths: ServicePaths) -> dict[str, Any]:
         return payload
 
 
+def resolve_governance_desktop_execution_ticket(
+    authority_request: Mapping[str, Any],
+    *,
+    governance_url: str = "",
+    timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Resolve one ticket through the governance-owned ContractRuntime store."""
+
+    project_id = str(authority_request.get("project_id") or "").strip()
+    if not project_id:
+        raise ServiceError("Desktop authority request requires project_id")
+    base_url = str(
+        governance_url
+        or os.environ.get("AMING_CLAW_GOVERNANCE_URL")
+        or DEFAULT_GOVERNANCE_URL
+    ).rstrip("/")
+    url = "{}/api/projects/{}/cli-agent/desktop-execution-ticket/resolve".format(
+        base_url,
+        urllib.parse.quote(project_id, safe=""),
+    )
+    request_bytes = json.dumps(
+        dict(authority_request),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(request_bytes) > MAX_REQUEST_BYTES:
+        raise ServiceError("Desktop authority request exceeded the size limit")
+    request = urllib.request.Request(
+        url,
+        data=request_bytes,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(float(timeout_seconds), 0.05),
+        ) as response:
+            response_bytes = response.read(MAX_REQUEST_BYTES + 1)
+    except (OSError, urllib.error.URLError) as exc:
+        raise ServiceUnavailableError(
+            "ContractRuntime authority resolver is unavailable"
+        ) from exc
+    if len(response_bytes) > MAX_REQUEST_BYTES:
+        raise ServiceError("Desktop authority response exceeded the size limit")
+    try:
+        resolved = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ServiceError(
+            "ContractRuntime authority resolver returned an invalid response"
+        ) from exc
+    if not isinstance(resolved, Mapping):
+        raise ServiceError(
+            "ContractRuntime authority resolver returned an invalid response"
+        )
+    ticket = resolved.get("execution_ticket")
+    if resolved.get("ok") is not True or not isinstance(ticket, Mapping):
+        raise ServiceError("ContractRuntime authority rejected Desktop admission")
+    return dict(ticket)
+
+
 class CliAgentService:
     """Foreground Unix-socket service intended to be supervised by launchd."""
 
@@ -184,6 +280,198 @@ class CliAgentService:
                 state_dir=self.paths.state_dir / "supervisor",
                 host_envelope_store=self.host_envelope_store,
             )
+        self._desktop_adapters: dict[str, CodexDesktopAdapter] = {
+            "codex_desktop": CodexDesktopAdapter(),
+        }
+        self._contract_runtime_authority_resolver = (
+            resolve_governance_desktop_execution_ticket
+        )
+
+    def _desktop_adapter(self, payload: Mapping[str, Any]) -> CodexDesktopAdapter:
+        host_kind = str(payload.get("host_kind") or "").strip().lower()
+        adapter = self._desktop_adapters.get(host_kind)
+        if adapter is None:
+            raise ServiceError("Desktop host kind is unsupported")
+        return adapter
+
+    def _admit_desktop_execution_ticket(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        unsupported = sorted(set(payload) - _DESKTOP_ADMISSION_PUBLIC_FIELDS)
+        if unsupported:
+            raise ServiceError(
+                "Desktop ticket admission contains unsupported authority fields"
+            )
+        missing = [
+            field
+            for field in (
+                "host_kind",
+                "project_id",
+                "backlog_id",
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "worker_id",
+                "worker_slot_id",
+                "observer_command_id",
+            )
+            if not str(payload.get(field) or "").strip()
+        ]
+        if missing:
+            raise ServiceError(
+                "Desktop ticket admission is missing canonical authority selectors"
+            )
+        try:
+            expected_revision = int(
+                payload.get("expected_execution_state_revision") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(
+                "Desktop ticket admission state revision is invalid"
+            ) from exc
+        if expected_revision <= 0:
+            raise ServiceError(
+                "Desktop ticket admission requires current authority coordinates"
+            )
+        authority_request = {
+            field: payload.get(field)
+            for field in _DESKTOP_ADMISSION_PUBLIC_FIELDS
+            if field not in {"host_kind", "now_iso"}
+            and payload.get(field) not in (None, "")
+        }
+        authority_request["expected_execution_state_revision"] = expected_revision
+        canonical_ticket = self._contract_runtime_authority_resolver(
+            authority_request
+        )
+        if not isinstance(canonical_ticket, Mapping):
+            raise ServiceError(
+                "ContractRuntime authority resolver returned an invalid ticket"
+            )
+        dispatch = canonical_ticket.get("dispatch_identity")
+        if not isinstance(dispatch, Mapping):
+            raise ServiceError(
+                "ContractRuntime authority resolver returned an invalid dispatch"
+            )
+        mismatches = [
+            field
+            for field in _DESKTOP_ADMISSION_IDENTITY_FIELDS
+            if str(dispatch.get(field) or "").strip()
+            != str(payload.get(field) or "").strip()
+        ]
+        if str(canonical_ticket.get("contract_execution_id") or "").strip() != str(
+            payload.get("contract_execution_id") or ""
+        ).strip():
+            mismatches.append("contract_execution_id")
+        try:
+            canonical_revision = int(
+                canonical_ticket.get("execution_state_revision") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(
+                "ContractRuntime authority resolver returned an invalid state revision"
+            ) from exc
+        if canonical_revision != expected_revision:
+            mismatches.append("execution_state_revision")
+        expected_state_hash = str(
+            payload.get("expected_execution_state_hash") or ""
+        ).strip()
+        if expected_state_hash and str(
+            canonical_ticket.get("execution_state_hash") or ""
+        ).strip() != expected_state_hash:
+            mismatches.append("execution_state_hash")
+        expected_dispatch_hash = str(
+            payload.get("expected_dispatch_identity_hash") or ""
+        ).strip()
+        if expected_dispatch_hash and str(
+            canonical_ticket.get("dispatch_identity_hash") or ""
+        ).strip() != expected_dispatch_hash:
+            mismatches.append("dispatch_identity_hash")
+        if mismatches:
+            raise ServiceError(
+                "ContractRuntime authority resolver returned stale or mismatched authority"
+            )
+        adapter = self._desktop_adapter(payload)
+        admission = adapter._admit_service_execution_ticket(
+            canonical_execution_ticket=canonical_ticket,
+            now_iso=str(payload.get("now_iso") or ""),
+        )
+        return {
+            "ok": True,
+            "host_kind": adapter.host_kind,
+            "execution_ticket": dict(canonical_ticket),
+            **admission,
+        }
+
+    def _dispatch_desktop_operation(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if operation == "desktop_execution_ticket_admit":
+            return self._admit_desktop_execution_ticket(payload)
+        adapter = self._desktop_adapter(payload)
+        if operation == "desktop_host_register":
+            result = adapter.register_host(
+                host_id=str(payload.get("host_id") or ""),
+                capabilities=list(payload.get("capabilities") or []),
+                automation_mode=str(
+                    payload.get("automation_mode") or "service_callable"
+                ),
+                auth_mode=str(payload.get("auth_mode") or "host_owned"),
+                heartbeat_ttl_seconds=payload.get("heartbeat_ttl_seconds") or 30,
+                host_session_id=str(payload.get("host_session_id") or ""),
+                now_iso=str(payload.get("now_iso") or ""),
+            )
+        elif operation == "desktop_host_heartbeat":
+            result = adapter.heartbeat(
+                host_id=str(payload.get("host_id") or ""),
+                heartbeat_id=str(payload.get("heartbeat_id") or ""),
+                capabilities=list(payload.get("capabilities") or []),
+                now_iso=str(payload.get("now_iso") or ""),
+            )
+        elif operation == "desktop_execution_ticket_ack":
+            ticket = payload.get("execution_ticket")
+            if not isinstance(ticket, Mapping):
+                raise ServiceError("Desktop execution ticket is required")
+            result = adapter.acknowledge_execution_ticket(
+                host_id=str(payload.get("host_id") or ""),
+                execution_ticket=ticket,
+                run_id=str(payload.get("run_id") or ""),
+                now_iso=str(payload.get("now_iso") or ""),
+            )
+        elif operation == "desktop_runtime_join":
+            ack = payload.get("ticket_ack")
+            if not isinstance(ack, Mapping):
+                raise ServiceError("Desktop ticket acknowledgement is required")
+            canonical_ack = dict(ack)
+            canonical_ack.pop("ok", None)
+            result = adapter.join_runtime_context(
+                ticket_ack=canonical_ack,
+                actual_host_worker_id=str(
+                    payload.get("actual_host_worker_id") or ""
+                ),
+                worker_session_id=str(payload.get("worker_session_id") or ""),
+                worker_transcript_ref=str(
+                    payload.get("worker_transcript_ref") or ""
+                ),
+                session_token_ref=str(payload.get("session_token_ref") or ""),
+                observer_command_id=str(
+                    payload.get("observer_command_id") or ""
+                ),
+                launch_text_hash=str(payload.get("launch_text_hash") or ""),
+                worker_slot_id=str(payload.get("worker_slot_id") or ""),
+                host_startup_id=str(payload.get("host_startup_id") or ""),
+                now_iso=str(payload.get("now_iso") or ""),
+            )
+        elif operation == "desktop_run_cleanup":
+            result = adapter.cleanup_run(
+                str(payload.get("run_id") or ""),
+                reason=str(payload.get("reason") or "run_cleanup"),
+            )
+        else:  # pragma: no cover - guarded by _dispatch
+            raise ServiceError("unsupported Desktop host operation")
+        return {"ok": True, "host_kind": adapter.host_kind, **result}
 
     def _snapshot(
         self,
@@ -320,6 +608,18 @@ class CliAgentService:
             if not isinstance(payload, Mapping):
                 raise ServiceError("host envelope run payload must be an object")
             return self._start_host_envelope_run(payload), False
+        if operation in {
+            "desktop_host_register",
+            "desktop_host_heartbeat",
+            "desktop_execution_ticket_admit",
+            "desktop_execution_ticket_ack",
+            "desktop_runtime_join",
+            "desktop_run_cleanup",
+        }:
+            payload = request.get("payload")
+            if not isinstance(payload, Mapping):
+                raise ServiceError("Desktop host payload must be an object")
+            return self._dispatch_desktop_operation(operation, payload), False
         if operation == "host_envelope":
             payload = request.get("payload")
             if not isinstance(payload, Mapping):
@@ -353,6 +653,12 @@ class CliAgentService:
                 "stop",
                 "host_envelope",
                 "start_host_envelope_run",
+                "desktop_host_register",
+                "desktop_host_heartbeat",
+                "desktop_execution_ticket_admit",
+                "desktop_execution_ticket_ack",
+                "desktop_runtime_join",
+                "desktop_run_cleanup",
             ],
         }, False
 
@@ -363,6 +669,7 @@ class CliAgentService:
             request = self._read_request(connection)
             response, should_stop = self._dispatch(request)
         except (
+            DesktopHostAdapterError,
             HostEnvelopeError,
             ServiceError,
             UnicodeDecodeError,
