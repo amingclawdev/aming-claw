@@ -12061,6 +12061,7 @@ def _runtime_context_projection_response(
         contract_execution_id=contract_execution_id,
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
+        context=context,
     )
     if contract_runtime_projection:
         response["contract_runtime_current_state"] = dict(
@@ -12082,6 +12083,29 @@ def _runtime_context_projection_response(
         response["runtime_context_service"][
             "contract_runtime_authority_decision_source"
         ] = "contract_runtime_current_state"
+        contract_runtime_dispatch_identity = dict(
+            contract_runtime_projection.get("contract_runtime_dispatch_identity")
+            or {}
+        )
+        if contract_runtime_dispatch_identity:
+            response["contract_runtime_dispatch_identity"] = dict(
+                contract_runtime_dispatch_identity
+            )
+            response["runtime_context_service"][
+                "contract_runtime_dispatch_identity"
+            ] = dict(contract_runtime_dispatch_identity)
+            source_refs["contract_runtime_dispatch_identity"] = str(
+                contract_runtime_dispatch_identity.get("source_ref") or ""
+            )
+            dispatch_projection_fields = (
+                _contract_runtime_dispatch_identity_projection_fields(
+                    contract_runtime_dispatch_identity
+                )
+            )
+            response.update(dispatch_projection_fields)
+            response["runtime_context_service"].update(
+                dispatch_projection_fields
+            )
         _runtime_context_project_contract_runtime_into_worker_views(
             exposed_views,
             contract_runtime_projection,
@@ -12161,6 +12185,11 @@ def _runtime_context_projection_response(
         context_hash=str(scoped_content_address.get("projection_hash") or ""),
         worker_implementation_lineage=(
             contract_runtime_projection.get("worker_implementation_lineage")
+            if isinstance(contract_runtime_projection, Mapping)
+            else {}
+        ),
+        contract_runtime_dispatch_identity=(
+            contract_runtime_projection.get("contract_runtime_dispatch_identity")
             if isinstance(contract_runtime_projection, Mapping)
             else {}
         ),
@@ -12369,6 +12398,7 @@ def _runtime_context_contract_runtime_worker_projection(
     contract_execution_id: str,
     runtime_context_id: str,
     task_id: str,
+    context=None,
 ) -> dict[str, Any]:
     execution_id = str(contract_execution_id or "").strip()
     if not execution_id:
@@ -12417,6 +12447,19 @@ def _runtime_context_contract_runtime_worker_projection(
         current_state["worker_implementation_lineage"] = dict(
             worker_implementation_lineage
         )
+    contract_runtime_dispatch_identity = (
+        _contract_runtime_dispatch_identity_resolution(canonical_record, context)
+        if context is not None
+        else {}
+    )
+    if contract_runtime_dispatch_identity:
+        current_state["contract_runtime_dispatch_identity"] = dict(
+            contract_runtime_dispatch_identity
+        )
+        if contract_runtime_dispatch_identity.get("accepted"):
+            current_state["observer_command_id"] = str(
+                contract_runtime_dispatch_identity.get("observer_command_id") or ""
+            )
     return {
         "schema_version": "runtime_context.contract_runtime_projection.v1",
         "source_of_authority": "contract_runtime_current_state",
@@ -12428,6 +12471,9 @@ def _runtime_context_contract_runtime_worker_projection(
         "contract_runtime_next_legal_action": next_action,
         "worker_implementation_lineage": dict(
             worker_implementation_lineage
+        ),
+        "contract_runtime_dispatch_identity": dict(
+            contract_runtime_dispatch_identity
         ),
         "timeline_projection_authoritative": False,
     }
@@ -12446,6 +12492,9 @@ def _runtime_context_project_contract_runtime_into_worker_views(
     next_action = dict(
         projection.get("contract_runtime_next_legal_action") or {}
     )
+    contract_runtime_dispatch_identity = dict(
+        projection.get("contract_runtime_dispatch_identity") or {}
+    )
     fields = {
         "contract_runtime_current_state": current_state,
         "contract_runtime_next_legal_action": next_action,
@@ -12458,8 +12507,14 @@ def _runtime_context_project_contract_runtime_into_worker_views(
         "worker_implementation_lineage": dict(
             projection.get("worker_implementation_lineage") or {}
         ),
+        "contract_runtime_dispatch_identity": contract_runtime_dispatch_identity,
         "timeline_projection_authoritative": False,
     }
+    fields.update(
+        _contract_runtime_dispatch_identity_projection_fields(
+            contract_runtime_dispatch_identity
+        )
+    )
     for container in (
         worker_view,
         worker_view.get("task") if isinstance(worker_view.get("task"), dict) else {},
@@ -13668,6 +13723,24 @@ def _runtime_context_worker_guide_response(
     contract_runtime_current_state = dict(
         current_state_response.get("contract_runtime_current_state") or {}
     )
+    contract_runtime_dispatch_identity = dict(
+        current_state_response.get("contract_runtime_dispatch_identity")
+        or contract_runtime_current_state.get("contract_runtime_dispatch_identity")
+        or worker_view.get("contract_runtime_dispatch_identity")
+        or {}
+    )
+    canonical_observer_command_id = (
+        str(
+            contract_runtime_dispatch_identity.get("observer_command_id") or ""
+        ).strip()
+        if contract_runtime_dispatch_identity.get("accepted")
+        else ""
+    )
+    canonical_dispatch_projection_fields = (
+        _contract_runtime_dispatch_identity_projection_fields(
+            contract_runtime_dispatch_identity
+        )
+    )
     contract_runtime_next_legal_action = dict(
         current_state_response.get("contract_runtime_next_legal_action") or {}
     )
@@ -14184,7 +14257,8 @@ def _runtime_context_worker_guide_response(
         or ""
     ).strip()
     hinted_observer_command_id = str(
-        finish_attestation_hint.get("observer_command_id")
+        canonical_observer_command_id
+        or finish_attestation_hint.get("observer_command_id")
         or timeline_refs.get("observer_command_id")
         or ""
     ).strip()
@@ -14225,6 +14299,7 @@ def _runtime_context_worker_guide_response(
             hinted_observer_command_id
             or "<claimed execute_backlog_row command id>"
         ),
+        **canonical_dispatch_projection_fields,
         "head_commit": str(
             finish_attestation_hint.get("head_commit")
             or finish_submission_head_commit
@@ -14421,6 +14496,7 @@ def _runtime_context_worker_guide_response(
             hinted_observer_command_id
             or "<same observer_command_id used for finish-time attestation>"
         ),
+        **canonical_dispatch_projection_fields,
         "finish_time_worker_self_attestation": (
             "<finish_time_worker_self_attestation returned by "
             "finish-time-worker-attestation>"
@@ -14451,6 +14527,7 @@ def _runtime_context_worker_guide_response(
                 hinted_observer_command_id
                 or "<same observer_command_id used for finish-time attestation>"
             ),
+            **canonical_dispatch_projection_fields,
             "finish_time_worker_self_attestation": (
                 "<finish_time_worker_self_attestation returned by "
                 "finish-time-worker-attestation>"
@@ -14993,6 +15070,7 @@ def _runtime_context_worker_guide_response(
             if isinstance(contract_runtime_current_state, Mapping)
             else {}
         ),
+        contract_runtime_dispatch_identity=contract_runtime_dispatch_identity,
     )
     if not contract_worker_commit_required:
         actionable_payloads.pop("worker_commit_facade_payload_skeleton", None)
@@ -15063,6 +15141,7 @@ def _runtime_context_worker_guide_response(
             {},
         ),
         "contract_runtime_current_state": contract_runtime_current_state,
+        "contract_runtime_dispatch_identity": contract_runtime_dispatch_identity,
         "contract_runtime_next_legal_action": contract_runtime_next_legal_action,
         "contract_runtime_authority_decision_source": (
             contract_runtime_authority_decision_source
@@ -15147,6 +15226,9 @@ def _runtime_context_worker_guide_response(
                 {},
             ),
             "contract_runtime_current_state": contract_runtime_current_state,
+            "contract_runtime_dispatch_identity": (
+                contract_runtime_dispatch_identity
+            ),
             "contract_runtime_next_legal_action": contract_runtime_next_legal_action,
             "contract_runtime_authority_decision_source": (
                 contract_runtime_authority_decision_source
@@ -15655,6 +15737,7 @@ def _runtime_context_worker_recovery_payloads(
     context_hash: str = "",
     graph_trace_id: str = "",
     worker_implementation_lineage: Mapping[str, Any] | None = None,
+    contract_runtime_dispatch_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_route_identity = {
         field: str((route_identity or {}).get(field) or "").strip()
@@ -15674,6 +15757,22 @@ def _runtime_context_worker_recovery_payloads(
         if isinstance(worker_implementation_lineage, Mapping)
         else {}
     )
+    canonical_dispatch_identity = dict(
+        contract_runtime_dispatch_identity
+        if isinstance(contract_runtime_dispatch_identity, Mapping)
+        else {}
+    )
+    canonical_observer_command_id = (
+        str(canonical_dispatch_identity.get("observer_command_id") or "").strip()
+        if canonical_dispatch_identity.get("accepted")
+        else ""
+    )
+    canonical_dispatch_fields = (
+        _contract_runtime_dispatch_identity_projection_fields(
+            canonical_dispatch_identity
+        )
+    )
+    canonical_dispatch_fields.pop("observer_command_id", None)
     implementation_lineage_ref = str(
         canonical_implementation_lineage.get("implementation_lineage_ref") or ""
     ).strip()
@@ -16208,7 +16307,11 @@ def _runtime_context_worker_recovery_payloads(
             normalized_target_head_commit or "<assigned target HEAD commit>"
         ),
         "merge_queue_id": normalized_merge_queue_id or "<assigned merge_queue_id>",
-        "observer_command_id": "<claimed execute_backlog_row command id>",
+        "observer_command_id": (
+            canonical_observer_command_id
+            or "<claimed execute_backlog_row command id>"
+        ),
+        **canonical_dispatch_fields,
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,
         "session_token_ref": session_token_ref_placeholder,
@@ -16266,6 +16369,14 @@ def _runtime_context_worker_recovery_payloads(
             "base_commit": normalized_base_commit,
             "target_head_commit": normalized_target_head_commit,
             "merge_queue_id": normalized_merge_queue_id,
+            **(
+                {
+                    "observer_command_id": canonical_observer_command_id,
+                    **canonical_dispatch_fields,
+                }
+                if canonical_observer_command_id
+                else {}
+            ),
             "target_project_root": target_project_root,
             "session_token_env": session_token_env,
             "session_token_ref": session_token_ref_placeholder,
@@ -19276,6 +19387,7 @@ def _runtime_context_finish_gate_submission_payload(
     read_receipt_event_id: str,
     read_receipt_hash: str,
     observer_command_id: str = "",
+    contract_runtime_dispatch_identity: Mapping[str, Any] | None = None,
     worker_session_id: str = "",
     filer_principal: str = "",
     finish_order_projection: Mapping[str, Any] | None = None,
@@ -19283,6 +19395,17 @@ def _runtime_context_finish_gate_submission_payload(
 ) -> dict[str, Any]:
     body = request_body if isinstance(request_body, Mapping) else {}
     route = route_identity if isinstance(route_identity, Mapping) else {}
+    dispatch_identity = (
+        contract_runtime_dispatch_identity
+        if isinstance(contract_runtime_dispatch_identity, Mapping)
+        else {}
+    )
+    dispatch_identity_fields = (
+        _contract_runtime_dispatch_identity_projection_fields(
+            dispatch_identity
+        )
+    )
+    dispatch_identity_fields.pop("observer_command_id", None)
     target_project_root = str(
         body.get("target_project_root")
         or getattr(context, "target_project_root", "")
@@ -19365,6 +19488,7 @@ def _runtime_context_finish_gate_submission_payload(
         submission_body["finish_order_projection"] = dict(finish_order_projection)
     if observer_command_id:
         submission_body["observer_command_id"] = observer_command_id
+    submission_body.update(dispatch_identity_fields)
     if worker_session_id:
         submission_body["worker_session_id"] = worker_session_id
     if filer_principal:
@@ -19409,6 +19533,7 @@ def _runtime_context_finish_gate_submission_payload(
             else {}
         ),
         **({"observer_command_id": observer_command_id} if observer_command_id else {}),
+        **dispatch_identity_fields,
         "body": submission_body,
         "reminders": {
             "fence_token": "Use the same lane fence_token from the worker launch envelope.",
@@ -22601,6 +22726,54 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
                 contract_identity=contract_execution_identity,
             )
         )
+        contract_execution_id = str(
+            contract_execution_identity.get("contract_execution_id") or ""
+        )
+        contract_runtime_dispatch_identity = (
+            _contract_runtime_dispatch_identity_for_execution(
+                conn,
+                contract_execution_id=contract_execution_id,
+                context=context,
+            )
+        )
+        contract_runtime_dispatch_projection_fields = (
+            _contract_runtime_dispatch_identity_projection_fields(
+                contract_runtime_dispatch_identity
+            )
+        )
+        supplied_observer_command_id = _runtime_context_finish_attestation_text(
+            body,
+            "observer_command_id",
+        )
+        observer_command_id = ""
+        if contract_runtime_dispatch_identity.get("accepted"):
+            _contract_runtime_require_matching_dispatch_identity(
+                supplied_observer_command_id,
+                contract_runtime_dispatch_identity,
+                action="finish_time_worker_attestation",
+            )
+            observer_command_id = str(
+                contract_runtime_dispatch_identity.get("observer_command_id") or ""
+            ).strip()
+        elif contract_execution_id:
+            raise GovernanceError(
+                "observer_command_id_non_reconstructable",
+                (
+                    "finish-time worker attestation requires a source-backed "
+                    "ContractRuntime dispatch line"
+                ),
+                422,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": context.task_id,
+                    "contract_execution_id": contract_execution_id,
+                    "contract_runtime_dispatch_identity": dict(
+                        contract_runtime_dispatch_identity
+                    ),
+                    "timeline_projection_authoritative": False,
+                    "replacement_evidence_allowed": False,
+                },
+            )
         parent_route_identity = _runtime_context_latest_parent_route_identity(
             revision_payload,
             route_identity,
@@ -22670,9 +22843,6 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         finish_order_projection: dict[str, Any] = {}
         head_commit = actual_head or str(body.get("head_commit") or context.head_commit or "")
         changed_files: list[str] = []
-        contract_execution_id = str(
-            contract_execution_identity.get("contract_execution_id") or ""
-        )
         canonical_worker_commit_required = (
             _runtime_context_contract_requires_worker_commit(
                 conn,
@@ -22807,10 +22977,11 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             graph_trace_db_evidence.get("verified_trace_ids") or []
         )
 
-        observer_command_id = (
-            _runtime_context_finish_attestation_text(body, "observer_command_id")
-            or str(timeline_refs.get("observer_command_id") or "").strip()
-        )
+        if not observer_command_id:
+            observer_command_id = (
+                supplied_observer_command_id
+                or str(timeline_refs.get("observer_command_id") or "").strip()
+            )
         worker_session_id = _runtime_context_finish_attestation_text(
             body,
             "worker_session_id",
@@ -22885,6 +23056,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "changed_files": changed_files,
             "owned_files": attestation_git_scope["owned_files"],
             "observer_command_id": observer_command_id,
+            **contract_runtime_dispatch_projection_fields,
             "read_receipt_hash": read_receipt_hash,
             "read_receipt_event_id": read_receipt_event_id,
             "route_token_ref": event_route_identity.get("route_token_ref") or "",
@@ -22926,6 +23098,7 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             )
             or "",
             "observer_command_id": observer_command_id,
+            **contract_runtime_dispatch_projection_fields,
             "head_commit": head_commit,
             "contract_worker_commit_evidence": finish_order_projection,
             "finish_order_projection": finish_order_projection,
@@ -23011,6 +23184,9 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             read_receipt_event_id=read_receipt_event_id,
             read_receipt_hash=read_receipt_hash,
             observer_command_id=observer_command_id,
+            contract_runtime_dispatch_identity=(
+                contract_runtime_dispatch_identity
+            ),
             worker_session_id=worker_session_id,
             filer_principal=filer_principal,
             finish_order_projection=finish_order_projection,
@@ -48988,7 +49164,11 @@ def _contract_runtime_dispatch_identity_bridge(
     record: Mapping[str, Any] | None,
     dispatch_match: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    if not isinstance(record, Mapping) or not isinstance(dispatch_match, Mapping):
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(dispatch_match, Mapping)
+        or not dispatch_match
+    ):
         return {}
     contract_execution_id = str(record.get("contract_execution_id") or "").strip()
     if not contract_execution_id:
@@ -49024,6 +49204,8 @@ def _contract_runtime_dispatch_identity_bridge(
     return {
         "schema_version": "contract_runtime.dispatch_identity_bridge.v1",
         "accepted": True,
+        "status": "resolved",
+        "reconstructable": True,
         "source": dispatch_identity_source,
         "source_label": f"{dispatch_identity_source}/{dispatch_identity_field}",
         "dispatch_identity": observer_command_id,
@@ -49043,6 +49225,116 @@ def _contract_runtime_dispatch_identity_bridge(
         "evidence_kind": str(dispatch_match.get("evidence_kind") or ""),
         "source_ref": str(dispatch_match.get("source_ref") or ""),
     }
+
+
+def _contract_runtime_dispatch_identity_resolution(
+    record: Mapping[str, Any] | None,
+    context,
+) -> dict[str, Any]:
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    bridge = _contract_runtime_dispatch_identity_bridge(record, dispatch_match)
+    if bridge:
+        return bridge
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    return {
+        "schema_version": "contract_runtime.dispatch_identity_resolution.v1",
+        "accepted": False,
+        "status": "non_reconstructable",
+        "non_reconstructable": True,
+        "reconstructable": False,
+        "reason_code": "source_backed_contract_runtime_dispatch_line_missing",
+        "source": "contract_runtime_completed_lines",
+        "timeline_projection_authoritative": False,
+        "replacement_evidence_allowed": False,
+        "observer_command_id": "",
+        "contract_id": str((record or {}).get("contract_id") or "").strip(),
+        "contract_execution_id": str(
+            (record or {}).get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+    }
+
+
+def _contract_runtime_dispatch_identity_projection_fields(
+    bridge: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(bridge, Mapping) or not bridge.get("accepted"):
+        return {}
+    observer_command_id = str(bridge.get("observer_command_id") or "").strip()
+    if not observer_command_id:
+        return {}
+    return {
+        "observer_command_id": observer_command_id,
+        "observer_command_id_source": str(
+            bridge.get("observer_command_id_source") or ""
+        ),
+        "observer_command_id_kind": str(
+            bridge.get("observer_command_id_kind") or ""
+        ),
+        "legacy_observer_command_id": str(
+            bridge.get("legacy_observer_command_id") or ""
+        ),
+        "legacy_observer_command_id_present": bool(
+            bridge.get("legacy_observer_command_id_present")
+        ),
+        "dispatch_identity_source": str(bridge.get("source") or ""),
+        "dispatch_identity_source_label": str(bridge.get("source_label") or ""),
+        "contract_runtime_dispatch_identity": dict(bridge),
+    }
+
+
+def _contract_runtime_dispatch_identity_for_execution(
+    conn,
+    *,
+    contract_execution_id: str,
+    context,
+) -> dict[str, Any]:
+    execution_id = str(contract_execution_id or "").strip()
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        record = {"contract_execution_id": execution_id}
+    return _contract_runtime_dispatch_identity_resolution(record, context)
+
+
+def _contract_runtime_require_matching_dispatch_identity(
+    supplied_observer_command_id: str,
+    bridge: Mapping[str, Any] | None,
+    *,
+    action: str,
+) -> None:
+    supplied = str(supplied_observer_command_id or "").strip()
+    canonical = str((bridge or {}).get("observer_command_id") or "").strip()
+    if not supplied or not canonical or supplied == canonical:
+        return
+    raise GovernanceError(
+        "observer_command_id_conflict",
+        (
+            "caller-supplied observer_command_id conflicts with the canonical "
+            "ContractRuntime dispatch identity"
+        ),
+        422,
+        {
+            "action": action,
+            "supplied_observer_command_id": supplied,
+            "canonical_observer_command_id": canonical,
+            "contract_execution_id": str(
+                (bridge or {}).get("contract_execution_id") or ""
+            ),
+            "runtime_context_id": str(
+                (bridge or {}).get("runtime_context_id") or ""
+            ),
+            "source_ref": str((bridge or {}).get("source_ref") or ""),
+            "fail_closed": True,
+        },
+    )
 
 
 def _contract_runtime_record_references_runtime_context(
@@ -49104,8 +49396,9 @@ def _contract_runtime_dispatch_bridge_for_startup(
     payload: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     startup_payload = dict(payload)
-    if str(startup_payload.get("observer_command_id") or "").strip():
-        return startup_payload, {}
+    supplied_observer_command_id = str(
+        startup_payload.get("observer_command_id") or ""
+    ).strip()
 
     runtime_context_id = str(startup_payload.get("runtime_context_id") or "").strip()
     task_id = str(startup_payload.get("task_id") or "").strip()
@@ -49188,6 +49481,11 @@ def _contract_runtime_dispatch_bridge_for_startup(
         bridge = _contract_runtime_dispatch_identity_bridge(record, dispatch_match)
         if not bridge:
             continue
+        _contract_runtime_require_matching_dispatch_identity(
+            supplied_observer_command_id,
+            bridge,
+            action="parallel_branch_startup",
+        )
         startup_payload.update(
             {
                 "observer_command_id": bridge["observer_command_id"],
@@ -49204,6 +49502,38 @@ def _contract_runtime_dispatch_bridge_for_startup(
         )
         startup_payload.setdefault("startup_source", bridge["source"])
         return startup_payload, bridge
+    canonical_candidate = next(
+        (
+            record
+            for record in records
+            if str(record.get("contract_execution_id") or "") in candidate_ids
+        ),
+        None,
+    )
+    if canonical_candidate is not None:
+        resolution = _contract_runtime_dispatch_identity_resolution(
+            canonical_candidate,
+            context,
+        )
+        raise GovernanceError(
+            "observer_command_id_non_reconstructable",
+            (
+                "parallel branch startup requires a source-backed "
+                "ContractRuntime dispatch line"
+            ),
+            422,
+            {
+                "action": "parallel_branch_startup",
+                "runtime_context_id": expected_runtime_context_id,
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "contract_execution_id": str(
+                    canonical_candidate.get("contract_execution_id") or ""
+                ),
+                "contract_runtime_dispatch_identity": resolution,
+                "timeline_projection_authoritative": False,
+                "replacement_evidence_allowed": False,
+            },
+        )
     return startup_payload, {}
 
 

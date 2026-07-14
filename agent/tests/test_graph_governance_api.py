@@ -48594,6 +48594,342 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         "contract_runtime_execution_id_bridge"
     )
 
+    worker_query = {
+        "parent_task_id": backlog_id,
+        "fence_token": "fence-contract-startup-bridge",
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worktree),
+    }
+    current = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={**worker_query, "view": "all"},
+            )
+        )
+    )
+    assert current["observer_command_id"] == successor["contract_execution_id"]
+    assert current["contract_runtime_dispatch_identity"]["source_ref"].startswith(
+        f"contract_runtime:{successor['contract_execution_id']}:completed_lines:"
+    )
+    worker_view = current["runtime_context_service"]["views"]["worker_view"]
+    assert worker_view["observer_command_id"] == successor["contract_execution_id"]
+    assert worker_view["timeline_projection_authoritative"] is False
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            query=worker_query,
+        )
+    )
+    startup_copy = guide["startup_facade_payload_skeleton"]["copy_safe_body"]
+    finish_copy = guide["actionable_payloads"][
+        "finish_time_worker_attestation_submission"
+    ]["copy_safe_body"]
+    assert startup_copy["observer_command_id"] == successor["contract_execution_id"]
+    assert finish_copy["observer_command_id"] == successor["contract_execution_id"]
+    assert finish_copy["observer_command_id_source"] == (
+        "contract_runtime_execution_id_bridge"
+    )
+    assert guide["contract_runtime_dispatch_identity"]["accepted"] is True
+
+
+def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-MF-PARALLEL-INFLIGHT-DISPATCH-BRIDGE"
+    worker_task_id = "parallel-inflight-dispatch-bridge-worker"
+    worker_token = "parallel-inflight-dispatch-bridge-token"
+    worker_fence = "fence-parallel-inflight-dispatch-bridge"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    graph_trace_id = "gqt-parallel-inflight-dispatch-bridge"
+    head_commit = hashlib.sha1(b"parallel-inflight-dispatch-bridge").hexdigest()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-inflight-dispatch-bridge-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=worker_fence,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        include_finish_evidence=False,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+    )
+    conn.execute(
+        "DELETE FROM task_timeline_events "
+        "WHERE project_id = ? AND backlog_id = ? "
+        "AND event_kind = 'bounded_implementation_worker_dispatch'",
+        (PID, backlog_id),
+    )
+    conn.commit()
+    command_count_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM observer_command_queue"
+    ).fetchone()["count"]
+
+    worker_query = {
+        "parent_task_id": backlog_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+    current = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={**worker_query, "view": "all"},
+            )
+        )
+    )
+    bridge = current["contract_runtime_dispatch_identity"]
+    assert bridge["accepted"] is True
+    assert bridge["observer_command_id"] == successor["contract_execution_id"]
+    assert bridge["legacy_observer_command_id_present"] is False
+    assert current["source_refs"]["timeline"].get("observer_command_id", "") == ""
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            query=worker_query,
+        )
+    )
+    finish_copy = guide["actionable_payloads"][
+        "finish_time_worker_attestation_submission"
+    ]["copy_safe_body"]
+    assert finish_copy["observer_command_id"] == successor["contract_execution_id"]
+    assert "<claimed execute_backlog_row" not in json.dumps(finish_copy)
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_worker_commit_projection",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.contract_worker_commit_projection.v1",
+            "status": "validated",
+            "canonical_worker_commit_required": True,
+            "worker_commit_sha": head_commit,
+            "head_commit": head_commit,
+            "changed_files": ["agent/governance/server.py"],
+            "owned_files": ["agent/governance/server.py"],
+            "diff_base_commit": runtime_context.base_commit,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_changed_files",
+        lambda *_args, **_kwargs: ["agent/governance/server.py"],
+    )
+    from agent.governance import worker_transcript_verify
+
+    monkeypatch.setattr(
+        worker_transcript_verify,
+        "verify_worker_transcript",
+        lambda payload: {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": payload["worker_session_id"],
+            "filer_principal": payload["filer_principal"],
+            "worker_transcript_ref": "codex:inflight-dispatch-bridge",
+            "harness_type": "codex",
+            "blockers": [],
+        },
+    )
+    worker_session_id = f"session-{worker_task_id}"
+    finish = (
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **worker_query,
+                    "worker_session_id": worker_session_id,
+                    "filer_principal": worker_session_id,
+                    "worker_transcript_ref": "codex:inflight-dispatch-bridge",
+                    "harness_type": "codex",
+                    "graph_trace_ids": [graph_trace_id],
+                    "read_receipt_event_id": evidence_events["read_receipt"],
+                    "read_receipt_hash": (
+                        "sha256:mf-parallel-runtime-projection-read"
+                    ),
+                    "head_commit": head_commit,
+                    "actual_cwd": str(worker_root),
+                    "actual_git_root": str(worker_root),
+                    "test_results": {"status": "passed", "passed": True},
+                },
+            )
+        )
+    )
+    assert finish["ok"] is True
+    assert finish["next_legal_action"] == "record_finish_gate"
+    stored_finish = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (finish["timeline_event"]["id"],),
+    ).fetchone()
+    stored_payload = json.loads(stored_finish["payload_json"])
+    assert stored_payload["observer_command_id"] == successor["contract_execution_id"]
+    assert stored_payload["observer_command_id_source"] == (
+        "contract_runtime_execution_id_bridge"
+    )
+    assert finish["finish_gate_submission"]["body"]["observer_command_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    ) == []
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM observer_command_queue"
+    ).fetchone()["count"] == command_count_before
+
+
+def test_mf_parallel_dispatch_identity_conflicts_fail_before_worker_evidence(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-DISPATCH-IDENTITY-CONFLICT"
+    worker_task_id = "parallel-dispatch-identity-conflict-worker"
+    worker_token = "parallel-dispatch-identity-conflict-token"
+    worker_fence = "fence-parallel-dispatch-identity-conflict"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="parallel-dispatch-identity-conflict-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    common = {
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+        "observer_command_id": "cmd-conflicting-dispatch-identity",
+    }
+    evidence_count_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"]
+    command_count_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM observer_command_queue"
+    ).fetchone()["count"]
+
+    with pytest.raises(GovernanceError) as startup_exc:
+        server.handle_graph_governance_parallel_branch_startup(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=common,
+            )
+        )
+    assert startup_exc.value.code == "observer_command_id_conflict"
+    assert startup_exc.value.details["canonical_observer_command_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert startup_exc.value.details["fail_closed"] is True
+
+    with pytest.raises(GovernanceError) as finish_exc:
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=common,
+            )
+        )
+    assert finish_exc.value.code == "observer_command_id_conflict"
+    assert finish_exc.value.details["canonical_observer_command_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert finish_exc.value.details["fail_closed"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"] == evidence_count_before
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM observer_command_queue"
+    ).fetchone()["count"] == command_count_before
+
+
+def test_contract_dispatch_identity_without_source_is_non_reconstructable():
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-no-dispatch-source",
+        task_id="worker-no-dispatch-source",
+        parent_task_id="cex-no-dispatch-source",
+        root_task_id="cex-no-dispatch-source",
+    )
+
+    resolution = server._contract_runtime_dispatch_identity_resolution(
+        {
+            "contract_id": "mf_parallel.v2",
+            "contract_execution_id": "cex-no-dispatch-source",
+            "completed_lines": [],
+        },
+        context,
+    )
+
+    assert resolution["accepted"] is False
+    assert resolution["status"] == "non_reconstructable"
+    assert resolution["reconstructable"] is False
+    assert resolution["observer_command_id"] == ""
+    assert resolution["reason_code"] == (
+        "source_backed_contract_runtime_dispatch_line_missing"
+    )
+
 
 def test_mf_parallel_finish_projection_uses_source_backed_worker_commit():
     commit_sha = "3752db90f311ef34e37d5f2debad9e69b8ec6f7c"
