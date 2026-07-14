@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,83 @@ def _wait_for(predicate, *, timeout=10):
             return value
         time.sleep(0.02)
     raise AssertionError("timed out waiting for guided runtime E2E state")
+
+
+def _git(cwd, *args):
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _dogfood_branch(tmp_path, *, suffix, fence_token):
+    from governance.parallel_branch_runtime import (
+        STATE_WORKTREE_READY,
+        branch_runtime_allocation_evidence,
+        plan_branch_runtime_context,
+    )
+
+    main = tmp_path / "main"
+    main.mkdir(parents=True)
+    _git(main, "init")
+    _git(main, "checkout", "-b", "main")
+    (main / "README.md").write_text("guided runtime fixture\n", encoding="utf-8")
+    _git(main, "add", "README.md")
+    _git(
+        main,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    head = _git(main, "rev-parse", "HEAD")
+    context = plan_branch_runtime_context(
+        project_id="aming-claw",
+        task_id="task-guided-{}".format(suffix),
+        workspace_root=str(tmp_path),
+        backlog_id="AC-GUIDED-E2E",
+        parent_task_id="AC-GUIDED-E2E",
+        chain_id="AC-GUIDED-E2E",
+        root_task_id="AC-GUIDED-E2E",
+        stage_type="observer_dogfood",
+        agent_id="dogfood_observer",
+        worker_id="principal-guided-{}".format(suffix),
+        allocation_owner="dogfood_observer",
+        worker_slot_id="principal-guided-{}".format(suffix),
+        target_files=("agent/owned-{}.py".format(suffix),),
+        owned_files=("agent/owned-{}.py".format(suffix),),
+        branch_prefix="guided",
+        worktree_root=".worktrees",
+        base_commit=head,
+        target_head_commit=head,
+        merge_queue_id="mq-guided-e2e",
+        fence_token=fence_token,
+        status=STATE_WORKTREE_READY,
+    )
+    worktree = Path(context.worktree_path)
+    worktree.parent.mkdir(parents=True)
+    branch_name = context.branch_ref.removeprefix("refs/heads/")
+    _git(main, "worktree", "add", "-b", branch_name, str(worktree), head)
+    evidence = branch_runtime_allocation_evidence(
+        context,
+        source_ref="/api/graph-governance/aming-claw/parallel-branches/allocate",
+        route_identity={
+            "route_id": "route-guided-{}".format(suffix),
+            "route_context_hash": "sha256:" + ("b" * 64),
+            "prompt_contract_id": "rprompt-guided-{}".format(suffix),
+            "prompt_contract_hash": "sha256:" + ("c" * 64),
+            "route_token_ref": "rtok-guided-{}".format(suffix),
+            "visible_injection_manifest_hash": "sha256:" + ("d" * 64),
+        },
+    )
+    return main, worktree, head, context, evidence
 
 
 def _profiled_run(executable, *, role, suffix):
@@ -70,7 +148,16 @@ def _profiled_run(executable, *, role, suffix):
     )
 
 
-def _canonical_ticket(run, *, role, suffix, worktree):
+def _canonical_ticket(
+    run,
+    *,
+    role,
+    suffix,
+    worktree,
+    runtime_context_id="",
+    branch_ref="",
+    base_commit="",
+):
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
 
     worker_id = "principal-guided-{}".format(suffix)
@@ -82,16 +169,17 @@ def _canonical_ticket(run, *, role, suffix, worktree):
         "evidence_kind": "dispatch_bounded_worker",
         "owner_role": "observer",
         "worker_role": role,
-        "runtime_context_id": "mfrctx-guided-{}".format(suffix),
+        "runtime_context_id": runtime_context_id
+        or "mfrctx-guided-{}".format(suffix),
         "task_id": "task-guided-{}".format(suffix),
         "worker_id": worker_id,
         "worker_slot_id": worker_id,
         "observer_command_id": "command-guided-{}".format(suffix),
-        "parent_task_id": "task-guided-parent",
+        "parent_task_id": "AC-GUIDED-E2E",
         "target_project_root": str(worktree),
-        "branch_ref": "refs/heads/guided/{}".format(suffix),
-        "base_commit": "a" * 40,
-        "target_head_commit": "a" * 40,
+        "branch_ref": branch_ref or "refs/heads/guided/{}".format(suffix),
+        "base_commit": base_commit or "a" * 40,
+        "target_head_commit": base_commit or "a" * 40,
         "merge_queue_id": "mq-guided-e2e",
         "route_id": "route-guided-{}".format(suffix),
         "route_context_hash": "sha256:" + ("b" * 64),
@@ -182,7 +270,7 @@ def _host_envelope(selectors, *, session_token, fence_token):
         "project_id": selectors["project_id"],
         "runtime_context_id": selectors["runtime_context_id"],
         "task_id": selectors["task_id"],
-        "parent_task_id": "task-guided-parent",
+        "parent_task_id": "AC-GUIDED-E2E",
         "worker_role": selectors["role"],
         "worker_id": selectors["worker_id"],
         "worker_slot_id": selectors["worker_slot_id"],
@@ -204,15 +292,33 @@ def _host_envelope(selectors, *, session_token, fence_token):
     }
 
 
+def _host_envelope_refs(selectors):
+    return {
+        "project_id": selectors["project_id"],
+        "runtime_context_id": selectors["runtime_context_id"],
+        "task_id": selectors["task_id"],
+        "parent_task_id": "AC-GUIDED-E2E",
+        "worker_role": selectors["role"],
+        "worker_id": selectors["worker_id"],
+        "worker_slot_id": selectors["worker_slot_id"],
+        "session_token_ref": "wstok-guided-{}".format(
+            selectors["runtime_context_id"]
+        ),
+    }
+
+
 def _fake_codex(path):
     path.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, pathlib, sys\n"
+        "import hashlib, json, pathlib, sys\n"
         "args = sys.argv[1:]\n"
         "output = pathlib.Path(args[args.index('-o') + 1])\n"
         "prompt = sys.stdin.read()\n"
         "with pathlib.Path('spawns.jsonl').open('a', encoding='utf-8') as fh:\n"
-        "    fh.write(json.dumps({'prompt': prompt}, sort_keys=True) + '\\n')\n"
+        "    fh.write(json.dumps({\n"
+        "        'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),\n"
+        "        'spawned': True,\n"
+        "    }, sort_keys=True) + '\\n')\n"
         "output.write_text('public-safe result', encoding='utf-8')\n",
         encoding="utf-8",
     )
@@ -283,27 +389,54 @@ class _GovernanceFixture:
 def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
     tmp_path, monkeypatch
 ):
+    import observer_runtime
+    from ai_invocation import RoutePromptContract
     from cli_agent_service.service import CliAgentService, ServicePaths, request_service
+    from observer_runtime import (
+        DogfoodObserverPlanRequest,
+        build_dogfood_observer_run_plan,
+    )
+
+    def fail_direct_invocation(_request):
+        raise AssertionError("governed runtime must not invoke_ai directly")
+
+    monkeypatch.setattr(observer_runtime, "invoke_ai", fail_direct_invocation)
 
     state_dir = tmp_path / "state"
-    worktree = tmp_path / "worker"
-    worktree.mkdir()
-    executable = _fake_codex(worktree / "codex")
+    executable = _fake_codex(tmp_path / "codex")
     cases = (
         ("observer", "l2"),
         ("mf_sub", "l3"),
         ("qa", "qa"),
     )
+    fence_tokens = {
+        suffix: "fence-{}-{}".format(suffix, secrets.token_urlsafe(24))
+        for _role, suffix in cases
+    }
+    branches = {
+        suffix: _dogfood_branch(
+            tmp_path / suffix,
+            suffix=suffix,
+            fence_token=fence_tokens[suffix],
+        )
+        for _role, suffix in cases
+    }
     runs = {
         suffix: _profiled_run(executable, role=role, suffix=suffix)
         for role, suffix in cases
     }
-    admissions = {
-        suffix: _canonical_ticket(
-            runs[suffix], role=role, suffix=suffix, worktree=worktree
+    admissions = {}
+    for role, suffix in cases:
+        _main, worktree, head, context, evidence = branches[suffix]
+        admissions[suffix] = _canonical_ticket(
+            runs[suffix],
+            role=role,
+            suffix=suffix,
+            worktree=worktree,
+            runtime_context_id=evidence["runtime_context_id"],
+            branch_ref=context.branch_ref,
+            base_commit=head,
         )
-        for role, suffix in cases
-    }
     governance = _GovernanceFixture(
         {ticket["contract_execution_id"]: ticket for ticket, _ in admissions.values()}
     )
@@ -317,35 +450,102 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
     _wait_for(paths.socket_path.exists)
     private_memory = "PRIVATE-JB-MEMORY-{}".format(secrets.token_hex(16))
     raw_values = []
-    responses = []
+    service_dispatches = []
     try:
         for role, suffix in cases:
+            main, worktree, head, context, evidence = branches[suffix]
             ticket, selectors = admissions[suffix]
-            session_token = "session-{}-{}".format(suffix, secrets.token_urlsafe(24))
-            fence_token = "fence-{}-{}".format(suffix, secrets.token_urlsafe(24))
-            raw_values.extend((session_token, fence_token))
-            response = request_service(
-                paths,
-                "start_host_envelope_run",
-                payload={
-                    "run": runs[suffix].to_public_dict(),
-                    "worktree": str(worktree),
-                    "prompt": "public-safe intent role={}".format(role),
-                    "authority_selectors": selectors,
-                    "host_envelope": _host_envelope(
-                        selectors,
-                        session_token=session_token,
-                        fence_token=fence_token,
-                    ),
-                    "ttl_seconds": 30,
-                },
+            dispatch = ticket["dispatch_identity"]
+            session_token = "session-{}-{}".format(
+                suffix, secrets.token_urlsafe(24)
             )
-            responses.append(response)
-            assert response == {
-                "ok": True,
-                "run_id": runs[suffix].run_id,
-                "status": "started",
+            fence_token = fence_tokens[suffix]
+            raw_values.extend((session_token, fence_token))
+            monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", session_token)
+            admission = {
+                "run": runs[suffix].to_public_dict(),
+                "authority_selectors": selectors,
+                "host_envelope": _host_envelope_refs(selectors),
+                "ttl_seconds": 30,
             }
+            response = build_dogfood_observer_run_plan(
+                DogfoodObserverPlanRequest(
+                    project_id=selectors["project_id"],
+                    backlog_id=selectors["backlog_id"],
+                    route=RoutePromptContract(
+                        route_id=dispatch["route_id"],
+                        route_context_hash=dispatch["route_context_hash"],
+                        prompt_contract_id=dispatch["prompt_contract_id"],
+                        prompt_contract_hash=dispatch["prompt_contract_hash"],
+                        route_token_ref=dispatch["route_token_ref"],
+                        visible_injection_manifest_hash=dispatch[
+                            "visible_injection_manifest_hash"
+                        ],
+                    ),
+                    provider="openai",
+                    backend_mode="codex_cli",
+                    main_worktree=str(main),
+                    workspace_root=str(tmp_path / suffix),
+                    owned_files=("agent/owned-{}.py".format(suffix),),
+                    task_id=selectors["task_id"],
+                    worker_id=selectors["worker_id"],
+                    allocation_owner="dogfood_observer",
+                    branch_prefix="guided",
+                    worktree_root=".worktrees",
+                    merge_queue_id=context.merge_queue_id,
+                    fence_token=fence_token,
+                    graph_trace_ids=("gqt-guided-e2e-{}".format(suffix),),
+                    branch_runtime_registration_ref=evidence["source_ref"],
+                    branch_runtime_evidence=evidence,
+                    runtime_context_id=evidence["runtime_context_id"],
+                    base_commit=head,
+                    target_head_commit=head,
+                    prompt="public-safe intent role={}".format(role),
+                    route_id=dispatch["route_id"],
+                    visible_injection_manifest_hash=dispatch[
+                        "visible_injection_manifest_hash"
+                    ],
+                    guided_service_admission=admission,
+                    cli_agent_service_state_dir=str(state_dir),
+                ),
+                execute=True,
+            )
+            failure_context = {
+                key: response.get(key)
+                for key in (
+                    "status",
+                    "error",
+                    "launch_backend_blocker",
+                    "execute_preflight",
+                    "dispatch_gate_validation",
+                    "service_admission_blocker",
+                    "service_dispatch_blocker",
+                )
+            }
+            assert response["ok"] is True, json.dumps(
+                failure_context,
+                indent=2,
+                sort_keys=True,
+            )
+            assert fence_token not in response["runtime_text"]["launch_text"]
+            assert response["status"] == "started"
+            observer_run = response["observer_run"]
+            assert observer_run["status"] == "started"
+            assert observer_run["one_hop_execution_gate"]["status"] == (
+                "delegated_to_canonical_service_admission"
+            )
+            invocation = observer_run["invocation"]
+            assert invocation["backend_mode"] == "cli_agent_service"
+            service_dispatch = invocation["service_dispatch"]
+            service_dispatches.append(service_dispatch)
+            assert service_dispatch["run_id"] == runs[suffix].run_id
+            assert service_dispatch["role"] == role
+            assert service_dispatch["profile_id"] == selectors["profile_id"]
+            assert service_dispatch["principal_id"] == selectors["principal_id"]
+            assert service_dispatch["runtime_context_id"] == (
+                selectors["runtime_context_id"]
+            )
+            assert service_dispatch["direct_invocation_fallback"] is False
             _wait_for(
                 lambda run_id=runs[suffix].run_id: (
                     service.registry.get_run(run_id)
@@ -375,13 +575,17 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
     assert qa_request["principal_id"] != l3_request["principal_id"]
     assert qa_request["profile_id"] != l3_request["profile_id"]
 
-    spawn_lines = (worktree / "spawns.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(spawn_lines) == 3
-    assert {json.loads(line)["prompt"] for line in spawn_lines} == {
-        "public-safe intent role=observer",
-        "public-safe intent role=mf_sub",
-        "public-safe intent role=qa",
-    }
+    spawn_records = []
+    for _role, suffix in cases:
+        worktree = branches[suffix][1]
+        spawn_lines = (
+            worktree / "spawns.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        assert len(spawn_lines) == 1
+        spawn_records.append(json.loads(spawn_lines[0]))
+    assert all(record["spawned"] is True for record in spawn_records)
+    assert all(len(record["prompt_sha256"]) == 64 for record in spawn_records)
+
     assert governance.receipts
     assert {item["receipt"]["state"] for item in governance.receipts} >= {
         "accepted",
@@ -394,12 +598,15 @@ def test_guided_runtime_uses_one_production_spawn_for_l2_l3_and_distinct_qa(
         for item in governance.receipts
     )
 
-    serialized_responses = json.dumps(responses, sort_keys=True)
+    serialized_dispatches = json.dumps(service_dispatches, sort_keys=True)
     persisted = b"".join(
-        path.read_bytes() for path in state_dir.rglob("*") if path.is_file()
+        path.read_bytes()
+        for root in (state_dir, *(tmp_path / suffix for _role, suffix in cases))
+        for path in root.rglob("*")
+        if path.is_file()
     )
     for raw in (*raw_values, private_memory):
-        assert raw not in serialized_responses
+        assert raw not in serialized_dispatches
         assert raw.encode("utf-8") not in persisted
 
 

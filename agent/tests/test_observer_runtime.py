@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import urllib.error
 from pathlib import Path
 
 import pytest
@@ -148,46 +147,41 @@ def _dogfood_request_with_worker(tmp_path):
     return request, allocation_evidence
 
 
-def _patch_dogfood_no_progress(monkeypatch):
-    def fake_run_observer(observer_request, *, execute=False):
-        assert execute is True
-        return {
-            "ok": False,
-            "status": "blocked",
-            "invocation": {
-                "auth_status": "cli_no_progress",
-                "blocker_id": "codex_cli_worker_no_progress_no_read_receipt",
-                "output_empty": True,
-                "runtime_monitor": {
-                    "schema_version": "codex_cli_runtime_monitor.v1",
-                    "early_progress_timeout_sec": 0.25,
-                    "heartbeat_enabled": False,
-                    "heartbeat_count": 0,
-                    "heartbeat_failures": 0,
-                    "progress_observed": False,
-                    "early_progress": {
-                        "progress_observed": False,
-                        "stdout_bytes": 0,
-                        "stderr_bytes": 0,
-                        "dirty_files": [],
-                        "changed_files": [],
-                    },
-                },
+def _guided_service_admission(*, role="mf_sub"):
+    selectors = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+        "contract_execution_id": "cex-guided-a3",
+        "runtime_context_id": "mfrctx-guided-a3",
+        "task_id": "task-a3",
+        "worker_id": "worker-a3",
+        "worker_slot_id": "worker-a3",
+        "observer_command_id": "task-a3",
+        "role": role,
+        "profile_id": "profile-guided-a3",
+        "principal_id": "worker-a3",
+        "expected_execution_state_revision": 1,
+    }
+    return {
+        "run": {
+            "run_id": "run-guided-a3",
+            "profile": {"profile_id": "profile-guided-a3"},
+            "config": {
+                "project_id": "aming-claw",
+                "role": role,
+                "profile_id": "profile-guided-a3",
             },
-        }
-
-    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
-    monkeypatch.setattr(
-        "agent.observer_runtime._dogfood_submit_read_receipt_facade",
-        lambda **_: {
-            "schema_version": "observer_dogfood_read_receipt_submission.v1",
-            "ok": True,
-            "status": "test_skipped",
-            "read_receipt_recorded": False,
-            "raw_session_token_persisted": False,
-            "raw_fence_token_persisted": False,
         },
-    )
+        "authority_selectors": selectors,
+        "host_envelope": {
+            "runtime_context_id": "mfrctx-guided-a3",
+            "task_id": "task-a3",
+            "worker_role": role,
+            "worker_id": "worker-a3",
+            "worker_slot_id": "worker-a3",
+            "session_token_ref": "wstok-guided-a3",
+        },
+    }
 
 
 def _patch_timeline_events(monkeypatch, events):
@@ -804,217 +798,91 @@ def test_runtime_text_prepare_rejects_projection_missing_startup_finish_field(tm
     assert validation["status"] == "missing_runtime_context_projection_fields"
 
 
-def test_dogfood_no_progress_terminal_blocker_appends_timeline(monkeypatch, tmp_path):
-    request, allocation_evidence = _dogfood_request_with_worker(tmp_path)
+def test_dogfood_execute_forwards_governed_service_admission(monkeypatch, tmp_path):
+    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
+    admission = _guided_service_admission()
+    request.guided_service_admission = admission
+    request.cli_agent_service_state_dir = str(tmp_path / "service-state")
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
-    _patch_dogfood_no_progress(monkeypatch)
-    recorded_events = []
+    observed = []
 
-    def fake_record_task_timeline_event(*, project_id, event):
-        event_id = 17 + len(recorded_events)
-        recorded_events.append((project_id, event))
+    def fail_worker_evidence(**_kwargs):
+        raise AssertionError("observer must not author worker evidence")
+
+    def fake_run_observer(observer_request, *, execute=False):
+        observed.append(observer_request)
+        assert execute is True
         return {
-            "id": event_id,
-            "project_id": project_id,
-            **event,
-            "created_at": "2026-06-05T00:00:00Z",
+            "ok": True,
+            "status": "started",
+            "invocation": {
+                "status": "started",
+                "backend_mode": "cli_agent_service",
+                "calls_models": True,
+                "auth_status": "host_envelope_delivered",
+                "service_dispatch": {
+                    "run_id": "run-guided-a3",
+                    "direct_invocation_fallback": False,
+                },
+            },
         }
 
     monkeypatch.setattr(
-        "agent.observer_runtime._record_task_timeline_event",
-        fake_record_task_timeline_event,
+        "agent.observer_runtime._dogfood_submit_read_receipt_facade",
+        fail_worker_evidence,
     )
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
 
     result = build_dogfood_observer_run_plan(request, execute=True)
 
-    assert result["ok"] is False
-    assert result["status"] == "blocked"
-    blocker = result["cli_timeout_blocker"]
-    assert blocker["schema_version"] == "observer_cli_no_progress_blocker.v1"
-    assert blocker["blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
-    assert blocker["invocation_blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
-    assert blocker["failure_evidence_appended"] is True
-    assert blocker["failure_evidence_append"]["event_id"] == 17
-    assert blocker["route_identity"]["route_id"] == "route-20260605-a3"
-    assert blocker["route_identity"]["route_context_hash"] == "sha256:route-a3"
-    assert blocker["route_identity"]["prompt_contract_hash"] == "sha256:prompt-a3"
-    assert blocker["runtime_context_id"] == allocation_evidence["runtime_context_id"]
-    assert blocker["worker_id"] == "worker-a3"
-    assert blocker["worker_agent_id"].startswith("host_adapter_agent:codex_cli:")
-    worker_agent_id = blocker["worker_agent_id"]
-    next_action = blocker["next_legal_action"]
-    assert next_action["schema_version"] == "bounded_worker_no_progress_next_action.v1"
-    assert next_action["runtime_context_id"] == allocation_evidence["runtime_context_id"]
-    assert next_action["task_id"] == "task-a3"
-    assert next_action["parent_task_id"] == "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
-    assert next_action["observer_command_id"] == "task-a3"
-    assert next_action["worker_id"] == "worker-a3"
-    assert next_action["worker_agent_id"] == worker_agent_id
-    assert next_action["merge_queue_id"] == "mq-route-gate-fixture-parity-a3"
-    assert next_action["next_action"] == "retry_with_new_worker"
-    assert next_action["deterministic_order"] == [
-        "retry_with_new_worker",
-        "repair_runtime_text_payload",
-        "authorize_explicit_hotfix_exception",
-    ]
-    assert [action["id"] for action in blocker["next_legal_actions"]] == [
-        "retry_with_new_worker",
-        "repair_runtime_text_payload",
-        "authorize_explicit_hotfix_exception",
-    ]
-    assert blocker["worktree_diff_scope"]["no_diff"] is True
-    assert blocker["runtime_monitor_summary"]["present"] is True
-    assert blocker["runtime_monitor_summary"]["progress_observed"] is False
-    executable_launch = blocker["executable_worker_launch"]
-    assert executable_launch["schema_version"] == "observer_executable_worker_launch.v1"
-    assert executable_launch["status"] == "ready"
-    assert executable_launch["executable"] is True
-    assert executable_launch["payload"]["route_context_hash"] == "sha256:route-a3"
-    assert executable_launch["payload"]["prompt_contract_id"] == "rprompt-a3"
-    assert executable_launch["payload"]["owned_files"] == [
-        "agent/observer_runtime.py",
-        "agent/tests/test_observer_runtime.py",
-    ]
-    assert executable_launch["payload"]["runtime_context_id"] == (
-        allocation_evidence["runtime_context_id"]
+    assert result["ok"] is True
+    assert result["status"] == "started"
+    assert len(observed) == 1
+    observer_request = observed[0]
+    assert observer_request.guided_service_admission == admission
+    assert observer_request.cli_agent_service_state_dir == str(
+        tmp_path / "service-state"
     )
-    assert executable_launch["stdin"]["source"] == "response.launch_text"
-    assert "codex exec" in executable_launch["command_display"]
-    assert "AMING_WORKER_SESSION_TOKEN" in executable_launch["command_display"]
-
-    startup_status = blocker["startup_read_receipt_recording_status"]
-    assert startup_status["startup_prepared"] is False
-    assert startup_status["startup_recorded"] is False
-    assert startup_status["startup_close_satisfying"] is False
-    assert startup_status["startup_counts_as_real_worker_evidence"] is False
-    assert startup_status["startup_surrogate_not_close_satisfying"] is False
-    assert startup_status["read_receipt_prepared"] is False
-    assert startup_status["read_receipt_recorded"] is False
-    assert startup_status["read_receipt_recorded_before_implementation_wait"] is False
-    assert startup_status["read_receipt_timeline_event_id"] == ""
-    assert startup_status["startup_timeline_event_id"] == ""
-    assert startup_status["implementation_evidence_recorded"] is False
-    assert blocker["implementation_evidence_recorded"] is False
-    assert blocker["close_ready"] is False
-    assert blocker["read_receipt_timeline_event_id"] == ""
-    assert blocker["startup_timeline_event_id"] == ""
-    assert "read_receipt" not in result
-    assert "startup_timeline_event" not in result
-
-    assert len(recorded_events) == 1
-    project_id, event = recorded_events[0]
-    assert project_id == "aming-claw"
-    assert event["event_type"] == "observer_dogfood_terminal_blocker"
-    assert event["event_kind"] == "observer_cli_terminal_blocker"
-    assert event["event_kind"] not in {"implementation", "verification", "close_ready"}
-    assert event["status"] == "blocked"
-    assert event["task_id"] == "task-a3"
-    assert event["backlog_id"] == "AC-ROUTE-GATE-FIXTURE-PARITY-20260531"
-    payload = event["payload"]
-    assert payload["route_identity"]["route_id"] == "route-20260605-a3"
-    assert payload["route_identity"]["route_token_ref"] == "route-token-a3"
-    assert payload["branch_identity"]["runtime_context_id"] == (
-        allocation_evidence["runtime_context_id"]
+    assert observer_request.env["AMING_WORKER_SESSION_TOKEN"] == (
+        "worker-session-token-test"
     )
-    assert payload["branch_identity"]["fence_token"] == (
+    assert observer_request.env["AMING_WORKER_FENCE_TOKEN"] == (
         "fence-route-gate-fixture-parity-a3"
     )
-    assert payload["timeout_no_progress"]["blocker_id"] == (
-        "codex_cli_worker_no_progress_no_read_receipt"
-    )
-    assert payload["next_legal_action"]["next_action"] == "retry_with_new_worker"
-    assert payload["next_legal_action"]["runtime_context_id"] == (
-        allocation_evidence["runtime_context_id"]
-    )
-    assert payload["next_legal_action"]["worker_agent_id"] == worker_agent_id
-    assert (
-        "executable_worker_launch_payload"
-        in payload["command_projection"]["terminal_evidence_refs"]
-    )
-    assert (
-        "mf_subagent_startup_not_recorded"
-        in payload["command_projection"]["terminal_evidence_refs"]
-    )
-    assert payload["executable_worker_launch"]["payload"]["task_id"] == "task-a3"
-    assert payload["command_projection"]["command_projection_status"] == "failed"
-    assert payload["worktree_diff_scope"]["no_diff"] is True
-    assert payload["startup_read_receipt_recording_status"]["startup_recorded"] is False
-    assert payload["startup_read_receipt_recording_status"]["read_receipt_recorded"] is False
-    assert event["verification"]["passed"] is False
-    assert event["verification"]["implementation_evidence_recorded"] is False
+    assert result["planned_invocation"]["backend_mode"] == "cli_agent_service"
+    assert result["planned_invocation"]["service_dispatch"][
+        "direct_invocation_fallback"
+    ] is False
+    assert "read_receipt_submission" not in result
+    assert "worker-session-token-test" not in json.dumps(result)
 
 
-def test_dogfood_timeout_blocker_uses_timeline_read_receipt_status(
+def test_dogfood_execute_requires_canonical_service_admission(
     monkeypatch, tmp_path
 ):
     request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
     monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
-    _patch_dogfood_no_progress(monkeypatch)
-    recorded_events = []
 
-    def fake_timeline_status(**kwargs):
-        assert kwargs["project_id"] == "aming-claw"
-        assert kwargs["task_id"] == "task-a3"
-        assert kwargs["runtime_context_id"]
-        assert kwargs["route_identity"]["route_context_hash"] == "sha256:route-a3"
-        return {
-            "schema_version": "observer_startup_read_receipt_timeline_status.v1",
-            "read_receipt_recorded": True,
-            "read_receipt_recorded_before_implementation_wait": True,
-            "read_receipt_timeline_event_id": "41",
-            "read_receipt_hash": "sha256:receipt-a3",
-            "read_receipt_prepared": True,
-            "startup_recorded": False,
-            "startup_timeline_event_id": "",
-            "timeline_read_receipt_event_ids": [41],
-            "timeline_startup_event_ids": [],
-        }
+    def fail_run_observer(observer_request, *, execute=False):
+        raise AssertionError("governed execution must fail before local invocation")
 
-    def fake_record_task_timeline_event(*, project_id, event):
-        recorded_events.append((project_id, event))
-        return {
-            "id": 42,
-            "project_id": project_id,
-            **event,
-            "created_at": "2026-06-20T00:00:00Z",
-        }
-
-    monkeypatch.setattr(
-        "agent.observer_runtime._timeline_startup_read_receipt_recording_status",
-        fake_timeline_status,
-    )
-    monkeypatch.setattr(
-        "agent.observer_runtime._record_task_timeline_event",
-        fake_record_task_timeline_event,
-    )
+    monkeypatch.setattr("agent.observer_runtime.run_observer", fail_run_observer)
 
     result = build_dogfood_observer_run_plan(request, execute=True)
 
     assert result["ok"] is False
     assert result["status"] == "blocked"
-    blocker = result["cli_timeout_blocker"]
-    assert blocker["schema_version"] == "observer_cli_timeout_blocker.v1"
-    assert blocker["blocker_id"] == "codex_cli_timeout_no_output_no_finish"
-    assert blocker["invocation_blocker_id"] == "codex_cli_worker_no_progress_no_read_receipt"
-    assert blocker["read_receipt_recorded"] is True
-    assert blocker["read_receipt_recorded_before_implementation_wait"] is True
-    assert blocker["read_receipt_timeline_event_id"] == "41"
-    assert blocker["startup_recorded"] is False
-    projection = blocker["terminal_contract_projection"]
-    assert "mf_subagent_read_receipt_recorded" in projection["terminal_evidence_refs"]
-    assert (
-        "mf_subagent_read_receipt_not_recorded"
-        not in projection["terminal_evidence_refs"]
-    )
-    assert "mf_subagent_startup_not_recorded" in projection["terminal_evidence_refs"]
-    assert recorded_events
-    event_payload = recorded_events[0][1]["payload"]
-    assert event_payload["startup_read_receipt_recording_status"][
-        "read_receipt_recorded"
-    ] is True
-    assert event_payload["command_projection"]["divergence_reason"] == (
-        "codex_cli_timeout_no_output_no_finish"
-    )
+    assert result["calls_models"] is False
+    assert result["auth_status"] == "not_invoked"
+    assert result["direct_invocation_fallback"] is False
+    blocker = result["service_admission_blocker"]
+    assert blocker["blocker_id"] == "canonical_cli_agent_service_admission_missing"
+    assert blocker["service_operation"] == "start_host_envelope_run"
+    assert blocker["raw_session_token_exposed"] is False
+    assert blocker["raw_fence_token_exposed"] is False
+    assert "observer_run" not in result
+    assert "read_receipt_submission" not in result
+    assert "worker-session-token-test" not in json.dumps(result)
 
 
 def test_timeline_startup_status_ignores_superseded_runtime_lineage(monkeypatch):
@@ -1117,159 +985,55 @@ def test_timeline_startup_status_accepts_current_runtime_lineage(monkeypatch):
     assert status["timeline_startup_ignored_event_ids"] == []
 
 
-def test_dogfood_execute_submits_read_receipt_before_provider(monkeypatch, tmp_path):
-    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
-    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
-    calls = []
+def test_run_observer_guided_service_unavailable_fails_closed(
+    monkeypatch, tmp_path
+):
+    session_token = "worker-session-token-guided"
+    fence_token = "worker-fence-token-guided"
 
-    class FakeResponse:
-        status = 200
+    def fail_invoke(_request):
+        raise AssertionError("governed service failure must not invoke_ai")
 
-        def __enter__(self):
-            return self
+    monkeypatch.setattr("agent.observer_runtime.invoke_ai", fail_invoke)
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "ok": True,
-                    "timeline_event": {
-                        "id": 41,
-                        "event_kind": "mf_subagent_read_receipt",
-                        "status": "accepted",
-                    },
-                    "read_receipt": {
-                        "read_receipt_hash": "sha256:receipt-a3",
-                    },
-                }
-            ).encode("utf-8")
-
-    def fake_urlopen(http_request, timeout):
-        body = json.loads(http_request.data.decode("utf-8"))
-        calls.append(("read_receipt", body))
-        assert body["session_token"] == "worker-session-token-test"
-        assert body["fence_token"] == "fence-route-gate-fixture-parity-a3"
-        assert body["read_receipt_hash"] == body["launch_text_hash"]
-        return FakeResponse()
-
-    def fake_run_observer(observer_request, *, execute=False):
-        calls.append(("invoke", dict(observer_request.env)))
-        return {
-            "ok": False,
-            "status": "blocked",
-            "invocation": {
-                "auth_status": "cli_no_progress",
-                "blocker_id": "codex_cli_worker_no_progress_no_read_receipt",
-                "output_empty": True,
+    result = run_observer(
+        ObserverRunRequest(
+            project_id="aming-claw",
+            backlog_id="AC-ROUTE-GATE-FIXTURE-PARITY-20260531",
+            route=RoutePromptContract(
+                route_context_hash="sha256:route-a3",
+                prompt_contract_id="rprompt-a3",
+                prompt_contract_hash="sha256:prompt-a3",
+                route_token_ref="route-token-a3",
+            ),
+            provider="openai",
+            backend_mode="codex_cli",
+            workspace=str(tmp_path),
+            env={
+                "AMING_WORKER_SESSION_TOKEN": session_token,
+                "AMING_WORKER_FENCE_TOKEN": fence_token,
             },
-        }
-
-    monkeypatch.setattr("agent.observer_runtime.urllib.request.urlopen", fake_urlopen)
-    monkeypatch.setattr("agent.observer_runtime.run_observer", fake_run_observer)
-    monkeypatch.setattr(
-        "agent.observer_runtime._timeline_startup_read_receipt_recording_status",
-        lambda **_: {},
+            guided_service_admission=_guided_service_admission(),
+            cli_agent_service_state_dir=str(tmp_path / "missing-service"),
+        ),
+        execute=True,
     )
-    monkeypatch.setattr(
-        "agent.observer_runtime._record_task_timeline_event",
-        lambda *, project_id, event: {"id": 99, "project_id": project_id, **event},
-    )
-
-    result = build_dogfood_observer_run_plan(request, execute=True)
-
-    assert [item[0] for item in calls] == ["read_receipt", "invoke"]
-    submission = result["read_receipt_submission"]
-    assert submission["ok"] is True
-    assert submission["read_receipt_recorded"] is True
-    assert submission["read_receipt_timeline_event_id"] == "41"
-    assert "worker-session-token-test" not in json.dumps(submission["request"])
-    observer_run = result["observer_run"]
-    assert observer_run["read_receipt_recorded"] is True
-    blocker = result["cli_timeout_blocker"]
-    assert blocker["schema_version"] == "observer_cli_timeout_blocker.v1"
-    assert blocker["read_receipt_recorded"] is True
-    assert blocker["read_receipt_timeline_event_id"] == "41"
-    projection = blocker["terminal_contract_projection"]
-    assert "mf_subagent_read_receipt_recorded" in projection["terminal_evidence_refs"]
-    assert (
-        "mf_subagent_read_receipt_not_recorded"
-        not in projection["terminal_evidence_refs"]
-    )
-
-
-def test_dogfood_execute_blocks_when_read_receipt_facade_fails(monkeypatch, tmp_path):
-    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
-    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
-
-    def fake_urlopen(http_request, timeout):
-        raise urllib.error.URLError("governance unavailable")
-
-    def fail_run_observer(observer_request, *, execute=False):
-        raise AssertionError("provider must not be invoked before read receipt")
-
-    monkeypatch.setattr("agent.observer_runtime.urllib.request.urlopen", fake_urlopen)
-    monkeypatch.setattr("agent.observer_runtime.run_observer", fail_run_observer)
-
-    result = build_dogfood_observer_run_plan(request, execute=True)
 
     assert result["ok"] is False
     assert result["status"] == "blocked"
-    assert result["calls_models"] is False
-    assert result["auth_status"] == "not_invoked"
-    blocker = result["read_receipt_submission_blocker"]
-    assert blocker["blocker_id"] == "read_receipt_facade_submit_failed"
-    assert result["terminal_contract_projection"]["divergence_reason"] == (
-        "read_receipt_facade_submit_failed"
+    assert result["one_hop_execution_gate"]["status"] == (
+        "canonical_service_admission_failed"
     )
-    assert "observer_run" not in result
-    assert "worker-session-token-test" not in json.dumps(
-        result["read_receipt_submission"]
-    )
-
-
-def test_dogfood_no_progress_terminal_blocker_reports_append_error(monkeypatch, tmp_path):
-    request, _allocation_evidence = _dogfood_request_with_worker(tmp_path)
-    monkeypatch.setenv("AMING_WORKER_SESSION_TOKEN", "worker-session-token-test")
-    _patch_dogfood_no_progress(monkeypatch)
-
-    def fail_record_task_timeline_event(*, project_id, event):
-        if event["event_type"] == "observer_dogfood_terminal_blocker":
-            raise RuntimeError("timeline append unavailable")
-        raise AssertionError(f"observer must not append worker event {event['event_type']}")
-
-    monkeypatch.setattr(
-        "agent.observer_runtime._record_task_timeline_event",
-        fail_record_task_timeline_event,
-    )
-
-    result = build_dogfood_observer_run_plan(request, execute=True)
-
-    assert result["ok"] is False
-    assert result["status"] == "blocked"
-    blocker = result["cli_timeout_blocker"]
-    assert blocker["failure_evidence_appended"] is False
-    assert "timeline append unavailable" in blocker["failure_evidence_append_error"]
-    append = blocker["failure_evidence_append"]
-    assert append["ok"] is False
-    assert append["event_type"] == "observer_dogfood_terminal_blocker"
-    assert append["event_kind"] == "observer_cli_terminal_blocker"
-    assert "timeline append unavailable" in append["error"]
-    assert append["request"]["payload"]["route_identity"]["route_context_hash"] == (
-        "sha256:route-a3"
-    )
-    assert append["request"]["payload"]["command_projection"][
-        "command_projection_status"
-    ] == "failed"
-    startup_status = blocker["startup_read_receipt_recording_status"]
-    assert startup_status["startup_recorded"] is False
-    assert startup_status["read_receipt_recorded"] is False
-    assert startup_status["read_receipt_recorded_before_implementation_wait"] is False
-    assert startup_status["read_receipt_timeline_event_id"] == ""
-    assert startup_status["startup_timeline_event_id"] == ""
-    assert startup_status["implementation_evidence_recorded"] is False
-    assert blocker["implementation_evidence_recorded"] is False
+    assert result["one_hop_execution_gate"]["direct_invocation_fallback"] is False
+    invocation = result["invocation"]
+    assert invocation["backend_mode"] == "cli_agent_service"
+    assert invocation["provider_backed"] is False
+    assert invocation["calls_models"] is False
+    assert invocation["service_dispatch"]["status"] == "unavailable"
+    assert invocation["service_dispatch"]["direct_invocation_fallback"] is False
+    serialized = json.dumps(result, sort_keys=True)
+    assert session_token not in serialized
+    assert fence_token not in serialized
 
 
 def test_dogfood_execute_blocks_missing_worker_session_token_env(tmp_path):

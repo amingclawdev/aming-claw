@@ -75,6 +75,9 @@ else:  # pragma: no cover - direct module import path
 
 
 OBSERVER_RUN_SCHEMA_VERSION = "observer_run.v1"
+OBSERVER_GUIDED_SERVICE_INVOCATION_SCHEMA_VERSION = (
+    "observer_guided_service_invocation.v1"
+)
 OBSERVER_POLL_SCHEMA_VERSION = "observer_poll.v1"
 OBSERVER_POLL_LOOP_SCHEMA_VERSION = "observer_poll_loop.v1"
 OBSERVER_POLL_TIMELINE_PAYLOAD_SCHEMA_VERSION = "observer_poll_timeline_payload.v1"
@@ -366,6 +369,8 @@ class ObserverRunRequest:
     heartbeat_callback: Callable[[], Mapping[str, Any]] | None = None
     heartbeat_interval_sec: float = 0.0
     env: Mapping[str, str] = field(default_factory=dict)
+    guided_service_admission: Mapping[str, Any] = field(default_factory=dict)
+    cli_agent_service_state_dir: str = ""
 
     @classmethod
     def from_route_token(
@@ -430,6 +435,8 @@ class DogfoodObserverPlanRequest:
     route_id: str = ""
     precheck_run_id: str = ""
     visible_injection_manifest_hash: str = ""
+    guided_service_admission: Mapping[str, Any] = field(default_factory=dict)
+    cli_agent_service_state_dir: str = ""
 
 
 @dataclass
@@ -4591,6 +4598,14 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
             "failure as a worker-owned blocker.\n\n"
         )
 
+    runtime_contract_json = json.dumps(compact_payload, indent=2, sort_keys=True)
+    fence_token = str(runtime_context.get("fence_token") or "")
+    if fence_token:
+        runtime_contract_json = runtime_contract_json.replace(
+            fence_token,
+            "<read from env:AMING_WORKER_FENCE_TOKEN at launch time>",
+        )
+
     return (
         "You are a bounded mf_sub implementation worker for Aming Claw.\n\n"
         "Follow the runtime context exactly. Raw private route/context-pack "
@@ -4655,7 +4670,7 @@ def _runtime_text_launch_text(payload: Mapping[str, Any]) -> str:
         "reason.\n\n"
         f"{test_environment_instruction}"
         "Runtime contract JSON:\n"
-        + json.dumps(compact_payload, indent=2, sort_keys=True)
+        + runtime_contract_json
     )
 
 
@@ -8145,45 +8160,44 @@ def build_dogfood_observer_run_plan(
         )
         return result
 
-    read_receipt_submission: dict[str, Any] = {}
-    if execute:
-        read_receipt_submission = _dogfood_submit_read_receipt_facade(
-            request=request,
-            context=context,
-            launch_env=launch_env,
-            runtime_text=runtime_text,
-            executable_worker_launch=executable_worker_launch,
+    guided_service_admission = (
+        dict(request.guided_service_admission)
+        if isinstance(request.guided_service_admission, Mapping)
+        else {}
+    )
+    if execute and not guided_service_admission:
+        blocker = {
+            "schema_version": "observer_guided_service_admission_blocker.v1",
+            "ok": False,
+            "status": "blocked",
+            "blocker_id": "canonical_cli_agent_service_admission_missing",
+            "missing_fields": [
+                "guided_service_admission.run",
+                "guided_service_admission.authority_selectors",
+                "guided_service_admission.host_envelope",
+            ],
+            "service_operation": "start_host_envelope_run",
+            "direct_invocation_fallback": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "reason": (
+                "governed dogfood execution requires public run data, "
+                "ContractRuntime selectors, and copy-safe host envelope references"
+            ),
+        }
+        result.update(
+            {
+                "ok": False,
+                "status": "blocked",
+                "calls_models": False,
+                "auth_status": "not_invoked",
+                "service_admission_blocker": blocker,
+                "terminal_dispatch_blocker": True,
+                "direct_invocation_fallback": False,
+                "error": blocker["reason"],
+            }
         )
-        result["read_receipt_submission"] = read_receipt_submission
-        if not read_receipt_submission.get("ok"):
-            blocker = _dogfood_read_receipt_submission_blocker(
-                request=request,
-                context=context,
-                submission=read_receipt_submission,
-                executable_worker_launch=executable_worker_launch,
-            )
-            result.update(
-                {
-                    "ok": False,
-                    "status": "blocked",
-                    "calls_models": False,
-                    "auth_status": "not_invoked",
-                    "read_receipt_submission_blocker": blocker,
-                    "terminal_dispatch_blocker": True,
-                    "command_projection_status": "failed",
-                    "canonical_contract_state": "blocked",
-                    "terminal_contract_projection": {
-                        "schema_version": "observer_command_terminal_projection.v1",
-                        "passed": False,
-                        "canonical_contract_state": "blocked",
-                        "command_projection_status": "failed",
-                        "divergence_reason": blocker["blocker_id"],
-                        "observer_command_id": observer_command_id,
-                    },
-                    "error": blocker["reason"],
-                }
-            )
-            return result
+        return result
 
     observer_request = ObserverRunRequest(
         project_id=request.project_id,
@@ -8199,46 +8213,13 @@ def build_dogfood_observer_run_plan(
         dispatch_gate=dispatch_gate,
         main_worktree=str(main_worktree),
         env=launch_env.get("env") if isinstance(launch_env.get("env"), Mapping) else {},
+        guided_service_admission=guided_service_admission,
+        cli_agent_service_state_dir=request.cli_agent_service_state_dir,
     )
 
     observer_result = run_observer(observer_request, execute=execute)
     if execute:
         observer_result["executable_worker_launch"] = dict(executable_worker_launch)
-        observer_result["read_receipt_submission"] = dict(read_receipt_submission)
-        if read_receipt_submission.get("read_receipt_recorded"):
-            read_receipt_event_id = str(
-                read_receipt_submission.get("read_receipt_timeline_event_id") or ""
-            )
-            read_receipt_hash = str(
-                read_receipt_submission.get("read_receipt_hash") or ""
-            )
-            observer_result["read_receipt_recorded"] = True
-            observer_result["read_receipt_recorded_before_implementation_wait"] = True
-            observer_result["read_receipt"] = {
-                "timeline_event_id": read_receipt_event_id,
-                "read_receipt_hash": read_receipt_hash,
-                "hash": read_receipt_hash,
-                "source": "observer_dogfood_auto_submit_read_receipt",
-            }
-            observer_result["read_receipt_recording_append"] = {
-                "event_id": read_receipt_event_id,
-                "read_receipt_hash": read_receipt_hash,
-            }
-    if execute and observer_result.get("status") == "blocked":
-        timeout_blocker = _dogfood_cli_timeout_blocker(
-            request,
-            context=context,
-            worker_worktree=worker_worktree,
-            owned_files=owned_files,
-            observer_result=observer_result,
-            executable_worker_launch=executable_worker_launch,
-        )
-        projection = timeout_blocker["terminal_contract_projection"]
-        observer_result["cli_timeout_blocker"] = timeout_blocker
-        observer_result["terminal_contract_projection"] = projection
-        observer_result["canonical_contract_state"] = projection["canonical_contract_state"]
-        observer_result["command_projection_status"] = projection["command_projection_status"]
-        observer_result["divergence_reason"] = projection["divergence_reason"]
     invocation = observer_result.get("invocation") or observer_result.get("invocation_request") or {}
     result.update(
         {
@@ -8251,16 +8232,11 @@ def build_dogfood_observer_run_plan(
         }
     )
     if execute and observer_result.get("status") == "blocked":
-        timeout_blocker = observer_result.get("cli_timeout_blocker") or {}
-        projection = observer_result.get("terminal_contract_projection") or {}
         result["ok"] = False
         result["status"] = "blocked"
         result["calls_models"] = False
-        result["cli_timeout_blocker"] = timeout_blocker
-        result["terminal_contract_projection"] = projection
-        result["canonical_contract_state"] = projection.get("canonical_contract_state", "blocked")
-        result["command_projection_status"] = projection.get("command_projection_status", "blocked")
-        result["divergence_reason"] = projection.get("divergence_reason", "")
+        result["direct_invocation_fallback"] = False
+        result["service_dispatch_blocker"] = invocation.get("service_dispatch") or {}
     return result
 
 
@@ -8275,6 +8251,114 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
             "missing": missing,
             "execute": execute,
             "invocation_request": invocation_request.to_evidence(),
+        }
+
+    if execute and request.guided_service_admission:
+        launch_missing = validate_observer_run_request(
+            request,
+            require_launch_identity=True,
+        )
+        if launch_missing:
+            return {
+                "ok": False,
+                "schema_version": OBSERVER_RUN_SCHEMA_VERSION,
+                "status": "rejected",
+                "project_id": request.project_id,
+                "backlog_id": request.backlog_id,
+                "execute": execute,
+                "missing": launch_missing,
+                "one_hop_execution_gate": {
+                    "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
+                    "required": True,
+                    "allowed": False,
+                    "status": "guided_service_admission_incomplete",
+                },
+                "invocation_request": invocation_request.to_evidence(),
+            }
+        try:
+            try:
+                from cli_agent_service.guided_runtime import (
+                    GuidedRuntimeDispatchError,
+                    request_guided_runtime,
+                )
+            except ImportError:  # pragma: no cover - package import path
+                from agent.cli_agent_service.guided_runtime import (
+                    GuidedRuntimeDispatchError,
+                    request_guided_runtime,
+                )
+
+            service_dispatch = request_guided_runtime(
+                admission=request.guided_service_admission,
+                project_id=request.project_id,
+                backlog_id=request.backlog_id,
+                prompt=invocation_request.prompt_text(),
+                worktree=request.workspace or invocation_request.cwd,
+                environment=request.env,
+                state_dir=request.cli_agent_service_state_dir,
+            )
+        except GuidedRuntimeDispatchError as exc:
+            service_dispatch = {
+                "schema_version": (
+                    OBSERVER_GUIDED_SERVICE_INVOCATION_SCHEMA_VERSION
+                ),
+                "ok": False,
+                "status": exc.status,
+                "operation": "start_host_envelope_run",
+                "error": str(exc),
+                "direct_invocation_fallback": False,
+                "raw_session_token_exposed": False,
+                "raw_fence_token_exposed": False,
+            }
+            return {
+                "ok": False,
+                "schema_version": OBSERVER_RUN_SCHEMA_VERSION,
+                "status": "blocked",
+                "project_id": request.project_id,
+                "backlog_id": request.backlog_id,
+                "execute": execute,
+                "one_hop_execution_gate": {
+                    "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
+                    "required": True,
+                    "allowed": False,
+                    "status": "canonical_service_admission_failed",
+                    "direct_invocation_fallback": False,
+                },
+                "invocation": {
+                    "schema_version": (
+                        OBSERVER_GUIDED_SERVICE_INVOCATION_SCHEMA_VERSION
+                    ),
+                    "status": "blocked",
+                    "backend_mode": "cli_agent_service",
+                    "provider_backed": False,
+                    "calls_models": False,
+                    "auth_status": "not_invoked",
+                    "service_dispatch": service_dispatch,
+                },
+            }
+        return {
+            "ok": True,
+            "schema_version": OBSERVER_RUN_SCHEMA_VERSION,
+            "status": "started",
+            "project_id": request.project_id,
+            "backlog_id": request.backlog_id,
+            "execute": execute,
+            "one_hop_execution_gate": {
+                "schema_version": ONE_HOP_EXECUTION_GATE_SCHEMA_VERSION,
+                "required": True,
+                "allowed": True,
+                "status": "delegated_to_canonical_service_admission",
+                "direct_invocation_fallback": False,
+            },
+            "invocation": {
+                "schema_version": OBSERVER_GUIDED_SERVICE_INVOCATION_SCHEMA_VERSION,
+                "status": "started",
+                "backend_mode": "cli_agent_service",
+                "provider_backed": True,
+                "calls_models": True,
+                "auth_status": "host_envelope_delivered",
+                "run_id": service_dispatch["run_id"],
+                "service_dispatch": service_dispatch,
+            },
         }
 
     if execute:

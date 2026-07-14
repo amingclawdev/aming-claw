@@ -31,6 +31,7 @@ from .supervisor import CodexC0Supervisor
 
 
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_LOCAL_SERVICE_MESSAGE_BYTES = 1024 * 1024
 DEFAULT_SOCKET_TIMEOUT_SECONDS = 3.0
 DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
 
@@ -172,13 +173,13 @@ def request_service(
     del serialized
     response = bytearray()
     try:
-        if len(request) > MAX_REQUEST_BYTES:
+        if len(request) > MAX_LOCAL_SERVICE_MESSAGE_BYTES:
             raise ServiceError("CLI Agent Service request exceeded the size limit")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(max(float(timeout_seconds), 0.05))
             client.connect(str(paths.socket_path))
             client.sendall(request)
-            while len(response) <= MAX_REQUEST_BYTES:
+            while len(response) <= MAX_LOCAL_SERVICE_MESSAGE_BYTES:
                 chunk = client.recv(4096)
                 if not chunk:
                     break
@@ -191,7 +192,7 @@ def request_service(
         _wipe_buffer(request)
         scrub_host_envelope_payload(request_value)
     try:
-        if len(response) > MAX_REQUEST_BYTES:
+        if len(response) > MAX_LOCAL_SERVICE_MESSAGE_BYTES:
             raise ServiceError("CLI Agent Service response exceeded the size limit")
         result = json.loads(bytes(response).split(b"\n", 1)[0].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -600,14 +601,14 @@ class CliAgentService:
     def _read_request(self, connection: socket.socket) -> dict[str, Any]:
         data = bytearray()
         try:
-            while len(data) <= MAX_REQUEST_BYTES:
+            while len(data) <= MAX_LOCAL_SERVICE_MESSAGE_BYTES:
                 chunk = connection.recv(4096)
                 if not chunk:
                     break
                 data.extend(chunk)
                 if b"\n" in chunk:
                     break
-            if len(data) > MAX_REQUEST_BYTES:
+            if len(data) > MAX_LOCAL_SERVICE_MESSAGE_BYTES:
                 raise ServiceError("request exceeded the size limit")
             value = json.loads(bytes(data).split(b"\n", 1)[0].decode("utf-8"))
         finally:
