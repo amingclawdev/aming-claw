@@ -195,6 +195,50 @@ def test_profile_lease_acquisition_is_atomic_under_contention(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM agent_leases WHERE status='active'").fetchone()[0] == 1
 
 
+def test_fresh_run_registration_is_atomic_under_same_run_contention(tmp_path):
+    from cli_agent_service.registry import (
+        AgentRegistry,
+        RunRegistrationConflictError,
+    )
+
+    registry = _registry(tmp_path)
+    profile = _profile(max_concurrency=2)
+    run = _run("run-one-ticket", profile)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def register():
+        contender = AgentRegistry(registry.db_path, clock=lambda: NOW)
+        barrier.wait(timeout=5)
+        try:
+            lease = contender.register_run_and_acquire_lease(
+                run,
+                "one-daemon-owner",
+                ttl_seconds=60,
+                require_new_run=True,
+            )
+        except RunRegistrationConflictError:
+            outcomes.append("conflict")
+        else:
+            outcomes.append(lease.status)
+
+    threads = [threading.Thread(target=register) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == ["active", "conflict"]
+    with sqlite3.connect(registry.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM agent_runs WHERE run_id='run-one-ticket'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM agent_leases WHERE run_id='run-one-ticket'"
+        ).fetchone()[0] == 1
+
+
 def test_heartbeat_requires_lease_owner_and_persists_extension(tmp_path):
     from cli_agent_service.registry import LeaseNotOwnedError
 

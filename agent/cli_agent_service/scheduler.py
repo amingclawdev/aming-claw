@@ -22,7 +22,12 @@ from .models import (
     ProfileState,
     ScheduledAgentRun,
 )
-from .registry import AgentRegistry, LeaseConflictError, RegistryError
+from .registry import (
+    AgentRegistry,
+    LeaseConflictError,
+    RegistryError,
+    RunRegistrationConflictError,
+)
 
 
 class SchedulerError(RuntimeError):
@@ -560,6 +565,7 @@ class AgentScheduler:
         created_at: str = "",
         parent_run_id: str = "",
         successor_of_run_id: str = "",
+        require_new_run: bool = False,
         now: datetime | str | None = None,
     ) -> ScheduledAgentRun:
         run_id = _text(run_id)
@@ -575,17 +581,21 @@ class AgentScheduler:
             role=role,
             project_id=project_id,
         )
-        existing = self._existing_run_selection(
-            run_id=run_id,
-            owner_id=owner_id,
-            role=role,
-            project_id=project_id,
-            requirements=resolved_requirements,
-            ttl_seconds=ttl_seconds,
-            now=now,
-        )
-        if existing is not None:
-            return existing
+        if require_new_run:
+            if self.registry.get_run(run_id) is not None:
+                raise RunIdentityConflictError("run is already registered")
+        else:
+            existing = self._existing_run_selection(
+                run_id=run_id,
+                owner_id=owner_id,
+                role=role,
+                project_id=project_id,
+                requirements=resolved_requirements,
+                ttl_seconds=ttl_seconds,
+                now=now,
+            )
+            if existing is not None:
+                return existing
 
         evaluations = self.evaluate_profiles(resolved_requirements, now=now)
         for evaluation in evaluations:
@@ -613,8 +623,11 @@ class AgentScheduler:
                     owner_id,
                     ttl_seconds=ttl_seconds,
                     evidence_refs=evidence_refs,
+                    require_new_run=require_new_run,
                     now=now,
                 )
+            except RunRegistrationConflictError as exc:
+                raise RunIdentityConflictError("run is already registered") from exc
             except LeaseConflictError:
                 continue
             selection = ProfileSelection(
