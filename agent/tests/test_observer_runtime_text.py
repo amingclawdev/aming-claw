@@ -271,9 +271,14 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
         "launch_text"
     ]
     assert "Completion order is strict" in result["launch_text"]
+    assert "create the worker git commit" in result["launch_text"]
+    assert "`runtime_context_worker_commit`" in result["launch_text"]
+    assert "`ContractRuntime.completed_lines.worker_commit` is the finish authority" in (
+        result["launch_text"]
+    )
     assert "finish-time worker attestation" in result["launch_text"]
-    assert "Do not run `git commit`" in result["launch_text"]
-    assert "`::git-commit` final directive" in result["launch_text"]
+    assert "Do not run `git commit`" not in result["launch_text"]
+    assert "uncommitted until finish gate passes" not in result["launch_text"]
     assert "test_environment_preflight.setup_commands" in result["launch_text"]
     assert "installs missing pytest runner dependencies" in result["launch_text"]
     assert result["finish_gate_contract"]["required"] is True
@@ -346,31 +351,54 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert launch_pack["worker_guide_hash"].startswith("sha256:")
     assert launch_pack["next_legal_action"] == "submit_mf_subagent_read_receipt"
     assert "submit_mf_subagent_read_receipt" in launch_pack["allowed_actions"]
+    assert "git_commit" in launch_pack["allowed_actions"]
+    assert "record_worker_commit" in launch_pack["allowed_actions"]
     assert "merge" in launch_pack["blocked_actions"]
-    assert "git_commit_before_finish_gate" in launch_pack["blocked_actions"]
-    assert "emit_git_commit_directive_before_finish_gate" in launch_pack[
+    assert "git_commit_before_finish_gate" not in launch_pack["blocked_actions"]
+    assert "emit_git_commit_directive_before_finish_gate" not in launch_pack[
         "blocked_actions"
     ]
-    precommit_policy = launch_pack["precommit_finish_policy"]
-    assert precommit_policy["required"] is True
-    assert precommit_policy["finish_gate_before_git_commit"] is True
-    assert precommit_policy["worker_final_must_not_commit_before_finish_gate"] is True
-    assert precommit_policy["sequence"] == [
+    assert "post_worker_commit_head_drift" in launch_pack["blocked_actions"]
+    commit_order = launch_pack["contract_worker_commit_order"]
+    assert commit_order["required"] is True
+    assert commit_order["contract"] == "mf_parallel.v2"
+    assert commit_order["sequence"] == [
         "record_implementation_evidence",
+        "git_commit",
+        "record_worker_commit",
         "record_finish_time_worker_attestation",
         "record_finish_gate",
-        "git_commit",
         "report_review_ready_or_waiting_merge",
     ]
-    assert "::git-commit final directive" in precommit_policy[
-        "forbidden_before_finish_gate"
-    ]
-    assert launch_pack["worker_guide"]["precommit_finish_policy"] == precommit_policy
-    assert launch_pack["worker_guide"]["constraints"]["precommit_finish_policy"] == (
-        precommit_policy
+    assert (
+        commit_order["finish_authority"]
+        == "ContractRuntime.completed_lines.worker_commit"
     )
-    assert "create_git_commit_after_finish_gate" in launch_pack["worker_guide"][
-        "worker_next_moves"
+    assert commit_order["finish_consumes_contract_recorded_commit"] is True
+    assert commit_order["head_drift_policy"] == {
+        "pre_worker_commit_head_change_allowed": True,
+        "post_worker_commit_head_drift_rejected": True,
+        "blocker": "post_worker_commit_head_drift",
+    }
+    assert commit_order["legacy_no_worker_commit_contracts"] == {
+        "support": "compatibility_only",
+        "canonical": False,
+        "must_not_override": "mf_parallel.v2",
+    }
+    assert launch_pack["worker_guide"]["contract_worker_commit_order"] == (
+        commit_order
+    )
+    assert launch_pack["worker_guide"]["constraints"][
+        "contract_worker_commit_order"
+    ] == commit_order
+    worker_next_moves = launch_pack["worker_guide"]["worker_next_moves"]
+    implementation_index = worker_next_moves.index("record_implementation_evidence")
+    assert worker_next_moves[implementation_index : implementation_index + 5] == [
+        "record_implementation_evidence",
+        "git_commit",
+        "record_worker_commit",
+        "record_finish_time_worker_attestation",
+        "record_finish_gate",
     ]
     assert launch_pack["startup_preflight"]["allowed"] is True
     assert launch_pack["startup_preflight"]["status"] == "passed"
@@ -394,9 +422,15 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     assert ".venv/bin/python -m pip install pytest" in test_env["setup_commands"][0]
     assert launch_pack["worker_guide"]["test_environment_preflight"] == test_env
     assert launch_pack["worker_guide"]["tests_to_run"] == test_env["test_commands"]
-    assert "runtime_context_read_receipt" in {
-        item["id"] for item in launch_pack["required_evidence"]
-    }
+    assert [item["id"] for item in launch_pack["required_evidence"]] == [
+        "runtime_context_read_receipt",
+        "mf_subagent_startup",
+        "worker_graph_trace",
+        "implementation_evidence",
+        "worker_commit",
+        "finish_time_worker_attestation",
+        "finish_gate",
+    ]
     assert launch_pack["transcript_refs"] == []
     assert launch_pack["transcript_digests"] == []
     assert result["persistent_evidence"]["worker_launch_pack_hash"] == (
@@ -447,7 +481,7 @@ def test_runtime_text_builder_hashes_launch_text_and_does_not_persist_raw(tmp_pa
     ]
     assert executable["payload"]["session_token_env"] == "AMING_WORKER_SESSION_TOKEN"
     handoff = executable["handoff_packet"]
-    assert handoff["precommit_finish_policy"] == precommit_policy
+    assert handoff["contract_worker_commit_order"] == commit_order
     receipt_skeleton = handoff["read_receipt_facade_payload_skeleton"]
     receipt_body = receipt_skeleton["copy_safe_body"]
     assert receipt_skeleton["top_level_body_required"] is True
