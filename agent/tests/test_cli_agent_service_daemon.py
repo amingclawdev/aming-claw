@@ -119,8 +119,14 @@ def _guided_host_envelope(
     }
 
 
-def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
+def _guided_ticket_and_selectors(
+    tmp_path,
+    *,
+    profile_id="profile-codex-a",
+    profile_role="mf_sub",
+):
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
+    from cli_agent_service.service import _stable_json_hash
 
     route_identity = {
         "route_id": "route-guided-daemon",
@@ -129,6 +135,13 @@ def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
         "prompt_contract_hash": "sha256:" + ("c" * 64),
         "route_token_ref": "rtok-guided-daemon",
         "visible_injection_manifest_hash": "sha256:" + ("d" * 64),
+    }
+    profile_requirements = {
+        "profile_id": profile_id,
+        "role": "mf_sub",
+        "harness": "codex",
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
     }
     action = {
         "id": "worker_dispatch",
@@ -151,13 +164,7 @@ def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
         "merge_queue_id": "mq-guided-daemon",
         "owned_files": ["agent/owned.py"],
         **route_identity,
-        "profile_requirements": {
-            "profile_id": profile_id,
-            "role": "mf_sub",
-            "harness": "codex",
-            "provider": "openai",
-            "model": "gpt-5.4-codex",
-        },
+        "profile_requirements": profile_requirements,
         "retry_policy": {"attempt": 1, "max_attempts": 1},
     }
     launch_identity = {
@@ -170,6 +177,7 @@ def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
         "parent_task_id": action["parent_task_id"],
         "runtime_context_id": action["runtime_context_id"],
         "worker_role": action["worker_role"],
+        "target_project_root": action["target_project_root"],
         "worktree_path": action["target_project_root"],
         "branch_ref": action["branch_ref"],
         "base_commit": action["base_commit"],
@@ -197,6 +205,16 @@ def _guided_ticket_and_selectors(tmp_path, *, profile_id="profile-codex-a"):
         expected_execution_state_revision=7,
     )
     assert ticket["status"] == "issued", ticket
+    if profile_role is None:
+        ticket["profile_requirements"].pop("role", None)
+    else:
+        ticket["profile_requirements"]["role"] = profile_role
+    ticket["profile_requirements_hash"] = _stable_json_hash(
+        ticket["profile_requirements"]
+    )
+    ticket_material = dict(ticket)
+    ticket_material.pop("ticket_hash", None)
+    ticket["ticket_hash"] = _stable_json_hash(ticket_material)
     selectors = {
         "project_id": "aming-claw",
         "backlog_id": "AC-GUIDED-DAEMON",
@@ -523,6 +541,80 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert response["provider_output_suppressed"] is True
     assert session_token not in public
     assert fence_token not in public
+
+
+def test_daemon_admits_absent_profile_role_and_passes_canonical_role_to_scheduler(
+    tmp_path,
+):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile())
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role=None,
+    )
+    assert "role" not in ticket["profile_requirements"]
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+    schedule_requests = []
+    schedule_run = service.scheduler.schedule_run
+
+    def recording_schedule_run(**kwargs):
+        schedule_requests.append(dict(kwargs))
+        return schedule_run(**kwargs)
+
+    service.scheduler.schedule_run = recording_schedule_run
+
+    response = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "host_envelope": _guided_host_envelope(),
+        }
+    )
+
+    assert response["status"] == "started"
+    assert response["role"] == "mf_sub"
+    assert len(schedule_requests) == 1
+    assert schedule_requests[0]["role"] == "mf_sub"
+    assert schedule_requests[0]["profile_requirements"]["role"] == "mf_sub"
+    assert "role" not in ticket["profile_requirements"]
+
+
+def test_daemon_rejects_explicit_conflicting_profile_role(tmp_path):
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile())
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+    )
+    service._contract_runtime_authority_resolver = lambda _request: dict(ticket)
+
+    with pytest.raises(ServiceError, match="profile_requirements.role"):
+        service._admit_governed_host_envelope_run(
+            {
+                "authority_selectors": selectors,
+                "host_envelope": _guided_host_envelope(),
+            }
+        )
+
+    assert supervisor.starts == []
+    assert registry.get_run("run-{}".format(ticket["ticket_id"])) is None
 
 
 @pytest.mark.parametrize(

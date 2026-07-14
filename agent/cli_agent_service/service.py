@@ -797,7 +797,8 @@ class CliAgentService:
             ).strip():
                 mismatches.append(field)
         role = str(dispatch.get("worker_role") or "").strip().lower()
-        if str(profile_requirements.get("role") or "").strip().lower() != role:
+        profile_role = str(profile_requirements.get("role") or "").strip().lower()
+        if profile_role and profile_role != role:
             mismatches.append("profile_requirements.role")
         worktree = str(dispatch.get("worktree_path") or "").strip()
         if not worktree:
@@ -850,6 +851,7 @@ class CliAgentService:
         run_id = "run-{}".format(ticket_id)
         expected_backend = str(selectors.get("backend_mode") or "").strip()
         scheduler_requirements = dict(profile_requirements)
+        scheduler_requirements["role"] = role
         if expected_backend:
             scheduler_requirements["backend_mode"] = expected_backend
         try:
