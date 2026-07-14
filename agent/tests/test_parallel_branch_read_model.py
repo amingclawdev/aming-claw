@@ -1730,14 +1730,17 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
     assert reminders["worker_rules"]["no_historical_evidence_backfill"][
         "allowed"
     ] is False
-    assert reminders["worker_rules"]["finish_gate_before_git_commit"][
-        "sequence"
-    ] == [
+    commit_rule = reminders["worker_rules"]["contract_canonical_worker_commit"]
+    assert commit_rule["sequence"] == [
         "implementation_evidence",
+        "git_commit",
+        "worker_commit_evidence",
         "finish_time_worker_attestation",
         "finish_gate",
-        "git_commit",
     ]
+    assert commit_rule["source_of_authority"] == "ContractRuntime.worker_commit"
+    assert commit_rule["finish_consumes_contract_recorded_commit"] is True
+    assert commit_rule["later_head_drift_rejected"] is True
     graph_first = reminders["worker_rules"]["graph_trace_before_implementation"]
     assert graph_first["required"] is True
     assert graph_first["blocker"] == "pre_implementation_graph_trace_missing"
@@ -1769,6 +1772,7 @@ def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders()
     assert recovery["required_before"] == "finish_gate"
     assert recovery["sequence"] == [
         "implementation_evidence",
+        "worker_commit_evidence",
         "finish_time_worker_attestation",
         "refresh_runtime_context_current",
         "finish_gate",
