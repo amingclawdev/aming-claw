@@ -1010,8 +1010,12 @@ class CliAgentService:
             "Task: {task_id}\n"
             "Contract execution: {contract_execution_id}\n"
             "Read the current worker guide and follow ContractRuntime's current "
-            "next legal action. ContractRuntime, not this operational prompt, is "
-            "the authority."
+            "next legal action. After each accepted ContractRuntime line, re-read "
+            "the current guide and continue through worker startup, graph context, "
+            "bounded implementation, worker commit, and finish gate. Stop only at "
+            "terminal completion or a real blocker reported by the current guide. "
+            "ContractRuntime, not this operational prompt, is the authority; remain "
+            "within the allocated worker scope."
         ).format(
             role=role,
             runtime_context_id=evidence_refs["runtime_context_id"],

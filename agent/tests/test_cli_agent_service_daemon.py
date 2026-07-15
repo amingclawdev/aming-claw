@@ -509,6 +509,11 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert start["execution_ticket"] == ticket
     assert start["require_host_envelope"] is True
     assert "ContractRuntime" in start["prompt"]
+    assert "After each accepted ContractRuntime line" in start["prompt"]
+    assert "worker startup, graph context" in start["prompt"]
+    assert "worker commit, and finish gate" in start["prompt"]
+    assert "Stop only at terminal completion or a real blocker" in start["prompt"]
+    assert "remain within the allocated worker scope" in start["prompt"]
     assert supervisor.start_leases == [scheduled.lease]
     assert supervisor.host_envelope_consumed == [True]
     assert supervisor.consumed_environment_keys == [
