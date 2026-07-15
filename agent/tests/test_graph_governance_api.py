@@ -24157,6 +24157,112 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     )
 
 
+def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_worker_sequence(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-RUNTIME-REJOIN-CONTRACT-SEQUENCE"
+    target_root = tmp_path / "runtime-rejoin-contract-sequence"
+    target_root.mkdir()
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="runtime-rejoin-contract-parent",
+        worker_task_id="runtime-rejoin-contract-worker",
+        fence_token="fence-runtime-rejoin-contract",
+        token="lost-runtime-rejoin-contract-token",
+        target_project_root=str(target_root),
+        worktree_path=str(target_root),
+    )
+    runtime = server._contract_runtime(conn)
+    identity = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": backlog_id,
+        "worker_role": "mf_sub",
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+    }
+    for stage_id, line_id, evidence_kind in (
+        ("worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_subagent_startup"),
+    ):
+        runtime.current_guide(
+            successor["contract_execution_id"],
+            actor_role="mf_sub",
+        )
+        record = runtime.store.get(successor["contract_execution_id"])
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write.update(identity)
+        write["payload"] = dict(identity)
+        accepted = runtime.submit_line_write(
+            successor["contract_execution_id"],
+            write,
+            actor_role="mf_sub",
+        )
+        assert accepted["ok"] is True
+
+    startup_events_before = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_startup",
+    )
+    assert startup_events_before == []
+
+    result = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": "same worker lost host auth after ContractRuntime startup",
+                "ttl_seconds": 1200,
+                "now_iso": "2026-07-15T06:00:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_rejoin_issued"
+    assert result["raw_tokens_persisted_to_timeline"] is False
+    audit_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="observer_command",
+    )
+    rejoin_payload = next(
+        event["payload"]
+        for event in audit_events
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_rejoin"
+    )
+    sequence = rejoin_payload["contract_runtime_worker_sequence"]
+    assert sequence["ordered"] is True
+    assert sequence["startup_ref"].startswith("contract_runtime:")
+    assert rejoin_payload["startup_event_ref"] == ""
+    assert rejoin_payload["effective_startup_ref"] == sequence["startup_ref"]
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_startup",
+    ) == []
+    serialized_audit = json.dumps(rejoin_payload, sort_keys=True)
+    assert result["session_token"] not in serialized_audit
+    assert result["fence_token"] not in serialized_audit
+
+
 def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
     conn,
     tmp_path,

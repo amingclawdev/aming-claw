@@ -20828,11 +20828,28 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 timeline_events=timeline_events,
             )
         )
+        contract_runtime_sequence = (
+            _runtime_context_contract_runtime_worker_sequence_evidence(
+                conn,
+                project_id=project_id,
+                context=context,
+            )
+        )
+        effective_read_receipt_ref = str(
+            timeline_refs.get("read_receipt_event_ref")
+            or contract_runtime_sequence.get("read_receipt_ref")
+            or ""
+        )
+        effective_startup_ref = str(
+            timeline_refs.get("startup_event_ref")
+            or contract_runtime_sequence.get("startup_ref")
+            or ""
+        )
         missing_lineage = [
             item
             for item, present in (
-                ("mf_subagent_read_receipt", timeline_refs.get("read_receipt_event_ref")),
-                ("mf_subagent_startup", timeline_refs.get("startup_event_ref")),
+                ("mf_subagent_read_receipt", effective_read_receipt_ref),
+                ("mf_subagent_startup", effective_startup_ref),
             )
             if not present
         ]
@@ -21025,6 +21042,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "operator_session_role": session_role(session),
                 "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
                 "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
+                "effective_read_receipt_ref": effective_read_receipt_ref,
+                "effective_startup_ref": effective_startup_ref,
+                "contract_runtime_worker_sequence": contract_runtime_sequence,
                 "reopen_for_revision": reopen_for_revision,
                 "timeline_reopen_for_revision": timeline_reopen_for_revision,
                 "contract_runtime_failed_qa_revision": (
