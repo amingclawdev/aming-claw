@@ -158,6 +158,7 @@ def _canonical_ticket(
     runtime_context_id="",
     branch_ref="",
     base_commit="",
+    authority_decision_source="contract_runtime_completed_dispatch_line",
 ):
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
 
@@ -233,7 +234,7 @@ def _canonical_ticket(
     }
     authority = {
         "source_of_authority": "ContractRuntime",
-        "authority_decision_source": "contract_runtime_completed_dispatch_line",
+        "authority_decision_source": authority_decision_source,
         "project_id": "aming-claw",
         "backlog_id": "AC-GUIDED-E2E",
         "contract_execution_id": "cex-guided-{}".format(suffix),
@@ -322,6 +323,7 @@ class _GovernanceFixture:
         self.tickets = tickets
         self.ticket_requests = []
         self.receipts = []
+        self.qa_tokens = []
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -330,6 +332,7 @@ class _GovernanceFixture:
                 body = json.loads(self.rfile.read(size).decode("utf-8"))
                 if self.path.endswith("/cli-agent/execution-ticket/resolve"):
                     fixture.ticket_requests.append(body)
+                    fixture.qa_tokens.append(self.headers.get("X-Gov-Token", ""))
                     ticket = fixture.tickets[body["contract_execution_id"]]
                     response = {
                         "ok": True,
@@ -586,12 +589,7 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
     assert service._restart_reconciled is True
     assert len(governance.ticket_requests) == len(cases)
     assert all("execution_ticket" not in request for request in governance.ticket_requests)
-    assert all("profile_requirements" not in request for request in governance.ticket_requests)
-    assert all("launch_identity" not in request for request in governance.ticket_requests)
-    assert all("run" not in request for request in governance.ticket_requests)
-    assert all("prompt" not in request for request in governance.ticket_requests)
-    assert all("environment" not in request for request in governance.ticket_requests)
-    assert all("host_envelope" not in request for request in governance.ticket_requests)
+
 
     spawn_records = []
     for _role, suffix in cases:
@@ -640,6 +638,111 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
     assert b"public-safe intent role=" not in service_persisted
     assert b"Proceed as the allocated Aming Claw" not in service_persisted
     assert b"public-safe result" not in service_persisted
+
+
+def test_qa_ticket_uses_distinct_native_service_run_and_transient_token(
+    tmp_path, monkeypatch
+):
+    from cli_agent_service.guided_runtime import (
+        request_guided_runtime,
+        request_qa_execution_ticket_runtime,
+    )
+    from cli_agent_service.service import CliAgentService, ServicePaths
+
+    executable = _fake_codex(tmp_path / "codex")
+    _main, worktree, head, worker_context, worker_evidence = _dogfood_branch(
+        tmp_path / "worker",
+        suffix="native-worker",
+        fence_token="fence-native-worker",
+    )
+    worker_run = _profiled_run(executable, role="mf_sub", suffix="native-worker")
+    qa_run = _profiled_run(executable, role="qa", suffix="native-qa")
+    worker_ticket, worker_selectors = _canonical_ticket(
+        worker_run,
+        role="mf_sub",
+        suffix="native-worker",
+        worktree=worktree,
+        runtime_context_id=worker_evidence["runtime_context_id"],
+        branch_ref=worker_context.branch_ref,
+        base_commit=head,
+    )
+    qa_ticket, qa_selectors = _canonical_ticket(
+        qa_run,
+        role="qa",
+        suffix="native-qa",
+        worktree=worktree,
+        runtime_context_id="mfrctx-guided-native-qa",
+        branch_ref=worker_context.branch_ref,
+        base_commit=head,
+        authority_decision_source="contract_runtime_qa_execution_ticket",
+    )
+    qa_selectors.pop("profile_id")
+    governance = _GovernanceFixture(
+        {
+            worker_ticket["contract_execution_id"]: worker_ticket,
+            qa_ticket["contract_execution_id"]: qa_ticket,
+        }
+    )
+    governance.start()
+    monkeypatch.setenv("AMING_CLAW_GOVERNANCE_URL", governance.url)
+    paths = ServicePaths.from_state_dir(tmp_path / "state")
+    service = CliAgentService(paths)
+    service.registry.register_profile(worker_run.profile)
+    service.registry.register_profile(qa_run.profile)
+    service_thread = threading.Thread(target=service.serve_forever, daemon=True)
+    service_thread.start()
+    _wait_for(paths.socket_path.exists)
+    qa_token = "qa-token-{}".format(secrets.token_urlsafe(24))
+    try:
+        worker = request_guided_runtime(
+            admission={"authority_selectors": worker_selectors},
+            project_id="aming-claw",
+            backlog_id="AC-GUIDED-E2E",
+            transient_host_envelope={
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "session-native-worker",
+                    "AMING_WORKER_FENCE_TOKEN": "fence-native-worker",
+                }
+            },
+            state_dir=str(paths.state_dir),
+            timeout_seconds=10,
+        )
+        qa = request_qa_execution_ticket_runtime(
+            authority_selectors=qa_selectors,
+            qa_session_token=qa_token,
+            state_dir=str(paths.state_dir),
+            timeout_seconds=10,
+        )
+        _wait_for(
+            lambda: service.registry.get_run(worker["run_id"]).state == "completed"
+        )
+        _wait_for(lambda: service.registry.get_run(qa["run_id"]).state == "completed")
+    finally:
+        service.stop()
+        service_thread.join(timeout=5)
+        governance.stop()
+
+    assert worker["run_id"] != qa["run_id"]
+    assert worker["role"] == "mf_sub"
+    assert qa["role"] == "qa"
+    assert qa["profile_id"] == qa_run.config.profile_id
+    assert governance.qa_tokens[-1] == qa_token
+    assert all("qa_session_token" not in request for request in governance.ticket_requests)
+    assert qa_token.encode("utf-8") not in Path(service.registry.db_path).read_bytes()
+    qa_response = qa["service_response"]
+    assert qa_response["caller_run_accepted"] is False
+    assert qa_response["caller_prompt_accepted"] is False
+    assert qa_response["caller_environment_accepted"] is False
+    assert qa_response["transient_qa_session_token_persisted"] is False
+    for forbidden in (
+        "profile_requirements",
+        "launch_identity",
+        "run",
+        "prompt",
+        "environment",
+        "host_envelope",
+    ):
+        assert all(forbidden not in request for request in governance.ticket_requests)
 
 
 def test_restart_projects_lost_and_service_owns_selector_only_successor(

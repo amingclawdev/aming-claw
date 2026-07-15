@@ -267,6 +267,7 @@ def _governance_json_post(
     *,
     governance_url: str = "",
     timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+    role_token: str = "",
 ) -> dict[str, Any]:
     base_url = str(
         governance_url
@@ -280,10 +281,13 @@ def _governance_json_post(
     ).encode("utf-8")
     if len(request_bytes) > MAX_REQUEST_BYTES:
         raise ServiceError("governance request exceeded the size limit")
+    headers = {"Content-Type": "application/json"}
+    if role_token:
+        headers["X-Gov-Token"] = role_token
     request = urllib.request.Request(
         base_url + path,
         data=request_bytes,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -310,6 +314,7 @@ def resolve_governance_execution_ticket(
     *,
     governance_url: str = "",
     timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+    qa_session_token: str = "",
 ) -> dict[str, Any]:
     """Resolve one role-generic ticket from governance-owned ContractRuntime state."""
 
@@ -324,6 +329,7 @@ def resolve_governance_execution_ticket(
         authority_request,
         governance_url=governance_url,
         timeout_seconds=timeout_seconds,
+        role_token=qa_session_token,
     )
     ticket = resolved.get("execution_ticket")
     if resolved.get("ok") is not True or not isinstance(ticket, Mapping):
@@ -692,8 +698,15 @@ class CliAgentService:
     def _admit_governed_host_envelope_run(
         self,
         payload: Mapping[str, Any],
+        *,
+        qa_mode: bool = False,
     ) -> dict[str, Any]:
-        if set(payload) - {"authority_selectors", "host_envelope"}:
+        allowed_payload_fields = (
+            {"authority_selectors", "qa_session_token"}
+            if qa_mode
+            else {"authority_selectors", "host_envelope"}
+        )
+        if set(payload) - allowed_payload_fields:
             raise ServiceError("governed run request contains unsupported fields")
         selectors = payload.get("authority_selectors")
         if not isinstance(selectors, Mapping):
@@ -701,9 +714,18 @@ class CliAgentService:
         unsupported = sorted(set(selectors) - _GUIDED_RUNTIME_AUTHORITY_FIELDS)
         if unsupported:
             raise ServiceError("governed run contains caller-owned authority fields")
+        required_selectors = (
+            tuple(
+                field
+                for field in _GUIDED_RUNTIME_REQUIRED_SELECTORS
+                if field != "profile_id"
+            )
+            if qa_mode
+            else _GUIDED_RUNTIME_REQUIRED_SELECTORS
+        )
         if any(
             not str(selectors.get(field) or "").strip()
-            for field in _GUIDED_RUNTIME_REQUIRED_SELECTORS
+            for field in required_selectors
         ):
             raise ServiceError("governed run is missing canonical authority selectors")
         try:
@@ -721,7 +743,17 @@ class CliAgentService:
             if selectors.get(field) not in (None, "")
         }
         authority_request["expected_execution_state_revision"] = expected_revision
-        ticket = self._contract_runtime_authority_resolver(authority_request)
+        qa_session_token = str(payload.get("qa_session_token") or "")
+        if qa_mode and not qa_session_token:
+            raise ServiceError("QA run requires a transient QA session token")
+        if qa_mode:
+            ticket = resolve_governance_execution_ticket(
+                authority_request,
+                qa_session_token=qa_session_token,
+            )
+        else:
+            ticket = self._contract_runtime_authority_resolver(authority_request)
+        qa_session_token = ""
         if not isinstance(ticket, Mapping):
             raise ServiceError("ContractRuntime resolver returned an invalid ticket")
         dispatch = ticket.get("dispatch_identity")
@@ -733,7 +765,11 @@ class CliAgentService:
             or ticket.get("issue_allowed") is not True
             or ticket.get("source_of_authority") != "ContractRuntime"
             or ticket.get("authority_decision_source")
-            != "contract_runtime_completed_dispatch_line"
+            not in (
+                {"contract_runtime_qa_execution_ticket"}
+                if qa_mode
+                else {"contract_runtime_completed_dispatch_line"}
+            )
             or ticket.get("immutable") is not True
             or ticket.get("consumed") is not False
             or not isinstance(dispatch, Mapping)
@@ -785,12 +821,13 @@ class CliAgentService:
             "observer_command_id": dispatch.get("observer_command_id"),
             "principal_id": dispatch.get("worker_id"),
             "role": dispatch.get("worker_role"),
-            "profile_id": profile_requirements.get("profile_id"),
             **{
                 field: dispatch.get(field)
                 for field in _GUIDED_RUNTIME_ROUTE_FIELDS
             },
         }
+        if not qa_mode:
+            selector_comparisons["profile_id"] = profile_requirements.get("profile_id")
         mismatches = [
             field
             for field, canonical in selector_comparisons.items()
@@ -804,6 +841,8 @@ class CliAgentService:
             ).strip():
                 mismatches.append(field)
         role = str(dispatch.get("worker_role") or "").strip().lower()
+        if qa_mode and role != "qa":
+            mismatches.append("qa_role")
         profile_role = str(profile_requirements.get("role") or "").strip().lower()
         if profile_role and profile_role != role:
             mismatches.append("profile_requirements.role")
@@ -889,7 +928,7 @@ class CliAgentService:
                 ref.name: ref.value for ref in canonical_run.evidence_refs
             }
             if (
-                canonical_run.run.config.profile_id != expected_profile_id
+                (expected_profile_id and canonical_run.run.config.profile_id != expected_profile_id)
                 or canonical_run.run.config.role != role
                 or canonical_run.run.config.project_id != project_id
                 or any(
@@ -990,8 +1029,10 @@ class CliAgentService:
         lease = scheduled.lease
         if (
             profile is None
-            or profile.profile_id
-            != str(profile_requirements.get("profile_id") or "").strip()
+            or (
+                expected_profile_id
+                and profile.profile_id != expected_profile_id
+            )
             or profile.inference_endpoint.backend_mode != expected_backend
             or lease.run_id != run.run_id
             or lease.profile_id != profile.profile_id
@@ -1023,6 +1064,15 @@ class CliAgentService:
             task_id=evidence_refs["task_id"],
             contract_execution_id=evidence_refs["contract_execution_id"],
         )
+        if qa_mode:
+            prompt = (
+                "Proceed as the ContractRuntime-authorized independent QA verifier.\n"
+                "Runtime context: {runtime_context_id}\n"
+                "Task: {task_id}\n"
+                "Contract execution: {contract_execution_id}\n"
+                "Read the current QA guide, run the bounded graph context and focused "
+                "verification, then record exactly one audited QA verdict."
+            ).format(**evidence_refs)
         supplied_host_envelope = payload.get("host_envelope")
         canonical_host_envelope: dict[str, Any] = {
             "project_id": evidence_refs["project_id"],
@@ -1035,13 +1085,14 @@ class CliAgentService:
             "worker_slot_id": str(dispatch.get("worker_slot_id") or ""),
         }
         try:
-            if not isinstance(supplied_host_envelope, Mapping) or set(
+            if not qa_mode and (not isinstance(supplied_host_envelope, Mapping) or set(
                 supplied_host_envelope
-            ) != {"env"}:
+            ) != {"env"}):
                 raise HostEnvelopeError(
                     "governed run requires one transient worker host envelope"
                 )
-            canonical_host_envelope["env"] = supplied_host_envelope.get("env")
+            if not qa_mode:
+                canonical_host_envelope["env"] = supplied_host_envelope.get("env")
             public_text = json.dumps(
                 {
                     "run": run.to_public_dict(),
@@ -1053,12 +1104,13 @@ class CliAgentService:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            self.host_envelope_store.stage(
-                run.run_id,
-                canonical_host_envelope,
-                lease_owner_id=lease.owner_id,
-                public_text=public_text,
-            )
+            if not qa_mode:
+                self.host_envelope_store.stage(
+                    run.run_id,
+                    canonical_host_envelope,
+                    lease_owner_id=lease.owner_id,
+                    public_text=public_text,
+                )
             del public_text
             self.supervisor.start_run(
                 run,
@@ -1066,7 +1118,7 @@ class CliAgentService:
                 worktree=worktree,
                 evidence_refs=evidence_refs,
                 execution_ticket=ticket,
-                require_host_envelope=True,
+                require_host_envelope=not qa_mode,
             )
         except BaseException as exc:
             try:
@@ -1108,9 +1160,9 @@ class CliAgentService:
             "caller_run_accepted": False,
             "caller_prompt_accepted": False,
             "caller_environment_accepted": False,
-            "transient_host_envelope_required": True,
-            "transient_host_envelope_accepted": True,
-            "transient_host_envelope_consumed": True,
+            "transient_host_envelope_required": not qa_mode,
+            "transient_host_envelope_accepted": not qa_mode,
+            "transient_host_envelope_consumed": not qa_mode,
             "transient_host_envelope_persisted": False,
             "host_envelope_run_authority": False,
             "raw_argv_persisted": False,
@@ -1120,6 +1172,8 @@ class CliAgentService:
             "raw_route_token_persisted": False,
             "raw_session_token_persisted": False,
             "raw_fence_token_persisted": False,
+            "transient_qa_session_token_accepted": qa_mode,
+            "transient_qa_session_token_persisted": False,
             "raw_prompt_persisted": False,
             "raw_provider_output_persisted": False,
             "provider_output_suppressed": True,
@@ -1150,6 +1204,14 @@ class CliAgentService:
             if not isinstance(payload, Mapping):
                 raise ServiceError("host envelope run payload must be an object")
             return self._admit_governed_host_envelope_run(payload), False
+        if operation == "start_qa_execution_ticket_run":
+            payload = request.get("payload")
+            if not isinstance(payload, Mapping):
+                raise ServiceError("QA execution ticket payload must be an object")
+            return self._admit_governed_host_envelope_run(
+                payload,
+                qa_mode=True,
+            ), False
         if operation in {
             "desktop_host_register",
             "desktop_host_heartbeat",
@@ -1195,6 +1257,7 @@ class CliAgentService:
                 "stop",
                 "host_envelope",
                 "start_host_envelope_run",
+                "start_qa_execution_ticket_run",
                 *sorted(PROFILE_OPERATIONS),
                 "desktop_host_register",
                 "desktop_host_heartbeat",

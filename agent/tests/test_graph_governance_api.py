@@ -25917,6 +25917,7 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert corrected["graph_query_body"]["target_project_root"] == str(canonical_root)
     assert corrected["graph_query_body"]["worktree_path"] == str(worktree)
     assert corrected["graph_query_body"]["route_identity"] == route_identity
+    assert corrected["write_facade_body"]["route_identity"] == route_identity
     assert corrected["startup_body"]["target_project_root"] == str(canonical_root)
     worker_view = current["runtime_context_service"]["views"]["worker_view"]
     assert worker_view["task"]["target_project_root"] == str(canonical_root)
@@ -25940,6 +25941,9 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert worker_guide["corrected_request_shapes"]["write_facade_body"][
         "target_project_root"
     ] == str(canonical_root)
+    assert worker_guide["corrected_request_shapes"]["write_facade_body"][
+        "route_identity"
+    ] == route_identity
     implementation_skeleton = worker_guide[
         "implementation_evidence_facade_payload_skeleton"
     ]
@@ -54589,6 +54593,113 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
                 },
             )
         )
+
+
+def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
+    class Connection:
+        def close(self):
+            pass
+
+    dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "payload": {
+            "runtime_context_id": "mfrctx-qa-ticket",
+            "task_id": "worker-qa-ticket",
+            "worker_id": "worker-qa-ticket",
+            "worker_slot_id": "slot-qa-ticket",
+            "observer_command_id": "cex-qa-ticket",
+            "parent_task_id": "AC-QA-TICKET",
+            "worker_role": "mf_sub",
+            "target_project_root": "/tmp/qa-ticket",
+            "worktree_path": "/tmp/qa-ticket/.worktrees/worker",
+            "branch_ref": "refs/heads/worker-qa-ticket",
+            "base_commit": "a" * 40,
+            "target_head_commit": "b" * 40,
+            "merge_queue_id": "mq-qa-ticket",
+            "owned_files": ["agent/governance/server.py"],
+            "route_identity": {
+                "route_id": "route-qa-ticket",
+                "route_context_hash": "sha256:" + "1" * 64,
+                "prompt_contract_id": "prompt-qa-ticket",
+                "prompt_contract_hash": "sha256:" + "2" * 64,
+                "route_token_ref": "rtref-qa-ticket",
+                "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+            },
+            "profile_requirements": {
+                "profile_id": "codex-worker",
+                "harness": "codex",
+                "provider": "openai",
+            },
+            "retry_policy": {"attempt": 1, "max_attempts": 2},
+        },
+    }
+    record = {
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "contract_execution_id": "cex-qa-ticket",
+        "completed_lines": [dispatch],
+    }
+    current_state = {
+        "next_legal_action": {
+            "owner_role": "qa",
+            "stage_id": "qa",
+            "line_id": "qa_graph_context",
+            "evidence_kind": "graph_trace",
+        }
+    }
+    projected = server._contract_runtime_qa_ticket_authority(record, current_state)
+    assert projected["status"] == "projected"
+    authority = {
+        "source_of_authority": "ContractRuntime",
+        "authority_decision_source": "contract_runtime_qa_execution_ticket",
+        "project_id": PID,
+        "backlog_id": "AC-QA-TICKET",
+        "contract_execution_id": "cex-qa-ticket",
+        "contract_revision_id": "rev-qa-ticket",
+        "execution_state_revision": 9,
+        "execution_state_hash": "sha256:" + "4" * 64,
+        "runtime_guide_hash": "sha256:" + "5" * 64,
+        "readiness_state": "contract_active",
+        "next_legal_action": projected["next_legal_action"],
+    }
+    launch = server._contract_runtime_desktop_launch_identity(authority)
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_contract_runtime_authority",
+        lambda _conn, **_kwargs: authority,
+    )
+    body = {
+        "project_id": PID,
+        "backlog_id": "AC-QA-TICKET",
+        "contract_execution_id": "cex-qa-ticket",
+        "runtime_context_id": launch["runtime_context_id"],
+        "task_id": launch["task_id"],
+        "worker_id": launch["worker_id"],
+        "worker_slot_id": launch["worker_slot_id"],
+        "observer_command_id": launch["observer_command_id"],
+        "role": "qa",
+        "expected_execution_state_revision": 9,
+        "expected_execution_state_hash": "sha256:" + "4" * 64,
+    }
+
+    result = server.handle_cli_agent_desktop_execution_ticket_resolve(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert result["ok"] is True, result["execution_ticket"].get("errors")
+    ticket = result["execution_ticket"]
+    assert ticket["authority_decision_source"] == (
+        "contract_runtime_qa_execution_ticket"
+    )
+    assert ticket["next_legal_action"]["worker_role"] == "qa"
+    assert ticket["profile_requirements"]["role"] == "qa"
+    assert "profile_id" not in ticket["profile_requirements"]
+    assert ticket["profile_requirements"]["required_capabilities"] == [
+        "independent_verification"
+    ]
 
 
 @pytest.mark.parametrize(
