@@ -30,6 +30,10 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v4"
+CLI_AGENT_QA_ONBOARD_GUIDANCE_SCHEMA_VERSION = (
+    "cli_agent.qa_onboard_guidance_contract.v1"
+)
+CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION = "qa-onboard-guidance.v1"
 CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
     "cli_agent.managed_profile_tooling_contract.v1"
 )
@@ -3603,6 +3607,61 @@ def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
     }
 
 
+def cli_agent_qa_onboard_guidance_contract() -> dict[str, Any]:
+    """Return the public machine contract shared by QA tickets and onboard."""
+
+    material = {
+        "schema_version": CLI_AGENT_QA_ONBOARD_GUIDANCE_SCHEMA_VERSION,
+        "guidance_version": CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION,
+        "selected_role_guidance_schema_version": (
+            "onboard_route_guide.qa_selected_role_guidance.v1"
+        ),
+        "line_contracts": {
+            "qa_graph_context": {
+                "ordered_step_ids": [
+                    "qa_session_register",
+                    "graph_query_schema",
+                    "read_compact_contract_runtime",
+                    "submit_qa_graph_context",
+                    "reread_after_qa_graph_context",
+                ],
+                "graph_query_tool": "query_schema",
+                "graph_query_source": "qa",
+                "graph_query_purpose": "independent_verification",
+                "submit_payload_schema_version": (
+                    "mf_parallel.qa_graph_context.v1"
+                ),
+                "redundant_graph_query_required": False,
+            },
+            "qa_independent_verification": {
+                "ordered_step_ids": [
+                    "qa_session_register",
+                    "read_refreshed_compact_contract_runtime",
+                    "run_focused_exact_tests",
+                    "submit_one_qa_independent_verification",
+                    "confirm_strict_revision_advance",
+                ],
+                "exactly_one_verdict": True,
+                "strict_revision_advance": True,
+                "redundant_graph_query_required": False,
+            },
+        },
+        "raw_qa_session_token_public": False,
+    }
+    return {**material, "guidance_hash": _stable_json_hash(material)}
+
+
+def cli_agent_qa_onboard_guidance_binding() -> dict[str, str]:
+    """Return the immutable QA onboard binding carried by execution tickets."""
+
+    contract = cli_agent_qa_onboard_guidance_contract()
+    return {
+        "schema_version": str(contract["schema_version"]),
+        "guidance_version": str(contract["guidance_version"]),
+        "guidance_hash": str(contract["guidance_hash"]),
+    }
+
+
 def cli_agent_managed_profile_source_payload_digest(
     plugin_source_root: str | Path | None = None,
 ) -> str:
@@ -4229,6 +4288,9 @@ def build_cli_agent_execution_ticket(
     if authority_decision_source == "contract_runtime_qa_execution_ticket":
         material["qa_bootstrap_guide_contract"] = (
             cli_agent_qa_bootstrap_guide_binding()
+        )
+        material["qa_onboard_guidance_contract"] = (
+            cli_agent_qa_onboard_guidance_binding()
         )
         material["managed_profile_tooling_contract"] = (
             cli_agent_managed_profile_tooling_binding()

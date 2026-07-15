@@ -449,6 +449,20 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     ):
         assert graph_index < prompt_template.index(graph_gated_step)
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
+    onboard_binding = issued["qa_onboard_guidance_contract"]
+    assert onboard_binding["schema_version"] == (
+        "cli_agent.qa_onboard_guidance_contract.v1"
+    )
+    assert onboard_binding["guidance_version"] == "qa-onboard-guidance.v1"
+    assert onboard_binding["guidance_hash"].startswith("sha256:")
+    onboard_contract = (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
+    )
+    assert onboard_contract["guidance_hash"] == onboard_binding["guidance_hash"]
+    assert onboard_contract["line_contracts"]["qa_graph_context"][
+        "ordered_step_ids"
+    ][:2] == ["qa_session_register", "graph_query_schema"]
+    assert "qa_onboard_guidance_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
         "cli_agent.managed_profile_tooling_contract.v1"
@@ -467,7 +481,44 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert same["ticket_id"] == issued["ticket_id"]
     assert same["ticket_hash"] == issued["ticket_hash"]
     assert same["qa_bootstrap_guide_contract"] == binding
+    assert same["qa_onboard_guidance_contract"] == onboard_binding
     assert same["managed_profile_tooling_contract"] == tooling_binding
+
+    original_onboard_version = (
+        contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
+        original_onboard_version + ".changed",
+    )
+    onboard_changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert onboard_changed["status"] == "issued"
+    assert onboard_changed["execution_state_revision"] == issued[
+        "execution_state_revision"
+    ]
+    assert onboard_changed["contract_revision_id"] == issued[
+        "contract_revision_id"
+    ]
+    assert onboard_changed["dispatch_identity"] == issued["dispatch_identity"]
+    assert onboard_changed["dispatch_identity_hash"] == issued[
+        "dispatch_identity_hash"
+    ]
+    assert onboard_changed["profile_requirements"] == issued["profile_requirements"]
+    assert onboard_changed["retry_policy"] == issued["retry_policy"]
+    assert onboard_changed["qa_bootstrap_guide_contract"] == binding
+    assert onboard_changed["managed_profile_tooling_contract"] == tooling_binding
+    assert onboard_changed["qa_onboard_guidance_contract"] != onboard_binding
+    assert onboard_changed["ticket_id"] != issued["ticket_id"]
+    assert onboard_changed["ticket_hash"] != issued["ticket_hash"]
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
+        original_onboard_version,
+    )
 
     monkeypatch.setattr(
         contract_state_runtime,

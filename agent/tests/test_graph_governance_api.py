@@ -21,6 +21,7 @@ from agent.tests.fixtures.rule_fingerprint_project import (
 )
 from agent.governance import asset_impact
 from agent.governance import batch_jobs
+from agent.governance import contract_state_runtime
 from agent.governance import graph_correction_patches
 from agent.governance import graph_events
 from agent.governance import graph_query_trace
@@ -38459,6 +38460,9 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert guidance["authority_decision_source"] == (
         "backlog_contract_chain_current"
     )
+    assert guidance["qa_onboard_guidance_contract"] == (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
+    )
     assert guidance["contract_execution_id"] == "cex-mf-parallel-qa-current-line"
     assert guidance["current_action_source"] == "backlog_contract_chain_current"
     steps = guidance["ordered_steps"]
@@ -38645,6 +38649,9 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     assert runtime_context.target_project_root != runtime_context.worktree_path
     assert graph_args["task_id"] == worker_task_id
     assert graph_args["repo_root"] == runtime_context.worktree_path
+    assert guidance["qa_onboard_guidance_contract"] == (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
+    )
     assert response["onboard_route_guide"]["selected_role_guidance"] == guidance
 
 
@@ -55542,10 +55549,13 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
     assert ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in ticket["profile_requirements"]
     assert ticket["qa_bootstrap_guide_contract"]["guide_version"] == (
-        "qa-bootstrap-guide.v1"
+        "qa-bootstrap-guide.v4"
     )
     assert ticket["qa_bootstrap_guide_contract"]["guide_hash"].startswith(
         "sha256:"
+    )
+    assert ticket["qa_onboard_guidance_contract"] == (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
     )
     assert ticket["retry_policy"] == {
         "attempt": 0,

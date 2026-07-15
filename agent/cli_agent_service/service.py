@@ -20,6 +20,7 @@ from governance.contract_state_runtime import (
     cli_agent_managed_profile_tooling_binding,
     cli_agent_qa_bootstrap_guide_binding,
     cli_agent_qa_bootstrap_guide_contract,
+    cli_agent_qa_onboard_guidance_binding,
 )
 
 from .adapters.codex_desktop import (
@@ -821,6 +822,13 @@ class CliAgentService:
             != cli_agent_qa_bootstrap_guide_binding()
         ):
             integrity_mismatches.append("qa_bootstrap_guide_contract")
+        ticket_qa_onboard_binding = ticket.get("qa_onboard_guidance_contract")
+        if qa_mode and (
+            not isinstance(ticket_qa_onboard_binding, Mapping)
+            or dict(ticket_qa_onboard_binding)
+            != cli_agent_qa_onboard_guidance_binding()
+        ):
+            integrity_mismatches.append("qa_onboard_guidance_contract")
         ticket_tooling_binding = ticket.get("managed_profile_tooling_contract")
         if qa_mode and (
             not isinstance(ticket_tooling_binding, Mapping)
