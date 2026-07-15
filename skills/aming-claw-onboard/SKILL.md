@@ -93,6 +93,14 @@ instructions.
   progress from runtime current state and timeline evidence; complete direct
   fix with independent QA, branch-service validation when runtime code changed,
   merge or redeploy, full reconcile, and protected backlog close.
+- For authoritative activation after an ordinary merge or redeploy, call
+  `graph_current_full_reconcile` with `semantic_use_ai=false`; this still runs
+  full structural and semantic materialization. Use `semantic_use_ai=true` only
+  for semantic-specific acceptance after provider auth and readiness preflight
+  succeeds. If a reconcile is already running, poll that same run and snapshot;
+  never start a concurrent retry. If an unready AI provider leaves the candidate
+  running, first confirm it is the same run, then have the observer stop it
+  through a manager-owned redeploy and issue exactly one non-AI retry.
 - Runtime resume guidance prefers live `backlog_contract_chain_current` /
   ContractRuntime current state. Treat compact-ledger resume as recovery
   fallback only when the live projection is missing or unrebuildable.
