@@ -739,7 +739,13 @@ def test_qa_ticket_uses_distinct_native_service_run_and_transient_token(
     assert qa_ticket["qa_bootstrap_guide_contract"]["guide_version"] == (
         "qa-bootstrap-guide.v1"
     )
+    assert qa_ticket["managed_profile_tooling_contract"]["tooling_version"] == (
+        "managed-profile-tooling.v1"
+    )
     assert "qa_bootstrap_guide_contract" not in qa_ticket[
+        "profile_requirements"
+    ]
+    assert "managed_profile_tooling_contract" not in qa_ticket[
         "profile_requirements"
     ]
     qa_receipts = service.supervisor.run_receipts(qa["run_id"])

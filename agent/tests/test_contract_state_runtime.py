@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -402,6 +403,16 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["guide_version"] == "qa-bootstrap-guide.v1"
     assert binding["guide_hash"].startswith("sha256:")
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
+    tooling_binding = issued["managed_profile_tooling_contract"]
+    assert tooling_binding["schema_version"] == (
+        "cli_agent.managed_profile_tooling_contract.v1"
+    )
+    assert tooling_binding["tooling_version"] == "managed-profile-tooling.v1"
+    assert tooling_binding["source_payload_digest"].startswith("sha256:")
+    assert tooling_binding["tooling_hash"].startswith("sha256:")
+    assert "managed_profile_tooling_contract" not in issued[
+        "profile_requirements"
+    ]
 
     same = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
@@ -410,6 +421,33 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert same["ticket_id"] == issued["ticket_id"]
     assert same["ticket_hash"] == issued["ticket_hash"]
     assert same["qa_bootstrap_guide_contract"] == binding
+    assert same["managed_profile_tooling_contract"] == tooling_binding
+
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION",
+        contract_state_runtime.CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION
+        + ".changed",
+    )
+    tooling_changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert tooling_changed["status"] == "issued"
+    assert tooling_changed["execution_state_revision"] == issued[
+        "execution_state_revision"
+    ]
+    assert tooling_changed["dispatch_identity_hash"] == issued[
+        "dispatch_identity_hash"
+    ]
+    assert tooling_changed["profile_requirements"] == issued[
+        "profile_requirements"
+    ]
+    assert tooling_changed["retry_policy"] == issued["retry_policy"]
+    assert tooling_changed["managed_profile_tooling_contract"] != tooling_binding
+    assert tooling_changed["ticket_id"] != issued["ticket_id"]
+    assert tooling_changed["ticket_hash"] != issued["ticket_hash"]
 
     monkeypatch.setattr(
         contract_state_runtime,
@@ -423,13 +461,188 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     )
 
     assert changed["status"] == "issued"
-    assert changed["execution_state_revision"] == issued["execution_state_revision"]
-    assert changed["dispatch_identity_hash"] == issued["dispatch_identity_hash"]
-    assert changed["profile_requirements"] == issued["profile_requirements"]
-    assert changed["retry_policy"] == issued["retry_policy"]
-    assert changed["qa_bootstrap_guide_contract"] != binding
-    assert changed["ticket_id"] != issued["ticket_id"]
-    assert changed["ticket_hash"] != issued["ticket_hash"]
+    assert changed["execution_state_revision"] == tooling_changed[
+        "execution_state_revision"
+    ]
+    assert changed["dispatch_identity_hash"] == tooling_changed[
+        "dispatch_identity_hash"
+    ]
+    assert changed["profile_requirements"] == tooling_changed[
+        "profile_requirements"
+    ]
+    assert changed["retry_policy"] == tooling_changed["retry_policy"]
+    assert changed["qa_bootstrap_guide_contract"] != tooling_changed[
+        "qa_bootstrap_guide_contract"
+    ]
+    assert changed["ticket_id"] != tooling_changed["ticket_id"]
+    assert changed["ticket_hash"] != tooling_changed["ticket_hash"]
+
+
+def test_cli_agent_qa_ticket_id_changes_with_source_payload_digest(
+    tmp_path,
+    monkeypatch,
+):
+    current, launch = _cli_agent_ticket_fixture()
+    current["authority_decision_source"] = "contract_runtime_qa_execution_ticket"
+    current["next_legal_action"].update(
+        {
+            "worker_role": "qa",
+            "profile_requirements": {
+                "harness": "codex",
+                "provider": "openai",
+                "role": "qa",
+                "required_capabilities": ["independent_verification"],
+            },
+        }
+    )
+    launch["worker_role"] = "qa"
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    payload = source_root / "payload.txt"
+    payload.write_bytes(b"first source payload")
+    digest_source = (
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload.txt",),
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "cli_agent_managed_profile_source_payload_digest",
+        lambda _plugin_source_root=None: digest_source(source_root),
+    )
+
+    first = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    payload.write_bytes(b"second source payload")
+    changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert first["status"] == changed["status"] == "issued"
+    assert first["execution_state_revision"] == changed[
+        "execution_state_revision"
+    ]
+    assert first["dispatch_identity_hash"] == changed[
+        "dispatch_identity_hash"
+    ]
+    assert first["profile_requirements"] == changed["profile_requirements"]
+    assert first["managed_profile_tooling_contract"][
+        "tooling_version"
+    ] == changed["managed_profile_tooling_contract"]["tooling_version"]
+    assert first["managed_profile_tooling_contract"][
+        "source_payload_digest"
+    ] != changed["managed_profile_tooling_contract"]["source_payload_digest"]
+    assert first["ticket_id"] != changed["ticket_id"]
+    assert first["ticket_hash"] != changed["ticket_hash"]
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    ("payload", "payload/required.txt"),
+)
+def test_managed_profile_source_digest_rejects_missing_canonical_payload(
+    tmp_path,
+    monkeypatch,
+    missing_path,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    if missing_path != "payload":
+        (source_root / "payload").mkdir()
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload",),
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "REQUIRED_PLUGIN_FILES",
+        ("payload/required.txt",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"payload is missing: {}$".format(missing_path),
+    ):
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+            source_root
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+@pytest.mark.parametrize("fifo_location", ("top-level", "descendant"))
+def test_managed_profile_source_digest_rejects_fifo_without_blocking(
+    tmp_path,
+    monkeypatch,
+    fifo_location,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    if fifo_location == "top-level":
+        fifo = source_root / "payload"
+        payload = ("payload",)
+        expected_path = "payload"
+    else:
+        payload_root = source_root / "payload"
+        payload_root.mkdir()
+        fifo = payload_root / "pipe"
+        payload = ("payload",)
+        expected_path = "payload/pipe"
+    monkeypatch.setattr(contract_state_runtime, "CODEX_PLUGIN_PAYLOAD", payload)
+    monkeypatch.setattr(contract_state_runtime, "REQUIRED_PLUGIN_FILES", ())
+    os.mkfifo(fifo)
+    try:
+        with pytest.raises(
+            ValueError,
+            match=r"unsupported file type: {}$".format(expected_path),
+        ):
+            contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+                source_root
+            )
+    finally:
+        fifo.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink is unavailable")
+@pytest.mark.parametrize("symlink_location", ("top-level", "descendant"))
+def test_managed_profile_source_digest_rejects_symlink(
+    tmp_path,
+    monkeypatch,
+    symlink_location,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    target = source_root / "target.txt"
+    target.write_bytes(b"symlink target")
+    if symlink_location == "top-level":
+        link = source_root / "payload"
+        expected_path = "payload"
+    else:
+        payload_root = source_root / "payload"
+        payload_root.mkdir()
+        link = payload_root / "link"
+        expected_path = "payload/link"
+    link.symlink_to(target)
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload",),
+    )
+    monkeypatch.setattr(contract_state_runtime, "REQUIRED_PLUGIN_FILES", ())
+
+    with pytest.raises(
+        ValueError,
+        match=r"contains symlink: {}$".format(expected_path),
+    ):
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+            source_root
+        )
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():

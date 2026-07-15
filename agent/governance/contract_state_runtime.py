@@ -10,7 +10,16 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
+
+try:
+    from agent.plugin_installer import CODEX_PLUGIN_PAYLOAD, REQUIRED_PLUGIN_FILES
+except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
+    from plugin_installer import (  # type: ignore
+        CODEX_PLUGIN_PAYLOAD,
+        REQUIRED_PLUGIN_FILES,
+    )
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
@@ -21,6 +30,15 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v1"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
+    "cli_agent.managed_profile_tooling_contract.v1"
+)
+CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION = "managed-profile-tooling.v1"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_ID = "aming-claw@aming-claw-local"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_VERSION = (
+    "0.1.1+codex.20260713045902"
+)
+CLI_AGENT_MANAGED_PROFILE_TOOLING_MCP_SERVER = "aming-claw"
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE = (
     "Proceed as the ContractRuntime-authorized independent QA verifier.\n"
     "Copy-safe canonical coordinates:\n"
@@ -3553,6 +3571,136 @@ def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
     }
 
 
+def cli_agent_managed_profile_source_payload_digest(
+    plugin_source_root: str | Path | None = None,
+) -> str:
+    """Hash canonical plugin payload relative paths and bytes only."""
+
+    root = (
+        Path(plugin_source_root).expanduser().resolve()
+        if plugin_source_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    payload_roots = tuple(sorted(set(CODEX_PLUGIN_PAYLOAD)))
+
+    def fail(reason: str, relative: str) -> None:
+        raise ValueError(
+            "managed profile tooling payload {}: {}".format(reason, relative)
+        )
+
+    for payload_path in payload_roots:
+        source = root / payload_path
+        relative = Path(payload_path).as_posix()
+        if source.is_symlink():
+            fail("contains symlink", relative)
+        if not source.exists():
+            fail("is missing", relative)
+        if not source.is_file() and not source.is_dir():
+            fail("has unsupported file type", relative)
+
+    required_descendants = tuple(
+        sorted(
+            relative
+            for relative in set(REQUIRED_PLUGIN_FILES)
+            if any(
+                relative == payload_root
+                or relative.startswith(payload_root.rstrip("/") + "/")
+                for payload_root in payload_roots
+            )
+        )
+    )
+    for required_path in required_descendants:
+        source = root / required_path
+        relative = Path(required_path).as_posix()
+        if source.is_symlink():
+            fail("contains symlink", relative)
+        if not source.exists():
+            fail("is missing", relative)
+        if not source.is_file():
+            fail("has unsupported file type", relative)
+
+    entries: dict[str, tuple[bytes, bytes]] = {}
+    for payload_path in payload_roots:
+        source = root / payload_path
+        relative = Path(payload_path).as_posix()
+        if source.is_file():
+            entries[relative] = (b"file", source.read_bytes())
+            continue
+        entries[relative] = (b"directory", b"")
+        for child in sorted(
+            source.rglob("*"),
+            key=lambda item: item.relative_to(root).as_posix(),
+        ):
+            child_relative = child.relative_to(root).as_posix()
+            if child.is_symlink():
+                fail("contains symlink", child_relative)
+            if child.is_dir():
+                entries[child_relative] = (b"directory", b"")
+            elif child.is_file():
+                entries[child_relative] = (b"file", child.read_bytes())
+            else:
+                fail("has unsupported file type", child_relative)
+
+    digest = hashlib.sha256()
+    digest.update(b"aming-claw-codex-plugin-payload.v1\0")
+    for relative in sorted(entries):
+        kind, content = entries[relative]
+        relative_bytes = relative.encode("utf-8")
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(len(kind).to_bytes(8, "big"))
+        digest.update(kind)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
+
+
+def cli_agent_managed_profile_tooling_contract(
+    *,
+    plugin_source_root: str | Path | None = None,
+    source_payload_digest: str = "",
+) -> dict[str, Any]:
+    """Return the copy-safe managed-profile plugin/MCP bootstrap contract."""
+
+    payload_digest = str(source_payload_digest or "").strip()
+    if not payload_digest:
+        payload_digest = cli_agent_managed_profile_source_payload_digest(
+            plugin_source_root
+        )
+    material = {
+        "schema_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION,
+        "tooling_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION,
+        "plugin_id": CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_ID,
+        "plugin_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_VERSION,
+        "mcp_server_name": CLI_AGENT_MANAGED_PROFILE_TOOLING_MCP_SERVER,
+        "bootstrap_source": "repository_source_snapshot",
+        "required_visibility": ["plugin", "mcp_server"],
+        "credential_policy": "preserve_managed_profile_auth",
+        "desktop_plugin_cache_source_allowed": False,
+        "source_payload_digest": payload_digest,
+    }
+    return {**material, "tooling_hash": _stable_json_hash(material)}
+
+
+def cli_agent_managed_profile_tooling_binding(
+    *,
+    plugin_source_root: str | Path | None = None,
+    source_payload_digest: str = "",
+) -> dict[str, str]:
+    """Return the immutable tooling binding carried outside profile selectors."""
+
+    contract = cli_agent_managed_profile_tooling_contract(
+        plugin_source_root=plugin_source_root,
+        source_payload_digest=source_payload_digest,
+    )
+    return {
+        "schema_version": str(contract["schema_version"]),
+        "tooling_version": str(contract["tooling_version"]),
+        "source_payload_digest": str(contract["source_payload_digest"]),
+        "tooling_hash": str(contract["tooling_hash"]),
+    }
+
+
 _CLI_AGENT_TICKET_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -4049,6 +4197,9 @@ def build_cli_agent_execution_ticket(
     if authority_decision_source == "contract_runtime_qa_execution_ticket":
         material["qa_bootstrap_guide_contract"] = (
             cli_agent_qa_bootstrap_guide_binding()
+        )
+        material["managed_profile_tooling_contract"] = (
+            cli_agent_managed_profile_tooling_binding()
         )
     material_hash = _stable_json_hash(material)
     ticket_id = "caet-" + material_hash.removeprefix("sha256:")[:24]

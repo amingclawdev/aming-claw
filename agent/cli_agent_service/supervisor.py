@@ -213,6 +213,10 @@ class CodexC0Supervisor:
         try:
             home = Path(self.managed_profile_home_resolver(profile)).resolve()
         except BaseException as exc:
+            if type(exc).__name__ == "ProfileToolingError":
+                raise SupervisorError(
+                    "managed Codex profile tooling bootstrap failed"
+                ) from exc
             raise SupervisorError("managed Codex profile home is unavailable") from exc
         if not home.is_dir():
             raise SupervisorError("managed Codex profile home is unavailable")
