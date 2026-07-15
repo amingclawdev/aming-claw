@@ -35,6 +35,7 @@ from agent.governance import task_timeline
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     _mf_parallel_worker_commit_errors,
+    _next_action_from_record,
     _worker_implementation_lineage,
 )
 from agent.governance.db import _ensure_schema
@@ -38396,27 +38397,44 @@ def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_rol
     )
 
 
-def _selected_qa_runtime_guidance(line_id: str, action: str) -> dict[str, Any]:
+def _selected_qa_runtime_guidance(
+    line_id: str,
+    action: str,
+    *,
+    include_dispatch: bool = True,
+) -> dict[str, Any]:
+    completed_lines = []
+    if include_dispatch:
+        completed_lines.append({
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "actor_role": "observer",
+            "payload": {
+                "task_id": "original-worker-task",
+                "worktree_path": "/tmp/assigned-qa-worktree",
+            },
+        })
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "contract_execution_id": "cex-mf-parallel-qa-current-line",
+        "contract_id": "mf_parallel",
+        "runtime_guide": {
+            "completed_lines": completed_lines,
+            "next_legal_action": {
+                "stage_id": "qa_graph_context" if line_id == "qa_graph_context" else "qa",
+                "line_id": line_id,
+                "action": action,
+                "evidence_kind": "graph_trace" if line_id == "qa_graph_context" else "independent_verification",
+                "owner_role": "qa",
+                "allowed_writer_roles": ["qa"],
+            },
+        },
+    }
     return server._onboard_selected_qa_contract_runtime_guidance(
-        {
-            "project_id": PID,
-            "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
-            "contract_execution_id": "onboard-service-qa-current-line",
-        },
-        next_legal_action={
-            "contract_execution_id": "cex-mf-parallel-qa-current-line",
-            "stage_id": "qa_graph_context" if line_id == "qa_graph_context" else "qa",
-            "line_id": line_id,
-            "id": action,
-            "action": action,
-            "source": "contract_runtime.current_state",
-            "source_of_authority": "contract_runtime",
-            "authority_decision_source": "backlog_contract_chain_current",
-            "original_worker_task_id": "original-worker-task",
-            "assigned_worktree": "/tmp/assigned-qa-worktree",
-            "owner_role": "qa",
-            "allowed_writer_roles": ["qa"],
-        },
+        record,
+        next_legal_action=_next_action_from_record(record),
     )
 
 
@@ -38435,7 +38453,7 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
         "backlog_contract_chain_current"
     )
     assert guidance["contract_execution_id"] == "cex-mf-parallel-qa-current-line"
-    assert guidance["current_action_source"] == "contract_runtime.current_state"
+    assert guidance["current_action_source"] == "backlog_contract_chain_current"
     steps = guidance["ordered_steps"]
     assert [step["id"] for step in steps] == [
         "qa_session_register",
@@ -38488,6 +38506,15 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
         "graph_query_trace_ids": ["<graph_query.trace_id>"],
     }
     assert "raw-qa-secret" not in json.dumps(guidance)
+
+    blocked = _selected_qa_runtime_guidance(
+        "qa_graph_context", "record_graph_trace", include_dispatch=False
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["executable"] is False
+    assert blocked["ordered_steps"] == []
+    assert blocked["blocker"]["missing_fields"] == ["task_id", "repo_root"]
+    assert "graph_query" not in json.dumps(blocked)
 
 
 def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances():

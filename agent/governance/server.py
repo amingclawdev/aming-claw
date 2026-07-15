@@ -53211,19 +53211,6 @@ def _onboard_selected_qa_contract_runtime_guidance(
     execution_id = str(
         action.get("contract_execution_id") or record.get("contract_execution_id") or ""
     ).strip()
-    dispatch = (
-        action.get("original_dispatch")
-        if isinstance(action.get("original_dispatch"), Mapping)
-        else {}
-    )
-    worker_task_id = str(
-        action.get("original_worker_task_id") or dispatch.get("worker_task_id")
-        or "<ContractRuntime original dispatch worker task_id>"
-    ).strip()
-    worktree = str(
-        action.get("assigned_worktree") or dispatch.get("assigned_worktree")
-        or "<ContractRuntime original dispatch assigned worktree>"
-    ).strip()
     current_action = str(action.get("action") or action.get("id") or line_id).strip()
     authority = str(
         action.get("source_of_authority") or "contract_runtime"
@@ -53231,6 +53218,63 @@ def _onboard_selected_qa_contract_runtime_guidance(
     authority_source = str(
         action.get("authority_decision_source") or "backlog_contract_chain_current"
     ).strip()
+    dispatch_line: Mapping[str, Any] = {}
+    for _index, candidate in reversed(_contract_runtime_completed_lines(record)):
+        if (
+            str(candidate.get("stage_id") or "").strip() == "dispatch"
+            and str(candidate.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+            and str(candidate.get("evidence_kind") or "").strip()
+            == "dispatch_bounded_worker"
+            and str(candidate.get("actor_role") or "").strip() == "observer"
+        ):
+            dispatch_line = candidate
+            break
+    dispatch_payload = (
+        dispatch_line.get("payload")
+        if isinstance(dispatch_line.get("payload"), Mapping)
+        else {}
+    )
+
+    def _dispatch_identity(*aliases: str) -> tuple[str, bool]:
+        for alias in aliases:
+            values = {
+                str(source.get(alias) or "").strip()
+                for source in (dispatch_line, dispatch_payload)
+                if str(source.get(alias) or "").strip()
+            }
+            if values:
+                return (next(iter(values)) if len(values) == 1 else "", len(values) > 1)
+        return "", False
+
+    worker_task_id, task_conflict = _dispatch_identity("task_id", "worker_task_id")
+    worktree, worktree_conflict = _dispatch_identity(
+        "assigned_worktree", "worktree_path", "target_project_root",
+        "project_root", "repo_root",
+    )
+    missing = [
+        field for field, value in (("task_id", worker_task_id), ("repo_root", worktree))
+        if not value
+    ]
+    if missing:
+        return {
+            "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
+            "next_action": action, "contract_execution_id": execution_id,
+            "current_line_id": line_id, "current_action": current_action,
+            "current_action_source": str(action.get("source") or "ContractRuntime.next_legal_action"),
+            "source_of_authority": authority,
+            "authority_decision_source": authority_source,
+            "status": "blocked", "executable": False, "ordered_steps": [],
+            "blocker": {
+                "id": "qa_canonical_dispatch_identity_unavailable",
+                "source": "ContractRuntime.completed_lines.observer_dispatch_bounded_workers",
+                "missing_fields": missing,
+                "conflicting_fields": [
+                    field for field, conflict in (("task_id", task_conflict), ("repo_root", worktree_conflict))
+                    if conflict
+                ],
+            },
+        }
     token = {
         "source": "qa_session_register.raw_token",
         "transport": "tool_argument_or_X-Gov-Token_header_only",
