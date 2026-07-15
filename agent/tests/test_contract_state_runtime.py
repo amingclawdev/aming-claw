@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from agent.governance import contract_state_runtime
 from agent.governance.contract_state_runtime import (
     _bounded_qa_graph_context_satisfies_requirement,
     _current_full_reconcile_satisfies_requirement,
@@ -365,7 +366,9 @@ def test_cli_agent_execution_ticket_rejects_non_dispatch_decision_source():
     )
 
 
-def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action():
+def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
+    monkeypatch,
+):
     current, launch = _cli_agent_ticket_fixture()
     current["authority_decision_source"] = "contract_runtime_qa_execution_ticket"
     current["next_legal_action"].update(
@@ -392,6 +395,41 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action():
     )
     assert issued["profile_requirements"]["role"] == "qa"
     assert "profile_id" not in issued["profile_requirements"]
+    binding = issued["qa_bootstrap_guide_contract"]
+    assert binding["schema_version"] == (
+        "cli_agent.qa_bootstrap_guide_contract.v1"
+    )
+    assert binding["guide_version"] == "qa-bootstrap-guide.v1"
+    assert binding["guide_hash"].startswith("sha256:")
+    assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
+
+    same = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert same["ticket_id"] == issued["ticket_id"]
+    assert same["ticket_hash"] == issued["ticket_hash"]
+    assert same["qa_bootstrap_guide_contract"] == binding
+
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE",
+        contract_state_runtime.CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE
+        + "\nVersioned guide change.",
+    )
+    changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert changed["status"] == "issued"
+    assert changed["execution_state_revision"] == issued["execution_state_revision"]
+    assert changed["dispatch_identity_hash"] == issued["dispatch_identity_hash"]
+    assert changed["profile_requirements"] == issued["profile_requirements"]
+    assert changed["retry_policy"] == issued["retry_policy"]
+    assert changed["qa_bootstrap_guide_contract"] != binding
+    assert changed["ticket_id"] != issued["ticket_id"]
+    assert changed["ticket_hash"] != issued["ticket_hash"]
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():

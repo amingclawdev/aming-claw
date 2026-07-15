@@ -577,7 +577,8 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
 ):
     import cli_agent_service.service as service_module
     from cli_agent_service.registry import AgentRegistry
-    from cli_agent_service.service import CliAgentService, ServicePaths
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+    from governance import contract_state_runtime
 
     registry = AgentRegistry(tmp_path / "registry" / "runs.db")
     registry.register_profile(_guided_profile(roles=("qa",)))
@@ -587,25 +588,76 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         registry=registry,
         supervisor=supervisor,
     )
-    ticket, selectors = _guided_ticket_and_selectors(
+    old_ticket, selectors = _guided_ticket_and_selectors(
         tmp_path,
         profile_role="qa",
         role="qa",
     )
-    assert "profile_id" not in ticket["profile_requirements"]
+    assert "profile_id" not in old_ticket["profile_requirements"]
     assert "profile_id" not in selectors
+    assert "qa_bootstrap_guide_contract" not in selectors
     raw_qa_token = "raw-qa-session-token-must-not-appear"
+    active_ticket = {"value": old_ticket}
+    schedule_requests = []
+    schedule_run = service.scheduler.schedule_run
+
+    def recording_schedule_run(**kwargs):
+        schedule_requests.append(dict(kwargs))
+        return schedule_run(**kwargs)
+
+    service.scheduler.schedule_run = recording_schedule_run
 
     def resolve_ticket(request, *, qa_session_token):
         assert request["task_id"] == "qa-task-guided-daemon"
+        assert "qa_bootstrap_guide_contract" not in request
         assert qa_session_token == raw_qa_token
-        return dict(ticket)
+        return dict(active_ticket["value"])
 
     monkeypatch.setattr(
         service_module,
         "resolve_governance_execution_ticket",
         resolve_ticket,
     )
+
+    old_response = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "qa_session_token": raw_qa_token,
+        },
+        qa_mode=True,
+    )
+    registry.record_exit(old_response["run_id"], 0)
+    old_record = registry.get_run(old_response["run_id"])
+    assert old_record is not None
+    assert old_record.state == "completed"
+
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE",
+        contract_state_runtime.CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE
+        + "\nVersioned daemon guide change.",
+    )
+    with pytest.raises(ServiceError, match="qa_bootstrap_guide_contract"):
+        service._admit_governed_host_envelope_run(
+            {
+                "authority_selectors": selectors,
+                "qa_session_token": raw_qa_token,
+            },
+            qa_mode=True,
+        )
+    assert len(schedule_requests) == 1
+    new_ticket, new_selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+        role="qa",
+    )
+    assert new_selectors == selectors
+    assert new_ticket["ticket_id"] != old_ticket["ticket_id"]
+    assert new_ticket["dispatch_identity_hash"] == old_ticket[
+        "dispatch_identity_hash"
+    ]
+    assert new_ticket["retry_policy"] == old_ticket["retry_policy"]
+    active_ticket["value"] = new_ticket
 
     response = service._admit_governed_host_envelope_run(
         {
@@ -617,8 +669,17 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
 
     assert response["status"] == "started"
     assert response["role"] == "qa"
-    assert len(supervisor.starts) == 1
-    _run, start = supervisor.starts[0]
+    assert response["run_id"] != old_response["run_id"]
+    assert registry.get_run(old_response["run_id"]).state == "completed"
+    assert registry.get_run(response["run_id"]) is not None
+    assert len(supervisor.starts) == 2
+    assert len(schedule_requests) == 2
+    for schedule_request in schedule_requests:
+        assert "qa_bootstrap_guide_contract" not in schedule_request[
+            "profile_requirements"
+        ]
+        assert "qa_bootstrap_guide_contract" not in schedule_request
+    _run, start = supervisor.starts[-1]
     prompt = start["prompt"]
     for coordinate in (
         "project_id=aming-claw",
