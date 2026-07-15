@@ -17,6 +17,41 @@ CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
 CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION = "cli_agent_execution_ticket.v1"
 CLI_AGENT_SUCCESSOR_TICKET_SCHEMA_VERSION = "cli_agent_successor_ticket.v1"
 CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION = "cli_agent_observer.contract_runtime_admission.v1"
+CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
+    "cli_agent.qa_bootstrap_guide_contract.v1"
+)
+CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v1"
+CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE = (
+    "Proceed as the ContractRuntime-authorized independent QA verifier.\n"
+    "Copy-safe canonical coordinates:\n"
+    "project_id={project_id}\n"
+    "backlog_id={backlog_id}\n"
+    "contract_execution_id={contract_execution_id}\n"
+    "runtime_context_id={runtime_context_id}\n"
+    "qa_task_id={qa_task_id}\n"
+    "original_worker_task_id={original_worker_task_id}\n"
+    "principal_id={principal_id}\n"
+    "assigned_worktree={assigned_worktree}\n"
+    "First load the Aming Claw onboard/plugin entrypoint and use its MCP tools; "
+    "do not guess or call a curl endpoint. In assigned_worktree, run exactly "
+    "`git rev-parse HEAD` and use that full candidate SHA; do not trust the "
+    "pre-dispatch target_head_commit.\n"
+    "Authoritative order:\n"
+    "1. Call qa_session_register with project_id, backlog_id, "
+    "task_id=original_worker_task_id, commit_sha=<full git HEAD>, and "
+    "principal_id. Treat the returned raw token only as qa_session_token or "
+    "X-Gov-Token; never echo it, write it to a file, or write it to timeline.\n"
+    "2. Read ContractRuntime current and guide for contract_execution_id.\n"
+    "3. Run the bounded QA graph query, then submit qa_graph_context exactly as "
+    "the current guide requires.\n"
+    "4. Re-read the guide and run only its focused tests.\n"
+    "5. Submit exactly one independent_verification verdict.\n"
+    "6. Re-read current and confirm ContractRuntime accepted the verdict and "
+    "advanced. If tests pass but runtime did not advance, report an explicit "
+    "blocker; do not declare operational success.\n"
+    "Degree control: use only rg, head, narrow sed ranges, and exact pytest node "
+    "ids. Never dump full runtime, timeline, large files, or raw provider output."
+)
 
 
 def resolve_cli_agent_observer_admission(
@@ -3496,6 +3531,28 @@ def _stable_json_hash(value: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def cli_agent_qa_bootstrap_guide_contract() -> dict[str, Any]:
+    """Return the one copy-safe QA prompt contract and its content binding."""
+
+    material = {
+        "schema_version": CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION,
+        "guide_version": CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION,
+        "prompt_template": CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE,
+    }
+    return {**material, "guide_hash": _stable_json_hash(material)}
+
+
+def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
+    """Return the immutable public binding carried by QA execution tickets."""
+
+    contract = cli_agent_qa_bootstrap_guide_contract()
+    return {
+        "schema_version": str(contract["schema_version"]),
+        "guide_version": str(contract["guide_version"]),
+        "guide_hash": str(contract["guide_hash"]),
+    }
+
+
 _CLI_AGENT_TICKET_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -3989,6 +4046,10 @@ def build_cli_agent_execution_ticket(
         "raw_route_token_persisted": False,
         "raw_private_context_persisted": False,
     }
+    if authority_decision_source == "contract_runtime_qa_execution_ticket":
+        material["qa_bootstrap_guide_contract"] = (
+            cli_agent_qa_bootstrap_guide_binding()
+        )
     material_hash = _stable_json_hash(material)
     ticket_id = "caet-" + material_hash.removeprefix("sha256:")[:24]
     ticket = {
