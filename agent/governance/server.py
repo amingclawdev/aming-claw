@@ -17134,6 +17134,304 @@ def _runtime_context_contract_runtime_worker_sequence_evidence(
     }
 
 
+def _runtime_context_contract_worker_startup_projection(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    revision_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one exact canonical worker startup for finish validation.
+
+    This is an in-memory compatibility projection.  It never creates a legacy
+    timeline row and accepts only the server-verified worker startup completed
+    by the exact ContractRuntime execution bound to this RuntimeContext.
+    """
+
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    if not all((runtime_context_id, task_id, parent_task_id)):
+        return {}
+    contract_identity = _runtime_context_contract_execution_identity(
+        revision_payload
+    )
+    resolved_identity, resolution = _runtime_context_resolve_contract_execution_identity(
+        conn,
+        project_id=project_id,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        contract_identity=contract_identity,
+    )
+    if resolution.get("fail_closed"):
+        return {}
+    contract_execution_id = str(
+        resolved_identity.get("contract_execution_id") or ""
+    ).strip()
+    if not contract_execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    if (
+        str(record.get("contract_execution_id") or "").strip()
+        != contract_execution_id
+        or str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip()
+        != str(getattr(context, "backlog_id", "") or "").strip()
+    ):
+        return {}
+
+    route_identity = _parallel_branch_runtime_contract_route_identity(
+        revision_payload
+    )
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+    )
+    if any(
+        not str(route_identity.get(field) or "").strip()
+        for field in required_route_fields
+    ):
+        return {}
+
+    expected_worker_ids = _contract_runtime_context_worker_identity_values(context)
+    expected_target_root = _runtime_context_effective_target_project_root(context)
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    expected_fence_token_hash = runtime_context_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
+    assigned_worktree = str(getattr(context, "worktree_path", "") or "").strip()
+    assigned_branch = str(getattr(context, "branch_ref", "") or "").strip()
+    for index, line in reversed(_contract_runtime_completed_lines(record)):
+        if str(line.get("line_id") or "").strip() != "worker_startup":
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("actor_role") or "").strip() != "mf_sub"
+            or str(line.get("stage_id") or "").strip() != "worker_startup"
+            or str(line.get("evidence_kind") or "").strip()
+            != "mf_subagent_startup"
+            or not _contract_runtime_line_status_passes(line)
+            or not _contract_runtime_mapping_matches_context(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        ):
+            continue
+        provenance = (
+            payload.get("worker_evidence_provenance")
+            if isinstance(payload.get("worker_evidence_provenance"), Mapping)
+            else {}
+        )
+        worker_id = str(
+            line.get("worker_id")
+            or payload.get("actual_host_worker_id")
+            or ""
+        ).strip()
+        worker_slot_id = str(
+            line.get("worker_slot_id") or worker_id
+        ).strip()
+        actual_host_worker_id = str(
+            payload.get("actual_host_worker_id") or worker_id
+        ).strip()
+        provenance_worker_ids = {
+            str(provenance.get("worker_id") or "").strip(),
+            str(provenance.get("worker_slot_id") or "").strip(),
+        }
+        if (
+            str(provenance.get("schema_version") or "").strip()
+            != "contract_runtime.worker_evidence_provenance.v1"
+            or str(provenance.get("source") or "").strip()
+            != "runtime_context_copy_safe_worker_proof"
+            or provenance.get("verified") is not True
+            or provenance.get("worker_owned") is not True
+            or provenance.get("observer_impersonation") is not False
+            or provenance.get("raw_session_token_persisted") is not False
+            or provenance.get("raw_fence_token_persisted") is not False
+            or provenance.get("session_token_ref_present") is not True
+            or str(provenance.get("runtime_context_id") or "").strip()
+            != runtime_context_id
+            or str(provenance.get("task_id") or "").strip() != task_id
+            or str(provenance.get("parent_task_id") or "").strip()
+            != parent_task_id
+            or str(provenance.get("worker_role") or "").strip() != "mf_sub"
+            or str(provenance.get("target_project_root") or "").strip()
+            != expected_target_root
+            or str(provenance.get("fence_token_hash") or "").strip()
+            != expected_fence_token_hash
+            or line.get("observer_impersonation")
+            or payload.get("observer_impersonation")
+            or not provenance_worker_ids.issubset(expected_worker_ids)
+            or not expected_worker_ids.intersection(
+                {worker_id, worker_slot_id, actual_host_worker_id}
+            )
+        ):
+            continue
+        actual_cwd = str(payload.get("actual_cwd") or "").strip()
+        actual_git_root = str(payload.get("actual_git_root") or "").strip()
+        if (
+            not assigned_worktree
+            or actual_cwd != assigned_worktree
+            or actual_git_root != assigned_worktree
+        ):
+            continue
+        worker_session_id = str(
+            payload.get("worker_session_id") or ""
+        ).strip()
+        filer_principal = str(payload.get("filer_principal") or "").strip()
+        worker_transcript_ref = str(
+            payload.get("worker_transcript_ref")
+            or payload.get("worker_transcript_path")
+            or ""
+        ).strip()
+        harness_type = str(payload.get("harness_type") or "").strip()
+        head_commit = str(payload.get("head_commit") or "").strip()
+        read_receipt_hash = str(
+            payload.get("read_receipt_hash") or ""
+        ).strip()
+        read_receipt_event_id = str(
+            payload.get("read_receipt_event_id") or ""
+        ).strip()
+        session_token_ref = str(
+            provenance.get("session_token_ref")
+            or line.get("evidence_owner_session_ref")
+            or ""
+        ).strip()
+        fence_token_hash = str(
+            provenance.get("fence_token_hash") or ""
+        ).strip()
+        if not all(
+            (
+                worker_session_id,
+                filer_principal,
+                worker_transcript_ref,
+                harness_type,
+                head_commit,
+                read_receipt_hash,
+                read_receipt_event_id,
+                session_token_ref,
+                fence_token_hash,
+                assigned_branch,
+            )
+        ) or filer_principal != worker_session_id:
+            continue
+
+        source_ref = (
+            f"contract_runtime:{contract_execution_id}:completed_lines:{index}"
+        )
+        startup_gate = {
+            "schema_version": "mf_subagent_startup_gate.v1",
+            "gate_kind": "mf_subagent.startup",
+            "status": "passed",
+            "ok": True,
+            "allowed": True,
+            "bounded": True,
+            "started": True,
+            "startup_complete": True,
+            "actual_startup_recorded": True,
+            "close_satisfying": True,
+            "source": "contract_runtime_completed_lines",
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_startup"
+            ),
+            "contract_execution_id": contract_execution_id,
+            "contract_runtime_source_ref": source_ref,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "agent_id": actual_host_worker_id,
+            "actual_host_worker_id": actual_host_worker_id,
+            "agent_id_match_mode": "initial_join_actual_host_worker",
+            "session_token_evidence_type": "server_verified_ref",
+            "session_token_ref": session_token_ref,
+            "session_token_ref_present": True,
+            "server_issued_session_token_verified": True,
+            "fence_token_hash": fence_token_hash,
+            "fence_token_present": True,
+            "actual_cwd": actual_cwd,
+            "actual_git_root": actual_git_root,
+            "worktree_path": assigned_worktree,
+            "branch_ref": assigned_branch,
+            "head_commit": head_commit,
+            "worker_session_id": worker_session_id,
+            "filer_principal": filer_principal,
+            "worker_transcript_ref": worker_transcript_ref,
+            "harness_type": harness_type,
+            "read_receipt_hash": read_receipt_hash,
+            "read_receipt_event_id": read_receipt_event_id,
+            "observer_impersonation": False,
+            "startup_event_id": source_ref,
+            "startup_event_kind": "mf_subagent_startup",
+            "startup_event_status": "passed",
+            "synthetic_timeline_event_created": False,
+            "timeline_backfill_performed": False,
+        }
+        for field in (
+            *required_route_fields,
+            "visible_injection_manifest_hash",
+        ):
+            value = str(route_identity.get(field) or "").strip()
+            if value:
+                startup_gate[field] = value
+        return {
+            "id": source_ref,
+            "event_id": source_ref,
+            "event_kind": "mf_subagent_startup",
+            "event_type": "contract_runtime.worker_startup",
+            "phase": "startup_gate",
+            "status": "passed",
+            "actor": f"mf_sub:{worker_id}",
+            "source": "contract_runtime_completed_lines",
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_startup"
+            ),
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "payload": {"mf_subagent_startup_gate": startup_gate},
+            "synthetic_timeline_event_created": False,
+            "timeline_backfill_performed": False,
+        }
+    return {}
+
+
+def _runtime_context_finish_gate_startup_events(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    revision_payload: Mapping[str, Any],
+    legacy_startup_events: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    """Prefer durable legacy startup rows, else use one canonical projection."""
+
+    if legacy_startup_events:
+        return list(legacy_startup_events), {}
+    projection = _runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=project_id,
+        context=context,
+        revision_payload=revision_payload,
+    )
+    return ([projection], projection) if projection else ([], {})
+
+
 def _runtime_context_worker_recovery_details(
     ctx: RequestContext,
     conn,
@@ -24904,6 +25202,19 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             route_identity = _parallel_branch_runtime_contract_route_identity(
                 latest_contract_revision,
             )
+            (
+                authoritative_startup_events,
+                canonical_startup_projection,
+            ) = _runtime_context_finish_gate_startup_events(
+                conn,
+                project_id=project_id,
+                context=context,
+                revision_payload=latest_contract_revision,
+                legacy_startup_events=_db_startup_events,
+            )
+            _sanitized_body["real_startup_events"] = (
+                authoritative_startup_events
+            )
             route_token_binding, route_token_ref_error = (
                 _parallel_branch_finish_gate_route_token_binding(
                     conn,
@@ -24960,6 +25271,13 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                 gate["caller_supplied_real_startup_events_ignored"] = True
             if _caller_supplied_startup_evidence:
                 gate["caller_supplied_startup_evidence_ignored"] = True
+            if canonical_startup_projection:
+                gate["startup_evidence_source"] = (
+                    "ContractRuntime.completed_lines.worker_startup"
+                )
+                gate["legacy_startup_event_present"] = False
+                gate["synthetic_timeline_event_created"] = False
+                gate["timeline_backfill_performed"] = False
             runtime_context_lane = bool(
                 str(ctx.body.get("runtime_context_id") or "").strip()
             )

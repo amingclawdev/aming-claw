@@ -53854,6 +53854,288 @@ def test_finish_gate_server_accepts_db_sourced_real_startup_events(conn):
     assert result["gate"].get("caller_supplied_real_startup_events_ignored") is not True
 
 
+def _record_contract_runtime_only_worker_startup(
+    conn,
+    *,
+    contract_execution_id: str,
+    runtime_context: BranchTaskRuntimeContext,
+    parent_task_id: str,
+) -> None:
+    worker_id = runtime_context.worker_slot_id or runtime_context.worker_id
+    worker_session_id = f"session-{runtime_context.task_id}"
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id=f"crev-{runtime_context.task_id}-canonical-startup",
+        payload={
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+        },
+        route_identity={
+            "route_id": f"route-{runtime_context.task_id}",
+            "route_context_hash": f"sha256:route-{runtime_context.task_id}",
+            "prompt_contract_id": f"rprompt-{runtime_context.task_id}",
+            "prompt_contract_hash": f"sha256:prompt-{runtime_context.task_id}",
+            "route_token_ref": f"rtok-{runtime_context.task_id}",
+            "visible_injection_manifest_hash": (
+                f"sha256:visible-{runtime_context.task_id}"
+            ),
+        },
+    )
+    common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "target_project_root": runtime_context.target_project_root,
+    }
+    startup_payload = {
+        **common,
+        "actual_cwd": runtime_context.worktree_path,
+        "actual_git_root": runtime_context.worktree_path,
+        "actual_host_worker_id": worker_id,
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_ref": f"codex:{worker_session_id}",
+        "harness_type": "codex",
+        "head_commit": f"head-{runtime_context.task_id}",
+        "read_receipt_hash": f"sha256:read-{runtime_context.task_id}",
+        "read_receipt_event_id": f"timeline:read-{runtime_context.task_id}",
+        "observer_impersonation": False,
+        "worker_evidence_provenance": {
+            "schema_version": "contract_runtime.worker_evidence_provenance.v1",
+            "source": "runtime_context_copy_safe_worker_proof",
+            "verified": True,
+            "worker_owned": True,
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": runtime_context.target_project_root,
+            "session_token_ref": f"wstok-{runtime_context.task_id}",
+            "session_token_ref_present": True,
+            "fence_token_hash": _fake_sha(runtime_context.fence_token),
+            "raw_session_token_persisted": False,
+            "raw_fence_token_persisted": False,
+            "observer_impersonation": False,
+        },
+    }
+    runtime = server._contract_runtime(conn)
+    for stage_id, line_id, evidence_kind, payload in (
+        ("worker_read", "worker_read_runtime_guide", "read_receipt", common),
+        (
+            "worker_startup",
+            "worker_startup",
+            "mf_subagent_startup",
+            startup_payload,
+        ),
+    ):
+        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write["payload"] = payload
+        write.update(payload)
+        result = runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role="mf_sub",
+        )
+        assert result["ok"] is True, (line_id, result.get("decision"))
+
+
+def test_finish_gate_projects_exact_contract_runtime_worker_startup(conn):
+    backlog_id = "AC-FINISH-GATE-CANONICAL-STARTUP-PROJECTION"
+    task_id = "finish-gate-canonical-startup-worker"
+    fence_token = "fence-finish-gate-canonical-startup"
+    worktree_path = f"/tmp/{task_id}"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="finish-gate-canonical-startup-parent",
+        worker_task_id=task_id,
+        fence_token=fence_token,
+        token="finish-gate-canonical-startup-token",
+        worktree_path=worktree_path,
+    )
+    _record_contract_runtime_only_worker_startup(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+    )
+    conn.commit()
+
+    revision = server._runtime_context_latest_contract_revision_payload(
+        conn,
+        runtime_context,
+    )
+    startup_events_before = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_startup",
+    )
+    projected = server._runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        revision_payload=revision,
+    )
+
+    assert projected
+    assert projected["source_of_authority"] == (
+        "ContractRuntime.completed_lines.worker_startup"
+    )
+    assert projected["synthetic_timeline_event_created"] is False
+    assert projected["timeline_backfill_performed"] is False
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        event_kind="mf_subagent_startup",
+    ) == startup_events_before
+    startup = projected["payload"]["mf_subagent_startup_gate"]
+    assert startup["contract_execution_id"] == successor["contract_execution_id"]
+    assert startup["runtime_context_id"] == runtime_context.runtime_context_id
+    assert startup["task_id"] == task_id
+    assert startup["session_token_evidence_type"] == "server_verified_ref"
+    assert startup["fence_token_hash"] == _fake_sha(fence_token)
+    assert "fence_token" not in startup
+    assert fence_token not in json.dumps(projected, sort_keys=True)
+
+    body = _surrogate_finish_gate_body(
+        task_id=task_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=runtime_context.branch_ref,
+        real_startup_events=[projected],
+    )
+    body.update(
+        {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "parent_task_id": backlog_id,
+            "worker_role": "mf_sub",
+            "actual_cwd": worktree_path,
+            "actual_git_root": worktree_path,
+            "head_commit": f"head-{task_id}",
+        }
+    )
+    result = validate_mf_subagent_finish_gate(body, context=runtime_context)
+    assert result["startup_lineage"]["startup_event_id"].startswith(
+        f"contract_runtime:{successor['contract_execution_id']}:completed_lines:"
+    )
+    assert result["worker_identity"]["startup_worker_session_id"] == (
+        f"session-{task_id}"
+    )
+
+
+def test_finish_gate_startup_projection_rejects_wrong_authority(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-FINISH-GATE-CANONICAL-STARTUP-BOUNDARY"
+    task_id = "finish-gate-canonical-startup-boundary-worker"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="finish-gate-canonical-startup-boundary-parent",
+        worker_task_id=task_id,
+        fence_token="fence-finish-gate-canonical-startup-boundary",
+        token="finish-gate-canonical-startup-boundary-token",
+        worktree_path=f"/tmp/{task_id}",
+    )
+    _record_contract_runtime_only_worker_startup(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+    )
+    conn.commit()
+    revision = server._runtime_context_latest_contract_revision_payload(
+        conn,
+        runtime_context,
+    )
+    legacy = [{"id": "legacy-startup", "event_kind": "mf_subagent_startup"}]
+    events, projection = server._runtime_context_finish_gate_startup_events(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        revision_payload=revision,
+        legacy_startup_events=legacy,
+    )
+    assert events == legacy
+    assert projection == {}
+
+    runtime = server._contract_runtime(conn)
+    record = json.loads(
+        json.dumps(runtime.store.get(successor["contract_execution_id"]))
+    )
+    startup_line = next(
+        line
+        for _, line in server._contract_runtime_completed_lines(record)
+        if line.get("line_id") == "worker_startup"
+    )
+    provenance = startup_line["payload"]["worker_evidence_provenance"]
+    provenance["verified"] = False
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: record),
+    )
+    assert server._runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        revision_payload=revision,
+    ) == {}
+
+    provenance["verified"] = True
+    provenance["runtime_context_id"] = "mfrctx-wrong-provenance"
+    assert server._runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        revision_payload=revision,
+    ) == {}
+    provenance["runtime_context_id"] = runtime_context.runtime_context_id
+
+    wrong_execution_revision = json.loads(json.dumps(revision))
+    wrong_execution_revision["payload"]["contract_execution_id"] = (
+        "cex-wrong-startup-projection"
+    )
+    assert server._runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=PID,
+        context=runtime_context,
+        revision_payload=wrong_execution_revision,
+    ) == {}
+
+    wrong_context = replace(
+        runtime_context,
+        task_id=f"{task_id}-other",
+        runtime_context_id=f"{runtime_context.runtime_context_id}-other",
+    )
+    assert server._runtime_context_contract_worker_startup_projection(
+        conn,
+        project_id=PID,
+        context=wrong_context,
+        revision_payload=revision,
+    ) == {}
+
+
 def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     task_id = "fence-token-db-trace-task"
     parent_task_id = "fence-token-db-trace-parent"
