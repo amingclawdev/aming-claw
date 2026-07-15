@@ -1123,6 +1123,75 @@ def test_run_observer_guided_service_unavailable_fails_closed(
     assert fence_token not in serialized
 
 
+def test_run_observer_routes_source_backed_observer_contract_to_managed_service(
+    monkeypatch, tmp_path
+):
+    observed = []
+
+    def fake_contract_observer(**kwargs):
+        observed.append(kwargs)
+        return {
+            "ok": True,
+            "status": "started",
+            "run_id": "run-observer-contract",
+            "direct_invocation_fallback": False,
+        }
+
+    monkeypatch.setattr(
+        "agent.cli_agent_service.guided_runtime.request_contract_runtime_observer",
+        fake_contract_observer,
+    )
+    monkeypatch.setattr(
+        "cli_agent_service.guided_runtime.request_contract_runtime_observer",
+        fake_contract_observer,
+    )
+    admission = _guided_service_admission(role="observer")
+    selectors = admission["authority_selectors"]
+    result = run_observer(
+        ObserverRunRequest(
+            project_id=selectors["project_id"],
+            backlog_id=selectors["backlog_id"],
+            route=RoutePromptContract(
+                route_context_hash=selectors["route_context_hash"],
+                prompt_contract_id=selectors["prompt_contract_id"],
+                prompt_contract_hash=selectors["prompt_contract_hash"],
+                route_token_ref=selectors["route_token_ref"],
+            ),
+            workspace=str(tmp_path),
+            guided_service_admission=admission,
+            transient_host_envelope={
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "session-observer-contract",
+                    "AMING_WORKER_FENCE_TOKEN": "fence-observer-contract",
+                }
+            },
+            contract_runtime_current_state={
+                "contract_id": "cli_agent_observer.v1",
+                "project_id": selectors["project_id"],
+                "backlog_id": selectors["backlog_id"],
+                "contract_execution_id": selectors["contract_execution_id"],
+                "execution_state_revision": selectors[
+                    "expected_execution_state_revision"
+                ],
+                "execution_state_hash": selectors["expected_execution_state_hash"],
+                "route_token_ref": selectors["route_token_ref"],
+                "next_legal_action": {"line_id": "observer_service_admission"},
+            },
+            contract_runtime_identity=selectors,
+            contract_runtime_profile_requirements={},
+        ),
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert result["invocation"]["service_dispatch"]["run_id"] == (
+        "run-observer-contract"
+    )
+    assert len(observed) == 1
+    assert observed[0]["current_state"]["contract_id"] == "cli_agent_observer.v1"
+    assert observed[0]["runtime_identity"] == selectors
+
+
 def test_dogfood_execute_requires_current_worker_host_envelope(
     monkeypatch, tmp_path
 ):

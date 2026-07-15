@@ -538,6 +538,13 @@ def test_guided_runtime_uses_one_service_owned_spawn_for_l2_to_l3(
             assert service_dispatch["run_id"] == "run-{}".format(
                 ticket["ticket_id"]
             )
+            canonical_run_id = service_dispatch["run_id"]
+            assert service_dispatch["official_runtime_startup_identity"] == {
+                "actual_host_worker_id": canonical_run_id,
+                "worker_session_id": canonical_run_id,
+                "filer_principal": canonical_run_id,
+                "worker_transcript_ref": "codex:{}".format(canonical_run_id),
+            }
             assert service_dispatch["role"] == role
             assert service_dispatch["profile_id"] == selectors["profile_id"]
             assert service_dispatch["principal_id"] == selectors["principal_id"]

@@ -372,6 +372,9 @@ class ObserverRunRequest:
     guided_service_admission: Mapping[str, Any] = field(default_factory=dict)
     transient_host_envelope: Mapping[str, Any] = field(default_factory=dict)
     cli_agent_service_state_dir: str = ""
+    contract_runtime_current_state: Mapping[str, Any] = field(default_factory=dict)
+    contract_runtime_identity: Mapping[str, Any] = field(default_factory=dict)
+    contract_runtime_profile_requirements: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_route_token(
@@ -8371,6 +8374,15 @@ def build_dogfood_observer_run_plan(
         guided_service_admission=guided_service_admission,
         transient_host_envelope=transient_host_envelope,
         cli_agent_service_state_dir=request.cli_agent_service_state_dir,
+        contract_runtime_current_state=request.contract_runtime_current_state,
+        contract_runtime_identity=(
+            guided_service_admission.get("authority_selectors")
+            if isinstance(
+                guided_service_admission.get("authority_selectors"), Mapping
+            )
+            else {}
+        ),
+        contract_runtime_profile_requirements=request.profile_requirements,
     )
 
     observer_result = run_observer(observer_request, execute=execute)
@@ -8435,11 +8447,13 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
             try:
                 from cli_agent_service.guided_runtime import (
                     GuidedRuntimeDispatchError,
+                    request_contract_runtime_observer,
                     request_guided_runtime,
                 )
             except ImportError:  # pragma: no cover - package import path
                 from agent.cli_agent_service.guided_runtime import (
                     GuidedRuntimeDispatchError,
+                    request_contract_runtime_observer,
                     request_guided_runtime,
                 )
 
@@ -8449,13 +8463,24 @@ def run_observer(request: ObserverRunRequest, *, execute: bool = False) -> dict[
                     status="rejected",
                 )
 
-            service_dispatch = request_guided_runtime(
-                admission=request.guided_service_admission,
-                project_id=request.project_id,
-                backlog_id=request.backlog_id,
-                transient_host_envelope=request.transient_host_envelope,
-                state_dir=request.cli_agent_service_state_dir,
-            )
+            if str(
+                request.contract_runtime_current_state.get("contract_id") or ""
+            ).strip() in {"cli_agent_observer", "cli_agent_observer.v1"}:
+                service_dispatch = request_contract_runtime_observer(
+                    current_state=request.contract_runtime_current_state,
+                    runtime_identity=request.contract_runtime_identity,
+                    profile_requirements=request.contract_runtime_profile_requirements,
+                    transient_host_envelope=request.transient_host_envelope,
+                    state_dir=request.cli_agent_service_state_dir,
+                )
+            else:
+                service_dispatch = request_guided_runtime(
+                    admission=request.guided_service_admission,
+                    project_id=request.project_id,
+                    backlog_id=request.backlog_id,
+                    transient_host_envelope=request.transient_host_envelope,
+                    state_dir=request.cli_agent_service_state_dir,
+                )
         except GuidedRuntimeDispatchError as exc:
             service_dispatch = {
                 "schema_version": (

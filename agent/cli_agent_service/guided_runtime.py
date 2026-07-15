@@ -267,12 +267,20 @@ def request_guided_runtime(
             ),
             status="rejected",
         )
+    canonical_run_id = _text(response.get("run_id"))
+    official_runtime_startup_identity = {
+        "actual_host_worker_id": canonical_run_id,
+        "worker_session_id": canonical_run_id,
+        "filer_principal": canonical_run_id,
+        "worker_transcript_ref": "codex:{}".format(canonical_run_id),
+    }
     return {
         "schema_version": GUIDED_RUNTIME_DISPATCH_SCHEMA_VERSION,
         "ok": True,
         "status": "started",
         "operation": "start_host_envelope_run",
-        "run_id": _text(response.get("run_id")),
+        "run_id": canonical_run_id,
+        "official_runtime_startup_identity": official_runtime_startup_identity,
         "role": _text(response.get("role")),
         "profile_id": _text(response.get("profile_id")),
         "principal_id": _text(response.get("principal_id")),
@@ -299,3 +307,33 @@ def request_guided_runtime(
         "governance_authority": False,
         "operational_dispatch_only": True,
     }
+
+
+def request_contract_runtime_observer(
+    *,
+    current_state: Mapping[str, Any],
+    runtime_identity: Mapping[str, Any],
+    profile_requirements: Mapping[str, Any],
+    transient_host_envelope: Mapping[str, Any],
+    state_dir: str = "",
+    timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Resolve and dispatch the supported source-backed L2 observer path."""
+    from agent.governance.contract_state_runtime import (
+        resolve_cli_agent_observer_admission,
+    )
+
+    admission = resolve_cli_agent_observer_admission(
+        current_state,
+        runtime_identity=runtime_identity,
+        profile_requirements=profile_requirements,
+    )
+    selectors = admission["authority_selectors"]
+    return request_guided_runtime(
+        admission={"authority_selectors": selectors},
+        project_id=selectors["project_id"],
+        backlog_id=selectors["backlog_id"],
+        transient_host_envelope=transient_host_envelope,
+        state_dir=state_dir,
+        timeout_seconds=timeout_seconds,
+    )

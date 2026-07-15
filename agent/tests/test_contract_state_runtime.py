@@ -3,12 +3,67 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
+
 from agent.governance.contract_state_runtime import (
     _bounded_qa_graph_context_satisfies_requirement,
     _current_full_reconcile_satisfies_requirement,
     build_cli_agent_execution_ticket,
     build_contract_state_projection,
+    resolve_cli_agent_observer_admission,
 )
+
+
+def test_resolve_cli_agent_observer_admission_uses_current_contract_authority():
+    state = {
+        "contract_id": "cli_agent_observer.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-1",
+        "contract_execution_id": "cex-1",
+        "execution_state_revision": 3,
+        "execution_state_hash": "sha256:state",
+        "route_token_ref": "rtok-1",
+        "next_legal_action": {"line_id": "observer_service_admission"},
+    }
+    runtime = {
+        "runtime_context_id": "rctx-1",
+        "task_id": "task-1",
+        "worker_id": "observer-1",
+        "worker_slot_id": "observer-1",
+        "observer_command_id": "cmd-1",
+        "principal_id": "observer-1",
+        "expected_dispatch_identity_hash": "sha256:dispatch",
+        "route_id": "route-1",
+        "route_context_hash": "sha256:route",
+        "prompt_contract_id": "prompt-1",
+        "prompt_contract_hash": "sha256:prompt",
+        "visible_injection_manifest_hash": "sha256:manifest",
+    }
+    admission = resolve_cli_agent_observer_admission(
+        state,
+        runtime_identity=runtime,
+        profile_requirements={
+            "role": "observer",
+            "profile_id": "observer",
+            "backend_mode": "managed",
+        },
+    )
+    assert admission["authority_selectors"]["contract_execution_id"] == "cex-1"
+    assert admission["authority_selectors"]["expected_execution_state_revision"] == 3
+    assert admission["source_of_authority"] == "ContractRuntime.next_legal_action"
+    assert admission["direct_invocation_fallback"] is False
+
+
+def test_resolve_cli_agent_observer_admission_rejects_non_current_line():
+    with pytest.raises(ValueError, match="not the next legal action"):
+        resolve_cli_agent_observer_admission(
+            {
+                "contract_id": "cli_agent_observer.v1",
+                "next_legal_action": {"line_id": "observer_session_active"},
+            },
+            runtime_identity={},
+            profile_requirements={},
+        )
 
 
 def _event(

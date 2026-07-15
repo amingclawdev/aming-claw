@@ -14282,6 +14282,11 @@ def _runtime_context_worker_guide_response(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": str(
+            contract_runtime_execution_resolution.get("contract_execution_id")
+            or contract_runtime_current_state.get("contract_execution_id")
+            or ""
+        ),
         "worker_role": "mf_sub",
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,

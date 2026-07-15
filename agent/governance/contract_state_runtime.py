@@ -16,6 +16,70 @@ from typing import Any, Mapping
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
 CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION = "cli_agent_execution_ticket.v1"
 CLI_AGENT_SUCCESSOR_TICKET_SCHEMA_VERSION = "cli_agent_successor_ticket.v1"
+CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION = "cli_agent_observer.contract_runtime_admission.v1"
+
+
+def resolve_cli_agent_observer_admission(
+    current_state: Mapping[str, Any],
+    *,
+    runtime_identity: Mapping[str, Any],
+    profile_requirements: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve immutable managed-observer selectors from ContractRuntime state."""
+    if str(current_state.get("contract_id") or "").strip() not in {
+        "cli_agent_observer",
+        "cli_agent_observer.v1",
+    }:
+        raise ValueError("cli_agent_observer admission requires its source-backed contract")
+    next_action = current_state.get("next_legal_action")
+    if not isinstance(next_action, Mapping) or str(
+        next_action.get("line_id") or ""
+    ).strip() != "observer_service_admission":
+        raise ValueError("cli_agent_observer admission is not the next legal action")
+    revision = int(current_state.get("execution_state_revision") or 0)
+    state_hash = str(current_state.get("execution_state_hash") or "").strip()
+    if revision <= 0 or not state_hash:
+        raise ValueError("cli_agent_observer admission requires pinned execution state")
+    selectors = dict(runtime_identity)
+    selectors.update(dict(profile_requirements))
+    selectors.update(
+        {
+            "project_id": str(current_state.get("project_id") or "").strip(),
+            "backlog_id": str(current_state.get("backlog_id") or "").strip(),
+            "contract_execution_id": str(
+                current_state.get("contract_execution_id") or ""
+            ).strip(),
+            "expected_execution_state_revision": revision,
+            "expected_execution_state_hash": state_hash,
+            "route_token_ref": str(current_state.get("route_token_ref") or "").strip(),
+        }
+    )
+    required = (
+        "project_id", "backlog_id", "contract_execution_id", "runtime_context_id",
+        "task_id", "worker_id", "worker_slot_id", "observer_command_id", "role",
+        "profile_id", "principal_id", "expected_dispatch_identity_hash", "route_id",
+        "route_context_hash", "prompt_contract_id", "prompt_contract_hash",
+        "route_token_ref", "visible_injection_manifest_hash", "backend_mode",
+    )
+    missing = [name for name in required if not str(selectors.get(name) or "").strip()]
+    if missing:
+        raise ValueError(
+            "cli_agent_observer admission selectors are incomplete: {}".format(
+                ", ".join(missing)
+            )
+        )
+    if selectors["role"] != "observer":
+        raise ValueError("cli_agent_observer admission requires observer role")
+    if selectors["principal_id"] != selectors["worker_id"]:
+        raise ValueError("cli_agent_observer principal must match dispatch identity")
+    return {
+        "schema_version": CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION,
+        "authority_selectors": selectors,
+        "source_of_authority": "ContractRuntime.next_legal_action",
+        "direct_invocation_fallback": False,
+        "caller_prompt_accepted": False,
+        "caller_environment_accepted": False,
+    }
 
 CONTRACT_PASS_STATUSES = {
     "accepted",
