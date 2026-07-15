@@ -47873,7 +47873,7 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
-def test_contract_runtime_only_startup_principal_accepts_exact_worker_commit_session(
+def test_contract_runtime_only_startup_principal_projects_native_finish_attestation(
     conn,
     tmp_path,
 ):
@@ -48310,6 +48310,148 @@ def test_contract_runtime_only_startup_principal_accepts_exact_worker_commit_ses
         task_id=worker_task_id,
         event_kind="mf_subagent_startup",
     ) == []
+
+    finish_attestation = (
+        server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "contract_execution_id": contract_execution_id,
+                    "parent_task_id": backlog_id,
+                    "session_token": worker_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": "fence-contract-canonical-worker",
+                    "target_project_root": str(worker_root),
+                    "worker_session_id": native_worker_session_id,
+                    "filer_principal": native_worker_session_id,
+                    "actor": native_worker_session_id,
+                    "worker_transcript_ref": f"codex:{native_worker_session_id}",
+                    "harness_type": "codex",
+                    "graph_trace_ids": [graph_trace_id],
+                    "read_receipt_hash": "sha256:contract-canonical-worker-read",
+                    "read_receipt_event_id": str(read_event["id"]),
+                    "observer_command_id": contract_execution_id,
+                    "head_commit": worker_commit,
+                    "changed_files": ["agent/governance/server.py"],
+                    "owned_files": ["agent/governance/server.py"],
+                    "actual_cwd": str(worker_root),
+                    "actual_git_root": str(worker_root),
+                    "test_results": {
+                        "status": "passed",
+                        "passed": True,
+                        "command": "pytest -q",
+                    },
+                    **route_identity,
+                },
+            )
+        )
+    )
+    canonical_attestation = finish_attestation[
+        "finish_time_worker_self_attestation"
+    ]
+
+    service_principal = "cli-agent-contract-canonical-worker"
+    service_startup_attestation = {
+        **canonical_startup["mf_subagent_startup_gate"][
+            "worker_self_attestation"
+        ],
+        "worker_session_id": service_principal,
+        "filer_principal": service_principal,
+        "worker_transcript_ref": f"codex:{service_principal}",
+    }
+    service_startup_gate = {
+        **canonical_startup["mf_subagent_startup_gate"],
+        "worker_session_id": service_principal,
+        "filer_principal": service_principal,
+        "worker_transcript_ref": f"codex:{service_principal}",
+        "worker_self_attestation": service_startup_attestation,
+    }
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=worker_task_id,
+        backlog_id=backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        actor=service_principal,
+        payload={
+            **service_startup_gate,
+            "mf_subagent_startup_gate": service_startup_gate,
+        },
+    )
+    current_graph_trace_id = "gqt-contract-canonical-worker-finish"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=current_graph_trace_id,
+        parent_task_id=backlog_id,
+        snapshot_id="scope-contract-canonical-worker-finish",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=worker_task_id,
+        worker_role="mf_sub",
+        fence_token="fence-contract-canonical-worker",
+        run_id=_mf_sub_run_id(worker_task_id, "fence-contract-canonical-worker"),
+    )
+    finish_body = dict(finish_attestation["finish_gate_submission"]["body"])
+    finish_body.update(
+        {
+            "session_token": worker_token,
+            "fence_token": "fence-contract-canonical-worker",
+            "graph_trace_ids": [current_graph_trace_id],
+            "read_receipt_hash": "<returned read_receipt_hash>",
+            "read_receipt_event_id": "<returned read_receipt_event_id>",
+            "finish_time_worker_self_attestation": (
+                "<returned finish_time_worker_self_attestation>"
+            ),
+            "test_results": {"status": "passed", "passed": True},
+        }
+    )
+    finish_body.pop("worker_session_id")
+    finish_body.pop("filer_principal")
+    with pytest.raises(GovernanceError) as mismatch:
+        server.handle_graph_governance_runtime_context_finish_gate(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **finish_body,
+                    "finish_time_worker_self_attestation": {
+                        **canonical_attestation,
+                        "worker_session_id": "different-worker-session",
+                        "filer_principal": "different-worker-session",
+                    },
+                },
+            )
+        )
+    assert mismatch.value.code == "contract_worker_finish_attestation_mismatch"
+
+    server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=finish_body,
+        )
+    )
+    finish_event = task_timeline.list_events(
+        conn, PID, task_id=worker_task_id, event_kind="mf_subagent_finish_gate"
+    )[-1]
+    assert finish_event["payload"]["mf_subagent_finish_gate"][
+        "worker_self_attestation"
+    ]["worker_session_id"] == native_worker_session_id
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):

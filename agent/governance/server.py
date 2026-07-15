@@ -20031,6 +20031,149 @@ def _runtime_context_timeline_event_id(value: Any) -> str:
     return event_id
 
 
+def _runtime_context_finish_attestation_candidate(
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = body.get("evidence") if isinstance(body.get("evidence"), Mapping) else {}
+    for source in (body, evidence):
+        for key in (
+            "finish_time_worker_self_attestation",
+            "worker_self_attestation",
+            "finish_attestation",
+        ):
+            candidate = source.get(key)
+            if isinstance(candidate, Mapping):
+                return dict(candidate)
+    return {}
+
+
+def _runtime_context_contract_finish_attestation_projection(
+    conn,
+    *,
+    context: Any,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    parent_task_id: str,
+    head_commit: str,
+    changed_files: Sequence[str],
+    test_results: Mapping[str, Any],
+    worker_session_id: str = "",
+    read_receipt_event_id: str = "",
+    read_receipt_hash: str = "",
+    supplied_attestation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one exact accepted ContractRuntime finish attestation."""
+
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error) as exc:
+        raise GovernanceError(
+            "contract_worker_finish_attestation_required",
+            str(exc),
+            422,
+            {"contract_execution_id": contract_execution_id},
+        ) from exc
+    matches = [
+        (index, line)
+        for index, line in _contract_runtime_completed_lines(record)
+        if str(line.get("line_id") or "").strip()
+        == "worker_finish_time_attestation"
+        and _contract_runtime_mapping_matches_context(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+        )
+    ]
+    if len(matches) != 1:
+        raise GovernanceError(
+            (
+                "contract_worker_finish_attestation_required"
+                if not matches
+                else "contract_worker_finish_attestation_ambiguous"
+            ),
+            "finish requires one exact accepted ContractRuntime finish attestation",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "matching_completed_line_indexes": [index for index, _ in matches],
+            },
+        )
+
+    index, line = matches[0]
+    payload = dict(line.get("payload") or {})
+    from .mf_subagent_contract import _finish_time_worker_attestation_gate
+
+    gate = _finish_time_worker_attestation_gate(payload)
+    attestation = dict(gate.get("attestation") or {})
+    canonical_head = str(
+        line.get("commit_sha") or payload.get("head_commit") or ""
+    ).strip()
+    canonical_files = _runtime_context_service_query_values(payload, "changed_files")
+    canonical_tests = dict(payload.get("test_results") or {})
+    canonical_session = str(gate.get("worker_session_id") or "").strip()
+    canonical_filer = str(gate.get("filer_principal") or "").strip()
+    canonical_read_id = _runtime_context_timeline_event_id(
+        payload.get("read_receipt_event_id")
+    )
+    canonical_read_hash = str(payload.get("read_receipt_hash") or "").strip()
+    checks = {
+        "finish_time_worker_self_attestation": bool(gate.get("passed")),
+        "head_commit": canonical_head == str(head_commit or "").strip(),
+        "changed_files": _runtime_context_same_string_set(
+            canonical_files, changed_files
+        ),
+        "test_results": _runtime_context_test_results_passed(canonical_tests)
+        and _runtime_context_test_results_compatible(canonical_tests, test_results),
+        "worker_session_id": bool(canonical_session)
+        and canonical_filer == canonical_session
+        and (not worker_session_id or worker_session_id == canonical_session),
+        "read_receipt_event_id": bool(canonical_read_id)
+        and (
+            not read_receipt_event_id
+            or _runtime_context_timeline_event_id(read_receipt_event_id)
+            == canonical_read_id
+        ),
+        "read_receipt_hash": bool(canonical_read_hash)
+        and (not read_receipt_hash or read_receipt_hash == canonical_read_hash),
+        "graph_trace_ids": bool(
+            _runtime_context_service_query_values(payload, "graph_trace_ids")
+        ),
+    }
+    mismatched_fields = [field for field, passed in checks.items() if not passed]
+    if any(
+        _runtime_context_non_placeholder_text(value)
+        and value != attestation.get(field)
+        for field, value in (supplied_attestation or {}).items()
+    ):
+        mismatched_fields.append("finish_time_worker_self_attestation")
+    if mismatched_fields:
+        raise GovernanceError(
+            "contract_worker_finish_attestation_mismatch",
+            "canonical ContractRuntime finish attestation does not match finish gate",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "mismatched_fields": list(dict.fromkeys(mismatched_fields)),
+            },
+        )
+    return {
+        "source_of_authority": (
+            "ContractRuntime.completed_lines.worker_finish_time_attestation"
+        ),
+        "contract_execution_id": contract_execution_id,
+        "contract_runtime_source_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:{index}"
+        ),
+        "worker_session_id": canonical_session,
+        "filer_principal": canonical_filer,
+        "read_receipt_event_id": canonical_read_id,
+        "read_receipt_hash": canonical_read_hash,
+        "finish_time_worker_self_attestation": attestation,
+    }
+
+
 def _runtime_context_latest_finish_attestation(
     conn,
     *,
@@ -23815,6 +23958,9 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
             and isinstance(startup_gate.get("payload"), Mapping)
             else {}
         )
+        canonical_finish_attestation_required = bool(
+            finish_order_projection.get("canonical_worker_commit_required")
+        )
         expected_worker_session_id = str(
             body.get("worker_session_id")
             or body.get("filer_principal")
@@ -23880,19 +24026,60 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
                 ).strip()
                 if expected_read_receipt_hash:
                     break
-        recorded_attestation = _runtime_context_latest_finish_attestation(
-            conn,
-            project_id=project_id,
-            context=context,
-            runtime_context_id=runtime_context_id,
-            parent_task_id=parent_task_id,
-            head_commit=expected_head_commit,
-            changed_files=expected_changed_files,
-            test_results=expected_test_results,
-            worker_session_id=expected_worker_session_id,
-            read_receipt_event_id=expected_read_receipt_event_id,
-            read_receipt_hash=expected_read_receipt_hash,
-        )
+        if canonical_finish_attestation_required:
+            canonical_finish_attestation_projection = (
+                _runtime_context_contract_finish_attestation_projection(
+                    conn,
+                    context=context,
+                    contract_execution_id=str(
+                        finish_order_projection.get("contract_execution_id") or ""
+                    ),
+                    runtime_context_id=runtime_context_id,
+                    parent_task_id=parent_task_id,
+                    head_commit=expected_head_commit,
+                    changed_files=expected_changed_files,
+                    test_results=expected_test_results,
+                    worker_session_id=_runtime_context_finish_attestation_text(
+                        body, "worker_session_id", "filer_principal"
+                    ),
+                    read_receipt_event_id=_runtime_context_finish_attestation_text(
+                        body, "read_receipt_event_id", "read_receipt_timeline_id"
+                    ),
+                    read_receipt_hash=_runtime_context_finish_attestation_text(
+                        body, "read_receipt_hash"
+                    ),
+                    supplied_attestation=(
+                        _runtime_context_finish_attestation_candidate(body)
+                    ),
+                )
+            )
+            body.update(
+                {
+                    field: canonical_finish_attestation_projection.get(field, "")
+                    for field in (
+                        "worker_session_id",
+                        "filer_principal",
+                        "read_receipt_event_id",
+                        "read_receipt_hash",
+                        "finish_time_worker_self_attestation",
+                    )
+                }
+            )
+            recorded_attestation = {}
+        else:
+            recorded_attestation = _runtime_context_latest_finish_attestation(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                parent_task_id=parent_task_id,
+                head_commit=expected_head_commit,
+                changed_files=expected_changed_files,
+                test_results=expected_test_results,
+                worker_session_id=expected_worker_session_id,
+                read_receipt_event_id=expected_read_receipt_event_id,
+                read_receipt_hash=expected_read_receipt_hash,
+            )
     finally:
         conn.close()
 
