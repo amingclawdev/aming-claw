@@ -228,6 +228,44 @@ def test_supervisor_owns_process_group_lease_heartbeat_and_receipt(tmp_path):
     assert "private prompt" not in json.dumps(run_receipts)
 
 
+def test_receipt_emitter_binds_unpinned_ticket_to_selected_run_profile(tmp_path):
+    from cli_agent_service.evidence import hash_text
+
+    _registry, supervisor = _supervisor(tmp_path)
+    run = _run("run-unpinned-ticket")
+    ticket = _execution_ticket(run)
+    ticket["profile_requirements"] = {}
+
+    emitter = supervisor._run_receipt_emitter(
+        run,
+        ticket,
+        hash_text("selected profile command"),
+    )
+    receipt = emitter.emit("accepted", observed_at="2026-07-15T00:00:00Z")
+
+    assert receipt.profile_id == run.config.profile_id
+
+
+def test_receipt_emitter_rejects_pinned_ticket_profile_mismatch(tmp_path):
+    from cli_agent_service.evidence import hash_text
+    from cli_agent_service.supervisor import SupervisorError
+
+    _registry, supervisor = _supervisor(tmp_path)
+    run = _run("run-pinned-ticket-mismatch")
+    ticket = _execution_ticket(run)
+    ticket["profile_requirements"]["profile_id"] = "profile-other"
+
+    with pytest.raises(
+        SupervisorError,
+        match="execution_ticket profile does not match the run",
+    ):
+        supervisor._run_receipt_emitter(
+            run,
+            ticket,
+            hash_text("pinned profile command"),
+        )
+
+
 def test_managed_profile_launch_uses_exact_server_home_and_strips_provider_env(
     tmp_path,
     monkeypatch,
