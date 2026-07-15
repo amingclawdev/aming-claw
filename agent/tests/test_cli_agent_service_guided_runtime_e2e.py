@@ -737,7 +737,7 @@ def test_qa_ticket_uses_distinct_native_service_run_and_transient_token(
     assert qa_ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in qa_ticket["profile_requirements"]
     assert qa_ticket["qa_bootstrap_guide_contract"]["guide_version"] == (
-        "qa-bootstrap-guide.v1"
+        "qa-bootstrap-guide.v2"
     )
     assert qa_ticket["managed_profile_tooling_contract"]["tooling_version"] == (
         "managed-profile-tooling.v1"

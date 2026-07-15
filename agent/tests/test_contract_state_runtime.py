@@ -400,8 +400,17 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["schema_version"] == (
         "cli_agent.qa_bootstrap_guide_contract.v1"
     )
-    assert binding["guide_version"] == "qa-bootstrap-guide.v1"
+    assert binding["guide_version"] == "qa-bootstrap-guide.v2"
     assert binding["guide_hash"].startswith("sha256:")
+    guide_contract = contract_state_runtime.cli_agent_qa_bootstrap_guide_contract()
+    assert guide_contract["guide_version"] == binding["guide_version"]
+    assert guide_contract["guide_hash"] == binding["guide_hash"]
+    prompt_template = guide_contract["prompt_template"]
+    assert "managed MCP `contract_runtime_current`" in prompt_template
+    assert "managed MCP `contract_runtime_guide`" in prompt_template
+    assert "compact CLI projections" in prompt_template
+    assert "ContractRuntime remains the source of authority" in prompt_template
+    assert "After every accepted ContractRuntime line" in prompt_template
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
@@ -474,6 +483,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert changed["qa_bootstrap_guide_contract"] != tooling_changed[
         "qa_bootstrap_guide_contract"
     ]
+    assert changed["dispatch_identity"] == tooling_changed["dispatch_identity"]
     assert changed["ticket_id"] != tooling_changed["ticket_id"]
     assert changed["ticket_hash"] != tooling_changed["ticket_hash"]
 

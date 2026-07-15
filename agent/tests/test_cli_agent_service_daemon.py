@@ -775,13 +775,17 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "do not trust the pre-dispatch target_head_commit" in prompt
     assert "qa_session_token or X-Gov-Token" in prompt
     assert "never echo it, write it to a file, or write it to timeline" in prompt
+    assert "compact CLI projections" in prompt
+    assert "ContractRuntime remains the source of authority" in prompt
+    assert "After every accepted ContractRuntime line" in prompt
     ordered_steps = (
         "Call qa_session_register",
-        "Read ContractRuntime current and guide",
+        "managed MCP `contract_runtime_current`",
+        "managed MCP `contract_runtime_guide`",
         "submit qa_graph_context",
-        "run only its focused tests",
+        "run only the refreshed guide's focused tests",
         "Submit exactly one independent_verification verdict",
-        "Re-read current and confirm ContractRuntime accepted",
+        "Re-read both managed MCP projections and confirm ContractRuntime accepted",
     )
     assert [prompt.index(step) for step in ordered_steps] == sorted(
         prompt.index(step) for step in ordered_steps
