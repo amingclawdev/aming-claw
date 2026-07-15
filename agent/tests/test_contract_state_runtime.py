@@ -407,12 +407,33 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["schema_version"] == (
         "cli_agent.qa_bootstrap_guide_contract.v1"
     )
-    assert binding["guide_version"] == "qa-bootstrap-guide.v4"
+    assert binding["guide_version"] == "qa-bootstrap-guide.v5"
     assert binding["guide_hash"].startswith("sha256:")
     guide_contract = contract_state_runtime.cli_agent_qa_bootstrap_guide_contract()
     assert guide_contract["guide_version"] == binding["guide_version"]
     assert guide_contract["guide_hash"] == binding["guide_hash"]
     prompt_template = guide_contract["prompt_template"]
+    skill_token = "$aming-claw:aming-claw-onboard"
+    onboard_instruction = (
+        "Immediately use that skill to call managed MCP "
+        "`onboard_route_guide` with exactly project_id={project_id}, "
+        "backlog_id={backlog_id}, role=qa, and work_type=qa_verification."
+    )
+    assert prompt_template.startswith(skill_token + "\n")
+    assert prompt_template.count(skill_token) == 1
+    assert onboard_instruction in prompt_template
+    skill_index = prompt_template.index(skill_token)
+    onboard_index = prompt_template.index(onboard_instruction)
+    assert skill_index < onboard_index
+    for post_onboard_action in (
+        "3. In assigned_worktree, run exactly `git rev-parse HEAD`",
+        "4. Call qa_session_register",
+        "5. Immediately call managed MCP `graph_query`",
+        "managed MCP `contract_runtime_current`",
+        "run only the refreshed guide's focused exact pytest node ids",
+        "or send a final response",
+    ):
+        assert onboard_index < prompt_template.index(post_onboard_action)
     assert "managed MCP `contract_runtime_current`" in prompt_template
     assert "managed MCP `contract_runtime_guide`" in prompt_template
     assert "compact read-only CLI projections" in prompt_template
@@ -426,7 +447,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         "task_id={original_worker_task_id}",
         "commit_sha=<full git HEAD>",
         "repo_root={assigned_worktree}",
-        "qa_session_token=<raw token from step 1>",
+        "qa_session_token=<raw token from step 4>",
     ):
         assert graph_argument in prompt_template
     assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt_template
@@ -493,6 +514,48 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert same["qa_bootstrap_guide_contract"] == binding
     assert same["qa_onboard_guidance_contract"] == onboard_binding
     assert same["managed_profile_tooling_contract"] == tooling_binding
+
+    original_bootstrap_version = (
+        contract_state_runtime.CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION",
+        "qa-bootstrap-guide.v4",
+    )
+    previous_bootstrap = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert previous_bootstrap["qa_bootstrap_guide_contract"][
+        "guide_version"
+    ] == "qa-bootstrap-guide.v4"
+    assert previous_bootstrap["qa_bootstrap_guide_contract"] != binding
+    assert previous_bootstrap["ticket_id"] != issued["ticket_id"]
+    assert previous_bootstrap["ticket_hash"] != issued["ticket_hash"]
+    for stable_field in (
+        "execution_state_revision",
+        "contract_revision_id",
+        "dispatch_identity",
+        "dispatch_identity_hash",
+        "profile_requirements",
+        "retry_policy",
+        "qa_onboard_guidance_contract",
+        "managed_profile_tooling_contract",
+    ):
+        assert previous_bootstrap[stable_field] == issued[stable_field]
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION",
+        original_bootstrap_version,
+    )
+    deterministic_v5 = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert deterministic_v5["ticket_id"] == issued["ticket_id"]
+    assert deterministic_v5["ticket_hash"] == issued["ticket_hash"]
+    assert deterministic_v5["qa_bootstrap_guide_contract"] == binding
 
     original_onboard_version = (
         contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION
