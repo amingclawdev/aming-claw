@@ -8747,6 +8747,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             "governance_project_id": governance_project_id,
             "target_project_id": target_project_id,
             "reason": reason,
+            "underlying_reason": reason,
         }
         exc_details = getattr(exc, "details", None)
         if isinstance(exc_details, Mapping):
@@ -8771,6 +8772,16 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             raise GovernanceError(
                 "runtime_session_token_expired",
                 "mf_subagent runtime session token lease has expired",
+                403,
+                details,
+            ) from exc
+        if reason == "route_identity_missing" or reason.startswith(
+            "route_identity_missing:"
+        ):
+            details["route_identity_missing"] = True
+            raise GovernanceError(
+                "route_identity_missing",
+                "mf_subagent graph query route identity is incomplete",
                 403,
                 details,
             ) from exc
@@ -11955,6 +11966,7 @@ def _runtime_context_projection_response(
         parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         worker_id=worker_summary_id,
         worker_slot_id=worker_summary_slot_id,
+        route_identity=_runtime_context_latest_route_identity(conn, context),
     )
     audit = record_runtime_context_access_audit(
         conn,
@@ -13830,6 +13842,7 @@ def _runtime_context_worker_guide_response(
             parent_task_id=parent_task_id,
             worker_id=worker_id,
             worker_slot_id=worker_slot_id,
+            route_identity=_runtime_context_latest_route_identity(conn, context),
         )
     corrected_request_shapes = dict(
         target_root_projection.get("corrected_request_shapes") or {}
@@ -15545,6 +15558,7 @@ def _runtime_context_target_root_projection(
     parent_task_id: str = "",
     worker_id: str = "",
     worker_slot_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested = str(requested_target_project_root or "").strip()
     canonical = str(canonical_target_project_root or "").strip()
@@ -15576,6 +15590,11 @@ def _runtime_context_target_root_projection(
         "worker_id": worker_identity,
         "worker_slot_id": worker_slot_identity,
     }
+    copy_safe_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str((route_identity or {}).get(field) or "").strip()
+    }
     return {
         "schema_version": "runtime_context.target_project_root_projection.v1",
         "requested_target_project_root": requested,
@@ -15606,6 +15625,7 @@ def _runtime_context_target_root_projection(
                 "worker_role": "mf_sub",
                 "query_source": "mf_subagent",
                 "query_purpose": "subagent_context_build",
+                "route_identity": copy_safe_route_identity,
             },
             "write_facade_body": dict(write_identity_shape),
             "startup_body": dict(write_identity_shape),
@@ -17016,6 +17036,92 @@ def _runtime_context_worker_recovery_payloads(
     }
 
 
+def _runtime_context_contract_runtime_worker_sequence_evidence(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Project accepted worker read/startup lines without creating timeline rows."""
+    runtime_context_id, task_id, parent_task_id = _contract_runtime_context_identity(
+        context
+    )
+    contract_identity, resolution = _runtime_context_source_backed_contract_identity(
+        conn,
+        project_id=project_id,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    execution_id = str(contract_identity.get("contract_execution_id") or "").strip()
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+
+    accepted: dict[str, dict[str, Any]] = {}
+    required = {
+        "worker_read_runtime_guide": ("read_receipt", "worker_read"),
+        "worker_startup": ("mf_subagent_startup", "worker_startup"),
+    }
+    for index, line in _contract_runtime_completed_lines(record):
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id not in required or line_id in accepted:
+            continue
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        evidence_kind, stage_id = required[line_id]
+        if (
+            str(line.get("actor_role") or "").strip() != "mf_sub"
+            or str(line.get("evidence_kind") or "").strip() != evidence_kind
+            or str(line.get("stage_id") or "").strip() != stage_id
+            or not _contract_runtime_line_status_passes(line)
+        ):
+            continue
+        if not (
+            _contract_runtime_mapping_matches_context(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+            or _contract_runtime_mapping_matches_context(
+                payload,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        ):
+            continue
+        accepted[line_id] = {
+            "line_index": index,
+            "source_ref": f"contract_runtime:{execution_id}:completed_lines:{index}",
+        }
+
+    if "worker_read_runtime_guide" not in accepted:
+        return {}
+    startup = accepted.get("worker_startup")
+    read = accepted["worker_read_runtime_guide"]
+    if startup and int(startup["line_index"]) <= int(read["line_index"]):
+        startup = None
+    return {
+        "schema_version": "runtime_context.contract_runtime_worker_sequence_evidence.v1",
+        "source": "contract_runtime_completed_lines",
+        "source_of_authority": "contract_runtime",
+        "contract_execution_id": execution_id,
+        "contract_execution_resolution": dict(resolution),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "read_receipt_ref": str(read["source_ref"]),
+        "startup_ref": str((startup or {}).get("source_ref") or ""),
+        "ordered": bool(startup),
+        "synthetic_timeline_event_created": False,
+        "timeline_backfill_performed": False,
+    }
+
+
 def _runtime_context_worker_recovery_details(
     ctx: RequestContext,
     conn,
@@ -17206,6 +17312,7 @@ def _runtime_context_worker_recovery_details(
             parent_task_id=expected_parent_task_id,
             worker_id=expected_worker_id,
             worker_slot_id=expected_worker_slot_id,
+            route_identity=expected_route_identity,
         )
         diagnostics["target_project_root_projection"] = target_root_projection
         diagnostics["matches"] = {
@@ -17298,15 +17405,35 @@ def _runtime_context_worker_recovery_details(
                 timeline_events=timeline_events,
             )
         )
+        contract_runtime_sequence = (
+            _runtime_context_contract_runtime_worker_sequence_evidence(
+                conn,
+                project_id=getattr(context, "project_id", project_id),
+                context=context,
+            )
+        )
         diagnostics["timeline"] = {
             "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
             "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
         }
+        diagnostics["contract_runtime_worker_sequence"] = dict(
+            contract_runtime_sequence
+        )
+        effective_read_receipt_ref = str(
+            timeline_refs.get("read_receipt_event_ref")
+            or contract_runtime_sequence.get("read_receipt_ref")
+            or ""
+        )
+        effective_startup_ref = str(
+            timeline_refs.get("startup_event_ref")
+            or contract_runtime_sequence.get("startup_ref")
+            or ""
+        )
         missing_worker_lineage = [
             item
             for item, present in (
-                ("mf_subagent_read_receipt", timeline_refs.get("read_receipt_event_ref")),
-                ("mf_subagent_startup", timeline_refs.get("startup_event_ref")),
+                ("mf_subagent_read_receipt", effective_read_receipt_ref),
+                ("mf_subagent_startup", effective_startup_ref),
             )
             if not present
         ]
@@ -17424,10 +17551,10 @@ def _runtime_context_worker_recovery_details(
             else:
                 next_legal_action = "verify_runtime_context_identity"
                 recovery_action_id = "retry_with_matching_runtime_context_identity"
-        elif not timeline_refs.get("read_receipt_event_ref"):
+        elif not effective_read_receipt_ref:
             next_legal_action = "submit_mf_subagent_read_receipt"
             recovery_action_id = "post_runtime_context_read_receipt"
-        elif not timeline_refs.get("startup_event_ref"):
+        elif not effective_startup_ref:
             next_legal_action = "record_mf_subagent_startup"
             recovery_action_id = "post_runtime_context_startup"
         elif lease_view.get("expired"):

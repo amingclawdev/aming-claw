@@ -25810,6 +25810,7 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     corrected = projection["corrected_request_shapes"]
     assert corrected["graph_query_body"]["target_project_root"] == str(canonical_root)
     assert corrected["graph_query_body"]["worktree_path"] == str(worktree)
+    assert corrected["graph_query_body"]["route_identity"] == route_identity
     assert corrected["startup_body"]["target_project_root"] == str(canonical_root)
     worker_view = current["runtime_context_service"]["views"]["worker_view"]
     assert worker_view["task"]["target_project_root"] == str(canonical_root)
@@ -26034,6 +26035,7 @@ def test_runtime_context_worker_guide_corrected_shapes_default_worker_identity(
     assert corrected["write_facade_body"]["worker_id"] == task_id
     assert corrected["write_facade_body"]["worker_slot_id"] == task_id
     assert corrected["graph_query_body"]["worker_id"] == task_id
+    assert corrected["graph_query_body"]["route_identity"] == route_identity
     worker_guide = guide["worker_guide"]
     guide_corrected = worker_guide["corrected_request_shapes"]
     assert guide_corrected["write_facade_body"]["worker_id"] == task_id
@@ -26043,6 +26045,116 @@ def test_runtime_context_worker_guide_corrected_shapes_default_worker_identity(
     ]
     assert receipt_body["worker_id"] == task_id
     assert receipt_body["worker_slot_id"] == task_id
+
+
+def test_contract_runtime_worker_sequence_projects_ordered_read_and_startup_without_timeline_backfill(
+    monkeypatch,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-sequence-projection",
+        task_id="worker-sequence-projection",
+        root_task_id="AC-SEQUENCE-PROJECTION",
+        backlog_id="AC-SEQUENCE-PROJECTION",
+    )
+    identity = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+    }
+    record = {
+        "contract_execution_id": "cex-sequence-projection",
+        "completed_lines": [
+            {
+                **identity,
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "actor_role": "mf_sub",
+                "status": "accepted",
+            },
+            {
+                **identity,
+                "stage_id": "worker_startup",
+                "line_id": "worker_startup",
+                "evidence_kind": "mf_subagent_startup",
+                "actor_role": "mf_sub",
+                "status": "accepted",
+            },
+        ],
+    }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_source_backed_contract_identity",
+        lambda *args, **kwargs: (
+            {"contract_execution_id": "cex-sequence-projection"},
+            {"status": "resolved_source_backed_worker_lineage"},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda conn: SimpleNamespace(get=lambda execution_id: record),
+    )
+
+    evidence = server._runtime_context_contract_runtime_worker_sequence_evidence(
+        object(),
+        project_id=PID,
+        context=context,
+    )
+
+    assert evidence["ordered"] is True
+    assert evidence["read_receipt_ref"].endswith("completed_lines:0")
+    assert evidence["startup_ref"].endswith("completed_lines:1")
+    assert evidence["source_of_authority"] == "contract_runtime"
+    assert evidence["synthetic_timeline_event_created"] is False
+    assert evidence["timeline_backfill_performed"] is False
+
+
+def test_mf_sub_graph_query_preserves_route_identity_missing_reason(monkeypatch):
+    from agent.governance import parallel_branch_runtime
+
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_mf_subagent",
+        lambda *args, **kwargs: {"role": "mf_sub"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        lambda *args, **kwargs: {"next_legal_action": "retry_with_route_identity"},
+    )
+
+    def reject_missing_route_identity(*args, **kwargs):
+        error = BranchRuntimeFenceError("route_identity_missing")
+        error.details = {"missing_route_identity_fields": ["route_id"]}
+        raise error
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "validate_mf_subagent_graph_query_identity",
+        reject_missing_route_identity,
+    )
+    ctx = SimpleNamespace(
+        body={},
+        query={},
+        get_project_id=lambda: PID,
+    )
+    body = {
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "runtime_context_id": "mfrctx-route-missing",
+        "worker_role": "mf_sub",
+        "fence_token": "fence-route-missing",
+    }
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server._require_graph_query_capability(ctx, object(), body, "graph.query")
+
+    assert exc_info.value.code == "route_identity_missing"
+    assert exc_info.value.details["underlying_reason"] == "route_identity_missing"
+    assert exc_info.value.details["route_identity_missing"] is True
+    assert exc_info.value.details["missing_route_identity_fields"] == ["route_id"]
 
 
 def test_mf_sub_graph_query_rejects_unknown_task_id_and_fake_fence(conn):
