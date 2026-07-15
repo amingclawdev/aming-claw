@@ -10,7 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
+
+try:
+    from agent.plugin_installer import CODEX_PLUGIN_PAYLOAD
+except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
+    from plugin_installer import CODEX_PLUGIN_PAYLOAD  # type: ignore
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
@@ -3562,9 +3568,74 @@ def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
     }
 
 
-def cli_agent_managed_profile_tooling_contract() -> dict[str, Any]:
+def cli_agent_managed_profile_source_payload_digest(
+    plugin_source_root: str | Path | None = None,
+) -> str:
+    """Hash canonical plugin payload relative paths and bytes only."""
+
+    root = (
+        Path(plugin_source_root).expanduser().resolve()
+        if plugin_source_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    entries: dict[str, tuple[bytes, bytes]] = {}
+    for payload_path in sorted(set(CODEX_PLUGIN_PAYLOAD)):
+        source = root / payload_path
+        relative = Path(payload_path).as_posix()
+        if source.is_symlink():
+            raise ValueError("managed profile tooling payload cannot contain symlinks")
+        if not source.exists():
+            entries[relative] = (b"missing", b"")
+            continue
+        if source.is_file():
+            entries[relative] = (b"file", source.read_bytes())
+            continue
+        if not source.is_dir():
+            entries[relative] = (b"unsupported", b"")
+            continue
+        entries[relative] = (b"directory", b"")
+        for child in sorted(
+            source.rglob("*"),
+            key=lambda item: item.relative_to(root).as_posix(),
+        ):
+            child_relative = child.relative_to(root).as_posix()
+            if child.is_symlink():
+                raise ValueError(
+                    "managed profile tooling payload cannot contain symlinks"
+                )
+            if child.is_dir():
+                entries[child_relative] = (b"directory", b"")
+            elif child.is_file():
+                entries[child_relative] = (b"file", child.read_bytes())
+            else:
+                entries[child_relative] = (b"unsupported", b"")
+
+    digest = hashlib.sha256()
+    digest.update(b"aming-claw-codex-plugin-payload.v1\0")
+    for relative in sorted(entries):
+        kind, content = entries[relative]
+        relative_bytes = relative.encode("utf-8")
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(len(kind).to_bytes(8, "big"))
+        digest.update(kind)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
+
+
+def cli_agent_managed_profile_tooling_contract(
+    *,
+    plugin_source_root: str | Path | None = None,
+    source_payload_digest: str = "",
+) -> dict[str, Any]:
     """Return the copy-safe managed-profile plugin/MCP bootstrap contract."""
 
+    payload_digest = str(source_payload_digest or "").strip()
+    if not payload_digest:
+        payload_digest = cli_agent_managed_profile_source_payload_digest(
+            plugin_source_root
+        )
     material = {
         "schema_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION,
         "tooling_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION,
@@ -3575,17 +3646,26 @@ def cli_agent_managed_profile_tooling_contract() -> dict[str, Any]:
         "required_visibility": ["plugin", "mcp_server"],
         "credential_policy": "preserve_managed_profile_auth",
         "desktop_plugin_cache_source_allowed": False,
+        "source_payload_digest": payload_digest,
     }
     return {**material, "tooling_hash": _stable_json_hash(material)}
 
 
-def cli_agent_managed_profile_tooling_binding() -> dict[str, str]:
+def cli_agent_managed_profile_tooling_binding(
+    *,
+    plugin_source_root: str | Path | None = None,
+    source_payload_digest: str = "",
+) -> dict[str, str]:
     """Return the immutable tooling binding carried outside profile selectors."""
 
-    contract = cli_agent_managed_profile_tooling_contract()
+    contract = cli_agent_managed_profile_tooling_contract(
+        plugin_source_root=plugin_source_root,
+        source_payload_digest=source_payload_digest,
+    )
     return {
         "schema_version": str(contract["schema_version"]),
         "tooling_version": str(contract["tooling_version"]),
+        "source_payload_digest": str(contract["source_payload_digest"]),
         "tooling_hash": str(contract["tooling_hash"]),
     }
 

@@ -407,6 +407,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         "cli_agent.managed_profile_tooling_contract.v1"
     )
     assert tooling_binding["tooling_version"] == "managed-profile-tooling.v1"
+    assert tooling_binding["source_payload_digest"].startswith("sha256:")
     assert tooling_binding["tooling_hash"].startswith("sha256:")
     assert "managed_profile_tooling_contract" not in issued[
         "profile_requirements"
@@ -474,6 +475,70 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     ]
     assert changed["ticket_id"] != tooling_changed["ticket_id"]
     assert changed["ticket_hash"] != tooling_changed["ticket_hash"]
+
+
+def test_cli_agent_qa_ticket_id_changes_with_source_payload_digest(
+    tmp_path,
+    monkeypatch,
+):
+    current, launch = _cli_agent_ticket_fixture()
+    current["authority_decision_source"] = "contract_runtime_qa_execution_ticket"
+    current["next_legal_action"].update(
+        {
+            "worker_role": "qa",
+            "profile_requirements": {
+                "harness": "codex",
+                "provider": "openai",
+                "role": "qa",
+                "required_capabilities": ["independent_verification"],
+            },
+        }
+    )
+    launch["worker_role"] = "qa"
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    payload = source_root / "payload.txt"
+    payload.write_bytes(b"first source payload")
+    digest_source = (
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload.txt",),
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "cli_agent_managed_profile_source_payload_digest",
+        lambda _plugin_source_root=None: digest_source(source_root),
+    )
+
+    first = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    payload.write_bytes(b"second source payload")
+    changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert first["status"] == changed["status"] == "issued"
+    assert first["execution_state_revision"] == changed[
+        "execution_state_revision"
+    ]
+    assert first["dispatch_identity_hash"] == changed[
+        "dispatch_identity_hash"
+    ]
+    assert first["profile_requirements"] == changed["profile_requirements"]
+    assert first["managed_profile_tooling_contract"][
+        "tooling_version"
+    ] == changed["managed_profile_tooling_contract"]["tooling_version"]
+    assert first["managed_profile_tooling_contract"][
+        "source_payload_digest"
+    ] != changed["managed_profile_tooling_contract"]["source_payload_digest"]
+    assert first["ticket_id"] != changed["ticket_id"]
+    assert first["ticket_hash"] != changed["ticket_hash"]
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():

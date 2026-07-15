@@ -207,16 +207,18 @@ class ManagedProfileControl:
         profile_home: Path,
         *,
         contract: Mapping[str, Any],
+        binding: Mapping[str, str],
     ) -> None:
         marker_path = ManagedProfileControl._tooling_marker_path(profile_home)
         marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = {
             "schema_version": "cli_agent_service.managed_profile_tooling_readiness.v1",
             "ready": True,
-            "tooling_contract": cli_agent_managed_profile_tooling_binding(),
+            "tooling_contract": dict(binding),
             "plugin_id": str(contract["plugin_id"]),
             "plugin_version": str(contract["plugin_version"]),
             "mcp_server_name": str(contract["mcp_server_name"]),
+            "source_payload_digest": str(contract["source_payload_digest"]),
             "repository_source_snapshot": True,
             "desktop_plugin_cache_copied": False,
             "raw_credentials_copied": False,
@@ -245,8 +247,10 @@ class ManagedProfileControl:
             temporary.unlink(missing_ok=True)
 
     def _source_tooling_contract(self) -> dict[str, Any]:
-        contract = cli_agent_managed_profile_tooling_contract()
         try:
+            contract = cli_agent_managed_profile_tooling_contract(
+                plugin_source_root=self.plugin_source_root
+            )
             manifest = json.loads(
                 (self.plugin_source_root / ".codex-plugin" / "plugin.json").read_text(
                     encoding="utf-8"
@@ -255,7 +259,7 @@ class ManagedProfileControl:
             mcp = json.loads(
                 (self.plugin_source_root / ".mcp.json").read_text(encoding="utf-8")
             )
-        except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError) as exc:
             raise ProfileToolingError(
                 "managed Codex profile tooling source is invalid"
             ) from exc
@@ -364,13 +368,17 @@ class ManagedProfileControl:
 
         with self._tooling_lock:
             contract = self._source_tooling_contract()
-            binding = cli_agent_managed_profile_tooling_binding()
+            binding = cli_agent_managed_profile_tooling_binding(
+                source_payload_digest=str(contract["source_payload_digest"])
+            )
             marker = self._read_tooling_marker(profile_home)
             auth_before = self._auth_file_identity(profile_home)
             try:
                 if (
                     marker.get("ready") is True
                     and marker.get("tooling_contract") == binding
+                    and marker.get("source_payload_digest")
+                    == contract["source_payload_digest"]
                     and self._tooling_is_visible(profile_home, contract=contract)
                 ):
                     return dict(marker)
@@ -395,7 +403,11 @@ class ManagedProfileControl:
                     raise ProfileToolingError(
                         "managed Codex profile tooling is not visible"
                     )
-                self._write_tooling_marker(profile_home, contract=contract)
+                self._write_tooling_marker(
+                    profile_home,
+                    contract=contract,
+                    binding=binding,
+                )
             except ProfileToolingError:
                 raise
             except BaseException as exc:

@@ -21,7 +21,7 @@ def _fake_codex(tmp_path):
     return executable
 
 
-def _control(tmp_path, *, ready=True):
+def _control(tmp_path, *, ready=True, plugin_source_root=REPO_ROOT):
     from cli_agent_service.auth import ProfileAuthController
     from cli_agent_service.profile_control import ManagedProfileControl
     from cli_agent_service.registry import AgentRegistry
@@ -66,9 +66,24 @@ def _control(tmp_path, *, ready=True):
     return registry, auth, ManagedProfileControl(
         registry,
         auth,
-        plugin_source_root=REPO_ROOT,
+        plugin_source_root=plugin_source_root,
         tooling_runner=runner,
     )
+
+
+def _copy_canonical_plugin_source(destination):
+    from plugin_installer import CODEX_PLUGIN_PAYLOAD
+
+    destination.mkdir(parents=True)
+    for relative in CODEX_PLUGIN_PAYLOAD:
+        source = REPO_ROOT / relative
+        target = destination / relative
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    return destination
 
 
 def test_fixed_login_status_activate_and_list_register_only_ready_profile(tmp_path):
@@ -215,6 +230,75 @@ def test_managed_profile_ids_resolve_to_disjoint_server_owned_homes(tmp_path):
     forged_cross_selection = replace(profiles[0], profile_id=profiles[1].profile_id)
     with pytest.raises(ValueError, match="registered immutable profile"):
         control.resolve_profile_home(forged_cross_selection)
+
+
+def test_same_version_source_payload_change_reinstalls_and_updates_marker(tmp_path):
+    source_root = _copy_canonical_plugin_source(tmp_path / "plugin-source")
+    registry, auth, control = _control(
+        tmp_path,
+        plugin_source_root=source_root,
+    )
+    control.prepare_login("profile-codex-payload-refresh")
+    control.activate("profile-codex-payload-refresh")
+    profile = registry.get_profile("profile-codex-payload-refresh")
+    assert profile is not None
+    home = auth.managed_profile_home(profile.profile_id, "codex")
+    auth_path = home / "auth.json"
+    auth_bytes = b'{"managed_test_secret":"must-remain-byte-identical"}\n'
+    auth_path.write_bytes(auth_bytes)
+    os.chmod(auth_path, 0o600)
+
+    control.resolve_profile_home(profile)
+    marker_path = home / "managed-tooling" / "readiness.json"
+    first_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    source_skill = source_root / "skills" / "aming-claw-onboard" / "SKILL.md"
+    cache_skill = (
+        home
+        / "plugins"
+        / "cache"
+        / "aming-claw-local"
+        / "aming-claw"
+        / "0.1.1+codex.20260713045902"
+        / "skills"
+        / "aming-claw-onboard"
+        / "SKILL.md"
+    )
+    marketplace_skill = (
+        home
+        / "managed-tooling"
+        / "aming-claw-local"
+        / "aming-claw"
+        / "skills"
+        / "aming-claw-onboard"
+        / "SKILL.md"
+    )
+    original = source_skill.read_bytes()
+    assert cache_skill.read_bytes() == original
+    assert marketplace_skill.read_bytes() == original
+
+    changed = original + b"\nSame-version managed profile payload refresh.\n"
+    source_skill.write_bytes(changed)
+    control.resolve_profile_home(profile)
+    second_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+    assert first_marker["source_payload_digest"] != second_marker[
+        "source_payload_digest"
+    ]
+    assert second_marker["source_payload_digest"] == second_marker[
+        "tooling_contract"
+    ]["source_payload_digest"]
+    assert first_marker["tooling_contract"]["tooling_hash"] != second_marker[
+        "tooling_contract"
+    ]["tooling_hash"]
+    assert cache_skill.read_bytes() == changed
+    assert marketplace_skill.read_bytes() == changed
+    assert auth_path.read_bytes() == auth_bytes
+    manifest = json.loads(
+        (source_root / ".codex-plugin" / "plugin.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["version"] == "0.1.1+codex.20260713045902"
 
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI is unavailable")
