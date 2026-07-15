@@ -775,7 +775,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "do not trust the pre-dispatch target_head_commit" in prompt
     assert "qa_session_token or X-Gov-Token" in prompt
     assert "never echo it, write it to a file, or write it to timeline" in prompt
-    assert "compact CLI projections" in prompt
+    assert "compact read-only CLI projections" in prompt
     assert "ContractRuntime remains the source of authority" in prompt
     for graph_argument in (
         "tool=query_schema",
@@ -796,11 +796,19 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "tests list records every exact pytest node id and outcome" in prompt
     assert "starts with a clear PASS: or FAIL:" in prompt
     assert "execution_state_revision to be strictly greater" in prompt
+    assert "Before this graph call succeeds, do not read ContractRuntime" in prompt
+    assert "run tests, or send a final response" in prompt
+    assert "If graph_query returns an error" in prompt
+    assert "report only a public blocker" in prompt
+    assert "Read-only current/guide calls and a process exit 0 are not completion" in (
+        prompt
+    )
     ordered_steps = (
         "Call qa_session_register",
+        "Immediately call managed MCP `graph_query`",
+        "Only after graph_query returns a successful trace_id",
         "managed MCP `contract_runtime_current`",
         "managed MCP `contract_runtime_guide`",
-        "Call managed MCP `graph_query`",
         "Call managed MCP `contract_runtime_submit_line` for qa_graph_context",
         "After qa_graph_context is accepted, re-read both managed MCP",
         "run only the refreshed guide's focused exact pytest node ids",
