@@ -9,12 +9,15 @@ import json
 import logging
 import os
 import posixpath
+import secrets
 import socket
 import subprocess
 import sys
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -547,6 +550,10 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
         "qa_session_token": {
             "type": "string",
             "description": "Raw QA role token used only as X-Gov-Token; never forwarded as evidence body.",
+        },
+        "qa_session_token_ref": {
+            "type": "string",
+            "description": "Process-local opaque QA session ref resolved to X-Gov-Token; safe as explicit QA evidence provenance only.",
         },
         "worker_role": {
             "type": "string",
@@ -1206,7 +1213,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "qa_session_register",
-        "description": "Register a bounded QA role session for QA-owned ContractRuntime evidence lines.",
+        "description": "Register a bounded QA role session; managed MCP retains the one-time raw token and returns a process-local opaque ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1231,6 +1238,10 @@ TOOLS: list[dict] = [
                 "commit_sha": {
                     "type": "string",
                     "description": "Bounded QA full candidate commit; server derives the canonical tuple binding.",
+                },
+                "contract_execution_id": {
+                    "type": "string",
+                    "description": "ContractRuntime execution bound locally to the opaque QA session ref; not forwarded to role assignment.",
                 },
             },
             "required": ["project_id", "backlog_id", "task_id", "commit_sha"],
@@ -2327,6 +2338,10 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Backlog scope that must match the registered opaque QA session ref.",
+                },
                 "contract_execution_id": {"type": "string"},
                 "observer_route_token_ref": {
                     "type": "string",
@@ -2340,6 +2355,10 @@ TOOLS: list[dict] = [
                 "qa_session_token": {
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
+                "qa_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque QA session ref resolved internally to X-Gov-Token.",
                 },
             },
             "required": ["project_id", "contract_execution_id"],
@@ -2352,6 +2371,10 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
+                "backlog_id": {
+                    "type": "string",
+                    "description": "Backlog scope that must match the registered opaque QA session ref.",
+                },
                 "contract_execution_id": {"type": "string"},
                 "observer_route_token_ref": {
                     "type": "string",
@@ -2365,6 +2388,10 @@ TOOLS: list[dict] = [
                 "qa_session_token": {
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded as query/body.",
+                },
+                "qa_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque QA session ref resolved internally to X-Gov-Token.",
                 },
             },
             "required": ["project_id", "contract_execution_id"],
@@ -2706,6 +2733,10 @@ TOOLS: list[dict] = [
                 "qa_session_token": {
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded into graph query data.",
+                },
+                "qa_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque QA session ref resolved internally to X-Gov-Token.",
                 },
                 "repo_root": {"type": "string"},
                 "project_root": {"type": "string"},
@@ -3707,6 +3738,28 @@ def _governance_offline_hint(payload: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+_QA_SESSION_RAW_TOKEN_FIELDS = (
+    "token",
+    "raw_token",
+    "qa_session_token",
+    "role_token",
+    "access_token",
+)
+
+
+def _qa_session_expiry(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
@@ -3734,6 +3787,138 @@ class ToolDispatcher:
             "CODEX_WORKSPACE",
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         )
+        self._qa_session_refs: dict[str, dict[str, Any]] = {}
+        self._qa_session_refs_lock = threading.Lock()
+
+    @staticmethod
+    def _qa_session_ref_error(error: str, message: str, **details: Any) -> dict:
+        return {"ok": False, "error": error, "message": message, **details}
+
+    def _register_qa_session_ref(self, args: dict, result: Any) -> Any:
+        """Replace the one-time raw QA token with a process-local opaque ref."""
+        if not isinstance(result, dict):
+            return result
+        raw_token = next(
+            (
+                str(result.get(field) or "").strip()
+                for field in _QA_SESSION_RAW_TOKEN_FIELDS
+                if str(result.get(field) or "").strip()
+            ),
+            "",
+        )
+        public = {
+            key: value
+            for key, value in result.items()
+            if key not in _QA_SESSION_RAW_TOKEN_FIELDS
+        }
+        if raw_token:
+            public.pop("message", None)
+        if not raw_token or result.get("error"):
+            return public
+
+        binding = {
+            "project_id": str(args.get("project_id") or "").strip(),
+            "backlog_id": str(args.get("backlog_id") or "").strip(),
+            "task_id": str(args.get("task_id") or "").strip(),
+            "commit_sha": str(args.get("commit_sha") or "").strip().lower(),
+            "contract_execution_id": str(
+                args.get("contract_execution_id") or ""
+            ).strip(),
+            "session_id": str(result.get("session_id") or "").strip(),
+        }
+        expires_at = str(result.get("expires_at") or "").strip()
+        required_binding = (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "commit_sha",
+            "session_id",
+        )
+        if (
+            not all(binding[field] for field in required_binding)
+            or _qa_session_expiry(expires_at) is None
+        ):
+            return self._qa_session_ref_error(
+                "qa_session_register_invalid_response",
+                "QA session registration did not return a complete public scope and expiry.",
+            )
+
+        token_ref = "qa-session-ref-" + secrets.token_urlsafe(32)
+        with self._qa_session_refs_lock:
+            now = datetime.now(timezone.utc)
+            for existing_ref, existing in list(self._qa_session_refs.items()):
+                existing_expiry = _qa_session_expiry(existing.get("expires_at"))
+                if (
+                    existing.get("session_id") == binding["session_id"]
+                    or existing_expiry is None
+                    or existing_expiry <= now
+                ):
+                    self._qa_session_refs.pop(existing_ref, None)
+            self._qa_session_refs[token_ref] = {
+                **binding,
+                "expires_at": expires_at,
+                "raw_token": raw_token,
+            }
+        public["qa_session_token_ref"] = token_ref
+        public["qa_session_scope_binding"] = binding
+        public["raw_qa_session_token_exposed"] = False
+        public["message"] = (
+            "QA session registered; pass qa_session_token_ref to managed MCP tools."
+        )
+        return public
+
+    def _qa_role_token_for_scope(
+        self,
+        args: dict,
+        *,
+        required_scope_fields: tuple[str, ...],
+    ) -> tuple[str, dict | None]:
+        """Resolve an opaque QA ref to its header token and fail closed on drift."""
+        raw_token = str(args.get("qa_session_token") or "").strip()
+        token_ref = str(args.get("qa_session_token_ref") or "").strip()
+        if raw_token and token_ref:
+            return "", self._qa_session_ref_error(
+                "qa_session_auth_ambiguous",
+                "Provide either qa_session_token_ref or the direct HTTP-compatible raw token, not both.",
+            )
+        if not token_ref:
+            return raw_token, None
+
+        with self._qa_session_refs_lock:
+            entry = self._qa_session_refs.get(token_ref)
+            if entry is not None:
+                entry = dict(entry)
+        if entry is None:
+            return "", self._qa_session_ref_error(
+                "qa_session_token_ref_unknown",
+                "QA session ref is unknown to this MCP process; register a fresh QA session.",
+            )
+
+        expiry = _qa_session_expiry(entry.get("expires_at"))
+        if expiry is None or expiry <= datetime.now(timezone.utc):
+            with self._qa_session_refs_lock:
+                self._qa_session_refs.pop(token_ref, None)
+            return "", self._qa_session_ref_error(
+                "qa_session_token_ref_stale",
+                "QA session ref is stale; register a fresh QA session.",
+            )
+
+        mismatched_fields: list[str] = []
+        for field in required_scope_fields:
+            expected = str(entry.get(field) or "").strip()
+            actual = str(args.get(field) or "").strip()
+            if field == "commit_sha":
+                expected = expected.lower()
+                actual = actual.lower()
+            if not expected or not actual or expected != actual:
+                mismatched_fields.append(field)
+        if mismatched_fields:
+            return "", self._qa_session_ref_error(
+                "qa_session_token_ref_scope_mismatch",
+                "QA session ref scope does not match this request.",
+                mismatched_fields=sorted(mismatched_fields),
+            )
+        return str(entry.get("raw_token") or "").strip(), None
 
     def _governance_url(self) -> str:
         bound_owner = getattr(self._api, "__self__", None)
@@ -3894,7 +4079,10 @@ class ToolDispatcher:
             for key in ("backlog_id", "task_id", "commit_sha"):
                 if args.get(key) is not None:
                     body[key] = args[key]
-            return self._api("POST", "/api/role/assign", body)
+            return self._register_qa_session_ref(
+                args,
+                self._api("POST", "/api/role/assign", body),
+            )
 
         if name == "qa_session_heartbeat":
             pid = args["project_id"]
@@ -4313,7 +4501,16 @@ class ToolDispatcher:
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
             suffix = "guide" if name == "contract_runtime_guide" else "current-state"
-            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
             query = {
                 "response_view": (
                     "cli_guide" if name == "contract_runtime_guide" else "cli_current"
@@ -4341,7 +4538,16 @@ class ToolDispatcher:
         if name == "contract_runtime_submit_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
-            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
             body = {
                 key: value
                 for key, value in args.items()
@@ -4363,7 +4569,16 @@ class ToolDispatcher:
         if name == "contract_runtime_precheck_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
-            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
             body = {
                 key: value
                 for key, value in args.items()
@@ -4509,7 +4724,17 @@ class ToolDispatcher:
 
         if name == "graph_query":
             pid = args["project_id"]
-            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "commit_sha",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
             request_args = (
                 _worker_auth_from_env(args)
                 if str(args.get("query_source") or "").strip().lower()
@@ -4520,7 +4745,9 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in request_args.items()
-                if key not in {"project_id", "qa_session_token"} and value is not None
+                if key
+                not in {"project_id", "qa_session_token", "qa_session_token_ref"}
+                and value is not None
             }
             body.setdefault("query_source", "observer")
             body.setdefault("query_purpose", "prompt_context_build")

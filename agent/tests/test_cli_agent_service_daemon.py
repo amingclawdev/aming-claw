@@ -884,8 +884,8 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "`git rev-parse HEAD`" in prompt
     assert "full candidate SHA" in prompt
     assert "do not trust the pre-dispatch target_head_commit" in prompt
-    assert "qa_session_token or X-Gov-Token" in prompt
-    assert "never echo it, write it to a file, or write it to timeline" in prompt
+    assert "qa_session_token_ref as an opaque process-local handle" in prompt
+    assert "raw token internal and never returns it" in prompt
     assert "compact read-only CLI projections" in prompt
     assert "ContractRuntime remains the source of authority" in prompt
     for graph_argument in (
@@ -897,7 +897,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "task_id=task-guided-daemon",
         "commit_sha=<full git HEAD>",
         "repo_root={}".format(tmp_path),
-        "qa_session_token=<raw token from step 4>",
+        "qa_session_token_ref=<opaque ref from step 4>",
     ):
         assert graph_argument in prompt
     assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt
@@ -927,7 +927,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "After qa_graph_context is accepted, re-read both managed MCP",
         "run only the refreshed guide's focused exact pytest node ids",
         "exactly once for qa_independent_verification",
-        "Re-read both managed MCP projections and require",
+        "Re-read both managed MCP projections with the same",
     )
     assert [prompt.index(step) for step in ordered_steps] == sorted(
         prompt.index(step) for step in ordered_steps
@@ -946,6 +946,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "use only rg, head, narrow sed ranges, and exact pytest node ids" in prompt
     assert "Never dump full runtime, timeline, large files, or raw provider output" in prompt
     assert raw_qa_token not in prompt
+    assert "qa_session_token=<raw" not in prompt
     assert start["worktree"] == str(tmp_path)
     assert start["require_host_envelope"] is False
 

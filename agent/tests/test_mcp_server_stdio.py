@@ -293,7 +293,8 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
 
     assert returncode == 0
     assert stderr == ""
-    names = {tool["name"] for tool in responses[0]["result"]["tools"]}
+    tools = responses[0]["result"]["tools"]
+    names = {tool["name"] for tool in tools}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {
         "observer_hotfix_enter",
@@ -306,6 +307,22 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
         "runtime_context_session_token_initial_join",
         "runtime_context_session_token_reissue",
     }.issubset(names)
+    tool_by_name = {tool["name"]: tool for tool in tools}
+    assert "contract_execution_id" in tool_by_name["qa_session_register"][
+        "inputSchema"
+    ]["properties"]
+    assert "qa_session_token_ref" in tool_by_name["graph_query"]["inputSchema"][
+        "properties"
+    ]
+    for tool_name in (
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_precheck_line",
+        "contract_runtime_submit_line",
+    ):
+        properties = tool_by_name[tool_name]["inputSchema"]["properties"]
+        assert "backlog_id" in properties
+        assert "qa_session_token_ref" in properties
 
 
 def test_runtime_context_finish_time_worker_attestation_schema_requires_harness_type():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from agent.governance import mcp_server as governance_mcp_server
@@ -1756,6 +1757,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
     assert {"qa_session_register", "qa_session_heartbeat"}.issubset(names)
     assert "qa_session_token" in _tool_properties("qa_session_heartbeat")
     assert "qa_session_token" in _tool_properties("graph_query")
+    assert "qa_session_token_ref" in _tool_properties("graph_query")
     assert "qa_session_token" in _tool_properties("task_timeline_append")
     qa_register = next(
         tool for tool in TOOLS if tool.get("name") == "qa_session_register"
@@ -1766,6 +1768,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         "task_id",
         "commit_sha",
     }
+    assert "contract_execution_id" in qa_register["inputSchema"]["properties"]
     for tool_name in (
         "onboard_contract_submit_line",
         "contract_add_current",
@@ -1778,6 +1781,14 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         "contract_runtime_precheck_line",
     ):
         assert "qa_session_token" in _tool_properties(tool_name)
+    for tool_name in (
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "contract_runtime_submit_line",
+        "contract_runtime_precheck_line",
+    ):
+        assert "qa_session_token_ref" in _tool_properties(tool_name)
+        assert "backlog_id" in _tool_properties(tool_name)
 
     recorder = _AuthRecorder()
     dispatcher = ToolDispatcher(
@@ -1990,6 +2001,238 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "gov-qa-token",
         ),
     ]
+
+
+def test_mcp_qa_session_opaque_ref_roundtrip_is_scope_bound_and_header_only():
+    raw_token = "gov-qa-raw-must-stay-inside-dispatcher"
+    commit_sha = "a" * 40
+
+    class QARefRecorder(_AuthRecorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            self.calls.append((method, path, data))
+            if path == "/api/role/assign":
+                return {
+                    "session_id": "ses-qa-opaque",
+                    "principal_id": "qa:opaque",
+                    "role": "qa",
+                    "scope": [
+                        "backlog:AC-QA-OPAQUE",
+                        "task:worker-task",
+                        f"commit:{commit_sha}",
+                    ],
+                    "token": raw_token,
+                    "expires_at": "2099-07-15T12:00:00Z",
+                }
+            return {"ok": True}
+
+    recorder = QARefRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        manager_api_fn=recorder.api,
+        workspace="/repo",
+    )
+    dispatcher._api_with_role_token = recorder.api_with_role_token
+
+    registered = dispatcher.dispatch(
+        "qa_session_register",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-QA-OPAQUE",
+            "task_id": "worker-task",
+            "commit_sha": commit_sha,
+            "contract_execution_id": "cex-qa-opaque",
+            "principal_id": "qa:opaque",
+        },
+    )
+    token_ref = registered["qa_session_token_ref"]
+
+    assert token_ref.startswith("qa-session-ref-")
+    assert len(token_ref) >= 50
+    assert registered["session_id"] == "ses-qa-opaque"
+    assert registered["expires_at"] == "2099-07-15T12:00:00Z"
+    assert registered["qa_session_scope_binding"] == {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-OPAQUE",
+        "task_id": "worker-task",
+        "commit_sha": commit_sha,
+        "contract_execution_id": "cex-qa-opaque",
+        "session_id": "ses-qa-opaque",
+    }
+    assert registered["raw_qa_session_token_exposed"] is False
+    assert raw_token not in json.dumps(registered, sort_keys=True)
+    for raw_field in ("token", "raw_token", "qa_session_token", "role_token"):
+        assert raw_field not in registered
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/role/assign",
+            {
+                "project_id": "aming-claw",
+                "principal_id": "qa:opaque",
+                "role": "qa",
+                "backlog_id": "AC-QA-OPAQUE",
+                "task_id": "worker-task",
+                "commit_sha": commit_sha,
+            },
+        )
+    ]
+
+    dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-QA-OPAQUE",
+            "task_id": "worker-task",
+            "commit_sha": commit_sha,
+            "qa_session_token_ref": token_ref,
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+        },
+    )
+    for tool_name in ("contract_runtime_current", "contract_runtime_guide"):
+        dispatcher.dispatch(
+            tool_name,
+            {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-OPAQUE",
+                "contract_execution_id": "cex-qa-opaque",
+                "qa_session_token_ref": token_ref,
+            },
+        )
+    for tool_name in (
+        "contract_runtime_precheck_line",
+        "contract_runtime_submit_line",
+    ):
+        dispatcher.dispatch(
+            tool_name,
+            {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-OPAQUE",
+                "contract_execution_id": "cex-qa-opaque",
+                "qa_session_token_ref": token_ref,
+                "execution_state_revision": 11,
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+            },
+        )
+
+    assert len(recorder.auth_calls) == 5
+    assert all(call[3] == raw_token for call in recorder.auth_calls)
+    graph_body = recorder.auth_calls[0][2]
+    assert graph_body is not None
+    assert "qa_session_token_ref" not in graph_body
+    assert raw_token not in json.dumps(graph_body, sort_keys=True)
+    assert all(token_ref not in call[1] for call in recorder.auth_calls)
+    assert recorder.auth_calls[1][2] is None
+    assert recorder.auth_calls[2][2] is None
+    for line_call in recorder.auth_calls[3:]:
+        assert line_call[2]["qa_session_token_ref"] == token_ref
+        assert line_call[2]["backlog_id"] == "AC-QA-OPAQUE"
+        assert raw_token not in json.dumps(line_call[2], sort_keys=True)
+
+
+def test_mcp_qa_session_opaque_ref_rejects_unknown_stale_and_cross_scope():
+    commit_sha = "b" * 40
+
+    class QARefRecorder(_AuthRecorder):
+        def __init__(self, expires_at: str = "2099-07-15T12:00:00Z"):
+            super().__init__()
+            self.expires_at = expires_at
+
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            self.calls.append((method, path, data))
+            if path == "/api/role/assign":
+                return {
+                    "session_id": "ses-qa-scope",
+                    "principal_id": "qa:scope",
+                    "role": "qa",
+                    "scope": [],
+                    "token": "gov-qa-scope-secret",
+                    "expires_at": self.expires_at,
+                }
+            return {"ok": True}
+
+    def registered_dispatcher(expires_at: str = "2099-07-15T12:00:00Z"):
+        recorder = QARefRecorder(expires_at)
+        dispatcher = ToolDispatcher(
+            api_fn=recorder.api,
+            worker_pool=None,
+            manager_api_fn=recorder.api,
+            workspace="/repo",
+        )
+        dispatcher._api_with_role_token = recorder.api_with_role_token
+        result = dispatcher.dispatch(
+            "qa_session_register",
+            {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-SCOPE",
+                "task_id": "worker-task",
+                "commit_sha": commit_sha,
+                "contract_execution_id": "cex-qa-scope",
+            },
+        )
+        return dispatcher, recorder, result["qa_session_token_ref"]
+
+    dispatcher, recorder, token_ref = registered_dispatcher()
+    graph_args = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-SCOPE",
+        "task_id": "worker-task",
+        "commit_sha": commit_sha,
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+    }
+    unknown = dispatcher.dispatch(
+        "graph_query",
+        {**graph_args, "qa_session_token_ref": "qa-session-ref-unknown"},
+    )
+    assert unknown["error"] == "qa_session_token_ref_unknown"
+
+    mismatches = (
+        ("project_id", "other-project"),
+        ("backlog_id", "AC-OTHER"),
+        ("task_id", "other-task"),
+        ("commit_sha", "c" * 40),
+    )
+    for field, value in mismatches:
+        rejected = dispatcher.dispatch(
+            "graph_query",
+            {**graph_args, field: value, "qa_session_token_ref": token_ref},
+        )
+        assert rejected["error"] == "qa_session_token_ref_scope_mismatch"
+        assert field in rejected["mismatched_fields"]
+
+    for field, value in (
+        ("backlog_id", "AC-OTHER"),
+        ("contract_execution_id", "cex-other"),
+    ):
+        rejected = dispatcher.dispatch(
+            "contract_runtime_current",
+            {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-SCOPE",
+                "contract_execution_id": "cex-qa-scope",
+                "qa_session_token_ref": token_ref,
+                field: value,
+            },
+        )
+        assert rejected["error"] == "qa_session_token_ref_scope_mismatch"
+        assert field in rejected["mismatched_fields"]
+    assert recorder.auth_calls == []
+
+    stale_dispatcher, stale_recorder, stale_ref = registered_dispatcher(
+        "2000-01-01T00:00:00Z"
+    )
+    stale = stale_dispatcher.dispatch(
+        "graph_query",
+        {**graph_args, "qa_session_token_ref": stale_ref},
+    )
+    assert stale["error"] == "qa_session_token_ref_stale"
+    assert stale_recorder.auth_calls == []
 
 
 def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
