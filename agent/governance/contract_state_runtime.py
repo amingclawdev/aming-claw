@@ -29,7 +29,7 @@ CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION = "cli_agent_observer.contract_runti
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
-CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v5"
+CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v6"
 CLI_AGENT_QA_ONBOARD_GUIDANCE_SCHEMA_VERSION = (
     "cli_agent.qa_onboard_guidance_contract.v1"
 )
@@ -39,10 +39,19 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
         "onboard_route_guide.qa_selected_role_guidance.v1"
     ),
     "token_transport": {
-        "source": "qa_session_register.raw_token",
-        "transport": "tool_argument_or_X-Gov-Token_header_only",
+        "source": "qa_session_register.qa_session_token_ref",
+        "transport": "managed_mcp_process_local_opaque_ref_argument",
         "raw_value_exposed": False,
         "persisted": False,
+        "safe_ref_evidence_allowed": True,
+        "scope_binding": [
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "commit_sha",
+            "contract_execution_id",
+            "session_id",
+        ],
     },
     "compact_selected_role_projection": {
         "schema_version": (
@@ -104,6 +113,20 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                 {
                     "id": "qa_session_register",
                     "mcp_tool": "qa_session_register",
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "task_id": "$original_worker_task_id",
+                        "commit_sha": (
+                            "<full git HEAD from git rev-parse HEAD in "
+                            "assigned_worktree>"
+                        ),
+                        "contract_execution_id": "$contract_execution_id",
+                        "principal_id": "$principal_id",
+                    },
+                    "result_binding": {
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                 },
                 {
                     "id": "graph_query_schema",
@@ -120,7 +143,7 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                             "assigned_worktree>"
                         ),
                         "repo_root": "$assigned_worktree",
-                        "qa_session_token": "$qa_session_token",
+                        "qa_session_token_ref": "$qa_session_token_ref",
                     },
                     "required_result": "successful trace_id",
                     "blocked_before_success": [
@@ -137,6 +160,12 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                         "contract_runtime_current",
                         "contract_runtime_guide",
                     ],
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                     "requires": ["graph_query_schema.successful_trace_id"],
                     "completion_evidence": False,
                 },
@@ -150,7 +179,10 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                     ),
                     "copy_all_safe_fields": True,
                     "add_arguments": {
-                        "qa_session_token": "$qa_session_token",
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
                         "graph_trace_ids": ["<graph_query.trace_id>"],
                         "graph_query_trace_ids": ["<graph_query.trace_id>"],
                         "payload": {
@@ -166,6 +198,12 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                         "contract_runtime_current",
                         "contract_runtime_guide",
                     ],
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                     "requires": ["submit_qa_graph_context.accepted"],
                     "require_revision_advance": True,
                     "next_expected_line_id": "qa_independent_verification",
@@ -178,6 +216,20 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                 {
                     "id": "qa_session_register",
                     "mcp_tool": "qa_session_register",
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "task_id": "$original_worker_task_id",
+                        "commit_sha": (
+                            "<full git HEAD from git rev-parse HEAD in "
+                            "assigned_worktree>"
+                        ),
+                        "contract_execution_id": "$contract_execution_id",
+                        "principal_id": "$principal_id",
+                    },
+                    "result_binding": {
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                 },
                 {
                     "id": "read_refreshed_compact_contract_runtime",
@@ -185,6 +237,12 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                         "contract_runtime_current",
                         "contract_runtime_guide",
                     ],
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                     "completion_evidence": False,
                 },
                 {
@@ -203,7 +261,10 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                     ),
                     "copy_all_safe_fields": True,
                     "add_arguments": {
-                        "qa_session_token": "$qa_session_token",
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
                         "payload": {
                             "tests": "<exact pytest node ids and outcomes>",
                             "summary": "<clear PASS or FAIL summary>",
@@ -216,6 +277,12 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                         "contract_runtime_current",
                         "contract_runtime_guide",
                     ],
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "contract_execution_id": "$contract_execution_id",
+                        "qa_session_token_ref": "$qa_session_token_ref",
+                    },
                     "requires": [
                         "submit_one_qa_independent_verification.accepted"
                     ],
@@ -260,44 +327,50 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE = (
     "full candidate SHA; do not trust the pre-dispatch target_head_commit.\n"
     "4. Call qa_session_register with project_id, backlog_id, "
     "task_id=original_worker_task_id, commit_sha=<full git HEAD>, and "
-    "principal_id. Treat the returned raw token only as qa_session_token or "
-    "X-Gov-Token; never echo it, write it to a file, or write it to timeline.\n"
+    "contract_execution_id and principal_id. Keep the returned "
+    "qa_session_token_ref as an opaque process-local handle; the managed MCP "
+    "dispatcher keeps the raw token internal and never returns it.\n"
     "5. Immediately call managed MCP `graph_query` with exactly these arguments: "
     "tool=query_schema, query_source=qa, "
     "query_purpose=independent_verification, project_id={project_id}, "
     "backlog_id={backlog_id}, task_id={original_worker_task_id}, "
     "commit_sha=<full git HEAD>, repo_root={assigned_worktree}, and "
-    "qa_session_token=<raw token from step 4>. Keep the returned trace_id. "
+    "qa_session_token_ref=<opaque ref from step 4>. Keep the returned trace_id. "
     "Before this graph call succeeds, do not read ContractRuntime, run tests, "
     "or send a final response. If graph_query returns an error, stop and report "
     "only a public blocker; never include the token or raw provider output.\n"
     "6. Only after graph_query returns a successful trace_id, call managed MCP "
     "`contract_runtime_current`, then managed MCP `contract_runtime_guide`, with "
-    "project_id, contract_execution_id, and qa_session_token=<raw token>. These "
+    "project_id, backlog_id, contract_execution_id, and "
+    "qa_session_token_ref=<opaque ref>. These "
     "reads are compact read-only CLI projections; ContractRuntime remains the "
     "source of authority. Read-only current/guide calls and a process exit 0 are "
     "not completion.\n"
-    "7. Call managed MCP `contract_runtime_submit_line` for qa_graph_context. "
+    "7. Call managed MCP `contract_runtime_submit_line` for qa_graph_context "
+    "with project_id, backlog_id, and contract_execution_id. "
     "Copy every field from the refreshed guide's "
     "writer_role_safe_copy_payload.copy_payload unchanged, then add "
-    "qa_session_token=<raw token>, graph_trace_ids=[<returned trace_id>], "
+    "qa_session_token_ref=<opaque ref>, graph_trace_ids=[<returned trace_id>], "
     "graph_query_trace_ids=[<returned trace_id>], and payload with "
     "schema_version=mf_parallel.qa_graph_context.v1, "
     "graph_trace_ids=[<returned trace_id>], and "
     "graph_query_trace_ids=[<returned trace_id>]. Do not hand-author or omit "
     "safe-copy fields.\n"
     "8. After qa_graph_context is accepted, re-read both managed MCP "
-    "`contract_runtime_current` and `contract_runtime_guide`, require the "
+    "`contract_runtime_current` and `contract_runtime_guide` with the same "
+    "qa_session_token_ref, require the "
     "execution_state_revision to advance, and run only the refreshed guide's "
     "focused exact pytest node ids.\n"
     "9. Record that refreshed revision, then call `contract_runtime_submit_line` "
-    "exactly once for qa_independent_verification. Copy every field from the "
+    "exactly once for qa_independent_verification with project_id, backlog_id, "
+    "and contract_execution_id. Copy every field from the "
     "refreshed writer_role_safe_copy_payload.copy_payload unchanged, add "
-    "qa_session_token=<raw token>, and add or merge a compact payload whose "
+    "qa_session_token_ref=<opaque ref>, and add or merge a compact payload whose "
     "tests list records every exact pytest node id and outcome and whose summary "
     "starts with a clear PASS: or FAIL:. Never report PASS when any focused test "
     "failed.\n"
-    "10. Re-read both managed MCP projections and require "
+    "10. Re-read both managed MCP projections with the same "
+    "qa_session_token_ref and require "
     "execution_state_revision to be strictly greater than the revision recorded "
     "before the verdict and ContractRuntime to have advanced. If tests pass but "
     "runtime did not advance, report an explicit blocker; do not declare "

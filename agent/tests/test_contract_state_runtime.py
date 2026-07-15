@@ -407,7 +407,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["schema_version"] == (
         "cli_agent.qa_bootstrap_guide_contract.v1"
     )
-    assert binding["guide_version"] == "qa-bootstrap-guide.v5"
+    assert binding["guide_version"] == "qa-bootstrap-guide.v6"
     assert binding["guide_hash"].startswith("sha256:")
     guide_contract = contract_state_runtime.cli_agent_qa_bootstrap_guide_contract()
     assert guide_contract["guide_version"] == binding["guide_version"]
@@ -447,9 +447,12 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         "task_id={original_worker_task_id}",
         "commit_sha=<full git HEAD>",
         "repo_root={assigned_worktree}",
-        "qa_session_token=<raw token from step 4>",
+        "qa_session_token_ref=<opaque ref from step 4>",
     ):
         assert graph_argument in prompt_template
+    assert "contract_execution_id and principal_id" in prompt_template
+    assert "raw token internal and never returns it" in prompt_template
+    assert "qa_session_token=<raw" not in prompt_template
     assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt_template
     assert "schema_version=mf_parallel.qa_graph_context.v1" in prompt_template
     assert "graph_trace_ids=[<returned trace_id>]" in prompt_template
@@ -473,7 +476,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         "Call managed MCP `contract_runtime_submit_line` for qa_graph_context",
         "focused exact pytest node ids",
         "exactly once for qa_independent_verification",
-        "Re-read both managed MCP projections and require",
+        "Re-read both managed MCP projections with the same",
     ):
         assert graph_index < prompt_template.index(graph_gated_step)
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
@@ -487,12 +490,50 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
     )
     assert onboard_contract["guidance_hash"] == onboard_binding["guidance_hash"]
+    assert onboard_contract["token_transport"] == {
+        "source": "qa_session_register.qa_session_token_ref",
+        "transport": "managed_mcp_process_local_opaque_ref_argument",
+        "raw_value_exposed": False,
+        "persisted": False,
+        "safe_ref_evidence_allowed": True,
+        "scope_binding": [
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "commit_sha",
+            "contract_execution_id",
+            "session_id",
+        ],
+    }
     assert [
         step["id"]
         for step in onboard_contract["line_contracts"]["qa_graph_context"][
             "ordered_steps"
         ][:2]
     ] == ["qa_session_register", "graph_query_schema"]
+    expected_register_arguments = {
+        "project_id": "$project_id",
+        "backlog_id": "$backlog_id",
+        "task_id": "$original_worker_task_id",
+        "commit_sha": (
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ),
+        "contract_execution_id": "$contract_execution_id",
+        "principal_id": "$principal_id",
+    }
+    for line_id in ("qa_graph_context", "qa_independent_verification"):
+        register_step = onboard_contract["line_contracts"][line_id][
+            "ordered_steps"
+        ][0]
+        assert register_step["arguments"] == expected_register_arguments
+        assert register_step["result_binding"] == {
+            "qa_session_token_ref": "$qa_session_token_ref"
+        }
+    graph_arguments = onboard_contract["line_contracts"]["qa_graph_context"][
+        "ordered_steps"
+    ][1]["arguments"]
+    assert graph_arguments["qa_session_token_ref"] == "$qa_session_token_ref"
+    assert "qa_session_token" not in graph_arguments
     compact_projection = onboard_contract["compact_selected_role_projection"]
     assert compact_projection["projection_version"] == (
         "qa-selected-role-compact.v1"
@@ -537,7 +578,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     monkeypatch.setattr(
         contract_state_runtime,
         "CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION",
-        "qa-bootstrap-guide.v4",
+        "qa-bootstrap-guide.v5",
     )
     previous_bootstrap = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
@@ -545,7 +586,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     )
     assert previous_bootstrap["qa_bootstrap_guide_contract"][
         "guide_version"
-    ] == "qa-bootstrap-guide.v4"
+    ] == "qa-bootstrap-guide.v5"
     assert previous_bootstrap["qa_bootstrap_guide_contract"] != binding
     assert previous_bootstrap["ticket_id"] != issued["ticket_id"]
     assert previous_bootstrap["ticket_hash"] != issued["ticket_hash"]
@@ -565,13 +606,13 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
         "CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION",
         original_bootstrap_version,
     )
-    deterministic_v5 = build_cli_agent_execution_ticket(
+    deterministic_v6 = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
         launch_identity=launch,
     )
-    assert deterministic_v5["ticket_id"] == issued["ticket_id"]
-    assert deterministic_v5["ticket_hash"] == issued["ticket_hash"]
-    assert deterministic_v5["qa_bootstrap_guide_contract"] == binding
+    assert deterministic_v6["ticket_id"] == issued["ticket_id"]
+    assert deterministic_v6["ticket_hash"] == issued["ticket_hash"]
+    assert deterministic_v6["qa_bootstrap_guide_contract"] == binding
 
     original_onboard_version = (
         contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION

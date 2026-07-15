@@ -38504,6 +38504,19 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
         "submit_qa_graph_context",
         "reread_after_qa_graph_context",
     ]
+    assert steps[0]["arguments"] == {
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "task_id": "original-worker-task",
+        "commit_sha": (
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ),
+        "contract_execution_id": "cex-mf-parallel-qa-current-line",
+        "principal_id": "qa:original-worker-task",
+    }
+    assert steps[0]["result_binding"]["qa_session_token_ref"][
+        "raw_value_exposed"
+    ] is False
     graph = steps[1]
     assert graph["arguments"] == {
         "tool": "query_schema",
@@ -38516,11 +38529,20 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
             "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
         ),
         "repo_root": "/tmp/assigned-qa-worktree",
-        "qa_session_token": {
-            "source": "qa_session_register.raw_token",
-            "transport": "tool_argument_or_X-Gov-Token_header_only",
+        "qa_session_token_ref": {
+            "source": "qa_session_register.qa_session_token_ref",
+            "transport": "managed_mcp_process_local_opaque_ref_argument",
             "raw_value_exposed": False,
             "persisted": False,
+            "safe_ref_evidence_allowed": True,
+            "scope_binding": [
+                "project_id",
+                "backlog_id",
+                "task_id",
+                "commit_sha",
+                "contract_execution_id",
+                "session_id",
+            ],
         },
     }
     assert graph["blocked_before_success"] == [
@@ -38656,7 +38678,9 @@ def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances
         "tests": "<exact pytest node ids and outcomes>",
         "summary": "<clear PASS or FAIL summary>",
     }
-    assert verdict["add_arguments"]["qa_session_token"]["raw_value_exposed"] is False
+    assert verdict["add_arguments"]["qa_session_token_ref"][
+        "raw_value_exposed"
+    ] is False
     assert steps[4]["revision_must_be_strictly_greater"] is True
     assert steps[4]["read_only_or_process_exit_zero_is_completion"] is False
 
@@ -38771,11 +38795,20 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
             contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
         ),
     }
-    assert compact_guidance["token_descriptor"]["qa_session_token"] == {
-        "source": "qa_session_register.raw_token",
-        "transport": "tool_argument_or_X-Gov-Token_header_only",
+    assert compact_guidance["token_descriptor"]["qa_session_token_ref"] == {
+        "source": "qa_session_register.qa_session_token_ref",
+        "transport": "managed_mcp_process_local_opaque_ref_argument",
         "raw_value_exposed": False,
         "persisted": False,
+        "safe_ref_evidence_allowed": True,
+        "scope_binding": [
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "commit_sha",
+            "contract_execution_id",
+            "session_id",
+        ],
     }
     assert response["onboard_route_guide"][
         "selected_role_guidance_path"
@@ -55699,7 +55732,7 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
     assert ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in ticket["profile_requirements"]
     assert ticket["qa_bootstrap_guide_contract"]["guide_version"] == (
-        "qa-bootstrap-guide.v5"
+        "qa-bootstrap-guide.v6"
     )
     assert ticket["qa_bootstrap_guide_contract"]["guide_hash"].startswith(
         "sha256:"

@@ -53387,9 +53387,11 @@ def _onboard_selected_qa_contract_runtime_guidance(
     replacements: dict[str, Any] = {
         "$project_id": project_id,
         "$backlog_id": backlog_id,
+        "$contract_execution_id": execution_id,
         "$original_worker_task_id": worker_task_id,
+        "$principal_id": f"qa:{worker_task_id}",
         "$assigned_worktree": repo_root,
-        "$qa_session_token": dict(token_transport),
+        "$qa_session_token_ref": dict(token_transport),
     }
     unresolved_placeholders: set[str] = set()
 
@@ -55735,7 +55737,7 @@ def _qa_onboard_compact_selected_role_response(
         "canonical_dispatch_identity": canonical_dispatch_identity,
         "contract_runtime_authority": contract_runtime_authority,
         "token_descriptor": {
-            "qa_session_token": deepcopy(
+            "qa_session_token_ref": deepcopy(
                 guidance_contract.get("token_transport") or {}
             ),
             "route_token_ref": route_token_descriptor,
