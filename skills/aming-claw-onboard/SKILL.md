@@ -78,6 +78,18 @@ instructions.
   `parallel_branch_merge_queue_apply`. Timeline implementation events are
   append-only compatibility projections and never override canonical
   ContractRuntime worker implementation or worker commit state.
+- At the `mf_parallel.v2` `worker_finish_gate` step, never submit a graph-trace
+  placeholder such as `<worker-owned-graph-query-trace-id>`. If the copy-safe
+  finish-gate payload lacks a concrete worker trace already verified in the
+  governance DB, especially after resume, redeploy, or reconcile, the same
+  worker must run exactly one current worker-scoped `graph_query` using its
+  existing `runtime_context_id`, `task_id`, `parent_task_id`, `fence_token`,
+  `session_token_ref`, and `target_project_root`, then substitute the returned
+  trace id into `graph_trace_ids`. Preserve accepted read, startup,
+  implementation, git commit, `worker_commit`, and finish-attestation lines;
+  never repeat them. A `missing_worker_graph_trace_evidence` rejection is
+  non-mutating: retry the finish gate once, and only after that graph query
+  succeeds.
 - Route-token-ref renewal must preserve or narrow the existing project,
   backlog/task, allowed-actions, target-files, and owned-files scope. If the
   observer session is stale, heartbeat or register an observer session before
