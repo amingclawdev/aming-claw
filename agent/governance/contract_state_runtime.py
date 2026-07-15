@@ -29,7 +29,7 @@ CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION = "cli_agent_observer.contract_runti
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
-CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v1"
+CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v2"
 CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
     "cli_agent.managed_profile_tooling_contract.v1"
 )
@@ -59,14 +59,19 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE = (
     "task_id=original_worker_task_id, commit_sha=<full git HEAD>, and "
     "principal_id. Treat the returned raw token only as qa_session_token or "
     "X-Gov-Token; never echo it, write it to a file, or write it to timeline.\n"
-    "2. Read ContractRuntime current and guide for contract_execution_id.\n"
+    "2. Call managed MCP `contract_runtime_current`, then managed MCP "
+    "`contract_runtime_guide`, for contract_execution_id. These reads are "
+    "compact CLI projections; ContractRuntime remains the source of authority.\n"
     "3. Run the bounded QA graph query, then submit qa_graph_context exactly as "
     "the current guide requires.\n"
-    "4. Re-read the guide and run only its focused tests.\n"
+    "4. After every accepted ContractRuntime line, re-read both managed MCP "
+    "`contract_runtime_current` and `contract_runtime_guide` before the next "
+    "action. After qa_graph_context is accepted, run only the refreshed guide's "
+    "focused tests.\n"
     "5. Submit exactly one independent_verification verdict.\n"
-    "6. Re-read current and confirm ContractRuntime accepted the verdict and "
-    "advanced. If tests pass but runtime did not advance, report an explicit "
-    "blocker; do not declare operational success.\n"
+    "6. Re-read both managed MCP projections and confirm ContractRuntime accepted "
+    "the verdict and advanced. If tests pass but runtime did not advance, report "
+    "an explicit blocker; do not declare operational success.\n"
     "Degree control: use only rg, head, narrow sed ranges, and exact pytest node "
     "ids. Never dump full runtime, timeline, large files, or raw provider output."
 )
