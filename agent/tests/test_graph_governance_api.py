@@ -35,6 +35,7 @@ from agent.governance import task_timeline
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     _mf_parallel_worker_commit_errors,
+    _next_action_from_record,
     _worker_implementation_lineage,
 )
 from agent.governance.db import _ensure_schema
@@ -38394,6 +38395,257 @@ def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_rol
     assert qa_guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
         "qa_session_register"
     )
+
+
+def _selected_qa_runtime_guidance(
+    line_id: str,
+    action: str,
+    *,
+    include_dispatch: bool = True,
+    conflicting_worktree: bool = False,
+) -> dict[str, Any]:
+    completed_lines = []
+    if include_dispatch:
+        completed_lines.append({
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "actor_role": "observer",
+            "payload": {
+                "task_id": "original-worker-task",
+                "worktree_path": "/tmp/assigned-qa-worktree",
+                "target_project_root": "/tmp/canonical-project-root",
+                **(
+                    {"assigned_worktree": "/tmp/conflicting-assigned-worktree"}
+                    if conflicting_worktree
+                    else {}
+                ),
+            },
+        })
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "contract_execution_id": "cex-mf-parallel-qa-current-line",
+        "contract_id": "mf_parallel",
+        "runtime_guide": {
+            "completed_lines": completed_lines,
+            "next_legal_action": {
+                "stage_id": "qa_graph_context" if line_id == "qa_graph_context" else "qa",
+                "line_id": line_id,
+                "action": action,
+                "evidence_kind": "graph_trace" if line_id == "qa_graph_context" else "independent_verification",
+                "owner_role": "qa",
+                "allowed_writer_roles": ["qa"],
+            },
+        },
+    }
+    return server._onboard_selected_qa_contract_runtime_guidance(
+        record,
+        next_legal_action=_next_action_from_record(record),
+    )
+
+
+def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe():
+    guidance = _selected_qa_runtime_guidance(
+        "qa_graph_context",
+        "record_graph_trace",
+    )
+
+    assert guidance["next_action"]["line_id"] == "qa_graph_context"
+    assert guidance["next_action"]["action"] == "record_graph_trace"
+    assert guidance["current_line_id"] == "qa_graph_context"
+    assert guidance["current_action"] == "record_graph_trace"
+    assert guidance["source_of_authority"] == "contract_runtime"
+    assert guidance["authority_decision_source"] == (
+        "backlog_contract_chain_current"
+    )
+    assert guidance["contract_execution_id"] == "cex-mf-parallel-qa-current-line"
+    assert guidance["current_action_source"] == "backlog_contract_chain_current"
+    steps = guidance["ordered_steps"]
+    assert [step["id"] for step in steps] == [
+        "qa_session_register",
+        "graph_query_schema",
+        "read_compact_contract_runtime",
+        "submit_qa_graph_context",
+        "reread_after_qa_graph_context",
+    ]
+    graph = steps[1]
+    assert graph["arguments"] == {
+        "tool": "query_schema",
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "task_id": "original-worker-task",
+        "commit_sha": (
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ),
+        "repo_root": "/tmp/assigned-qa-worktree",
+        "qa_session_token": {
+            "source": "qa_session_register.raw_token",
+            "transport": "tool_argument_or_X-Gov-Token_header_only",
+            "raw_value_exposed": False,
+            "persisted": False,
+        },
+    }
+    assert graph["blocked_before_success"] == [
+        "contract_runtime_current",
+        "contract_runtime_guide",
+        "focused_tests",
+        "qa_independent_verification",
+    ]
+    assert graph["on_error"] == "report_public_blocker_only"
+    assert steps[2]["requires"] == ["graph_query_schema.successful_trace_id"]
+    submit = steps[3]
+    assert submit["copy_payload_source"].endswith(
+        "writer_role_safe_copy_payload.copy_payload"
+    )
+    assert submit["copy_all_safe_fields"] is True
+    assert submit["add_arguments"]["graph_trace_ids"] == [
+        "<graph_query.trace_id>"
+    ]
+    assert submit["add_arguments"]["graph_query_trace_ids"] == [
+        "<graph_query.trace_id>"
+    ]
+    assert submit["add_arguments"]["payload"] == {
+        "schema_version": "mf_parallel.qa_graph_context.v1",
+        "graph_trace_ids": ["<graph_query.trace_id>"],
+        "graph_query_trace_ids": ["<graph_query.trace_id>"],
+    }
+    assert "raw-qa-secret" not in json.dumps(guidance)
+
+    blocked = _selected_qa_runtime_guidance(
+        "qa_graph_context", "record_graph_trace", include_dispatch=False
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["executable"] is False
+    assert blocked["ordered_steps"] == []
+    assert blocked["blocker"]["missing_fields"] == ["task_id", "repo_root"]
+    assert "graph_query" not in json.dumps(blocked)
+
+    conflict = _selected_qa_runtime_guidance(
+        "qa_graph_context", "record_graph_trace", conflicting_worktree=True
+    )
+    assert conflict["executable"] is False
+    assert conflict["blocker"]["conflicting_fields"] == ["worktree_path"]
+    assert "graph_query" not in json.dumps(conflict)
+
+
+def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances():
+    guidance = _selected_qa_runtime_guidance(
+        "qa_independent_verification",
+        "record_independent_verification",
+    )
+
+    assert guidance["next_action"]["line_id"] == "qa_independent_verification"
+    assert guidance["next_action"]["action"] == "record_independent_verification"
+    assert guidance["current_line_id"] == "qa_independent_verification"
+    assert guidance["current_action"] == "record_independent_verification"
+    assert guidance["redundant_graph_query_required"] is False
+    steps = guidance["ordered_steps"]
+    assert [step["id"] for step in steps] == [
+        "qa_session_register",
+        "read_refreshed_compact_contract_runtime",
+        "run_focused_exact_tests",
+        "submit_one_qa_independent_verification",
+        "confirm_strict_revision_advance",
+    ]
+    assert all(step.get("mcp_tool") != "graph_query" for step in steps)
+    assert steps[1]["completion_evidence"] is False
+    assert steps[2]["exact_node_ids_only"] is True
+    verdict = steps[3]
+    assert verdict["line_id"] == "qa_independent_verification"
+    assert verdict["exactly_once"] is True
+    assert verdict["copy_payload_source"].endswith(
+        "writer_role_safe_copy_payload.copy_payload"
+    )
+    assert verdict["copy_all_safe_fields"] is True
+    assert verdict["add_arguments"]["payload"] == {
+        "tests": "<exact pytest node ids and outcomes>",
+        "summary": "<clear PASS or FAIL summary>",
+    }
+    assert verdict["add_arguments"]["qa_session_token"]["raw_value_exposed"] is False
+    assert steps[4]["revision_must_be_strictly_greater"] is True
+    assert steps[4]["read_only_or_process_exit_zero_is_completion"] is False
+
+
+def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-ONBOARD-QA-ACTIVE-CHILD-DISPATCH"
+    worker_task_id = "handler-original-worker-task"
+    canonical_root = tmp_path / "canonical-project-root"
+    assigned_worktree = tmp_path / "assigned-worktree"
+    canonical_root.mkdir()
+    assigned_worktree.mkdir()
+    head_commit = _init_test_git_repo(assigned_worktree)
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="handler-parent-task",
+        worker_task_id=worker_task_id,
+        fence_token="fence-handler-active-child",
+        token="token-handler-active-child",
+        worktree_path=str(assigned_worktree),
+        target_project_root=str(canonical_root),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=runtime_context.fence_token,
+        graph_trace_id="gqt-handler-active-child-worker",
+        head_commit=head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-handler-active-child-worker",
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+    )
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+        )
+    )
+    assert current["next_legal_action"]["line_id"] == "qa_graph_context"
+    projected_before_service = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    assert projected_before_service["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+
+    response = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "qa",
+                "work_type": "qa_verification",
+            },
+        )
+    )
+
+    guidance = response["agent_onboard_guidance"]["selected_role_guidance"]
+    assert response["next_legal_action"]["contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
+    assert guidance["current_line_id"] == "qa_graph_context"
+    graph_args = guidance["ordered_steps"][1]["arguments"]
+    assert runtime_context.target_project_root != runtime_context.worktree_path
+    assert graph_args["task_id"] == worker_task_id
+    assert graph_args["repo_root"] == runtime_context.worktree_path
+    assert response["onboard_route_guide"]["selected_role_guidance"] == guidance
 
 
 def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(conn):

@@ -53196,10 +53196,187 @@ def _direct_fix_branch_service_takeover_guidance() -> dict[str, Any]:
     }
 
 
+def _onboard_selected_qa_contract_runtime_guidance(
+    record: Mapping[str, Any],
+    *,
+    next_legal_action: Mapping[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Overlay selected-QA guidance for ContractRuntime's current line."""
+    action = dict(next_legal_action or {})
+    line_id = str(action.get("line_id") or "").strip()
+    if line_id not in {"qa_graph_context", "qa_independent_verification"}:
+        return {}
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(
+        action.get("contract_execution_id") or record.get("contract_execution_id") or ""
+    ).strip()
+    current_action = str(action.get("action") or action.get("id") or line_id).strip()
+    authority = str(
+        action.get("source_of_authority") or "contract_runtime"
+    ).strip()
+    authority_source = str(
+        action.get("authority_decision_source") or "backlog_contract_chain_current"
+    ).strip()
+    dispatch_record = (
+        qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
+    )
+    dispatch_line: Mapping[str, Any] = {}
+    for _index, candidate in reversed(
+        _contract_runtime_completed_lines(dispatch_record)
+    ):
+        if (
+            str(candidate.get("stage_id") or "").strip() == "dispatch"
+            and str(candidate.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+            and str(candidate.get("evidence_kind") or "").strip()
+            == "dispatch_bounded_worker"
+            and str(candidate.get("actor_role") or "").strip() == "observer"
+        ):
+            dispatch_line = candidate
+            break
+    dispatch_payload = (
+        dispatch_line.get("payload")
+        if isinstance(dispatch_line.get("payload"), Mapping)
+        else {}
+    )
+
+    def _dispatch_identity(*aliases: str) -> tuple[str, bool, bool]:
+        values = {
+            str(source.get(alias) or "").strip()
+            for source in (dispatch_line, dispatch_payload)
+            for alias in aliases
+            if str(source.get(alias) or "").strip()
+        }
+        return (
+            next(iter(values)) if len(values) == 1 else "",
+            len(values) > 1,
+            bool(values),
+        )
+
+    worker_task_id, task_conflict, _task_present = _dispatch_identity(
+        "task_id", "worker_task_id"
+    )
+    worktree, worktree_conflict, worktree_present = _dispatch_identity(
+        "worktree_path", "worker_worktree_path", "assigned_worktree"
+    )
+    target_root, target_root_conflict, _target_root_present = _dispatch_identity(
+        "target_project_root", "project_root", "repo_root"
+    )
+    repo_root = worktree if worktree_present else target_root
+    missing = [
+        field for field, value in (("task_id", worker_task_id), ("repo_root", repo_root))
+        if not value
+    ]
+    conflicts = [
+        field for field, conflict in (
+            ("task_id", task_conflict),
+            ("worktree_path", worktree_conflict),
+            ("target_project_root", target_root_conflict),
+        )
+        if conflict
+    ]
+    if missing or conflicts:
+        return {
+            "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
+            "next_action": action, "contract_execution_id": execution_id,
+            "current_line_id": line_id, "current_action": current_action,
+            "current_action_source": str(action.get("source") or "ContractRuntime.next_legal_action"),
+            "source_of_authority": authority,
+            "authority_decision_source": authority_source,
+            "status": "blocked", "executable": False, "ordered_steps": [],
+            "blocker": {
+                "id": "qa_canonical_dispatch_identity_unavailable",
+                "source": "ContractRuntime.completed_lines.observer_dispatch_bounded_workers",
+                "missing_fields": missing,
+                "conflicting_fields": conflicts,
+            },
+        }
+    token = {
+        "source": "qa_session_register.raw_token",
+        "transport": "tool_argument_or_X-Gov-Token_header_only",
+        "raw_value_exposed": False, "persisted": False,
+    }
+    full_head = "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+    register = {"id": "qa_session_register", "mcp_tool": "qa_session_register"}
+    action_source = str(
+        action.get("source") or "ContractRuntime.next_legal_action"
+    ).strip()
+    read_tools = ["contract_runtime_current", "contract_runtime_guide"]
+    copy_source = "contract_runtime_guide.writer_role_safe_copy_payload.copy_payload"
+    if line_id == "qa_graph_context":
+        trace_ref = "<graph_query.trace_id>"
+        graph_arguments = {
+            "tool": "query_schema", "query_source": "qa",
+            "query_purpose": "independent_verification", "project_id": project_id,
+            "backlog_id": backlog_id, "task_id": worker_task_id,
+            "commit_sha": full_head, "repo_root": repo_root, "qa_session_token": token,
+        }
+        trace_payload = {
+            "graph_trace_ids": [trace_ref], "graph_query_trace_ids": [trace_ref]
+        }
+        steps = [register, {
+            "id": "graph_query_schema", "mcp_tool": "graph_query",
+            "arguments": graph_arguments,
+            "required_result": "successful trace_id",
+            "blocked_before_success": [*read_tools, "focused_tests", "qa_independent_verification"],
+            "on_error": "report_public_blocker_only",
+        }, {
+            "id": "read_compact_contract_runtime", "mcp_tools": read_tools,
+            "requires": ["graph_query_schema.successful_trace_id"],
+            "completion_evidence": False,
+        }, {
+            "id": "submit_qa_graph_context", "mcp_tool": "contract_runtime_submit_line",
+            "line_id": line_id, "copy_payload_source": copy_source,
+            "copy_all_safe_fields": True,
+            "add_arguments": {"qa_session_token": token, **trace_payload,
+                "payload": {"schema_version": "mf_parallel.qa_graph_context.v1", **trace_payload}},
+        }, {
+            "id": "reread_after_qa_graph_context", "mcp_tools": read_tools,
+            "requires": ["submit_qa_graph_context.accepted"],
+            "require_revision_advance": True, "next_expected_line_id": "qa_independent_verification",
+        }]
+    else:
+        steps = [register, {
+            "id": "read_refreshed_compact_contract_runtime", "mcp_tools": read_tools,
+            "completion_evidence": False,
+        }, {
+            "id": "run_focused_exact_tests", "exact_node_ids_only": True,
+            "test_source": "refreshed_contract_runtime_guide",
+        }, {
+            "id": "submit_one_qa_independent_verification",
+            "mcp_tool": "contract_runtime_submit_line", "line_id": line_id,
+            "exactly_once": True, "copy_payload_source": copy_source,
+            "copy_all_safe_fields": True,
+            "add_arguments": {"qa_session_token": token, "payload": {
+                "tests": "<exact pytest node ids and outcomes>",
+                "summary": "<clear PASS or FAIL summary>"}},
+        }, {
+            "id": "confirm_strict_revision_advance",
+            "mcp_tools": read_tools,
+            "requires": ["submit_one_qa_independent_verification.accepted"],
+            "revision_must_be_strictly_greater": True,
+            "read_only_or_process_exit_zero_is_completion": False,
+        }]
+    return {
+        "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
+        "next_action": action,
+        "contract_execution_id": execution_id,
+        "current_line_id": line_id,
+        "current_action": current_action,
+        "current_action_source": action_source,
+        "source_of_authority": authority,
+        "authority_decision_source": authority_source,
+        "ordered_steps": steps, "redundant_graph_query_required": False,
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
     next_legal_action: Mapping[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -53532,6 +53709,13 @@ def _onboard_contract_route_guide(
         "raw_qa_session_token_exposed": False,
         "raw_route_token_exposed": False,
     }
+    qa_entry.update(
+        _onboard_selected_qa_contract_runtime_guidance(
+            record,
+            next_legal_action=next_legal_action,
+            qa_runtime_record=qa_runtime_record,
+        )
+    )
     direct_main_allowed_files = _onboard_contract_route_issue_target_files_from_record(
         record
     )
@@ -54154,6 +54338,7 @@ def _onboard_contract_agent_guidance(
     *,
     next_legal_action: Mapping[str, Any],
     selected_role: str = "",
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -54208,6 +54393,7 @@ def _onboard_contract_agent_guidance(
     route_guide = _onboard_contract_route_guide(
         record,
         next_legal_action=next_legal_action,
+        qa_runtime_record=qa_runtime_record,
     )
     role_entries = (
         route_guide.get("role_entries")
@@ -54578,6 +54764,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     next_action: dict[str, Any],
     current_projection: dict[str, Any],
     runtime_resume: dict[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> None:
     if str(next_action.get("action") or "") == "no_runtime_action":
         return
@@ -54789,6 +54976,19 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
             patched_next_action=patched_next_action,
         )
     route_guide = guidance.get("onboard_route_guide")
+    if str(guidance.get("role") or "").strip() == "qa":
+        overlay = _onboard_selected_qa_contract_runtime_guidance(
+            record,
+            next_legal_action=patched_next_action,
+            qa_runtime_record=qa_runtime_record,
+        )
+        for container in (guidance, route_guide):
+            if isinstance(container, dict):
+                selected = dict(container.get("selected_role_guidance") or {})
+                selected.update(overlay)
+                container["selected_role_guidance"] = selected
+        if isinstance(route_guide, dict) and isinstance(route_guide.get("role_entries"), dict):
+            route_guide["role_entries"]["qa"] = dict(route_guide["selected_role_guidance"])
     if isinstance(route_guide, dict):
         route_guide["route_token_ref"] = current_ref
         route_guide["route_token_ref_present"] = bool(current_ref)
@@ -55356,6 +55556,26 @@ def _onboard_route_guide_service_response(
     current_projection = _contract_chain_current_with_runtime_authority_overlay(
         current_projection
     )
+    preexisting_next_action = (
+        preexisting_projection.get("next_legal_action")
+        if isinstance(preexisting_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if (
+        str(role or "").strip() == "qa"
+        and str(preexisting_next_action.get("line_id") or "").strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+    ):
+        current_projection = _contract_chain_current_with_backlog_close_blocker(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            current_projection=preexisting_projection,
+            route_token_ref=route_token_ref,
+        )
+        current_projection = _contract_chain_current_with_runtime_authority_overlay(
+            current_projection
+        )
     projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
@@ -55496,10 +55716,33 @@ def _onboard_route_guide_service_response(
                 runtime_resume=runtime_resume,
                 backlog_row_status=backlog_row_status,
             )
+    qa_runtime_record: Mapping[str, Any] | None = None
+    if (
+        str(role or "").strip() == "qa"
+        and str(next_action.get("line_id") or "").strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+    ):
+        qa_runtime_record = {}
+        qa_execution_id = _onboard_route_guide_target_contract_execution_id(
+            next_action=next_action,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+        )
+        try:
+            candidate = _contract_runtime_store(conn).get(qa_execution_id)
+        except ContractRuntimeError:
+            candidate = {}
+        if (
+            str(candidate.get("project_id") or "") == project_id
+            and str(candidate.get("backlog_id") or "") == backlog_id
+            and not _onboard_service_record(candidate)
+        ):
+            qa_runtime_record = candidate
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
         selected_role=str(role or "").strip() or "observer",
+        qa_runtime_record=qa_runtime_record,
     )
     if current_projection:
         guidance["contract_chain_current"] = current_projection
@@ -55533,6 +55776,7 @@ def _onboard_route_guide_service_response(
         next_action=next_action,
         current_projection=current_projection,
         runtime_resume=runtime_resume,
+        qa_runtime_record=qa_runtime_record,
     )
     return {
         "schema_version": "onboard_route_guide.service_response.v1",
