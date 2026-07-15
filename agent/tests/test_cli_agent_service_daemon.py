@@ -74,6 +74,7 @@ def _guided_profile(
     profile_id="profile-codex-a",
     backend_mode="codex_cli",
     max_concurrency=1,
+    roles=("mf_sub",),
 ):
     from cli_agent_service.models import (
         AgentProfile,
@@ -106,7 +107,7 @@ def _guided_profile(
         launcher_adapter=LauncherAdapter(launcher_id="launcher-codex-guided"),
         role_policy=RolePolicy(
             policy_id="policy-codex-guided",
-            roles=("mf_sub",),
+            roles=roles,
             project_ids=("aming-claw",),
             max_concurrency=max_concurrency,
         ),
@@ -131,6 +132,7 @@ def _guided_ticket_and_selectors(
     profile_id="profile-codex-a",
     profile_role="mf_sub",
     retry_policy=None,
+    role="mf_sub",
 ):
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
     from cli_agent_service.service import _stable_json_hash
@@ -143,25 +145,31 @@ def _guided_ticket_and_selectors(
         "route_token_ref": "rtok-guided-daemon",
         "visible_injection_manifest_hash": "sha256:" + ("d" * 64),
     }
+    is_qa = role == "qa"
+    task_id = "qa-task-guided-daemon" if is_qa else "task-guided-daemon"
+    worker_id = "qa:task-guided-daemon" if is_qa else "worker-guided-daemon"
     profile_requirements = {
-        "profile_id": profile_id,
-        "role": "mf_sub",
+        "role": role,
         "harness": "codex",
         "provider": "openai",
         "model": "gpt-5.4-codex",
     }
+    if not is_qa:
+        profile_requirements["profile_id"] = profile_id
     action = {
-        "id": "worker_dispatch",
-        "action": "dispatch_bounded_worker",
-        "stage_id": "dispatch",
-        "line_id": "observer_dispatch_bounded_workers",
-        "evidence_kind": "dispatch_bounded_worker",
-        "owner_role": "observer",
-        "worker_role": "mf_sub",
+        "id": "qa_graph_context" if is_qa else "worker_dispatch",
+        "action": "dispatch_bounded_qa" if is_qa else "dispatch_bounded_worker",
+        "stage_id": "qa" if is_qa else "dispatch",
+        "line_id": (
+            "qa_graph_context" if is_qa else "observer_dispatch_bounded_workers"
+        ),
+        "evidence_kind": "graph_trace" if is_qa else "dispatch_bounded_worker",
+        "owner_role": "qa" if is_qa else "observer",
+        "worker_role": role,
         "runtime_context_id": "mfrctx-guided-daemon",
-        "task_id": "task-guided-daemon",
-        "worker_id": "worker-guided-daemon",
-        "worker_slot_id": "worker-guided-daemon",
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
         "observer_command_id": "command-guided-daemon",
         "parent_task_id": "AC-GUIDED-DAEMON",
         "target_project_root": str(tmp_path),
@@ -197,7 +205,11 @@ def _guided_ticket_and_selectors(
     }
     authority = {
         "source_of_authority": "ContractRuntime",
-        "authority_decision_source": "contract_runtime_completed_dispatch_line",
+        "authority_decision_source": (
+            "contract_runtime_qa_execution_ticket"
+            if is_qa
+            else "contract_runtime_completed_dispatch_line"
+        ),
         "project_id": "aming-claw",
         "backlog_id": "AC-GUIDED-DAEMON",
         "contract_execution_id": "cex-guided-daemon",
@@ -234,7 +246,6 @@ def _guided_ticket_and_selectors(
         "worker_slot_id": action["worker_slot_id"],
         "observer_command_id": action["observer_command_id"],
         "role": action["worker_role"],
-        "profile_id": profile_id,
         "principal_id": action["worker_id"],
         "expected_execution_state_revision": 7,
         "expected_execution_state_hash": authority["execution_state_hash"],
@@ -245,6 +256,8 @@ def _guided_ticket_and_selectors(
         "model": "gpt-5.4-codex",
         "backend_mode": "codex_cli",
     }
+    if not is_qa:
+        selectors["profile_id"] = profile_id
     return ticket, selectors
 
 
@@ -556,6 +569,93 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert response["provider_output_suppressed"] is True
     assert session_token not in public
     assert fence_token not in public
+
+
+def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
+    tmp_path,
+    monkeypatch,
+):
+    import cli_agent_service.service as service_module
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(_guided_profile(roles=("qa",)))
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+        role="qa",
+    )
+    assert "profile_id" not in ticket["profile_requirements"]
+    assert "profile_id" not in selectors
+    raw_qa_token = "raw-qa-session-token-must-not-appear"
+
+    def resolve_ticket(request, *, qa_session_token):
+        assert request["task_id"] == "qa-task-guided-daemon"
+        assert qa_session_token == raw_qa_token
+        return dict(ticket)
+
+    monkeypatch.setattr(
+        service_module,
+        "resolve_governance_execution_ticket",
+        resolve_ticket,
+    )
+
+    response = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "qa_session_token": raw_qa_token,
+        },
+        qa_mode=True,
+    )
+
+    assert response["status"] == "started"
+    assert response["role"] == "qa"
+    assert len(supervisor.starts) == 1
+    _run, start = supervisor.starts[0]
+    prompt = start["prompt"]
+    for coordinate in (
+        "project_id=aming-claw",
+        "backlog_id=AC-GUIDED-DAEMON",
+        "contract_execution_id=cex-guided-daemon",
+        "runtime_context_id=mfrctx-guided-daemon",
+        "qa_task_id=qa-task-guided-daemon",
+        "original_worker_task_id=task-guided-daemon",
+        "principal_id=qa:task-guided-daemon",
+        "assigned_worktree={}".format(tmp_path),
+    ):
+        assert coordinate in prompt
+    assert "Aming Claw onboard/plugin" in prompt
+    assert "do not guess or call a curl endpoint" in prompt
+    assert "`git rev-parse HEAD`" in prompt
+    assert "full candidate SHA" in prompt
+    assert "do not trust the pre-dispatch target_head_commit" in prompt
+    assert "qa_session_token or X-Gov-Token" in prompt
+    assert "never echo it, write it to a file, or write it to timeline" in prompt
+    ordered_steps = (
+        "Call qa_session_register",
+        "Read ContractRuntime current and guide",
+        "submit qa_graph_context",
+        "run only its focused tests",
+        "Submit exactly one independent_verification verdict",
+        "Re-read current and confirm ContractRuntime accepted",
+    )
+    assert [prompt.index(step) for step in ordered_steps] == sorted(
+        prompt.index(step) for step in ordered_steps
+    )
+    assert "If tests pass but runtime did not advance, report an explicit blocker" in prompt
+    assert "do not declare operational success" in prompt
+    assert "use only rg, head, narrow sed ranges, and exact pytest node ids" in prompt
+    assert "Never dump full runtime, timeline, large files, or raw provider output" in prompt
+    assert raw_qa_token not in prompt
+    assert start["worktree"] == str(tmp_path)
+    assert start["require_host_envelope"] is False
 
 
 def test_daemon_admits_absent_profile_role_and_passes_canonical_role_to_scheduler(
