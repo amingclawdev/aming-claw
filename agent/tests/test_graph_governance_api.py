@@ -38402,6 +38402,7 @@ def _selected_qa_runtime_guidance(
     action: str,
     *,
     include_dispatch: bool = True,
+    conflicting_dispatch: bool = False,
 ) -> dict[str, Any]:
     completed_lines = []
     if include_dispatch:
@@ -38413,6 +38414,11 @@ def _selected_qa_runtime_guidance(
             "payload": {
                 "task_id": "original-worker-task",
                 "worktree_path": "/tmp/assigned-qa-worktree",
+                **(
+                    {"target_project_root": "/tmp/conflicting-project-root"}
+                    if conflicting_dispatch
+                    else {}
+                ),
             },
         })
     record = {
@@ -38516,6 +38522,13 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert blocked["blocker"]["missing_fields"] == ["task_id", "repo_root"]
     assert "graph_query" not in json.dumps(blocked)
 
+    conflict = _selected_qa_runtime_guidance(
+        "qa_graph_context", "record_graph_trace", conflicting_dispatch=True
+    )
+    assert conflict["executable"] is False
+    assert conflict["blocker"]["conflicting_fields"] == ["repo_root"]
+    assert "graph_query" not in json.dumps(conflict)
+
 
 def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances():
     guidance = _selected_qa_runtime_guidance(
@@ -38553,6 +38566,102 @@ def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances
     assert verdict["add_arguments"]["qa_session_token"]["raw_value_exposed"] is False
     assert steps[4]["revision_must_be_strictly_greater"] is True
     assert steps[4]["read_only_or_process_exit_zero_is_completion"] is False
+
+
+def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(conn):
+    backlog_id = "AC-ONBOARD-QA-ACTIVE-CHILD-DISPATCH"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    child_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent["contract_execution_id"],
+        "qa-active-child-dispatch",
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.start_execution(
+        server.MF_PARALLEL_CONTRACT_ID,
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=child_execution_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
+        root_contract_execution_id=parent["contract_execution_id"],
+        contract_chain_id=parent["contract_chain_id"],
+        role_binding={"observer": "observer", "mf_sub": "mf_sub", "qa": "qa"},
+        backlog_lineage={"project_id": PID, "backlog_id": backlog_id},
+    )
+    specs = [
+        ("observer", "orchestration", "observer_prefill_child_contracts", "contract_binding"),
+        ("observer", "dispatch", "observer_dispatch_bounded_workers", "dispatch_bounded_worker"),
+        ("mf_sub", "worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("mf_sub", "worker_startup", "worker_startup", "mf_subagent_startup"),
+        ("mf_sub", "worker_context", "worker_graph_context", "graph_trace"),
+        ("mf_sub", "worker_implementation", "worker_implementation", "implementation"),
+        ("mf_sub", "worker_commit", "worker_commit", "worker_commit"),
+        ("mf_sub", "worker_attestation", "worker_finish_time_attestation", "record_finish_time_worker_attestation"),
+        ("mf_sub", "worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
+        ("mf_sub", "qa_handoff", "worker_review_ready_handoff", "review_ready"),
+    ]
+    completed_lines = [
+        {
+            "actor_role": actor_role,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "evidence_kind": evidence_kind,
+            **(
+                {"payload": {
+                    "task_id": "handler-original-worker-task",
+                    "worktree_path": "/tmp/handler-assigned-worktree",
+                }}
+                if line_id == "observer_dispatch_bounded_workers"
+                else {}
+            ),
+            **({"db_verified": True} if line_id == "worker_graph_context" else {}),
+        }
+        for actor_role, stage_id, line_id, evidence_kind in specs
+    ]
+    projected = runtime.projected_record(
+        child_execution_id,
+        actor_role="qa",
+        completed_lines=completed_lines,
+    )
+    assert projected["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+    runtime.store.update(child_execution_id, projected)
+    child = runtime.store.get(child_execution_id)
+    server.upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent,
+        child_record=child,
+        edge_kind="mf_parallel_child",
+        binding_kind="mf_parallel_child_current",
+    )
+
+    response = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "qa",
+                "work_type": "qa_verification",
+            },
+        )
+    )
+
+    guidance = response["agent_onboard_guidance"]["selected_role_guidance"]
+    assert response["next_legal_action"]["contract_execution_id"] == child_execution_id
+    assert guidance["current_line_id"] == "qa_graph_context"
+    graph_args = guidance["ordered_steps"][1]["arguments"]
+    assert graph_args["task_id"] == "handler-original-worker-task"
+    assert graph_args["repo_root"] == "/tmp/handler-assigned-worktree"
+    assert response["onboard_route_guide"]["selected_role_guidance"] == guidance
 
 
 def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(conn):

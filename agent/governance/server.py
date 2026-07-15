@@ -53200,6 +53200,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
     record: Mapping[str, Any],
     *,
     next_legal_action: Mapping[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Overlay selected-QA guidance for ContractRuntime's current line."""
     action = dict(next_legal_action or {})
@@ -53218,8 +53219,13 @@ def _onboard_selected_qa_contract_runtime_guidance(
     authority_source = str(
         action.get("authority_decision_source") or "backlog_contract_chain_current"
     ).strip()
+    dispatch_record = (
+        qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
+    )
     dispatch_line: Mapping[str, Any] = {}
-    for _index, candidate in reversed(_contract_runtime_completed_lines(record)):
+    for _index, candidate in reversed(
+        _contract_runtime_completed_lines(dispatch_record)
+    ):
         if (
             str(candidate.get("stage_id") or "").strip() == "dispatch"
             and str(candidate.get("line_id") or "").strip()
@@ -53237,15 +53243,13 @@ def _onboard_selected_qa_contract_runtime_guidance(
     )
 
     def _dispatch_identity(*aliases: str) -> tuple[str, bool]:
-        for alias in aliases:
-            values = {
-                str(source.get(alias) or "").strip()
-                for source in (dispatch_line, dispatch_payload)
-                if str(source.get(alias) or "").strip()
-            }
-            if values:
-                return (next(iter(values)) if len(values) == 1 else "", len(values) > 1)
-        return "", False
+        values = {
+            str(source.get(alias) or "").strip()
+            for source in (dispatch_line, dispatch_payload)
+            for alias in aliases
+            if str(source.get(alias) or "").strip()
+        }
+        return (next(iter(values)) if len(values) == 1 else "", len(values) > 1)
 
     worker_task_id, task_conflict = _dispatch_identity("task_id", "worker_task_id")
     worktree, worktree_conflict = _dispatch_identity(
@@ -53358,6 +53362,7 @@ def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
     next_legal_action: Mapping[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -53694,6 +53699,7 @@ def _onboard_contract_route_guide(
         _onboard_selected_qa_contract_runtime_guidance(
             record,
             next_legal_action=next_legal_action,
+            qa_runtime_record=qa_runtime_record,
         )
     )
     direct_main_allowed_files = _onboard_contract_route_issue_target_files_from_record(
@@ -54318,6 +54324,7 @@ def _onboard_contract_agent_guidance(
     *,
     next_legal_action: Mapping[str, Any],
     selected_role: str = "",
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_id = str(record.get("project_id") or "")
     backlog_id = str(record.get("backlog_id") or "")
@@ -54372,6 +54379,7 @@ def _onboard_contract_agent_guidance(
     route_guide = _onboard_contract_route_guide(
         record,
         next_legal_action=next_legal_action,
+        qa_runtime_record=qa_runtime_record,
     )
     role_entries = (
         route_guide.get("role_entries")
@@ -54742,6 +54750,7 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     next_action: dict[str, Any],
     current_projection: dict[str, Any],
     runtime_resume: dict[str, Any],
+    qa_runtime_record: Mapping[str, Any] | None = None,
 ) -> None:
     if str(next_action.get("action") or "") == "no_runtime_action":
         return
@@ -54955,7 +54964,9 @@ def _onboard_route_guide_apply_runtime_route_token_scope(
     route_guide = guidance.get("onboard_route_guide")
     if str(guidance.get("role") or "").strip() == "qa":
         overlay = _onboard_selected_qa_contract_runtime_guidance(
-            record, next_legal_action=patched_next_action
+            record,
+            next_legal_action=patched_next_action,
+            qa_runtime_record=qa_runtime_record,
         )
         for container in (guidance, route_guide):
             if isinstance(container, dict):
@@ -55671,10 +55682,33 @@ def _onboard_route_guide_service_response(
                 runtime_resume=runtime_resume,
                 backlog_row_status=backlog_row_status,
             )
+    qa_runtime_record: Mapping[str, Any] | None = None
+    if (
+        str(role or "").strip() == "qa"
+        and str(next_action.get("line_id") or "").strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+    ):
+        qa_runtime_record = {}
+        qa_execution_id = _onboard_route_guide_target_contract_execution_id(
+            next_action=next_action,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+        )
+        try:
+            candidate = _contract_runtime_store(conn).get(qa_execution_id)
+        except ContractRuntimeError:
+            candidate = {}
+        if (
+            str(candidate.get("project_id") or "") == project_id
+            and str(candidate.get("backlog_id") or "") == backlog_id
+            and not _onboard_service_record(candidate)
+        ):
+            qa_runtime_record = candidate
     guidance = _onboard_contract_agent_guidance(
         record,
         next_legal_action=next_action,
         selected_role=str(role or "").strip() or "observer",
+        qa_runtime_record=qa_runtime_record,
     )
     if current_projection:
         guidance["contract_chain_current"] = current_projection
@@ -55708,6 +55742,7 @@ def _onboard_route_guide_service_response(
         next_action=next_action,
         current_projection=current_projection,
         runtime_resume=runtime_resume,
+        qa_runtime_record=qa_runtime_record,
     )
     return {
         "schema_version": "onboard_route_guide.service_response.v1",
