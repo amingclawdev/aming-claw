@@ -101,6 +101,12 @@ instructions.
   never start a concurrent retry. If an unready AI provider leaves the candidate
   running, first confirm it is the same run, then have the observer stop it
   through a manager-owned redeploy and issue exactly one non-AI retry.
+- For post-merge current-full route proof, the submitted `task_id` or
+  `contract_execution_id` must exactly match the selected observer
+  `route_token_ref` server-registered task scope. A parent observer ref uses its
+  parent task scope (for example, `qa-role-admission-r1`), never a worker task
+  guessed from RuntimeContext. A route-proof rejection before run creation is
+  non-mutating; correct it once with the same `snapshot_id` and `run_id`.
 - Runtime resume guidance prefers live `backlog_contract_chain_current` /
   ContractRuntime current state. Treat compact-ledger resume as recovery
   fallback only when the live projection is missing or unrebuildable.
