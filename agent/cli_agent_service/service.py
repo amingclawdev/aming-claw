@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from governance.contract_state_runtime import (
+    cli_agent_managed_profile_tooling_binding,
     cli_agent_qa_bootstrap_guide_binding,
     cli_agent_qa_bootstrap_guide_contract,
 )
@@ -39,6 +40,7 @@ from .profile_control import (
     ManagedProfileControl,
     PROFILE_OPERATIONS,
     ProfileControlError,
+    ProfileToolingError,
 )
 from .supervisor import CodexC0Supervisor
 
@@ -819,6 +821,13 @@ class CliAgentService:
             != cli_agent_qa_bootstrap_guide_binding()
         ):
             integrity_mismatches.append("qa_bootstrap_guide_contract")
+        ticket_tooling_binding = ticket.get("managed_profile_tooling_contract")
+        if qa_mode and (
+            not isinstance(ticket_tooling_binding, Mapping)
+            or dict(ticket_tooling_binding)
+            != cli_agent_managed_profile_tooling_binding()
+        ):
+            integrity_mismatches.append("managed_profile_tooling_contract")
         if integrity_mismatches:
             raise ServiceError(
                 "ContractRuntime ticket integrity is invalid: "
@@ -1060,6 +1069,27 @@ class CliAgentService:
                 failure_category="scheduled_identity_mismatch",
             )
             raise ServiceError("scheduler result does not match the canonical ticket")
+        if str(profile.credential_ref.ref_kind or "").strip() == "provider_home":
+            try:
+                self.profile_control.resolve_profile_home(profile)
+            except ProfileToolingError as exc:
+                self.registry.record_exit(
+                    run.run_id,
+                    127,
+                    failure_category="managed_profile_tooling_unavailable",
+                )
+                raise ServiceError(
+                    "managed Codex profile tooling bootstrap failed"
+                ) from exc
+            except ProfileControlError as exc:
+                self.registry.record_exit(
+                    run.run_id,
+                    127,
+                    failure_category="managed_profile_configuration_unavailable",
+                )
+                raise ServiceError(
+                    "managed Codex profile configuration is unavailable"
+                ) from exc
         prompt = (
             "Proceed as the allocated Aming Claw {role} worker.\n"
             "Runtime context: {runtime_context_id}\n"

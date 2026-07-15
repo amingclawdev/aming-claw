@@ -21,6 +21,15 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v1"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
+    "cli_agent.managed_profile_tooling_contract.v1"
+)
+CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION = "managed-profile-tooling.v1"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_ID = "aming-claw@aming-claw-local"
+CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_VERSION = (
+    "0.1.1+codex.20260713045902"
+)
+CLI_AGENT_MANAGED_PROFILE_TOOLING_MCP_SERVER = "aming-claw"
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE = (
     "Proceed as the ContractRuntime-authorized independent QA verifier.\n"
     "Copy-safe canonical coordinates:\n"
@@ -3553,6 +3562,34 @@ def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
     }
 
 
+def cli_agent_managed_profile_tooling_contract() -> dict[str, Any]:
+    """Return the copy-safe managed-profile plugin/MCP bootstrap contract."""
+
+    material = {
+        "schema_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION,
+        "tooling_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION,
+        "plugin_id": CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_ID,
+        "plugin_version": CLI_AGENT_MANAGED_PROFILE_TOOLING_PLUGIN_VERSION,
+        "mcp_server_name": CLI_AGENT_MANAGED_PROFILE_TOOLING_MCP_SERVER,
+        "bootstrap_source": "repository_source_snapshot",
+        "required_visibility": ["plugin", "mcp_server"],
+        "credential_policy": "preserve_managed_profile_auth",
+        "desktop_plugin_cache_source_allowed": False,
+    }
+    return {**material, "tooling_hash": _stable_json_hash(material)}
+
+
+def cli_agent_managed_profile_tooling_binding() -> dict[str, str]:
+    """Return the immutable tooling binding carried outside profile selectors."""
+
+    contract = cli_agent_managed_profile_tooling_contract()
+    return {
+        "schema_version": str(contract["schema_version"]),
+        "tooling_version": str(contract["tooling_version"]),
+        "tooling_hash": str(contract["tooling_hash"]),
+    }
+
+
 _CLI_AGENT_TICKET_ROUTE_FIELDS = (
     "route_id",
     "route_context_hash",
@@ -4049,6 +4086,9 @@ def build_cli_agent_execution_ticket(
     if authority_decision_source == "contract_runtime_qa_execution_ticket":
         material["qa_bootstrap_guide_contract"] = (
             cli_agent_qa_bootstrap_guide_binding()
+        )
+        material["managed_profile_tooling_contract"] = (
+            cli_agent_managed_profile_tooling_binding()
         )
     material_hash = _stable_json_hash(material)
     ticket_id = "caet-" + material_hash.removeprefix("sha256:")[:24]

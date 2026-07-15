@@ -3,8 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+from governance.contract_state_runtime import (
+    cli_agent_managed_profile_tooling_binding,
+    cli_agent_managed_profile_tooling_contract,
+)
+
+try:
+    from agent.plugin_installer import (
+        CODEX_MARKETPLACE_NAME,
+        configure_codex_plugin,
+        install_codex_marketplace,
+        install_codex_plugin_cache,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
+    from plugin_installer import (  # type: ignore
+        CODEX_MARKETPLACE_NAME,
+        configure_codex_plugin,
+        install_codex_marketplace,
+        install_codex_plugin_cache,
+    )
 
 from .adapters.codex_cli import (
     CODEX_CLI_DEFAULT_MODEL,
@@ -43,6 +69,10 @@ _MANAGED_PROVIDER_ALIASES = {"codex": "codex", "openai": "codex"}
 
 class ProfileControlError(ValueError):
     """A fixed profile-control request was invalid or not ready."""
+
+
+class ProfileToolingError(ProfileControlError):
+    """A managed profile could not satisfy its plugin/MCP contract."""
 
 
 def _managed_provider(value: Any) -> str:
@@ -124,9 +154,260 @@ class ManagedProfileControl:
         self,
         registry: AgentRegistry,
         auth_controller: ProfileAuthController,
+        *,
+        plugin_source_root: str | os.PathLike[str] | None = None,
+        tooling_runner: Callable[..., Any] | None = None,
+        tooling_timeout_seconds: float = 10.0,
     ) -> None:
         self.registry = registry
         self.auth_controller = auth_controller
+        self.plugin_source_root = (
+            Path(plugin_source_root).expanduser().resolve()
+            if plugin_source_root is not None
+            else Path(__file__).resolve().parents[2]
+        )
+        self.tooling_runner = tooling_runner or subprocess.run
+        self.tooling_timeout_seconds = max(float(tooling_timeout_seconds), 0.05)
+        self._tooling_lock = threading.RLock()
+
+    @staticmethod
+    def _auth_file_identity(profile_home: Path) -> tuple[int, ...] | None:
+        auth_path = profile_home / "auth.json"
+        try:
+            stat = auth_path.stat()
+        except FileNotFoundError:
+            return None
+        return (
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_mode),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+
+    @staticmethod
+    def _tooling_marker_path(profile_home: Path) -> Path:
+        return profile_home / "managed-tooling" / "readiness.json"
+
+    @staticmethod
+    def _read_tooling_marker(profile_home: Path) -> dict[str, Any]:
+        try:
+            value = json.loads(
+                ManagedProfileControl._tooling_marker_path(profile_home).read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _write_tooling_marker(
+        profile_home: Path,
+        *,
+        contract: Mapping[str, Any],
+    ) -> None:
+        marker_path = ManagedProfileControl._tooling_marker_path(profile_home)
+        marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "cli_agent_service.managed_profile_tooling_readiness.v1",
+            "ready": True,
+            "tooling_contract": cli_agent_managed_profile_tooling_binding(),
+            "plugin_id": str(contract["plugin_id"]),
+            "plugin_version": str(contract["plugin_version"]),
+            "mcp_server_name": str(contract["mcp_server_name"]),
+            "repository_source_snapshot": True,
+            "desktop_plugin_cache_copied": False,
+            "raw_credentials_copied": False,
+        }
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".{}.".format(marker_path.name),
+            suffix=".tmp",
+            dir=marker_path.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            descriptor = -1
+            with handle:
+                handle.write(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, marker_path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+
+    def _source_tooling_contract(self) -> dict[str, Any]:
+        contract = cli_agent_managed_profile_tooling_contract()
+        try:
+            manifest = json.loads(
+                (self.plugin_source_root / ".codex-plugin" / "plugin.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            mcp = json.loads(
+                (self.plugin_source_root / ".mcp.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            raise ProfileToolingError(
+                "managed Codex profile tooling source is invalid"
+            ) from exc
+        servers = mcp.get("mcpServers") if isinstance(mcp, Mapping) else None
+        if (
+            not isinstance(manifest, Mapping)
+            or str(manifest.get("name") or "")
+            != str(contract["plugin_id"]).split("@", 1)[0]
+            or str(manifest.get("version") or "") != str(contract["plugin_version"])
+            or not isinstance(servers, Mapping)
+            or str(contract["mcp_server_name"]) not in servers
+        ):
+            raise ProfileToolingError(
+                "managed Codex profile tooling source does not match its contract"
+            )
+        return contract
+
+    @staticmethod
+    def _tooling_environment(profile_home: Path) -> dict[str, str]:
+        environment = dict(os.environ)
+        for key in (
+            "AMING_WORKER_SESSION_TOKEN",
+            "AMING_WORKER_FENCE_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "OPENAI_ACCESS_TOKEN",
+            "CODEX_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+        ):
+            environment.pop(key, None)
+        environment.update(
+            {
+                "CODEX_HOME": str(profile_home),
+                "CI": "1",
+                "NO_COLOR": "1",
+                "TERM": "dumb",
+            }
+        )
+        return environment
+
+    def _run_tooling_probe(
+        self,
+        profile_home: Path,
+        *args: str,
+    ) -> Any:
+        try:
+            executable = self.auth_controller.codex.resolve_executable()
+            return self.tooling_runner(
+                (executable, *args),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.tooling_timeout_seconds,
+                stdin=subprocess.DEVNULL,
+                env=self._tooling_environment(profile_home),
+                cwd=str(self.plugin_source_root),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProfileToolingError(
+                "managed Codex profile tooling visibility probe failed"
+            ) from exc
+
+    def _tooling_is_visible(
+        self,
+        profile_home: Path,
+        *,
+        contract: Mapping[str, Any],
+    ) -> bool:
+        plugin_result = self._run_tooling_probe(
+            profile_home,
+            "plugin",
+            "list",
+            "--json",
+        )
+        mcp_result = self._run_tooling_probe(profile_home, "mcp", "list", "--json")
+        if int(plugin_result.returncode) != 0 or int(mcp_result.returncode) != 0:
+            return False
+        try:
+            plugins = json.loads(str(plugin_result.stdout or ""))
+            mcp_servers = json.loads(str(mcp_result.stdout or ""))
+        except (json.JSONDecodeError, TypeError):
+            return False
+        installed = plugins.get("installed") if isinstance(plugins, Mapping) else None
+        if not isinstance(installed, list) or not isinstance(mcp_servers, list):
+            return False
+        plugin_ready = any(
+            isinstance(item, Mapping)
+            and str(item.get("pluginId") or "") == str(contract["plugin_id"])
+            and str(item.get("version") or "") == str(contract["plugin_version"])
+            and item.get("installed") is True
+            and item.get("enabled") is True
+            for item in installed
+        )
+        mcp_ready = any(
+            isinstance(item, Mapping)
+            and str(item.get("name") or "") == str(contract["mcp_server_name"])
+            and item.get("enabled") is True
+            for item in mcp_servers
+        )
+        return plugin_ready and mcp_ready
+
+    def ensure_profile_tooling(self, profile_home: Path) -> dict[str, Any]:
+        """Idempotently make repository-source plugin/MCP tooling visible."""
+
+        with self._tooling_lock:
+            contract = self._source_tooling_contract()
+            binding = cli_agent_managed_profile_tooling_binding()
+            marker = self._read_tooling_marker(profile_home)
+            auth_before = self._auth_file_identity(profile_home)
+            try:
+                if (
+                    marker.get("ready") is True
+                    and marker.get("tooling_contract") == binding
+                    and self._tooling_is_visible(profile_home, contract=contract)
+                ):
+                    return dict(marker)
+                marketplace_root = (
+                    profile_home / "managed-tooling" / CODEX_MARKETPLACE_NAME
+                )
+                install_codex_plugin_cache(
+                    self.plugin_source_root,
+                    codex_home=profile_home,
+                    python_executable=sys.executable,
+                )
+                install_codex_marketplace(
+                    self.plugin_source_root,
+                    marketplace_root=marketplace_root,
+                    python_executable=sys.executable,
+                )
+                configure_codex_plugin(
+                    codex_config=profile_home / "config.toml",
+                    marketplace_root=marketplace_root,
+                )
+                if not self._tooling_is_visible(profile_home, contract=contract):
+                    raise ProfileToolingError(
+                        "managed Codex profile tooling is not visible"
+                    )
+                self._write_tooling_marker(profile_home, contract=contract)
+            except ProfileToolingError:
+                raise
+            except BaseException as exc:
+                raise ProfileToolingError(
+                    "managed Codex profile tooling bootstrap failed"
+                ) from exc
+            finally:
+                if self._auth_file_identity(profile_home) != auth_before:
+                    raise ProfileToolingError(
+                        "managed Codex profile auth changed during tooling bootstrap"
+                    )
+            return self._read_tooling_marker(profile_home)
 
     @staticmethod
     def _validate_payload(
@@ -254,6 +535,7 @@ class ManagedProfileControl:
         supplied_home = Path(status.profile_home).resolve()
         if supplied_home != expected_home or not expected_home.is_dir():
             raise ProfileControlError("managed profile home identity is invalid")
+        self.ensure_profile_tooling(expected_home)
         return expected_home
 
     def dispatch(
@@ -287,6 +569,7 @@ __all__ = [
     "ManagedProfileControl",
     "ProfileControl",
     "ProfileControlError",
+    "ProfileToolingError",
     "PROFILE_OPERATIONS",
     "PROFILE_LIST_OPERATION",
     "PROFILE_LOGIN_PREPARE_OPERATION",

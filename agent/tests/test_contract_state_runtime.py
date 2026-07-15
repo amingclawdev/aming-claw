@@ -402,6 +402,15 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["guide_version"] == "qa-bootstrap-guide.v1"
     assert binding["guide_hash"].startswith("sha256:")
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
+    tooling_binding = issued["managed_profile_tooling_contract"]
+    assert tooling_binding["schema_version"] == (
+        "cli_agent.managed_profile_tooling_contract.v1"
+    )
+    assert tooling_binding["tooling_version"] == "managed-profile-tooling.v1"
+    assert tooling_binding["tooling_hash"].startswith("sha256:")
+    assert "managed_profile_tooling_contract" not in issued[
+        "profile_requirements"
+    ]
 
     same = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
@@ -410,6 +419,33 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert same["ticket_id"] == issued["ticket_id"]
     assert same["ticket_hash"] == issued["ticket_hash"]
     assert same["qa_bootstrap_guide_contract"] == binding
+    assert same["managed_profile_tooling_contract"] == tooling_binding
+
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION",
+        contract_state_runtime.CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION
+        + ".changed",
+    )
+    tooling_changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert tooling_changed["status"] == "issued"
+    assert tooling_changed["execution_state_revision"] == issued[
+        "execution_state_revision"
+    ]
+    assert tooling_changed["dispatch_identity_hash"] == issued[
+        "dispatch_identity_hash"
+    ]
+    assert tooling_changed["profile_requirements"] == issued[
+        "profile_requirements"
+    ]
+    assert tooling_changed["retry_policy"] == issued["retry_policy"]
+    assert tooling_changed["managed_profile_tooling_contract"] != tooling_binding
+    assert tooling_changed["ticket_id"] != issued["ticket_id"]
+    assert tooling_changed["ticket_hash"] != issued["ticket_hash"]
 
     monkeypatch.setattr(
         contract_state_runtime,
@@ -423,13 +459,21 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     )
 
     assert changed["status"] == "issued"
-    assert changed["execution_state_revision"] == issued["execution_state_revision"]
-    assert changed["dispatch_identity_hash"] == issued["dispatch_identity_hash"]
-    assert changed["profile_requirements"] == issued["profile_requirements"]
-    assert changed["retry_policy"] == issued["retry_policy"]
-    assert changed["qa_bootstrap_guide_contract"] != binding
-    assert changed["ticket_id"] != issued["ticket_id"]
-    assert changed["ticket_hash"] != issued["ticket_hash"]
+    assert changed["execution_state_revision"] == tooling_changed[
+        "execution_state_revision"
+    ]
+    assert changed["dispatch_identity_hash"] == tooling_changed[
+        "dispatch_identity_hash"
+    ]
+    assert changed["profile_requirements"] == tooling_changed[
+        "profile_requirements"
+    ]
+    assert changed["retry_policy"] == tooling_changed["retry_policy"]
+    assert changed["qa_bootstrap_guide_contract"] != tooling_changed[
+        "qa_bootstrap_guide_contract"
+    ]
+    assert changed["ticket_id"] != tooling_changed["ticket_id"]
+    assert changed["ticket_hash"] != tooling_changed["ticket_hash"]
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():

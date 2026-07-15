@@ -280,6 +280,32 @@ def test_managed_profile_launch_uses_exact_server_home_and_strips_provider_env(
     executable = _fake_codex(tmp_path)
 
     def ready_runner(command, **_kwargs):
+        args = tuple(command[1:])
+        if args == ("plugin", "list", "--json"):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "installed": [
+                            {
+                                "pluginId": "aming-claw@aming-claw-local",
+                                "version": "0.1.1+codex.20260713045902",
+                                "installed": True,
+                                "enabled": True,
+                            }
+                        ]
+                    }
+                ),
+                "",
+            )
+        if args == ("mcp", "list", "--json"):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps([{"name": "aming-claw", "enabled": True}]),
+                "",
+            )
         return subprocess.CompletedProcess(command, 0, "Logged in", "")
 
     registry = AgentRegistry(tmp_path / "managed-registry" / "runs.db")
@@ -288,7 +314,11 @@ def test_managed_profile_launch_uses_exact_server_home_and_strips_provider_env(
         codex_executable=str(executable),
         runner=ready_runner,
     )
-    control = ManagedProfileControl(registry, auth)
+    control = ManagedProfileControl(
+        registry,
+        auth,
+        tooling_runner=ready_runner,
+    )
     control.prepare_login("profile-codex-managed")
     control.activate("profile-codex-managed")
     profile = registry.get_profile("profile-codex-managed")

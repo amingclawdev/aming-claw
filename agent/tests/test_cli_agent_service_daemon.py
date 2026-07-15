@@ -75,6 +75,7 @@ def _guided_profile(
     backend_mode="codex_cli",
     max_concurrency=1,
     roles=("mf_sub",),
+    ref_kind="inherited_current",
 ):
     from cli_agent_service.models import (
         AgentProfile,
@@ -102,7 +103,7 @@ def _guided_profile(
         credential_ref=CredentialRef(
             ref_id="credential:codex-home:inherited",
             provider="openai",
-            ref_kind="inherited_current",
+            ref_kind=ref_kind,
         ),
         launcher_adapter=LauncherAdapter(launcher_id="launcher-codex-guided"),
         role_policy=RolePolicy(
@@ -577,7 +578,12 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
 ):
     import cli_agent_service.service as service_module
     from cli_agent_service.registry import AgentRegistry
-    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+    from cli_agent_service.service import (
+        CliAgentService,
+        ServiceError,
+        ServicePaths,
+        _stable_json_hash,
+    )
     from governance import contract_state_runtime
 
     registry = AgentRegistry(tmp_path / "registry" / "runs.db")
@@ -596,6 +602,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "profile_id" not in old_ticket["profile_requirements"]
     assert "profile_id" not in selectors
     assert "qa_bootstrap_guide_contract" not in selectors
+    assert "managed_profile_tooling_contract" not in selectors
     raw_qa_token = "raw-qa-session-token-must-not-appear"
     active_ticket = {"value": old_ticket}
     schedule_requests = []
@@ -610,6 +617,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     def resolve_ticket(request, *, qa_session_token):
         assert request["task_id"] == "qa-task-guided-daemon"
         assert "qa_bootstrap_guide_contract" not in request
+        assert "managed_profile_tooling_contract" not in request
         assert qa_session_token == raw_qa_token
         return dict(active_ticket["value"])
 
@@ -618,6 +626,28 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "resolve_governance_execution_ticket",
         resolve_ticket,
     )
+
+    for invalid_binding in (None, {"tooling_hash": "sha256:stale"}):
+        invalid_ticket = dict(old_ticket)
+        if invalid_binding is None:
+            invalid_ticket.pop("managed_profile_tooling_contract")
+        else:
+            invalid_ticket["managed_profile_tooling_contract"] = invalid_binding
+        invalid_material = dict(invalid_ticket)
+        invalid_material.pop("ticket_hash", None)
+        invalid_ticket["ticket_hash"] = _stable_json_hash(invalid_material)
+        active_ticket["value"] = invalid_ticket
+        with pytest.raises(ServiceError, match="managed_profile_tooling_contract"):
+            service._admit_governed_host_envelope_run(
+                {
+                    "authority_selectors": selectors,
+                    "qa_session_token": raw_qa_token,
+                },
+                qa_mode=True,
+            )
+    assert schedule_requests == []
+    assert supervisor.starts == []
+    active_ticket["value"] = old_ticket
 
     old_response = service._admit_governed_host_envelope_run(
         {
@@ -633,6 +663,47 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
 
     monkeypatch.setattr(
         contract_state_runtime,
+        "CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION",
+        contract_state_runtime.CLI_AGENT_MANAGED_PROFILE_TOOLING_VERSION
+        + ".daemon-change",
+    )
+    with pytest.raises(ServiceError, match="managed_profile_tooling_contract"):
+        service._admit_governed_host_envelope_run(
+            {
+                "authority_selectors": selectors,
+                "qa_session_token": raw_qa_token,
+            },
+            qa_mode=True,
+        )
+    assert len(schedule_requests) == 1
+    tooling_ticket, tooling_selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+        role="qa",
+    )
+    assert tooling_selectors == selectors
+    assert tooling_ticket["ticket_id"] != old_ticket["ticket_id"]
+    assert tooling_ticket["dispatch_identity_hash"] == old_ticket[
+        "dispatch_identity_hash"
+    ]
+    assert tooling_ticket["retry_policy"] == old_ticket["retry_policy"]
+    assert tooling_ticket["managed_profile_tooling_contract"] != old_ticket[
+        "managed_profile_tooling_contract"
+    ]
+    active_ticket["value"] = tooling_ticket
+    tooling_response = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "qa_session_token": raw_qa_token,
+        },
+        qa_mode=True,
+    )
+    registry.record_exit(tooling_response["run_id"], 0)
+    assert registry.get_run(old_response["run_id"]).state == "completed"
+    assert registry.get_run(tooling_response["run_id"]).state == "completed"
+
+    monkeypatch.setattr(
+        contract_state_runtime,
         "CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE",
         contract_state_runtime.CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE
         + "\nVersioned daemon guide change.",
@@ -645,14 +716,14 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
             },
             qa_mode=True,
         )
-    assert len(schedule_requests) == 1
+    assert len(schedule_requests) == 2
     new_ticket, new_selectors = _guided_ticket_and_selectors(
         tmp_path,
         profile_role="qa",
         role="qa",
     )
     assert new_selectors == selectors
-    assert new_ticket["ticket_id"] != old_ticket["ticket_id"]
+    assert new_ticket["ticket_id"] != tooling_ticket["ticket_id"]
     assert new_ticket["dispatch_identity_hash"] == old_ticket[
         "dispatch_identity_hash"
     ]
@@ -671,14 +742,19 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert response["role"] == "qa"
     assert response["run_id"] != old_response["run_id"]
     assert registry.get_run(old_response["run_id"]).state == "completed"
+    assert registry.get_run(tooling_response["run_id"]).state == "completed"
     assert registry.get_run(response["run_id"]) is not None
-    assert len(supervisor.starts) == 2
-    assert len(schedule_requests) == 2
+    assert len(supervisor.starts) == 3
+    assert len(schedule_requests) == 3
     for schedule_request in schedule_requests:
         assert "qa_bootstrap_guide_contract" not in schedule_request[
             "profile_requirements"
         ]
         assert "qa_bootstrap_guide_contract" not in schedule_request
+        assert "managed_profile_tooling_contract" not in schedule_request[
+            "profile_requirements"
+        ]
+        assert "managed_profile_tooling_contract" not in schedule_request
     _run, start = supervisor.starts[-1]
     prompt = start["prompt"]
     for coordinate in (
@@ -717,6 +793,61 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert raw_qa_token not in prompt
     assert start["worktree"] == str(tmp_path)
     assert start["require_host_envelope"] is False
+
+
+def test_daemon_reports_managed_tooling_failure_before_spawn(tmp_path, monkeypatch):
+    import cli_agent_service.service as service_module
+    from cli_agent_service.profile_control import ProfileToolingError
+    from cli_agent_service.registry import AgentRegistry
+    from cli_agent_service.service import CliAgentService, ServiceError, ServicePaths
+
+    registry = AgentRegistry(tmp_path / "registry" / "runs.db")
+    registry.register_profile(
+        _guided_profile(roles=("qa",), ref_kind="provider_home")
+    )
+    supervisor = _RecordingSupervisor(registry)
+    service = CliAgentService(
+        ServicePaths.from_state_dir(tmp_path / "state"),
+        registry=registry,
+        supervisor=supervisor,
+    )
+    ticket, selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+        role="qa",
+    )
+
+    def resolve_ticket(_request, *, qa_session_token):
+        assert qa_session_token == "transient-qa-token"
+        return dict(ticket)
+
+    def fail_profile_tooling(_profile):
+        raise ProfileToolingError("injected tooling failure")
+
+    monkeypatch.setattr(
+        service_module,
+        "resolve_governance_execution_ticket",
+        resolve_ticket,
+    )
+    service.profile_control.resolve_profile_home = fail_profile_tooling
+
+    with pytest.raises(
+        ServiceError,
+        match="managed Codex profile tooling bootstrap failed",
+    ):
+        service._admit_governed_host_envelope_run(
+            {
+                "authority_selectors": selectors,
+                "qa_session_token": "transient-qa-token",
+            },
+            qa_mode=True,
+        )
+
+    record = registry.get_run("run-{}".format(ticket["ticket_id"]))
+    assert record is not None
+    assert record.state == "failed"
+    assert record.lease is None
+    assert supervisor.starts == []
 
 
 def test_daemon_admits_absent_profile_role_and_passes_canonical_role_to_scheduler(
