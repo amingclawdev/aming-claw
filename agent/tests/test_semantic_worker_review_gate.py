@@ -425,6 +425,58 @@ def test_a5_persist_jobs_preserves_newer_terminal_cancelled_status(conn):
     assert row["updated_at"] == "2026-05-19T05:25:00Z"
 
 
+def test_governance_startup_bounds_node_catchup_to_one_batch(tmp_path, monkeypatch):
+    governance_root = tmp_path / "governance"
+    project_dir = governance_root / PID
+    project_dir.mkdir(parents=True)
+    (project_dir / "governance.db").touch()
+
+    class _StartupConn:
+        def execute(self, sql, params=()):
+            if "graph_snapshot_refs" in sql:
+                row = {"snapshot_id": "snapshot-startup-bounded"}
+            elif "graph_semantic_jobs" in sql:
+                row = {"n": 90}
+            else:
+                row = {"n": 0}
+            return type("_Cursor", (), {"fetchone": lambda self: row})()
+
+        def close(self):
+            return None
+
+    submitted: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+    class _Executor:
+        def submit(self, fn, *args, **kwargs):
+            submitted.append((fn, args, kwargs))
+            return object()
+
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root",
+        lambda: governance_root,
+    )
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda _project_id: _StartupConn(),
+    )
+    monkeypatch.setattr(semantic_worker, "_get_executor", lambda _workers: _Executor())
+    monkeypatch.setattr(
+        semantic_worker,
+        "_worker_runtime_config",
+        lambda project_id="": {"max_workers": 4},
+    )
+
+    semantic_worker.on_governance_startup({})
+
+    assert submitted == [
+        (
+            semantic_worker._drain_node,
+            (PID, "snapshot-startup-bounded"),
+            {"max_batches": 1},
+        )
+    ]
+
+
 def test_a6_drain_node_continues_after_first_claim_batch(conn, tmp_path, monkeypatch):
     """A6: one enqueue event must drain more rows than one claim batch."""
     node_ids = ["L7.1", "L7.2", "L7.3"]

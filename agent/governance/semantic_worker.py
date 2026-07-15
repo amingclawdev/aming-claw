@@ -1199,10 +1199,17 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
         lock.release()
 
 
-def _drain_node(project_id: str, snapshot_id: str) -> None:
+def _drain_node(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    max_batches: int | None = None,
+) -> None:
     """Drain ai_pending semantic jobs for one snapshot.
 
-    Claims configured batches until no claimable rows remain. Each batch
+    Claims configured batches until no claimable rows remain. ``max_batches``
+    optionally bounds catchup work; the default keeps event-driven drains
+    unbounded. Each batch
     processes claimed nodes concurrently up to
     execution_policy.worker_max_concurrency. The snapshot lock only protects
     claim ownership; each node uses its own DB connection.
@@ -1368,6 +1375,14 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                         project_id,
                         snapshot_id,
                     )
+                if max_batches is not None and batch_count >= max_batches:
+                    log.info(
+                        "semantic_worker: bounded drain complete %s/%s batches=%d",
+                        project_id,
+                        snapshot_id,
+                        batch_count,
+                    )
+                    return
         finally:
             conn.close()
     finally:
@@ -2661,7 +2676,7 @@ def on_governance_startup(payload: Any = None) -> None:
                             project_id, sid, n,
                         )
                         _get_executor(_worker_runtime_config(project_id)["max_workers"]).submit(
-                            _drain_node, project_id, sid
+                            _drain_node, project_id, sid, max_batches=1
                         )
                     # MF-2026-05-10-017: also drain unenriched edge requests.
                     # observer-hotfix 2026-05-11: mirror the dedup-by-event_seq
