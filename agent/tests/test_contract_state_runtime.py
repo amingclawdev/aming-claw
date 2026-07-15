@@ -400,7 +400,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["schema_version"] == (
         "cli_agent.qa_bootstrap_guide_contract.v1"
     )
-    assert binding["guide_version"] == "qa-bootstrap-guide.v3"
+    assert binding["guide_version"] == "qa-bootstrap-guide.v4"
     assert binding["guide_hash"].startswith("sha256:")
     guide_contract = contract_state_runtime.cli_agent_qa_bootstrap_guide_contract()
     assert guide_contract["guide_version"] == binding["guide_version"]
@@ -408,7 +408,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     prompt_template = guide_contract["prompt_template"]
     assert "managed MCP `contract_runtime_current`" in prompt_template
     assert "managed MCP `contract_runtime_guide`" in prompt_template
-    assert "compact CLI projections" in prompt_template
+    assert "compact read-only CLI projections" in prompt_template
     assert "ContractRuntime remains the source of authority" in prompt_template
     for graph_argument in (
         "tool=query_schema",
@@ -430,6 +430,24 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert "tests list records every exact pytest node id and outcome" in prompt_template
     assert "starts with a clear PASS: or FAIL:" in prompt_template
     assert "execution_state_revision to be strictly greater" in prompt_template
+    assert "Before this graph call succeeds, do not read ContractRuntime" in (
+        prompt_template
+    )
+    assert "run tests, or send a final response" in prompt_template
+    assert "If graph_query returns an error" in prompt_template
+    assert "report only a public blocker" in prompt_template
+    assert "Read-only current/guide calls and a process exit 0 are not completion" in (
+        prompt_template
+    )
+    graph_index = prompt_template.index("Immediately call managed MCP `graph_query`")
+    for graph_gated_step in (
+        "Only after graph_query returns a successful trace_id",
+        "Call managed MCP `contract_runtime_submit_line` for qa_graph_context",
+        "focused exact pytest node ids",
+        "exactly once for qa_independent_verification",
+        "Re-read both managed MCP projections and require",
+    ):
+        assert graph_index < prompt_template.index(graph_gated_step)
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
