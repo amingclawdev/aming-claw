@@ -365,6 +365,35 @@ def test_cli_agent_execution_ticket_rejects_non_dispatch_decision_source():
     )
 
 
+def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action():
+    current, launch = _cli_agent_ticket_fixture()
+    current["authority_decision_source"] = "contract_runtime_qa_execution_ticket"
+    current["next_legal_action"].update(
+        {
+            "worker_role": "qa",
+            "profile_requirements": {
+                "harness": "codex",
+                "provider": "openai",
+                "role": "qa",
+                "required_capabilities": ["independent_verification"],
+            },
+        }
+    )
+    launch["worker_role"] = "qa"
+
+    issued = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+
+    assert issued["status"] == "issued"
+    assert issued["authority_decision_source"] == (
+        "contract_runtime_qa_execution_ticket"
+    )
+    assert issued["profile_requirements"]["role"] == "qa"
+    assert "profile_id" not in issued["profile_requirements"]
+
+
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
     current, launch = _cli_agent_ticket_fixture()
     issued = build_cli_agent_execution_ticket(

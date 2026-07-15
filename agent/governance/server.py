@@ -15627,7 +15627,10 @@ def _runtime_context_target_root_projection(
                 "query_purpose": "subagent_context_build",
                 "route_identity": copy_safe_route_identity,
             },
-            "write_facade_body": dict(write_identity_shape),
+            "write_facade_body": {
+                **write_identity_shape,
+                "route_identity": copy_safe_route_identity,
+            },
             "startup_body": dict(write_identity_shape),
         },
         "strict_gates_validate_canonical_target_project_root": True,
@@ -69178,6 +69181,76 @@ def _contract_runtime_dispatch_ticket_authority(
     }
 
 
+def _contract_runtime_qa_ticket_authority(
+    record: Mapping[str, Any],
+    current_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one QA service ticket from the active QA-owned contract line."""
+    next_action = current_state.get("next_legal_action")
+    if not isinstance(next_action, Mapping):
+        return {}
+    if str(next_action.get("owner_role") or "").strip() != "qa" or str(
+        next_action.get("line_id") or next_action.get("id") or ""
+    ).strip() not in {"qa_graph_context", "qa_independent_verification"}:
+        return {}
+    dispatch: Mapping[str, Any] = {}
+    for _index, line in _contract_runtime_completed_lines(record):
+        if str(line.get("line_id") or "").strip() == "observer_dispatch_bounded_workers":
+            payload = line.get("payload")
+            dispatch = payload if isinstance(payload, Mapping) else line
+            break
+    if not dispatch:
+        return {}
+    profile = dispatch.get("profile_requirements")
+    profile = dict(profile) if isinstance(profile, Mapping) else {}
+    profile.pop("profile_id", None)
+    profile.update(
+        {
+            "role": "qa",
+            "independent_qa_required": True,
+            "required_capabilities": ["independent_verification"],
+        }
+    )
+    worker_task_id = str(dispatch.get("task_id") or "").strip()
+    qa_task_id = "qa-{}".format(worker_task_id)
+    qa_identity = "qa:{}".format(worker_task_id)
+    projected = dict(dispatch)
+    route_identity = (
+        dispatch.get("route_identity")
+        if isinstance(dispatch.get("route_identity"), Mapping)
+        else {}
+    )
+    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+        value = str(dispatch.get(field) or route_identity.get(field) or "").strip()
+        if value:
+            projected[field] = value
+    projected.update(
+        {
+            "id": str(next_action.get("id") or next_action.get("line_id") or ""),
+            "action": "dispatch_bounded_qa",
+            "stage_id": str(next_action.get("stage_id") or "qa"),
+            "line_id": str(next_action.get("line_id") or ""),
+            "evidence_kind": str(next_action.get("evidence_kind") or ""),
+            "owner_role": "qa",
+            "worker_role": "qa",
+            "task_id": qa_task_id,
+            "worker_id": qa_identity,
+            "worker_slot_id": qa_identity,
+            "observer_command_id": str(record.get("contract_execution_id") or ""),
+            "profile_requirements": profile,
+            "retry_policy": {"attempt": 0, "max_attempts": 0, "successor_required": False},
+        }
+    )
+    return {
+        "status": "projected",
+        "next_legal_action": projected,
+        "source_ref": "contract_runtime:{}:next_legal_action:{}".format(
+            record.get("contract_execution_id") or "",
+            projected["line_id"],
+        ),
+    }
+
+
 def _observer_runtime_text_contract_runtime_authority(
     conn,
     *,
@@ -69220,7 +69293,22 @@ def _observer_runtime_text_contract_runtime_authority(
         record,
         current_state,
     )
-    if dispatch_authority.get("status") == "projected":
+    qa_ticket_authority = _contract_runtime_qa_ticket_authority(
+        record,
+        current_state,
+    )
+    if qa_ticket_authority.get("status") == "projected":
+        current_state["next_legal_action"] = dict(
+            qa_ticket_authority.get("next_legal_action") or {}
+        )
+        current_state["authority_decision_source"] = (
+            "contract_runtime_qa_execution_ticket"
+        )
+        current_state["ticket_authority_status"] = "qa_execution_ready"
+        current_state["ticket_authority_source_ref"] = str(
+            qa_ticket_authority.get("source_ref") or ""
+        )
+    elif dispatch_authority.get("status") == "projected":
         current_state["next_legal_action"] = dict(
             dispatch_authority.get("next_legal_action") or {}
         )

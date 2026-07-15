@@ -309,6 +309,83 @@ def request_guided_runtime(
     }
 
 
+def request_qa_execution_ticket_runtime(
+    *,
+    authority_selectors: Mapping[str, Any],
+    qa_session_token: str,
+    state_dir: str = "",
+    timeout_seconds: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run one QA ticket without accepting caller launch material."""
+    selectors = _mapping(authority_selectors, "QA ContractRuntime selectors")
+    unsupported = sorted(set(selectors) - _AUTHORITY_FIELDS)
+    if unsupported:
+        raise GuidedRuntimeDispatchError(
+            "QA guided runtime selectors contain unsupported authority fields"
+        )
+    required = tuple(
+        field for field in _REQUIRED_AUTHORITY_FIELDS if field != "profile_id"
+    )
+    missing = [field for field in required if not _text(selectors.get(field))]
+    if missing or _text(selectors.get("role")).lower() != "qa":
+        raise GuidedRuntimeDispatchError(
+            "QA guided runtime requires complete QA authority selectors"
+        )
+    token = _text(qa_session_token)
+    if not token:
+        raise GuidedRuntimeDispatchError("QA guided runtime requires a QA session token")
+    payload = {
+        "authority_selectors": dict(selectors),
+        "qa_session_token": token,
+    }
+    try:
+        response = request_service(
+            ServicePaths.from_state_dir(state_dir or None),
+            "start_qa_execution_ticket_run",
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+        )
+    except (ServiceUnavailableError, ServiceError) as exc:
+        raise GuidedRuntimeDispatchError(
+            "CLI Agent Service rejected the QA execution ticket",
+            status="rejected",
+        ) from exc
+    finally:
+        payload["qa_session_token"] = ""
+        token = ""
+    if response.get("ok") is not True or response.get("status") != "started":
+        raise GuidedRuntimeDispatchError(
+            _text(response.get("error")) or "QA execution ticket was rejected",
+            status=_text(response.get("status")) or "rejected",
+        )
+    if (
+        _text(response.get("role")).lower() != "qa"
+        or not _text(response.get("run_id"))
+        or response.get("caller_run_accepted") is not False
+        or response.get("caller_prompt_accepted") is not False
+        or response.get("caller_environment_accepted") is not False
+        or response.get("transient_qa_session_token_accepted") is not True
+        or response.get("transient_qa_session_token_persisted") is not False
+    ):
+        raise GuidedRuntimeDispatchError(
+            "CLI Agent Service returned invalid QA admission evidence",
+            status="rejected",
+        )
+    return {
+        "schema_version": "cli_agent_service.qa_execution_ticket_dispatch.v1",
+        "ok": True,
+        "status": "started",
+        "run_id": _text(response.get("run_id")),
+        "role": "qa",
+        "profile_id": _text(response.get("profile_id")),
+        "service_response": dict(response),
+        "caller_run_accepted": False,
+        "caller_prompt_accepted": False,
+        "caller_environment_accepted": False,
+        "transient_qa_session_token_persisted": False,
+    }
+
+
 def request_contract_runtime_observer(
     *,
     current_state: Mapping[str, Any],
