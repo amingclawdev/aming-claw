@@ -529,6 +529,8 @@ def test_daemon_owns_ticket_profile_run_and_single_supervisor_start(tmp_path):
     assert "and finish gate" in start["prompt"]
     assert "Stop only at terminal completion or a real blocker" in start["prompt"]
     assert "remain within the allocated worker scope" in start["prompt"]
+    assert "$aming-claw:aming-claw-onboard" not in start["prompt"]
+    assert "work_type=qa_verification" not in start["prompt"]
     assert supervisor.start_leases == [scheduled.lease]
     assert supervisor.host_envelope_consumed == [True]
     assert supervisor.consumed_environment_keys == [
@@ -628,6 +630,22 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "resolve_governance_execution_ticket",
         resolve_ticket,
     )
+
+    for caller_field, caller_value in (
+        ("prompt", "caller prompt must not replace the v5 guide"),
+        ("environment", {"CALLER_ENV_MUST_NOT_APPEAR": "secret"}),
+    ):
+        with pytest.raises(ServiceError, match="unsupported fields"):
+            service._admit_governed_host_envelope_run(
+                {
+                    "authority_selectors": selectors,
+                    "qa_session_token": raw_qa_token,
+                    caller_field: caller_value,
+                },
+                qa_mode=True,
+            )
+    assert schedule_requests == []
+    assert supervisor.starts == []
 
     for invalid_binding in (None, {"tooling_hash": "sha256:stale"}):
         invalid_ticket = dict(old_ticket)
@@ -845,8 +863,17 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "assigned_worktree={}".format(tmp_path),
     ):
         assert coordinate in prompt
-    assert "Aming Claw onboard/plugin" in prompt
-    assert "do not guess or call a curl endpoint" in prompt
+    skill_token = "$aming-claw:aming-claw-onboard"
+    onboard_instruction = (
+        "Immediately use that skill to call managed MCP "
+        "`onboard_route_guide` with exactly project_id=aming-claw, "
+        "backlog_id=AC-GUIDED-DAEMON, role=qa, and "
+        "work_type=qa_verification."
+    )
+    assert prompt.startswith(skill_token + "\n")
+    assert prompt.count(skill_token) == 1
+    assert onboard_instruction in prompt
+    assert "Do not guess or call a curl endpoint" in prompt
     assert "`git rev-parse HEAD`" in prompt
     assert "full candidate SHA" in prompt
     assert "do not trust the pre-dispatch target_head_commit" in prompt
@@ -863,7 +890,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "task_id=task-guided-daemon",
         "commit_sha=<full git HEAD>",
         "repo_root={}".format(tmp_path),
-        "qa_session_token=<raw token from step 1>",
+        "qa_session_token=<raw token from step 4>",
     ):
         assert graph_argument in prompt
     assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt
@@ -881,8 +908,11 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         prompt
     )
     ordered_steps = (
-        "Call qa_session_register",
-        "Immediately call managed MCP `graph_query`",
+        skill_token,
+        onboard_instruction,
+        "3. In assigned_worktree, run exactly `git rev-parse HEAD`",
+        "4. Call qa_session_register",
+        "5. Immediately call managed MCP `graph_query`",
         "Only after graph_query returns a successful trace_id",
         "managed MCP `contract_runtime_current`",
         "managed MCP `contract_runtime_guide`",
@@ -895,6 +925,15 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert [prompt.index(step) for step in ordered_steps] == sorted(
         prompt.index(step) for step in ordered_steps
     )
+    onboard_index = prompt.index(onboard_instruction)
+    for forbidden_before_onboard in (
+        "4. Call qa_session_register",
+        "5. Immediately call managed MCP `graph_query`",
+        "managed MCP `contract_runtime_current`",
+        "run only the refreshed guide's focused exact pytest node ids",
+        "or send a final response",
+    ):
+        assert onboard_index < prompt.index(forbidden_before_onboard)
     assert "If tests pass but runtime did not advance, report an explicit blocker" in prompt
     assert "do not declare operational success" in prompt
     assert "use only rg, head, narrow sed ranges, and exact pytest node ids" in prompt

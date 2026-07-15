@@ -55606,7 +55606,7 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
     assert ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in ticket["profile_requirements"]
     assert ticket["qa_bootstrap_guide_contract"]["guide_version"] == (
-        "qa-bootstrap-guide.v4"
+        "qa-bootstrap-guide.v5"
     )
     assert ticket["qa_bootstrap_guide_contract"]["guide_hash"].startswith(
         "sha256:"
