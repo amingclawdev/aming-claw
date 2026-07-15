@@ -47856,7 +47856,7 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
-def test_worker_commit_succeeds_without_implementation_timeline_event(
+def test_contract_runtime_only_startup_principal_accepts_exact_worker_commit_session(
     conn,
     tmp_path,
 ):
@@ -47903,6 +47903,7 @@ def test_worker_commit_succeeds_without_implementation_timeline_event(
         )
     )
     actual_worker_id = runtime_context.worker_slot_id
+    native_worker_session_id = "codex-session-contract-canonical-worker"
     runtime_context = upsert_branch_context(
         conn,
         replace(
@@ -47994,10 +47995,10 @@ def test_worker_commit_succeeds_without_implementation_timeline_event(
                 "fence_token": "fence-contract-canonical-worker",
                 "agent_id": actual_worker_id,
                 "actual_host_worker_id": actual_worker_id,
-                "worker_session_id": actual_worker_id,
-                "worker_transcript_ref": f"codex:{actual_worker_id}",
+                "worker_session_id": native_worker_session_id,
+                "worker_transcript_ref": f"codex:{native_worker_session_id}",
                 "harness_type": "codex",
-                "filer_principal": actual_worker_id,
+                "filer_principal": native_worker_session_id,
                 "observer_command_id": contract_execution_id,
                 "actual_cwd": str(worker_root),
                 "actual_git_root": str(worker_root),
@@ -48025,6 +48026,25 @@ def test_worker_commit_succeeds_without_implementation_timeline_event(
     assert contract_record["completed_lines"][-1]["line_id"] == (
         "worker_startup"
     )
+    canonical_startup = contract_record["completed_lines"][-1]["payload"]
+    assert canonical_startup["worker_session_id"] == native_worker_session_id
+    assert canonical_startup["filer_principal"] == native_worker_session_id
+    assert native_worker_session_id != runtime_context.worker_id
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE task_id = ? AND event_kind IN (?, ?)",
+        (
+            worker_task_id,
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+        ),
+    )
+    conn.commit()
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_startup",
+    ) == []
 
     graph_trace_id = "gqt-contract-canonical-worker"
     _insert_mf_sub_graph_query_trace(
@@ -48238,9 +48258,9 @@ def test_worker_commit_succeeds_without_implementation_timeline_event(
                     "session_token_ref": session_ref,
                     "fence_token": "fence-contract-canonical-worker",
                     "target_project_root": str(worker_root),
-                    "worker_session_id": actual_worker_id,
-                    "filer_principal": actual_worker_id,
-                    "actor": actual_worker_id,
+                    "worker_session_id": native_worker_session_id,
+                    "filer_principal": native_worker_session_id,
+                    "actor": native_worker_session_id,
                     "implementation_lineage_ref": implementation_lineage[
                         "implementation_lineage_ref"
                     ],
@@ -48267,6 +48287,12 @@ def test_worker_commit_succeeds_without_implementation_timeline_event(
         contract_execution_id
     )
     assert committed_record["completed_lines"][-1]["line_id"] == "worker_commit"
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=worker_task_id,
+        event_kind="mf_subagent_startup",
+    ) == []
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):

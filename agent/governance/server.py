@@ -17097,6 +17097,12 @@ def _runtime_context_contract_runtime_worker_sequence_evidence(
         accepted[line_id] = {
             "line_index": index,
             "source_ref": f"contract_runtime:{execution_id}:completed_lines:{index}",
+            "worker_session_id": _runtime_context_non_placeholder_text(
+                payload.get("worker_session_id")
+            ),
+            "filer_principal": _runtime_context_non_placeholder_text(
+                payload.get("filer_principal")
+            ),
         }
 
     if "worker_read_runtime_guide" not in accepted:
@@ -17116,6 +17122,12 @@ def _runtime_context_contract_runtime_worker_sequence_evidence(
         "parent_task_id": parent_task_id,
         "read_receipt_ref": str(read["source_ref"]),
         "startup_ref": str((startup or {}).get("source_ref") or ""),
+        "startup_principal": {
+            "worker_session_id": str(
+                (startup or {}).get("worker_session_id") or ""
+            ),
+            "filer_principal": str((startup or {}).get("filer_principal") or ""),
+        },
         "ordered": bool(startup),
         "synthetic_timeline_event_created": False,
         "timeline_backfill_performed": False,
@@ -22598,6 +22610,22 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 timeline_events=timeline_events,
             )
         )
+        if not timeline_refs.get("startup_event_ref"):
+            contract_runtime_sequence = (
+                _runtime_context_contract_runtime_worker_sequence_evidence(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                )
+            )
+            canonical_startup_principal = contract_runtime_sequence.get(
+                "startup_principal"
+            )
+            if (
+                contract_runtime_sequence.get("ordered")
+                and isinstance(canonical_startup_principal, Mapping)
+            ):
+                startup_gate = {"payload": dict(canonical_startup_principal)}
         implementation_event_ref = str(
             body.get("implementation_event_ref") or ""
         ).strip()
