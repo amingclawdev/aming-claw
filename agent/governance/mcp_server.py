@@ -2719,11 +2719,16 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         suffix = "guide" if name == "contract_runtime_guide" else "current-state"
         qa_session_token = str(args.get("qa_session_token") or "").strip()
         query = {
-            key: value
-            for key, value in args.items()
-            if key
-            in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
-            and value is not None
+            "response_view": (
+                "cli_guide" if name == "contract_runtime_guide" else "cli_current"
+            ),
+            **{
+                key: value
+                for key, value in args.items()
+                if key
+                in {"observer_session_id", "observer_session_ref", "observer_route_token_ref", "route_token_ref"}
+                and value is not None
+            },
         }
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http_with_optional_gov_token(

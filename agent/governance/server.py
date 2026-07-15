@@ -46847,10 +46847,16 @@ def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str,
     return dict(guide)
 
 
-def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
+def _contract_runtime_response(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str = "",
+    response_view: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
     guide = _contract_runtime_guide_for_response(record)
     current_state = _runtime_current_state_from_record(record)
-    return {
+    response = {
         "schema_version": "contract_runtime.runtime_facade_response.v1",
         "ok": True,
         "project_id": str(record.get("project_id") or ""),
@@ -46869,6 +46875,32 @@ def _contract_runtime_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
+    if actor_role != "qa" or response_view not in {"cli_current", "cli_guide"}:
+        return response
+
+    response.pop("contract_runtime_current_state", None)
+    response.pop("runtime_guide", None)
+    response.update(
+        {
+            "schema_version": "contract_runtime.compact_qa_response.v1",
+            "response_view": response_view,
+            "source_of_authority": "ContractRuntime",
+            "actor_role": actor_role,
+            "request_id": request_id,
+        }
+    )
+    if response_view == "cli_guide":
+        completed_lines = guide.get("completed_lines")
+        compact_guide = {
+            key: value for key, value in guide.items() if key != "completed_lines"
+        }
+        compact_guide["completed_lines_summary"] = {
+            "count": len(completed_lines) if isinstance(completed_lines, list) else 0,
+            "omitted_from_cli_projection": True,
+            "source_of_authority": "ContractRuntime",
+        }
+        response["runtime_guide"] = compact_guide
+    return response
 
 
 def _onboard_service_record(value: Mapping[str, Any] | None) -> bool:
@@ -76322,7 +76354,12 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 actor_role=actor_role,
             )
         conn.commit()
-    response = _contract_runtime_response(record)
+    response = _contract_runtime_response(
+        record,
+        actor_role=actor_role,
+        response_view=str(ctx.query.get("response_view") or "").strip(),
+        request_id=ctx.request_id,
+    )
     response["actor_role"] = actor_role
     return response
 

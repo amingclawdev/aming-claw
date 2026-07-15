@@ -48481,6 +48481,105 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     ]["worker_session_id"] == native_worker_session_id
 
 
+def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
+    reader_hash = "sha256:" + "1" * 64
+    writer_hash = "sha256:" + "2" * 64
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-CONTRACT-RUNTIME-COMPACT-QA",
+        "contract_execution_id": "cex-contract-runtime-compact-qa",
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "revision": "rev10",
+        "definition_hash": "sha256:" + "3" * 64,
+        "execution_state_revision": 10,
+        "execution_state": {"execution_state_hash": "sha256:" + "4" * 64},
+        "route_token_ref": "rtok-contract-runtime-compact-qa",
+        "runtime_guide": {
+            "schema_version": "contract_runtime_guide.v1",
+            "runtime_guide_hash": reader_hash,
+            "execution": {
+                "contract_execution_id": "cex-contract-runtime-compact-qa",
+                "execution_state_revision": 10,
+                "execution_state_hash": "sha256:" + "4" * 64,
+                "route_token_ref": "rtok-contract-runtime-compact-qa",
+            },
+            "next_legal_action": {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "owner_role": "qa",
+                "allowed_writer_roles": ["qa"],
+                "evidence_kind": "independent_verification",
+                "required": True,
+                "body": {"status": "passed", "graph_trace_ids": ["<gqt-id>"]},
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "runtime_guide_hash": writer_hash,
+                    "stage_id": "qa",
+                    "line_id": "qa_independent_verification",
+                    "evidence_kind": "independent_verification",
+                }
+            },
+            "completed_lines": [
+                {"payload": {"duplicated_runtime_guide": "x" * 150_000}}
+            ],
+        },
+    }
+
+    full = server._contract_runtime_response(
+        record, actor_role="observer", response_view="cli_current"
+    )
+    current = server._contract_runtime_response(
+        record,
+        actor_role="qa",
+        response_view="cli_current",
+        request_id="req-compact-current",
+    )
+    guide = server._contract_runtime_response(
+        record,
+        actor_role="qa",
+        response_view="cli_guide",
+        request_id="req-compact-guide",
+    )
+
+    assert len(json.dumps(full)) > 150_000
+    assert len(json.dumps(current)) < 16_384
+    assert len(json.dumps(guide)) < 16_384
+    assert "duplicated_runtime_guide" not in json.dumps([current, guide])
+    for response in (current, guide):
+        assert response["source_of_authority"] == "ContractRuntime"
+        assert response["execution_state_revision"] == 10
+        assert response["execution_state_hash"] == "sha256:" + "4" * 64
+        assert response["contract_id"] == server.MF_PARALLEL_CONTRACT_ID
+        assert response["contract_revision_id"] == "rev10"
+        assert response["contract_hash"] == "sha256:" + "3" * 64
+        assert response["runtime_guide_hash"] == reader_hash
+        assert response["route_token_ref"] == "rtok-contract-runtime-compact-qa"
+        assert response["actor_role"] == "qa"
+        assert response["next_legal_action"]["line_id"] == (
+            "qa_independent_verification"
+        )
+        assert response["next_legal_action"]["owner_role"] == "qa"
+        assert response["submit_line_guidance"][
+            "current_required_runtime_guide_hash"
+        ] == writer_hash
+    assert "runtime_guide" not in current
+    assert "contract_runtime_current_state" not in current
+    assert current["response_view"] == "cli_current"
+    assert current["request_id"] == "req-compact-current"
+    assert guide["response_view"] == "cli_guide"
+    assert guide["request_id"] == "req-compact-guide"
+    assert "completed_lines" not in guide["runtime_guide"]
+    assert guide["runtime_guide"]["completed_lines_summary"] == {
+        "count": 1,
+        "omitted_from_cli_projection": True,
+        "source_of_authority": "ContractRuntime",
+    }
+    assert guide["runtime_guide"]["writer_role_safe_copy_payload"] == record[
+        "runtime_guide"
+    ]["writer_role_safe_copy_payload"]
+
+
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
     backlog_id = "AC-CONTRACT-RUNTIME-COPY-SAFE-WORKER-READ"
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(

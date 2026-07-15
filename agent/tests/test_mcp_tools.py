@@ -1700,12 +1700,18 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     assert recorder.calls == [
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state",
+            (
+                "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state"
+                "?response_view=cli_current"
+            ),
             None,
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide",
+            (
+                "/api/projects/aming-claw/contract-runtime/cex-onboard/guide"
+                "?response_view=cli_guide"
+            ),
             None,
         ),
         (
@@ -1810,6 +1816,14 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         },
     )
     dispatcher.dispatch(
+        "contract_runtime_guide",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-hotfix",
+            "qa_session_token": "gov-qa-token",
+        },
+    )
+    dispatcher.dispatch(
         "onboard_contract_submit_line",
         {
             "project_id": "aming-claw",
@@ -1898,7 +1912,19 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-hotfix/current-state",
+            (
+                "/api/projects/aming-claw/contract-runtime/cex-hotfix/current-state"
+                "?response_view=cli_current"
+            ),
+            None,
+            "gov-qa-token",
+        ),
+        (
+            "GET",
+            (
+                "/api/projects/aming-claw/contract-runtime/cex-hotfix/guide"
+                "?response_view=cli_guide"
+            ),
             None,
             "gov-qa-token",
         ),
