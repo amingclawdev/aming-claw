@@ -20057,7 +20057,8 @@ def _runtime_context_contract_finish_attestation_projection(
     head_commit: str,
     changed_files: Sequence[str],
     test_results: Mapping[str, Any],
-    worker_session_id: str = "",
+    supplied_worker_session_id: str = "",
+    supplied_filer_principal: str = "",
     read_receipt_event_id: str = "",
     read_receipt_hash: str = "",
     supplied_attestation: Mapping[str, Any] | None = None,
@@ -20127,8 +20128,16 @@ def _runtime_context_contract_finish_attestation_projection(
         "test_results": _runtime_context_test_results_passed(canonical_tests)
         and _runtime_context_test_results_compatible(canonical_tests, test_results),
         "worker_session_id": bool(canonical_session)
+        and (
+            not supplied_worker_session_id
+            or supplied_worker_session_id == canonical_session
+        ),
+        "filer_principal": bool(canonical_filer)
         and canonical_filer == canonical_session
-        and (not worker_session_id or worker_session_id == canonical_session),
+        and (
+            not supplied_filer_principal
+            or supplied_filer_principal == canonical_filer
+        ),
         "read_receipt_event_id": bool(canonical_read_id)
         and (
             not read_receipt_event_id
@@ -24039,8 +24048,13 @@ def handle_graph_governance_runtime_context_finish_gate(ctx: RequestContext):
                     head_commit=expected_head_commit,
                     changed_files=expected_changed_files,
                     test_results=expected_test_results,
-                    worker_session_id=_runtime_context_finish_attestation_text(
-                        body, "worker_session_id", "filer_principal"
+                    supplied_worker_session_id=(
+                        _runtime_context_non_placeholder_text(
+                            body.get("worker_session_id")
+                        )
+                    ),
+                    supplied_filer_principal=_runtime_context_non_placeholder_text(
+                        body.get("filer_principal")
                     ),
                     read_receipt_event_id=_runtime_context_finish_attestation_text(
                         body, "read_receipt_event_id", "read_receipt_timeline_id"

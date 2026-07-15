@@ -48414,6 +48414,29 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     )
     finish_body.pop("worker_session_id")
     finish_body.pop("filer_principal")
+    with pytest.raises(GovernanceError) as filer_mismatch:
+        server.handle_graph_governance_runtime_context_finish_gate(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    **finish_body,
+                    "worker_session_id": native_worker_session_id,
+                    "filer_principal": "different-filer-principal",
+                },
+            )
+        )
+    assert filer_mismatch.value.code == (
+        "contract_worker_finish_attestation_mismatch"
+    )
+    assert filer_mismatch.value.details["mismatched_fields"] == [
+        "filer_principal"
+    ]
+
     with pytest.raises(GovernanceError) as mismatch:
         server.handle_graph_governance_runtime_context_finish_gate(
             _ctx_with_role(
