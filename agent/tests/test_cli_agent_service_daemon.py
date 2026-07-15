@@ -745,11 +745,18 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert registry.get_run(old_response["run_id"]).state == "completed"
     assert registry.get_run(tooling_response["run_id"]).state == "completed"
 
+    changed_onboard_machine_contract = json.loads(
+        json.dumps(
+            contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT
+        )
+    )
+    changed_onboard_machine_contract["compact_selected_role_projection"][
+        "projection_version"
+    ] += ".daemon-change"
     monkeypatch.setattr(
         contract_state_runtime,
-        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
-        contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION
-        + ".daemon-change",
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT",
+        changed_onboard_machine_contract,
     )
     with pytest.raises(ServiceError, match="qa_onboard_guidance_contract"):
         service._admit_governed_host_envelope_run(

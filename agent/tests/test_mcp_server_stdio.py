@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
+from agent.mcp import server as plugin_mcp_server
 from agent.mcp.server import AmingClawMCP
 from agent.mcp.tools import TOOLS as runtime_mcp_tools
 from agent.mcp.tools import ToolDispatcher
@@ -78,6 +79,96 @@ def test_mcp_stdio_initialize_and_health_survive_missing_governance():
     text = responses[1]["result"]["content"][0]["text"]
     payload = json.loads(text)
     assert "error" in payload
+
+
+def test_mcp_stdio_serializes_qa_onboard_compact_selected_role_under_limit(
+    tmp_path,
+    monkeypatch,
+):
+    compact_payload = {
+        "schema_version": "onboard_route_guide.service_response.v1",
+        "projection_version": "qa-selected-role-compact.v1",
+        "ok": True,
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-COMPACT-MCP",
+        "selected_role": "qa",
+        "selected_work_type": "qa_verification",
+        "compact_selected_role": True,
+        "mcp_text_content_serialized_char_limit": 64000,
+        "agent_onboard_guidance": {
+            "selected_role_guidance": {
+                "current_line_id": "qa_graph_context",
+                "ordered_steps": [
+                    {"id": "qa_session_register"},
+                    {"id": "graph_query_schema"},
+                    {"id": "read_compact_contract_runtime"},
+                    {"id": "submit_qa_graph_context"},
+                    {"id": "reread_after_qa_graph_context"},
+                ],
+            },
+            "canonical_dispatch_identity": {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-COMPACT-MCP",
+                "original_worker_task_id": "worker-qa-compact",
+                "assigned_worktree": "/tmp/qa-compact-worker",
+                "route_context_hash": "sha256:route",
+                "prompt_contract_id": "rprompt-qa-compact",
+                "prompt_contract_hash": "sha256:prompt",
+                "visible_injection_manifest_hash": "sha256:manifest",
+            },
+        },
+        "next_legal_action": {
+            "line_id": "qa_graph_context",
+            "action": "record_graph_trace",
+        },
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+    class CompactDispatcher:
+        def dispatch(self, name, arguments):
+            assert name == "onboard_route_guide"
+            assert arguments == {
+                "project_id": "aming-claw",
+                "backlog_id": "AC-QA-COMPACT-MCP",
+                "role": "qa",
+                "work_type": "qa_verification",
+            }
+            return compact_payload
+
+    mcp = AmingClawMCP(
+        project_id="aming-claw",
+        governance_url="http://127.0.0.1:9",
+        workspace=str(tmp_path),
+        redis_url="redis://127.0.0.1:9/0",
+    )
+    mcp.dispatcher = CompactDispatcher()
+    messages = []
+    monkeypatch.setattr(plugin_mcp_server, "_write", messages.append)
+
+    mcp._handle(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "onboard_route_guide",
+                    "arguments": {
+                        "project_id": "aming-claw",
+                        "backlog_id": "AC-QA-COMPACT-MCP",
+                        "role": "qa",
+                        "work_type": "qa_verification",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(messages) == 1
+    content_text = messages[0]["result"]["content"][0]["text"]
+    assert json.loads(content_text) == compact_payload
+    assert len(content_text) <= 64000
 
 
 def test_worker_mcp_hides_and_rejects_host_only_auth_tools():
