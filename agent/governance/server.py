@@ -53242,25 +53242,42 @@ def _onboard_selected_qa_contract_runtime_guidance(
         else {}
     )
 
-    def _dispatch_identity(*aliases: str) -> tuple[str, bool]:
+    def _dispatch_identity(*aliases: str) -> tuple[str, bool, bool]:
         values = {
             str(source.get(alias) or "").strip()
             for source in (dispatch_line, dispatch_payload)
             for alias in aliases
             if str(source.get(alias) or "").strip()
         }
-        return (next(iter(values)) if len(values) == 1 else "", len(values) > 1)
+        return (
+            next(iter(values)) if len(values) == 1 else "",
+            len(values) > 1,
+            bool(values),
+        )
 
-    worker_task_id, task_conflict = _dispatch_identity("task_id", "worker_task_id")
-    worktree, worktree_conflict = _dispatch_identity(
-        "assigned_worktree", "worktree_path", "target_project_root",
-        "project_root", "repo_root",
+    worker_task_id, task_conflict, _task_present = _dispatch_identity(
+        "task_id", "worker_task_id"
     )
+    worktree, worktree_conflict, worktree_present = _dispatch_identity(
+        "worktree_path", "worker_worktree_path", "assigned_worktree"
+    )
+    target_root, target_root_conflict, _target_root_present = _dispatch_identity(
+        "target_project_root", "project_root", "repo_root"
+    )
+    repo_root = worktree if worktree_present else target_root
     missing = [
-        field for field, value in (("task_id", worker_task_id), ("repo_root", worktree))
+        field for field, value in (("task_id", worker_task_id), ("repo_root", repo_root))
         if not value
     ]
-    if missing:
+    conflicts = [
+        field for field, conflict in (
+            ("task_id", task_conflict),
+            ("worktree_path", worktree_conflict),
+            ("target_project_root", target_root_conflict),
+        )
+        if conflict
+    ]
+    if missing or conflicts:
         return {
             "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
             "next_action": action, "contract_execution_id": execution_id,
@@ -53273,10 +53290,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
                 "id": "qa_canonical_dispatch_identity_unavailable",
                 "source": "ContractRuntime.completed_lines.observer_dispatch_bounded_workers",
                 "missing_fields": missing,
-                "conflicting_fields": [
-                    field for field, conflict in (("task_id", task_conflict), ("repo_root", worktree_conflict))
-                    if conflict
-                ],
+                "conflicting_fields": conflicts,
             },
         }
     token = {
@@ -53297,7 +53311,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
             "tool": "query_schema", "query_source": "qa",
             "query_purpose": "independent_verification", "project_id": project_id,
             "backlog_id": backlog_id, "task_id": worker_task_id,
-            "commit_sha": full_head, "repo_root": worktree, "qa_session_token": token,
+            "commit_sha": full_head, "repo_root": repo_root, "qa_session_token": token,
         }
         trace_payload = {
             "graph_trace_ids": [trace_ref], "graph_query_trace_ids": [trace_ref]
@@ -55542,6 +55556,26 @@ def _onboard_route_guide_service_response(
     current_projection = _contract_chain_current_with_runtime_authority_overlay(
         current_projection
     )
+    preexisting_next_action = (
+        preexisting_projection.get("next_legal_action")
+        if isinstance(preexisting_projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if (
+        str(role or "").strip() == "qa"
+        and str(preexisting_next_action.get("line_id") or "").strip()
+        in {"qa_graph_context", "qa_independent_verification"}
+    ):
+        current_projection = _contract_chain_current_with_backlog_close_blocker(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            current_projection=preexisting_projection,
+            route_token_ref=route_token_ref,
+        )
+        current_projection = _contract_chain_current_with_runtime_authority_overlay(
+            current_projection
+        )
     projection_degraded = bool(current_projection.get("degraded"))
     record["metadata"] = {
         **dict(record.get("metadata") or {}),
