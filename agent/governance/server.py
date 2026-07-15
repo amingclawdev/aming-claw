@@ -47553,8 +47553,8 @@ def _contract_runtime_projection_post_worker_lines(
                 or stored_qa_trace_ids
             ),
             target_project_root=str(
-                getattr(context, "target_project_root", "")
-                or getattr(context, "worktree_path", "")
+                getattr(context, "worktree_path", "")
+                or getattr(context, "target_project_root", "")
                 or ""
             ),
             expected_backlog_id=backlog_id if bounded_qa_policy else "",
