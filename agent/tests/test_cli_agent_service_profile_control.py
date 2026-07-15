@@ -301,6 +301,59 @@ def test_same_version_source_payload_change_reinstalls_and_updates_marker(tmp_pa
     assert manifest["version"] == "0.1.1+codex.20260713045902"
 
 
+def test_invalid_source_payload_fails_before_installer_or_ready_marker(
+    tmp_path,
+    monkeypatch,
+):
+    import cli_agent_service.profile_control as profile_control_module
+    from cli_agent_service.profile_control import ProfileToolingError
+
+    source_root = _copy_canonical_plugin_source(tmp_path / "plugin-source")
+    (source_root / "skills" / "aming-claw-onboard" / "SKILL.md").unlink()
+    registry, auth, control = _control(
+        tmp_path,
+        plugin_source_root=source_root,
+    )
+    control.prepare_login("profile-codex-invalid-payload")
+    control.activate("profile-codex-invalid-payload")
+    profile = registry.get_profile("profile-codex-invalid-payload")
+    assert profile is not None
+    home = auth.managed_profile_home(profile.profile_id, "codex")
+    auth_path = home / "auth.json"
+    auth_bytes = b'{"managed_test_secret":"must-remain-byte-identical"}\n'
+    auth_path.write_bytes(auth_bytes)
+    installer_calls = []
+
+    def record_installer_call(name):
+        def recorder(*_args, **_kwargs):
+            installer_calls.append(name)
+
+        return recorder
+
+    monkeypatch.setattr(
+        profile_control_module,
+        "install_codex_plugin_cache",
+        record_installer_call("cache"),
+    )
+    monkeypatch.setattr(
+        profile_control_module,
+        "install_codex_marketplace",
+        record_installer_call("marketplace"),
+    )
+    monkeypatch.setattr(
+        profile_control_module,
+        "configure_codex_plugin",
+        record_installer_call("config"),
+    )
+
+    with pytest.raises(ProfileToolingError, match="tooling source is invalid"):
+        control.resolve_profile_home(profile)
+
+    assert installer_calls == []
+    assert not (home / "managed-tooling" / "readiness.json").exists()
+    assert auth_path.read_bytes() == auth_bytes
+
+
 @pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI is unavailable")
 def test_repo_source_tooling_bootstrap_is_idempotent_visible_and_preserves_auth(
     tmp_path,

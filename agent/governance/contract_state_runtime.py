@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 try:
-    from agent.plugin_installer import CODEX_PLUGIN_PAYLOAD
+    from agent.plugin_installer import CODEX_PLUGIN_PAYLOAD, REQUIRED_PLUGIN_FILES
 except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
-    from plugin_installer import CODEX_PLUGIN_PAYLOAD  # type: ignore
+    from plugin_installer import (  # type: ignore
+        CODEX_PLUGIN_PAYLOAD,
+        REQUIRED_PLUGIN_FILES,
+    )
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
@@ -3578,20 +3581,50 @@ def cli_agent_managed_profile_source_payload_digest(
         if plugin_source_root is not None
         else Path(__file__).resolve().parents[2]
     )
-    entries: dict[str, tuple[bytes, bytes]] = {}
-    for payload_path in sorted(set(CODEX_PLUGIN_PAYLOAD)):
+    payload_roots = tuple(sorted(set(CODEX_PLUGIN_PAYLOAD)))
+
+    def fail(reason: str, relative: str) -> None:
+        raise ValueError(
+            "managed profile tooling payload {}: {}".format(reason, relative)
+        )
+
+    for payload_path in payload_roots:
         source = root / payload_path
         relative = Path(payload_path).as_posix()
         if source.is_symlink():
-            raise ValueError("managed profile tooling payload cannot contain symlinks")
+            fail("contains symlink", relative)
         if not source.exists():
-            entries[relative] = (b"missing", b"")
-            continue
+            fail("is missing", relative)
+        if not source.is_file() and not source.is_dir():
+            fail("has unsupported file type", relative)
+
+    required_descendants = tuple(
+        sorted(
+            relative
+            for relative in set(REQUIRED_PLUGIN_FILES)
+            if any(
+                relative == payload_root
+                or relative.startswith(payload_root.rstrip("/") + "/")
+                for payload_root in payload_roots
+            )
+        )
+    )
+    for required_path in required_descendants:
+        source = root / required_path
+        relative = Path(required_path).as_posix()
+        if source.is_symlink():
+            fail("contains symlink", relative)
+        if not source.exists():
+            fail("is missing", relative)
+        if not source.is_file():
+            fail("has unsupported file type", relative)
+
+    entries: dict[str, tuple[bytes, bytes]] = {}
+    for payload_path in payload_roots:
+        source = root / payload_path
+        relative = Path(payload_path).as_posix()
         if source.is_file():
             entries[relative] = (b"file", source.read_bytes())
-            continue
-        if not source.is_dir():
-            entries[relative] = (b"unsupported", b"")
             continue
         entries[relative] = (b"directory", b"")
         for child in sorted(
@@ -3600,15 +3633,13 @@ def cli_agent_managed_profile_source_payload_digest(
         ):
             child_relative = child.relative_to(root).as_posix()
             if child.is_symlink():
-                raise ValueError(
-                    "managed profile tooling payload cannot contain symlinks"
-                )
+                fail("contains symlink", child_relative)
             if child.is_dir():
                 entries[child_relative] = (b"directory", b"")
             elif child.is_file():
                 entries[child_relative] = (b"file", child.read_bytes())
             else:
-                entries[child_relative] = (b"unsupported", b"")
+                fail("has unsupported file type", child_relative)
 
     digest = hashlib.sha256()
     digest.update(b"aming-claw-codex-plugin-payload.v1\0")

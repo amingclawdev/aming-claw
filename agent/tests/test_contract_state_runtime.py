@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -539,6 +540,109 @@ def test_cli_agent_qa_ticket_id_changes_with_source_payload_digest(
     ] != changed["managed_profile_tooling_contract"]["source_payload_digest"]
     assert first["ticket_id"] != changed["ticket_id"]
     assert first["ticket_hash"] != changed["ticket_hash"]
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    ("payload", "payload/required.txt"),
+)
+def test_managed_profile_source_digest_rejects_missing_canonical_payload(
+    tmp_path,
+    monkeypatch,
+    missing_path,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    if missing_path != "payload":
+        (source_root / "payload").mkdir()
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload",),
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "REQUIRED_PLUGIN_FILES",
+        ("payload/required.txt",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"payload is missing: {}$".format(missing_path),
+    ):
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+            source_root
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+@pytest.mark.parametrize("fifo_location", ("top-level", "descendant"))
+def test_managed_profile_source_digest_rejects_fifo_without_blocking(
+    tmp_path,
+    monkeypatch,
+    fifo_location,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    if fifo_location == "top-level":
+        fifo = source_root / "payload"
+        payload = ("payload",)
+        expected_path = "payload"
+    else:
+        payload_root = source_root / "payload"
+        payload_root.mkdir()
+        fifo = payload_root / "pipe"
+        payload = ("payload",)
+        expected_path = "payload/pipe"
+    monkeypatch.setattr(contract_state_runtime, "CODEX_PLUGIN_PAYLOAD", payload)
+    monkeypatch.setattr(contract_state_runtime, "REQUIRED_PLUGIN_FILES", ())
+    os.mkfifo(fifo)
+    try:
+        with pytest.raises(
+            ValueError,
+            match=r"unsupported file type: {}$".format(expected_path),
+        ):
+            contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+                source_root
+            )
+    finally:
+        fifo.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink is unavailable")
+@pytest.mark.parametrize("symlink_location", ("top-level", "descendant"))
+def test_managed_profile_source_digest_rejects_symlink(
+    tmp_path,
+    monkeypatch,
+    symlink_location,
+):
+    source_root = tmp_path / "plugin-source"
+    source_root.mkdir()
+    target = source_root / "target.txt"
+    target.write_bytes(b"symlink target")
+    if symlink_location == "top-level":
+        link = source_root / "payload"
+        expected_path = "payload"
+    else:
+        payload_root = source_root / "payload"
+        payload_root.mkdir()
+        link = payload_root / "link"
+        expected_path = "payload/link"
+    link.symlink_to(target)
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CODEX_PLUGIN_PAYLOAD",
+        ("payload",),
+    )
+    monkeypatch.setattr(contract_state_runtime, "REQUIRED_PLUGIN_FILES", ())
+
+    with pytest.raises(
+        ValueError,
+        match=r"contains symlink: {}$".format(expected_path),
+    ):
+        contract_state_runtime.cli_agent_managed_profile_source_payload_digest(
+            source_root
+        )
 
 
 def test_cli_agent_execution_ticket_rejects_consumed_dispatch_identity():
