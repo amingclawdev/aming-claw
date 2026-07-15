@@ -493,6 +493,22 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
             "ordered_steps"
         ][:2]
     ] == ["qa_session_register", "graph_query_schema"]
+    compact_projection = onboard_contract["compact_selected_role_projection"]
+    assert compact_projection["projection_version"] == (
+        "qa-selected-role-compact.v1"
+    )
+    assert compact_projection["automatic_selector"] == {
+        "role": "qa",
+        "work_type": "qa_verification",
+        "backlog_required": True,
+        "caller_flag_required": False,
+    }
+    assert compact_projection[
+        "mcp_text_content_serialized_char_limit"
+    ] == 64000
+    assert compact_projection[
+        "http_envelope_serialization_reserve_chars"
+    ] == 512
     assert "qa_onboard_guidance_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
@@ -696,6 +712,13 @@ def test_cli_agent_qa_ticket_rotates_for_each_executable_guidance_semantic(
                 "ordered_steps", 3, "add_arguments", "payload", "summary",
             ),
             "<changed verdict payload summary>",
+        ),
+        (
+            (
+                "compact_selected_role_projection",
+                "projection_version",
+            ),
+            "qa-selected-role-compact.changed",
         ),
     ]
     authority_fields = (

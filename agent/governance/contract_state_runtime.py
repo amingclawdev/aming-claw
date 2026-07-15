@@ -44,6 +44,60 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
         "raw_value_exposed": False,
         "persisted": False,
     },
+    "compact_selected_role_projection": {
+        "schema_version": (
+            "onboard_route_guide.qa_selected_role_compact_response.v1"
+        ),
+        "projection_version": "qa-selected-role-compact.v1",
+        "automatic_selector": {
+            "role": "qa",
+            "work_type": "qa_verification",
+            "backlog_required": True,
+            "caller_flag_required": False,
+        },
+        "mcp_text_content_serialized_char_limit": 64000,
+        "http_envelope_serialization_reserve_chars": 512,
+        "canonical_dispatch_identity_fields": [
+            "runtime_context_id",
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        ],
+        "route_token_descriptor_fields": [
+            "schema_version",
+            "status",
+            "current_route_token_ref",
+            "current_ref_present",
+            "target_contract_execution_id",
+            "target_contract_id",
+            "pass_to_next_runtime_writes_as",
+            "raw_qa_session_token_required",
+            "raw_qa_session_token_exposed",
+            "raw_route_token_required",
+            "raw_route_token_exposed",
+        ],
+        "required_response_sections": [
+            "agent_onboard_guidance.selected_role_guidance",
+            "agent_onboard_guidance.canonical_dispatch_identity",
+            "agent_onboard_guidance.contract_runtime_authority",
+            "agent_onboard_guidance.token_descriptor",
+            "next_legal_action",
+        ],
+        "omitted_response_sections": [
+            "agent_onboard_guidance.onboard_route_guide",
+            "agent_onboard_guidance.contract_chain",
+            "agent_onboard_guidance.entrypoints",
+            "agent_onboard_guidance.observer_session_route_token_checklist",
+            "onboard_route_guide.role_entries",
+            "onboard_route_guide.capability_index",
+            "onboard_route_guide.system_operation_index",
+            "contract_chain_current",
+            "runtime_resume",
+        ],
+    },
     "line_contracts": {
         "qa_graph_context": {
             "ordered_steps": [

@@ -38325,6 +38325,19 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert result["agent_onboard_guidance"]["entrypoints"]["onboard_start"][
         "entrypoint"
     ] == "onboard_route_guide"
+    assert "compact_selected_role" not in result
+
+    default_result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    assert "compact_selected_role" not in default_result
+    assert "role_entries" in default_result["onboard_route_guide"]
+    assert "capability_index" in default_result["onboard_route_guide"]
+    assert "system_operation_index" in default_result["onboard_route_guide"]
 
 
 def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_roles(conn):
@@ -38365,6 +38378,10 @@ def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_rol
     assert worker_guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
         "runtime_context_worker_guide"
     )
+    assert "compact_selected_role" not in worker
+    assert "role_entries" in worker["onboard_route_guide"]
+    assert "capability_index" in worker["onboard_route_guide"]
+    assert "system_operation_index" in worker["onboard_route_guide"]
 
     qa = server.handle_project_onboard_route_guide(
         _ctx(
@@ -38388,14 +38405,23 @@ def test_onboard_route_guide_service_guidance_matches_selected_worker_and_qa_rol
         "task_id or contract_execution_id",
         "qa_session_token_ref or route_token_ref",
     ]
+    assert qa["compact_selected_role"] is True
+    assert qa["compact_selected_role_automatic"] is True
+    assert qa["projection_version"] == "qa-selected-role-compact.v1"
     assert qa_guidance["selected_role_guidance"]["role"] == "qa"
-    assert qa_guidance["onboard_route_guide"]["selected_role"] == "qa"
-    assert qa_guidance["onboard_route_guide"]["selected_role_guidance"][
-        "entrypoint"
-    ] == "qa_session_register"
-    assert qa_guidance["route_token_issue"]["mcp_entrypoint"]["tool"] == (
+    assert qa_guidance["selected_role_guidance"]["entrypoint"] == (
         "qa_session_register"
     )
+    assert qa["onboard_route_guide"]["selected_role"] == "qa"
+    assert qa["onboard_route_guide"]["selected_role_guidance_path"] == (
+        "agent_onboard_guidance.selected_role_guidance"
+    )
+    assert "onboard_route_guide" not in qa_guidance
+    assert "role_entries" not in qa["onboard_route_guide"]
+    assert "capability_index" not in qa["onboard_route_guide"]
+    assert "system_operation_index" not in qa["onboard_route_guide"]
+    assert "contract_chain_current" not in qa
+    assert "runtime_resume" not in qa
 
 
 def _selected_qa_runtime_guidance(
@@ -38463,6 +38489,11 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert guidance["qa_onboard_guidance_contract"] == (
         contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
     )
+    assert guidance["machine_contract"]["line_contract"][
+        "ordered_steps"
+    ] == contract_state_runtime.cli_agent_qa_onboard_guidance_contract()[
+        "line_contracts"
+    ]["qa_graph_context"]["ordered_steps"]
     assert guidance["contract_execution_id"] == "cex-mf-parallel-qa-current-line"
     assert guidance["current_action_source"] == "backlog_contract_chain_current"
     steps = guidance["ordered_steps"]
@@ -38709,7 +38740,68 @@ def test_onboard_selected_qa_service_uses_active_child_dispatch_identity(
     assert guidance["qa_onboard_guidance_contract"] == (
         contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
     )
-    assert response["onboard_route_guide"]["selected_role_guidance"] == guidance
+    canonical_identity = guidance["canonical_dispatch_identity"]
+    assert canonical_identity == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "original_worker_task_id": worker_task_id,
+        "assigned_worktree": runtime_context.worktree_path,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": (
+            f"sha256:visible-{worker_task_id}"
+        ),
+    }
+    compact_guidance = response["agent_onboard_guidance"]
+    assert compact_guidance["selected_role_guidance"] == guidance
+    assert compact_guidance["canonical_dispatch_identity"] == (
+        canonical_identity
+    )
+    assert compact_guidance["contract_runtime_authority"] == {
+        "source_of_authority": "contract_runtime",
+        "authority_decision_source": "contract_runtime_current_state",
+        "contract_execution_id": successor["contract_execution_id"],
+        "current_line_id": "qa_graph_context",
+        "current_action": "record_graph_trace",
+        "qa_onboard_guidance_contract": (
+            contract_state_runtime.cli_agent_qa_onboard_guidance_binding()
+        ),
+    }
+    assert compact_guidance["token_descriptor"]["qa_session_token"] == {
+        "source": "qa_session_register.raw_token",
+        "transport": "tool_argument_or_X-Gov-Token_header_only",
+        "raw_value_exposed": False,
+        "persisted": False,
+    }
+    assert response["onboard_route_guide"][
+        "selected_role_guidance_path"
+    ] == "agent_onboard_guidance.selected_role_guidance"
+    for omitted in (
+        "onboard_route_guide",
+        "contract_chain",
+        "entrypoints",
+        "observer_session_route_token_checklist",
+    ):
+        assert omitted not in compact_guidance
+    for omitted in (
+        "role_entries",
+        "capability_index",
+        "system_operation_index",
+        "backlog_chain_binding",
+    ):
+        assert omitted not in response["onboard_route_guide"]
+    assert "contract_chain_current" not in response
+    assert "runtime_resume" not in response
+    serialized_response = json.dumps(response, ensure_ascii=False, indent=2)
+    serialized_chars = len(serialized_response)
+    assert response["mcp_text_content_serialized_char_limit"] == 64000
+    assert response["http_envelope_serialization_reserve_chars"] == 512
+    assert serialized_chars <= 64000 - 512
+    assert "token-handler-active-child" not in serialized_response
 
 
 def test_onboard_route_guide_observer_discovers_separate_parallel_worker_host(conn):
@@ -38826,6 +38918,7 @@ def test_onboard_route_guide_no_backlog_capability_query_returns_start_guide(con
     assert result["backlog_required"] is False
     assert result["onboard_contract_required"] is False
     assert result["onboard_service_waiver"] == {}
+    assert "compact_selected_role" not in result
     guide = result["onboard_route_guide"]
     assert guide["backlog_chain_binding"]["status"] == "backlog_not_bound"
     assert guide["backlog_chain_binding"]["next_required_action"] == (

@@ -53225,6 +53225,19 @@ def _onboard_selected_qa_contract_runtime_guidance(
     )
 
     guidance_contract = cli_agent_qa_onboard_guidance_contract()
+    compact_projection_contract = guidance_contract.get(
+        "compact_selected_role_projection"
+    )
+    canonical_dispatch_identity_fields = (
+        list(
+            compact_projection_contract.get(
+                "canonical_dispatch_identity_fields"
+            )
+            or []
+        )
+        if isinstance(compact_projection_contract, Mapping)
+        else []
+    )
     line_contracts = guidance_contract.get("line_contracts")
     line_contract = (
         line_contracts.get(line_id) if isinstance(line_contracts, Mapping) else {}
@@ -53303,11 +53316,22 @@ def _onboard_selected_qa_contract_runtime_guidance(
         if isinstance(dispatch_line.get("payload"), Mapping)
         else {}
     )
+    dispatch_route_identity = (
+        dispatch_payload.get("route_identity")
+        if isinstance(dispatch_payload.get("route_identity"), Mapping)
+        else dispatch_line.get("route_identity")
+        if isinstance(dispatch_line.get("route_identity"), Mapping)
+        else {}
+    )
 
     def _dispatch_identity(*aliases: str) -> tuple[str, bool, bool]:
         values = {
             str(source.get(alias) or "").strip()
-            for source in (dispatch_line, dispatch_payload)
+            for source in (
+                dispatch_line,
+                dispatch_payload,
+                dispatch_route_identity,
+            )
             for alias in aliases
             if str(source.get(alias) or "").strip()
         }
@@ -53327,6 +53351,16 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "target_project_root", "project_root", "repo_root"
     )
     repo_root = worktree if worktree_present else target_root
+    canonical_dispatch_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "original_worker_task_id": worker_task_id,
+        "assigned_worktree": repo_root,
+    }
+    for field in canonical_dispatch_identity_fields:
+        value, conflict, _present = _dispatch_identity(str(field))
+        if value and not conflict:
+            canonical_dispatch_identity[str(field)] = value
     missing = [
         field for field, value in (("task_id", worker_task_id), ("repo_root", repo_root))
         if not value
@@ -53387,6 +53421,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
     return {
         **base_guidance,
         "ordered_steps": steps,
+        "canonical_dispatch_identity": canonical_dispatch_identity,
         "machine_contract": {
             "token_transport": deepcopy(token_transport),
             "line_contract": deepcopy(line_contract),
@@ -55532,6 +55567,268 @@ def _onboard_blocked_contract_resume_projection(
     return {}
 
 
+def _qa_onboard_compact_selected_role_response(
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    """Project the automatic bounded QA response used by managed MCP."""
+
+    from .contract_state_runtime import (
+        cli_agent_qa_onboard_guidance_binding,
+        cli_agent_qa_onboard_guidance_contract,
+    )
+
+    guidance_contract = cli_agent_qa_onboard_guidance_contract()
+    projection_contract = guidance_contract.get(
+        "compact_selected_role_projection"
+    )
+    if not isinstance(projection_contract, Mapping):
+        return response
+    selector = projection_contract.get("automatic_selector")
+    if not isinstance(selector, Mapping):
+        return response
+    if (
+        str(response.get("selected_role") or "").strip()
+        != str(selector.get("role") or "").strip()
+        or str(response.get("selected_work_type") or "").strip()
+        != str(selector.get("work_type") or "").strip()
+        or (
+            bool(selector.get("backlog_required"))
+            and not str(response.get("backlog_id") or "").strip()
+        )
+    ):
+        return response
+
+    projection_schema = str(
+        projection_contract.get("schema_version") or ""
+    ).strip()
+    projection_version = str(
+        projection_contract.get("projection_version") or ""
+    ).strip()
+    try:
+        serialized_char_limit = int(
+            projection_contract.get(
+                "mcp_text_content_serialized_char_limit"
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        serialized_char_limit = 0
+    try:
+        serialization_reserve_chars = int(
+            projection_contract.get(
+                "http_envelope_serialization_reserve_chars"
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        serialization_reserve_chars = 0
+    guidance = (
+        response.get("agent_onboard_guidance")
+        if isinstance(response.get("agent_onboard_guidance"), Mapping)
+        else {}
+    )
+    selected_guidance = (
+        dict(guidance.get("selected_role_guidance"))
+        if isinstance(guidance.get("selected_role_guidance"), Mapping)
+        else {}
+    )
+    if (
+        not projection_schema
+        or not projection_version
+        or serialized_char_limit <= 0
+        or not selected_guidance
+    ):
+        return {
+            "schema_version": projection_schema
+            or "onboard_route_guide.qa_selected_role_compact_response.invalid",
+            "ok": False,
+            "project_id": str(response.get("project_id") or ""),
+            "backlog_id": str(response.get("backlog_id") or ""),
+            "selected_role": "qa",
+            "selected_work_type": str(
+                response.get("selected_work_type") or ""
+            ),
+            "compact_selected_role": True,
+            "blocker": {
+                "id": "qa_compact_selected_role_contract_invalid",
+                "source": "cli_agent_qa_onboard_guidance_contract",
+            },
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+
+    route_token_guidance = (
+        guidance.get("route_token_ref_guidance")
+        if isinstance(guidance.get("route_token_ref_guidance"), Mapping)
+        else {}
+    )
+    route_token_descriptor_fields = [
+        str(field)
+        for field in (
+            projection_contract.get("route_token_descriptor_fields") or []
+        )
+        if str(field)
+    ]
+    route_token_descriptor = {
+        field: deepcopy(route_token_guidance[field])
+        for field in route_token_descriptor_fields
+        if field in route_token_guidance
+    }
+    route_token_descriptor.setdefault("raw_route_token_required", False)
+    route_token_descriptor.setdefault("raw_route_token_exposed", False)
+    canonical_dispatch_identity = (
+        dict(selected_guidance.get("canonical_dispatch_identity"))
+        if isinstance(
+            selected_guidance.get("canonical_dispatch_identity"), Mapping
+        )
+        else {
+            "project_id": str(response.get("project_id") or ""),
+            "backlog_id": str(response.get("backlog_id") or ""),
+        }
+    )
+    next_action = (
+        dict(response.get("next_legal_action"))
+        if isinstance(response.get("next_legal_action"), Mapping)
+        else {}
+    )
+    contract_runtime_authority = {
+        "source_of_authority": str(
+            selected_guidance.get("source_of_authority")
+            or next_action.get("source_of_authority")
+            or next_action.get("source")
+            or ""
+        ),
+        "authority_decision_source": str(
+            selected_guidance.get("authority_decision_source")
+            or next_action.get("authority_decision_source")
+            or ""
+        ),
+        "contract_execution_id": str(
+            selected_guidance.get("contract_execution_id")
+            or next_action.get("contract_execution_id")
+            or next_action.get("current_contract_execution_id")
+            or ""
+        ),
+        "current_line_id": str(
+            selected_guidance.get("current_line_id")
+            or next_action.get("line_id")
+            or ""
+        ),
+        "current_action": str(
+            selected_guidance.get("current_action")
+            or next_action.get("action")
+            or next_action.get("id")
+            or ""
+        ),
+        "qa_onboard_guidance_contract": (
+            cli_agent_qa_onboard_guidance_binding()
+        ),
+    }
+    compact_guidance = {
+        "schema_version": str(guidance.get("schema_version") or ""),
+        "projection_schema_version": projection_schema,
+        "projection_version": projection_version,
+        "role": "qa",
+        "actor_role": "qa",
+        "required_identity": deepcopy(guidance.get("required_identity") or {}),
+        "selected_role_guidance": selected_guidance,
+        "canonical_dispatch_identity": canonical_dispatch_identity,
+        "contract_runtime_authority": contract_runtime_authority,
+        "token_descriptor": {
+            "qa_session_token": deepcopy(
+                guidance_contract.get("token_transport") or {}
+            ),
+            "route_token_ref": route_token_descriptor,
+        },
+        "next_legal_action_path": "next_legal_action",
+        "raw_qa_session_token_required": False,
+        "raw_qa_session_token_exposed": False,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    compact_response = {
+        "schema_version": str(response.get("schema_version") or ""),
+        "projection_schema_version": projection_schema,
+        "projection_version": projection_version,
+        "ok": bool(response.get("ok")),
+        "project_id": str(response.get("project_id") or ""),
+        "backlog_id": str(response.get("backlog_id") or ""),
+        "service": deepcopy(response.get("service") or {}),
+        "selected_role": "qa",
+        "selected_work_type": str(response.get("selected_work_type") or ""),
+        "compact_selected_role": True,
+        "compact_selected_role_automatic": True,
+        "mcp_text_content_serialized_char_limit": serialized_char_limit,
+        "http_envelope_serialization_reserve_chars": (
+            serialization_reserve_chars
+        ),
+        "legacy_onboard_contract_waived": bool(
+            response.get("legacy_onboard_contract_waived")
+        ),
+        "onboard_contract_required": bool(
+            response.get("onboard_contract_required")
+        ),
+        "onboard_service_waiver": deepcopy(
+            response.get("onboard_service_waiver") or {}
+        ),
+        "qa_onboard_guidance_contract": (
+            cli_agent_qa_onboard_guidance_binding()
+        ),
+        "agent_onboard_guidance": compact_guidance,
+        "onboard_route_guide": {
+            "schema_version": projection_schema,
+            "projection_version": projection_version,
+            "selected_role": "qa",
+            "selected_actor_role": "qa",
+            "selected_role_guidance_path": (
+                "agent_onboard_guidance.selected_role_guidance"
+            ),
+            "next_legal_action_path": "next_legal_action",
+            "canonical_dispatch_identity_path": (
+                "agent_onboard_guidance.canonical_dispatch_identity"
+            ),
+            "contract_runtime_authority_path": (
+                "agent_onboard_guidance.contract_runtime_authority"
+            ),
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "projection_degraded": bool(response.get("projection_degraded")),
+        "projection_degraded_reason": deepcopy(
+            response.get("projection_degraded_reason") or {}
+        ),
+        "next_legal_action": next_action,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    serialized_chars = len(
+        json.dumps(compact_response, ensure_ascii=False, indent=2)
+    )
+    if serialized_chars <= (
+        serialized_char_limit - max(serialization_reserve_chars, 0)
+    ):
+        return compact_response
+    return {
+        "schema_version": str(response.get("schema_version") or ""),
+        "projection_schema_version": projection_schema,
+        "projection_version": projection_version,
+        "ok": False,
+        "project_id": str(response.get("project_id") or ""),
+        "backlog_id": str(response.get("backlog_id") or ""),
+        "selected_role": "qa",
+        "selected_work_type": str(response.get("selected_work_type") or ""),
+        "compact_selected_role": True,
+        "mcp_text_content_serialized_char_limit": serialized_char_limit,
+        "blocker": {
+            "id": "qa_compact_selected_role_serialized_size_exceeded",
+            "source": "onboard_route_guide_service",
+            "measured_chars": serialized_chars,
+        },
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _onboard_route_guide_service_response(
     conn,
     *,
@@ -55803,7 +56100,7 @@ def _onboard_route_guide_service_response(
         runtime_resume=runtime_resume,
         qa_runtime_record=qa_runtime_record,
     )
-    return {
+    response = {
         "schema_version": "onboard_route_guide.service_response.v1",
         "ok": True,
         "project_id": project_id,
@@ -55838,6 +56135,7 @@ def _onboard_route_guide_service_response(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+    return _qa_onboard_compact_selected_role_response(response)
 
 
 def _onboard_contract_response(record: Mapping[str, Any]) -> dict[str, Any]:
