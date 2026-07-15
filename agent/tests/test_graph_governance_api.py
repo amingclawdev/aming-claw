@@ -632,7 +632,7 @@ def test_worker_commit_timeline_alias_only_projects_same_canonical_line():
         )
 
 
-def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift(
+def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift(
     tmp_path,
     monkeypatch,
 ):
@@ -692,7 +692,22 @@ def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift
     monkeypatch.setattr(
         server,
         "_runtime_context_contract_requires_worker_commit",
-        lambda *_args, **_kwargs: True,
+        lambda _conn, contract_execution_id: contract_execution_id == "cex-drift",
+    )
+    resolution = {
+        "schema_version": "runtime_context.contract_execution_resolution.v1",
+        "source": "source_backed_contract_runtime_worker_lineage",
+        "status": "resolved_source_backed_worker_lineage",
+        "contract_execution_id": "cex-drift",
+        "fail_closed": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *_args, **_kwargs: (
+            {"contract_execution_id": "cex-drift"},
+            resolution,
+        ),
     )
     context = SimpleNamespace(
         worktree_path=str(worktree),
@@ -704,7 +719,7 @@ def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift
         "context": context,
         "runtime_context_id": "mfrctx-drift",
         "revision_payload": {},
-        "body": {"contract_execution_id": "cex-drift"},
+        "body": {},
         "source": "test.finish",
     }
 
@@ -713,6 +728,8 @@ def test_runtime_context_finish_consumes_recorded_commit_and_rejects_later_drift
         **kwargs,
     )
     assert projection["worker_commit_sha"] == worker_commit
+    assert projection["contract_execution_id"] == "cex-drift"
+    assert projection["contract_runtime_execution_resolution"] == resolution
 
     owned.write_text("dirty after commit\n", encoding="utf-8")
     with pytest.raises(GovernanceError) as dirty:

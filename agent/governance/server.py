@@ -21864,9 +21864,20 @@ def _runtime_context_git_dirty_files(worktree_path: str) -> list[str]:
 def _runtime_context_worker_commit_contract_execution_id(
     revision_payload: Mapping[str, Any],
     body: Mapping[str, Any],
+    *,
+    resolved_contract_identity: Mapping[str, Any] | None = None,
 ) -> str:
     identity = _runtime_context_contract_execution_identity(revision_payload)
-    expected = str(identity.get("contract_execution_id") or "").strip()
+    resolved_identity = (
+        resolved_contract_identity
+        if isinstance(resolved_contract_identity, Mapping)
+        else {}
+    )
+    expected = str(
+        resolved_identity.get("contract_execution_id")
+        or identity.get("contract_execution_id")
+        or ""
+    ).strip()
     supplied = str(
         body.get("contract_execution_id")
         or body.get("successor_contract_execution_id")
@@ -22704,9 +22715,23 @@ def _runtime_context_contract_worker_commit_projection(
 ) -> dict[str, Any]:
     """Validate finish state against the actual ContractRuntime commit line."""
 
+    contract_identity = _runtime_context_contract_execution_identity(
+        revision_payload,
+    )
+    resolved_contract_identity, contract_execution_resolution = (
+        _runtime_context_resolve_contract_execution_identity(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            contract_identity=contract_identity,
+        )
+    )
     contract_execution_id = _runtime_context_worker_commit_contract_execution_id(
         revision_payload,
         body,
+        resolved_contract_identity=resolved_contract_identity,
     )
     if not _runtime_context_contract_requires_worker_commit(
         conn,
@@ -22722,6 +22747,9 @@ def _runtime_context_contract_worker_commit_projection(
         )
         legacy["canonical_worker_commit_required"] = False
         legacy["compatibility_only"] = True
+        legacy["contract_runtime_execution_resolution"] = dict(
+            contract_execution_resolution
+        )
         return legacy
 
     line, payload = _runtime_context_actual_worker_commit_line(
@@ -22803,6 +22831,9 @@ def _runtime_context_contract_worker_commit_projection(
         "canonical_worker_commit_required": True,
         "timeline_projection_authoritative": False,
         "contract_execution_id": contract_execution_id,
+        "contract_runtime_execution_resolution": dict(
+            contract_execution_resolution
+        ),
         "runtime_context_id": runtime_context_id,
         "task_id": str(getattr(context, "task_id", "") or ""),
         "worker_commit_sha": commit_sha,
