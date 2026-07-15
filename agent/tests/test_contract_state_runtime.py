@@ -400,7 +400,7 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert binding["schema_version"] == (
         "cli_agent.qa_bootstrap_guide_contract.v1"
     )
-    assert binding["guide_version"] == "qa-bootstrap-guide.v2"
+    assert binding["guide_version"] == "qa-bootstrap-guide.v3"
     assert binding["guide_hash"].startswith("sha256:")
     guide_contract = contract_state_runtime.cli_agent_qa_bootstrap_guide_contract()
     assert guide_contract["guide_version"] == binding["guide_version"]
@@ -410,7 +410,26 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert "managed MCP `contract_runtime_guide`" in prompt_template
     assert "compact CLI projections" in prompt_template
     assert "ContractRuntime remains the source of authority" in prompt_template
-    assert "After every accepted ContractRuntime line" in prompt_template
+    for graph_argument in (
+        "tool=query_schema",
+        "query_source=qa",
+        "query_purpose=independent_verification",
+        "project_id={project_id}",
+        "backlog_id={backlog_id}",
+        "task_id={original_worker_task_id}",
+        "commit_sha=<full git HEAD>",
+        "repo_root={assigned_worktree}",
+        "qa_session_token=<raw token from step 1>",
+    ):
+        assert graph_argument in prompt_template
+    assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt_template
+    assert "schema_version=mf_parallel.qa_graph_context.v1" in prompt_template
+    assert "graph_trace_ids=[<returned trace_id>]" in prompt_template
+    assert "graph_query_trace_ids=[<returned trace_id>]" in prompt_template
+    assert "focused exact pytest node ids" in prompt_template
+    assert "tests list records every exact pytest node id and outcome" in prompt_template
+    assert "starts with a clear PASS: or FAIL:" in prompt_template
+    assert "execution_state_revision to be strictly greater" in prompt_template
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
