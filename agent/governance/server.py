@@ -53219,6 +53219,68 @@ def _onboard_selected_qa_contract_runtime_guidance(
     authority_source = str(
         action.get("authority_decision_source") or "backlog_contract_chain_current"
     ).strip()
+    from .contract_state_runtime import (
+        cli_agent_qa_onboard_guidance_binding,
+        cli_agent_qa_onboard_guidance_contract,
+    )
+
+    guidance_contract = cli_agent_qa_onboard_guidance_contract()
+    line_contracts = guidance_contract.get("line_contracts")
+    line_contract = (
+        line_contracts.get(line_id) if isinstance(line_contracts, Mapping) else {}
+    )
+    ordered_steps_template = (
+        list(line_contract.get("ordered_steps") or [])
+        if isinstance(line_contract, Mapping)
+        else []
+    )
+    ordered_step_ids = [
+        str(step.get("id") or "").strip()
+        if isinstance(step, Mapping)
+        else ""
+        for step in ordered_steps_template
+    ]
+    token_transport = guidance_contract.get("token_transport")
+    guidance_schema = str(
+        guidance_contract.get("selected_role_guidance_schema_version") or ""
+    ).strip()
+    base_guidance = {
+        "schema_version": guidance_schema,
+        "next_action": action,
+        "contract_execution_id": execution_id,
+        "current_line_id": line_id,
+        "current_action": current_action,
+        "current_action_source": str(
+            action.get("source") or "ContractRuntime.next_legal_action"
+        ).strip(),
+        "source_of_authority": authority,
+        "authority_decision_source": authority_source,
+        "qa_onboard_guidance_contract": (
+            cli_agent_qa_onboard_guidance_binding()
+        ),
+    }
+    if (
+        not guidance_schema
+        or not isinstance(line_contract, Mapping)
+        or not ordered_steps_template
+        or not all(ordered_step_ids)
+        or len(set(ordered_step_ids)) != len(ordered_step_ids)
+        or not isinstance(token_transport, Mapping)
+        or token_transport.get("raw_value_exposed") is not False
+        or token_transport.get("persisted") is not False
+        or guidance_contract.get("raw_qa_session_token_public") is not False
+        or not isinstance(
+            line_contract.get("redundant_graph_query_required"), bool
+        )
+    ):
+        return {
+            **base_guidance,
+            "status": "blocked", "executable": False, "ordered_steps": [],
+            "blocker": {
+                "id": "qa_onboard_guidance_contract_invalid",
+                "source": "cli_agent_qa_onboard_guidance_contract",
+            },
+        }
     dispatch_record = (
         qa_runtime_record if isinstance(qa_runtime_record, Mapping) else record
     )
@@ -53279,12 +53341,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
     ]
     if missing or conflicts:
         return {
-            "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
-            "next_action": action, "contract_execution_id": execution_id,
-            "current_line_id": line_id, "current_action": current_action,
-            "current_action_source": str(action.get("source") or "ContractRuntime.next_legal_action"),
-            "source_of_authority": authority,
-            "authority_decision_source": authority_source,
+            **base_guidance,
             "status": "blocked", "executable": False, "ordered_steps": [],
             "blocker": {
                 "id": "qa_canonical_dispatch_identity_unavailable",
@@ -53293,82 +53350,50 @@ def _onboard_selected_qa_contract_runtime_guidance(
                 "conflicting_fields": conflicts,
             },
         }
-    token = {
-        "source": "qa_session_register.raw_token",
-        "transport": "tool_argument_or_X-Gov-Token_header_only",
-        "raw_value_exposed": False, "persisted": False,
+    replacements: dict[str, Any] = {
+        "$project_id": project_id,
+        "$backlog_id": backlog_id,
+        "$original_worker_task_id": worker_task_id,
+        "$assigned_worktree": repo_root,
+        "$qa_session_token": dict(token_transport),
     }
-    full_head = "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
-    register = {"id": "qa_session_register", "mcp_tool": "qa_session_register"}
-    action_source = str(
-        action.get("source") or "ContractRuntime.next_legal_action"
-    ).strip()
-    read_tools = ["contract_runtime_current", "contract_runtime_guide"]
-    copy_source = "contract_runtime_guide.writer_role_safe_copy_payload.copy_payload"
-    if line_id == "qa_graph_context":
-        trace_ref = "<graph_query.trace_id>"
-        graph_arguments = {
-            "tool": "query_schema", "query_source": "qa",
-            "query_purpose": "independent_verification", "project_id": project_id,
-            "backlog_id": backlog_id, "task_id": worker_task_id,
-            "commit_sha": full_head, "repo_root": repo_root, "qa_session_token": token,
+    unresolved_placeholders: set[str] = set()
+
+    def _render_machine_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): _render_machine_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_render_machine_value(item) for item in value]
+        if isinstance(value, str) and value in replacements:
+            return deepcopy(replacements[value])
+        if isinstance(value, str) and value.startswith("$"):
+            unresolved_placeholders.add(value)
+        return value
+
+    steps = _render_machine_value(ordered_steps_template)
+    if unresolved_placeholders:
+        return {
+            **base_guidance,
+            "status": "blocked", "executable": False, "ordered_steps": [],
+            "blocker": {
+                "id": "qa_onboard_guidance_contract_invalid",
+                "source": "cli_agent_qa_onboard_guidance_contract",
+                "unresolved_placeholders": sorted(unresolved_placeholders),
+            },
         }
-        trace_payload = {
-            "graph_trace_ids": [trace_ref], "graph_query_trace_ids": [trace_ref]
-        }
-        steps = [register, {
-            "id": "graph_query_schema", "mcp_tool": "graph_query",
-            "arguments": graph_arguments,
-            "required_result": "successful trace_id",
-            "blocked_before_success": [*read_tools, "focused_tests", "qa_independent_verification"],
-            "on_error": "report_public_blocker_only",
-        }, {
-            "id": "read_compact_contract_runtime", "mcp_tools": read_tools,
-            "requires": ["graph_query_schema.successful_trace_id"],
-            "completion_evidence": False,
-        }, {
-            "id": "submit_qa_graph_context", "mcp_tool": "contract_runtime_submit_line",
-            "line_id": line_id, "copy_payload_source": copy_source,
-            "copy_all_safe_fields": True,
-            "add_arguments": {"qa_session_token": token, **trace_payload,
-                "payload": {"schema_version": "mf_parallel.qa_graph_context.v1", **trace_payload}},
-        }, {
-            "id": "reread_after_qa_graph_context", "mcp_tools": read_tools,
-            "requires": ["submit_qa_graph_context.accepted"],
-            "require_revision_advance": True, "next_expected_line_id": "qa_independent_verification",
-        }]
-    else:
-        steps = [register, {
-            "id": "read_refreshed_compact_contract_runtime", "mcp_tools": read_tools,
-            "completion_evidence": False,
-        }, {
-            "id": "run_focused_exact_tests", "exact_node_ids_only": True,
-            "test_source": "refreshed_contract_runtime_guide",
-        }, {
-            "id": "submit_one_qa_independent_verification",
-            "mcp_tool": "contract_runtime_submit_line", "line_id": line_id,
-            "exactly_once": True, "copy_payload_source": copy_source,
-            "copy_all_safe_fields": True,
-            "add_arguments": {"qa_session_token": token, "payload": {
-                "tests": "<exact pytest node ids and outcomes>",
-                "summary": "<clear PASS or FAIL summary>"}},
-        }, {
-            "id": "confirm_strict_revision_advance",
-            "mcp_tools": read_tools,
-            "requires": ["submit_one_qa_independent_verification.accepted"],
-            "revision_must_be_strictly_greater": True,
-            "read_only_or_process_exit_zero_is_completion": False,
-        }]
     return {
-        "schema_version": "onboard_route_guide.qa_selected_role_guidance.v1",
-        "next_action": action,
-        "contract_execution_id": execution_id,
-        "current_line_id": line_id,
-        "current_action": current_action,
-        "current_action_source": action_source,
-        "source_of_authority": authority,
-        "authority_decision_source": authority_source,
-        "ordered_steps": steps, "redundant_graph_query_required": False,
+        **base_guidance,
+        "ordered_steps": steps,
+        "machine_contract": {
+            "token_transport": deepcopy(token_transport),
+            "line_contract": deepcopy(line_contract),
+        },
+        "redundant_graph_query_required": bool(
+            line_contract["redundant_graph_query_required"]
+        ),
     }
 
 

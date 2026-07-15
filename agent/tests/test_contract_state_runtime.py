@@ -211,6 +211,26 @@ def _cli_agent_ticket_fixture() -> tuple[dict, dict]:
     return current, launch
 
 
+def _qa_cli_agent_ticket_fixture() -> tuple[dict, dict]:
+    current, launch = _cli_agent_ticket_fixture()
+    current["authority_decision_source"] = (
+        "contract_runtime_qa_execution_ticket"
+    )
+    current["next_legal_action"].update(
+        {
+            "worker_role": "qa",
+            "profile_requirements": {
+                "harness": "codex",
+                "provider": "openai",
+                "role": "qa",
+                "required_capabilities": ["independent_verification"],
+            },
+        }
+    )
+    launch["worker_role"] = "qa"
+    return current, launch
+
+
 def test_cli_agent_execution_ticket_is_idempotent_and_public_only():
     current, launch = _cli_agent_ticket_fixture()
     kwargs = {
@@ -370,20 +390,7 @@ def test_cli_agent_execution_ticket_rejects_non_dispatch_decision_source():
 def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     monkeypatch,
 ):
-    current, launch = _cli_agent_ticket_fixture()
-    current["authority_decision_source"] = "contract_runtime_qa_execution_ticket"
-    current["next_legal_action"].update(
-        {
-            "worker_role": "qa",
-            "profile_requirements": {
-                "harness": "codex",
-                "provider": "openai",
-                "role": "qa",
-                "required_capabilities": ["independent_verification"],
-            },
-        }
-    )
-    launch["worker_role"] = "qa"
+    current, launch = _qa_cli_agent_ticket_fixture()
 
     issued = build_cli_agent_execution_ticket(
         contract_runtime_current_state=current,
@@ -449,6 +456,23 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     ):
         assert graph_index < prompt_template.index(graph_gated_step)
     assert "qa_bootstrap_guide_contract" not in issued["profile_requirements"]
+    onboard_binding = issued["qa_onboard_guidance_contract"]
+    assert onboard_binding["schema_version"] == (
+        "cli_agent.qa_onboard_guidance_contract.v1"
+    )
+    assert onboard_binding["guidance_version"] == "qa-onboard-guidance.v1"
+    assert onboard_binding["guidance_hash"].startswith("sha256:")
+    onboard_contract = (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
+    )
+    assert onboard_contract["guidance_hash"] == onboard_binding["guidance_hash"]
+    assert [
+        step["id"]
+        for step in onboard_contract["line_contracts"]["qa_graph_context"][
+            "ordered_steps"
+        ][:2]
+    ] == ["qa_session_register", "graph_query_schema"]
+    assert "qa_onboard_guidance_contract" not in issued["profile_requirements"]
     tooling_binding = issued["managed_profile_tooling_contract"]
     assert tooling_binding["schema_version"] == (
         "cli_agent.managed_profile_tooling_contract.v1"
@@ -467,7 +491,44 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert same["ticket_id"] == issued["ticket_id"]
     assert same["ticket_hash"] == issued["ticket_hash"]
     assert same["qa_bootstrap_guide_contract"] == binding
+    assert same["qa_onboard_guidance_contract"] == onboard_binding
     assert same["managed_profile_tooling_contract"] == tooling_binding
+
+    original_onboard_version = (
+        contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION
+    )
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
+        original_onboard_version + ".changed",
+    )
+    onboard_changed = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert onboard_changed["status"] == "issued"
+    assert onboard_changed["execution_state_revision"] == issued[
+        "execution_state_revision"
+    ]
+    assert onboard_changed["contract_revision_id"] == issued[
+        "contract_revision_id"
+    ]
+    assert onboard_changed["dispatch_identity"] == issued["dispatch_identity"]
+    assert onboard_changed["dispatch_identity_hash"] == issued[
+        "dispatch_identity_hash"
+    ]
+    assert onboard_changed["profile_requirements"] == issued["profile_requirements"]
+    assert onboard_changed["retry_policy"] == issued["retry_policy"]
+    assert onboard_changed["qa_bootstrap_guide_contract"] == binding
+    assert onboard_changed["managed_profile_tooling_contract"] == tooling_binding
+    assert onboard_changed["qa_onboard_guidance_contract"] != onboard_binding
+    assert onboard_changed["ticket_id"] != issued["ticket_id"]
+    assert onboard_changed["ticket_hash"] != issued["ticket_hash"]
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
+        original_onboard_version,
+    )
 
     monkeypatch.setattr(
         contract_state_runtime,
@@ -523,6 +584,93 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
     assert changed["dispatch_identity"] == tooling_changed["dispatch_identity"]
     assert changed["ticket_id"] != tooling_changed["ticket_id"]
     assert changed["ticket_hash"] != tooling_changed["ticket_hash"]
+
+
+def test_cli_agent_qa_ticket_rotates_for_each_executable_guidance_semantic(
+    monkeypatch,
+):
+    current, launch = _qa_cli_agent_ticket_fixture()
+    baseline_machine_contract = json.loads(
+        json.dumps(
+            contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT
+        )
+    )
+    baseline = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=current,
+        launch_identity=launch,
+    )
+    assert baseline["status"] == "issued"
+
+    mutations = [
+        (
+            (
+                "line_contracts", "qa_graph_context", "ordered_steps", 3,
+                "copy_all_safe_fields",
+            ),
+            False,
+        ),
+        (
+            (
+                "line_contracts", "qa_graph_context", "ordered_steps", 3,
+                "copy_payload_source",
+            ),
+            "changed.writer_role_safe_copy_payload.copy_payload",
+        ),
+        (
+            ("token_transport", "transport"),
+            "changed-token-transport",
+        ),
+        (
+            (
+                "line_contracts", "qa_graph_context", "ordered_steps", 1,
+                "blocked_before_success",
+            ),
+            ["changed-graph-gate"],
+        ),
+        (
+            (
+                "line_contracts", "qa_independent_verification",
+                "ordered_steps", 3, "add_arguments", "payload", "summary",
+            ),
+            "<changed verdict payload summary>",
+        ),
+    ]
+    authority_fields = (
+        "execution_state_revision",
+        "contract_revision_id",
+        "dispatch_identity",
+        "dispatch_identity_hash",
+        "profile_requirements",
+        "retry_policy",
+        "qa_bootstrap_guide_contract",
+        "managed_profile_tooling_contract",
+    )
+
+    for path, changed_value in mutations:
+        candidate_contract = json.loads(json.dumps(baseline_machine_contract))
+        cursor = candidate_contract
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = changed_value
+        monkeypatch.setattr(
+            contract_state_runtime,
+            "CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT",
+            candidate_contract,
+        )
+
+        changed = build_cli_agent_execution_ticket(
+            contract_runtime_current_state=current,
+            launch_identity=launch,
+        )
+
+        assert changed["status"] == "issued"
+        assert changed["qa_onboard_guidance_contract"]["guidance_hash"] != (
+            baseline["qa_onboard_guidance_contract"]["guidance_hash"]
+        )
+        assert changed["ticket_id"] != baseline["ticket_id"]
+        assert changed["ticket_hash"] != baseline["ticket_hash"]
+        for field in authority_fields:
+            assert changed[field] == baseline[field]
 
 
 def test_cli_agent_qa_ticket_id_changes_with_source_payload_digest(

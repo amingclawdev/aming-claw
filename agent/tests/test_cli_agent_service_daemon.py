@@ -602,6 +602,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "profile_id" not in old_ticket["profile_requirements"]
     assert "profile_id" not in selectors
     assert "qa_bootstrap_guide_contract" not in selectors
+    assert "qa_onboard_guidance_contract" not in selectors
     assert "managed_profile_tooling_contract" not in selectors
     raw_qa_token = "raw-qa-session-token-must-not-appear"
     active_ticket = {"value": old_ticket}
@@ -617,6 +618,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     def resolve_ticket(request, *, qa_session_token):
         assert request["task_id"] == "qa-task-guided-daemon"
         assert "qa_bootstrap_guide_contract" not in request
+        assert "qa_onboard_guidance_contract" not in request
         assert "managed_profile_tooling_contract" not in request
         assert qa_session_token == raw_qa_token
         return dict(active_ticket["value"])
@@ -647,6 +649,29 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
             )
     assert schedule_requests == []
     assert supervisor.starts == []
+
+    for invalid_binding in (None, {"guidance_hash": "sha256:stale"}):
+        invalid_ticket = dict(old_ticket)
+        if invalid_binding is None:
+            invalid_ticket.pop("qa_onboard_guidance_contract")
+        else:
+            invalid_ticket["qa_onboard_guidance_contract"] = invalid_binding
+        invalid_material = dict(invalid_ticket)
+        invalid_material.pop("ticket_hash", None)
+        invalid_ticket["ticket_hash"] = _stable_json_hash(invalid_material)
+        active_ticket["value"] = invalid_ticket
+        with pytest.raises(ServiceError, match="qa_onboard_guidance_contract"):
+            service._admit_governed_host_envelope_run(
+                {
+                    "authority_selectors": selectors,
+                    "qa_session_token": raw_qa_token,
+                },
+                qa_mode=True,
+            )
+    assert schedule_requests == []
+    assert supervisor.starts == []
+    with sqlite3.connect(registry.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0] == 0
     active_ticket["value"] = old_ticket
 
     old_response = service._admit_governed_host_envelope_run(
@@ -704,6 +729,52 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
 
     monkeypatch.setattr(
         contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION",
+        contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION
+        + ".daemon-change",
+    )
+    with pytest.raises(ServiceError, match="qa_onboard_guidance_contract"):
+        service._admit_governed_host_envelope_run(
+            {
+                "authority_selectors": selectors,
+                "qa_session_token": raw_qa_token,
+            },
+            qa_mode=True,
+        )
+    assert len(schedule_requests) == 2
+    onboard_ticket, onboard_selectors = _guided_ticket_and_selectors(
+        tmp_path,
+        profile_role="qa",
+        role="qa",
+    )
+    assert onboard_selectors == selectors
+    assert onboard_ticket["ticket_id"] != tooling_ticket["ticket_id"]
+    assert onboard_ticket["dispatch_identity_hash"] == old_ticket[
+        "dispatch_identity_hash"
+    ]
+    assert onboard_ticket["profile_requirements"] == tooling_ticket[
+        "profile_requirements"
+    ]
+    assert onboard_ticket["retry_policy"] == old_ticket["retry_policy"]
+    assert onboard_ticket["qa_bootstrap_guide_contract"] == old_ticket[
+        "qa_bootstrap_guide_contract"
+    ]
+    assert onboard_ticket["managed_profile_tooling_contract"] == tooling_ticket[
+        "managed_profile_tooling_contract"
+    ]
+    active_ticket["value"] = onboard_ticket
+    onboard_response = service._admit_governed_host_envelope_run(
+        {
+            "authority_selectors": selectors,
+            "qa_session_token": raw_qa_token,
+        },
+        qa_mode=True,
+    )
+    registry.record_exit(onboard_response["run_id"], 0)
+    assert registry.get_run(onboard_response["run_id"]).state == "completed"
+
+    monkeypatch.setattr(
+        contract_state_runtime,
         "CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE",
         contract_state_runtime.CLI_AGENT_QA_BOOTSTRAP_GUIDE_PROMPT_TEMPLATE
         + "\nVersioned daemon guide change.",
@@ -716,7 +787,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
             },
             qa_mode=True,
         )
-    assert len(schedule_requests) == 2
+    assert len(schedule_requests) == 3
     new_ticket, new_selectors = _guided_ticket_and_selectors(
         tmp_path,
         profile_role="qa",
@@ -728,6 +799,7 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
         "dispatch_identity_hash"
     ]
     assert new_ticket["retry_policy"] == old_ticket["retry_policy"]
+    assert new_ticket["ticket_id"] != onboard_ticket["ticket_id"]
     active_ticket["value"] = new_ticket
 
     response = service._admit_governed_host_envelope_run(
@@ -743,14 +815,19 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert response["run_id"] != old_response["run_id"]
     assert registry.get_run(old_response["run_id"]).state == "completed"
     assert registry.get_run(tooling_response["run_id"]).state == "completed"
+    assert registry.get_run(onboard_response["run_id"]).state == "completed"
     assert registry.get_run(response["run_id"]) is not None
-    assert len(supervisor.starts) == 3
-    assert len(schedule_requests) == 3
+    assert len(supervisor.starts) == 4
+    assert len(schedule_requests) == 4
     for schedule_request in schedule_requests:
         assert "qa_bootstrap_guide_contract" not in schedule_request[
             "profile_requirements"
         ]
         assert "qa_bootstrap_guide_contract" not in schedule_request
+        assert "qa_onboard_guidance_contract" not in schedule_request[
+            "profile_requirements"
+        ]
+        assert "qa_onboard_guidance_contract" not in schedule_request
         assert "managed_profile_tooling_contract" not in schedule_request[
             "profile_requirements"
         ]

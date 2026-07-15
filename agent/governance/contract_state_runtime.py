@@ -30,6 +30,150 @@ CLI_AGENT_QA_BOOTSTRAP_GUIDE_SCHEMA_VERSION = (
     "cli_agent.qa_bootstrap_guide_contract.v1"
 )
 CLI_AGENT_QA_BOOTSTRAP_GUIDE_VERSION = "qa-bootstrap-guide.v4"
+CLI_AGENT_QA_ONBOARD_GUIDANCE_SCHEMA_VERSION = (
+    "cli_agent.qa_onboard_guidance_contract.v1"
+)
+CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION = "qa-onboard-guidance.v1"
+CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
+    "selected_role_guidance_schema_version": (
+        "onboard_route_guide.qa_selected_role_guidance.v1"
+    ),
+    "token_transport": {
+        "source": "qa_session_register.raw_token",
+        "transport": "tool_argument_or_X-Gov-Token_header_only",
+        "raw_value_exposed": False,
+        "persisted": False,
+    },
+    "line_contracts": {
+        "qa_graph_context": {
+            "ordered_steps": [
+                {
+                    "id": "qa_session_register",
+                    "mcp_tool": "qa_session_register",
+                },
+                {
+                    "id": "graph_query_schema",
+                    "mcp_tool": "graph_query",
+                    "arguments": {
+                        "tool": "query_schema",
+                        "query_source": "qa",
+                        "query_purpose": "independent_verification",
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "task_id": "$original_worker_task_id",
+                        "commit_sha": (
+                            "<full git HEAD from git rev-parse HEAD in "
+                            "assigned_worktree>"
+                        ),
+                        "repo_root": "$assigned_worktree",
+                        "qa_session_token": "$qa_session_token",
+                    },
+                    "required_result": "successful trace_id",
+                    "blocked_before_success": [
+                        "contract_runtime_current",
+                        "contract_runtime_guide",
+                        "focused_tests",
+                        "qa_independent_verification",
+                    ],
+                    "on_error": "report_public_blocker_only",
+                },
+                {
+                    "id": "read_compact_contract_runtime",
+                    "mcp_tools": [
+                        "contract_runtime_current",
+                        "contract_runtime_guide",
+                    ],
+                    "requires": ["graph_query_schema.successful_trace_id"],
+                    "completion_evidence": False,
+                },
+                {
+                    "id": "submit_qa_graph_context",
+                    "mcp_tool": "contract_runtime_submit_line",
+                    "line_id": "qa_graph_context",
+                    "copy_payload_source": (
+                        "contract_runtime_guide.writer_role_safe_copy_payload."
+                        "copy_payload"
+                    ),
+                    "copy_all_safe_fields": True,
+                    "add_arguments": {
+                        "qa_session_token": "$qa_session_token",
+                        "graph_trace_ids": ["<graph_query.trace_id>"],
+                        "graph_query_trace_ids": ["<graph_query.trace_id>"],
+                        "payload": {
+                            "schema_version": "mf_parallel.qa_graph_context.v1",
+                            "graph_trace_ids": ["<graph_query.trace_id>"],
+                            "graph_query_trace_ids": ["<graph_query.trace_id>"],
+                        },
+                    },
+                },
+                {
+                    "id": "reread_after_qa_graph_context",
+                    "mcp_tools": [
+                        "contract_runtime_current",
+                        "contract_runtime_guide",
+                    ],
+                    "requires": ["submit_qa_graph_context.accepted"],
+                    "require_revision_advance": True,
+                    "next_expected_line_id": "qa_independent_verification",
+                },
+            ],
+            "redundant_graph_query_required": False,
+        },
+        "qa_independent_verification": {
+            "ordered_steps": [
+                {
+                    "id": "qa_session_register",
+                    "mcp_tool": "qa_session_register",
+                },
+                {
+                    "id": "read_refreshed_compact_contract_runtime",
+                    "mcp_tools": [
+                        "contract_runtime_current",
+                        "contract_runtime_guide",
+                    ],
+                    "completion_evidence": False,
+                },
+                {
+                    "id": "run_focused_exact_tests",
+                    "exact_node_ids_only": True,
+                    "test_source": "refreshed_contract_runtime_guide",
+                },
+                {
+                    "id": "submit_one_qa_independent_verification",
+                    "mcp_tool": "contract_runtime_submit_line",
+                    "line_id": "qa_independent_verification",
+                    "exactly_once": True,
+                    "copy_payload_source": (
+                        "contract_runtime_guide.writer_role_safe_copy_payload."
+                        "copy_payload"
+                    ),
+                    "copy_all_safe_fields": True,
+                    "add_arguments": {
+                        "qa_session_token": "$qa_session_token",
+                        "payload": {
+                            "tests": "<exact pytest node ids and outcomes>",
+                            "summary": "<clear PASS or FAIL summary>",
+                        },
+                    },
+                },
+                {
+                    "id": "confirm_strict_revision_advance",
+                    "mcp_tools": [
+                        "contract_runtime_current",
+                        "contract_runtime_guide",
+                    ],
+                    "requires": [
+                        "submit_one_qa_independent_verification.accepted"
+                    ],
+                    "revision_must_be_strictly_greater": True,
+                    "read_only_or_process_exit_zero_is_completion": False,
+                },
+            ],
+            "redundant_graph_query_required": False,
+        },
+    },
+    "raw_qa_session_token_public": False,
+}
 CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
     "cli_agent.managed_profile_tooling_contract.v1"
 )
@@ -3603,6 +3747,30 @@ def cli_agent_qa_bootstrap_guide_binding() -> dict[str, str]:
     }
 
 
+def cli_agent_qa_onboard_guidance_contract() -> dict[str, Any]:
+    """Return the public machine contract shared by QA tickets and onboard."""
+
+    material = {
+        "schema_version": CLI_AGENT_QA_ONBOARD_GUIDANCE_SCHEMA_VERSION,
+        "guidance_version": CLI_AGENT_QA_ONBOARD_GUIDANCE_VERSION,
+        **json.loads(
+            json.dumps(CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT)
+        ),
+    }
+    return {**material, "guidance_hash": _stable_json_hash(material)}
+
+
+def cli_agent_qa_onboard_guidance_binding() -> dict[str, str]:
+    """Return the immutable QA onboard binding carried by execution tickets."""
+
+    contract = cli_agent_qa_onboard_guidance_contract()
+    return {
+        "schema_version": str(contract["schema_version"]),
+        "guidance_version": str(contract["guidance_version"]),
+        "guidance_hash": str(contract["guidance_hash"]),
+    }
+
+
 def cli_agent_managed_profile_source_payload_digest(
     plugin_source_root: str | Path | None = None,
 ) -> str:
@@ -4229,6 +4397,9 @@ def build_cli_agent_execution_ticket(
     if authority_decision_source == "contract_runtime_qa_execution_ticket":
         material["qa_bootstrap_guide_contract"] = (
             cli_agent_qa_bootstrap_guide_binding()
+        )
+        material["qa_onboard_guidance_contract"] = (
+            cli_agent_qa_onboard_guidance_binding()
         )
         material["managed_profile_tooling_contract"] = (
             cli_agent_managed_profile_tooling_binding()
