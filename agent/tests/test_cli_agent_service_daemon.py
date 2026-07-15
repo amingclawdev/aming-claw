@@ -777,15 +777,35 @@ def test_daemon_qa_prompt_bootstraps_authoritative_bounded_verification(
     assert "never echo it, write it to a file, or write it to timeline" in prompt
     assert "compact CLI projections" in prompt
     assert "ContractRuntime remains the source of authority" in prompt
-    assert "After every accepted ContractRuntime line" in prompt
+    for graph_argument in (
+        "tool=query_schema",
+        "query_source=qa",
+        "query_purpose=independent_verification",
+        "project_id=aming-claw",
+        "backlog_id=AC-GUIDED-DAEMON",
+        "task_id=task-guided-daemon",
+        "commit_sha=<full git HEAD>",
+        "repo_root={}".format(tmp_path),
+        "qa_session_token=<raw token from step 1>",
+    ):
+        assert graph_argument in prompt
+    assert "writer_role_safe_copy_payload.copy_payload unchanged" in prompt
+    assert "schema_version=mf_parallel.qa_graph_context.v1" in prompt
+    assert "graph_trace_ids=[<returned trace_id>]" in prompt
+    assert "graph_query_trace_ids=[<returned trace_id>]" in prompt
+    assert "tests list records every exact pytest node id and outcome" in prompt
+    assert "starts with a clear PASS: or FAIL:" in prompt
+    assert "execution_state_revision to be strictly greater" in prompt
     ordered_steps = (
         "Call qa_session_register",
         "managed MCP `contract_runtime_current`",
         "managed MCP `contract_runtime_guide`",
-        "submit qa_graph_context",
-        "run only the refreshed guide's focused tests",
-        "Submit exactly one independent_verification verdict",
-        "Re-read both managed MCP projections and confirm ContractRuntime accepted",
+        "Call managed MCP `graph_query`",
+        "Call managed MCP `contract_runtime_submit_line` for qa_graph_context",
+        "After qa_graph_context is accepted, re-read both managed MCP",
+        "run only the refreshed guide's focused exact pytest node ids",
+        "exactly once for qa_independent_verification",
+        "Re-read both managed MCP projections and require",
     )
     assert [prompt.index(step) for step in ordered_steps] == sorted(
         prompt.index(step) for step in ordered_steps
