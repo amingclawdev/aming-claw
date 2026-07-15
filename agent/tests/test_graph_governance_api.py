@@ -55122,6 +55122,7 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
                 "profile_id": "codex-worker",
                 "harness": "codex",
                 "provider": "openai",
+                "required_capabilities": ["worker", "tool_use"],
             },
             "retry_policy": {"attempt": 1, "max_attempts": 2},
         },
@@ -55187,9 +55188,8 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
     assert ticket["next_legal_action"]["worker_role"] == "qa"
     assert ticket["profile_requirements"]["role"] == "qa"
     assert "profile_id" not in ticket["profile_requirements"]
-    assert ticket["profile_requirements"]["required_capabilities"] == [
-        "independent_verification"
-    ]
+    assert ticket["profile_requirements"]["independent_qa_required"] is True
+    assert "required_capabilities" not in ticket["profile_requirements"]
 
 
 @pytest.mark.parametrize(

@@ -118,6 +118,7 @@ def _profiled_run(executable, *, role, suffix):
             runtime_id="runtime-guided-{}".format(suffix),
             kind="codex_cli",
             executable_ref="path:{}".format(executable),
+            capabilities=("stdio", "worktree"),
         ),
         inference_endpoint=InferenceEndpoint(
             endpoint_id="endpoint-guided-{}".format(suffix),
@@ -197,7 +198,7 @@ def _canonical_ticket(
             "harness": "codex",
             "provider": "openai",
             "model": "gpt-5.4-codex",
-            "independent_qa_required": role != "qa",
+            "independent_qa_required": True,
             "successor_budget": 1,
         },
         "retry_policy": {
@@ -726,6 +727,9 @@ def test_qa_ticket_uses_distinct_native_service_run_and_transient_token(
     assert worker["role"] == "mf_sub"
     assert qa["role"] == "qa"
     assert qa["profile_id"] == qa_run.config.profile_id
+    assert qa_run.profile.harness_runtime.capabilities == ("stdio", "worktree")
+    assert qa_ticket["profile_requirements"]["independent_qa_required"] is True
+    assert "required_capabilities" not in qa_ticket["profile_requirements"]
     assert governance.qa_tokens[-1] == qa_token
     assert all("qa_session_token" not in request for request in governance.ticket_requests)
     assert qa_token.encode("utf-8") not in Path(service.registry.db_path).read_bytes()

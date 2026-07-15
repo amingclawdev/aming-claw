@@ -69204,11 +69204,14 @@ def _contract_runtime_qa_ticket_authority(
     profile = dispatch.get("profile_requirements")
     profile = dict(profile) if isinstance(profile, Mapping) else {}
     profile.pop("profile_id", None)
+    # QA independence is ContractRuntime evidence authority, not a harness
+    # capability.  Do not carry worker-only capability selectors into the QA
+    # ticket or synthesize one that installed QA-capable profiles cannot claim.
+    profile.pop("required_capabilities", None)
     profile.update(
         {
             "role": "qa",
             "independent_qa_required": True,
-            "required_capabilities": ["independent_verification"],
         }
     )
     worker_task_id = str(dispatch.get("task_id") or "").strip()
