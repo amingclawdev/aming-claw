@@ -69241,7 +69241,12 @@ def _contract_runtime_qa_ticket_authority(
             "worker_slot_id": qa_identity,
             "observer_command_id": str(record.get("contract_execution_id") or ""),
             "profile_requirements": profile,
-            "retry_policy": {"attempt": 0, "max_attempts": 0, "successor_required": False},
+            "retry_policy": {
+                "attempt": 0,
+                "max_attempts": 1,
+                "on_crash": "retry_same_profile",
+                "successor_required": True,
+            },
         }
     )
     return {

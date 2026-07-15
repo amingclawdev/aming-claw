@@ -55190,6 +55190,12 @@ def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):
     assert "profile_id" not in ticket["profile_requirements"]
     assert ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in ticket["profile_requirements"]
+    assert ticket["retry_policy"] == {
+        "attempt": 0,
+        "max_attempts": 1,
+        "on_crash": "retry_same_profile",
+        "successor_required": True,
+    }
 
 
 @pytest.mark.parametrize(

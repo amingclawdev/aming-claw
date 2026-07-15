@@ -164,9 +164,10 @@ class CodexC0Supervisor:
         dispatch = execution_ticket.get("dispatch_identity")
         if not isinstance(profile, Mapping) or not isinstance(dispatch, Mapping):
             raise SupervisorError("execution_ticket is missing run identity")
-        profile_id = str(profile.get("profile_id") or "").strip()
-        if profile_id != run.config.profile_id:
+        ticket_profile_id = str(profile.get("profile_id") or "").strip()
+        if ticket_profile_id and ticket_profile_id != run.config.profile_id:
             raise SupervisorError("execution_ticket profile does not match the run")
+        profile_id = ticket_profile_id or run.config.profile_id
         return RunReceiptEmitter(
             run_id=run.run_id,
             ticket_id=execution_ticket.get("ticket_id", ""),

@@ -164,6 +164,24 @@ def _canonical_ticket(
     from governance.contract_state_runtime import build_cli_agent_execution_ticket
 
     worker_id = "principal-guided-{}".format(suffix)
+    profile_requirements = {
+        "profile_kind": "governed",
+        "role": role,
+        "harness": "codex",
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "independent_qa_required": True,
+        "successor_budget": 1,
+    }
+    if role != "qa":
+        profile_requirements["profile_id"] = run.config.profile_id
+    retry_policy = {
+        "attempt": 0,
+        "max_attempts": 1,
+        "successor_required": True,
+    }
+    if role == "qa":
+        retry_policy["on_crash"] = "retry_same_profile"
     action = {
         "id": "dispatch-guided-{}".format(suffix),
         "action": "dispatch_bounded_worker",
@@ -191,21 +209,8 @@ def _canonical_ticket(
         "route_token_ref": "rtok-guided-{}".format(suffix),
         "visible_injection_manifest_hash": "sha256:" + ("d" * 64),
         "owned_files": ["agent/owned-{}.py".format(suffix)],
-        "profile_requirements": {
-            "profile_id": run.config.profile_id,
-            "profile_kind": "governed",
-            "role": role,
-            "harness": "codex",
-            "provider": "openai",
-            "model": "gpt-5.4-codex",
-            "independent_qa_required": True,
-            "successor_budget": 1,
-        },
-        "retry_policy": {
-            "attempt": 0,
-            "max_attempts": 1,
-            "successor_required": True,
-        },
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
     }
     launch_identity = {
         "project_id": "aming-claw",
@@ -728,8 +733,14 @@ def test_qa_ticket_uses_distinct_native_service_run_and_transient_token(
     assert qa["role"] == "qa"
     assert qa["profile_id"] == qa_run.config.profile_id
     assert qa_run.profile.harness_runtime.capabilities == ("stdio", "worktree")
+    assert "profile_id" not in qa_ticket["profile_requirements"]
     assert qa_ticket["profile_requirements"]["independent_qa_required"] is True
     assert "required_capabilities" not in qa_ticket["profile_requirements"]
+    qa_receipts = service.supervisor.run_receipts(qa["run_id"])
+    assert qa_receipts
+    assert {item["profile_id"] for item in qa_receipts} == {
+        qa_run.config.profile_id
+    }
     assert governance.qa_tokens[-1] == qa_token
     assert all("qa_session_token" not in request for request in governance.ticket_requests)
     assert qa_token.encode("utf-8") not in Path(service.registry.db_path).read_bytes()
