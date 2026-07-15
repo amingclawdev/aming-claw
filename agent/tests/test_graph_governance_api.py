@@ -38504,6 +38504,19 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
         "submit_qa_graph_context",
         "reread_after_qa_graph_context",
     ]
+    assert steps[0]["arguments"] == {
+        "project_id": PID,
+        "backlog_id": "AC-ONBOARD-QA-CURRENT-LINE",
+        "task_id": "original-worker-task",
+        "commit_sha": (
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ),
+        "contract_execution_id": "cex-mf-parallel-qa-current-line",
+        "principal_id": "qa:original-worker-task",
+    }
+    assert steps[0]["result_binding"]["qa_session_token_ref"][
+        "raw_value_exposed"
+    ] is False
     graph = steps[1]
     assert graph["arguments"] == {
         "tool": "query_schema",

@@ -1767,6 +1767,7 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
         "backlog_id",
         "task_id",
         "commit_sha",
+        "contract_execution_id",
     }
     assert "contract_execution_id" in qa_register["inputSchema"]["properties"]
     for tool_name in (
@@ -2001,6 +2002,46 @@ def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body()
             "gov-qa-token",
         ),
     ]
+
+
+def test_mcp_qa_session_register_without_contract_does_not_issue_opaque_ref():
+    raw_token = "gov-qa-missing-contract-must-stay-private"
+
+    class MissingContractRecorder(_Recorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            self.calls.append((method, path, data))
+            return {
+                "session_id": "ses-qa-missing-contract",
+                "principal_id": "qa:missing-contract",
+                "role": "qa",
+                "scope": [],
+                "token": raw_token,
+                "expires_at": "2099-07-15T12:00:00Z",
+            }
+
+    recorder = MissingContractRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        manager_api_fn=recorder.api,
+        workspace="/repo",
+    )
+
+    rejected = dispatcher.dispatch(
+        "qa_session_register",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-QA-MISSING-CONTRACT",
+            "task_id": "worker-task",
+            "commit_sha": "d" * 40,
+            "principal_id": "qa:missing-contract",
+        },
+    )
+
+    assert rejected["error"] == "qa_session_register_invalid_response"
+    assert "qa_session_token_ref" not in rejected
+    assert raw_token not in json.dumps(rejected, sort_keys=True)
+    assert dispatcher._qa_session_refs == {}
 
 
 def test_mcp_qa_session_opaque_ref_roundtrip_is_scope_bound_and_header_only():

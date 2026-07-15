@@ -511,6 +511,24 @@ def test_cli_agent_execution_ticket_accepts_qa_owned_contract_runtime_action(
             "ordered_steps"
         ][:2]
     ] == ["qa_session_register", "graph_query_schema"]
+    expected_register_arguments = {
+        "project_id": "$project_id",
+        "backlog_id": "$backlog_id",
+        "task_id": "$original_worker_task_id",
+        "commit_sha": (
+            "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
+        ),
+        "contract_execution_id": "$contract_execution_id",
+        "principal_id": "$principal_id",
+    }
+    for line_id in ("qa_graph_context", "qa_independent_verification"):
+        register_step = onboard_contract["line_contracts"][line_id][
+            "ordered_steps"
+        ][0]
+        assert register_step["arguments"] == expected_register_arguments
+        assert register_step["result_binding"] == {
+            "qa_session_token_ref": "$qa_session_token_ref"
+        }
     graph_arguments = onboard_contract["line_contracts"]["qa_graph_context"][
         "ordered_steps"
     ][1]["arguments"]

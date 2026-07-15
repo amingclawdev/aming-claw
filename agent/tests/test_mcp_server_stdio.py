@@ -311,6 +311,9 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert "contract_execution_id" in tool_by_name["qa_session_register"][
         "inputSchema"
     ]["properties"]
+    assert "contract_execution_id" in tool_by_name["qa_session_register"][
+        "inputSchema"
+    ]["required"]
     assert "qa_session_token_ref" in tool_by_name["graph_query"]["inputSchema"][
         "properties"
     ]

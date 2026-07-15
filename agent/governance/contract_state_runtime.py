@@ -113,6 +113,17 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                 {
                     "id": "qa_session_register",
                     "mcp_tool": "qa_session_register",
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "task_id": "$original_worker_task_id",
+                        "commit_sha": (
+                            "<full git HEAD from git rev-parse HEAD in "
+                            "assigned_worktree>"
+                        ),
+                        "contract_execution_id": "$contract_execution_id",
+                        "principal_id": "$principal_id",
+                    },
                     "result_binding": {
                         "qa_session_token_ref": "$qa_session_token_ref",
                     },
@@ -205,6 +216,17 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
                 {
                     "id": "qa_session_register",
                     "mcp_tool": "qa_session_register",
+                    "arguments": {
+                        "project_id": "$project_id",
+                        "backlog_id": "$backlog_id",
+                        "task_id": "$original_worker_task_id",
+                        "commit_sha": (
+                            "<full git HEAD from git rev-parse HEAD in "
+                            "assigned_worktree>"
+                        ),
+                        "contract_execution_id": "$contract_execution_id",
+                        "principal_id": "$principal_id",
+                    },
                     "result_binding": {
                         "qa_session_token_ref": "$qa_session_token_ref",
                     },

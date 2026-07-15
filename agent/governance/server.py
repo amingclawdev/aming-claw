@@ -53389,6 +53389,7 @@ def _onboard_selected_qa_contract_runtime_guidance(
         "$backlog_id": backlog_id,
         "$contract_execution_id": execution_id,
         "$original_worker_task_id": worker_task_id,
+        "$principal_id": f"qa:{worker_task_id}",
         "$assigned_worktree": repo_root,
         "$qa_session_token_ref": dict(token_transport),
     }

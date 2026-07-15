@@ -1244,7 +1244,13 @@ TOOLS: list[dict] = [
                     "description": "ContractRuntime execution bound locally to the opaque QA session ref; not forwarded to role assignment.",
                 },
             },
-            "required": ["project_id", "backlog_id", "task_id", "commit_sha"],
+            "required": [
+                "project_id",
+                "backlog_id",
+                "task_id",
+                "commit_sha",
+                "contract_execution_id",
+            ],
         },
     },
     {
@@ -3832,6 +3838,7 @@ class ToolDispatcher:
             "backlog_id",
             "task_id",
             "commit_sha",
+            "contract_execution_id",
             "session_id",
         )
         if (
