@@ -2101,7 +2101,7 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
 
     assert calls[0] == (
         "GET",
-        "/api/projects/aming-claw/contract-runtime/cex-direct-fix/current-state",
+        "/api/projects/aming-claw/contract-runtime/cex-direct-fix/current-state?response_view=cli_current",
         None,
         "gov-qa-token",
     )
@@ -2382,12 +2382,12 @@ def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/current-state?response_view=cli_current&observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
         ),
         (
             "GET",
-            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide?observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
+            "/api/projects/aming-claw/contract-runtime/cex-onboard/guide?response_view=cli_guide&observer_session_id=obs-onboard&observer_route_token_ref=rtok-onboard",
             None,
         ),
         (
