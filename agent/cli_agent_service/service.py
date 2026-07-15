@@ -1065,14 +1065,51 @@ class CliAgentService:
             contract_execution_id=evidence_refs["contract_execution_id"],
         )
         if qa_mode:
+            qa_task_id = evidence_refs["task_id"]
+            original_worker_task_id = (
+                qa_task_id[3:]
+                if qa_task_id.startswith("qa-") and len(qa_task_id) > 3
+                else "not-derivable-from-qa-task"
+            )
             prompt = (
                 "Proceed as the ContractRuntime-authorized independent QA verifier.\n"
-                "Runtime context: {runtime_context_id}\n"
-                "Task: {task_id}\n"
-                "Contract execution: {contract_execution_id}\n"
-                "Read the current QA guide, run the bounded graph context and focused "
-                "verification, then record exactly one audited QA verdict."
-            ).format(**evidence_refs)
+                "Copy-safe canonical coordinates:\n"
+                "project_id={project_id}\n"
+                "backlog_id={backlog_id}\n"
+                "contract_execution_id={contract_execution_id}\n"
+                "runtime_context_id={runtime_context_id}\n"
+                "qa_task_id={qa_task_id}\n"
+                "original_worker_task_id={original_worker_task_id}\n"
+                "principal_id={principal_id}\n"
+                "assigned_worktree={assigned_worktree}\n"
+                "First load the Aming Claw onboard/plugin entrypoint and use its MCP "
+                "tools; do not guess or call a curl endpoint. In assigned_worktree, "
+                "run exactly `git rev-parse HEAD` and use that full candidate SHA; do "
+                "not trust the pre-dispatch target_head_commit.\n"
+                "Authoritative order:\n"
+                "1. Call qa_session_register with project_id, backlog_id, "
+                "task_id=original_worker_task_id, commit_sha=<full git HEAD>, and "
+                "principal_id. Treat the returned raw token only as qa_session_token "
+                "or X-Gov-Token; never echo it, write it to a file, or write it to "
+                "timeline.\n"
+                "2. Read ContractRuntime current and guide for contract_execution_id.\n"
+                "3. Run the bounded QA graph query, then submit qa_graph_context "
+                "exactly as the current guide requires.\n"
+                "4. Re-read the guide and run only its focused tests.\n"
+                "5. Submit exactly one independent_verification verdict.\n"
+                "6. Re-read current and confirm ContractRuntime accepted the verdict "
+                "and advanced. If tests pass but runtime did not advance, report an "
+                "explicit blocker; do not declare operational success.\n"
+                "Degree control: use only rg, head, narrow sed ranges, and exact pytest "
+                "node ids. Never dump full runtime, timeline, large files, or raw "
+                "provider output."
+            ).format(
+                **evidence_refs,
+                qa_task_id=qa_task_id,
+                original_worker_task_id=original_worker_task_id,
+                principal_id=principal_id,
+                assigned_worktree=worktree,
+            )
         supplied_host_envelope = payload.get("host_envelope")
         canonical_host_envelope: dict[str, Any] = {
             "project_id": evidence_refs["project_id"],
