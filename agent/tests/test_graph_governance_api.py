@@ -22134,7 +22134,7 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
             conn,
             project_id=PID,
             explicit_trace_ids=[trace_id],
-            target_project_root=str(fixture.root),
+            target_project_root=str(candidate_root),
             expected_backlog_id=backlog_id,
             expected_task_id=task_id,
             expected_candidate_commit_sha=candidate_commit,
@@ -22149,10 +22149,10 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
         "identity_mismatches"
     ]
     assert before_merge["assigned_target_project_root"] == str(
-        fixture.root.resolve()
+        candidate_root.resolve()
     )
     assert before_merge["canonical_project_root"] == str(fixture.root.resolve())
-    assert before_merge["target_project_root"] == str(fixture.root.resolve())
+    assert before_merge["target_project_root"] == str(candidate_root.resolve())
     assert before_merge["query_root"] == str(candidate_root.resolve())
     assert before_merge["candidate_query_root"] == str(candidate_root.resolve())
     subprocess.run(
@@ -50300,10 +50300,10 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert stored_authority["backlog_id"] == backlog_id
     assert stored_authority["task_id"] == runtime_context.task_id
     assert stored_authority["target_project_root"] == str(
-        Path(runtime_context.target_project_root).resolve()
+        worktree.resolve()
     )
     assert stored_authority["assigned_target_project_root"] == str(
-        canonical_root.resolve()
+        worktree.resolve()
     )
     assert stored_authority["canonical_project_root"] == str(
         canonical_root.resolve()

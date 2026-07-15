@@ -11358,30 +11358,31 @@ def _runtime_context_service_qa_graph_trace_refs(
             result["candidate_query_root"] = persisted_query_root
         if persisted_canonical_root:
             result["canonical_project_root"] = persisted_canonical_root
-            result["target_project_root"] = persisted_canonical_root
+        if persisted_query_root:
+            result["target_project_root"] = persisted_query_root
         result["requested_target_project_root"] = assigned_target_root
         result["assigned_target_project_root"] = assigned_target_root
-        if persisted_canonical_root:
+        if persisted_query_root:
             if require_complete_authority and not assigned_target_root:
                 result["identity_mismatches"].append(
                     {
                         "trace_id": "|".join(requested_trace_ids),
                         "field": "target_project_root",
-                        "expected": persisted_canonical_root,
+                        "expected": persisted_query_root,
                         "actual": "missing assigned target root",
                     }
                 )
                 result["db_verified"] = False
             elif assigned_target_root and (
                 Path(assigned_target_root).resolve()
-                != Path(persisted_canonical_root).resolve()
+                != Path(persisted_query_root).resolve()
             ):
                 result["identity_mismatches"].append(
                     {
                         "trace_id": "|".join(requested_trace_ids),
                         "field": "target_project_root",
                         "expected": assigned_target_root,
-                        "actual": persisted_canonical_root,
+                        "actual": persisted_query_root,
                     }
                 )
                 result["db_verified"] = False
@@ -50502,6 +50503,7 @@ def _contract_runtime_assigned_target_project_root(
         and str(line.get("line_id") or "").strip() in dispatch_line_ids
     ]
     for line in dispatch_lines:
+        matched_runtime_context = False
         for context in _contract_runtime_contexts_for_dispatch_line(
             conn,
             project_id=project_id,
@@ -50517,10 +50519,20 @@ def _contract_runtime_assigned_target_project_root(
                 continue
             if identity.get("task_id") and task_id != identity["task_id"]:
                 continue
-            target_root = _runtime_context_effective_target_project_root(context)
+            # QA executes the candidate graph query from the allocated worker
+            # worktree.  Its canonical project root remains separate identity.
+            target_root = str(
+                getattr(context, "worktree_path", "") or ""
+            ).strip()
+            target_root = target_root or _runtime_context_effective_target_project_root(
+                context
+            )
             if target_root:
                 roots.add(str(Path(target_root).resolve()))
+                matched_runtime_context = True
 
+        if matched_runtime_context:
+            continue
         for candidate in _contract_runtime_mapping_candidates(line):
             candidate_runtime_context_id = _contract_runtime_mapping_value(
                 candidate,
@@ -50544,8 +50556,8 @@ def _contract_runtime_assigned_target_project_root(
                 continue
             target_root = _contract_runtime_mapping_value(
                 candidate,
-                "target_project_root",
                 "worktree_path",
+                "target_project_root",
             )
             if target_root:
                 roots.add(str(Path(target_root).resolve()))
