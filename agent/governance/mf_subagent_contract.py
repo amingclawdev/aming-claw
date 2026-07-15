@@ -7194,8 +7194,10 @@ _AI_INVOCATION_ROUTE_ALLOWED_KEYS = {
     "prompt_contract_hash",
     "prompt_contract_id",
     "raw_context_exposed",
+    "route_id",
     "route_context_hash",
     "route_token_ref",
+    "visible_injection_manifest_hash",
 }
 _AI_INVOCATION_ROUTE_ALERT_ALLOWED_KEYS = {
     "prompt_contract_hash",

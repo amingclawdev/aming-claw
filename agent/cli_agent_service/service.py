@@ -870,7 +870,10 @@ class CliAgentService:
             max_attempts = int(retry_policy.get("max_attempts") or 0)
         except (TypeError, ValueError) as exc:
             raise ServiceError("canonical execution ticket retry policy is invalid") from exc
-        if ticket_attempt < 1 or max_attempts < ticket_attempt:
+        # ContractRuntime numbers the initial dispatch at attempt zero.  The
+        # operational spawn loop below starts at the following one-based
+        # attempt, so zero is a valid canonical ticket value here.
+        if ticket_attempt < 0 or max_attempts < ticket_attempt:
             raise ServiceError("canonical execution ticket retry policy is invalid")
 
         terminal_failure_states = {

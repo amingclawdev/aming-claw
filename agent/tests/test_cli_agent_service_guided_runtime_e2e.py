@@ -215,6 +215,7 @@ def _canonical_ticket(
         "parent_task_id": action["parent_task_id"],
         "runtime_context_id": action["runtime_context_id"],
         "worker_role": role,
+        "target_project_root": str(worktree),
         "worktree_path": str(worktree),
         "branch_ref": action["branch_ref"],
         "base_commit": action["base_commit"],

@@ -49215,7 +49215,13 @@ def _contract_runtime_dispatch_identity_bridge(
         _contract_runtime_mapping_value(line, "observer_command_id", "command_id")
         or _contract_runtime_mapping_value(payload, "observer_command_id", "command_id")
     )
-    if legacy_observer_command_id:
+    # A dispatch line may project the active ContractRuntime execution id into
+    # observer_command_id for compatibility.  That is the execution-id bridge,
+    # not evidence that a distinct legacy observer command existed.
+    if (
+        legacy_observer_command_id
+        and legacy_observer_command_id != contract_execution_id
+    ):
         observer_command_id = legacy_observer_command_id
         observer_command_id_source = "legacy_observer_command_id"
         observer_command_id_kind = "legacy_observer_command_id"
@@ -49224,6 +49230,7 @@ def _contract_runtime_dispatch_identity_bridge(
         legacy_present = True
     else:
         observer_command_id = contract_execution_id
+        legacy_observer_command_id = ""
         observer_command_id_source = "contract_runtime_execution_id_bridge"
         observer_command_id_kind = "contract_runtime_execution"
         dispatch_identity_source = "contract_runtime_execution"
