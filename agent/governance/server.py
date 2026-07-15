@@ -53229,29 +53229,21 @@ def _onboard_selected_qa_contract_runtime_guidance(
     line_contract = (
         line_contracts.get(line_id) if isinstance(line_contracts, Mapping) else {}
     )
-    ordered_step_ids = (
-        list(line_contract.get("ordered_step_ids") or [])
+    ordered_steps_template = (
+        list(line_contract.get("ordered_steps") or [])
         if isinstance(line_contract, Mapping)
         else []
     )
+    ordered_step_ids = [
+        str(step.get("id") or "").strip()
+        if isinstance(step, Mapping)
+        else ""
+        for step in ordered_steps_template
+    ]
+    token_transport = guidance_contract.get("token_transport")
     guidance_schema = str(
         guidance_contract.get("selected_role_guidance_schema_version") or ""
     ).strip()
-    required_line_contract_fields = (
-        {
-            "graph_query_tool",
-            "graph_query_source",
-            "graph_query_purpose",
-            "submit_payload_schema_version",
-            "redundant_graph_query_required",
-        }
-        if line_id == "qa_graph_context"
-        else {
-            "exactly_one_verdict",
-            "strict_revision_advance",
-            "redundant_graph_query_required",
-        }
-    )
     base_guidance = {
         "schema_version": guidance_schema,
         "next_action": action,
@@ -53270,9 +53262,16 @@ def _onboard_selected_qa_contract_runtime_guidance(
     if (
         not guidance_schema
         or not isinstance(line_contract, Mapping)
-        or not required_line_contract_fields.issubset(line_contract)
-        or len(ordered_step_ids) != 5
-        or len(set(ordered_step_ids)) != 5
+        or not ordered_steps_template
+        or not all(ordered_step_ids)
+        or len(set(ordered_step_ids)) != len(ordered_step_ids)
+        or not isinstance(token_transport, Mapping)
+        or token_transport.get("raw_value_exposed") is not False
+        or token_transport.get("persisted") is not False
+        or guidance_contract.get("raw_qa_session_token_public") is not False
+        or not isinstance(
+            line_contract.get("redundant_graph_query_required"), bool
+        )
     ):
         return {
             **base_guidance,
@@ -53351,77 +53350,47 @@ def _onboard_selected_qa_contract_runtime_guidance(
                 "conflicting_fields": conflicts,
             },
         }
-    token = {
-        "source": "qa_session_register.raw_token",
-        "transport": "tool_argument_or_X-Gov-Token_header_only",
-        "raw_value_exposed": False, "persisted": False,
+    replacements: dict[str, Any] = {
+        "$project_id": project_id,
+        "$backlog_id": backlog_id,
+        "$original_worker_task_id": worker_task_id,
+        "$assigned_worktree": repo_root,
+        "$qa_session_token": dict(token_transport),
     }
-    full_head = "<full git HEAD from git rev-parse HEAD in assigned_worktree>"
-    register = {"id": ordered_step_ids[0], "mcp_tool": "qa_session_register"}
-    read_tools = ["contract_runtime_current", "contract_runtime_guide"]
-    copy_source = "contract_runtime_guide.writer_role_safe_copy_payload.copy_payload"
-    if line_id == "qa_graph_context":
-        trace_ref = "<graph_query.trace_id>"
-        graph_arguments = {
-            "tool": line_contract["graph_query_tool"],
-            "query_source": line_contract["graph_query_source"],
-            "query_purpose": line_contract["graph_query_purpose"],
-            "project_id": project_id,
-            "backlog_id": backlog_id, "task_id": worker_task_id,
-            "commit_sha": full_head, "repo_root": repo_root, "qa_session_token": token,
+    unresolved_placeholders: set[str] = set()
+
+    def _render_machine_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): _render_machine_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_render_machine_value(item) for item in value]
+        if isinstance(value, str) and value in replacements:
+            return deepcopy(replacements[value])
+        if isinstance(value, str) and value.startswith("$"):
+            unresolved_placeholders.add(value)
+        return value
+
+    steps = _render_machine_value(ordered_steps_template)
+    if unresolved_placeholders:
+        return {
+            **base_guidance,
+            "status": "blocked", "executable": False, "ordered_steps": [],
+            "blocker": {
+                "id": "qa_onboard_guidance_contract_invalid",
+                "source": "cli_agent_qa_onboard_guidance_contract",
+                "unresolved_placeholders": sorted(unresolved_placeholders),
+            },
         }
-        trace_payload = {
-            "graph_trace_ids": [trace_ref], "graph_query_trace_ids": [trace_ref]
-        }
-        steps = [register, {
-            "id": ordered_step_ids[1], "mcp_tool": "graph_query",
-            "arguments": graph_arguments,
-            "required_result": "successful trace_id",
-            "blocked_before_success": [*read_tools, "focused_tests", "qa_independent_verification"],
-            "on_error": "report_public_blocker_only",
-        }, {
-            "id": ordered_step_ids[2], "mcp_tools": read_tools,
-            "requires": [f"{ordered_step_ids[1]}.successful_trace_id"],
-            "completion_evidence": False,
-        }, {
-            "id": ordered_step_ids[3], "mcp_tool": "contract_runtime_submit_line",
-            "line_id": line_id, "copy_payload_source": copy_source,
-            "copy_all_safe_fields": True,
-            "add_arguments": {"qa_session_token": token, **trace_payload,
-                "payload": {"schema_version": line_contract["submit_payload_schema_version"], **trace_payload}},
-        }, {
-            "id": ordered_step_ids[4], "mcp_tools": read_tools,
-            "requires": [f"{ordered_step_ids[3]}.accepted"],
-            "require_revision_advance": True, "next_expected_line_id": "qa_independent_verification",
-        }]
-    else:
-        steps = [register, {
-            "id": ordered_step_ids[1], "mcp_tools": read_tools,
-            "completion_evidence": False,
-        }, {
-            "id": ordered_step_ids[2], "exact_node_ids_only": True,
-            "test_source": "refreshed_contract_runtime_guide",
-        }, {
-            "id": ordered_step_ids[3],
-            "mcp_tool": "contract_runtime_submit_line", "line_id": line_id,
-            "exactly_once": bool(line_contract["exactly_one_verdict"]),
-            "copy_payload_source": copy_source,
-            "copy_all_safe_fields": True,
-            "add_arguments": {"qa_session_token": token, "payload": {
-                "tests": "<exact pytest node ids and outcomes>",
-                "summary": "<clear PASS or FAIL summary>"}},
-        }, {
-            "id": ordered_step_ids[4],
-            "mcp_tools": read_tools,
-            "requires": [f"{ordered_step_ids[3]}.accepted"],
-            "revision_must_be_strictly_greater": bool(
-                line_contract["strict_revision_advance"]
-            ),
-            "read_only_or_process_exit_zero_is_completion": False,
-        }]
     return {
         **base_guidance,
         "ordered_steps": steps,
+        "machine_contract": {
+            "token_transport": deepcopy(token_transport),
+            "line_contract": deepcopy(line_contract),
+        },
         "redundant_graph_query_required": bool(
             line_contract["redundant_graph_query_required"]
         ),

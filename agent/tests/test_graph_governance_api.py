@@ -38535,6 +38535,63 @@ def test_onboard_selected_qa_graph_context_guidance_is_graph_first_and_copy_safe
     assert "graph_query" not in json.dumps(conflict)
 
 
+def test_onboard_qa_machine_contract_binding_drives_emitted_guidance(
+    monkeypatch,
+):
+    baseline = _selected_qa_runtime_guidance(
+        "qa_graph_context",
+        "record_graph_trace",
+    )
+    baseline_contract = (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
+    )
+    assert baseline["machine_contract"] == {
+        "token_transport": baseline_contract["token_transport"],
+        "line_contract": baseline_contract["line_contracts"][
+            "qa_graph_context"
+        ],
+    }
+    assert [step["id"] for step in baseline["ordered_steps"]] == [
+        step["id"]
+        for step in baseline["machine_contract"]["line_contract"][
+            "ordered_steps"
+        ]
+    ]
+
+    changed_machine_contract = json.loads(
+        json.dumps(
+            contract_state_runtime.CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT
+        )
+    )
+    changed_machine_contract["line_contracts"]["qa_graph_context"][
+        "ordered_steps"
+    ][3]["copy_all_safe_fields"] = False
+    monkeypatch.setattr(
+        contract_state_runtime,
+        "CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT",
+        changed_machine_contract,
+    )
+
+    changed = _selected_qa_runtime_guidance(
+        "qa_graph_context",
+        "record_graph_trace",
+    )
+    changed_contract = (
+        contract_state_runtime.cli_agent_qa_onboard_guidance_contract()
+    )
+
+    assert changed["qa_onboard_guidance_contract"]["guidance_hash"] != (
+        baseline["qa_onboard_guidance_contract"]["guidance_hash"]
+    )
+    assert changed["machine_contract"] == {
+        "token_transport": changed_contract["token_transport"],
+        "line_contract": changed_contract["line_contracts"][
+            "qa_graph_context"
+        ],
+    }
+    assert changed["ordered_steps"][3]["copy_all_safe_fields"] is False
+
+
 def test_onboard_selected_qa_verdict_guidance_skips_redundant_graph_and_advances():
     guidance = _selected_qa_runtime_guidance(
         "qa_independent_verification",
