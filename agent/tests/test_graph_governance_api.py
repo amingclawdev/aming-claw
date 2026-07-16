@@ -23201,6 +23201,24 @@ def test_exact_candidate_trace_remains_verified_after_scoped_durable_live_merge(
     update_merge_event(
         payload={
             **merge_payload,
+            "branch_head": "f" * 40,
+        }
+    )
+    unresolvable_candidate_claim = trace_refs()
+    assert unresolvable_candidate_claim["db_verified"] is False
+
+    update_merge_event(
+        payload={
+            **merge_payload,
+            "target_head_after_merge": "f" * 40,
+        }
+    )
+    unresolvable_merge_claim = trace_refs()
+    assert unresolvable_merge_claim["db_verified"] is False
+
+    update_merge_event(
+        payload={
+            **merge_payload,
             "runtime_context_id": "mfrctx-wrong-live-merge",
         }
     )

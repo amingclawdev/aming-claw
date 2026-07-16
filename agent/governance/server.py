@@ -8394,8 +8394,11 @@ def _qa_exact_candidate_post_merge_provenance(
                 _qa_post_merge_resolve_commit(canonical_project_root, item)
                 for item in candidate_claims
             }
-            candidate_commits.discard("")
-            if candidate_commits != {candidate_commit}:
+            if (
+                not candidate_claims
+                or "" in candidate_commits
+                or candidate_commits != {candidate_commit}
+            ):
                 continue
             merge_claims = {
                 str(event.get("commit_sha") or "").strip().lower(),
@@ -8412,8 +8415,7 @@ def _qa_exact_candidate_post_merge_provenance(
                 _qa_post_merge_resolve_commit(canonical_project_root, item)
                 for item in merge_claims
             }
-            merge_commits.discard("")
-            if len(merge_commits) != 1:
+            if not merge_claims or "" in merge_commits or len(merge_commits) != 1:
                 continue
             scoped_merge_commit = next(iter(merge_commits))
             if scoped_merge_commit == candidate_commit:
