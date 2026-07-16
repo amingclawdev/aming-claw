@@ -2581,6 +2581,12 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
         assert "query_source=qa" in path_prompt
         assert "query_purpose=independent_verification" in path_prompt
         assert "its own rg + graph_query" in path_prompt
+        assert "managed MCP qa_session_register" in path_prompt
+        assert "opaque qa_session_token_ref" in path_prompt
+        assert "top-level graph_query argument" in path_prompt
+        assert "qa_session_id is identity only, not authentication" in path_prompt
+        assert "never put it inside graph_query args" in path_prompt
+        assert "Keep the raw QA token internal to managed MCP" in path_prompt
         assert "system CLI agent service or a host-created bounded worker/subagent" in path_prompt
         assert "do not act as the worker from the observer session" in path_prompt
         assert "Do not stop after planning" in path_prompt
