@@ -10026,6 +10026,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         materialize_branch_worktree,
         plan_branch_runtime_context,
         preserve_materialized_context_for_allocation,
+        runtime_context_session_token_ref,
         upsert_branch_context,
     )
 
@@ -10281,6 +10282,13 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 saved,
                 source_ref=f"/api/graph-governance/{project_id}/parallel-branches/allocate",
                 registration_source="parallel_branch_allocate",
+                route_identity=route_identity_for_revision,
+                observer_command_id=str(
+                    ctx.body.get("observer_command_id")
+                    or ctx.body.get("contract_execution_id")
+                    or ""
+                ),
+                session_token_ref=runtime_context_session_token_ref(saved),
             ),
             "worktree": worktree_result["worktree"] if worktree_result else None,
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
@@ -10327,6 +10335,32 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 "recovery": _bounded_worker_dispatch_recovery_payload(
                     project_id=project_id,
                     error=str(exc),
+                    runtime_context_id=saved.runtime_context_id,
+                    task_id=saved.task_id,
+                    parent_task_id=saved.parent_task_id
+                    or saved.root_task_id
+                    or saved.backlog_id,
+                    observer_command_id=str(
+                        ctx.body.get("observer_command_id")
+                        or ctx.body.get("contract_execution_id")
+                        or ""
+                    ),
+                    worker_id=saved.worker_slot_id or saved.worker_id,
+                    session_token_ref=runtime_context_session_token_ref(saved),
+                    target_project_root=saved.target_project_root,
+                    worktree_path=saved.worktree_path,
+                    branch_ref=saved.branch_ref,
+                    base_commit=saved.base_commit,
+                    target_head_commit=saved.target_head_commit,
+                    merge_queue_id=saved.merge_queue_id,
+                    owned_files=saved.owned_files or saved.target_files,
+                    profile_requirements=ctx.body.get("profile_requirements")
+                    if isinstance(ctx.body.get("profile_requirements"), Mapping)
+                    else {},
+                    retry_policy=ctx.body.get("retry_policy")
+                    if isinstance(ctx.body.get("retry_policy"), Mapping)
+                    else {},
+                    route_identity=route_identity_for_revision,
                 ),
             }
         if same_owner_worker_session:
@@ -52216,7 +52250,22 @@ def _contract_runtime_rev3_dispatch_authority(
         return next(iter(values)) if values else ""
 
     runtime_context_id = supplied_text("runtime_context_id")
-    task_id = supplied_text("task_id", "worker_task_id")
+    task_claims = [
+        (
+            source_name,
+            key,
+            str(source.get(key) or "").strip(),
+        )
+        for source_name, source in (
+            ("write", effective),
+            ("payload", payload),
+            ("bounded_worker", bounded_worker),
+        )
+        if source
+        for key in ("task_id", "worker_task_id")
+        if str(source.get(key) or "").strip()
+    ]
+    task_id = ""
     parent_task_id = supplied_text("parent_task_id")
     worker_id = supplied_text("worker_id")
     worker_slot_id = supplied_text("worker_slot_id")
@@ -52238,7 +52287,6 @@ def _contract_runtime_rev3_dispatch_authority(
 
     required_text = {
         "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
         "parent_task_id": parent_task_id,
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
@@ -52312,6 +52360,24 @@ def _contract_runtime_rev3_dispatch_authority(
     if context is None:
         errors.append("mf_parallel rev3 dispatch requires a persisted runtime context")
     else:
+        canonical_task_id = str(getattr(context, "task_id", "") or "").strip()
+        contract_task_id = str(record.get("contract_execution_id") or "").strip()
+        for source_name, key, claimed_task_id in task_claims:
+            if claimed_task_id == canonical_task_id:
+                continue
+            if (
+                source_name == "payload"
+                and key == "task_id"
+                and claimed_task_id == contract_task_id
+            ):
+                continue
+            errors.append(
+                "dispatch task_id does not match persisted runtime context"
+            )
+        if not canonical_task_id:
+            errors.append("persisted runtime context is missing task_id")
+        task_id = canonical_task_id
+        required_text["task_id"] = task_id
         canonical_worker_id = str(
             getattr(context, "worker_id", "")
             or getattr(context, "worker_slot_id", "")
@@ -52399,7 +52465,7 @@ def _contract_runtime_rev3_dispatch_authority(
                 project_id=project_id,
                 route_token_ref=route_token_ref,
                 backlog_id=str(record.get("backlog_id") or ""),
-                task_id=task_id,
+                task_id=str(record.get("contract_execution_id") or ""),
             )
         except observer_route_context.RouteTokenRefError as exc:
             errors.append(f"dispatch child route identity could not be resolved: {exc}")
@@ -52407,6 +52473,25 @@ def _contract_runtime_rev3_dispatch_authority(
             errors.append("dispatch child route_token_ref is not server registered")
 
     if resolved:
+        resolved_scope = (
+            resolved.get("scope")
+            if isinstance(resolved.get("scope"), Mapping)
+            else {}
+        )
+        if (
+            str(resolved_scope.get("backlog_id") or "").strip()
+            != str(record.get("backlog_id") or "").strip()
+        ):
+            errors.append(
+                "dispatch child route identity backlog does not match contract runtime"
+            )
+        if (
+            str(resolved_scope.get("task_id") or "").strip()
+            != str(record.get("contract_execution_id") or "").strip()
+        ):
+            errors.append(
+                "dispatch child route identity task scope does not match successor contract"
+            )
         allowed_actions = {
             str(action or "").strip().lower().replace("-", "_").replace(".", "_")
             for action in (resolved.get("allowed_actions") or [])
@@ -68498,18 +68583,51 @@ def _bounded_worker_dispatch_recovery_payload(
     error: str = "",
     runtime_context_id: str = "",
     task_id: str = "",
+    parent_task_id: str = "",
     observer_command_id: str = "",
     worker_id: str = "",
+    session_token_ref: str = "",
+    target_project_root: str = "",
+    worktree_path: str = "",
+    branch_ref: str = "",
+    base_commit: str = "",
+    target_head_commit: str = "",
     merge_queue_id: str = "",
+    owned_files: Sequence[str] | None = None,
+    profile_requirements: Mapping[str, Any] | None = None,
+    retry_policy: Mapping[str, Any] | None = None,
     route_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     missing = [str(item) for item in (missing_fields or []) if str(item or "").strip()]
     route_identity = route_identity if isinstance(route_identity, Mapping) else {}
+    copy_safe_owned_files = [
+        str(path)
+        for path in (owned_files or [])
+        if str(path or "").strip()
+    ]
+    copy_safe_profile_requirements = (
+        dict(profile_requirements)
+        if isinstance(profile_requirements, Mapping) and profile_requirements
+        else {
+            "profile_id": "codex-mf-sub",
+            "harness": "codex",
+        }
+    )
+    copy_safe_retry_policy = (
+        dict(retry_policy)
+        if isinstance(retry_policy, Mapping) and retry_policy
+        else {"attempt": 1, "max_attempts": 2}
+    )
     repair_payload = {
         "runtime_context_id": runtime_context_id or "<mfrctx-...>",
         "task_id": task_id or "<worker-task-id>",
-        "parent_task_id": "<observer-or-root-task-id>",
+        "parent_task_id": parent_task_id or "<observer-or-root-task-id>",
         "observer_command_id": observer_command_id or "<observer-command-id>",
+        "worker_id": worker_id or "<actual host-created worker id>",
+        "worker_slot_id": worker_id or "<worker-slot-id>",
+        "session_token_ref": session_token_ref
+        or "<copy-safe worker session_token_ref>",
+        "target_project_root": target_project_root or "<absolute-project-root>",
         "route_id": str(route_identity.get("route_id") or "<route-id>"),
         "route_context_hash": str(
             route_identity.get("route_context_hash") or "<sha256:...>"
@@ -68524,24 +68642,38 @@ def _bounded_worker_dispatch_recovery_payload(
         "visible_injection_manifest_hash": str(
             route_identity.get("visible_injection_manifest_hash") or "<sha256:...>"
         ),
-        "owned_files": ["<repo-relative-owned-file>"],
-        "fence_token": "<fence-token>",
-        "worktree_path": "<absolute-worker-worktree>",
-        "branch_ref": "<refs/heads/...>",
-        "base_commit": "<base-sha>",
-        "target_head_commit": "<target-head-sha>",
+        "route_identity": {
+            key: str(route_identity.get(key) or "")
+            for key in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+            )
+        },
+        "owned_files": copy_safe_owned_files
+        or ["<repo-relative-owned-file>"],
+        "fence_token": "<read from env:AMING_WORKER_FENCE_TOKEN>",
+        "worktree_path": worktree_path or "<absolute-worker-worktree>",
+        "branch_ref": branch_ref or "<refs/heads/...>",
+        "base_commit": base_commit or "<base-sha>",
+        "target_head_commit": target_head_commit or "<target-head-sha>",
         "merge_queue_id": merge_queue_id or "<merge-queue-id>",
         "merge_queue_id_source": "runtime_context.current_values.merge_queue_id",
+        "profile_requirements": copy_safe_profile_requirements,
+        "retry_policy": copy_safe_retry_policy,
     }
     worker_host_envelope_handoff = _mf_sub_worker_host_envelope_handoff(
         project_id=project_id,
         runtime_context_id=str(repair_payload.get("runtime_context_id") or ""),
         task_id=str(repair_payload.get("task_id") or ""),
         parent_task_id=str(repair_payload.get("parent_task_id") or ""),
-        target_project_root=str(repair_payload.get("worktree_path") or ""),
+        target_project_root=str(repair_payload.get("target_project_root") or ""),
         worker_id=worker_id or "<actual host-created worker id>",
         worker_slot_id=worker_id or "<worker-slot-id>",
-        session_token_ref="<copy-safe worker session_token_ref>",
+        session_token_ref=str(repair_payload.get("session_token_ref") or ""),
         fence_token=str(repair_payload.get("fence_token") or ""),
         merge_queue_id=str(repair_payload.get("merge_queue_id") or ""),
         route_identity=repair_payload,
@@ -68674,6 +68806,7 @@ def _bounded_worker_dispatch_recovery_payload(
             ),
         },
         "payload_shape": repair_payload,
+        "copy_safe_retry_payload": repair_payload,
         "worker_host_envelope_handoff": worker_host_envelope_handoff,
         "capacity_fallback_guidance": capacity_fallback_guidance,
         "copy_safe_bridge_payload": {
@@ -68786,6 +68919,16 @@ def _record_bounded_worker_dispatch_event(
                 if values:
                     return values
         return []
+
+    def _first_mapping(*keys: str) -> dict[str, Any]:
+        for source_map in source_maps:
+            if not isinstance(source_map, Mapping):
+                continue
+            for key in keys:
+                value = source_map.get(key)
+                if isinstance(value, Mapping) and value:
+                    return dict(value)
+        return {}
 
     task_id = _first_field("task_id", "stage_task_id")
     backlog_id = _first_field("backlog_id")
@@ -69208,9 +69351,28 @@ def _record_bounded_worker_dispatch_event(
                 missing_fields=missing,
                 runtime_context_id=runtime_context_id,
                 task_id=task_id,
+                parent_task_id=parent_task_id,
                 observer_command_id=observer_command_id,
                 worker_id=worker_slot_id,
+                session_token_ref=_first_field(
+                    "session_token_ref",
+                    "worker_session_token_ref",
+                ),
+                target_project_root=_first_field(
+                    "target_project_root",
+                    "project_root",
+                    "repo_root",
+                ),
+                worktree_path=str(dispatch.get("worktree_path") or ""),
+                branch_ref=str(dispatch.get("branch_ref") or ""),
+                base_commit=str(dispatch.get("base_commit") or ""),
+                target_head_commit=str(
+                    dispatch.get("target_head_commit") or ""
+                ),
                 merge_queue_id=str(dispatch.get("merge_queue_id") or ""),
+                owned_files=owned_files,
+                profile_requirements=_first_mapping("profile_requirements"),
+                retry_policy=_first_mapping("retry_policy"),
                 route_identity=missing_route_identity,
             ),
         }

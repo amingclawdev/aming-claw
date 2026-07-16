@@ -4277,6 +4277,23 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert revision["route_identity"]["route_token_ref"] == "rtok-allocate-contract"
     assert revision["payload"]["observer_command_id"] == "cmd-allocate-contract"
     assert revision["payload"]["owned_files"] == ["agent/governance/server.py"]
+    allocation_evidence = created["branch_runtime_evidence"]
+    assert allocation_evidence["observer_command_id"] == "cmd-allocate-contract"
+    assert allocation_evidence["route_identity"]["route_token_ref"] == (
+        revision["route_identity"]["route_token_ref"]
+    )
+    assert allocation_evidence["route_context_hash"] == (
+        "sha256:route-allocate-contract"
+    )
+    assert allocation_evidence["prompt_contract_id"] == (
+        "rprompt-allocate-contract"
+    )
+    assert allocation_evidence["prompt_contract_hash"] == (
+        "sha256:prompt-allocate-contract"
+    )
+    assert allocation_evidence["visible_injection_manifest_hash"] == (
+        "sha256:visible-allocate-contract"
+    )
     assert created["dispatch_timeline_event"]["status"] == "recorded"
 
     latest = get_latest_branch_contract_revision(
@@ -4868,7 +4885,18 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     payload_shape = dispatch_event["recovery"]["payload_shape"]
     assert payload_shape["runtime_context_id"] == context["runtime_context_id"]
     assert payload_shape["task_id"] == "allocate-incomplete-task"
+    assert payload_shape["parent_task_id"] == "AC-ALLOCATE-INCOMPLETE"
     assert payload_shape["observer_command_id"] == "cmd-allocate-incomplete"
+    assert payload_shape["worker_id"] == "contract-worker"
+    assert payload_shape["worker_slot_id"] == "contract-worker"
+    assert payload_shape["session_token_ref"] == (
+        "<copy-safe worker session_token_ref>"
+    )
+    assert payload_shape["target_project_root"] == context["target_project_root"]
+    assert payload_shape["worktree_path"] == context["worktree_path"]
+    assert payload_shape["branch_ref"] == context["branch_ref"]
+    assert payload_shape["base_commit"] == "base-allocate-incomplete"
+    assert payload_shape["target_head_commit"] == "target-allocate-incomplete"
     assert payload_shape["merge_queue_id"] == "mq-allocate-incomplete"
     assert payload_shape["merge_queue_id_source"] == (
         "runtime_context.current_values.merge_queue_id"
@@ -4878,6 +4906,17 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     assert payload_shape["prompt_contract_id"] == "rprompt-allocate-incomplete"
     assert payload_shape["prompt_contract_hash"] == "sha256:prompt-allocate-incomplete"
     assert payload_shape["route_token_ref"] == "rtok-allocate-incomplete"
+    assert payload_shape["route_identity"] == dispatch_event["route_identity"]
+    assert payload_shape["profile_requirements"] == {
+        "profile_id": "codex-mf-sub",
+        "harness": "codex",
+    }
+    assert payload_shape["retry_policy"] == {"attempt": 1, "max_attempts": 2}
+    assert dispatch_event["recovery"]["copy_safe_retry_payload"] == payload_shape
+    assert "fence-allocate-incomplete" not in json.dumps(
+        dispatch_event["recovery"],
+        sort_keys=True,
+    )
     capacity_guidance = dispatch_event["recovery"]["capacity_fallback_guidance"]
     assert capacity_guidance["official_fallback_options"] == [
         "reuse_existing_idle_subagent_same_runtime_envelope",
@@ -32844,7 +32883,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
-        task_id=worker_task_id,
+        task_id=successor["contract_execution_id"],
         **route_identity,
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
@@ -33408,7 +33447,7 @@ def test_mf_parallel_projection_accepts_source_backed_dispatch_without_worker_ro
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
-        task_id=worker_task_id,
+        task_id=successor["contract_execution_id"],
         **route_identity,
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
@@ -46788,6 +46827,7 @@ def _mf_parallel_rev3_worker_dispatch_payload(
     backlog_id: str,
     runtime_context: BranchTaskRuntimeContext,
     route_label: str,
+    route_task_id: str = "",
     task_field: str = "task_id",
     parent_task_id: str | None = None,
     include_worker_role: bool = True,
@@ -46805,7 +46845,7 @@ def _mf_parallel_rev3_worker_dispatch_payload(
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
-        task_id=runtime_context.task_id,
+        task_id=route_task_id or runtime_context.task_id,
         **route_identity,
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
@@ -46956,7 +46996,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
-        task_id=worker_task_id,
+        task_id=successor["contract_execution_id"],
         **route_identity,
     )
     if not submit_dispatch:
@@ -47353,6 +47393,56 @@ def test_mf_parallel_rev3_dispatch_rejection_is_atomic(
     assert rejected["contract_runtime_current_state"][
         "execution_state_hash"
     ] == before_state_hash
+
+
+def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_scope(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-REV3-CONTRACT-ROUTE-SCOPE"
+    worker_task_id = "mf-parallel-rev3-contract-route-worker"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="mf-parallel-rev3-contract-route-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-mf-parallel-rev3-contract-route",
+        token="token-mf-parallel-rev3-contract-route",
+        submit_dispatch=False,
+    )
+    execution_id = successor["contract_execution_id"]
+    dispatch_payload = _mf_parallel_rev3_worker_dispatch_payload(
+        conn,
+        backlog_id=backlog_id,
+        runtime_context=runtime_context,
+        route_label="mf-parallel-rev3-contract-route",
+        route_task_id=execution_id,
+        task_field="worker_task_id",
+    )
+    dispatch_payload["task_id"] = execution_id
+
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": dispatch_payload,
+            },
+        )
+    )
+
+    assert dispatch["ok"] is True
+    stored = server._contract_runtime_store(conn).get(execution_id)
+    completed_dispatch = stored["completed_lines"][-1]
+    assert completed_dispatch["task_id"] == runtime_context.task_id
+    assert completed_dispatch["payload"]["task_id"] == runtime_context.task_id
+    assert completed_dispatch["payload"]["worker_task_id"] == runtime_context.task_id
+    assert completed_dispatch["payload"]["route_identity"]["route_token_ref"] == (
+        "rtok-mf-parallel-rev3-contract-route"
+    )
 
 
 def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_read(
@@ -50539,7 +50629,7 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     _persist_append_route_token_ref(
         conn,
         backlog_id=backlog_id,
-        task_id=worker_task_id,
+        task_id=successor["contract_execution_id"],
         **route_identity,
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
@@ -51639,6 +51729,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="runtime-context-projection",
+        route_task_id=successor["contract_execution_id"],
     )
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -52383,6 +52474,7 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_bounded_worker_list(co
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="parallel-list-dispatch-worker",
+        route_task_id=result["contract_execution_id"],
     )
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -52492,6 +52584,7 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_default_worker_role(co
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="parallel-default-worker-role",
+        route_task_id=result["contract_execution_id"],
         include_worker_role=False,
     )
     dispatch = server.handle_project_contract_runtime_line_write(
@@ -52610,6 +52703,7 @@ def test_mf_parallel_worker_read_accepts_dispatch_payload_worker_task_alias(conn
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="parallel-worker-task-alias",
+        route_task_id=result["contract_execution_id"],
         task_field="worker_task_id",
     )
     dispatch = server.handle_project_contract_runtime_line_write(
@@ -52726,6 +52820,7 @@ def test_mf_parallel_dispatch_rejects_source_backed_payload_without_task_parent_
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="source-backed-dispatch",
+        route_task_id=result["contract_execution_id"],
     )
     dispatch_payload.pop("task_id")
     dispatch_payload.pop("parent_task_id")
@@ -52966,6 +53061,7 @@ def test_mf_parallel_worker_read_rejects_dispatch_parent_task_mismatch(conn):
         backlog_id=backlog_id,
         runtime_context=runtime_context,
         route_label="dispatch-parent-worker",
+        route_task_id=result["contract_execution_id"],
         parent_task_id="AC-WRONG-PARENT",
     )
     dispatch = server.handle_project_contract_runtime_line_write(

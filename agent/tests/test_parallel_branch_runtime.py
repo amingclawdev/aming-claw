@@ -7119,6 +7119,8 @@ def test_mf_branch_allocation_evidence_hydrates_contract_single_source_fields() 
             "visible_injection_manifest_hash": "sha256:visible",
             "raw_private_context": "do not expose",
         },
+        observer_command_id="cex-allocation-contract",
+        session_token_ref="wstok-allocation-contract",
     )
 
     assert evidence["target_project_root"] == expected_root
@@ -7132,6 +7134,8 @@ def test_mf_branch_allocation_evidence_hydrates_contract_single_source_fields() 
     assert evidence["prompt_contract_hash"] == "sha256:prompt"
     assert evidence["route_token_ref"] == "rtok-contract"
     assert evidence["visible_injection_manifest_hash"] == "sha256:visible"
+    assert evidence["observer_command_id"] == "cex-allocation-contract"
+    assert evidence["session_token_ref"] == "wstok-allocation-contract"
     assert "raw_private_context" not in evidence["route_identity"]
 
 

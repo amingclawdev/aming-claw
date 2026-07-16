@@ -2709,6 +2709,8 @@ def branch_runtime_allocation_evidence(
     source_ref: str,
     registration_source: str = "parallel_branch_allocate",
     route_identity: Mapping[str, Any] | None = None,
+    observer_command_id: str = "",
+    session_token_ref: str = "",
 ) -> dict[str, Any]:
     """Return machine-consumable branch runtime allocation evidence."""
     runtime_context_id = runtime_context_id_for_branch_context(context)
@@ -2726,6 +2728,8 @@ def branch_runtime_allocation_evidence(
         "allocation_source_ref": source_ref,
         "registration_source": registration_source,
         "runtime_context_id": runtime_context_id,
+        "observer_command_id": str(observer_command_id or "").strip(),
+        "session_token_ref": str(session_token_ref or "").strip(),
         "merge_queue_id": context_payload.get("merge_queue_id", ""),
         "target_project_root": context_payload.get("target_project_root", ""),
         "project_root": context_payload.get("project_root", ""),
