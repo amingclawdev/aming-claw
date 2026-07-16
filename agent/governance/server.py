@@ -25676,6 +25676,9 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                             payload=handoff_payload,
                         )
                     )
+                    canonical_handoff_line[
+                        "required_by_pinned_definition"
+                    ] = True
                 elif canonical_execution_id:
                     canonical_handoff_line = {
                         "schema_version": (
@@ -25686,6 +25689,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                         "canonical": False,
                         "contract_execution_id": canonical_execution_id,
                         "line_id": "worker_review_ready_handoff",
+                        "required_by_pinned_definition": False,
                     }
                 finish_event_payload["contract_runtime_canonical_line"] = dict(
                     canonical_finish_line

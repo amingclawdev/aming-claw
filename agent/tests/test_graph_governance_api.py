@@ -46491,6 +46491,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     worktree_path: str | None = None,
     target_project_root: str | None = None,
     submit_dispatch: bool = True,
+    pinned_revision: str = "",
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -46505,6 +46506,44 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
         )
     )
     _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    if pinned_revision:
+        runtime = server._contract_runtime(conn)
+        parent_record = runtime.store.get(started["contract_execution_id"])
+        parent_execution_id = str(parent_record["contract_execution_id"])
+        successor_execution_id = server._mf_parallel_execution_id(
+            PID,
+            backlog_id,
+            parent_execution_id,
+            task_id,
+        )
+        runtime.start_execution(
+            server.MF_PARALLEL_CONTRACT_ID,
+            project_id=PID,
+            backlog_id=backlog_id,
+            actor_role="observer",
+            contract_execution_id=successor_execution_id,
+            version="v2",
+            revision=pinned_revision,
+            route_token_ref=f"rtok-{backlog_id.lower()}-root",
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=str(
+                parent_record.get("root_contract_execution_id")
+                or parent_execution_id
+            ),
+            contract_chain_id=str(parent_record["contract_chain_id"]),
+            role_binding={
+                "observer": "observer",
+                "mf_sub": "mf_sub",
+                "qa": "qa",
+                "binding_source": "mf_parallel_successor_facade",
+            },
+            backlog_lineage={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            metadata={"facade": "mf_parallel", "generic_crud_exposed": False},
+        )
     successor = server.handle_project_mf_parallel_enter(
         _ctx_with_role(
             {"project_id": PID},
@@ -48452,9 +48491,16 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
+@pytest.mark.parametrize(
+    ("pinned_revision", "handoff_required"),
+    [("rev3", False), ("rev1", True)],
+    ids=("rev3-skips-handoff", "rev1-keeps-handoff"),
+)
 def test_contract_runtime_only_startup_principal_projects_native_finish_attestation(
     conn,
     tmp_path,
+    pinned_revision,
+    handoff_required,
 ):
     backlog_id = "AC-CONTRACT-CANONICAL-WORKER-BRIDGE"
     worker_task_id = "contract-canonical-worker-bridge"
@@ -48496,6 +48542,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             fence_token="fence-contract-canonical-worker",
             token=worker_token,
             worktree_path=str(worker_root),
+            pinned_revision=pinned_revision,
         )
     )
     actual_worker_id = runtime_context.worker_slot_id
@@ -49048,19 +49095,33 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             body=finish_body,
         )
     )
-    assert finish_response["contract_runtime_canonical_handoff_line"] == {
-        "schema_version": "runtime_context.canonical_contract_line.v1",
-        "accepted": False,
-        "status": "not_required_by_pinned_definition",
-        "canonical": False,
-        "contract_execution_id": contract_execution_id,
-        "line_id": "worker_review_ready_handoff",
-    }
+    canonical_handoff = finish_response[
+        "contract_runtime_canonical_handoff_line"
+    ]
+    assert canonical_handoff["required_by_pinned_definition"] is (
+        handoff_required
+    )
+    assert canonical_handoff["line_id"] == "worker_review_ready_handoff"
+    if handoff_required:
+        assert canonical_handoff["accepted"] is True
+        assert canonical_handoff["canonical"] is True
+    else:
+        assert canonical_handoff == {
+            "schema_version": "runtime_context.canonical_contract_line.v1",
+            "accepted": False,
+            "status": "not_required_by_pinned_definition",
+            "canonical": False,
+            "contract_execution_id": contract_execution_id,
+            "line_id": "worker_review_ready_handoff",
+            "required_by_pinned_definition": False,
+        }
     contract_after_finish = server._contract_runtime_store(conn).get(
         contract_execution_id
     )
     assert contract_after_finish["completed_lines"][-1]["line_id"] == (
-        "worker_finish_gate"
+        "worker_review_ready_handoff"
+        if handoff_required
+        else "worker_finish_gate"
     )
     assert contract_after_finish["runtime_guide"]["next_legal_action"][
         "line_id"
