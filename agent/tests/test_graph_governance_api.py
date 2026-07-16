@@ -52535,6 +52535,136 @@ def test_reconcile_task_fence_rejects_taskless_when_policy_disallows_it():
     ) is False
 
 
+def test_live_merge_recorder_parent_task_scope_projects_exact_child_task(conn):
+    backlog_id = "AC-LIVE-MERGE-PARENT-CHILD-SCOPE"
+    parent_task_id = "cex-live-merge-parent-scope"
+    child_task_id = "worker-live-merge-child-scope"
+    runtime_context_id = "mfrctx-live-merge-parent-child-scope"
+    merge_commit = "a" * 40
+    recorded = server._record_parallel_branch_merge_contract_timeline_events(
+        conn,
+        project_id=PID,
+        body={
+            "backlog_id": backlog_id,
+            "task_id": child_task_id,
+            "contract_actor": "codex-observer",
+        },
+        result={
+            "ok": True,
+            "executed": True,
+            "dry_run": False,
+            "merge_commit": merge_commit,
+            "preview": {
+                "status": "pass",
+                "target_commit": "b" * 40,
+                "branch_commit": "c" * 40,
+            },
+            "gate_plan": {"merge_gate_passed": True},
+            "recorded": {
+                "context": {
+                    "task_id": child_task_id,
+                    "root_task_id": parent_task_id,
+                    "backlog_id": backlog_id,
+                    "runtime_context_id": runtime_context_id,
+                    "merge_queue_id": "mq-live-merge-parent-child-scope",
+                },
+                "queue_item": {
+                    "task_id": child_task_id,
+                    "queue_item_id": "mqi-live-merge-parent-child-scope",
+                    "merge_queue_id": "mq-live-merge-parent-child-scope",
+                    "status": "merged",
+                    "target_head_before_merge": "b" * 40,
+                    "target_head_after_merge": merge_commit,
+                },
+            },
+        },
+    )
+    live_merge = next(
+        event for event in recorded if event["event_kind"] == "live_merge"
+    )
+
+    assert live_merge["task_id"] == parent_task_id
+    scope = server._contract_runtime_projection_timeline_scope_values(
+        live_merge
+    )
+    assert scope["child_task_ids"] == [child_task_id]
+    assert child_task_id in scope["task_ids"]
+    assert parent_task_id in scope["task_ids"]
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        live_merge,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={parent_task_id},
+        allow_taskless=False,
+    ) is True
+    projected = server._contract_runtime_projection_latest_timeline_event(
+        recorded,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"live_merge"},
+        phase_tokens={"live_merge"},
+        actor_roles={"observer"},
+        related_task_ids={parent_task_id},
+    )
+    assert projected["id"] == live_merge["id"]
+    assert server._contract_runtime_projection_latest_timeline_event(
+        recorded,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        backlog_id="AC-UNRELATED-LIVE-MERGE-SCOPE",
+        kind_tokens={"live_merge"},
+        phase_tokens={"live_merge"},
+        actor_roles={"observer"},
+        related_task_ids={parent_task_id},
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("top_level_task_id", "cex-unrelated-live-merge"),
+        ("child_task_id", "worker-unrelated-live-merge"),
+        ("parent_task_id", "cex-forged-live-merge-parent"),
+        ("runtime_context_id", "mfrctx-unrelated-live-merge"),
+    ],
+)
+def test_live_merge_parent_child_scope_projection_rejects_forged_claims(
+    mutation,
+    value,
+):
+    parent_task_id = "cex-live-merge-parent-scope"
+    child_task_id = "worker-live-merge-child-scope"
+    runtime_context_id = "mfrctx-live-merge-parent-child-scope"
+    event = {
+        "task_id": parent_task_id,
+        "payload": {
+            "child_task_id": child_task_id,
+            "parent_task_id": parent_task_id,
+            "runtime_context_id": runtime_context_id,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "root_task_id": parent_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    }
+    if mutation == "top_level_task_id":
+        event["task_id"] = value
+    else:
+        event["payload"][mutation] = value
+
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        event,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={parent_task_id},
+        allow_taskless=False,
+    ) is False
+
+
 def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     conn,
     tmp_path,
