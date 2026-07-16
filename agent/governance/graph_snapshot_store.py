@@ -2169,6 +2169,7 @@ def record_current_full_reconcile_provenance(
     route_evidence: Mapping[str, Any],
     reconcile_event_id: int,
     reconcile_event_created_at: str,
+    runtime_context_scope: Mapping[str, Any] | None = None,
     marker_created_at: str | None = None,
 ) -> dict[str, Any]:
     """Seal one protected current-full completion to its durable reconcile event."""
@@ -2218,6 +2219,57 @@ def record_current_full_reconcile_provenance(
         "POST /api/graph-governance/{project_id}/reconcile/current-full"
     )
     safe_route_evidence = dict(route_evidence or {})
+    safe_runtime_context_scope = {
+        key: str((runtime_context_scope or {}).get(key) or "").strip()
+        for key in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+        )
+        if str((runtime_context_scope or {}).get(key) or "").strip()
+    }
+    route_runtime_context_scope = (
+        safe_route_evidence.get("runtime_context_scope")
+        if isinstance(
+            safe_route_evidence.get("runtime_context_scope"),
+            Mapping,
+        )
+        else {}
+    )
+    if safe_runtime_context_scope:
+        if (
+            str(route_runtime_context_scope.get("source") or "").strip()
+            != "parallel_branch_runtime_context"
+            or route_runtime_context_scope.get("server_derived") is not True
+        ):
+            raise ValueError(
+                "current-full reconcile runtime context scope requires server-derived route evidence"
+            )
+        comparable_route_scope = {
+            key: str(route_runtime_context_scope.get(key) or "").strip()
+            for key in safe_runtime_context_scope
+        }
+        if comparable_route_scope != safe_runtime_context_scope:
+            raise ValueError(
+                "current-full reconcile runtime context scope must match route evidence"
+            )
+        for field in (
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+        ):
+            route_value = str(safe_route_evidence.get(field) or "").strip()
+            scope_value = safe_runtime_context_scope.get(field, "")
+            if route_value and route_value != scope_value:
+                raise ValueError(
+                    "current-full reconcile route evidence runtime scope mismatch: "
+                    + field
+                )
     provenance_id = f"cfrp-{uuid.uuid4().hex[:24]}"
     marker_core = {
         "schema_version": "current_full_reconcile.provenance.v2",
@@ -2236,6 +2288,12 @@ def record_current_full_reconcile_provenance(
         "reconcile_event_created_at": reconcile_event_created_at,
         "route_evidence": safe_route_evidence,
     }
+    if safe_runtime_context_scope:
+        marker_core["runtime_context_scope"] = {
+            **safe_runtime_context_scope,
+            "source": "parallel_branch_runtime_context",
+            "server_derived": True,
+        }
     provenance_hash = _stable_sha256(marker_core)
     marker = {**marker_core, "provenance_hash": provenance_hash}
     notes = _snapshot_notes(snapshot)
@@ -2287,6 +2345,7 @@ def record_current_full_reconcile_provenance(
         "reconcile_event_id": reconcile_event_id,
         "reconcile_event_created_at": reconcile_event_created_at,
         "route_evidence": safe_route_evidence,
+        "runtime_context_scope": safe_runtime_context_scope,
         "provenance_hash": provenance_hash,
         "marker": marker,
     }
@@ -2368,6 +2427,59 @@ def current_full_reconcile_state(
     provenance_hash = str(provenance.get("provenance_hash") or "").strip()
     marker_reconcile_event_id = 0
     provenance_reconcile_event_id = 0
+    marker_runtime_context_scope = (
+        marker.get("runtime_context_scope")
+        if isinstance(marker.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    route_runtime_context_scope = (
+        stored_route_evidence.get("runtime_context_scope")
+        if isinstance(
+            stored_route_evidence.get("runtime_context_scope"),
+            Mapping,
+        )
+        else {}
+    )
+    runtime_context_scope_link_verified = bool(
+        (
+            not marker_runtime_context_scope
+            and not route_runtime_context_scope
+        )
+        or (
+            marker_runtime_context_scope
+            and route_runtime_context_scope
+            and {
+                key: str(marker_runtime_context_scope.get(key) or "").strip()
+                for key in (
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "parent_task_id",
+                    "runtime_context_id",
+                    "merge_queue_id",
+                )
+                if str(marker_runtime_context_scope.get(key) or "").strip()
+            }
+            == {
+                key: str(route_runtime_context_scope.get(key) or "").strip()
+                for key in (
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "parent_task_id",
+                    "runtime_context_id",
+                    "merge_queue_id",
+                )
+                if str(route_runtime_context_scope.get(key) or "").strip()
+            }
+            and marker_runtime_context_scope.get("server_derived") is True
+            and route_runtime_context_scope.get("server_derived") is True
+            and marker_runtime_context_scope.get("source")
+            == "parallel_branch_runtime_context"
+            and route_runtime_context_scope.get("source")
+            == "parallel_branch_runtime_context"
+        )
+    )
     try:
         marker_reconcile_event_id = int(marker.get("reconcile_event_id") or 0)
         provenance_reconcile_event_id = int(
@@ -2421,6 +2533,7 @@ def current_full_reconcile_state(
         and stored_route_evidence.get("raw_route_token_persisted") is False
         and stored_route_evidence.get("protected_action")
         == "graph_current_full_reconcile"
+        and runtime_context_scope_link_verified
     )
     try:
         qa_event_id = int(qa_event_id)
@@ -2473,6 +2586,8 @@ def current_full_reconcile_state(
             reconcile_task_id,
             stored_route_evidence.get("task_id"),
             route_scope.get("task_id"),
+            marker_runtime_context_scope.get("task_id"),
+            route_runtime_context_scope.get("task_id"),
         )
         if str(value or "").strip()
     }
@@ -2482,6 +2597,8 @@ def current_full_reconcile_state(
             reconcile_runtime_context_id,
             stored_route_evidence.get("runtime_context_id"),
             route_scope.get("runtime_context_id"),
+            marker_runtime_context_scope.get("runtime_context_id"),
+            route_runtime_context_scope.get("runtime_context_id"),
         )
         if str(value or "").strip()
     }
@@ -2542,6 +2659,9 @@ def current_full_reconcile_state(
         "provenance_scope_verified": provenance_scope_verified,
         "task_scope_verified": task_scope_verified,
         "runtime_context_scope_verified": runtime_context_scope_verified,
+        "runtime_context_scope_link_verified": (
+            runtime_context_scope_link_verified
+        ),
         "expected_task_id": expected_task_id,
         "expected_runtime_context_id": expected_runtime_context_id,
         "reconcile_task_id": str(reconcile_task_id or "").strip(),
