@@ -23334,6 +23334,10 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         ]
         is True
     )
+    linked_reporting = guide["linked_bypass_diagnostic_reporting"]
+    assert linked_reporting["applicable"] is False
+    assert linked_reporting["normal_qa_graph_requirements_unchanged"] is True
+    assert "copy_safe_provenance_shape" not in linked_reporting
 
     append_evidence = guide["append_evidence"]
     assert append_evidence["route_token_ref_body"]["verification"][
@@ -42895,6 +42899,172 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
     ).fetchone()[0] == 1
 
 
+def test_mf_parallel_qa_pass_with_linked_open_graph_diagnostic_advances_merge(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-MF-PARALLEL-QA-LINKED-GRAPH-DIAGNOSTIC"
+    worker_task_id = "mf-parallel-qa-linked-graph-diagnostic-worker"
+    worker_fence = "fence-mf-parallel-qa-linked-graph-diagnostic"
+    worker_token = "token-mf-parallel-qa-linked-graph-diagnostic"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    head_commit = hashlib.sha1(backlog_id.encode("utf-8")).hexdigest()
+    graph_trace_id = "gqt-mf-parallel-qa-linked-graph-diagnostic"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="mf-parallel-qa-linked-graph-diagnostic-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+    )
+    evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token=worker_fence,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=head_commit,
+        implementation_event_ref=f"timeline:{evidence_events['implementation']}",
+    )
+    runtime = server._contract_runtime(conn)
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+            method="GET",
+        )
+    )
+    assert current["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+    bypass_identity = (
+        f"bypass:{successor['contract_execution_id']}:qa-graph-context"
+    )
+    diagnostic_backlog_id = "AC-MF-PARALLEL-QA-GRAPH-INFRA-DIAGNOSTIC"
+    bypass = server.handle_project_contract_runtime_line_bypass(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+            method="POST",
+            body={
+                "bypass_identity": bypass_identity,
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "execution_state_revision": current["execution_state_revision"],
+                "runtime_guide_hash": current["runtime_guide_hash"],
+                "diagnostic_backlog_id": diagnostic_backlog_id,
+                "classification": "candidate_graph_infrastructure_blocker",
+                "reason": "exact candidate graph snapshot is unavailable",
+                "decision": "continue through the audited bypass chain",
+                "evidence_refs": ["request:req-exact-snapshot-blocker"],
+                "task_id": runtime_context.task_id,
+            },
+        )
+    )
+    assert bypass["ok"] is True
+    assert bypass["diagnostic_status"] == "OPEN"
+    assert bypass["written_line"]["no_pass_claim"] is True
+    assert bypass["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
+
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        context=runtime_context,
+    )
+    qa_guide = server._runtime_context_qa_verification_guide(
+        project_id=PID,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        parent_task_id=backlog_id,
+        target_project_root=str(worker_root),
+        route_identity={},
+        target_files=["agent/governance/server.py"],
+        contract_runtime_state=projection["contract_runtime_current_state"],
+    )
+    reporting = qa_guide["linked_bypass_diagnostic_reporting"]
+    assert reporting["applicable"] is True
+    assert reporting["normal_qa_graph_requirements_unchanged"] is True
+    assert reporting["active_links"][0]["diagnostic_backlog_id"] == (
+        diagnostic_backlog_id
+    )
+    finding = reporting["copy_safe_provenance_shape"][
+        "out_of_baseline_findings"
+    ][0]
+    assert finding["bypassed_business_line_passed"] is False
+    assert finding["no_pass_claim"] is True
+    assert not set(reporting["forbidden_finding_keys"]).intersection(finding)
+
+    qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "passed",
+                "commit_sha": head_commit,
+                "verification": {
+                    "verdict": "passed",
+                    "focused_tests_passed": True,
+                },
+                "payload": {
+                    "verification_summary": "independent QA passed",
+                    "tests": ["focused linked-bypass regression"],
+                },
+                "qa_evidence_provenance": {
+                    "out_of_baseline_findings": [
+                        {
+                            **finding,
+                            "diagnostic_backlog_id": diagnostic_backlog_id,
+                            "source_bypass_identity": bypass_identity,
+                        }
+                    ]
+                },
+            },
+        )
+    )
+
+    assert qa["ok"] is True
+    assert qa["next_legal_action"]["line_id"] == "observer_merge"
+    stored = runtime.store.get(successor["contract_execution_id"])
+    assert server._contract_runtime_latest_failed_qa_line(stored) == {}
+    assert server._contract_runtime_value_reports_failed_qa(
+        {
+            "line_id": "qa_independent_verification",
+            "qa_evidence_provenance": {
+                "ordinary_finding": {"status": "blocked"}
+            },
+        }
+    ) is True
+
+
 def test_onboard_contract_stale_pinned_execution_returns_recovery_next_action(conn):
     backlog_id = "AC-ONBOARD-STALE-PINNED-RECOVERY"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
@@ -46491,6 +46661,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     worktree_path: str | None = None,
     target_project_root: str | None = None,
     submit_dispatch: bool = True,
+    pinned_revision: str = "",
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -46505,6 +46676,44 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
         )
     )
     _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    if pinned_revision:
+        runtime = server._contract_runtime(conn)
+        parent_record = runtime.store.get(started["contract_execution_id"])
+        parent_execution_id = str(parent_record["contract_execution_id"])
+        successor_execution_id = server._mf_parallel_execution_id(
+            PID,
+            backlog_id,
+            parent_execution_id,
+            task_id,
+        )
+        runtime.start_execution(
+            server.MF_PARALLEL_CONTRACT_ID,
+            project_id=PID,
+            backlog_id=backlog_id,
+            actor_role="observer",
+            contract_execution_id=successor_execution_id,
+            version="v2",
+            revision=pinned_revision,
+            route_token_ref=f"rtok-{backlog_id.lower()}-root",
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=str(
+                parent_record.get("root_contract_execution_id")
+                or parent_execution_id
+            ),
+            contract_chain_id=str(parent_record["contract_chain_id"]),
+            role_binding={
+                "observer": "observer",
+                "mf_sub": "mf_sub",
+                "qa": "qa",
+                "binding_source": "mf_parallel_successor_facade",
+            },
+            backlog_lineage={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            metadata={"facade": "mf_parallel", "generic_crud_exposed": False},
+        )
     successor = server.handle_project_mf_parallel_enter(
         _ctx_with_role(
             {"project_id": PID},
@@ -48452,9 +48661,16 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
+@pytest.mark.parametrize(
+    ("pinned_revision", "handoff_required"),
+    [("rev3", False), ("rev1", True)],
+    ids=("rev3-skips-handoff", "rev1-keeps-handoff"),
+)
 def test_contract_runtime_only_startup_principal_projects_native_finish_attestation(
     conn,
     tmp_path,
+    pinned_revision,
+    handoff_required,
 ):
     backlog_id = "AC-CONTRACT-CANONICAL-WORKER-BRIDGE"
     worker_task_id = "contract-canonical-worker-bridge"
@@ -48496,6 +48712,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             fence_token="fence-contract-canonical-worker",
             token=worker_token,
             worktree_path=str(worker_root),
+            pinned_revision=pinned_revision,
         )
     )
     actual_worker_id = runtime_context.worker_slot_id
@@ -49048,19 +49265,33 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             body=finish_body,
         )
     )
-    assert finish_response["contract_runtime_canonical_handoff_line"] == {
-        "schema_version": "runtime_context.canonical_contract_line.v1",
-        "accepted": False,
-        "status": "not_required_by_pinned_definition",
-        "canonical": False,
-        "contract_execution_id": contract_execution_id,
-        "line_id": "worker_review_ready_handoff",
-    }
+    canonical_handoff = finish_response[
+        "contract_runtime_canonical_handoff_line"
+    ]
+    assert canonical_handoff["required_by_pinned_definition"] is (
+        handoff_required
+    )
+    assert canonical_handoff["line_id"] == "worker_review_ready_handoff"
+    if handoff_required:
+        assert canonical_handoff["accepted"] is True
+        assert canonical_handoff["canonical"] is True
+    else:
+        assert canonical_handoff == {
+            "schema_version": "runtime_context.canonical_contract_line.v1",
+            "accepted": False,
+            "status": "not_required_by_pinned_definition",
+            "canonical": False,
+            "contract_execution_id": contract_execution_id,
+            "line_id": "worker_review_ready_handoff",
+            "required_by_pinned_definition": False,
+        }
     contract_after_finish = server._contract_runtime_store(conn).get(
         contract_execution_id
     )
     assert contract_after_finish["completed_lines"][-1]["line_id"] == (
-        "worker_finish_gate"
+        "worker_review_ready_handoff"
+        if handoff_required
+        else "worker_finish_gate"
     )
     assert contract_after_finish["runtime_guide"]["next_legal_action"][
         "line_id"
