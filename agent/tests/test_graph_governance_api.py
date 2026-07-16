@@ -40774,6 +40774,8 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
     )
     assert resolved_child is not None
     assert "contract_runtime_submit_line" in resolved_child["allowed_actions"]
+    assert "contract_runtime_bypass_line" in resolved_child["allowed_actions"]
+    assert "graph_query" in resolved_child["allowed_actions"]
     assert resolved_child["parent_route_lineage"]["route_token_ref"] == parent_ref
 
     child_refs = [
@@ -40813,6 +40815,8 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
         )
     )
     assert retry["contract_execution_id"] == direct_execution_id
+
+
     assert retry["route_token_ref"] == child_ref
     retry_child_refs = [
         row["route_token_ref"]
@@ -40858,6 +40862,49 @@ def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
     assert approval["ok"] is True
     assert approval["actor_role"] == "observer"
     assert approval["next_legal_action"]["line_id"] == "direct_fix_observer_graph_scope"
+
+
+def test_direct_main_bypass_route_actions_are_observer_copy_safe():
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id="AC-DIRECT-MAIN-BYPASS-ROUTE-SCOPE",
+        task_id="direct-main-bypass-route-scope",
+        target_files=["agent/governance/server.py"],
+        allowed_actions=[
+            "graph_query",
+            "observer_direct_mutation_exception",
+            "contract_runtime_bypass_line",
+            "task_timeline_append",
+            "backlog_upsert",
+        ],
+    )
+
+    scope = issued["route_action_scope"]
+    assert issued["requires_mf_sub_implementation_lane"] is False
+    assert scope["classification"] == "observer_admin_close_evidence_only"
+    assert scope["unknown_actions"] == []
+    assert scope["implementation_or_merge_actions"] == []
+    assert {
+        "graph_query",
+        "observer_direct_mutation_exception",
+        "contract_runtime_bypass_line",
+    }.issubset(scope["direct_main_or_reconcile_actions"])
+    assert all(
+        lane["role"] != "mf_sub"
+        for lane in issued["route_token"]["required_lanes"]
+    )
+
+    assert {
+        "graph_query",
+        "observer_direct_mutation_exception",
+        "contract_runtime_bypass_line",
+    }.issubset(server._ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS)
+    assert {"graph_query", "contract_runtime_bypass_line"}.issubset(
+        server._CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS
+    )
+    assert {"graph_query", "contract_runtime_bypass_line"}.issubset(
+        server._DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS
+    )
 
 
 def test_direct_fix_enter_binds_legacy_existing_successor_once(conn):

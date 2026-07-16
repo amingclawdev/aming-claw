@@ -52344,6 +52344,7 @@ ONBOARD_ROUTE_GUIDE_SERVICE_ID = "onboard_route_guide"
 
 _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "onboard_route_guide",
+    "graph_query",
     "onboard_contract_start",
     "onboard_contract_current",
     "onboard_contract_submit_line",
@@ -52357,6 +52358,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_update_submit_line",
     "contract_runtime_current",
     "contract_runtime_submit_line",
+    "contract_runtime_bypass_line",
     "runtime_context_read_receipt",
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
@@ -52368,9 +52370,11 @@ _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
     "contract_runtime_submit_line",
 )
 _CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "graph_query",
     "contract_runtime_current",
     "contract_runtime_guide",
     "contract_runtime_submit_line",
+    "contract_runtime_bypass_line",
     "parallel_branch_allocate",
     "runtime_context_read_receipt",
     "task_timeline_append",
@@ -56609,9 +56613,11 @@ CONTRACT_UPDATE_CONTRACT_ID = "contract_update"
 DIRECT_FIX_CONTRACT_ID = "direct_fix"
 DIRECT_FIX_TEMPLATE_ID = "direct_fix.v1"
 _DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS = (
+    "graph_query",
     "contract_runtime_current",
     "contract_runtime_guide",
     "contract_runtime_submit_line",
+    "contract_runtime_bypass_line",
     "parallel_branch_allocate",
     "task_timeline_append",
 )
