@@ -3088,6 +3088,7 @@ _OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS = (
     "mf_batch_parallel_enter",
     "backlog_close",
     "contract_runtime_submit_line",
+    "contract_runtime_bypass_line",
     "task_timeline_append",
     "graph_current_full_reconcile",
 )
@@ -77065,6 +77066,193 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["actor_role"] = actor_role
     if "dispatch_timeline_event" in locals() and dispatch_timeline_event:
         response["contract_runtime_dispatch_timeline_event"] = dispatch_timeline_event
+    return response
+
+
+@route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-bypasses")
+def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
+    """Atomically waive the current line and link its OPEN diagnostic row."""
+
+    from . import task_timeline
+
+    project_id = ctx.get_project_id()
+    execution_id = str(ctx.path_params.get("contract_execution_id") or "").strip()
+    if not execution_id:
+        raise ValidationError("contract_execution_id is required")
+    body = dict(ctx.body or {})
+    bypass_identity = str(body.get("bypass_identity") or "").strip()
+    diagnostic_id = str(body.get("diagnostic_backlog_id") or "").strip()
+    if not diagnostic_id and bypass_identity:
+        suffix = hashlib.sha256(bypass_identity.encode("utf-8")).hexdigest()[:16]
+        diagnostic_id = f"AC-CONTRACT-LINE-BYPASS-{suffix.upper()}"
+    body["diagnostic_backlog_id"] = diagnostic_id
+
+    with DBContext(project_id) as conn:
+        runtime = _contract_runtime(conn)
+        record = runtime.store.get(execution_id)
+        actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_bypass_line",
+            backlog_id=str(record.get("backlog_id") or ""),
+            contract_execution_id=execution_id,
+            record=record,
+        )
+        try:
+            runtime.current_guide(execution_id, actor_role=actor_role)
+            record = runtime.store.get(execution_id)
+            record, projection = _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                actor_role=actor_role,
+            )
+            result = runtime.bypass_current_line(
+                execution_id,
+                {
+                    "bypass_identity": bypass_identity,
+                    "stage_id": body.get("stage_id"),
+                    "line_id": body.get("line_id"),
+                    "execution_state_revision": body.get("execution_state_revision"),
+                    "runtime_guide_hash": body.get("runtime_guide_hash"),
+                    "diagnostic_backlog_id": diagnostic_id,
+                    "classification": body.get("classification"),
+                    "reason": body.get("reason"),
+                    "decision": body.get("decision"),
+                    "evidence_refs": body.get("evidence_refs") or [],
+                },
+                actor_role=actor_role,
+                projected_completed_lines=(
+                    _contract_runtime_projection_completed_lines(projection)
+                ),
+                projection=projection,
+            )
+        except StalePinnedContractExecutionError as exc:
+            return _contract_runtime_stale_recovery_projection(
+                exc,
+                action="contract_runtime_bypass_line",
+                route_token_ref=_contract_runtime_ref_value(
+                    ctx, "route_token_ref", "observer_route_token_ref"
+                ),
+                actor_role=actor_role,
+            )
+        if not result.get("ok"):
+            conn.rollback()
+            return {
+                "schema_version": "contract_runtime.line_bypass_response.v1",
+                "ok": False,
+                "project_id": project_id,
+                "contract_execution_id": execution_id,
+                "actor_role": actor_role,
+                "diagnostic_backlog_id": diagnostic_id,
+                "decision": result.get("decision") or {},
+            }
+
+        timeline_events: list[dict[str, Any]] = []
+        if not result.get("idempotent"):
+            source_id = str(record.get("backlog_id") or "").strip()
+            source = conn.execute(
+                "SELECT * FROM backlog_bugs WHERE bug_id = ?", (source_id,)
+            ).fetchone()
+            if not source:
+                raise ValidationError(f"source backlog row not found: {source_id}")
+            existing = conn.execute(
+                "SELECT * FROM backlog_bugs WHERE bug_id = ?", (diagnostic_id,)
+            ).fetchone()
+            link = {
+                "source_backlog_id": source_id,
+                "contract_execution_id": execution_id,
+                "line_id": str(body.get("line_id") or ""),
+                "execution_state_revision": int(body.get("execution_state_revision") or 0),
+                "bypass_identity": bypass_identity,
+                "classification": str(body.get("classification") or ""),
+                "disposition": "proceeded_with_exception",
+                "no_pass_claim": True,
+            }
+            if existing:
+                prior = backlog_runtime.parse_json_object(existing["chain_trigger_json"])
+                if existing["status"] != "OPEN" or any(
+                    str(prior.get(key) or "") != str(link.get(key) or "")
+                    for key in ("source_backlog_id", "contract_execution_id", "line_id")
+                ):
+                    raise ValidationError(
+                        "diagnostic_backlog_id is not the matching OPEN bypass row"
+                    )
+            else:
+                now = _utc_now()
+                target_files = str(source["target_files"] or "[]")
+                test_files = str(source["test_files"] or "[]")
+                conn.execute(
+                    """INSERT INTO backlog_bugs
+                       (bug_id, title, status, priority, target_files, test_files,
+                        acceptance_criteria, details_md, chain_trigger_json,
+                        provenance_paths, bypass_policy_json, mf_type, created_at, updated_at)
+                       VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, 'chain_rescue', ?, ?)""",
+                    (
+                        diagnostic_id,
+                        f"ContractRuntime bypass diagnostic: {link['line_id']}",
+                        str(body.get("diagnostic_priority") or "P1"),
+                        target_files,
+                        test_files,
+                        json.dumps([
+                            "Repair the blocked line without relying on this bypass.",
+                            "Keep source and diagnostic timeline linkage durable.",
+                        ]),
+                        str(body.get("reason") or ""),
+                        json.dumps(link),
+                        json.dumps([
+                            f"backlog:{source_id}",
+                            f"contract-runtime:{execution_id}",
+                        ]),
+                        json.dumps({**link, "keep_open": True}),
+                        now,
+                        now,
+                    ),
+                )
+            event_payload = {**link, "diagnostic_backlog_id": diagnostic_id}
+            common = {
+                "project_id": project_id,
+                "task_id": str(body.get("task_id") or execution_id),
+                "correlation_id": f"contract-line-bypass:{bypass_identity}",
+                "phase": str(body.get("phase") or "contract_runtime_bypass"),
+                "event_kind": "record_blocker",
+                "actor": actor_role,
+                "commit_sha": str(body.get("commit_sha") or ""),
+                "payload": event_payload,
+            }
+            timeline_events.append(task_timeline.record_event(
+                conn,
+                backlog_id=source_id,
+                event_type="contract_line_bypass",
+                status="proceeded_with_exception",
+                decision="linked_open_diagnostic_no_pass",
+                **common,
+            ))
+            timeline_events.append(task_timeline.record_event(
+                conn,
+                backlog_id=diagnostic_id,
+                event_type="contract_line_bypass_diagnostic_linked",
+                status="open",
+                decision="keep_open_until_block_repaired",
+                **common,
+            ))
+
+    response = {
+        "schema_version": "contract_runtime.line_bypass_response.v1",
+        "ok": True,
+        "project_id": project_id,
+        "contract_execution_id": execution_id,
+        "actor_role": actor_role,
+        "idempotent": bool(result.get("idempotent")),
+        "diagnostic_backlog_id": diagnostic_id,
+        "diagnostic_status": "OPEN",
+        "decision": result.get("decision") or {},
+        "written_line": result.get("written_line") or {},
+        "timeline_events": timeline_events,
+    }
+    if isinstance(result.get("record"), Mapping):
+        response.update(_contract_runtime_response(result["record"]))
+        response["schema_version"] = "contract_runtime.line_bypass_response.v1"
     return response
 
 

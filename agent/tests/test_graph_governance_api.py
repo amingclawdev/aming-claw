@@ -42762,6 +42762,83 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     )
 
 
+def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-LINE-BYPASS"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    record = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-contract-runtime-line-bypass",
+    )
+    conn.commit()
+    body = {
+        "bypass_identity": "bypass:cex-contract-runtime-line-bypass:1",
+        "stage_id": "pre_mutation",
+        "line_id": "hotfix_pre_reason",
+        "execution_state_revision": record["execution_state_revision"],
+        "runtime_guide_hash": record["runtime_guide"]["runtime_guide_hash"],
+        "classification": "process_contract_conflict",
+        "reason": "the guide cannot produce this line in the current environment",
+        "decision": "continue with an audited exception",
+        "evidence_refs": [f"backlog:{backlog_id}"],
+        "task_id": "task-contract-runtime-line-bypass",
+        "phase": "direct_main",
+    }
+    ctx = lambda payload: _ctx_with_role(
+        {"project_id": PID, "contract_execution_id": record["contract_execution_id"]},
+        "observer",
+        method="POST",
+        body=payload,
+    )
+
+    accepted = server.handle_project_contract_runtime_line_bypass(ctx(body))
+
+    assert accepted["ok"] is True
+    assert accepted["idempotent"] is False
+    assert accepted["decision"]["no_pass_claim"] is True
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["next_legal_action"]["id"] == "hotfix_post_action_summary"
+    diagnostic_id = accepted["diagnostic_backlog_id"]
+    diagnostic = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?", (diagnostic_id,)
+    ).fetchone()
+    assert diagnostic["status"] == "OPEN"
+    link = json.loads(diagnostic["chain_trigger_json"])
+    assert link["source_backlog_id"] == backlog_id
+    assert link["line_id"] == "hotfix_pre_reason"
+    events = conn.execute(
+        "SELECT backlog_id, event_type FROM task_timeline_events "
+        "WHERE correlation_id = ? ORDER BY id",
+        (f"contract-line-bypass:{body['bypass_identity']}",),
+    ).fetchall()
+    assert [(row["backlog_id"], row["event_type"]) for row in events] == [
+        (backlog_id, "contract_line_bypass"),
+        (diagnostic_id, "contract_line_bypass_diagnostic_linked"),
+    ]
+
+    retry = server.handle_project_contract_runtime_line_bypass(ctx(body))
+    assert retry["ok"] is True
+    assert retry["idempotent"] is True
+    assert retry["timeline_events"] == []
+    event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE correlation_id = ?",
+        (f"contract-line-bypass:{body['bypass_identity']}",),
+    ).fetchone()[0]
+    assert event_count == 2
+
+    stale = server.handle_project_contract_runtime_line_bypass(
+        ctx({**body, "bypass_identity": "bypass:stale"})
+    )
+    assert stale["ok"] is False
+    assert stale["decision"]["errors"] == ["execution_state_revision mismatch"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE bug_id LIKE 'AC-CONTRACT-LINE-BYPASS-%'"
+    ).fetchone()[0] == 1
+
+
 def test_onboard_contract_stale_pinned_execution_returns_recovery_next_action(conn):
     backlog_id = "AC-ONBOARD-STALE-PINNED-RECOVERY"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
