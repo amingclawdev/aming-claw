@@ -20,6 +20,12 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Any
 
+from .schema_contract import (
+    MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
+    MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_compatibility,
+)
+
 log = logging.getLogger(__name__)
 
 _RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS = 900
@@ -3285,7 +3291,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_status",
-        "description": "Aggregate governance health, manager health, and version_check into one runtime status report.",
+        "description": "Aggregate governance health, manager health, version_check, and loaded-vs-server MCP tool schema freshness into one runtime status report.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5089,12 +5095,46 @@ class ToolDispatcher:
             manager = self._manager_api("GET", "/api/manager/health")
             version = _governance_offline_hint(self._api("GET", f"/api/version-check/{pid}"))
             classification = _runtime_status_classification(governance, manager, version)
+            server_schema = (
+                governance.get("mcp_tool_schema")
+                if isinstance(governance.get("mcp_tool_schema"), dict)
+                else {}
+            )
+            server_schema_version = str(
+                server_schema.get("server_tool_schema_version")
+                or governance.get("mcp_tool_schema_version")
+                or ""
+            ).strip()
+            minimum_client_schema_version = str(
+                server_schema.get("minimum_client_tool_schema_version")
+                or governance.get("mcp_tool_schema_min_client_version")
+                or MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION
+            ).strip()
+            schema_status = mcp_tool_schema_compatibility(
+                loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
+                server_schema_version=(
+                    server_schema_version or MCP_TOOL_SCHEMA_VERSION
+                ),
+                minimum_client_schema_version=minimum_client_schema_version,
+            )
+            schema_status["server_version_observable"] = bool(
+                server_schema_version
+            )
+            if not server_schema_version:
+                schema_status["client_schema_fresh"] = None
+                schema_status["stale_client_possible"] = True
+                schema_status["status"] = "server_schema_signal_unavailable"
+            elif schema_status["client_schema_fresh"]:
+                schema_status["status"] = "current"
+            else:
+                schema_status["status"] = "stale_client"
             status = {
                 **classification,
                 "project_id": pid,
                 "governance": governance,
                 "manager": manager,
                 "version_check": version,
+                "mcp_tool_schema": schema_status,
                 "recommended_actions": [],
             }
             if isinstance(version, dict):
@@ -5129,6 +5169,10 @@ class ToolDispatcher:
                 status["recommended_actions"].append("start_governance")
             elif governance.get("status") != "ok":
                 status["recommended_actions"].append("governance_redeploy")
+            if schema_status["client_schema_fresh"] is False:
+                status["recommended_actions"].append(
+                    "restart_or_refresh_mcp_session"
+                )
             if not manager.get("ok"):
                 status["recommended_actions"].append("advanced_chain_ops_manager_start")
             if _runtime_status_target_dirty(version):

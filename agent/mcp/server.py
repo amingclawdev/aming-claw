@@ -34,6 +34,10 @@ if _agent_dir not in sys.path:
 from mcp.tools import TOOLS, ToolDispatcher, tools_for_current_process
 from mcp.executor import WorkerPool
 from mcp.events import EventBridge
+from mcp.schema_contract import (
+    MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_compatibility,
+)
 
 log = logging.getLogger(__name__)
 
@@ -712,7 +716,15 @@ class AmingClawMCP:
 
         # --- tools/list ---
         if method == "tools/list":
-            _response(req_id, {"tools": tools_for_current_process(TOOLS)})
+            _response(req_id, {
+                "tools": tools_for_current_process(TOOLS),
+                "_meta": {
+                    "aming_claw_tool_schema": mcp_tool_schema_compatibility(
+                        loaded_schema_version=MCP_TOOL_SCHEMA_VERSION,
+                        server_schema_version=MCP_TOOL_SCHEMA_VERSION,
+                    ),
+                },
+            })
             return
 
         # --- resources/list ---

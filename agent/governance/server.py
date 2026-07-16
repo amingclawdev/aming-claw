@@ -65,6 +65,12 @@ from .contracts.runtime import (
 )
 from .contracts.hash import stable_sha256
 from .contracts.write_gate import contract_line_evidence_policy
+from agent.mcp.schema_contract import (
+    MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
+    MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_compatibility,
+    qa_session_register_http_fallback,
+)
 
 import os
 import shutil
@@ -4964,9 +4970,32 @@ def handle_role_assign(ctx: RequestContext):
             if not backlog_id or not task_id or not re.fullmatch(
                 r"[0-9a-f]{40,64}", commit_sha
             ):
+                missing_fields = [
+                    field
+                    for field, value in (
+                        ("backlog_id", backlog_id),
+                        ("task_id", task_id),
+                        ("commit_sha", commit_sha),
+                    )
+                    if not value
+                ]
+                invalid_fields = (
+                    ["commit_sha"]
+                    if commit_sha
+                    and not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha)
+                    else []
+                )
                 raise ValidationError(
                     "bounded QA role assignment requires backlog_id, task_id, "
-                    "and full commit_sha"
+                    "and full commit_sha",
+                    {
+                        "missing_fields": missing_fields,
+                        "invalid_fields": invalid_fields,
+                        "diagnostic": "stale_client_or_wrong_call",
+                        "mcp_tool_schema_compatibility": (
+                            mcp_tool_schema_compatibility()
+                        ),
+                    },
                 )
             reserved_scope = [
                 item
@@ -53894,6 +53923,8 @@ def _onboard_contract_route_guide(
         "qa_session_register": {
             "kind": "mcp_or_http",
             "mcp_tool": "qa_session_register",
+            "http_fallback": qa_session_register_http_fallback(),
+            "schema_freshness": mcp_tool_schema_compatibility(),
         },
         "task_timeline_append": {
             "kind": "mcp_or_http",
@@ -54271,6 +54302,7 @@ def _onboard_contract_route_guide(
         },
         "onboard_contract_required": not legacy_onboard_contract_waived,
         "legacy_onboard_contract_waived": legacy_onboard_contract_waived,
+        "mcp_client_freshness": mcp_tool_schema_compatibility(),
         "guide_steps": [
             {
                 "id": "confirm_role",
@@ -70762,6 +70794,11 @@ def handle_health(ctx: RequestContext):
         "health_version": health_version,
         "gov_runtime_version": gov_runtime_version,
         "governance_runtime_version": gov_runtime_version,
+        "mcp_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
+        "mcp_tool_schema_min_client_version": (
+            MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION
+        ),
+        "mcp_tool_schema": mcp_tool_schema_compatibility(),
         "pid": SERVER_PID,
     }
 

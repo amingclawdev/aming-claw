@@ -13,6 +13,7 @@ import pytest
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import server as plugin_mcp_server
 from agent.mcp.server import AmingClawMCP
+from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
 from agent.mcp.tools import TOOLS as runtime_mcp_tools
 from agent.mcp.tools import ToolDispatcher
 
@@ -294,6 +295,12 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert returncode == 0
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
+    schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
+    assert schema_meta["loaded_client_tool_schema_version"] == (
+        MCP_TOOL_SCHEMA_VERSION
+    )
+    assert schema_meta["server_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
+    assert schema_meta["client_schema_fresh"] is True
     names = {tool["name"] for tool in tools}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {

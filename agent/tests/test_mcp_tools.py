@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import tools as mcp_tools
+from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
 
@@ -174,7 +175,12 @@ class _RuntimeGovRecorder(_Recorder):
     def api(self, method: str, path: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
         if path == "/api/health":
-            return {"status": "ok", "version": "abc1234"}
+            return {
+                "status": "ok",
+                "version": "abc1234",
+                "mcp_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
+                "mcp_tool_schema_min_client_version": MCP_TOOL_SCHEMA_VERSION,
+            }
         if path == "/api/version-check/aming-claw":
             return {
                 "ok": True,
@@ -2989,12 +2995,43 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert status["version_check"]["runtime_match"] is True
     assert status["target_project_version"]["head"] == "abc1234"
     assert status["governance_runtime"]["runtime_match"] is True
+    assert status["mcp_tool_schema"]["status"] == "current"
+    assert status["mcp_tool_schema"]["client_schema_fresh"] is True
+    assert status["mcp_tool_schema"]["loaded_client_tool_schema_version"] == (
+        MCP_TOOL_SCHEMA_VERSION
+    )
     assert status["legacy_runtime_waivers"] == []
     assert governance.calls == [
         ("GET", "/api/health", None),
         ("GET", "/api/version-check/aming-claw", None),
     ]
     assert manager.calls == [("GET", "/api/manager/health", None)]
+
+
+def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
+    class UpgradedSchemaGovernance(_RuntimeGovRecorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            if path == "/api/health":
+                self.calls.append((method, path, data))
+                return {
+                    "status": "ok",
+                    "version": "next123",
+                    "mcp_tool_schema_version": "2099-01-01.1",
+                    "mcp_tool_schema_min_client_version": "2099-01-01.1",
+                }
+            return super().api(method, path, data)
+
+    status = _dispatcher(UpgradedSchemaGovernance(), _Recorder()).dispatch(
+        "runtime_status",
+        {"project_id": "aming-claw"},
+    )
+
+    schema = status["mcp_tool_schema"]
+    assert schema["status"] == "stale_client"
+    assert schema["client_schema_fresh"] is False
+    assert schema["loaded_client_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
+    assert schema["server_tool_schema_version"] == "2099-01-01.1"
+    assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
 def test_mcp_runtime_status_current_target_chain_mismatch_blocks_core():

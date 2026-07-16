@@ -41,6 +41,7 @@ from agent.governance.contracts.runtime import (
 )
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import GovernanceError, PermissionDeniedError, ValidationError
+from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
@@ -1724,6 +1725,13 @@ def test_health_and_version_check_distinguish_head_from_loaded_runtime(conn, tmp
     assert health["gov_runtime_version"] == loaded_runtime
     assert health["governance_runtime_version"] == loaded_runtime
     assert health["version"] != health["gov_runtime_version"]
+    assert health["mcp_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
+    assert health["mcp_tool_schema_min_client_version"] == (
+        MCP_TOOL_SCHEMA_VERSION
+    )
+    assert health["mcp_tool_schema"]["server_tool_schema_version"] == (
+        MCP_TOOL_SCHEMA_VERSION
+    )
 
     version = server.handle_version_check(
         _ctx({"project_id": PID}, body={"project_root": str(tmp_path)})
@@ -22340,10 +22348,19 @@ def test_qa_role_assignment_rejects_caller_authority_and_refreshes_scope(conn):
 
     missing_tuple = dict(first)
     missing_tuple.pop("commit_sha")
-    with pytest.raises(ValidationError, match="full commit_sha"):
+    with pytest.raises(ValidationError, match="full commit_sha") as exc:
         server.handle_role_assign(
             _ctx_with_role({}, "coordinator", method="POST", body=missing_tuple)
         )
+    compatibility = exc.value.details["mcp_tool_schema_compatibility"]
+    assert exc.value.details["missing_fields"] == ["commit_sha"]
+    assert exc.value.details["diagnostic"] == "stale_client_or_wrong_call"
+    assert compatibility["server_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
+    assert compatibility["minimum_client_tool_schema_version"] == (
+        MCP_TOOL_SCHEMA_VERSION
+    )
+    assert compatibility["refresh_action"] == "restart_or_refresh_mcp_session"
+    assert compatibility["http_fallback"]["path"] == "/api/role/assign"
 
     second = {
         **first,
@@ -37947,6 +37964,12 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
         "kind": "guide_service",
         "source": "onboard_contract_facade",
     }
+    freshness = route_guide["mcp_client_freshness"]
+    assert freshness["server_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
+    assert freshness["freshness_signal"]["mcp_tool"] == "runtime_status"
+    qa_register = route_guide["interface_index"]["qa_session_register"]
+    assert qa_register["http_fallback"]["method"] == "POST"
+    assert qa_register["http_fallback"]["path"] == "/api/role/assign"
     assert [step["id"] for step in route_guide["guide_steps"]] == [
         "confirm_role",
         "confirm_work_type",
