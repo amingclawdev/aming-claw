@@ -17001,6 +17001,13 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         capture_output=True,
         text=True,
     )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
     main_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -17013,7 +17020,12 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     queue_id = "mergeq-api-execute"
     evidence = {
         "dirty_worktree_check": {"status": "pass"},
-        "test_evidence": {"status": "pass"},
+        "test_evidence": {
+            "status": "pass",
+            "passed": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": "timeline:17001",
+        },
         "graph_currentness": {"status": "current"},
         "scope_reconcile": {"status": "pass"},
         "semantic_projection": {"status": "pass"},
@@ -17162,6 +17174,16 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         if event["event_type"].startswith("parallel.")
     ]
     assert recorded_requirement_ids == ["merge_preview", "live_merge"]
+    recorded_live_merge = next(
+        event for event in timeline if event["event_kind"] == "live_merge"
+    )
+    recorded_test_evidence = recorded_live_merge["payload"]["qa_evidence"][
+        "request_evidence"
+    ]["test_evidence"]
+    assert recorded_test_evidence["candidate_commit_sha"] == candidate_commit
+    assert recorded_test_evidence["qa_event_ref"] == "timeline:17001"
+    assert recorded_live_merge["payload"]["runtime_context_id"]
+    assert recorded_live_merge["payload"]["child_task_id"] == "execute-task"
     assert (repo / "live.txt").read_text(encoding="utf-8") == "live\n"
     assert subprocess.run(
         ["git", "log", "-1", "--format=%B"],
@@ -22745,7 +22767,7 @@ def test_qa_candidate_overlay_accepts_linked_candidate_worktree(tmp_path):
     assert identity["repository_identity_match"] is True
 
 
-def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
+def test_exact_candidate_trace_remains_verified_after_scoped_durable_live_merge(
     conn,
     monkeypatch,
     tmp_path,
@@ -22803,6 +22825,31 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
     trace_id = "gqt-exact-linked-candidate-reuse"
     backlog_id = "AC-EXACT-LINKED-CANDIDATE-REUSE"
     task_id = "exact-linked-candidate-reuse-task"
+    parent_task_id = "cex-exact-linked-candidate-reuse"
+    runtime_context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(fixture.root),
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            root_task_id=parent_task_id,
+            stage_task_id=task_id,
+            stage_type="mf_sub",
+            backlog_id=backlog_id,
+            worker_id="worker-exact-linked-candidate-reuse",
+            worker_slot_id="worker-exact-linked-candidate-reuse",
+            branch_ref="refs/heads/exact-candidate-linked-root",
+            worktree_path=str(candidate_root),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-exact-linked-candidate-reuse",
+            base_commit=fixture.main_head,
+            head_commit=candidate_commit,
+            target_head_commit=fixture.main_head,
+        ),
+    )
     _insert_exact_qa_graph_query_trace(
         conn,
         trace_id=trace_id,
@@ -22840,18 +22887,182 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
     assert before_merge["target_project_root"] == str(candidate_root.resolve())
     assert before_merge["query_root"] == str(candidate_root.resolve())
     assert before_merge["candidate_query_root"] == str(candidate_root.resolve())
+
+    qa_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="independent_verification.completed",
+        event_kind="independent_verification",
+        phase="verification",
+        actor="qa:exact-linked-candidate-reuse",
+        status="passed",
+        commit_sha=candidate_commit,
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "candidate_commit_sha": candidate_commit,
+            "verified_commit": candidate_commit,
+            "graph_trace_ids": [trace_id],
+        },
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        ("2026-07-16T10:01:00Z", int(qa_event["id"])),
+    )
     subprocess.run(
-        ["git", "merge", "--ff-only", candidate_commit],
+        [
+            "git",
+            "merge",
+            "--no-ff",
+            candidate_commit,
+            "-m",
+            "durable exact candidate live merge",
+        ],
         cwd=fixture.root,
         check=True,
         capture_output=True,
         text=True,
     )
-    assert batch_jobs.git_commit(fixture.root) == candidate_commit
+    merge_commit = batch_jobs.git_commit(fixture.root)
+    assert merge_commit != candidate_commit
+
+    missing_live_merge = trace_refs()
+    assert missing_live_merge["db_verified"] is False
+    assert any(
+        mismatch["field"] == "canonical_head_commit"
+        and "durable observer live_merge" in mismatch["expected"]
+        for mismatch in missing_live_merge["identity_mismatches"]
+    )
+
+    merge_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "child_task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "candidate_commit_sha": candidate_commit,
+        "branch_head": candidate_commit,
+        "qa_event_ref": f"timeline:{qa_event['id']}",
+        "merge_commit": merge_commit,
+        "target_head_after_merge": merge_commit,
+    }
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        actor="observer",
+        status="passed",
+        commit_sha=merge_commit,
+        payload=merge_payload,
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        ("2026-07-16T10:02:00Z", int(merge_event["id"])),
+    )
+    conn.commit()
+
     after_merge = trace_refs()
     assert after_merge["db_verified"] is True, after_merge[
         "identity_mismatches"
     ]
+
+    def update_merge_event(
+        *,
+        payload: dict[str, Any] | None = None,
+        event_backlog_id: str = backlog_id,
+        event_task_id: str = parent_task_id,
+        commit_sha: str = merge_commit,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE task_timeline_events
+            SET backlog_id = ?, task_id = ?, commit_sha = ?, payload_json = ?
+            WHERE id = ?
+            """,
+            (
+                event_backlog_id,
+                event_task_id,
+                commit_sha,
+                json.dumps(payload or merge_payload, sort_keys=True),
+                int(merge_event["id"]),
+            ),
+        )
+        conn.commit()
+
+    update_merge_event(
+        payload={
+            **merge_payload,
+            "runtime_context_id": "mfrctx-wrong-live-merge",
+        }
+    )
+    wrong_runtime_context = trace_refs()
+    assert wrong_runtime_context["db_verified"] is False
+
+    update_merge_event(
+        payload={
+            **merge_payload,
+            "child_task_id": "wrong-live-merge-task",
+        }
+    )
+    wrong_task = trace_refs()
+    assert wrong_task["db_verified"] is False
+
+    update_merge_event(event_backlog_id="AC-WRONG-LIVE-MERGE-BACKLOG")
+    wrong_backlog = trace_refs()
+    assert wrong_backlog["db_verified"] is False
+
+    update_merge_event(
+        payload={
+            **merge_payload,
+            "merge_commit": candidate_commit,
+            "target_head_after_merge": candidate_commit,
+        },
+        commit_sha=candidate_commit,
+    )
+    forged_merge = trace_refs()
+    assert forged_merge["db_verified"] is False
+
+    subprocess.run(
+        ["git", "checkout", "-b", "unrelated-canonical-head", fixture.main_head],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (fixture.root / "unrelated.txt").write_text(
+        "unrelated canonical head\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "unrelated.txt"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated canonical head"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated_commit = batch_jobs.git_commit(fixture.root)
+    update_merge_event(
+        payload={
+            **merge_payload,
+            "merge_commit": unrelated_commit,
+            "target_head_after_merge": unrelated_commit,
+        },
+        commit_sha=unrelated_commit,
+    )
+    unrelated_head = trace_refs()
+    assert unrelated_head["db_verified"] is False
 
 
 def _write_test_demo_environment_marker(project_root: Path) -> None:
@@ -33403,7 +33614,6 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     tmp_path,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-RUNTIME-CONTEXT-PROJECTION"
-    close_commit = "aa6275118745006c8324dfcbeecea62c39e91936"
     task_id = "timeline-gate-runtime-context-projection-parent"
     worker_task_id = "timeline-gate-runtime-context-projection-worker"
     worker_token = "timeline-gate-runtime-context-projection-token"
@@ -33419,13 +33629,50 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         "route_token_ref": "rtok-runtime-context-close-parent",
     }
     close_route_token_ref = "rtok-runtime-context-close-projection"
-    worktree = tmp_path / "runtime-context-close-projection"
-    worker_commit = _init_test_git_repo(worktree)
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="runtime-context-close-projection",
+    )
+    worktree = tmp_path / "runtime-context-close-projection-worker"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "runtime-context-close-projection-worker",
+            str(worktree),
+            fixture.main_head,
+        ],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (worktree / "runtime-context-close-projection.txt").write_text(
+        "worker candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "runtime-context-close-projection.txt"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "runtime context close projection candidate"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    worker_commit = batch_jobs.git_commit(worktree)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
         lambda _project_id, raw=None, **_kwargs: (
-            Path(raw).resolve() if raw else worktree
+            Path(raw).resolve() if raw else fixture.root
         ),
     )
 
@@ -33488,7 +33735,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         fence_token=fence_token,
         token=worker_token,
         worktree_path=str(worktree),
-        base_commit="base-runtime-context-close-projection",
+        base_commit=fixture.main_head,
         target_head_commit=worker_commit,
         merge_queue_id="mq-runtime-context-close-projection",
         owned_files=("agent/governance/server.py",),
@@ -33570,6 +33817,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
         backlog_id=backlog_id,
         task_id=runtime_context.task_id,
         target_project_root=runtime_context.target_project_root,
+        canonical_project_root=str(fixture.root),
     )
     qa_event = task_timeline.record_event(
         conn,
@@ -33640,6 +33888,22 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     }
     assert "worker_graph_context" in projected_ids
     assert "qa_graph_context" in projected_ids
+    subprocess.run(
+        [
+            "git",
+            "merge",
+            "--no-ff",
+            worker_commit,
+            "-m",
+            "runtime context close projection live merge",
+        ],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    close_commit = batch_jobs.git_commit(fixture.root)
+    assert close_commit != worker_commit
     merge_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -33655,6 +33919,9 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
             "runtime_context_id": runtime_context.runtime_context_id,
             "task_id": runtime_context.task_id,
             "parent_task_id": contract_execution_id,
+            "candidate_commit_sha": worker_commit,
+            "branch_head": worker_commit,
+            "qa_event_ref": f"timeline:{qa_event['id']}",
             "merge_commit": close_commit,
             "target_head_after_merge": close_commit,
         },
@@ -33819,7 +34086,7 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
-        lambda *_args, **_kwargs: worktree,
+        lambda *_args, **_kwargs: fixture.root,
     )
     monkeypatch.setattr(server, "_git_head_commit", lambda _root: close_commit)
     projected_after_timeline = server.handle_project_contract_runtime_current_state(
@@ -33941,17 +34208,6 @@ def test_backlog_close_applies_runtime_context_projection_before_current_state(
     }
     assert projection["accepted"] is True, projection
 
-    real_subprocess_run = server.subprocess.run
-
-    def fake_commit_verify(args, *run_args, **run_kwargs):
-        if (
-            list(args[:3]) == ["git", "rev-parse", "--verify"]
-            and not str(args[-1]).endswith("^{tree}")
-        ):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        return real_subprocess_run(args, *run_args, **run_kwargs)
-
-    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
     closed = server.handle_backlog_close(
         _ctx(
             {"project_id": PID, "bug_id": backlog_id},

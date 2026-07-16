@@ -8069,6 +8069,383 @@ def _qa_graph_review_context_from_trace_row(
     return review_context, mismatches
 
 
+def _qa_post_merge_deep_text_values(
+    value: Any,
+    keys: set[str],
+    *,
+    depth: int = 0,
+) -> set[str]:
+    if depth > 12:
+        return set()
+    values: set[str] = set()
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            key = str(raw_key or "").strip()
+            if key in keys:
+                text = _runtime_context_non_placeholder_text(child)
+                if text:
+                    values.add(text)
+            values.update(
+                _qa_post_merge_deep_text_values(
+                    child,
+                    keys,
+                    depth=depth + 1,
+                )
+            )
+    elif isinstance(value, (list, tuple, set)):
+        for child in value:
+            values.update(
+                _qa_post_merge_deep_text_values(
+                    child,
+                    keys,
+                    depth=depth + 1,
+                )
+            )
+    return values
+
+
+def _qa_post_merge_resolve_commit(project_root: Path, commit_sha: str) -> str:
+    normalized = str(commit_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,64}", normalized):
+        return ""
+    resolved = _qa_git_bytes(
+        Path(project_root).resolve(),
+        ["rev-parse", "--verify", f"{normalized}^{{commit}}"],
+    )
+    raw_stdout = resolved.stdout
+    full_commit = (
+        raw_stdout.decode("ascii", errors="ignore")
+        if isinstance(raw_stdout, bytes)
+        else str(raw_stdout or "")
+    ).strip().lower()
+    if resolved.returncode != 0 or not re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}",
+        full_commit,
+    ):
+        return ""
+    return full_commit
+
+
+def _qa_exact_candidate_post_merge_provenance(
+    conn,
+    *,
+    project_id: str,
+    row: Any,
+    canonical_project_root: Path,
+    candidate_commit_sha: str,
+    canonical_head_commit: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    trace_id = str(row["trace_id"] or "").strip()
+    backlog_id = str(row["backlog_id"] or "").strip()
+    task_id = str(row["task_id"] or "").strip()
+    candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
+    canonical_head_commit = str(canonical_head_commit or "").strip().lower()
+    mismatches: list[dict[str, Any]] = []
+
+    candidate_commit = _qa_post_merge_resolve_commit(
+        canonical_project_root,
+        candidate_commit_sha,
+    )
+    merged_commit = _qa_post_merge_resolve_commit(
+        canonical_project_root,
+        canonical_head_commit,
+    )
+    if candidate_commit != candidate_commit_sha or merged_commit != canonical_head_commit:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "canonical_head_commit",
+                "expected": "available full candidate and canonical commits",
+                "actual": canonical_head_commit,
+            }
+        )
+        return {}, mismatches
+    ancestry = _qa_git_bytes(
+        canonical_project_root,
+        ["merge-base", "--is-ancestor", candidate_commit, merged_commit],
+    )
+    if ancestry.returncode != 0:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "canonical_head_commit",
+                "expected": (
+                    "canonical live-merge commit containing the exact candidate"
+                ),
+                "actual": canonical_head_commit,
+            }
+        )
+        return {}, mismatches
+
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        runtime_context_id_for_branch_context,
+    )
+
+    runtime_context = get_branch_context(conn, project_id, task_id)
+    runtime_context_id = (
+        runtime_context_id_for_branch_context(runtime_context)
+        if runtime_context is not None
+        else ""
+    )
+    context_backlog_id = str(
+        getattr(runtime_context, "backlog_id", "") or ""
+    ).strip()
+    if (
+        runtime_context is None
+        or not runtime_context_id
+        or not backlog_id
+        or context_backlog_id != backlog_id
+    ):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "runtime_context_id",
+                "expected": (
+                    "task/backlog-bound branch runtime context for post-merge QA"
+                ),
+                "actual": runtime_context_id or "missing",
+            }
+        )
+        return {}, mismatches
+
+    parent_task_ids = {
+        str(getattr(runtime_context, "parent_task_id", "") or "").strip(),
+        str(getattr(runtime_context, "root_task_id", "") or "").strip(),
+    }
+    allowed_task_ids = {task_id, *(item for item in parent_task_ids if item)}
+    try:
+        from . import task_timeline
+
+        timeline_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    except Exception:
+        timeline_events = []
+
+    qa_events: list[dict[str, Any]] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        status = str(
+            event.get("status") or event.get("decision") or ""
+        ).strip().lower()
+        if status not in {
+            "accepted",
+            "ok",
+            "pass",
+            "passed",
+            "succeeded",
+            "success",
+        }:
+            continue
+        if _contract_runtime_projection_timeline_actor_role(event) != "qa":
+            continue
+        event_kind = _contract_runtime_close_normalized(event.get("event_kind"))
+        event_type = _contract_runtime_close_normalized(event.get("event_type"))
+        phase = _contract_runtime_close_normalized(event.get("phase"))
+        if (
+            event_kind
+            not in {"independent_verification", "qa_verification"}
+            and event_type
+            not in {"independent_verification", "qa_verification"}
+            and phase not in {"verification", "qa"}
+        ):
+            continue
+        if str(event.get("backlog_id") or "").strip() != backlog_id:
+            continue
+        if str(event.get("task_id") or "").strip() != task_id:
+            continue
+        if trace_id not in set(
+            _runtime_context_service_graph_trace_values_from_event(event)
+        ):
+            continue
+        qa_commit_claims = {
+            str(event.get("commit_sha") or "").strip().lower(),
+            *_qa_post_merge_deep_text_values(
+                event,
+                {
+                    "candidate_commit_sha",
+                    "verified_commit",
+                },
+            ),
+        }
+        qa_commit_claims = {
+            item.strip().lower() for item in qa_commit_claims if item.strip()
+        }
+        if not qa_commit_claims or not any(
+            _qa_post_merge_resolve_commit(canonical_project_root, item)
+            == candidate_commit
+            for item in qa_commit_claims
+        ):
+            continue
+        event_id = _contract_runtime_projection_timeline_event_id(event)
+        event_created_at = _contract_runtime_projection_timeline_event_time(event)
+        event_time = _contract_runtime_close_authority_time_order_value(
+            event_created_at
+        )
+        if event_id <= 0 or event_time is None:
+            continue
+        qa_events.append(
+            {
+                "event": dict(event),
+                "event_id": event_id,
+                "event_ref": f"timeline:{event_id}",
+                "event_created_at": event_created_at,
+                "event_time": event_time,
+            }
+        )
+
+    verified_provenance: dict[str, Any] = {}
+    for qa_event in sorted(
+        qa_events,
+        key=lambda item: (float(item["event_time"]), int(item["event_id"])),
+        reverse=True,
+    ):
+        for event in timeline_events:
+            if not isinstance(event, Mapping):
+                continue
+            status = str(
+                event.get("status") or event.get("decision") or ""
+            ).strip().lower()
+            if status not in {
+                "accepted",
+                "ok",
+                "pass",
+                "passed",
+                "succeeded",
+                "success",
+            }:
+                continue
+            if _contract_runtime_projection_timeline_actor_role(event) != "observer":
+                continue
+            event_kind = _contract_runtime_close_normalized(
+                event.get("event_kind")
+            )
+            event_type = _contract_runtime_close_normalized(
+                event.get("event_type")
+            )
+            phase = _contract_runtime_close_normalized(event.get("phase"))
+            if "live_merge" not in {event_kind, event_type, phase}:
+                continue
+            event_id = _contract_runtime_projection_timeline_event_id(event)
+            event_created_at = _contract_runtime_projection_timeline_event_time(
+                event
+            )
+            event_time = _contract_runtime_close_authority_time_order_value(
+                event_created_at
+            )
+            if (
+                event_id <= int(qa_event["event_id"])
+                or event_time is None
+                or float(event_time) <= float(qa_event["event_time"])
+            ):
+                continue
+            backlog_values = {
+                str(event.get("backlog_id") or "").strip(),
+                *_qa_post_merge_deep_text_values(event, {"backlog_id"}),
+            }
+            backlog_values = {item for item in backlog_values if item}
+            if backlog_values != {backlog_id}:
+                continue
+            task_values = {
+                str(event.get("task_id") or "").strip(),
+                *_qa_post_merge_deep_text_values(
+                    event,
+                    {
+                        "task_id",
+                        "worker_task_id",
+                        "child_task_id",
+                        "stage_task_id",
+                    },
+                ),
+            }
+            task_values = {item for item in task_values if item}
+            if task_id not in task_values or not task_values.issubset(
+                allowed_task_ids
+            ):
+                continue
+            runtime_context_values = _qa_post_merge_deep_text_values(
+                event,
+                {"runtime_context_id"},
+            )
+            if runtime_context_values != {runtime_context_id}:
+                continue
+            qa_event_refs = _qa_post_merge_deep_text_values(
+                event,
+                {"qa_event_ref"},
+            )
+            if qa_event["event_ref"] not in qa_event_refs:
+                continue
+            candidate_claims = _qa_post_merge_deep_text_values(
+                event,
+                {
+                    "candidate_commit_sha",
+                    "branch_head",
+                },
+            )
+            candidate_commits = {
+                _qa_post_merge_resolve_commit(canonical_project_root, item)
+                for item in candidate_claims
+            }
+            candidate_commits.discard("")
+            if candidate_commits != {candidate_commit}:
+                continue
+            merge_claims = {
+                str(event.get("commit_sha") or "").strip().lower(),
+                *_qa_post_merge_deep_text_values(
+                    event,
+                    {
+                        "merge_commit",
+                        "target_head_after_merge",
+                    },
+                ),
+            }
+            merge_claims = {item for item in merge_claims if item}
+            merge_commits = {
+                _qa_post_merge_resolve_commit(canonical_project_root, item)
+                for item in merge_claims
+            }
+            merge_commits.discard("")
+            if merge_commits != {merged_commit}:
+                continue
+            verified_provenance = {
+                "schema_version": "qa_exact_candidate.post_merge_provenance.v1",
+                "verified": True,
+                "source": "task_timeline.live_merge+git_ancestry",
+                "trace_id": trace_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "runtime_context_id": runtime_context_id,
+                "candidate_commit_sha": candidate_commit,
+                "merged_commit_sha": merged_commit,
+                "qa_event_ref": qa_event["event_ref"],
+                "merge_event_ref": f"timeline:{event_id}",
+                "ordered_after_qa": True,
+                "candidate_is_ancestor": True,
+            }
+            break
+        if verified_provenance:
+            break
+
+    if not verified_provenance:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "canonical_head_commit",
+                "expected": (
+                    "task/runtime-context-scoped durable observer live_merge "
+                    "ordered after accepted QA and containing the exact candidate"
+                ),
+                "actual": canonical_head_commit,
+            }
+        )
+    return verified_provenance, mismatches
+
+
 def _qa_reverify_candidate_trace_context(
     conn,
     *,
@@ -8209,17 +8586,19 @@ def _qa_reverify_candidate_trace_context(
                     }
                 )
         elif current_canonical_head != review_context["candidate_commit_sha"]:
-            mismatches.append(
-                {
-                    "trace_id": trace_id,
-                    "field": "canonical_head_commit",
-                    "expected": (
-                        f"{stored_canonical_head}|"
-                        f"{review_context['candidate_commit_sha']}"
-                    ),
-                    "actual": current_canonical_head,
-                }
+            _post_merge_provenance, post_merge_mismatches = (
+                _qa_exact_candidate_post_merge_provenance(
+                    conn,
+                    project_id=project_id,
+                    row=row,
+                    canonical_project_root=Path(canonical_root),
+                    candidate_commit_sha=review_context[
+                        "candidate_commit_sha"
+                    ],
+                    canonical_head_commit=current_canonical_head,
+                )
             )
+            mismatches.extend(post_merge_mismatches)
         return review_context, mismatches
 
     if review_context.get("graph_basis") != "canonical_base_plus_candidate_diff":
