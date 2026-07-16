@@ -6723,9 +6723,11 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
 
 def _current_full_reconcile_route_evidence(
     auth: Mapping[str, Any],
+    *,
+    runtime_context_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     scope = auth.get("route_token_scope")
-    return {
+    evidence = {
         "schema_version": "graph_current_full_reconcile.route_evidence.v1",
         "authenticated_role": str(auth.get("role") or "").strip(),
         "authentication_source": str(
@@ -6740,6 +6742,39 @@ def _current_full_reconcile_route_evidence(
         "raw_route_token_persisted": False,
         "protected_action": "graph_current_full_reconcile",
     }
+    canonical_scope = {
+        key: str((runtime_context_scope or {}).get(key) or "").strip()
+        for key in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+        )
+        if str((runtime_context_scope or {}).get(key) or "").strip()
+    }
+    if canonical_scope:
+        evidence.update(
+            {
+                key: value
+                for key, value in canonical_scope.items()
+                if key
+                in {
+                    "backlog_id",
+                    "task_id",
+                    "parent_task_id",
+                    "runtime_context_id",
+                    "merge_queue_id",
+                }
+            }
+        )
+        evidence["runtime_context_scope"] = {
+            **canonical_scope,
+            "source": "parallel_branch_runtime_context",
+            "server_derived": True,
+        }
+    return evidence
 
 
 def _require_graph_governance_mf_subagent(ctx: RequestContext, conn, action: str) -> dict:
@@ -32733,6 +32768,150 @@ def _contract_timeline_scope_from_graph_body(body: Mapping[str, Any]) -> dict[st
     }
 
 
+def _current_full_reconcile_runtime_context_scope(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    auth: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve current-full runtime provenance from persisted branch identity."""
+
+    body_scope = _contract_timeline_scope_from_graph_body(body)
+    route_scope = (
+        auth.get("route_token_scope")
+        if isinstance(auth.get("route_token_scope"), Mapping)
+        else {}
+    )
+    backlog_id = str(
+        route_scope.get("backlog_id") or body_scope.get("backlog_id") or ""
+    ).strip()
+    task_id = str(
+        route_scope.get("task_id") or body_scope.get("task_id") or ""
+    ).strip()
+    runtime_context_claims = {
+        str(candidate.get("runtime_context_id") or "").strip()
+        for candidate in (
+            body,
+            body.get("evidence")
+            if isinstance(body.get("evidence"), Mapping)
+            else {},
+        )
+        if str(candidate.get("runtime_context_id") or "").strip()
+    }
+    if len(runtime_context_claims) > 1:
+        raise GovernanceError(
+            "current_full_reconcile_runtime_context_scope_conflict",
+            "current-full reconcile received conflicting runtime_context_id claims",
+            422,
+            {
+                "runtime_context_id_claim_count": len(runtime_context_claims),
+                "fail_closed": True,
+            },
+        )
+    claimed_runtime_context_id = (
+        next(iter(runtime_context_claims)) if runtime_context_claims else ""
+    )
+    merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+    if not task_id:
+        if claimed_runtime_context_id:
+            raise GovernanceError(
+                "current_full_reconcile_runtime_context_scope_required",
+                "runtime-context-bound current-full reconcile requires a task_id",
+                422,
+                {
+                    "runtime_context_id_claimed": bool(
+                        claimed_runtime_context_id
+                    ),
+                    "fail_closed": True,
+                },
+            )
+        return {}
+
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        runtime_context_id_for_branch_context,
+    )
+
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        if claimed_runtime_context_id or (backlog_id and merge_queue_id):
+            raise GovernanceError(
+                "current_full_reconcile_runtime_context_not_found",
+                "contract-bound current-full reconcile task has no persisted branch runtime context",
+                409,
+                {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "runtime_context_id_claimed": bool(
+                        claimed_runtime_context_id
+                    ),
+                    "merge_queue_id": merge_queue_id,
+                    "fail_closed": True,
+                },
+            )
+        return {}
+
+    canonical_runtime_context_id = runtime_context_id_for_branch_context(context)
+    canonical_scope = {
+        "project_id": project_id,
+        "backlog_id": str(getattr(context, "backlog_id", "") or "").strip(),
+        "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "parent_task_id": str(
+            getattr(context, "parent_task_id", "")
+            or getattr(context, "root_task_id", "")
+            or ""
+        ).strip(),
+        "runtime_context_id": canonical_runtime_context_id,
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+    }
+    mismatches: dict[str, dict[str, str]] = {}
+    requested_values = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "runtime_context_id": claimed_runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+    }
+    for field, requested in requested_values.items():
+        canonical = canonical_scope.get(field, "")
+        if requested and requested != canonical:
+            mismatches[field] = {
+                "expected": canonical,
+                "actual": requested,
+            }
+    if not canonical_scope["backlog_id"]:
+        mismatches["backlog_id"] = {
+            "expected": "<persisted branch runtime backlog_id>",
+            "actual": "",
+        }
+    if not canonical_runtime_context_id:
+        mismatches["runtime_context_id"] = {
+            "expected": "<persisted canonical runtime_context_id>",
+            "actual": "",
+        }
+    if mismatches:
+        raise GovernanceError(
+            "current_full_reconcile_runtime_context_scope_mismatch",
+            "current-full reconcile scope does not match the persisted branch runtime context",
+            409,
+            {
+                "project_id": project_id,
+                "task_id": task_id,
+                "scope_mismatches": mismatches,
+                "source": "parallel_branch_runtime_context",
+                "fail_closed": True,
+            },
+        )
+    return {
+        **canonical_scope,
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
+
+
 def _record_pending_scope_reconcile_contract_event(
     conn,
     *,
@@ -32740,10 +32919,29 @@ def _record_pending_scope_reconcile_contract_event(
     body: Mapping[str, Any],
     result: Mapping[str, Any],
     target_commit_sha: str,
+    runtime_context_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(result, Mapping) or result.get("ok") is False:
         return {}
     scope = _contract_timeline_scope_from_graph_body(body)
+    canonical_scope = {
+        key: str((runtime_context_scope or {}).get(key) or "").strip()
+        for key in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+        )
+        if str((runtime_context_scope or {}).get(key) or "").strip()
+    }
+    if canonical_scope:
+        scope["backlog_id"] = canonical_scope.get(
+            "backlog_id",
+            scope["backlog_id"],
+        )
+        scope["task_id"] = canonical_scope.get("task_id", scope["task_id"])
     if not scope["backlog_id"]:
         return {}
     from . import task_timeline
@@ -32842,6 +33040,29 @@ def _record_pending_scope_reconcile_contract_event(
                 current_full
                 and canonical_head_verified
                 and active_snapshot_verified
+            ),
+            **{
+                key: value
+                for key, value in canonical_scope.items()
+                if key
+                in {
+                    "backlog_id",
+                    "task_id",
+                    "parent_task_id",
+                    "runtime_context_id",
+                    "merge_queue_id",
+                }
+            },
+            **(
+                {
+                    "runtime_context_scope": {
+                        **canonical_scope,
+                        "source": "parallel_branch_runtime_context",
+                        "server_derived": True,
+                    }
+                }
+                if canonical_scope
+                else {}
             ),
             "result_status": result.get("status") or result.get("snapshot_status") or "",
             "graph_reconcile_result": {
@@ -33116,6 +33337,12 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
             }
 
+        runtime_context_scope = _current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body=body,
+            auth=current_full_auth,
+        )
         semantic_use_ai = _semantic_use_ai_from_body(body)
         semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
         activate_requested = bool(body.get("activate", True))
@@ -33243,6 +33470,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 body=body,
                 result=result,
                 target_commit_sha=target_commit,
+                runtime_context_scope=runtime_context_scope,
             )
             if timeline_event:
                 result["timeline_event_recorded"] = {
@@ -33266,8 +33494,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     request_id=str(ctx.request_id),
                     request_started_at=request_started_at,
                     route_evidence=_current_full_reconcile_route_evidence(
-                        current_full_auth
+                        current_full_auth,
+                        runtime_context_scope=runtime_context_scope,
                     ),
+                    runtime_context_scope=runtime_context_scope,
                     reconcile_event_id=int(timeline_event.get("id") or 0),
                     reconcile_event_created_at=str(
                         timeline_event.get("created_at") or ""
@@ -33275,6 +33505,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     marker_created_at=_utc_now(),
                 )
                 result["current_full_reconcile_provenance"] = provenance
+            if runtime_context_scope:
+                result["current_full_reconcile_runtime_context_scope"] = dict(
+                    runtime_context_scope
+                )
         conn.commit()
         return 201, result
     finally:

@@ -2047,7 +2047,23 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
     head = "d" * 40
     backlog_id = "AC-PROTECTED-CURRENT-FULL-PROVENANCE"
     task_id = "cex-protected-current-full-provenance"
+    parent_task_id = "cex-protected-current-full-parent"
+    runtime_context_id = "mfrctx-protected-current-full"
     snapshot_id = "full-protected-current-full-provenance"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id=parent_task_id,
+            branch_ref="refs/heads/codex/protected-current-full",
+            status="merged",
+            target_head_commit=head,
+        ),
+        now_iso="2026-07-11T00:59:00Z",
+    )
     merge_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -2111,6 +2127,23 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
     assert provenance["snapshot_id"] == snapshot_id
     assert provenance["target_commit_sha"] == head
     assert provenance["route_evidence"]["raw_route_token_persisted"] is False
+    assert provenance["route_evidence"]["runtime_context_id"] == (
+        runtime_context_id
+    )
+    assert provenance["route_evidence"]["task_id"] == task_id
+    assert provenance["route_evidence"]["backlog_id"] == backlog_id
+    assert provenance["runtime_context_scope"] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+    }
+    assert provenance["marker"]["runtime_context_scope"] == {
+        **provenance["runtime_context_scope"],
+        "source": "parallel_branch_runtime_context",
+        "server_derived": True,
+    }
 
     reconcile_event = next(
         event
@@ -2122,6 +2155,16 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
         )
         if int(event["id"]) == int(provenance["reconcile_event_id"])
     )
+    assert reconcile_event["payload"]["runtime_context_id"] == (
+        runtime_context_id
+    )
+    assert reconcile_event["payload"]["task_id"] == task_id
+    assert reconcile_event["payload"]["backlog_id"] == backlog_id
+    reconcile_scope = server._contract_runtime_projection_timeline_scope_values(
+        reconcile_event
+    )
+    assert reconcile_scope["task_ids"] == [task_id]
+    assert reconcile_scope["runtime_context_ids"] == [runtime_context_id]
     state = store.current_full_reconcile_state(
         conn,
         PID,
@@ -2130,9 +2173,14 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
         merge_event_created_at=str(merge_event["created_at"]),
         reconcile_event_id=int(reconcile_event["id"]),
         reconcile_event_created_at=str(reconcile_event["created_at"]),
+        expected_task_id=task_id,
+        expected_runtime_context_id=runtime_context_id,
     )
     assert state["provenance_verified"] is True
     assert state["durable_order_verified"] is True
+    assert state["runtime_context_scope_link_verified"] is True
+    assert state["task_scope_verified"] is True
+    assert state["runtime_context_scope_verified"] is True
     assert state["db_verified"] is True
 
     authority = server._contract_runtime_current_full_reconcile_authority_from_merge(
@@ -2148,7 +2196,7 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
             "merge_source_ref": f"timeline:{merge_event['id']}",
             "merge_event_id": int(merge_event["id"]),
             "merge_event_created_at": str(merge_event["created_at"]),
-            "runtime_context_id": "mfrctx-protected-current-full",
+            "runtime_context_id": runtime_context_id,
             "task_id": task_id,
         },
         reconcile={
@@ -2157,12 +2205,91 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
             "reconcile_event_id": int(reconcile_event["id"]),
             "reconcile_event_created_at": str(reconcile_event["created_at"]),
             "reconcile_task_id": task_id,
-            "reconcile_runtime_context_id": "mfrctx-protected-current-full",
+            "reconcile_runtime_context_id": runtime_context_id,
         },
     )
     assert authority["db_verified"] is True
     assert authority["live_verified"] is True
     assert authority["graph_reconciled"] is True
+
+
+def test_current_full_reconcile_runtime_context_mismatch_fails_before_reconcile(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head = "f" * 40
+    backlog_id = "AC-CURRENT-FULL-RUNTIME-SCOPE-MISMATCH"
+    task_id = "mf-current-full-runtime-scope-mismatch"
+    runtime_context_id = "mfrctx-current-full-runtime-scope-canonical"
+    merge_queue_id = "mq-current-full-runtime-scope"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            backlog_id=backlog_id,
+            parent_task_id="cex-current-full-runtime-scope",
+            branch_ref="refs/heads/codex/current-full-runtime-scope",
+            status="merged",
+            target_head_commit=head,
+            merge_queue_id=merge_queue_id,
+        ),
+        now_iso="2026-07-11T03:00:00Z",
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: head)
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+    reconcile_calls: list[dict[str, Any]] = []
+
+    def fake_reconcile(_conn, project_id, root, **kwargs):
+        reconcile_calls.append({"project_id": project_id, "root": root, **kwargs})
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    with pytest.raises(GovernanceError) as exc_info:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "runtime_context_id": "mfrctx-caller-forged",
+                    "merge_queue_id": merge_queue_id,
+                    "target_commit_sha": head,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+    assert exc_info.value.code == (
+        "current_full_reconcile_runtime_context_scope_mismatch"
+    )
+    assert reconcile_calls == []
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    ) == []
+    assert conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM graph_current_full_reconcile_provenance
+        WHERE project_id = ?
+        """,
+        (PID,),
+    ).fetchone()[0] == 0
 
 
 def test_current_full_reconcile_accepts_observer_route_token_proof(
