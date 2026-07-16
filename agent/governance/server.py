@@ -52610,6 +52610,16 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "mf_batch_parallel_enter",
     "task_timeline_append",
 )
+_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
+    "graph_query",
+    "observer_direct_mutation_exception",
+    "task_timeline_append",
+    "run_tests",
+    "git_diff",
+    "graph_current_full_reconcile",
+    "backlog_close",
+    "merge",
+)
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
 _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
     "contract_runtime_current",
@@ -54073,6 +54083,38 @@ def _onboard_contract_route_guide(
             "before mutation, then edit only approved row-scoped files and "
             "record tests"
         ),
+        "full_round_route_issue": {
+            "schema_version": (
+                "onboard_contract.operator_supervised_direct_main."
+                "full_round_route_issue.v1"
+            ),
+            "issue_on_first_route": True,
+            "allowed_actions": list(
+                _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "single_scoped_issue_covers_full_round": True,
+            "mid_round_remint_expected": False,
+            "authority_change": False,
+        },
+        "heartbeat_before_long_actions": {
+            "schema_version": (
+                "onboard_contract.operator_supervised_direct_main."
+                "heartbeat_advisory.v1"
+            ),
+            "mcp_tool": "observer_session_heartbeat",
+            "heartbeat_interval_sec": observer_session.HEARTBEAT_INTERVAL_SEC,
+            "typical_round_may_exceed_heartbeat_interval": True,
+            "advisory_only": True,
+            "before_actions": [
+                "graph_current_full_reconcile",
+                "close_ready",
+                "backlog_close",
+            ],
+            "instruction": (
+                "Heartbeat immediately before reconcile or protected close when "
+                "the round has reached or is near the heartbeat interval."
+            ),
+        },
         "close_satisfying_evidence_template": {
             "schema_version": (
                 "onboard_route_guide.parentless_direct_close_evidence_template.v1"
@@ -54667,8 +54709,16 @@ def _onboard_contract_agent_guidance(
         requested_role = "worker"
     if requested_role not in {"observer", "worker", "qa"}:
         requested_role = "observer"
+    direct_main_round = (
+        str(next_legal_action.get("action") or "").strip()
+        == "observer_direct_mutation_exception"
+    )
     allowed_actions = _observer_route_context_issue_allowed_actions(
-        list(_ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS)
+        list(
+            _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            if direct_main_round
+            else _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS
+        )
     )
     issue_payload = {
         "project_id": project_id,

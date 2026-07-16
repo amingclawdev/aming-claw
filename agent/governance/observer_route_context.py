@@ -143,7 +143,7 @@ REQUIRED_EVIDENCE: tuple[str, ...] = (
     "dirty_scope_check",
 )
 
-ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v1"
+ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v2"
 
 # These observer-owned actions are governance/evidence/reconcile/close-control
 # operations. A route token scoped only to these actions must be copy-safe for
@@ -197,6 +197,16 @@ IMPLEMENTATION_OR_MERGE_ACTIONS: tuple[str, ...] = (
     "merge_queue",
     "merge_execute",
     "merge_result",
+    "merge",
+)
+
+# These actions are local steps in an explicitly selected, operator-supervised
+# direct-main round.  They are *not* observer-admin actions globally: merge must
+# continue to require worker/merge lanes unless the same route scope also carries
+# ``observer_direct_mutation_exception``.
+OBSERVER_DIRECT_MAIN_LOCAL_ROUND_ACTIONS: tuple[str, ...] = (
+    "run_tests",
+    "git_diff",
     "merge",
 )
 
@@ -446,10 +456,27 @@ def _route_lane_requirements_for_actions(
         _gate_normalized_action(action)
         for action in IMPLEMENTATION_OR_MERGE_ACTIONS
     }
-    unknown_actions = sorted(
+    direct_main_round = "observer_direct_mutation_exception" in action_set
+    direct_main_local_round_actions = {
+        _gate_normalized_action(action)
+        for action in OBSERVER_DIRECT_MAIN_LOCAL_ROUND_ACTIONS
+    }
+    direct_main_local_markers = (
+        sorted(action_set & direct_main_local_round_actions)
+        if direct_main_round
+        else []
+    )
+    unknown_action_set = (
         action_set - admin_close_evidence_actions - implementation_or_merge_actions
     )
-    implementation_markers = sorted(action_set & implementation_or_merge_actions)
+    implementation_marker_set = action_set & implementation_or_merge_actions
+    if direct_main_round:
+        unknown_action_set -= direct_main_local_round_actions
+        # ``merge`` is direct-main-local only when the explicit direct-main
+        # mutation-exception marker is present in the same scoped route.
+        implementation_marker_set -= direct_main_local_round_actions
+    unknown_actions = sorted(unknown_action_set)
+    implementation_markers = sorted(implementation_marker_set)
     admin_close_evidence_markers = sorted(
         action_set & admin_close_evidence_actions
     )
@@ -463,6 +490,15 @@ def _route_lane_requirements_for_actions(
             "This route action scope can dispatch implementation or merge/close "
             "work; bounded mf_sub implementation and independent verification "
             "lane requirements remain in force."
+        )
+    elif direct_main_round:
+        classification = "observer_direct_main_full_round"
+        required_lanes = [dict(lane) for lane in OBSERVER_DIRECT_MAIN_REQUIRED_LANES]
+        required_evidence = list(OBSERVER_DIRECT_MAIN_REQUIRED_EVIDENCE)
+        copy_safe_guidance = (
+            "This route action scope explicitly selects the operator-supervised "
+            "direct-main round; its bounded local test, diff, reconcile, merge, "
+            "and close steps do not imply a fresh mf_sub implementation lane."
         )
     else:
         classification = "observer_admin_close_evidence_only"
@@ -485,6 +521,8 @@ def _route_lane_requirements_for_actions(
             "direct_main_or_reconcile_actions": admin_close_evidence_markers,
             "admin_close_or_evidence_actions": admin_close_evidence_markers,
             "implementation_or_merge_actions": implementation_markers,
+            "direct_main_full_round": direct_main_round,
+            "direct_main_local_actions": direct_main_local_markers,
             "unknown_actions": unknown_actions,
             "requires_mf_sub_implementation_lane": requires_worker_lane,
             "requires_bounded_worker_implementation": requires_worker_lane,

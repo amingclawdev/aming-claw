@@ -38065,6 +38065,28 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert direct_main["requires_operator_approval"] is True
     assert "operator_approval_ref" in direct_main["required_identity"]
     assert "dirty_scope_exact_match" in direct_main["required_evidence"]
+    full_round_issue = direct_main["full_round_route_issue"]
+    assert full_round_issue["issue_on_first_route"] is True
+    assert full_round_issue["single_scoped_issue_covers_full_round"] is True
+    assert full_round_issue["mid_round_remint_expected"] is False
+    assert {
+        "observer_direct_mutation_exception",
+        "task_timeline_append",
+        "run_tests",
+        "git_diff",
+        "graph_current_full_reconcile",
+        "backlog_close",
+        "merge",
+    }.issubset(set(full_round_issue["allowed_actions"]))
+    heartbeat = direct_main["heartbeat_before_long_actions"]
+    assert heartbeat["heartbeat_interval_sec"] == 300
+    assert heartbeat["typical_round_may_exceed_heartbeat_interval"] is True
+    assert heartbeat["advisory_only"] is True
+    assert heartbeat["before_actions"] == [
+        "graph_current_full_reconcile",
+        "close_ready",
+        "backlog_close",
+    ]
     assert direct_main["raw_operator_token_required"] is False
     assert direct_main["raw_route_token_exposed"] is False
     assert route_guide["role_entries"]["worker"]["entrypoint"] == (
@@ -39375,6 +39397,12 @@ def test_onboard_route_guide_direct_main_complete_projection_points_to_exception
     assert next_action["contract_complete_runtime_no_remaining_line"] is True
     assert "graph_query first" in next_action["next_step"]
     assert "enter the selected successor interface" not in next_action["next_step"]
+    issue_payload = result["agent_onboard_guidance"]["route_token_issue"][
+        "observer_route_context_issue_payload"
+    ]
+    assert set(issue_payload["allowed_actions"]) == set(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
 
 
 @pytest.mark.parametrize(
@@ -40923,7 +40951,8 @@ def test_direct_main_bypass_route_actions_are_observer_copy_safe():
 
     scope = issued["route_action_scope"]
     assert issued["requires_mf_sub_implementation_lane"] is False
-    assert scope["classification"] == "observer_admin_close_evidence_only"
+    assert scope["classification"] == "observer_direct_main_full_round"
+    assert scope["direct_main_full_round"] is True
     assert scope["unknown_actions"] == []
     assert scope["implementation_or_merge_actions"] == []
     assert {

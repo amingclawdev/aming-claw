@@ -395,6 +395,41 @@ def test_clean_caller_supplied_allowed_actions_accepted():
     assert set(token["allowed_actions"]) == {"task_timeline_append", "backlog_close"}
 
 
+def test_direct_main_full_round_actions_do_not_invent_parallel_worker_lane():
+    token = _token(
+        allowed_actions=[
+            "graph_query",
+            "observer_direct_mutation_exception",
+            "task_timeline_append",
+            "run_tests",
+            "git_diff",
+            "graph_current_full_reconcile",
+            "backlog_close",
+            "merge",
+        ]
+    )
+
+    scope = token["route_action_scope"]
+    assert scope["classification"] == "observer_direct_main_full_round"
+    assert scope["direct_main_full_round"] is True
+    assert scope["direct_main_local_actions"] == ["git_diff", "merge", "run_tests"]
+    assert scope["implementation_or_merge_actions"] == []
+    assert scope["unknown_actions"] == []
+    assert scope["requires_mf_sub_implementation_lane"] is False
+    assert all(lane["role"] != "mf_sub" for lane in token["required_lanes"])
+
+
+def test_merge_without_direct_main_marker_still_requires_worker_lanes():
+    token = _token(allowed_actions=["task_timeline_append", "merge"])
+
+    scope = token["route_action_scope"]
+    assert scope["classification"] == "bounded_worker_implementation_or_merge"
+    assert scope["direct_main_full_round"] is False
+    assert scope["implementation_or_merge_actions"] == ["merge"]
+    assert scope["requires_mf_sub_implementation_lane"] is True
+    assert any(lane["role"] == "mf_sub" for lane in token["required_lanes"])
+
+
 # --- AC4 (HOTFIX): normalize caller-supplied actions to match the gate -------
 #
 # The gate (``_route_action_allowed`` / ``_normalized_action``) normalizes both
