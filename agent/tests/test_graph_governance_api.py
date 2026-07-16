@@ -17136,9 +17136,18 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
 
     assert live["ok"] is True
     assert live["executed"] is True
-    assert live["merge_commit"]
+    assert len(live["merge_commit"]) == 40
+    assert all(char in "0123456789abcdef" for char in live["merge_commit"])
+    assert live["merge_commit_canonicalized"] is True
+    assert live["merge_commit_source"] == "server_git_rev_parse"
     assert live["recorded"]["queue_item"]["status"] == "merged"
+    assert live["recorded"]["queue_item"]["merge_commit"] == live["merge_commit"]
+    assert (
+        live["recorded"]["queue_item"]["target_head_after_merge"]
+        == live["merge_commit"]
+    )
     assert live["recorded"]["context"]["status"] == "merged"
+    assert live["recorded"]["context"]["target_head_commit"] == live["merge_commit"]
     assert live["recorded"]["context"]["fence_token"] == "redacted"
     assert live["recorded"]["context"]["fence_token_hash"] == _fake_sha(
         "fence-execute-current"
@@ -17177,6 +17186,15 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     recorded_live_merge = next(
         event for event in timeline if event["event_kind"] == "live_merge"
     )
+    assert recorded_live_merge["commit_sha"] == live["merge_commit"]
+    assert (
+        recorded_live_merge["payload"]["merge_commit"]
+        == live["merge_commit"]
+    )
+    assert (
+        recorded_live_merge["payload"]["target_head_after_merge"]
+        == live["merge_commit"]
+    )
     recorded_test_evidence = recorded_live_merge["payload"]["qa_evidence"][
         "request_evidence"
     ]["test_evidence"]
@@ -17192,6 +17210,130 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         capture_output=True,
         text=True,
     ).stdout.find("Chain-Source-Stage: merge") != -1
+
+
+def test_parallel_branch_canonical_live_merge_identity_resolves_short_and_full_sha(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    full_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    short_identity = server._parallel_branch_canonical_live_merge_identity(
+        repo,
+        merge_commit=full_commit[:8],
+        target_head_before_merge="",
+        target_head_after_merge=full_commit[:8],
+        target_ref="main",
+    )
+    full_identity = server._parallel_branch_canonical_live_merge_identity(
+        repo,
+        merge_commit=full_commit,
+        target_head_before_merge="",
+        target_head_after_merge=full_commit,
+        target_ref="main",
+    )
+
+    assert short_identity["merge_commit"] == full_commit
+    assert short_identity["target_head_after_merge"] == full_commit
+    assert short_identity["current_target_head"] == full_commit
+    assert full_identity["merge_commit"] == full_commit
+    assert full_identity["target_head_after_merge"] == full_commit
+
+
+def test_parallel_branch_canonical_live_merge_identity_rejects_invalid_and_ambiguous_sha(
+    tmp_path,
+    monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+
+    with pytest.raises(GovernanceError) as invalid:
+        server._parallel_branch_canonical_live_merge_identity(
+            repo,
+            merge_commit="not-a-sha",
+            target_head_before_merge="",
+            target_head_after_merge="not-a-sha",
+            target_ref="main",
+        )
+    assert invalid.value.code == "parallel_merge_commit_invalid"
+
+    original_git_output = server._git_output
+
+    def ambiguous_git_output(project_root, args, *, timeout=5):
+        if args[:2] == ["rev-parse", "--verify"] and str(args[2]).startswith(
+            "abcdef0"
+        ):
+            return ""
+        return original_git_output(project_root, args, timeout=timeout)
+
+    monkeypatch.setattr(server, "_git_output", ambiguous_git_output)
+    with pytest.raises(GovernanceError) as ambiguous:
+        server._parallel_branch_canonical_live_merge_identity(
+            repo,
+            merge_commit="abcdef0",
+            target_head_before_merge="",
+            target_head_after_merge="abcdef0",
+            target_ref="main",
+        )
+    assert ambiguous.value.code == "parallel_merge_commit_unresolved"
+
+
+def test_parallel_branch_canonical_live_merge_identity_rejects_non_ancestor(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "--orphan", "unrelated-merge"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "rm", "-rf", "."],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated merge"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    unrelated_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(GovernanceError) as non_ancestor:
+        server._parallel_branch_canonical_live_merge_identity(
+            repo,
+            merge_commit=unrelated_commit[:8],
+            target_head_before_merge="",
+            target_head_after_merge=unrelated_commit[:8],
+            target_ref="main",
+        )
+    assert non_ancestor.value.code == "parallel_merge_commit_non_ancestor"
 
 
 def test_parallel_branch_merge_execute_accepts_refreshed_current_target_head(conn, tmp_path):
@@ -17564,7 +17706,16 @@ def test_parallel_branch_merge_execute_accepts_parent_route_for_reclaimed_contex
     )
 
 
-def test_parallel_branch_merge_result_route_records_with_fence(conn):
+def test_parallel_branch_merge_result_route_records_with_fence(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    merge_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    short_merge_commit = merge_commit[:8]
     queue_id = "mergeq-api-result"
     upsert_branch_context(
         conn,
@@ -17575,7 +17726,7 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
             branch_ref="refs/heads/codex/result-task",
             status="merge_ready",
             fence_token="fence-result-current",
-            target_head_commit="target-before",
+            target_head_commit=merge_commit,
             merge_queue_id=queue_id,
             merge_preview_id="preview-result",
         ),
@@ -17592,10 +17743,10 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
                 branch_ref="refs/heads/codex/result-task",
                 queue_index=1,
                 status="merge_ready",
-                target_ref="refs/heads/main",
+                target_ref="main",
                 branch_head="head-result",
-                validated_target_head="target-before",
-                current_target_head="target-before",
+                validated_target_head=merge_commit,
+                current_target_head=merge_commit,
                 merge_preview_id="preview-result",
                 snapshot_id="scope-result",
                 projection_id="semproj-result",
@@ -17610,11 +17761,13 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
                 {"project_id": PID},
                 method="POST",
                 body={
+                    "repo_root_path": str(repo),
                     "merge_queue_id": queue_id,
                     "task_id": "result-task",
                     "status": "merged",
-                    "merge_commit": "merge-result",
-                    "target_head_after_merge": "target-after",
+                    "merge_commit": short_merge_commit,
+                    "target_head_after_merge": short_merge_commit,
+                    "target_ref": "main",
                     "fence_token": "fence-stale",
                     "route_waiver": _route_waiver("merge_result", task_id="result-task"),
                 },
@@ -17626,12 +17779,14 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
             {"project_id": PID},
             method="POST",
             body={
+                "repo_root_path": str(repo),
                 "merge_queue_id": queue_id,
                 "task_id": "result-task",
                 "status": "merged",
-                "merge_commit": "merge-result",
-                "target_head_before_merge": "target-before",
-                "target_head_after_merge": "target-after",
+                "merge_commit": short_merge_commit,
+                "target_head_before_merge": short_merge_commit,
+                "target_head_after_merge": short_merge_commit,
+                "target_ref": "main",
                 "fence_token": "fence-result-current",
                 "route_waiver": _route_waiver("merge_result", task_id="result-task"),
                 "now_iso": "2026-05-17T08:26:00Z",
@@ -17640,16 +17795,32 @@ def test_parallel_branch_merge_result_route_records_with_fence(conn):
     )
 
     assert result["ok"] is True
+    assert result["merge_commit_canonicalized"] is True
+    assert result["merge_commit_source"] == "server_git_rev_parse"
     assert result["queue_item"]["status"] == "merged"
-    assert result["queue_item"]["merge_commit"] == "merge-result"
+    assert result["queue_item"]["merge_commit"] == merge_commit
+    assert result["queue_item"]["target_head_before_merge"] == merge_commit
+    assert result["queue_item"]["target_head_after_merge"] == merge_commit
     assert result["context"]["status"] == "merged"
-    assert result["context"]["target_head_commit"] == "target-after"
+    assert result["context"]["target_head_commit"] == merge_commit
     row = result["decision"]["rows"][0]
     assert row["queue_state"] == "merged"
     assert row["target_graph_activation_allowed"] is True
 
 
-def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_without_raw_fence(conn):
+def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_without_raw_fence(
+    conn,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    merge_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    short_merge_commit = merge_commit[:8]
     parent_task_id = "parent-close-ready-result"
     child_task_id = f"{parent_task_id}:row:1"
     queue_id = "mergeq-api-result-parent-route"
@@ -17678,7 +17849,7 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
             branch_ref="refs/heads/codex/result-parent-route",
             status="reclaimable",
             fence_token="fence-result-reclaimed",
-            target_head_commit="target-before-parent-route",
+            target_head_commit=merge_commit,
             merge_queue_id=queue_id,
             merge_preview_id="preview-parent-route",
         ),
@@ -17695,10 +17866,10 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
                 branch_ref="refs/heads/codex/result-parent-route",
                 queue_index=1,
                 status="planned",
-                target_ref="refs/heads/main",
+                target_ref="main",
                 branch_head="head-parent-route",
-                validated_target_head="target-before-parent-route",
-                current_target_head="target-before-parent-route",
+                validated_target_head=merge_commit,
+                current_target_head=merge_commit,
                 merge_preview_id="preview-parent-route",
                 snapshot_id="scope-parent-route",
                 projection_id="semproj-parent-route",
@@ -17714,12 +17885,14 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
                 {"project_id": PID},
                 method="POST",
                 body={
+                    "repo_root_path": str(repo),
                     "merge_queue_id": queue_id,
                     "queue_item_id": "item-result-parent-route",
                     "task_id": child_task_id,
                     "status": "merged",
-                    "merge_commit": "merge-parent-route",
-                    "target_head_after_merge": "target-after-parent-route",
+                    "merge_commit": short_merge_commit,
+                    "target_head_after_merge": short_merge_commit,
+                    "target_ref": "main",
                     "route_token_ref": issued["route_token_ref"],
                 },
             )
@@ -17731,13 +17904,15 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
                 {"project_id": PID},
                 method="POST",
                 body={
+                    "repo_root_path": str(repo),
                     "merge_queue_id": queue_id,
                     "queue_item_id": "item-result-parent-route",
                     "task_id": child_task_id,
                     "status": "merged",
-                    "merge_commit": "merge-parent-route",
-                    "target_head_before_merge": "target-before-parent-route",
-                    "target_head_after_merge": "target-after-parent-route",
+                    "merge_commit": short_merge_commit,
+                    "target_head_before_merge": short_merge_commit,
+                    "target_head_after_merge": short_merge_commit,
+                    "target_ref": "main",
                     "fence_token": "fence-stale-parent-route",
                     "route_token_ref": issued["route_token_ref"],
                 },
@@ -17749,13 +17924,15 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
             {"project_id": PID},
             method="POST",
             body={
+                "repo_root_path": str(repo),
                 "merge_queue_id": queue_id,
                 "queue_item_id": "item-result-parent-route",
                 "task_id": child_task_id,
                 "status": "merged",
-                "merge_commit": "merge-parent-route",
-                "target_head_before_merge": "target-before-parent-route",
-                "target_head_after_merge": "target-after-parent-route",
+                "merge_commit": short_merge_commit,
+                "target_head_before_merge": short_merge_commit,
+                "target_head_after_merge": short_merge_commit,
+                "target_ref": "main",
                 "route_token_ref": issued["route_token_ref"],
                 "now_iso": "2026-05-17T08:28:00Z",
             },
@@ -17768,12 +17945,13 @@ def test_parallel_branch_merge_result_parent_route_records_reclaimed_context_wit
     assert gate["action"] == "merge_result"
     assert gate["authorized_action"] == "close_or_merge_after_evidence"
     assert gate["parent_task_scope_accepted"] is True
+    assert result["merge_commit_canonicalized"] is True
     assert result["queue_item"]["status"] == "merged"
-    assert result["queue_item"]["merge_commit"] == "merge-parent-route"
-    assert result["queue_item"]["target_head_before_merge"] == "target-before-parent-route"
-    assert result["queue_item"]["target_head_after_merge"] == "target-after-parent-route"
+    assert result["queue_item"]["merge_commit"] == merge_commit
+    assert result["queue_item"]["target_head_before_merge"] == merge_commit
+    assert result["queue_item"]["target_head_after_merge"] == merge_commit
     assert result["context"]["status"] == "merged"
-    assert result["context"]["target_head_commit"] == "target-after-parent-route"
+    assert result["context"]["target_head_commit"] == merge_commit
 
 
 def test_parallel_branch_batch_runtime_route_returns_rollback_plan(conn):

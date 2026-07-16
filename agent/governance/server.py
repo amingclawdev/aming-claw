@@ -27306,6 +27306,156 @@ def _parallel_branch_merge_qa_evidence(
     return payload
 
 
+def _parallel_branch_resolve_canonical_commit(
+    repo_root: Path,
+    commit_ref: str,
+    *,
+    field: str,
+) -> str:
+    normalized = str(commit_ref or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,64}", normalized):
+        raise GovernanceError(
+            "parallel_merge_commit_invalid",
+            f"{field} must be an available hexadecimal Git commit",
+            409,
+            {
+                "field": field,
+                "commit_ref": normalized,
+                "canonical_full_commit_required": True,
+            },
+        )
+    resolved = _git_output(
+        Path(repo_root).resolve(),
+        ["rev-parse", "--verify", f"{normalized}^{{commit}}"],
+        timeout=10,
+    ).strip().lower()
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", resolved)
+        or not resolved.startswith(normalized)
+    ):
+        raise GovernanceError(
+            "parallel_merge_commit_unresolved",
+            f"{field} did not resolve unambiguously to a full Git commit",
+            409,
+            {
+                "field": field,
+                "commit_ref": normalized,
+                "canonical_full_commit_required": True,
+            },
+        )
+    return resolved
+
+
+def _parallel_branch_require_commit_ancestor(
+    repo_root: Path,
+    ancestor_commit: str,
+    descendant_commit: str,
+    *,
+    relationship: str,
+) -> None:
+    try:
+        ancestry = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                ancestor_commit,
+                descendant_commit,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=Path(repo_root).resolve(),
+        )
+    except Exception as exc:
+        raise GovernanceError(
+            "parallel_merge_commit_ancestry_unavailable",
+            "parallel live-merge commit ancestry could not be verified",
+            409,
+            {"relationship": relationship},
+        ) from exc
+    if ancestry.returncode != 0:
+        raise GovernanceError(
+            "parallel_merge_commit_non_ancestor",
+            "parallel live-merge commit ancestry verification failed",
+            409,
+            {
+                "relationship": relationship,
+                "ancestor_commit": ancestor_commit,
+                "descendant_commit": descendant_commit,
+            },
+        )
+
+
+def _parallel_branch_canonical_live_merge_identity(
+    repo_root: Path,
+    *,
+    merge_commit: str,
+    target_head_before_merge: str,
+    target_head_after_merge: str,
+    target_ref: str,
+) -> dict[str, str]:
+    canonical_merge = _parallel_branch_resolve_canonical_commit(
+        repo_root,
+        merge_commit,
+        field="merge_commit",
+    )
+    canonical_after = _parallel_branch_resolve_canonical_commit(
+        repo_root,
+        target_head_after_merge or merge_commit,
+        field="target_head_after_merge",
+    )
+    if canonical_after != canonical_merge:
+        raise GovernanceError(
+            "parallel_merge_target_head_mismatch",
+            "target_head_after_merge must identify the canonical merge commit",
+            409,
+            {
+                "merge_commit": canonical_merge,
+                "target_head_after_merge": canonical_after,
+            },
+        )
+
+    canonical_before = ""
+    if str(target_head_before_merge or "").strip():
+        canonical_before = _parallel_branch_resolve_canonical_commit(
+            repo_root,
+            target_head_before_merge,
+            field="target_head_before_merge",
+        )
+        _parallel_branch_require_commit_ancestor(
+            repo_root,
+            canonical_before,
+            canonical_merge,
+            relationship="target_head_before_merge_to_merge_commit",
+        )
+
+    resolved_target_ref = _git_output(
+        Path(repo_root).resolve(),
+        ["rev-parse", "--verify", f"{target_ref or 'refs/heads/main'}^{{commit}}"],
+        timeout=10,
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", resolved_target_ref):
+        raise GovernanceError(
+            "parallel_merge_target_ref_unresolved",
+            "parallel live-merge target ref did not resolve to a full Git commit",
+            409,
+            {"target_ref": target_ref or "refs/heads/main"},
+        )
+    _parallel_branch_require_commit_ancestor(
+        repo_root,
+        canonical_merge,
+        resolved_target_ref,
+        relationship="merge_commit_to_current_target_ref",
+    )
+    return {
+        "merge_commit": canonical_merge,
+        "target_head_before_merge": canonical_before,
+        "target_head_after_merge": canonical_after,
+        "current_target_head": resolved_target_ref,
+    }
+
+
 def _record_parallel_branch_merge_contract_timeline_events(
     conn,
     *,
@@ -27796,6 +27946,13 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
         raise ValidationError("status is required")
 
     target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
+    repo_root = Path(
+        str(
+            ctx.body.get("repo_root_path")
+            or ctx.body.get("workspace_root")
+            or os.getcwd()
+        )
+    )
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(
@@ -27817,6 +27974,27 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 status=status,
             )
         )
+        merge_identity = {
+            "merge_commit": str(ctx.body.get("merge_commit") or ""),
+            "target_head_before_merge": str(
+                ctx.body.get("target_head_before_merge") or ""
+            ),
+            "target_head_after_merge": str(
+                ctx.body.get("target_head_after_merge") or ""
+            ),
+        }
+        if status == "merged":
+            merge_identity = _parallel_branch_canonical_live_merge_identity(
+                repo_root,
+                merge_commit=merge_identity["merge_commit"],
+                target_head_before_merge=merge_identity[
+                    "target_head_before_merge"
+                ],
+                target_head_after_merge=merge_identity[
+                    "target_head_after_merge"
+                ],
+                target_ref=target_ref,
+            )
         with sqlite_write_lock():
             recorded = record_merge_queue_result(
                 conn,
@@ -27826,9 +28004,13 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 task_id=str(ctx.body.get("task_id") or ""),
                 target_ref=target_ref,
                 status=status,
-                merge_commit=str(ctx.body.get("merge_commit") or ""),
-                target_head_before_merge=str(ctx.body.get("target_head_before_merge") or ""),
-                target_head_after_merge=str(ctx.body.get("target_head_after_merge") or ""),
+                merge_commit=merge_identity["merge_commit"],
+                target_head_before_merge=merge_identity[
+                    "target_head_before_merge"
+                ],
+                target_head_after_merge=merge_identity[
+                    "target_head_after_merge"
+                ],
                 failure_reason=str(ctx.body.get("failure_reason") or ""),
                 snapshot_id=str(ctx.body.get("snapshot_id") or ""),
                 projection_id=str(ctx.body.get("projection_id") or ""),
@@ -27844,7 +28026,7 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 current_target_head=str(
                     ctx.body.get("current_target_head")
                     or ctx.body.get("latest_target_head")
-                    or ctx.body.get("target_head_after_merge")
+                    or merge_identity["target_head_after_merge"]
                     or ""
                 ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-014"),
@@ -27854,13 +28036,17 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 project_id,
                 route_gate,
                 task_id=str(ctx.body.get("task_id") or ""),
-                commit_sha=str(ctx.body.get("merge_commit") or ""),
+                commit_sha=merge_identity["merge_commit"],
             )
             conn.commit()
         return {
             "ok": True,
             "project_id": project_id,
             "route_token_gate": route_gate,
+            "merge_commit_canonicalized": status == "merged",
+            "merge_commit_source": (
+                "server_git_rev_parse" if status == "merged" else ""
+            ),
             **recorded,
             "decision": {
                 "scenario_id": decision.scenario_id,
@@ -27883,6 +28069,7 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
     from .parallel_branch_runtime import (
         decide_persisted_merge_queue,
         execute_merge_queue_item,
+        record_merge_queue_result,
     )
 
     merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
@@ -27959,6 +28146,76 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
             )
+            if (
+                result.get("ok")
+                and result.get("executed")
+                and not result.get("dry_run")
+            ):
+                recorded = (
+                    result.get("recorded")
+                    if isinstance(result.get("recorded"), Mapping)
+                    else {}
+                )
+                queue_item = (
+                    recorded.get("queue_item")
+                    if isinstance(recorded.get("queue_item"), Mapping)
+                    else {}
+                )
+                canonical_merge = _parallel_branch_canonical_live_merge_identity(
+                    Path(repo_root),
+                    merge_commit=str(
+                        result.get("merge_commit")
+                        or queue_item.get("merge_commit")
+                        or ""
+                    ),
+                    target_head_before_merge=str(
+                        queue_item.get("target_head_before_merge") or ""
+                    ),
+                    target_head_after_merge=str(
+                        queue_item.get("target_head_after_merge")
+                        or result.get("merge_commit")
+                        or ""
+                    ),
+                    target_ref=target_ref,
+                )
+                canonical_recorded = record_merge_queue_result(
+                    conn,
+                    project_id=project_id,
+                    merge_queue_id=merge_queue_id,
+                    queue_item_id=str(
+                        queue_item.get("queue_item_id")
+                        or ctx.body.get("queue_item_id")
+                        or ""
+                    ),
+                    task_id=str(
+                        queue_item.get("task_id")
+                        or ctx.body.get("task_id")
+                        or ""
+                    ),
+                    target_ref=target_ref,
+                    status="merged",
+                    merge_commit=canonical_merge["merge_commit"],
+                    target_head_before_merge=canonical_merge[
+                        "target_head_before_merge"
+                    ],
+                    target_head_after_merge=canonical_merge[
+                        "target_head_after_merge"
+                    ],
+                    snapshot_id=str(queue_item.get("snapshot_id") or ""),
+                    projection_id=str(queue_item.get("projection_id") or ""),
+                    fence_token=str(ctx.body.get("fence_token") or ""),
+                    allow_route_gated_reclaimed_fence_without_token=(
+                        allow_reclaimed_fence
+                    ),
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                result = {
+                    **result,
+                    **canonical_merge,
+                    "recorded": canonical_recorded,
+                    "merge_commit_canonicalized": True,
+                    "merge_commit_source": "server_git_rev_parse",
+                }
             decision = decide_persisted_merge_queue(
                 conn,
                 project_id,
