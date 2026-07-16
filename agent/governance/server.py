@@ -9512,6 +9512,31 @@ def _parallel_branch_allocate_normalize_worktree_path(
     return context
 
 
+def _parallel_branch_allocate_materialized_target_project_root(context: Any) -> Any:
+    """Bind an absent/stale target root to the actual materialized worktree."""
+
+    worktree_text = str(getattr(context, "worktree_path", "") or "").strip()
+    if not worktree_text:
+        return context
+    worktree_path = Path(worktree_text).expanduser().resolve()
+
+    target_text = str(
+        getattr(context, "target_project_root", "") or ""
+    ).strip()
+    if target_text:
+        target_path = Path(target_text).expanduser()
+        if target_path.exists() and target_path.is_dir():
+            canonical_target = str(target_path.resolve())
+            if canonical_target == target_text:
+                return context
+            return replace(context, target_project_root=canonical_target)
+
+    canonical_worktree = str(worktree_path)
+    if target_text == canonical_worktree:
+        return context
+    return replace(context, target_project_root=canonical_worktree)
+
+
 def _parallel_branch_allocate_identity_mismatches(
     existing: Any,
     planned: Any,
@@ -9802,10 +9827,16 @@ def _parallel_branch_allocate_contract_revision_payload(
             "test_command",
         ),
         "branch_ref": str(body.get("branch_ref") or saved_context.get("branch_ref") or ""),
+        "target_project_root": str(
+            saved_context.get("target_project_root")
+            or body.get("target_project_root")
+            or body.get("target_graph_root")
+            or ""
+        ),
         "worktree_path": str(
-            body.get("worktree_path")
+            saved_context.get("worktree_path")
+            or body.get("worktree_path")
             or body.get("assigned_worktree")
-            or saved_context.get("worktree_path")
             or ""
         ),
         "base_commit": str(
@@ -10214,6 +10245,17 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             )
             conn.commit()
             saved = get_branch_context(conn, project_id, task_id) or saved
+            projected = _parallel_branch_allocate_materialized_target_project_root(
+                saved
+            )
+            if projected != saved:
+                with sqlite_write_lock():
+                    saved = upsert_branch_context(
+                        conn,
+                        projected,
+                        now_iso=str(ctx.body.get("now_iso") or ""),
+                    )
+                    conn.commit()
 
         if should_issue_same_owner_session_token:
             same_owner_worker_session = issue_mf_subagent_session_token(saved)
@@ -10307,6 +10349,12 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 },
                 "target_files": list(saved.target_files),
                 "owned_files": list(saved.owned_files),
+                "target_project_root": saved.target_project_root,
+                "project_root": saved.target_project_root,
+                "repo_root": saved.target_project_root,
+                "worktree_path": saved.worktree_path,
+                "assigned_worktree": saved.worktree_path,
+                "branch_ref": saved.branch_ref,
             }
             response["dispatch_timeline_event"] = _record_bounded_worker_dispatch_event(
                 conn,
@@ -69065,6 +69113,11 @@ def _record_bounded_worker_dispatch_event(
         ),
         "fence_token": _first_field("fence_token", "worker_fence_token"),
         "worktree_path": worktree_path,
+        "target_project_root": _first_field(
+            "target_project_root",
+            "project_root",
+            "repo_root",
+        ),
         "branch": branch_ref,
         "branch_ref": branch_ref,
         "base_commit": _first_field("base_commit"),

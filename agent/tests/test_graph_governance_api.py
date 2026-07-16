@@ -4235,6 +4235,130 @@ def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_m
     assert lanes[0]["graph_epoch"]["base_commit"]
 
 
+def test_parallel_branch_allocate_projects_missing_target_root_to_nested_worktree(
+    conn,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    worktree_root = repo / ".worktrees" / "fresh-parallel"
+    worker_id = "codex-mf-dispatch-route-fresh-verify"
+    task_id = "mf-parallel-dispatch-route-fresh-verify"
+    stale_target_root = worktree_root / task_id
+    actual_worktree = worktree_root / worker_id / task_id
+
+    assert stale_target_root.exists() is False
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": task_id,
+                "parent_task_id": "AC-FRESH-PARALLEL-TARGET-ROOT",
+                "backlog_id": "AC-FRESH-PARALLEL-TARGET-ROOT",
+                "observer_command_id": "cmd-fresh-parallel-target-root",
+                "workspace_root": str(repo),
+                "worktree_root": str(worktree_root),
+                "target_project_root": str(stale_target_root),
+                "worker_id": worker_id,
+                "fence_token": "fence-fresh-parallel-target-root",
+                "merge_queue_id": "mq-fresh-parallel-target-root",
+                "route_id": "route-fresh-parallel-target-root",
+                "route_context_hash": "sha256:route-fresh-parallel-target-root",
+                "prompt_contract_id": "rprompt-fresh-parallel-target-root",
+                "prompt_contract_hash": "sha256:prompt-fresh-parallel-target-root",
+                "route_token_ref": "rtok-fresh-parallel-target-root",
+                "visible_injection_manifest_hash": (
+                    "sha256:visible-fresh-parallel-target-root"
+                ),
+                "owned_files": ["agent/governance/server.py"],
+                "create_worktree": True,
+            },
+        )
+    )
+
+    assert status == 201
+    context = created["context"]
+    assert actual_worktree.exists() is True
+    assert context["worktree_path"] == str(actual_worktree)
+    assert context["target_project_root"] == str(actual_worktree)
+    assert created["branch_runtime_evidence"]["target_project_root"] == (
+        str(actual_worktree)
+    )
+    assert created["runtime_contract_revision"]["payload"][
+        "target_project_root"
+    ] == str(actual_worktree)
+
+    recorded_dispatch = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-FRESH-PARALLEL-TARGET-ROOT",
+        task_id=task_id,
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    assert len(recorded_dispatch) == 1
+    dispatch_payload = recorded_dispatch[0]["payload"][
+        "bounded_implementation_worker_dispatch"
+    ]
+    assert dispatch_payload["target_project_root"] == str(actual_worktree)
+    assert dispatch_payload["worktree_path"] == str(actual_worktree)
+
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context["runtime_context_id"],
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": "AC-FRESH-PARALLEL-TARGET-ROOT",
+                "fence_token": "fence-fresh-parallel-target-root",
+            },
+        )
+    )
+    worker_guide = guide["worker_guide"]
+    assert guide["target_project_root"] == str(actual_worktree)
+    assert worker_guide["target_project_root"] == str(actual_worktree)
+    assert worker_guide["startup_facade_payload_skeleton"]["body"][
+        "target_project_root"
+    ] == str(actual_worktree)
+
+
+def test_parallel_branch_allocate_preserves_existing_canonical_target_root(
+    conn,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    canonical_root = tmp_path / "canonical-target"
+    canonical_root.mkdir()
+    worktree_root = repo / ".worktrees" / "batch-fanout"
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "batch-fanout-target-root",
+                "parent_task_id": "AC-BATCH-FANOUT-TARGET-ROOT",
+                "backlog_id": "AC-BATCH-FANOUT-TARGET-ROOT",
+                "workspace_root": str(repo),
+                "worktree_root": str(worktree_root),
+                "target_project_root": str(canonical_root),
+                "worker_id": "batch-fanout-worker",
+                "fence_token": "fence-batch-fanout-target-root",
+                "merge_queue_id": "mq-batch-fanout-target-root",
+                "create_worktree": True,
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["context"]["worktree_path"] != str(canonical_root)
+    assert created["context"]["target_project_root"] == str(canonical_root)
+    assert created["branch_runtime_evidence"]["target_project_root"] == (
+        str(canonical_root)
+    )
+
+
 def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_worker_guide(
     conn,
     tmp_path,
