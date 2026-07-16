@@ -4510,6 +4510,185 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     ]["scope"]["owned_files"] == ["agent/governance/server.py"]
 
 
+def _ref_only_parallel_allocate_body(
+    tmp_path,
+    *,
+    task_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "parent_task_id": contract_execution_id,
+        "contract_execution_id": contract_execution_id,
+        "observer_command_id": contract_execution_id,
+        "backlog_id": "AC-ALLOCATE-REF-ONLY",
+        "workspace_root": str(tmp_path / "workers"),
+        "worktree_path": str(tmp_path / "workers" / task_id),
+        "worker_id": f"{task_id}-worker",
+        "fence_token": f"fence-{task_id}",
+        "base_commit": f"base-{task_id}",
+        "target_head_commit": f"target-{task_id}",
+        "merge_queue_id": f"mq-{task_id}",
+        "route_token_ref": route_token_ref,
+        "owned_files": ["agent/governance/server.py"],
+        "create_worktree": False,
+    }
+
+
+def test_parallel_branch_allocate_resolves_contract_scoped_ref_into_revision_and_dispatch(
+    conn,
+    tmp_path,
+):
+    contract_execution_id = "cex-allocate-ref-only"
+    route_token_ref = "rtok-allocate-ref-only"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate", "task_timeline_append"],
+    )
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=_ref_only_parallel_allocate_body(
+                tmp_path,
+                task_id="allocate-ref-only-worker",
+                contract_execution_id=contract_execution_id,
+                route_token_ref=route_token_ref,
+            ),
+        )
+    )
+
+    assert status == 201
+    expected_identity = {
+        "route_id": f"route-{route_token_ref}",
+        "route_context_hash": _fake_sha(f"{route_token_ref}:context"),
+        "prompt_contract_id": f"prompt-{route_token_ref}",
+        "prompt_contract_hash": _fake_sha(f"{route_token_ref}:prompt"),
+        "visible_injection_manifest_hash": _fake_sha(f"{route_token_ref}:manifest"),
+        "route_token_ref": route_token_ref,
+    }
+    revision = created["runtime_contract_revision"]
+    for field, value in expected_identity.items():
+        assert revision["route_identity"][field] == value
+    assert revision["route_gate"]["route_token_gate"]["registry_verified"] is True
+    assert revision["route_gate"]["route_token_gate"]["allowed_action"] == (
+        "parallel_branch_allocate"
+    )
+    for field, value in expected_identity.items():
+        assert created["branch_runtime_evidence"]["route_identity"][field] == value
+    assert created["dispatch_timeline_event"]["status"] == "recorded"
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        task_id="allocate-ref-only-worker",
+        event_kind="bounded_implementation_worker_dispatch",
+    )
+    dispatch = events[0]["payload"]["bounded_implementation_worker_dispatch"]
+    for field, value in expected_identity.items():
+        assert dispatch[field] == value
+    persisted = json.dumps(
+        {
+            "revision": revision,
+            "dispatch": dispatch,
+        },
+        sort_keys=True,
+    )
+    assert '"route_token":' not in persisted
+
+
+def test_parallel_branch_allocate_rejects_explicit_ref_identity_conflict_before_write(
+    conn,
+    tmp_path,
+):
+    contract_execution_id = "cex-allocate-ref-conflict"
+    route_token_ref = "rtok-allocate-ref-conflict"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-ref-conflict-worker",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+    body["prompt_contract_hash"] = _fake_sha("explicit-conflict")
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_identity_conflict"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_parallel_branch_allocate_rejects_contract_scope_mismatch_before_write(
+    conn,
+    tmp_path,
+):
+    route_token_ref = "rtok-allocate-ref-wrong-contract"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        contract_execution_id="cex-other-contract",
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+    )
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-ref-wrong-contract-worker",
+        contract_execution_id="cex-request-contract",
+        route_token_ref=route_token_ref,
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_invalid"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_parallel_branch_allocate_rejects_ref_without_allocation_action_before_write(
+    conn,
+    tmp_path,
+):
+    contract_execution_id = "cex-allocate-ref-action"
+    route_token_ref = "rtok-allocate-ref-action"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["task_timeline_append"],
+    )
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-ref-action-worker",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_action_not_allowed"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
 def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     conn,
     tmp_path,

@@ -9855,6 +9855,11 @@ def _parallel_branch_allocate_route_gate(
     body: Mapping[str, Any],
     route_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
+    route_token_gate = (
+        dict(body.get("route_token_gate"))
+        if isinstance(body.get("route_token_gate"), Mapping)
+        else {}
+    )
     return {
         "schema_version": "parallel_branch_allocate_route_gate.v1",
         "source": "parallel_branch_allocate",
@@ -9862,6 +9867,7 @@ def _parallel_branch_allocate_route_gate(
         "caller_role": str(body.get("caller_role") or "observer"),
         "allowed_action": "parallel_branch_allocate",
         **dict(route_identity),
+        **({"route_token_gate": route_token_gate} if route_token_gate else {}),
         "raw_private_context_exposed": False,
     }
 
@@ -10040,6 +10046,195 @@ def _parallel_branch_allocate_should_persist_contract_revision(
     return route_identity, revision_owned_files
 
 
+def _parallel_branch_allocate_effective_route_body(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover a copy-safe allocation route identity from a registered ref."""
+
+    from . import observer_route_context
+
+    effective = dict(body or {})
+    route_token_ref = str(effective.get("route_token_ref") or "").strip()
+    if not route_token_ref:
+        return effective
+
+    explicit_identity = _parallel_branch_runtime_contract_route_identity(effective)
+    required_identity_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    )
+    ref_only = not all(
+        str(explicit_identity.get(field) or "").strip()
+        for field in required_identity_fields
+    )
+    observer_command_id = str(effective.get("observer_command_id") or "").strip()
+    contract_execution_id = _runtime_context_public_text(
+        effective.get("contract_execution_id"),
+        effective.get("successor_contract_execution_id"),
+        effective.get("current_contract_execution_id"),
+        observer_command_id if observer_command_id.startswith("cex-") else "",
+    )
+    backlog_id = str(effective.get("backlog_id") or "").strip()
+    if ref_only and (not backlog_id or not contract_execution_id):
+        raise GovernanceError(
+            "parallel_branch_allocate_route_scope_required",
+            "ref-only parallel allocation requires backlog_id and contract execution scope",
+            422,
+            {
+                "route_token_ref": route_token_ref,
+                "required_fields": ["backlog_id", "contract_execution_id"],
+            },
+        )
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            route_id=str(explicit_identity.get("route_id") or "").strip(),
+            route_context_hash=str(
+                explicit_identity.get("route_context_hash") or ""
+            ).strip(),
+            prompt_contract_id=str(
+                explicit_identity.get("prompt_contract_id") or ""
+            ).strip(),
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_token_ref_invalid",
+            str(exc),
+            422,
+            {
+                "route_token_ref": route_token_ref,
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+            },
+        ) from exc
+    if not resolved:
+        if not ref_only:
+            return effective
+        raise GovernanceError(
+            "parallel_branch_allocate_route_token_ref_unknown",
+            "parallel allocation route_token_ref is not registered",
+            422,
+            {"route_token_ref": route_token_ref},
+        )
+
+    resolved_scope = (
+        dict(resolved.get("scope"))
+        if isinstance(resolved.get("scope"), Mapping)
+        else {}
+    )
+    scope_mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "resolved": str(resolved_scope.get(field) or "").strip(),
+        }
+        for field, expected in (
+            ("project_id", project_id),
+            ("backlog_id", backlog_id),
+            ("task_id", contract_execution_id),
+        )
+        if expected and str(resolved_scope.get(field) or "").strip() != expected
+    ]
+    if scope_mismatches:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_scope_mismatch",
+            "parallel allocation route_token_ref scope does not match the request",
+            422,
+            {
+                "route_token_ref": route_token_ref,
+                "scope_mismatches": scope_mismatches,
+            },
+        )
+
+    caller_role = str(resolved.get("caller_role") or "").strip()
+    if caller_role not in {"observer", "coordinator"}:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_role_mismatch",
+            "parallel allocation route_token_ref must be observer/coordinator scoped",
+            422,
+            {"route_token_ref": route_token_ref, "caller_role": caller_role},
+        )
+    allowed_actions = {
+        str(action or "").strip()
+        for action in (resolved.get("allowed_actions") or [])
+        if str(action or "").strip()
+    }
+    if "parallel_branch_allocate" not in allowed_actions:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_action_not_allowed",
+            "parallel allocation route_token_ref does not allow parallel_branch_allocate",
+            422,
+            {
+                "route_token_ref": route_token_ref,
+                "allowed_actions": sorted(allowed_actions),
+            },
+        )
+
+    resolved_identity = {
+        field: str(resolved.get(field) or "").strip()
+        for field in required_identity_fields
+    }
+    missing_resolved = [
+        field for field, value in resolved_identity.items() if not value
+    ]
+    if missing_resolved:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_identity_incomplete",
+            "registered parallel allocation route identity is incomplete",
+            422,
+            {
+                "route_token_ref": route_token_ref,
+                "missing_fields": missing_resolved,
+            },
+        )
+    conflicts = [
+        {
+            "field": field,
+            "requested": str(explicit_identity.get(field) or "").strip(),
+            "resolved": value,
+        }
+        for field, value in resolved_identity.items()
+        if explicit_identity.get(field)
+        and str(explicit_identity.get(field) or "").strip() != value
+    ]
+    if conflicts:
+        raise GovernanceError(
+            "parallel_branch_allocate_route_identity_conflict",
+            "explicit parallel allocation route identity conflicts with route_token_ref",
+            409,
+            {"route_token_ref": route_token_ref, "conflicts": conflicts},
+        )
+
+    effective.update(resolved_identity)
+    effective["route_identity"] = resolved_identity
+    effective["route_token_gate"] = {
+        "schema_version": "parallel_branch_allocate.route_token_ref_gate.v1",
+        "decision": "route_token_ref_resolved",
+        "resolved_from_ref": True,
+        "registry_verified": True,
+        "binding_source": "observer_route_token_refs",
+        "route_token_ref": route_token_ref,
+        "caller_role": caller_role,
+        "allowed_action": "parallel_branch_allocate",
+        "allowed_actions": sorted(allowed_actions),
+        "scope": resolved_scope,
+        "raw_private_context_exposed": False,
+    }
+    return effective
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
 def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     """Allocate and optionally materialize one parallel branch runtime context."""
@@ -10205,6 +10400,11 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
+        effective_body = _parallel_branch_allocate_effective_route_body(
+            conn,
+            project_id=project_id,
+            body=ctx.body or {},
+        )
         with sqlite_write_lock():
             if not create_worktree:
                 existing = get_branch_context(conn, project_id, task_id)
@@ -10275,14 +10475,14 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         runtime_contract_revision: dict[str, Any] = {}
         route_identity_for_revision, owned_files_for_revision = (
             _parallel_branch_allocate_should_persist_contract_revision(
-                ctx.body or {},
+                effective_body,
                 owned_files=saved.owned_files or request_owned_files,
             )
         )
         if route_identity_for_revision and owned_files_for_revision:
             saved_context = branch_context_to_dict(saved)
             route_gate = _parallel_branch_allocate_route_gate(
-                ctx.body or {},
+                effective_body,
                 route_identity_for_revision,
             )
             with sqlite_write_lock():
@@ -10293,7 +10493,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         ctx.body.get("contract_version") or MF_PARALLEL_CONTRACT_ID
                     ),
                     payload=_parallel_branch_allocate_contract_revision_payload(
-                        ctx.body or {},
+                        effective_body,
                         saved_context,
                         route_identity_for_revision,
                         owned_files_for_revision,
@@ -10339,7 +10539,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             response["runtime_contract_revision"] = runtime_contract_revision
         try:
             dispatch_body = {
-                **dict(ctx.body or {}),
+                **effective_body,
                 "merge_queue_id": saved.merge_queue_id,
                 "merge_queue_id_source": merge_queue_id_source,
                 "contract_parent_lineage": {
