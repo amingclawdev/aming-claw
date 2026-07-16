@@ -1263,6 +1263,109 @@ def test_minimal_runtime_rejects_stale_runtime_guide_hash(tmp_path):
     assert "runtime_guide_hash mismatch" in result["decision"]["errors"]
 
 
+def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_path):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="bypass_min_path",
+        stages=[
+            {
+                "stage_id": "bootstrap",
+                "lines": [
+                    {
+                        "line_id": "read_context",
+                        "owner_role": "observer",
+                        "allowed_writer_roles": ["observer"],
+                        "evidence_kind": "read_receipt",
+                    }
+                ],
+            },
+            {
+                "stage_id": "qa",
+                "lines": [
+                    {
+                        "line_id": "qa_verdict",
+                        "owner_role": "qa",
+                        "allowed_writer_roles": ["qa"],
+                        "evidence_kind": "qa_verification",
+                        "requires": ["read_context"],
+                    }
+                ],
+            },
+        ],
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    record = runtime.start_execution(
+        "bypass_min_path",
+        project_id="aming-claw",
+        backlog_id="AC-BYPASS-MIN-PATH",
+        actor_role="observer",
+    )
+    request = {
+        "bypass_identity": "bypass:cex:1:read_context",
+        "stage_id": "bootstrap",
+        "line_id": "read_context",
+        "execution_state_revision": record["execution_state_revision"],
+        "runtime_guide_hash": record["runtime_guide"]["runtime_guide_hash"],
+        "diagnostic_backlog_id": "AC-BYPASS-DIAGNOSTIC",
+        "classification": "process_contract_conflict",
+        "reason": "guide cannot produce the required receipt",
+        "decision": "operator chose audited continuation",
+        "evidence_refs": ["backlog:AC-BYPASS-DIAGNOSTIC", "timeline:42"],
+    }
+
+    result = runtime.bypass_current_line(
+        record["contract_execution_id"],
+        request,
+        actor_role="observer",
+    )
+
+    assert result["ok"] is True
+    assert result["idempotent"] is False
+    assert result["decision"] == {
+        "ok": True,
+        "errors": [],
+        "disposition": "proceeded_with_exception",
+        "no_pass_claim": True,
+    }
+    assert result["written_line"]["status"] == "waived"
+    assert result["written_line"]["evidence_kind"] == "contract_line_bypass"
+    assert result["written_line"]["no_pass_claim"] is True
+    assert result["written_line"]["payload"]["diagnostic_backlog_id"] == (
+        "AC-BYPASS-DIAGNOSTIC"
+    )
+    assert result["record"]["execution_state_revision"] == 2
+    assert result["record"]["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "qa_verdict"
+    )
+
+    retry = runtime.bypass_current_line(
+        record["contract_execution_id"], request, actor_role="observer"
+    )
+    assert retry["ok"] is True
+    assert retry["idempotent"] is True
+    assert retry["record"]["execution_state_revision"] == 2
+    assert len(retry["record"]["completed_lines"]) == 1
+
+    conflict = runtime.bypass_current_line(
+        record["contract_execution_id"],
+        {**request, "reason": "changed after the identity was consumed"},
+        actor_role="observer",
+    )
+    assert conflict["ok"] is False
+    assert conflict["decision"]["errors"] == ["bypass_identity_conflict"]
+
+    stale = runtime.bypass_current_line(
+        record["contract_execution_id"],
+        {**request, "bypass_identity": "bypass:cex:stale"},
+        actor_role="observer",
+    )
+    assert stale["ok"] is False
+    assert stale["decision"]["errors"] == ["execution_state_revision mismatch"]
+
+
 def test_runtime_write_gate_rejects_negative_cases(tmp_path):
     _write_minimal_contract(tmp_path)
     runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path), instruction_root=tmp_path)

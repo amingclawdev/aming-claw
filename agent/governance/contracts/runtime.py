@@ -3615,6 +3615,196 @@ class ContractRuntime:
             "record": result_record,
         }
 
+    def bypass_current_line(
+        self,
+        contract_execution_id: str,
+        bypass: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+        projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
+        projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly waive only the current line without claiming it passed."""
+
+        record = self.store.get(contract_execution_id)
+        request = dict(bypass)
+        effective_actor_role = _effective_actor_role(request, actor_role=actor_role)
+        evidence_refs = _sanitize_line_evidence_value(request.get("evidence_refs") or [])
+        request_fields = {
+            "bypass_identity": str(request.get("bypass_identity") or "").strip(),
+            "line_id": str(request.get("line_id") or "").strip(),
+            "stage_id": str(request.get("stage_id") or "").strip(),
+            "execution_state_revision": request.get("execution_state_revision"),
+            "diagnostic_backlog_id": str(
+                request.get("diagnostic_backlog_id") or ""
+            ).strip(),
+            "classification": str(request.get("classification") or "").strip(),
+            "reason": str(request.get("reason") or "").strip(),
+            "decision": str(request.get("decision") or "").strip(),
+            "actor_role": effective_actor_role,
+            "evidence_refs": evidence_refs,
+        }
+        request_hash = stable_sha256(request_fields)
+
+        def rejected(*errors: str, current: Mapping[str, Any] | None = None) -> dict[str, Any]:
+            return {
+                "schema_version": "contract_runtime_bypass_result.v1",
+                "ok": False,
+                "idempotent": False,
+                "decision": {
+                    "ok": False,
+                    "errors": list(errors),
+                    "no_pass_claim": True,
+                },
+                "record": dict(current or record),
+            }
+
+        visible_lines = list(record.get("completed_lines") or [])
+        visible_lines.extend(list(projected_completed_lines or []))
+        for line in reversed(visible_lines):
+            payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+            if (
+                str(line.get("evidence_kind") or "") == "contract_line_bypass"
+                and str(payload.get("bypass_identity") or "")
+                == request_fields["bypass_identity"]
+            ):
+                if str(payload.get("request_hash") or "") != request_hash:
+                    return rejected("bypass_identity_conflict")
+                return {
+                    "schema_version": "contract_runtime_bypass_result.v1",
+                    "ok": True,
+                    "idempotent": True,
+                    "decision": {
+                        "ok": True,
+                        "errors": [],
+                        "disposition": "proceeded_with_exception",
+                        "no_pass_claim": True,
+                    },
+                    "written_line": deepcopy(dict(line)),
+                    "record": self.store.get(contract_execution_id),
+                }
+
+        missing = [
+            key
+            for key in (
+                "bypass_identity",
+                "line_id",
+                "diagnostic_backlog_id",
+                "classification",
+                "reason",
+                "decision",
+            )
+            if not request_fields[key]
+        ]
+        if missing:
+            return rejected(*(f"missing {key}" for key in missing))
+        if effective_actor_role not in {"observer", "qa"}:
+            return rejected("bypass actor_role must be observer or qa")
+        try:
+            expected_revision = int(request_fields["execution_state_revision"])
+        except (TypeError, ValueError):
+            return rejected("invalid execution_state_revision")
+        actual_revision = int(record.get("execution_state_revision") or 1)
+        if expected_revision != actual_revision:
+            return rejected("execution_state_revision mismatch")
+
+        guide = self.current_guide(
+            contract_execution_id,
+            actor_role=effective_actor_role,
+        )
+        refreshed = self.store.get(contract_execution_id)
+        gate_record: Mapping[str, Any] = refreshed
+        if projected_completed_lines is not None:
+            gate_record = self.projected_record(
+                contract_execution_id,
+                actor_role=effective_actor_role,
+                completed_lines=projected_completed_lines,
+                projection=projection,
+            )
+            guide = gate_record["runtime_guide"]
+        next_action = guide.get("next_legal_action")
+        if not isinstance(next_action, Mapping):
+            return rejected("contract has no current line to bypass", current=gate_record)
+        if request_fields["line_id"] != str(next_action.get("line_id") or ""):
+            return rejected("bypass does not match current line", current=gate_record)
+        if request_fields["stage_id"] and request_fields["stage_id"] != str(
+            next_action.get("stage_id") or ""
+        ):
+            return rejected("bypass does not match current stage", current=gate_record)
+        requested_guide_hash = str(request.get("runtime_guide_hash") or "").strip()
+        if requested_guide_hash and requested_guide_hash != str(
+            guide.get("runtime_guide_hash") or ""
+        ):
+            return rejected("runtime_guide_hash mismatch", current=gate_record)
+
+        payload = {
+            "schema_version": "contract_line_bypass.v1",
+            "bypass_identity": request_fields["bypass_identity"],
+            "request_hash": request_hash,
+            "source_backlog_id": str(record.get("backlog_id") or ""),
+            "diagnostic_backlog_id": request_fields["diagnostic_backlog_id"],
+            "classification": request_fields["classification"],
+            "reason": request_fields["reason"],
+            "decision": request_fields["decision"],
+            "blocked_owner_role": str(next_action.get("owner_role") or ""),
+            "blocked_evidence_kind": str(next_action.get("evidence_kind") or ""),
+            "execution_state_revision": expected_revision,
+            "disposition": "proceeded_with_exception",
+            "no_pass_claim": True,
+            "evidence_refs": evidence_refs,
+        }
+        written_line = {
+            "stage_id": str(next_action.get("stage_id") or ""),
+            "line_id": request_fields["line_id"],
+            "actor_role": effective_actor_role,
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "disposition": "proceeded_with_exception",
+            "no_pass_claim": True,
+            "payload": payload,
+        }
+        line_instance_id = str(next_action.get("line_instance_id") or "").strip()
+        if line_instance_id:
+            written_line["line_instance_id"] = line_instance_id
+
+        completed_lines = list(refreshed.get("completed_lines") or [])
+        completed_lines.append(written_line)
+        refreshed["completed_lines"] = completed_lines
+        refreshed["execution_state_revision"] = actual_revision + 1
+        try:
+            self.store.update(
+                contract_execution_id,
+                refreshed,
+                expected_revision=actual_revision,
+            )
+        except ContractRuntimeError as exc:
+            return rejected(str(exc), current=self.store.get(contract_execution_id))
+
+        self.current_guide(contract_execution_id, actor_role=effective_actor_role)
+        result_record = self.store.get(contract_execution_id)
+        if projected_completed_lines is not None:
+            projected_after = list(projected_completed_lines)
+            projected_after.append(written_line)
+            result_record = self.projected_record(
+                contract_execution_id,
+                actor_role=effective_actor_role,
+                completed_lines=projected_after,
+                projection=projection,
+            )
+        return {
+            "schema_version": "contract_runtime_bypass_result.v1",
+            "ok": True,
+            "idempotent": False,
+            "decision": {
+                "ok": True,
+                "errors": [],
+                "disposition": "proceeded_with_exception",
+                "no_pass_claim": True,
+            },
+            "written_line": deepcopy(written_line),
+            "record": result_record,
+        }
+
     def precheck_line_write(
         self,
         contract_execution_id: str,
