@@ -49971,6 +49971,7 @@ def _contract_runtime_projection_timeline_scope_values(
     task_ids = {
         str(event.get("task_id") or "").strip(),
     }
+    child_task_ids: set[str] = set()
     runtime_context_ids: set[str] = set()
     related_task_ids: set[str] = set()
     for candidate in _contract_runtime_mapping_candidates(payload):
@@ -49978,6 +49979,11 @@ def _contract_runtime_projection_timeline_scope_values(
             task_ids.add(
                 _runtime_context_non_placeholder_text(candidate.get(key))
             )
+        child_task_ids.add(
+            _runtime_context_non_placeholder_text(
+                candidate.get("child_task_id")
+            )
+        )
         runtime_context_ids.add(
             _runtime_context_non_placeholder_text(
                 candidate.get("runtime_context_id")
@@ -49993,6 +49999,7 @@ def _contract_runtime_projection_timeline_scope_values(
             )
     return {
         "task_ids": sorted(item for item in task_ids if item),
+        "child_task_ids": sorted(item for item in child_task_ids if item),
         "runtime_context_ids": sorted(
             item for item in runtime_context_ids if item
         ),
@@ -50014,25 +50021,48 @@ def _contract_runtime_projection_timeline_scope_matches(
     }
     scope = _contract_runtime_projection_timeline_scope_values(event)
     event_task_values = set(scope["task_ids"])
+    event_child_task_values = set(scope["child_task_ids"])
     event_context_values = set(scope["runtime_context_ids"])
     event_related_values = set(scope["related_task_ids"])
-    if expected_task_id and event_task_values and (
-        event_task_values != {expected_task_id}
+    if expected_task_id and event_child_task_values and (
+        event_child_task_values != {expected_task_id}
     ):
         return False
     if runtime_context_id and event_context_values and (
         event_context_values != {runtime_context_id}
     ):
         return False
-    if expected_task_id and event_task_values == {expected_task_id}:
+    if expected_related and event_related_values and not (
+        event_related_values.issubset(expected_related)
+    ):
+        return False
+    allowed_task_values = {
+        value for value in ({expected_task_id} | expected_related) if value
+    }
+    if expected_task_id and event_task_values and not (
+        event_task_values.issubset(allowed_task_values)
+    ):
+        return False
+    if expected_task_id and event_child_task_values == {expected_task_id}:
+        return True
+    if expected_task_id and expected_task_id in event_task_values:
         return True
     if runtime_context_id and event_context_values == {runtime_context_id}:
-        return True
+        return bool(
+            not event_task_values
+            or event_task_values.issubset(expected_related)
+        )
     if expected_related and event_related_values.intersection(expected_related):
-        return True
+        return bool(
+            not event_task_values
+            or event_task_values.issubset(expected_related)
+        )
     if allow_taskless:
         return not (
-            event_task_values or event_context_values or event_related_values
+            event_task_values
+            or event_child_task_values
+            or event_context_values
+            or event_related_values
         )
     return False
 
