@@ -49740,6 +49740,7 @@ def _contract_runtime_projection_post_worker_lines(
             phase_tokens={"verification", "qa"},
             actor_roles={"qa"},
             related_task_ids=related_task_ids,
+            direct_parent_task_id=parent_task_id,
         )
         if not candidate_qa_event:
             break
@@ -49788,6 +49789,7 @@ def _contract_runtime_projection_post_worker_lines(
         phase_tokens={"live_merge", "merge"},
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
+        direct_parent_task_id=parent_task_id,
     )
     allow_taskless_reconcile = True
     if reconcile_policy:
@@ -49809,6 +49811,7 @@ def _contract_runtime_projection_post_worker_lines(
         actor_roles={"observer"},
         allow_taskless=allow_taskless_reconcile,
         related_task_ids=related_task_ids,
+        direct_parent_task_id=parent_task_id,
     )
     close_ready_event = _contract_runtime_projection_latest_timeline_event(
         timeline_events,
@@ -49819,6 +49822,7 @@ def _contract_runtime_projection_post_worker_lines(
         phase_tokens={"close_ready", "close"},
         actor_roles={"observer"},
         related_task_ids=related_task_ids,
+        direct_parent_task_id=parent_task_id,
     )
     if reconcile_policy:
         qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
@@ -50189,6 +50193,7 @@ def _contract_runtime_projection_latest_timeline_event(
     actor_roles: set[str],
     allow_taskless: bool = False,
     related_task_ids: set[str] | None = None,
+    direct_parent_task_id: str = "",
 ) -> dict[str, Any]:
     for event in reversed([event for event in timeline_events if isinstance(event, Mapping)]):
         status = str(event.get("status") or event.get("decision") or "").strip().lower()
@@ -50203,6 +50208,7 @@ def _contract_runtime_projection_latest_timeline_event(
             task_id=task_id,
             related_task_ids=related_task_ids or set(),
             allow_taskless=allow_taskless,
+            direct_parent_task_id=direct_parent_task_id,
         ):
             continue
         event_kind = _contract_runtime_close_normalized(event.get("event_kind"))
@@ -50271,8 +50277,10 @@ def _contract_runtime_projection_timeline_scope_matches(
     task_id: str,
     related_task_ids: set[str],
     allow_taskless: bool,
+    direct_parent_task_id: str = "",
 ) -> bool:
     expected_task_id = str(task_id or "").strip()
+    expected_direct_parent = str(direct_parent_task_id or "").strip()
     expected_related = {
         str(item or "").strip() for item in related_task_ids if str(item or "").strip()
     }
@@ -50293,13 +50301,22 @@ def _contract_runtime_projection_timeline_scope_matches(
         value for value in ({expected_task_id} | expected_related) if value
     }
     top_level_task_id = str(event.get("task_id") or "").strip()
+    direct_parent_matches = bool(
+        expected_direct_parent
+        and expected_direct_parent in event_related_values
+    )
+    if not expected_direct_parent:
+        direct_parent_matches = bool(
+            expected_related
+            and expected_related.issubset(event_related_values)
+        )
     exact_batch_wrapper = bool(
         expected_task_id
         and runtime_context_id
         and event_child_task_values == {expected_task_id}
         and event_context_values == {runtime_context_id}
         and expected_related
-        and expected_related.issubset(event_related_values)
+        and direct_parent_matches
         and top_level_task_id
         and top_level_task_id not in allowed_task_values
         and (event_related_values - expected_related) == {top_level_task_id}

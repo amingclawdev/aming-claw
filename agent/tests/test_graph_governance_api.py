@@ -52801,6 +52801,8 @@ def test_live_merge_recorder_parent_task_scope_projects_exact_child_task(conn):
 def test_live_merge_batch_root_wrapper_projects_exact_child_task():
     batch_task_id = "mf-batch-live-merge-root"
     child_contract_id = "cex-live-merge-child-contract"
+    parent_contract_id = "onboard-live-merge-parent-contract"
+    root_contract_id = "onboard-live-merge-root-contract"
     child_task_id = f"{batch_task_id}:row:1"
     runtime_context_id = "mfrctx-live-merge-batch-child"
     event = {
@@ -52831,8 +52833,13 @@ def test_live_merge_batch_root_wrapper_projects_exact_child_task():
         event,
         runtime_context_id=runtime_context_id,
         task_id=child_task_id,
-        related_task_ids={child_contract_id},
+        related_task_ids={
+            child_contract_id,
+            parent_contract_id,
+            root_contract_id,
+        },
         allow_taskless=False,
+        direct_parent_task_id=child_contract_id,
     ) is True
 
 
@@ -52886,7 +52893,78 @@ def test_live_merge_batch_root_wrapper_rejects_forged_claims(
         task_id=child_task_id,
         related_task_ids={child_contract_id},
         allow_taskless=False,
+        direct_parent_task_id=child_contract_id,
     ) is False
+
+
+def test_post_worker_projection_uses_direct_parent_not_missing_ancestors(conn):
+    batch_task_id = "mf-batch-live-merge-real-shape"
+    child_contract_id = "cex-live-merge-real-child"
+    missing_parent_contract_id = "onboard-live-merge-real-parent"
+    missing_root_contract_id = "onboard-live-merge-real-root"
+    child_task_id = f"{batch_task_id}:row:1"
+    runtime_context_id = "mfrctx-live-merge-real-child"
+    backlog_id = "AC-LIVE-MERGE-REAL-BATCH-WRAPPER"
+    merge_commit = "d" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev1",
+        "contract_execution_id": child_contract_id,
+        "parent_contract_execution_id": missing_parent_contract_id,
+        "root_contract_execution_id": missing_root_contract_id,
+        "completed_lines": [],
+    }
+    context = SimpleNamespace(
+        backlog_id=backlog_id,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        parent_task_id=child_contract_id,
+        target_project_root="/real/batch/wrapper",
+        worktree_path="/real/batch/wrapper",
+    )
+    live_merge = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=batch_task_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        actor="codex-observer",
+        status="passed",
+        commit_sha=merge_commit,
+        payload={
+            "child_task_id": child_task_id,
+            "parent_task_id": batch_task_id,
+            "runtime_context_id": runtime_context_id,
+            "merge_commit": merge_commit,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "parent_task_id": child_contract_id,
+                    "root_task_id": batch_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    )
+
+    lines = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=[live_merge],
+    )
+
+    merge_line = next(
+        line for line in lines if line["line_id"] == "observer_merge"
+    )
+    assert merge_line["commit_sha"] == merge_commit
+    assert merge_line["payload"]["source_ref"] == f"timeline:{live_merge['id']}"
 
 
 @pytest.mark.parametrize(
