@@ -10070,10 +10070,6 @@ def _parallel_branch_allocate_effective_route_body(
         "visible_injection_manifest_hash",
         "route_token_ref",
     )
-    ref_only = not all(
-        str(explicit_identity.get(field) or "").strip()
-        for field in required_identity_fields
-    )
     observer_command_id = str(effective.get("observer_command_id") or "").strip()
     contract_execution_id = _runtime_context_public_text(
         effective.get("contract_execution_id"),
@@ -10082,10 +10078,10 @@ def _parallel_branch_allocate_effective_route_body(
         observer_command_id if observer_command_id.startswith("cex-") else "",
     )
     backlog_id = str(effective.get("backlog_id") or "").strip()
-    if ref_only and (not backlog_id or not contract_execution_id):
+    if not backlog_id or not contract_execution_id:
         raise GovernanceError(
             "parallel_branch_allocate_route_scope_required",
-            "ref-only parallel allocation requires backlog_id and contract execution scope",
+            "parallel allocation route_token_ref requires backlog_id and contract execution scope",
             422,
             {
                 "route_token_ref": route_token_ref,
@@ -10120,8 +10116,6 @@ def _parallel_branch_allocate_effective_route_body(
             },
         ) from exc
     if not resolved:
-        if not ref_only:
-            return effective
         raise GovernanceError(
             "parallel_branch_allocate_route_token_ref_unknown",
             "parallel allocation route_token_ref is not registered",
@@ -10159,10 +10153,10 @@ def _parallel_branch_allocate_effective_route_body(
         )
 
     caller_role = str(resolved.get("caller_role") or "").strip()
-    if caller_role not in {"observer", "coordinator"}:
+    if caller_role != "observer":
         raise GovernanceError(
             "parallel_branch_allocate_route_role_mismatch",
-            "parallel allocation route_token_ref must be observer/coordinator scoped",
+            "parallel allocation route_token_ref must be observer scoped",
             422,
             {"route_token_ref": route_token_ref, "caller_role": caller_role},
         )

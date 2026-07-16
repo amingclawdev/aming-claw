@@ -949,6 +949,45 @@ def _persist_contract_runtime_observer_route_ref(
     )
 
 
+def _persist_parallel_allocate_route_ref(
+    conn: sqlite3.Connection,
+    *,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_id: str,
+    route_context_hash: str,
+    prompt_contract_id: str,
+    prompt_contract_hash: str,
+    visible_injection_manifest_hash: str,
+    route_token_ref: str,
+) -> None:
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            "route_id": route_id,
+            "route_context_hash": route_context_hash,
+            "prompt_contract_id": prompt_contract_id,
+            "prompt_contract_hash": prompt_contract_hash,
+            "visible_injection_manifest_hash": visible_injection_manifest_hash,
+            "route_token_ref": route_token_ref,
+            "caller_role": "observer",
+            "allowed_actions": [
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": contract_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": ["test:parallel-branch-allocate-route-ref"],
+        },
+    )
+
+
 def _direct_fix_graph_trace_payload(
     *,
     actor_role: str,
@@ -4247,6 +4286,17 @@ def test_parallel_branch_allocate_projects_missing_target_root_to_nested_worktre
     actual_worktree = worktree_root / worker_id / task_id
 
     assert stale_target_root.exists() is False
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id="AC-FRESH-PARALLEL-TARGET-ROOT",
+        contract_execution_id="cex-fresh-parallel-target-root",
+        route_id="route-fresh-parallel-target-root",
+        route_context_hash="sha256:route-fresh-parallel-target-root",
+        prompt_contract_id="rprompt-fresh-parallel-target-root",
+        prompt_contract_hash="sha256:prompt-fresh-parallel-target-root",
+        visible_injection_manifest_hash="sha256:visible-fresh-parallel-target-root",
+        route_token_ref="rtok-fresh-parallel-target-root",
+    )
     status, created = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -4255,6 +4305,7 @@ def test_parallel_branch_allocate_projects_missing_target_root_to_nested_worktre
                 "task_id": task_id,
                 "parent_task_id": "AC-FRESH-PARALLEL-TARGET-ROOT",
                 "backlog_id": "AC-FRESH-PARALLEL-TARGET-ROOT",
+                "contract_execution_id": "cex-fresh-parallel-target-root",
                 "observer_command_id": "cmd-fresh-parallel-target-root",
                 "workspace_root": str(repo),
                 "worktree_root": str(worktree_root),
@@ -4366,6 +4417,17 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     workspace = tmp_path / "workers"
     worktree = workspace / "contract-worker" / "allocate-contract-task"
 
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-CONTRACT",
+        contract_execution_id="cex-allocate-contract",
+        route_id="route-allocate-contract",
+        route_context_hash="sha256:route-allocate-contract",
+        prompt_contract_id="rprompt-allocate-contract",
+        prompt_contract_hash="sha256:prompt-allocate-contract",
+        visible_injection_manifest_hash="sha256:visible-allocate-contract",
+        route_token_ref="rtok-allocate-contract",
+    )
     status, created = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -4374,6 +4436,7 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
                 "task_id": "allocate-contract-task",
                 "parent_task_id": "AC-ALLOCATE-CONTRACT",
                 "backlog_id": "AC-ALLOCATE-CONTRACT",
+                "contract_execution_id": "cex-allocate-contract",
                 "observer_command_id": "cmd-allocate-contract",
                 "workspace_root": str(workspace),
                 "worktree_path": str(worktree),
@@ -4444,7 +4507,7 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
     assert dispatch_payload["service_generated"] is True
     assert dispatch_payload["runtime_context_id"] == context["runtime_context_id"]
     assert dispatch_payload["task_id"] == "allocate-contract-task"
-    assert dispatch_payload["parent_task_id"] == "AC-ALLOCATE-CONTRACT"
+    assert dispatch_payload["parent_task_id"] == "cex-allocate-contract"
     assert dispatch_payload["observer_command_id"] == "cmd-allocate-contract"
     assert dispatch_payload["worker_id"] == "contract-worker"
     assert dispatch_payload["worker_slot_id"] == "contract-worker"
@@ -4689,6 +4752,90 @@ def test_parallel_branch_allocate_rejects_ref_without_allocation_action_before_w
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
+def test_parallel_branch_allocate_rejects_complete_identity_with_unknown_ref_before_write(
+    conn,
+    tmp_path,
+):
+    route_token_ref = "rtok-allocate-complete-unknown"
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-complete-unknown-worker",
+        contract_execution_id="cex-allocate-complete-unknown",
+        route_token_ref=route_token_ref,
+    )
+    body.update(
+        {
+            "route_id": "route-allocate-complete-unknown",
+            "route_context_hash": _fake_sha("allocate-complete-unknown:context"),
+            "prompt_contract_id": "rprompt-allocate-complete-unknown",
+            "prompt_contract_hash": _fake_sha("allocate-complete-unknown:prompt"),
+            "visible_injection_manifest_hash": _fake_sha(
+                "allocate-complete-unknown:manifest"
+            ),
+        }
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_token_ref_unknown"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_parallel_branch_allocate_rejects_route_ref_without_contract_scope_before_write(
+    conn,
+    tmp_path,
+):
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-missing-contract-scope-worker",
+        contract_execution_id="cex-allocate-missing-contract-scope",
+        route_token_ref="rtok-allocate-missing-contract-scope",
+    )
+    body.pop("contract_execution_id")
+    body["observer_command_id"] = "cmd-not-a-contract"
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_scope_required"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
+def test_parallel_branch_allocate_rejects_coordinator_route_ref_before_write(
+    conn,
+    tmp_path,
+):
+    contract_execution_id = "cex-allocate-coordinator-ref"
+    route_token_ref = "rtok-allocate-coordinator-ref"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-REF-ONLY",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["parallel_branch_allocate"],
+        caller_role="coordinator",
+    )
+    body = _ref_only_parallel_allocate_body(
+        tmp_path,
+        task_id="allocate-coordinator-ref-worker",
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "parallel_branch_allocate_route_role_mismatch"
+    assert get_branch_context(conn, PID, body["task_id"]) is None
+
+
 def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     conn,
     tmp_path,
@@ -4708,6 +4855,17 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
     workspace = tmp_path / "workers"
     worktree = workspace / "scope-worker" / "allocate-test-scope-task"
 
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="cex-allocate-test-scope",
+        route_id="route-allocate-test-scope",
+        route_context_hash="sha256:route-allocate-test-scope",
+        prompt_contract_id="rprompt-allocate-test-scope",
+        prompt_contract_hash="sha256:prompt-allocate-test-scope",
+        visible_injection_manifest_hash="sha256:visible-test-scope",
+        route_token_ref="rtok-allocate-test-scope",
+    )
     status, created = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -4716,6 +4874,7 @@ def test_parallel_branch_allocate_includes_backlog_test_files_in_worker_scope(
                 "task_id": "allocate-test-scope-task",
                 "parent_task_id": backlog_id,
                 "backlog_id": backlog_id,
+                "contract_execution_id": "cex-allocate-test-scope",
                 "observer_command_id": "cmd-allocate-test-scope",
                 "workspace_root": str(workspace),
                 "worktree_path": str(worktree),
@@ -4945,6 +5104,17 @@ def test_parallel_branch_allocate_persists_merge_queue_id_from_child_route_linea
         "merge_queue_id": "mq-allocate-lineage",
     }
 
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-LINEAGE",
+        contract_execution_id="cex-allocate-lineage",
+        route_id="route-allocate-lineage",
+        route_context_hash="sha256:route-allocate-lineage",
+        prompt_contract_id="rprompt-allocate-lineage",
+        prompt_contract_hash="sha256:prompt-allocate-lineage",
+        visible_injection_manifest_hash="sha256:visible-allocate-lineage",
+        route_token_ref="rtok-allocate-lineage",
+    )
     status, created = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -4953,6 +5123,7 @@ def test_parallel_branch_allocate_persists_merge_queue_id_from_child_route_linea
                 "task_id": "allocate-lineage-task",
                 "parent_task_id": "AC-ALLOCATE-LINEAGE",
                 "backlog_id": "AC-ALLOCATE-LINEAGE",
+                "contract_execution_id": "cex-allocate-lineage",
                 "observer_command_id": "cmd-allocate-lineage",
                 "workspace_root": str(workspace),
                 "worktree_path": str(worktree),
@@ -5109,6 +5280,17 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
 ):
     workspace = tmp_path / "workers"
 
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id="AC-ALLOCATE-INCOMPLETE",
+        contract_execution_id="cex-allocate-incomplete",
+        route_id="route-allocate-incomplete",
+        route_context_hash="sha256:route-allocate-incomplete",
+        prompt_contract_id="rprompt-allocate-incomplete",
+        prompt_contract_hash="sha256:prompt-allocate-incomplete",
+        visible_injection_manifest_hash="sha256:visible-allocate-incomplete",
+        route_token_ref="rtok-allocate-incomplete",
+    )
     status, created = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -5117,6 +5299,7 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
                 "task_id": "allocate-incomplete-task",
                 "parent_task_id": "AC-ALLOCATE-INCOMPLETE",
                 "backlog_id": "AC-ALLOCATE-INCOMPLETE",
+                "contract_execution_id": "cex-allocate-incomplete",
                 "observer_command_id": "cmd-allocate-incomplete",
                 "workspace_root": str(workspace),
                 "worker_id": "contract-worker",
@@ -5188,7 +5371,7 @@ def test_parallel_branch_allocate_incomplete_dispatch_recovery_is_actionable(
     payload_shape = dispatch_event["recovery"]["payload_shape"]
     assert payload_shape["runtime_context_id"] == context["runtime_context_id"]
     assert payload_shape["task_id"] == "allocate-incomplete-task"
-    assert payload_shape["parent_task_id"] == "AC-ALLOCATE-INCOMPLETE"
+    assert payload_shape["parent_task_id"] == "cex-allocate-incomplete"
     assert payload_shape["observer_command_id"] == "cmd-allocate-incomplete"
     assert payload_shape["worker_id"] == "contract-worker"
     assert payload_shape["worker_slot_id"] == "contract-worker"
