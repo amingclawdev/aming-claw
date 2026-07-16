@@ -12422,6 +12422,93 @@ def _runtime_context_contract_identity_from_record(
     }
 
 
+def _contract_runtime_active_linked_bypass_diagnostics(
+    conn,
+    *,
+    record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return only ContractRuntime bypasses backed by their matching OPEN row."""
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if guide.get("next_legal_action") is None:
+        return []
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    source_backlog_id = str(record.get("backlog_id") or "").strip()
+    if not execution_id or not source_backlog_id:
+        return []
+    links: list[dict[str, Any]] = []
+    for raw_line in record.get("completed_lines") or []:
+        if not isinstance(raw_line, Mapping):
+            continue
+        payload = (
+            raw_line.get("payload")
+            if isinstance(raw_line.get("payload"), Mapping)
+            else {}
+        )
+        diagnostic_backlog_id = str(
+            payload.get("diagnostic_backlog_id") or ""
+        ).strip()
+        classification = str(payload.get("classification") or "").strip()
+        if (
+            str(raw_line.get("evidence_kind") or "").strip()
+            != "contract_line_bypass"
+            or str(raw_line.get("status") or "").strip().lower() != "waived"
+            or raw_line.get("no_pass_claim") is not True
+            or payload.get("no_pass_claim") is not True
+            or not diagnostic_backlog_id
+            or classification
+            not in {
+                "candidate_graph_infrastructure_blocker",
+                "exact_candidate_snapshot_blocker",
+                "exact_snapshot_infrastructure_blocker",
+                "graph_infrastructure_blocker",
+            }
+        ):
+            continue
+        row = conn.execute(
+            "SELECT status, chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
+            (diagnostic_backlog_id,),
+        ).fetchone()
+        if not row or str(row["status"] or "").strip().upper() != "OPEN":
+            continue
+        chain = backlog_runtime.parse_json_object(row["chain_trigger_json"])
+        if any(
+            str(chain.get(key) or "").strip() != expected
+            for key, expected in (
+                ("source_backlog_id", source_backlog_id),
+                ("contract_execution_id", execution_id),
+                ("line_id", str(raw_line.get("line_id") or "").strip()),
+            )
+        ):
+            continue
+        links.append(
+            {
+                "schema_version": (
+                    "contract_runtime.active_linked_bypass_diagnostic.v1"
+                ),
+                "contract_execution_id": execution_id,
+                "source_backlog_id": source_backlog_id,
+                "diagnostic_backlog_id": diagnostic_backlog_id,
+                "diagnostic_status": "OPEN",
+                "bypassed_stage_id": str(
+                    raw_line.get("stage_id") or ""
+                ).strip(),
+                "bypassed_line_id": str(raw_line.get("line_id") or "").strip(),
+                "bypass_identity": str(
+                    payload.get("bypass_identity") or ""
+                ).strip(),
+                "classification": classification,
+                "bypassed_business_line_passed": False,
+                "no_pass_claim": True,
+            }
+        )
+    return links
+
+
 def _runtime_context_contract_runtime_worker_projection(
     conn,
     *,
@@ -12458,6 +12545,16 @@ def _runtime_context_contract_runtime_worker_projection(
         else {}
     )
     current_state = _runtime_current_state_from_record(canonical_record)
+    linked_bypass_diagnostics = (
+        _contract_runtime_active_linked_bypass_diagnostics(
+            conn,
+            record=canonical_record,
+        )
+    )
+    if linked_bypass_diagnostics:
+        current_state["active_linked_bypass_diagnostics"] = (
+            linked_bypass_diagnostics
+        )
     next_action = _runtime_next_action_from_guide(
         guide,
         source="contract_runtime_current_state",
@@ -13080,6 +13177,14 @@ def _runtime_context_executable_contract_envelope(
             ),
             target_files=worker_scope_files,
             route_identity=present_route_identity,
+            contract_runtime_state=(
+                current_state_response.get("contract_runtime_current_state")
+                if isinstance(
+                    current_state_response.get("contract_runtime_current_state"),
+                    Mapping,
+                )
+                else {}
+            ),
         ),
     }
 
@@ -13318,6 +13423,7 @@ def _runtime_context_qa_verification_guide(
     target_project_root: str,
     route_identity: Mapping[str, Any],
     target_files: Sequence[str] | None = None,
+    contract_runtime_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
     raw_qa_target_files = [
@@ -13446,6 +13552,76 @@ def _runtime_context_qa_verification_guide(
         target_project_root=target_project_root,
         route_identity=safe_route_identity,
     )
+    runtime_state = (
+        contract_runtime_state
+        if isinstance(contract_runtime_state, Mapping)
+        else {}
+    )
+    linked_bypass_diagnostics = [
+        dict(item)
+        for item in runtime_state.get("active_linked_bypass_diagnostics") or []
+        if isinstance(item, Mapping)
+    ]
+    linked_bypass_reporting = {
+        "schema_version": (
+            "runtime_context.qa_linked_bypass_diagnostic_reporting.v1"
+        ),
+        "applicable": bool(linked_bypass_diagnostics),
+        "status": (
+            "applicable_active_linked_open_bypass"
+            if linked_bypass_diagnostics
+            else "not_applicable_no_active_linked_open_bypass"
+        ),
+        "activation_requirements": [
+            "same active ContractRuntime contains a contract_line_bypass line",
+            "diagnostic_backlog_id resolves to a matching OPEN backlog row",
+            "the finding is candidate graph infrastructure outside the verified business-line baseline",
+        ],
+        "eligible_classifications": [
+            "candidate_graph_infrastructure_blocker",
+            "exact_candidate_snapshot_blocker",
+            "exact_snapshot_infrastructure_blocker",
+            "graph_infrastructure_blocker",
+        ],
+        "active_links": linked_bypass_diagnostics,
+        "evidence_path": "qa_evidence_provenance.out_of_baseline_findings",
+        "normal_qa_graph_requirements_unchanged": True,
+        "bypassed_line_must_not_be_claimed_passed": True,
+        "qa_overall_verdict_source": "actual_candidate_verification",
+        "forbidden_finding_keys": [
+            "status",
+            "verdict",
+            "outcome",
+            "decision",
+            "result",
+            "qa_status",
+            "qa_decision",
+            "verification_status",
+            "verification_decision",
+        ],
+        "failure_reporting_rule": (
+            "A failure in the candidate business-line verification remains a "
+            "QA failure; do not move it into out_of_baseline_findings."
+        ),
+    }
+    if linked_bypass_diagnostics:
+        linked_bypass_reporting["copy_safe_provenance_shape"] = {
+            "out_of_baseline_findings": [
+                {
+                    "finding_kind": "candidate_graph_infrastructure_blocker",
+                    "diagnostic_backlog_id": (
+                        "<diagnostic_backlog_id from active_links>"
+                    ),
+                    "diagnostic_status": "OPEN",
+                    "source_bypass_identity": (
+                        "<bypass_identity from active_links>"
+                    ),
+                    "disposition": "non_blocking_separately_filed",
+                    "bypassed_business_line_passed": False,
+                    "no_pass_claim": True,
+                }
+            ]
+        }
     return {
         "schema_version": "runtime_context.qa_independent_verification_guide.v1",
         "role": "qa",
@@ -13472,6 +13648,7 @@ def _runtime_context_qa_verification_guide(
             "observer_impersonation_allowed": False,
         },
         "verification_plan": verification_plan,
+        "linked_bypass_diagnostic_reporting": linked_bypass_reporting,
         "observer_prefill_route_token": {
             "schema_version": "runtime_context.qa_route_token_prefill.v1",
             "role": "observer",
@@ -14390,6 +14567,7 @@ def _runtime_context_worker_guide_response(
         target_project_root=target_project_root,
         target_files=worker_scope_files,
         route_identity=route_identity,
+        contract_runtime_state=contract_runtime_current_state,
     )
     finish_attestation_submission = {
         "schema_version": (
