@@ -16,6 +16,27 @@ MCP_TOOL_SCHEMA_VERSION = "2026-07-16.1"
 MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION = MCP_TOOL_SCHEMA_VERSION
 
 
+def mcp_loaded_tool_schema_metadata() -> dict[str, Any]:
+    """Describe only the schema frozen into the current MCP process."""
+
+    return {
+        "schema_version": "mcp_loaded_tool_schema.v1",
+        "loaded_client_tool_schema_version": MCP_TOOL_SCHEMA_VERSION,
+        "server_tool_schema_version": "",
+        "minimum_client_tool_schema_version": "",
+        "client_schema_fresh": None,
+        "server_version_observable": False,
+        "stale_client_possible": True,
+        "status": "process_local_loaded_schema",
+        "freshness_signal": {
+            "mcp_tool": "runtime_status",
+            "response_path": "mcp_tool_schema",
+            "tools_list_path": "_meta.aming_claw_tool_schema",
+        },
+        "refresh_action": "restart_or_refresh_mcp_session",
+    }
+
+
 def qa_session_register_http_fallback() -> dict[str, Any]:
     """Return the copy-safe HTTP fallback for a schema-lagging MCP session."""
 

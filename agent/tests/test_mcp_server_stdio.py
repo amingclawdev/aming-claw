@@ -299,8 +299,11 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
-    assert schema_meta["server_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
-    assert schema_meta["client_schema_fresh"] is True
+    assert schema_meta["server_tool_schema_version"] == ""
+    assert schema_meta["client_schema_fresh"] is None
+    assert schema_meta["server_version_observable"] is False
+    assert schema_meta["status"] == "process_local_loaded_schema"
+    assert schema_meta["freshness_signal"]["mcp_tool"] == "runtime_status"
     names = {tool["name"] for tool in tools}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
     assert {
