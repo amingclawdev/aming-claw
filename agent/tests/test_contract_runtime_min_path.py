@@ -1366,6 +1366,83 @@ def test_runtime_bypass_current_line_is_audited_idempotent_and_stale_safe(tmp_pa
     assert stale["decision"]["errors"] == ["execution_state_revision mismatch"]
 
 
+def test_runtime_current_guide_exposes_strict_line_bypass_row_binding(tmp_path):
+    _write_contract_definition(
+        tmp_path,
+        contract_id="bypass_guide_min_path",
+        stages=[
+            {
+                "stage_id": "bootstrap",
+                "lines": [
+                    {
+                        "line_id": "read_context",
+                        "owner_role": "observer",
+                        "allowed_writer_roles": ["observer"],
+                        "evidence_kind": "read_receipt",
+                    }
+                ],
+            }
+        ],
+    )
+    runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        instruction_root=tmp_path,
+    )
+    record = runtime.start_execution(
+        "bypass_guide_min_path",
+        project_id="aming-claw",
+        backlog_id="AC-BYPASS-GUIDE-MIN-PATH",
+        actor_role="observer",
+        contract_execution_id="cex-bypass-guide-min-path",
+    )
+
+    guide = runtime.current_guide(
+        record["contract_execution_id"],
+        actor_role="observer",
+    )
+
+    bypass = guide["line_bypass_guidance"]
+    assert bypass["status"] == "available_for_current_line"
+    assert bypass["endpoint"] == (
+        "/api/projects/aming-claw/contract-runtime/"
+        "cex-bypass-guide-min-path/line-bypasses"
+    )
+    assert bypass["current_line_binding"] == {
+        "source_backlog_id": "AC-BYPASS-GUIDE-MIN-PATH",
+        "contract_execution_id": "cex-bypass-guide-min-path",
+        "line_id": "read_context",
+        "stage_id": "bootstrap",
+        "line_instance_id": "",
+        "execution_state_revision": 1,
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+    }
+    identity = bypass["bypass_identity"]["recommended_value"]
+    assert identity == (
+        "bypass:cex-bypass-guide-min-path:revision-1:"
+        "bootstrap:read_context"
+    )
+    expected_diagnostic_id = (
+        "AC-CONTRACT-LINE-BYPASS-"
+        + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16].upper()
+    )
+    create = bypass["diagnostic_row_binding"]["create_new"]
+    assert create["deterministic_id_example"] == expected_diagnostic_id
+    assert "diagnostic_backlog_id" not in bypass["create_new_copy_safe_body"]
+    reuse = bypass["diagnostic_row_binding"]["reuse_existing_open"]
+    assert reuse["required_status"] == "OPEN"
+    assert reuse["required_exact_binding"] == {
+        "source_backlog_id": "AC-BYPASS-GUIDE-MIN-PATH",
+        "contract_execution_id": "cex-bypass-guide-min-path",
+        "line_id": "read_context",
+    }
+    generic = bypass["diagnostic_row_binding"]["generic_root_cause_row"]
+    assert generic["allowed_as"] == "evidence_ref_only"
+    assert generic["allowed_as_diagnostic_backlog_id"] is False
+    assert bypass["invariants"]["no_pass_claim"] is True
+    assert bypass["invariants"]["strict_line_validation_unchanged"] is True
+    assert bypass["invariants"]["bypass_acceptance_logic_unchanged"] is True
+
+
 def test_runtime_write_gate_rejects_negative_cases(tmp_path):
     _write_minimal_contract(tmp_path)
     runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path), instruction_root=tmp_path)

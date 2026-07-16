@@ -3462,6 +3462,11 @@ class ContractRuntime:
             sanitized_projection=sanitized_projection,
             reader_role=effective_actor_role,
         )
+        _attach_line_bypass_guidance(
+            guide,
+            record=record,
+            reader_role=effective_actor_role,
+        )
         current_precheck = self.gate_kernel.precheck(
             definition,
             action="current_state",
@@ -4353,6 +4358,165 @@ def _attach_writer_role_safe_submit_payload(
         writer_runtime_guide_hash=writer_hash or str(guide.get("runtime_guide_hash") or ""),
         role_runtime_guide_hashes=role_hashes,
     )
+
+
+def _attach_line_bypass_guidance(
+    guide: dict[str, Any],
+    *,
+    record: Mapping[str, Any],
+    reader_role: str,
+) -> None:
+    """Expose the existing strict line-bypass row lifecycle in copy-safe form."""
+
+    next_action = guide.get("next_legal_action")
+    if not isinstance(next_action, Mapping):
+        return
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    source_backlog_id = str(record.get("backlog_id") or "").strip()
+    stage_id = str(next_action.get("stage_id") or "").strip()
+    line_id = str(next_action.get("line_id") or "").strip()
+    if not contract_execution_id or not source_backlog_id or not line_id:
+        return
+    execution_state_revision = int(
+        next_action.get("execution_state_revision")
+        or record.get("execution_state_revision")
+        or 1
+    )
+    line_instance_id = str(
+        next_action.get("line_instance_id") or ""
+    ).strip()
+    identity_parts = [
+        "bypass",
+        contract_execution_id,
+        f"revision-{execution_state_revision}",
+        stage_id or "stage",
+        line_id,
+    ]
+    if line_instance_id:
+        identity_parts.append(line_instance_id)
+    bypass_identity = ":".join(identity_parts)
+    diagnostic_suffix = hashlib.sha256(
+        bypass_identity.encode("utf-8")
+    ).hexdigest()[:16].upper()
+    deterministic_diagnostic_id = (
+        f"AC-CONTRACT-LINE-BYPASS-{diagnostic_suffix}"
+    )
+    runtime_guide_hash = str(guide.get("runtime_guide_hash") or "")
+    evidence_refs = [
+        f"backlog:{source_backlog_id}",
+        (
+            f"contract-runtime:{contract_execution_id}:"
+            f"revision:{execution_state_revision}"
+        ),
+        "<blocked-line-evidence-ref>",
+    ]
+    common_body = {
+        "bypass_identity": bypass_identity,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "execution_state_revision": execution_state_revision,
+        "runtime_guide_hash": runtime_guide_hash,
+        "classification": "<process_guide|system_logic|environment>",
+        "reason": "<diagnosis of this exact blocked line>",
+        "decision": (
+            "<audited continuation decision; do not claim the blocked line passed>"
+        ),
+        "evidence_refs": evidence_refs,
+    }
+    exact_binding = {
+        "source_backlog_id": source_backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "line_id": line_id,
+    }
+    guide["line_bypass_guidance"] = {
+        "schema_version": "contract_runtime.line_bypass_guidance.v1",
+        "status": "available_for_current_line",
+        "copy_safe": True,
+        "endpoint": (
+            f"/api/projects/{record.get('project_id')}/contract-runtime/"
+            f"{contract_execution_id}/line-bypasses"
+        ),
+        "method": "POST",
+        "current_line_binding": {
+            **exact_binding,
+            "stage_id": stage_id,
+            "line_instance_id": line_instance_id,
+            "execution_state_revision": execution_state_revision,
+            "runtime_guide_hash": runtime_guide_hash,
+        },
+        "authorization": {
+            "allowed_actor_roles": ["observer", "qa"],
+            "reader_role": str(reader_role or ""),
+            "reader_role_authorized": str(reader_role or "")
+            in {"observer", "qa"},
+            "body_actor_role_is_not_authorization": True,
+        },
+        "bypass_identity": {
+            "recommended_value": bypass_identity,
+            "template": (
+                "bypass:{contract_execution_id}:revision-"
+                "{execution_state_revision}:{stage_id}:{line_id}"
+                "[:{line_instance_id}]"
+            ),
+            "line_specific": True,
+            "idempotency_key": True,
+        },
+        "diagnostic_row_binding": {
+            "policy": "new_atomic_or_existing_exact_open",
+            "create_new": {
+                "recommended": True,
+                "request_rule": (
+                    "Omit diagnostic_backlog_id. The line-bypass endpoint "
+                    "atomically creates and links a new OPEN diagnostic row."
+                ),
+                "deterministic_id_algorithm": (
+                    "AC-CONTRACT-LINE-BYPASS-"
+                    "{SHA256(bypass_identity)[0:16].upper()}"
+                ),
+                "deterministic_id_example": deterministic_diagnostic_id,
+                "must_not_precreate_or_reuse": True,
+            },
+            "reuse_existing_open": {
+                "allowed": True,
+                "request_rule": (
+                    "Set diagnostic_backlog_id only to an existing OPEN bypass "
+                    "diagnostic row whose stored binding matches every field "
+                    "in required_exact_binding."
+                ),
+                "required_status": "OPEN",
+                "required_exact_binding": exact_binding,
+                "all_fields_must_match": True,
+                "mismatch_fails_closed": True,
+            },
+            "generic_root_cause_row": {
+                "allowed_as": "evidence_ref_only",
+                "allowed_as_diagnostic_backlog_id": False,
+                "reason": (
+                    "A reusable root-cause row is not the line-specific bypass "
+                    "diagnostic binding."
+                ),
+            },
+        },
+        "create_new_copy_safe_body": dict(common_body),
+        "reuse_existing_open_copy_safe_body": {
+            **common_body,
+            "diagnostic_backlog_id": (
+                "<existing OPEN row with exact source/CEX/line binding>"
+            ),
+        },
+        "invariants": {
+            "no_pass_claim": True,
+            "written_status": "waived",
+            "disposition": "proceeded_with_exception",
+            "source_row_remains_open": True,
+            "diagnostic_row_remains_open": True,
+            "strict_line_validation_unchanged": True,
+            "strict_revision_and_runtime_guide_hash_validation_unchanged": True,
+            "bypass_acceptance_logic_unchanged": True,
+        },
+    }
 
 
 def _runtime_guide_role_hashes(
