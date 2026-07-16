@@ -7181,6 +7181,44 @@ def _qa_overlay_assert_safe_interpretation(
             )
 
 
+def _qa_demo_control_marker_is_server_generated(
+    query_root: Path,
+    *,
+    project_id: str,
+) -> bool:
+    marker_path = query_root / DEMO_ENVIRONMENT_MARKER
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    expected_keys = {
+        "schema_version",
+        "managed_by",
+        "owner_project_id",
+        "environment_id",
+        "template_id",
+        "project_id",
+        "fixture_root",
+        "created_at",
+    }
+    if set(payload) != expected_keys:
+        return False
+    expected = {
+        "schema_version": "demo_environment_marker.v1",
+        "managed_by": DEMO_ENVIRONMENT_MANAGED_BY,
+        "owner_project_id": project_id,
+        "fixture_root": str(query_root.resolve()),
+    }
+    if any(str(payload.get(key) or "") != value for key, value in expected.items()):
+        return False
+    return all(
+        str(payload.get(key) or "").strip()
+        for key in ("environment_id", "template_id", "project_id", "created_at")
+    )
+
+
 def _qa_checkout_root_identity(
     *,
     project_id: str,
@@ -7259,6 +7297,7 @@ def _qa_checkout_root_identity(
     query_root_clean: bool | None = None
     query_root_status_hash = ""
     query_root_tree_sha = ""
+    ignored_demo_control_metadata_paths: list[str] = []
     if require_query_candidate_head:
         status = _qa_git_bytes(
             query_root,
@@ -7270,7 +7309,15 @@ def _qa_checkout_root_identity(
                 "exact candidate review requires a verifiable clean query root",
                 query_root=str(query_root),
             )
-        query_root_clean = not bool(status.stdout)
+        dirty_entries = [item for item in status.stdout.split(b"\0") if item]
+        demo_marker_entry = f"?? {DEMO_ENVIRONMENT_MARKER}".encode("utf-8")
+        if demo_marker_entry in dirty_entries and _qa_demo_control_marker_is_server_generated(
+            query_root,
+            project_id=project_id,
+        ):
+            dirty_entries = [item for item in dirty_entries if item != demo_marker_entry]
+            ignored_demo_control_metadata_paths.append(DEMO_ENVIRONMENT_MARKER)
+        query_root_clean = not dirty_entries
         query_root_status_hash = (
             "sha256:" + hashlib.sha256(status.stdout).hexdigest()
         )
@@ -7279,8 +7326,9 @@ def _qa_checkout_root_identity(
                 "exact_candidate_query_root_dirty",
                 "exact candidate review requires a clean query worktree",
                 query_root=str(query_root),
-                dirty_entry_count=len(
-                    [item for item in status.stdout.split(b"\0") if item]
+                dirty_entry_count=len(dirty_entries),
+                ignored_demo_control_metadata_entry_count=len(
+                    ignored_demo_control_metadata_paths
                 ),
                 untracked_files_checked=True,
             )
@@ -7335,6 +7383,9 @@ def _qa_checkout_root_identity(
                 "query_root_status_hash": query_root_status_hash,
                 "query_root_tree_sha": query_root_tree_sha,
                 "query_root_untracked_files_checked": True,
+                "query_root_ignored_demo_control_metadata_paths": (
+                    ignored_demo_control_metadata_paths
+                ),
             }
         )
     return identity

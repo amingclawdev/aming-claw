@@ -22202,6 +22202,133 @@ def test_exact_candidate_context_accepts_linked_worktree_with_canonical_at_base(
     ]
 
 
+def _write_test_demo_environment_marker(project_root: Path) -> None:
+    server._write_demo_environment_marker(
+        {
+            "id": "demo-exact-candidate",
+            "template_id": "daily-planner-lite",
+            "project_id": "demo-exact-candidate-project",
+            "fixture_root": str(project_root),
+            "created_at": "2026-07-16T06:00:00Z",
+        },
+        PID,
+    )
+
+
+def test_exact_candidate_context_ignores_server_generated_demo_control_marker(
+    tmp_path,
+):
+    project_root = tmp_path / "qa-exact-demo-control-marker"
+    candidate_commit = _init_test_git_repo(project_root)
+    _write_test_demo_environment_marker(project_root)
+
+    context = server._qa_exact_candidate_context(
+        project_root,
+        project_id=PID,
+        canonical_project_root=project_root,
+        candidate_commit_sha=candidate_commit,
+    )
+
+    identity = context["root_identity"]
+    assert identity["query_root_clean"] is True
+    assert identity["query_root_ignored_demo_control_metadata_paths"] == [
+        server.DEMO_ENVIRONMENT_MARKER
+    ]
+
+
+def test_exact_candidate_context_rejects_demo_marker_lookalike_path(tmp_path):
+    project_root = tmp_path / "qa-exact-demo-control-lookalike"
+    candidate_commit = _init_test_git_repo(project_root)
+    lookalike = project_root / f"{server.DEMO_ENVIRONMENT_MARKER}.backup"
+    lookalike.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 0
+
+
+def test_exact_candidate_context_rejects_malformed_demo_control_marker(tmp_path):
+    project_root = tmp_path / "qa-exact-malformed-demo-control"
+    candidate_commit = _init_test_git_repo(project_root)
+    (project_root / server.DEMO_ENVIRONMENT_MARKER).write_text(
+        '{"managed_by": "aming-claw.demo-environments.v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 0
+
+
+def test_exact_candidate_context_still_rejects_other_dirty_file_with_demo_marker(
+    tmp_path,
+):
+    project_root = tmp_path / "qa-exact-demo-control-plus-dirty"
+    candidate_commit = _init_test_git_repo(project_root)
+    _write_test_demo_environment_marker(project_root)
+    (project_root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details["dirty_entry_count"] == 1
+    assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 1
+
+
+def test_exact_candidate_context_rejects_tracked_modified_demo_marker(tmp_path):
+    project_root = tmp_path / "qa-exact-tracked-demo-control"
+    _init_test_git_repo(project_root)
+    _write_test_demo_environment_marker(project_root)
+    subprocess.run(
+        ["git", "add", server.DEMO_ENVIRONMENT_MARKER],
+        cwd=project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "track demo control marker"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(project_root)
+    marker = project_root / server.DEMO_ENVIRONMENT_MARKER
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["created_at"] = "2026-07-16T06:01:00Z"
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_exact_candidate_context(
+            project_root,
+            project_id=PID,
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+        )
+
+    assert exc.value.reason == "exact_candidate_query_root_dirty"
+    assert exc.value.details["ignored_demo_control_metadata_entry_count"] == 0
+
+
 def test_exact_candidate_context_rejects_untracked_query_root(tmp_path):
     project_root = tmp_path / "qa-exact-dirty-root"
     candidate_commit = _init_test_git_repo(project_root)
