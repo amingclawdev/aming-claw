@@ -52366,7 +52366,7 @@ def _contract_runtime_rev3_dispatch_authority(
             if claimed_task_id == canonical_task_id:
                 continue
             if (
-                source_name == "payload"
+                source_name in {"write", "payload"}
                 and key == "task_id"
                 and claimed_task_id == contract_task_id
             ):

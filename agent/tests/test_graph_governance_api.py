@@ -47418,7 +47418,6 @@ def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_sco
         route_task_id=execution_id,
         task_field="worker_task_id",
     )
-    dispatch_payload["task_id"] = execution_id
 
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -47429,6 +47428,7 @@ def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_sco
                 "stage_id": "dispatch",
                 "line_id": "observer_dispatch_bounded_workers",
                 "evidence_kind": "dispatch_bounded_worker",
+                "task_id": execution_id,
                 "payload": dispatch_payload,
             },
         )
@@ -47442,6 +47442,55 @@ def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_sco
     assert completed_dispatch["payload"]["worker_task_id"] == runtime_context.task_id
     assert completed_dispatch["payload"]["route_identity"]["route_token_ref"] == (
         "rtok-mf-parallel-rev3-contract-route"
+    )
+
+
+def test_mf_parallel_rev3_dispatch_rejects_wrong_top_level_contract_task_id(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-REV3-WRONG-CONTRACT-TASK"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="mf-parallel-rev3-wrong-contract-parent",
+        worker_task_id="mf-parallel-rev3-wrong-contract-worker",
+        fence_token="fence-mf-parallel-rev3-wrong-contract",
+        token="token-mf-parallel-rev3-wrong-contract",
+        submit_dispatch=False,
+    )
+    execution_id = successor["contract_execution_id"]
+    dispatch_payload = _mf_parallel_rev3_worker_dispatch_payload(
+        conn,
+        backlog_id=backlog_id,
+        runtime_context=runtime_context,
+        route_label="mf-parallel-rev3-wrong-contract",
+        route_task_id=execution_id,
+        task_field="worker_task_id",
+    )
+
+    rejected = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "task_id": "cex-wrong-successor-contract",
+                "payload": dispatch_payload,
+            },
+        )
+    )
+
+    assert rejected["ok"] is False
+    assert (
+        "dispatch task_id does not match persisted runtime context"
+        in rejected["decision"]["errors"]
+    )
+    stored = server._contract_runtime_store(conn).get(execution_id)
+    assert stored["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
     )
 
 
