@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 from .worker_transcript_verify import verify_worker_transcript
 
 
@@ -16441,7 +16442,7 @@ def _git_worktree_dirty_files(repo_root: Path, *, timeout_seconds: int) -> list[
     )
     if proc.returncode != 0:
         return ["<git-status-error>"]
-    return [line[3:] if len(line) > 3 else line for line in proc.stdout.splitlines() if line]
+    return filter_dirty_files(parse_git_porcelain_paths(proc.stdout))
 
 
 def execute_merge_queue_item(

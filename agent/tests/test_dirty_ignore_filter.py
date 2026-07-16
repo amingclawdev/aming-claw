@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from agent.governance import parallel_branch_runtime as pbr
 from agent.governance.auto_chain import _DIRTY_IGNORE
 from agent.governance.dirty_worktree import filter_dirty_files, is_ignored_dirty_path
 from agent.governance.state_reconcile import _git_dirty_files
@@ -115,4 +116,21 @@ def test_scope_reconcile_dirty_files_uses_shared_filter(monkeypatch, tmp_path) -
     assert _git_dirty_files(tmp_path) == [
         "AGENTS.md",
         "agent/governance/server.py",
+    ]
+
+
+def test_parallel_merge_dirty_files_uses_shared_filter(monkeypatch, tmp_path) -> None:
+    stdout = "\n".join([
+        "?? .aming-claw-demo-environment.json",
+        "?? .worktrees/row-a/",
+        " M src/app.js",
+    ])
+
+    def fake_preview_command(repo_root, args, *, timeout_seconds):
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(pbr, "_git_preview_command", fake_preview_command)
+
+    assert pbr._git_worktree_dirty_files(tmp_path, timeout_seconds=30) == [
+        "src/app.js",
     ]
