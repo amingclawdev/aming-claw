@@ -31484,6 +31484,11 @@ def _complete_source_backed_mf_parallel_successor(
     ]
     record = runtime.store.get(contract_execution_id)
     for actor_role, stage_id, line_id, evidence_kind, payload, commit_sha in line_specs:
+        if not runtime.pinned_definition_has_line(
+            contract_execution_id,
+            line_id,
+        ):
+            continue
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
         write = server._contract_runtime_write_from_record(
@@ -40453,6 +40458,8 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
         ("mf_sub", "worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
         ("mf_sub", "qa_handoff", "worker_review_ready_handoff", "review_ready"),
     ]:
+        if not runtime.pinned_definition_has_line(execution_id, line_id):
+            continue
         submit_line(actor_role, stage_id, line_id, evidence_kind)
 
     submit_line(
@@ -40602,6 +40609,8 @@ def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
         ("mf_sub", "worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
         ("mf_sub", "qa_handoff", "worker_review_ready_handoff", "review_ready"),
     ]:
+        if not runtime.pinned_definition_has_line(execution_id, line_id):
+            continue
         submit_line(actor_role, stage_id, line_id, evidence_kind)
 
     failed_record = submit_line(
@@ -49028,7 +49037,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         )
     assert mismatch.value.code == "contract_worker_finish_attestation_mismatch"
 
-    server.handle_graph_governance_runtime_context_finish_gate(
+    finish_response = server.handle_graph_governance_runtime_context_finish_gate(
         _ctx_with_role(
             {
                 "project_id": PID,
@@ -49039,6 +49048,23 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             body=finish_body,
         )
     )
+    assert finish_response["contract_runtime_canonical_handoff_line"] == {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": False,
+        "status": "not_required_by_pinned_definition",
+        "canonical": False,
+        "contract_execution_id": contract_execution_id,
+        "line_id": "worker_review_ready_handoff",
+    }
+    contract_after_finish = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert contract_after_finish["completed_lines"][-1]["line_id"] == (
+        "worker_finish_gate"
+    )
+    assert contract_after_finish["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "qa_graph_context"
     finish_event = task_timeline.list_events(
         conn, PID, task_id=worker_task_id, event_kind="mf_subagent_finish_gate"
     )[-1]
@@ -51469,7 +51495,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert current["next_legal_action"]["line_id"] == "qa_independent_verification"
     projection = current["runtime_guide"]["completed_lines_projection"]
     assert projection["source"] == "runtime_context_worker_evidence"
-    assert projection["projected_line_count"] == 3
+    assert projection["projected_line_count"] == 2
     submit_guidance = current["submit_line_guidance"]
     assert submit_guidance["completed_lines_projection_present"] is True
     assert submit_guidance[
@@ -51482,8 +51508,10 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert {
         "worker_finish_time_attestation",
         "worker_finish_gate",
-        "worker_review_ready_handoff",
     }.issubset(submit_guidance["projected_line_ids"])
+    assert "worker_review_ready_handoff" not in submit_guidance[
+        "projected_line_ids"
+    ]
     assert "fence-runtime-context-projection" not in json.dumps(current)
 
     stored_before_qa = server._contract_runtime_store(conn).get(

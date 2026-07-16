@@ -25647,24 +25647,46 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                         payload=finish_event_payload,
                     )
                 )
-                handoff_payload = {
-                    **finish_event_payload,
-                    "action": "record_worker_review_ready_handoff",
-                    "review_ready": True,
-                    "finish_gate_checkpoint_id": saved.checkpoint_id,
-                    "finish_gate_contract_line": canonical_finish_line,
-                }
-                canonical_handoff_line = (
-                    _runtime_context_submit_canonical_contract_line(
-                        conn,
-                        project_id=project_id,
-                        context=saved,
-                        stage_id="qa_handoff",
-                        line_id="worker_review_ready_handoff",
-                        evidence_kind="review_ready",
-                        payload=handoff_payload,
+                canonical_execution_id = str(
+                    canonical_finish_line.get("contract_execution_id") or ""
+                ).strip()
+                handoff_is_pinned = bool(
+                    canonical_execution_id
+                    and _contract_runtime(conn).pinned_definition_has_line(
+                        canonical_execution_id,
+                        "worker_review_ready_handoff",
                     )
                 )
+                if handoff_is_pinned:
+                    handoff_payload = {
+                        **finish_event_payload,
+                        "action": "record_worker_review_ready_handoff",
+                        "review_ready": True,
+                        "finish_gate_checkpoint_id": saved.checkpoint_id,
+                        "finish_gate_contract_line": canonical_finish_line,
+                    }
+                    canonical_handoff_line = (
+                        _runtime_context_submit_canonical_contract_line(
+                            conn,
+                            project_id=project_id,
+                            context=saved,
+                            stage_id="qa_handoff",
+                            line_id="worker_review_ready_handoff",
+                            evidence_kind="review_ready",
+                            payload=handoff_payload,
+                        )
+                    )
+                elif canonical_execution_id:
+                    canonical_handoff_line = {
+                        "schema_version": (
+                            "runtime_context.canonical_contract_line.v1"
+                        ),
+                        "accepted": False,
+                        "status": "not_required_by_pinned_definition",
+                        "canonical": False,
+                        "contract_execution_id": canonical_execution_id,
+                        "line_id": "worker_review_ready_handoff",
+                    }
                 finish_event_payload["contract_runtime_canonical_line"] = dict(
                     canonical_finish_line
                 )
@@ -47736,9 +47758,18 @@ def _contract_runtime_projection_for_context(
     projected_line_refs: list[dict[str, Any]] = []
     source_refs: list[str] = []
     local_keys = set(existing_keys)
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    runtime = _contract_runtime(conn)
     for stage_id, line_id, evidence_kind, source_key in (
         _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES
     ):
+        if contract_execution_id and not runtime.pinned_definition_has_line(
+            contract_execution_id,
+            line_id,
+        ):
+            continue
         source = source_map.get(source_key)
         if line_id == "worker_commit":
             worker_commit_key = (
