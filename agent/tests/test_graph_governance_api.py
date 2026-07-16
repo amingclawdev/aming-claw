@@ -52798,6 +52798,97 @@ def test_live_merge_recorder_parent_task_scope_projects_exact_child_task(conn):
     ) == {}
 
 
+def test_live_merge_batch_root_wrapper_projects_exact_child_task():
+    batch_task_id = "mf-batch-live-merge-root"
+    child_contract_id = "cex-live-merge-child-contract"
+    child_task_id = f"{batch_task_id}:row:1"
+    runtime_context_id = "mfrctx-live-merge-batch-child"
+    event = {
+        "task_id": batch_task_id,
+        "payload": {
+            "child_task_id": child_task_id,
+            "parent_task_id": batch_task_id,
+            "runtime_context_id": runtime_context_id,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "parent_task_id": child_contract_id,
+                    "root_task_id": batch_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    }
+
+    scope = server._contract_runtime_projection_timeline_scope_values(event)
+    assert scope["child_task_ids"] == [child_task_id]
+    assert scope["runtime_context_ids"] == [runtime_context_id]
+    assert scope["related_task_ids"] == [
+        child_contract_id,
+        batch_task_id,
+    ]
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        event,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={child_contract_id},
+        allow_taskless=False,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("top_level_task_id", "mf-batch-unrelated-root"),
+        ("batch_parent_task_id", "mf-batch-forged-root"),
+        ("child_contract_parent_task_id", "cex-forged-child-contract"),
+        ("observer_command_id", "cex-unrelated-observer-command"),
+        ("child_task_id", "mf-batch-live-merge-root:row:2"),
+        ("runtime_context_id", "mfrctx-unrelated-batch-child"),
+    ],
+)
+def test_live_merge_batch_root_wrapper_rejects_forged_claims(
+    mutation,
+    value,
+):
+    batch_task_id = "mf-batch-live-merge-root"
+    child_contract_id = "cex-live-merge-child-contract"
+    child_task_id = f"{batch_task_id}:row:1"
+    runtime_context_id = "mfrctx-live-merge-batch-child"
+    event = {
+        "task_id": batch_task_id,
+        "payload": {
+            "child_task_id": child_task_id,
+            "parent_task_id": batch_task_id,
+            "runtime_context_id": runtime_context_id,
+            "recorded_merge": {
+                "context": {
+                    "task_id": child_task_id,
+                    "parent_task_id": child_contract_id,
+                    "root_task_id": batch_task_id,
+                    "runtime_context_id": runtime_context_id,
+                }
+            },
+        },
+    }
+    if mutation == "top_level_task_id":
+        event["task_id"] = value
+    elif mutation == "batch_parent_task_id":
+        event["payload"]["parent_task_id"] = value
+    elif mutation == "child_contract_parent_task_id":
+        event["payload"]["recorded_merge"]["context"]["parent_task_id"] = value
+    else:
+        event["payload"][mutation] = value
+
+    assert server._contract_runtime_projection_timeline_scope_matches(
+        event,
+        runtime_context_id=runtime_context_id,
+        task_id=child_task_id,
+        related_task_ids={child_contract_id},
+        allow_taskless=False,
+    ) is False
+
+
 @pytest.mark.parametrize(
     ("mutation", "value"),
     [

@@ -50289,13 +50289,28 @@ def _contract_runtime_projection_timeline_scope_matches(
         event_context_values != {runtime_context_id}
     ):
         return False
+    allowed_task_values = {
+        value for value in ({expected_task_id} | expected_related) if value
+    }
+    top_level_task_id = str(event.get("task_id") or "").strip()
+    exact_batch_wrapper = bool(
+        expected_task_id
+        and runtime_context_id
+        and event_child_task_values == {expected_task_id}
+        and event_context_values == {runtime_context_id}
+        and expected_related
+        and expected_related.issubset(event_related_values)
+        and top_level_task_id
+        and top_level_task_id not in allowed_task_values
+        and (event_related_values - expected_related) == {top_level_task_id}
+        and (event_task_values - allowed_task_values) == {top_level_task_id}
+    )
+    if exact_batch_wrapper:
+        return True
     if expected_related and event_related_values and not (
         event_related_values.issubset(expected_related)
     ):
         return False
-    allowed_task_values = {
-        value for value in ({expected_task_id} | expected_related) if value
-    }
     if expected_task_id and event_task_values and not (
         event_task_values.issubset(allowed_task_values)
     ):
