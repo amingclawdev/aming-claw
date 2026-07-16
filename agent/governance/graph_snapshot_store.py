@@ -2376,9 +2376,10 @@ def current_full_reconcile_state(
     active = get_active_graph_snapshot(conn, project_id) or {}
     active_snapshot_id = str(active.get("snapshot_id") or "").strip()
     active_snapshot_commit = str(active.get("commit_sha") or "").strip().lower()
-    marker = _snapshot_notes(active).get("current_full_reconcile")
-    marker = dict(marker) if isinstance(marker, Mapping) else {}
-    marker_target_commit = str(marker.get("target_commit_sha") or "").strip().lower()
+    active_marker = _snapshot_notes(active).get("current_full_reconcile")
+    active_marker = (
+        dict(active_marker) if isinstance(active_marker, Mapping) else {}
+    )
     pending_count = int(
         conn.execute(
             """
@@ -2394,7 +2395,18 @@ def current_full_reconcile_state(
             ),
         ).fetchone()[0]
     )
-    provenance_id = str(marker.get("provenance_id") or "").strip()
+    try:
+        requested_reconcile_event_id = int(reconcile_event_id or 0)
+    except (TypeError, ValueError):
+        requested_reconcile_event_id = 0
+    active_marker_target = str(
+        active_marker.get("target_commit_sha") or ""
+    ).strip().lower()
+    provenance_id = (
+        str(active_marker.get("provenance_id") or "").strip()
+        if active_marker_target == merged_commit_sha
+        else ""
+    )
     provenance_row = None
     if provenance_id:
         provenance_row = conn.execute(
@@ -2411,7 +2423,64 @@ def current_full_reconcile_state(
                 merged_commit_sha,
             ),
         ).fetchone()
+    if provenance_row is None and requested_reconcile_event_id > 0:
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND target_commit_sha = ?
+              AND reconcile_event_id = ?
+            ORDER BY created_at DESC, provenance_id DESC
+            LIMIT 2
+            """,
+            (
+                project_id,
+                merged_commit_sha,
+                requested_reconcile_event_id,
+            ),
+        ).fetchall()
+        if len(provenance_rows) == 1:
+            provenance_row = provenance_rows[0]
+    if provenance_row is None and requested_reconcile_event_id <= 0:
+        provenance_rows = conn.execute(
+            """
+            SELECT *
+            FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND target_commit_sha = ?
+            ORDER BY created_at DESC, provenance_id DESC
+            LIMIT 2
+            """,
+            (project_id, merged_commit_sha),
+        ).fetchall()
+        if len(provenance_rows) == 1:
+            provenance_row = provenance_rows[0]
     provenance = dict(provenance_row) if provenance_row else {}
+    reconcile_snapshot_id = str(provenance.get("snapshot_id") or "").strip()
+    reconcile_snapshot_row = None
+    if reconcile_snapshot_id:
+        reconcile_snapshot_row = conn.execute(
+            """
+            SELECT *
+            FROM graph_snapshots
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, reconcile_snapshot_id),
+        ).fetchone()
+    reconcile_snapshot = (
+        dict(reconcile_snapshot_row) if reconcile_snapshot_row else {}
+    )
+    if not reconcile_snapshot and active_snapshot_commit == merged_commit_sha:
+        reconcile_snapshot = dict(active)
+        reconcile_snapshot_id = active_snapshot_id
+    marker = _snapshot_notes(reconcile_snapshot).get("current_full_reconcile")
+    marker = dict(marker) if isinstance(marker, Mapping) else {}
+    marker_target_commit = str(marker.get("target_commit_sha") or "").strip().lower()
+    reconcile_snapshot_commit = str(
+        reconcile_snapshot.get("commit_sha") or ""
+    ).strip().lower()
+    reconcile_snapshot_status = str(
+        reconcile_snapshot.get("status") or ""
+    ).strip()
     try:
         stored_marker = json.loads(str(provenance.get("marker_json") or "{}"))
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -2499,7 +2568,8 @@ def current_full_reconcile_state(
         and marker.get("normal_update_path") is True
         and marker.get("activate") is True
         and marker_target_commit == merged_commit_sha
-        and str(marker.get("snapshot_id") or "").strip() == active_snapshot_id
+        and str(marker.get("snapshot_id") or "").strip()
+        == reconcile_snapshot_id
         and str(marker.get("protected_action") or "").strip()
         == "graph_current_full_reconcile"
         and str(marker.get("protected_entrypoint") or "").strip()
@@ -2618,6 +2688,12 @@ def current_full_reconcile_state(
     provenance_scope_verified = bool(
         task_scope_verified and runtime_context_scope_verified
     )
+    reconcile_snapshot_verified = bool(
+        reconcile_snapshot_id
+        and reconcile_snapshot_commit == merged_commit_sha
+        and reconcile_snapshot_status
+        in {SNAPSHOT_STATUS_ACTIVE, SNAPSHOT_STATUS_SUPERSEDED}
+    )
     active_snapshot_verified = bool(
         active_snapshot_id
         and str(active.get("status") or "").strip() == SNAPSHOT_STATUS_ACTIVE
@@ -2629,7 +2705,7 @@ def current_full_reconcile_state(
         and marker_verified
         and durable_order_verified
         and provenance_scope_verified
-        and active_snapshot_verified
+        and reconcile_snapshot_verified
         and pending_count == 0
     )
     return {
@@ -2642,6 +2718,10 @@ def current_full_reconcile_state(
         "active_snapshot_commit": active_snapshot_commit,
         "active_snapshot_status": str(active.get("status") or "").strip(),
         "active_snapshot_verified": active_snapshot_verified,
+        "reconcile_snapshot_id": reconcile_snapshot_id,
+        "reconcile_snapshot_commit": reconcile_snapshot_commit,
+        "reconcile_snapshot_status": reconcile_snapshot_status,
+        "reconcile_snapshot_verified": reconcile_snapshot_verified,
         "current_full_reconcile": bool(marker),
         "current_full_reconcile_marker": marker,
         "current_full_reconcile_marker_verified": marker_verified,
@@ -2673,6 +2753,11 @@ def current_full_reconcile_state(
         "pending_scope_reconcile_count": pending_count,
         "pending_scope_reconcile_zero": pending_count == 0,
         "source_ref": (
+            f"graph_snapshot:{reconcile_snapshot_id}"
+            if reconcile_snapshot_id
+            else ""
+        ),
+        "active_source_ref": (
             f"graph_snapshot:{active_snapshot_id}" if active_snapshot_id else ""
         ),
     }

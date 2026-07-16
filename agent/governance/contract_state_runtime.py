@@ -3502,7 +3502,13 @@ def _current_full_reconcile_satisfies_requirement(
         or authority.get("active_graph_commit")
         or ""
     ).strip().lower()
-    snapshot_id = str(
+    reconcile_snapshot_id = str(
+        authority.get("reconcile_snapshot_id")
+        or authority.get("active_snapshot_id")
+        or authority.get("snapshot_id")
+        or ""
+    ).strip()
+    active_snapshot_id = str(
         authority.get("active_snapshot_id") or authority.get("snapshot_id") or ""
     ).strip()
     marker = authority.get("current_full_reconcile_marker")
@@ -3578,7 +3584,8 @@ def _current_full_reconcile_satisfies_requirement(
         == str(provenance.get("provenance_hash") or "").strip()
         and str(marker.get("target_commit_sha") or "").strip().lower()
         == merged_head
-        and str(marker.get("snapshot_id") or "").strip() == snapshot_id
+        and str(marker.get("snapshot_id") or "").strip()
+        == reconcile_snapshot_id
         and positive_int(marker.get("reconcile_event_id")) == reconcile_event_id
         and positive_int(provenance.get("reconcile_event_id"))
         == reconcile_event_id
@@ -3602,12 +3609,23 @@ def _current_full_reconcile_satisfies_requirement(
     ):
         return False
     commits = (target_commit, canonical_head, merged_head, active_graph_commit)
+    exact_commit_authority = len(set(commits)) == 1
+    temporal_descendant_authority = bool(
+        target_commit == merged_head
+        and canonical_head == active_graph_commit
+        and authority.get(
+            "reconciled_commit_is_ancestor_of_canonical_head"
+        )
+        is True
+        and authority.get("active_snapshot_matches_canonical_head") is True
+    )
     qa_time = _event_time_order_value(qa_event_created_at)
     merge_time = _event_time_order_value(merge_event_created_at)
     reconcile_time = _event_time_order_value(reconcile_event_created_at)
     return bool(
         current_full
-        and snapshot_id
+        and reconcile_snapshot_id
+        and active_snapshot_id
         and authority.get("graph_reconciled") is True
         and authority.get("canonical_head_verified") is True
         and authority.get("active_snapshot_verified") is True
@@ -3626,7 +3644,7 @@ def _current_full_reconcile_satisfies_requirement(
         and qa_time < merge_time < reconcile_time
         and marker_verified
         and all(full_commit(value) for value in commits)
-        and len(set(commits)) == 1
+        and (exact_commit_authority or temporal_descendant_authority)
     )
 
 

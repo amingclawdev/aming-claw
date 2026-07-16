@@ -23149,6 +23149,32 @@ def test_exact_candidate_trace_remains_verified_after_scoped_durable_live_merge(
         "identity_mismatches"
     ]
 
+    (fixture.root / "later_sibling.txt").write_text(
+        "later sibling advances canonical main\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "later_sibling.txt"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "later sibling merge"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    later_sibling_head = batch_jobs.git_commit(fixture.root)
+    assert later_sibling_head != merge_commit
+
+    after_later_sibling = trace_refs()
+    assert after_later_sibling["db_verified"] is True, after_later_sibling[
+        "identity_mismatches"
+    ]
+
     def update_merge_event(
         *,
         payload: dict[str, Any] | None = None,
@@ -53740,6 +53766,53 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert reconcile_authority["strategy"] == "current_full_reconcile"
     assert reconcile_authority["provenance_verified"] is True
     assert reconcile_authority["durable_order_verified"] is True
+
+    later_sibling_head = "e" * 40
+    activate_current_full(
+        "full-runtime-context-later-sibling",
+        later_sibling_head,
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: later_sibling_head,
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == head_commit and descendant == later_sibling_head
+        ),
+    )
+    after_later_sibling = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "observer",
+        )
+    )
+    assert after_later_sibling["next_legal_action"] == {}
+    later_projection = after_later_sibling["runtime_guide"][
+        "completed_lines_projection"
+    ]["projected_completed_lines"]
+    later_reconcile = next(
+        line
+        for line in later_projection
+        if line["line_id"] == "observer_reconcile"
+    )
+    later_authority = later_reconcile["payload"]["reconcile_authority"]
+    assert later_authority["merged_commit_sha"] == head_commit
+    assert later_authority["reconcile_snapshot_id"] == current_full_snapshot_id
+    assert later_authority["canonical_head_commit"] == later_sibling_head
+    assert later_authority["active_snapshot_commit"] == later_sibling_head
+    assert (
+        later_authority["reconciled_commit_is_ancestor_of_canonical_head"]
+        is True
+    )
+    assert later_authority["active_snapshot_matches_canonical_head"] is True
 
 
 def test_contract_runtime_current_blocks_stale_dispatch_runtime_context_mismatch(conn):

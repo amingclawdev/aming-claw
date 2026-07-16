@@ -8146,11 +8146,14 @@ def _qa_exact_candidate_post_merge_provenance(
         canonical_project_root,
         candidate_commit_sha,
     )
-    merged_commit = _qa_post_merge_resolve_commit(
+    canonical_head = _qa_post_merge_resolve_commit(
         canonical_project_root,
         canonical_head_commit,
     )
-    if candidate_commit != candidate_commit_sha or merged_commit != canonical_head_commit:
+    if (
+        candidate_commit != candidate_commit_sha
+        or canonical_head != canonical_head_commit
+    ):
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -8162,7 +8165,7 @@ def _qa_exact_candidate_post_merge_provenance(
         return {}, mismatches
     ancestry = _qa_git_bytes(
         canonical_project_root,
-        ["merge-base", "--is-ancestor", candidate_commit, merged_commit],
+        ["merge-base", "--is-ancestor", candidate_commit, canonical_head],
     )
     if ancestry.returncode != 0:
         mismatches.append(
@@ -8410,7 +8413,33 @@ def _qa_exact_candidate_post_merge_provenance(
                 for item in merge_claims
             }
             merge_commits.discard("")
-            if merge_commits != {merged_commit}:
+            if len(merge_commits) != 1:
+                continue
+            scoped_merge_commit = next(iter(merge_commits))
+            if scoped_merge_commit == candidate_commit:
+                continue
+            candidate_to_scoped_merge = _qa_git_bytes(
+                canonical_project_root,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    candidate_commit,
+                    scoped_merge_commit,
+                ],
+            )
+            scoped_merge_to_canonical_head = _qa_git_bytes(
+                canonical_project_root,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    scoped_merge_commit,
+                    canonical_head,
+                ],
+            )
+            if (
+                candidate_to_scoped_merge.returncode != 0
+                or scoped_merge_to_canonical_head.returncode != 0
+            ):
                 continue
             verified_provenance = {
                 "schema_version": "qa_exact_candidate.post_merge_provenance.v1",
@@ -8421,11 +8450,13 @@ def _qa_exact_candidate_post_merge_provenance(
                 "task_id": task_id,
                 "runtime_context_id": runtime_context_id,
                 "candidate_commit_sha": candidate_commit,
-                "merged_commit_sha": merged_commit,
+                "merged_commit_sha": scoped_merge_commit,
+                "canonical_head_commit_sha": canonical_head,
                 "qa_event_ref": qa_event["event_ref"],
                 "merge_event_ref": f"timeline:{event_id}",
                 "ordered_after_qa": True,
                 "candidate_is_ancestor": True,
+                "scoped_merge_is_ancestor_of_canonical_head": True,
             }
             break
         if verified_provenance:
@@ -29254,6 +29285,37 @@ def _git_head_commit(project_root: Path) -> str:
     except Exception:
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_commit_is_ancestor(
+    project_root: Path,
+    ancestor_commit: str,
+    descendant_commit: str,
+) -> bool:
+    ancestor_commit = str(ancestor_commit or "").strip().lower()
+    descendant_commit = str(descendant_commit or "").strip().lower()
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ancestor_commit)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", descendant_commit)
+    ):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                ancestor_commit,
+                descendant_commit,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=project_root,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str:
@@ -53276,14 +53338,46 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
     )
     target_project_root = str(Path(root).resolve()) if root else ""
     canonical_head_commit = _git_head_commit(Path(root)).strip().lower() if root else ""
-    canonical_head_verified = bool(
+    active_snapshot_commit = str(
+        state.get("active_snapshot_commit") or ""
+    ).strip().lower()
+    canonical_head_equals_merged_commit = bool(
         merged_commit and canonical_head_commit == merged_commit
+    )
+    reconciled_commit_is_ancestor_of_canonical_head = bool(
+        canonical_head_equals_merged_commit
+        or (
+            root
+            and merged_commit
+            and canonical_head_commit
+            and _git_commit_is_ancestor(
+                Path(root),
+                merged_commit,
+                canonical_head_commit,
+            )
+        )
+    )
+    canonical_head_verified = bool(
+        reconciled_commit_is_ancestor_of_canonical_head
     )
     db_verified = bool(
         merge.get("timeline_verified") is True and state.get("db_verified") is True
     )
-    live_verified = bool(target_project_root and canonical_head_verified)
-    active_snapshot_verified = state.get("active_snapshot_verified") is True
+    active_snapshot_matches_canonical_head = bool(
+        active_snapshot_commit
+        and active_snapshot_commit == canonical_head_commit
+        and str(state.get("active_snapshot_status") or "").strip()
+        == "active"
+    )
+    live_verified = bool(
+        target_project_root
+        and canonical_head_verified
+        and active_snapshot_matches_canonical_head
+    )
+    active_snapshot_verified = bool(
+        live_verified
+        and state.get("reconcile_snapshot_verified") is True
+    )
     graph_reconciled = bool(db_verified and live_verified and active_snapshot_verified)
     authority = {
         **dict(state),
@@ -53292,6 +53386,9 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         "live_verified": live_verified,
         "canonical_head_verified": canonical_head_verified,
         "active_snapshot_verified": active_snapshot_verified,
+        "active_snapshot_matches_canonical_head": (
+            active_snapshot_matches_canonical_head
+        ),
         "graph_reconciled": graph_reconciled,
         "project_id": project_id,
         "backlog_id": str(record.get("backlog_id") or ""),
@@ -53300,10 +53397,14 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         "task_id": str(merge.get("task_id") or ""),
         "parent_task_id": str(merge.get("parent_task_id") or ""),
         "merged_commit_sha": merged_commit,
-        "reconciled_commit_sha": str(
-            state.get("active_snapshot_commit") or ""
-        ).strip().lower(),
+        "reconciled_commit_sha": merged_commit,
         "canonical_head_commit": canonical_head_commit,
+        "canonical_head_equals_merged_commit": (
+            canonical_head_equals_merged_commit
+        ),
+        "reconciled_commit_is_ancestor_of_canonical_head": (
+            reconciled_commit_is_ancestor_of_canonical_head
+        ),
         "target_project_root": target_project_root,
         "merge_source_ref": str(merge.get("merge_source_ref") or ""),
         "merge_projection_verified": merge.get("timeline_verified") is True,
