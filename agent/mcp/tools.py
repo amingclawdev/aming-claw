@@ -565,6 +565,34 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     return properties
 
 
+def _contract_runtime_bypass_line_schema_properties() -> dict[str, Any]:
+    properties = {
+        "project_id": {"type": "string"},
+        "backlog_id": {"type": "string"},
+        "contract_execution_id": {"type": "string"},
+        "bypass_identity": {"type": "string"},
+        "stage_id": {"type": "string"},
+        "line_id": {"type": "string"},
+        "execution_state_revision": {"type": "integer"},
+        "runtime_guide_hash": {"type": "string"},
+        "diagnostic_backlog_id": {"type": "string"},
+        "diagnostic_priority": {"type": "string"},
+        "classification": {"type": "string"},
+        "reason": {"type": "string"},
+        "decision": {"type": "string"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+        "task_id": {"type": "string"},
+        "phase": {"type": "string"},
+        "commit_sha": {"type": "string"},
+        "observer_route_token_ref": {"type": "string"},
+        "route_token_ref": {"type": "string"},
+        "observer_session_id": {"type": "string"},
+        "qa_session_token": {"type": "string"},
+        "qa_session_token_ref": {"type": "string"},
+    }
+    return properties
+
+
 def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
     route_identity_properties = {
         "route_id": {"type": "string"},
@@ -2410,6 +2438,28 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": _contract_runtime_submit_line_schema_properties(),
             "required": ["project_id", "contract_execution_id"],
+        },
+    },
+    {
+        "name": "contract_runtime_bypass_line",
+        "description": (
+            "Waive only the current ContractRuntime line, link an OPEN diagnostic, "
+            "and never claim PASS."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _contract_runtime_bypass_line_schema_properties(),
+            "required": [
+                "project_id",
+                "contract_execution_id",
+                "bypass_identity",
+                "stage_id",
+                "line_id",
+                "execution_state_revision",
+                "classification",
+                "reason",
+                "decision",
+            ],
         },
     },
     {
@@ -4570,6 +4620,41 @@ class ToolDispatcher:
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
+                body,
+            )
+
+        if name == "contract_runtime_bypass_line":
+            pid = args["project_id"]
+            execution_id = urllib.parse.quote(
+                str(args["contract_execution_id"]), safe=""
+            )
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "contract_execution_id",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
+            body = {
+                key: value
+                for key, value in args.items()
+                if key
+                not in {"project_id", "contract_execution_id", "qa_session_token"}
+                and value is not None
+            }
+            if qa_session_token:
+                return self._api_with_role_token(
+                    "POST",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/line-bypasses",
+                    body,
+                    role_token=qa_session_token,
+                )
+            return self._api(
+                "POST",
+                f"/api/projects/{pid}/contract-runtime/{execution_id}/line-bypasses",
                 body,
             )
 

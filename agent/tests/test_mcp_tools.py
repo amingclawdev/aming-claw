@@ -1752,6 +1752,72 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     ]
 
 
+def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_leak():
+    tool = next(
+        item for item in TOOLS if item.get("name") == "contract_runtime_bypass_line"
+    )
+    assert set(tool["inputSchema"]["required"]) == {
+        "project_id",
+        "contract_execution_id",
+        "bypass_identity",
+        "stage_id",
+        "line_id",
+        "execution_state_revision",
+        "classification",
+        "reason",
+        "decision",
+    }
+    assert _tool_properties("contract_runtime_bypass_line").keys() >= {
+        "runtime_guide_hash",
+        "diagnostic_backlog_id",
+        "diagnostic_priority",
+        "evidence_refs",
+        "observer_route_token_ref",
+        "observer_session_id",
+        "qa_session_token",
+        "qa_session_token_ref",
+    }
+
+    recorder = _AuthRecorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        manager_api_fn=recorder.api,
+        workspace="/repo",
+    )
+    dispatcher._api_with_role_token = recorder.api_with_role_token
+    body = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-bypass",
+        "bypass_identity": "bypass:cex-bypass:3",
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "execution_state_revision": 3,
+        "runtime_guide_hash": "sha256:guide",
+        "classification": "system_logic",
+        "reason": "the current gate cannot advance",
+        "decision": "continue with linked OPEN diagnostic",
+        "evidence_refs": ["timeline-event:13901"],
+        "qa_session_token": "gov-qa-secret",
+    }
+
+    dispatcher.dispatch("contract_runtime_bypass_line", body)
+
+    assert recorder.auth_calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/contract-runtime/cex-bypass/line-bypasses",
+            {
+                key: value
+                for key, value in body.items()
+                if key not in {"project_id", "contract_execution_id", "qa_session_token"}
+            },
+            "gov-qa-secret",
+        )
+    ]
+    assert "gov-qa-secret" not in json.dumps(recorder.auth_calls[0][2], sort_keys=True)
+
+
 def test_mcp_qa_session_tools_and_contract_runtime_auth_token_do_not_leak_body():
     names = _tool_names()
     assert {"qa_session_register", "qa_session_heartbeat"}.issubset(names)
