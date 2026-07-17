@@ -17212,6 +17212,168 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
     ).stdout.find("Chain-Source-Stage: merge") != -1
 
 
+def test_parallel_branch_merge_execute_mutates_target_owner_not_candidate_worktree(
+    conn,
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_worktree = tmp_path / "candidate-worker"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "feature-owned-main",
+            str(candidate_worktree),
+            main_head,
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (candidate_worktree / "owned-main.txt").write_text(
+        "candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "owned-main.txt"],
+        cwd=candidate_worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate from worker worktree"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    queue_id = "mergeq-api-target-owner"
+    task_id = "target-owner-task"
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {
+            "status": "pass",
+            "passed": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": "timeline:target-owner-qa",
+        },
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="mf-batch-shared-target-owner",
+            task_id=task_id,
+            branch_ref="refs/heads/feature-owned-main",
+            status="merge_ready",
+            fence_token="fence-target-owner",
+            target_project_root=str(candidate_worktree),
+            worktree_path=str(candidate_worktree),
+            base_commit=main_head,
+            head_commit=candidate_commit,
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-07-17T08:35:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-target-owner",
+                task_id=task_id,
+                branch_ref="refs/heads/feature-owned-main",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-target-owner",
+                projection_id="semproj-target-owner",
+            )
+        ],
+        now_iso="2026-07-17T08:35:00Z",
+    )
+
+    live = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "target_ref": "refs/heads/main",
+                "task_id": task_id,
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": "fence-target-owner",
+                "route_waiver": _route_waiver(
+                    "merge_execute",
+                    task_id=task_id,
+                ),
+                "message": "merge candidate without checking out main in worker",
+                "bug_id": "AC-MERGE-TARGET-OWNER",
+                "now_iso": "2026-07-17T08:36:00Z",
+            },
+        )
+    )
+
+    assert live["ok"] is True
+    assert live["executed"] is True
+    assert live["target_ref_mutated"] is True
+    assert live["repo_root_path"] == str(candidate_worktree.resolve())
+    assert live["repo_root_source"] == "runtime_context.target_project_root"
+    assert live["candidate_preview_root"] == str(candidate_worktree.resolve())
+    assert live["target_mutation_root"] == str(repo.resolve())
+    assert live["target_mutation_root_source"] == "git_worktree_target_ref_owner"
+    assert subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "feature-owned-main"
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == candidate_commit
+    assert subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == live["merge_commit"]
+    assert (repo / "owned-main.txt").read_text(encoding="utf-8") == "candidate\n"
+
+
 def test_parallel_branch_canonical_live_merge_identity_resolves_short_and_full_sha(
     tmp_path,
 ):

@@ -16445,6 +16445,56 @@ def _git_worktree_dirty_files(repo_root: Path, *, timeout_seconds: int) -> list[
     return filter_dirty_files(parse_git_porcelain_paths(proc.stdout))
 
 
+def _local_branch_ref(ref: str) -> str:
+    value = str(ref or "").strip()
+    if value.startswith("refs/heads/"):
+        return value
+    return f"refs/heads/{value}" if value else ""
+
+
+def _git_target_ref_owning_worktree(
+    repo_root: Path,
+    *,
+    target_ref: str,
+    timeout_seconds: int,
+) -> tuple[Path | None, str]:
+    """Return the linked worktree that actually owns ``target_ref``.
+
+    Candidate preview/evidence is intentionally allowed to run from a worker
+    worktree.  A live merge must not check the target branch out there because
+    Git permits a local branch to be checked out by only one linked worktree.
+    Resolve the existing target owner instead and leave the candidate worktree
+    untouched.
+    """
+
+    wanted = _local_branch_ref(target_ref)
+    if not wanted:
+        return None, "target_ref is required"
+    proc = _git_preview_command(
+        repo_root,
+        ["worktree", "list", "--porcelain"],
+        timeout_seconds=timeout_seconds,
+    )
+    if proc.returncode != 0:
+        return None, _bounded_command_text(proc.stderr or proc.stdout)
+
+    current_path = ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree ") :].strip()
+            continue
+        if (
+            line.startswith("branch ")
+            and line[len("branch ") :].strip() == wanted
+        ):
+            if not current_path:
+                return None, f"target branch owner for {wanted} has no worktree path"
+            return Path(current_path).resolve(), "git_worktree_target_ref_owner"
+        if not line.strip():
+            current_path = ""
+    return None, f"no linked worktree owns target branch {wanted}"
+
+
 def execute_merge_queue_item(
     conn: sqlite3.Connection,
     *,
@@ -16567,6 +16617,7 @@ def execute_merge_queue_item(
                 "executed": False,
                 "already_integrated": True,
                 "target_ref_mutated": False,
+                "candidate_preview_root": str(repo_root),
                 "preview": preview,
                 "gate_plan": merge_gate_plan_to_dict(gate_plan),
                 "queue_item": merge_queue_item_to_dict(integrated_item),
@@ -16599,6 +16650,7 @@ def execute_merge_queue_item(
             "already_integrated": True,
             "target_ref_mutated": False,
             "merge_commit": target_commit or branch_commit,
+            "candidate_preview_root": str(repo_root),
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": recorded,
@@ -16618,6 +16670,7 @@ def execute_merge_queue_item(
             "ok": True,
             "dry_run": True,
             "executed": False,
+            "candidate_preview_root": str(repo_root),
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": None,
@@ -16643,7 +16696,30 @@ def execute_merge_queue_item(
             "recorded": None,
         }
 
-    dirty_files = _git_worktree_dirty_files(repo_root, timeout_seconds=timeout_seconds)
+    mutation_root, mutation_root_source = _git_target_ref_owning_worktree(
+        repo_root,
+        target_ref=selected_target_ref,
+        timeout_seconds=timeout_seconds,
+    )
+    if mutation_root is None:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "target_ref_owning_worktree_unavailable",
+            "message": mutation_root_source,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": "",
+            "target_mutation_root_source": "",
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    dirty_files = _git_worktree_dirty_files(
+        mutation_root,
+        timeout_seconds=timeout_seconds,
+    )
     if dirty_files:
         return {
             "ok": False,
@@ -16651,6 +16727,9 @@ def execute_merge_queue_item(
             "executed": False,
             "error": "dirty_worktree",
             "dirty_files": dirty_files,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": None,
@@ -16674,27 +16753,9 @@ def execute_merge_queue_item(
         ),
     )
 
-    target_branch = _branch_name_from_ref(target_ref or item.target_ref)
     branch_name = _branch_name_from_ref(item.branch_ref)
-    checkout = _git_preview_command(
-        repo_root,
-        ["checkout", target_branch],
-        timeout_seconds=timeout_seconds,
-    )
-    if checkout.returncode != 0:
-        return {
-            "ok": False,
-            "dry_run": False,
-            "executed": False,
-            "error": "checkout_failed",
-            "stderr": _bounded_command_text(checkout.stderr or checkout.stdout),
-            "preview": preview,
-            "gate_plan": merge_gate_plan_to_dict(gate_plan),
-            "recorded": None,
-        }
-
     before_commit, before_error = _git_preview_commit(
-        repo_root,
+        mutation_root,
         "HEAD",
         timeout_seconds=timeout_seconds,
     )
@@ -16705,6 +16766,49 @@ def execute_merge_queue_item(
             "executed": False,
             "error": "target_head_unresolved",
             "stderr": before_error,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    live_target_commit, live_target_error = _git_preview_commit(
+        mutation_root,
+        selected_target_ref,
+        timeout_seconds=timeout_seconds,
+    )
+    if live_target_error:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "target_head_unresolved",
+            "stderr": live_target_error,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+    if before_commit != live_target_commit or live_target_commit != target_commit:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "target_head_changed_before_mutation",
+            "message": (
+                "target branch owner HEAD no longer matches the immutable "
+                "merge preview; rematerialize before retry"
+            ),
+            "expected_target_head": target_commit,
+            "live_target_head": live_target_commit,
+            "target_worktree_head": before_commit,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": None,
@@ -16715,7 +16819,7 @@ def execute_merge_queue_item(
     ok, merge_commit, error = write_merge_with_trailer(
         message or f"parallel branch merge: {item.task_id}",
         branch=branch_name,
-        cwd=str(repo_root),
+        cwd=str(mutation_root),
         task_id=item.task_id,
         source_contract_id=source_contract_id,
         parent_chain_sha=before_commit,
@@ -16745,6 +16849,9 @@ def execute_merge_queue_item(
             "executed": True,
             "error": "merge_failed",
             "message": error,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": recorded,
@@ -16770,7 +16877,11 @@ def execute_merge_queue_item(
         "ok": True,
         "dry_run": False,
         "executed": True,
+        "target_ref_mutated": True,
         "merge_commit": merge_commit,
+        "candidate_preview_root": str(repo_root),
+        "target_mutation_root": str(mutation_root),
+        "target_mutation_root_source": mutation_root_source,
         "preview": preview,
         "gate_plan": merge_gate_plan_to_dict(gate_plan),
         "recorded": recorded,
