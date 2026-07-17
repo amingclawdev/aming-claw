@@ -26451,6 +26451,47 @@ def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
         "resolved_active_route_token_ref"
     )
     assert result["raw_tokens_persisted_to_timeline"] is False
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    assert latest_revision is not None
+    assert {
+        field: latest_revision.route_identity[field]
+        for field in fresh_route_identity
+    } == fresh_route_identity
+    assert latest_revision.route_evidence_type == (
+        "resolved_active_route_token_ref_rejoin"
+    )
+    assert {
+        field: latest_revision.route_gate[field]
+        for field in fresh_route_identity
+    } == fresh_route_identity
+    assert latest_revision.payload["route_token_ref_renewal"] == {
+        "schema_version": "runtime_context.route_token_ref_renewal_revision.v1",
+        "status": "accepted_at_rejoin",
+        "previous_route_token_ref": old_issue["route_token_ref"],
+        "route_token_ref": fresh_issue["route_token_ref"],
+        "registry_verified": True,
+    }
+    assert result["route_contract_revision_id"] == latest_revision.revision_id
+    assert result["host_envelope"]["route_contract_revision_id"] == (
+        latest_revision.revision_id
+    )
+    graph_context = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.root_task_id,
+        worker_role="mf_sub",
+        fence_token=result["fence_token"],
+        session_token=result["session_token"],
+        target_project_root=str(target_root),
+        route_identity=fresh_route_identity,
+    )
+    assert graph_context.task_id == context.task_id
 
     implementation = server.handle_graph_governance_runtime_context_implementation_evidence(
         _ctx_with_role(
@@ -26484,10 +26525,13 @@ def test_runtime_context_session_token_rejoin_rebinds_superseded_route_ref(
     payload = json.loads(stored["payload_json"])
     assert payload["route_token_ref"] == fresh_issue["route_token_ref"]
     assert payload["parent_route_lineage"]["route_token_ref"] == (
-        old_issue["route_token_ref"]
+        fresh_issue["route_token_ref"]
     )
     assert payload["child_route_lineage"]["route_token_ref"] == (
         fresh_issue["route_token_ref"]
+    )
+    assert payload["parent_route_lineage_repair"]["status"] == (
+        "stale_parent_lineage_ignored_for_ref_resolved_current_route"
     )
 
 
