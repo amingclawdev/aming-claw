@@ -25678,6 +25678,16 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
         context,
         revision_id="crev-runtime-initial-join-renewed",
         route_identity=route_identity,
+        route_gate={
+            **route_identity,
+            "decision": "route_token",
+            "caller_role": "observer",
+            "scope": {
+                "project_id": PID,
+                "backlog_id": "AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+                "task_id": "worker-runtime-initial-join-renewed",
+            },
+        },
         payload={"route_identity": route_identity},
     )
     fake_ref_identity = {
@@ -25798,6 +25808,15 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
         for field in renewed_identity
     } == renewed_identity
     assert latest_revision.route_evidence_type == "renewed_route_token_ref"
+    assert {
+        field: latest_revision.route_gate[field]
+        for field in renewed_identity
+    } == renewed_identity
+    assert latest_revision.route_gate["scope"] == {
+        "project_id": PID,
+        "backlog_id": "AC-RUNTIME-TOKEN-INITIAL-JOIN-RENEWED",
+        "task_id": "worker-runtime-initial-join-renewed",
+    }
     assert latest_revision.payload["route_token_ref_renewal"] == {
         "schema_version": "runtime_context.route_token_ref_renewal_revision.v1",
         "status": "accepted_at_initial_join",

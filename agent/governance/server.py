@@ -22094,6 +22094,21 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                 ),
                 "raw_route_token_exposed": False,
             }
+            revision_payload["route_identity"] = dict(safe_route_identity)
+            renewed_route_gate = (
+                dict(previous_revision.route_gate)
+                if previous_revision is not None
+                and isinstance(previous_revision.route_gate, Mapping)
+                else {}
+            )
+            renewed_route_gate.update(
+                {
+                    field: safe_route_identity[field]
+                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                    if safe_route_identity.get(field)
+                }
+            )
+            renewed_route_gate["route_identity"] = dict(safe_route_identity)
             renewed_contract_revision = append_branch_contract_revision(
                 conn,
                 context,
@@ -22103,11 +22118,7 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     else "mf_parallel.v2"
                 ),
                 payload=revision_payload,
-                route_gate=(
-                    previous_revision.route_gate
-                    if previous_revision is not None
-                    else {}
-                ),
+                route_gate=renewed_route_gate,
                 route_identity=safe_route_identity,
                 route_evidence_type="renewed_route_token_ref",
                 actor="observer",
