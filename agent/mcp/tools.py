@@ -1838,6 +1838,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
                 },
+                "qa_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque QA session ref resolved to X-Gov-Token by the managed MCP dispatcher; never forwarded into timeline evidence.",
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
@@ -4333,7 +4337,17 @@ class ToolDispatcher:
 
         if name == "task_timeline_append":
             pid = args["project_id"]
-            qa_session_token = str(args.get("qa_session_token") or "").strip()
+            qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
+                args,
+                required_scope_fields=(
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "commit_sha",
+                ),
+            )
+            if qa_ref_error:
+                return qa_ref_error
             body = _task_timeline_body(args)
             if qa_session_token:
                 return self._api_with_role_token(

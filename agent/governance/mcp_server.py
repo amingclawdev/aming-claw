@@ -1335,6 +1335,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Raw QA role token used only as X-Gov-Token; never forwarded into timeline evidence.",
                 },
+                "qa_session_token_ref": {
+                    "type": "string",
+                    "description": "Process-local opaque QA session ref. The standalone governance dispatcher rejects this ref fail-closed; use the managed MCP dispatcher that issued it.",
+                },
                 "route_token": {"type": "object", "description": "Route-token evidence required for protected close-gate timeline evidence."},
                 "route_token_ref": {"type": "string", "description": "Opaque server-registered route token reference accepted by protected HTTP facades."},
                 "route_waiver": {"type": "object", "description": "Explicit route-context-consuming waiver for protected route-token gates."},
@@ -2557,6 +2561,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
 
     if name == "task_timeline_append":
         pid = args["project_id"]
+        qa_session_token_ref = str(
+            args.get("qa_session_token_ref") or ""
+        ).strip()
+        if qa_session_token_ref:
+            return {
+                "ok": False,
+                "error": "qa_session_token_ref_unavailable",
+                "message": (
+                    "Opaque QA session refs are process-local to the managed MCP "
+                    "dispatcher; this standalone dispatcher cannot resolve them."
+                ),
+            }
         qa_session_token = str(args.get("qa_session_token") or "").strip()
         return _http_with_optional_gov_token(
             "POST",
