@@ -52976,12 +52976,24 @@ def test_reconcile_task_fence_rejects_taskless_when_policy_disallows_it():
     ) is False
 
 
-def test_live_merge_recorder_parent_task_scope_projects_exact_child_task(conn):
+def test_live_merge_recorder_uses_child_task_scope_and_retains_parent_lineage(conn):
     backlog_id = "AC-LIVE-MERGE-PARENT-CHILD-SCOPE"
     parent_task_id = "cex-live-merge-parent-scope"
     child_task_id = "worker-live-merge-child-scope"
     runtime_context_id = "mfrctx-live-merge-parent-child-scope"
     merge_commit = "a" * 40
+    worker_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=child_task_id,
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"runtime_context_id": runtime_context_id},
+    )
     recorded = server._record_parallel_branch_merge_contract_timeline_events(
         conn,
         project_id=PID,
@@ -53020,17 +53032,31 @@ def test_live_merge_recorder_parent_task_scope_projects_exact_child_task(conn):
             },
         },
     )
+    merge_preview = next(
+        event for event in recorded if event["event_kind"] == "merge_preview"
+    )
     live_merge = next(
         event for event in recorded if event["event_kind"] == "live_merge"
     )
 
-    assert live_merge["task_id"] == parent_task_id
+    for event in (merge_preview, live_merge):
+        assert event["task_id"] == child_task_id
+        assert event["payload"]["parent_task_id"] == parent_task_id
+        assert event["payload"]["child_task_id"] == child_task_id
+        assert event["payload"]["runtime_context_id"] == runtime_context_id
+    service_events = server._runtime_context_service_timeline_events(
+        conn,
+        project_id=PID,
+        task_id=child_task_id,
+        backlog_id=backlog_id,
+    )
+    assert worker_event["id"] in {event["id"] for event in service_events}
+    assert live_merge["id"] in {event["id"] for event in service_events}
     scope = server._contract_runtime_projection_timeline_scope_values(
         live_merge
     )
     assert scope["child_task_ids"] == [child_task_id]
     assert child_task_id in scope["task_ids"]
-    assert parent_task_id in scope["task_ids"]
     assert server._contract_runtime_projection_timeline_scope_matches(
         live_merge,
         runtime_context_id=runtime_context_id,
