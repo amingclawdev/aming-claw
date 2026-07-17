@@ -1622,6 +1622,31 @@ def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutat
     assert saved.branch_ref == "refs/heads/codex/PB010-integrated"
     assert saved.merge_commit == "target-after"
 
+    replay = pbr.execute_merge_queue_item(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-PB010-integrated",
+        repo_root_path=tmp_path,
+        task_id="T-integrated",
+        target_ref=TARGET_REF,
+        dry_run=False,
+        allow_target_ref_mutation=False,
+        now_iso=NOW,
+    )
+
+    assert replay["ok"] is True
+    assert replay["already_integrated"] is True
+    assert replay["target_ref_mutated"] is False
+    assert replay["merge_commit"] == "target-after"
+    replayed_rows = pbr.list_merge_queue_items(
+        conn,
+        PROJECT_ID,
+        "mergeq-PB010-integrated",
+    )
+    assert len(replayed_rows) == 1
+    assert replayed_rows[0].status == "merged"
+    assert replayed_rows[0].merge_commit == "target-after"
+
 
 def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders() -> None:
     context = BranchTaskRuntimeContext(
