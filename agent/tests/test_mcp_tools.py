@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import tools as mcp_tools
-from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
+from agent.mcp.schema_contract import (
+    MCP_TOOL_SCHEMA_VERSION,
+    mcp_tool_schema_compatibility,
+)
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
 
@@ -3032,6 +3035,23 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert schema["loaded_client_tool_schema_version"] == MCP_TOOL_SCHEMA_VERSION
     assert schema["server_tool_schema_version"] == "2099-01-01.1"
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
+
+
+def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-17.1"
+    assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
+
+    compatibility = mcp_tool_schema_compatibility(
+        loaded_schema_version="2026-07-16.1",
+        server_schema_version=MCP_TOOL_SCHEMA_VERSION,
+        minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
+    )
+
+    assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
+    assert compatibility["server_tool_schema_version"] == "2026-07-17.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-17.1"
+    assert compatibility["client_schema_fresh"] is False
+    assert compatibility["stale_client_possible"] is True
 
 
 def test_mcp_runtime_status_current_target_chain_mismatch_blocks_core():

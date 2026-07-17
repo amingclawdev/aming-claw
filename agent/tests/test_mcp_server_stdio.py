@@ -296,6 +296,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-17.1"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
@@ -327,6 +328,9 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert "qa_session_token_ref" in tool_by_name["graph_query"]["inputSchema"][
         "properties"
     ]
+    assert "qa_session_token_ref" in tool_by_name["task_timeline_append"][
+        "inputSchema"
+    ]["properties"]
     for tool_name in (
         "contract_runtime_current",
         "contract_runtime_guide",
