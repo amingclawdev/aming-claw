@@ -23316,12 +23316,14 @@ def test_qa_overlay_hint_projection_rejects_actual_or_malformed_changes(
 def test_qa_overlay_python_symbols_use_qualified_identity_for_same_short_name():
     facts = server._qa_overlay_source_facts(
         "src/nested.py",
-        "class First:\n"
-        "    def collect(self):\n"
-        "        return 'first'\n\n"
-        "class Second:\n"
-        "    def collect(self):\n"
-        "        return 'second'\n",
+        "def first_scope():\n"
+        "    def collect():\n"
+        "        return 'first'\n"
+        "    return collect()\n\n"
+        "def second_scope():\n"
+        "    def collect():\n"
+        "        return 'second'\n"
+        "    return collect()\n",
     )
 
     collect_symbols = [
@@ -23330,12 +23332,12 @@ def test_qa_overlay_python_symbols_use_qualified_identity_for_same_short_name():
         if item["name"].split(".")[-1] == "collect"
     ]
     assert [item["name"] for item in collect_symbols] == [
-        "First.collect",
-        "Second.collect",
+        "collect",
+        "collect",
     ]
     assert {item["identity"] for item in collect_symbols} == {
-        "src.nested::First.collect",
-        "src.nested::Second.collect",
+        "src.nested::first_scope.collect",
+        "src.nested::second_scope.collect",
     }
 
 

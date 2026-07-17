@@ -5,6 +5,7 @@ Provides routing, middleware (auth, idempotency, request_id, audit), and JSON ha
 """
 from __future__ import annotations
 
+import ast
 import json
 import mimetypes
 import re
@@ -7060,6 +7061,45 @@ def _qa_overlay_module_name(path: str) -> str:
     return DEFAULT_LANGUAGE_POLICY.strip_source_suffix(path).replace("/", ".")
 
 
+def _qa_overlay_python_lexical_identities(
+    module_name: str,
+    source: str,
+) -> dict[tuple[int, str, str], str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    identities: dict[tuple[int, str, str], str] = {}
+
+    class LexicalIdentityVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+
+        def _visit_named_scope(self, node: ast.AST, *, kind: str) -> None:
+            name = str(getattr(node, "name", "") or "").strip()
+            line_number = int(getattr(node, "lineno", 0) or 0)
+            lexical_name = ".".join([*self.scope, name])
+            if name and line_number:
+                identities[(line_number, name, kind)] = (
+                    f"{module_name}::{lexical_name}"
+                )
+            self.scope.append(name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_named_scope(node, kind="function")
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_named_scope(node, kind="function")
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self._visit_named_scope(node, kind="class")
+
+    LexicalIdentityVisitor().visit(tree)
+    return identities
+
+
 def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
     from .language_adapters import PythonAdapter
     from .language_policy import DEFAULT_LANGUAGE_POLICY
@@ -7077,6 +7117,7 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
 
     module_name = _qa_overlay_module_name(path)
     raw_symbols: list[Mapping[str, Any]] = []
+    lexical_identities: dict[tuple[int, str, str], str] = {}
     if isinstance(adapter, PythonAdapter):
         from .reconcile_phases import phase_z_v2
 
@@ -7087,6 +7128,10 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
                 "candidate overlay could not parse Python source",
                 path=path,
             )
+        lexical_identities = _qa_overlay_python_lexical_identities(
+            module_name,
+            source,
+        )
         source_hashes = phase_z_v2.function_source_hashes(parsed)
         raw_symbols.extend(
             {
@@ -7122,7 +7167,13 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
             continue
         kind = str(raw_symbol.get("kind") or "symbol").strip()
         qualified_name = str(raw_symbol.get("qualified_name") or name).strip()
-        identity = (
+        short_name = name.split(".")[-1]
+        line_start = max(1, int(raw_symbol.get("lineno") or 1))
+        lexical_identity = lexical_identities.get(
+            (line_start, short_name, kind),
+            "",
+        )
+        identity = lexical_identity or (
             qualified_name
             if "::" in qualified_name
             else f"{module_name}::{qualified_name}"
@@ -7135,7 +7186,6 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
                 symbol_identity=identity,
             )
         seen.add(identity)
-        line_start = max(1, int(raw_symbol.get("lineno") or 1))
         line_end = max(line_start, int(raw_symbol.get("end_lineno") or line_start))
         snippet = "\n".join(lines[line_start - 1 : min(len(lines), line_end)])
         symbols.append(
