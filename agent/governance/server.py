@@ -6830,6 +6830,7 @@ def _qa_scope_binding_ref(
 _QA_OVERLAY_MAX_FILES = 160
 _QA_OVERLAY_MAX_FILE_BYTES = 512 * 1024
 _QA_OVERLAY_MAX_TOTAL_BYTES = 6 * 1024 * 1024
+_QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 _QA_OVERLAY_MAX_SYMBOLS = 10_000
 _QA_OVERLAY_OVERSIZED_SOURCE_POLICY = "oversized_supported_source"
 _QA_OVERLAY_UNSAFE_CONFIG_PATHS = {
@@ -7003,13 +7004,13 @@ def _qa_git_object_source(
     fallback_reason = ""
     adapter = None
     if byte_size > _QA_OVERLAY_MAX_FILE_BYTES:
-        if byte_size > _QA_OVERLAY_MAX_TOTAL_BYTES:
+        if byte_size > _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES:
             _qa_overlay_fail(
                 "total_source_limit_requires_exact_candidate_snapshot",
-                "candidate overlay source exceeds the total inspection limit",
+                "candidate overlay source exceeds the elevated bounded inspection limit",
                 path=path,
                 byte_size=byte_size,
-                max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+                max_total_bytes=_QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES,
             )
         adapter = _qa_overlay_deterministic_adapter(path)
         if adapter is None:
@@ -7028,7 +7029,10 @@ def _qa_git_object_source(
         "fallback_reason": fallback_reason,
         "file_byte_size": byte_size,
         "ordinary_max_file_bytes": _QA_OVERLAY_MAX_FILE_BYTES,
-        "max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+        "ordinary_max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+        "elevated_fallback_max_total_bytes": (
+            _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+        ),
         "deterministic_language_adapter": (
             str(adapter.language() or "") if adapter is not None else ""
         ),
@@ -7589,6 +7593,7 @@ def _qa_candidate_diff_context(
     candidate_sources: dict[str, dict[str, Any]] = {}
     total_bytes = 0
     total_symbols = 0
+    oversized_fallback_files: set[str] = set()
     status_counts = {key: 0 for key in ("A", "M", "D", "R")}
     symbol_counts = {key: 0 for key in ("added", "modified", "removed")}
     for change in file_changes:
@@ -7610,12 +7615,29 @@ def _qa_candidate_diff_context(
             candidate_source, candidate_bytes, candidate_inspection = _qa_git_object_source(
                 canonical_root, commit_sha=candidate_commit_sha, path=path
             )
+        if base_inspection.get("fallback_reason"):
+            oversized_fallback_files.add(base_path)
+        if candidate_inspection.get("fallback_reason"):
+            oversized_fallback_files.add(path)
         total_bytes += base_bytes + candidate_bytes
-        if total_bytes > _QA_OVERLAY_MAX_TOTAL_BYTES:
+        if total_bytes > _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES:
+            elevated_fallback_activated = bool(oversized_fallback_files)
             _qa_overlay_fail(
                 "total_source_limit_requires_exact_candidate_snapshot",
                 "candidate overlay total source limit was exceeded",
-                max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+                ordinary_max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+                effective_max_total_bytes=(
+                    _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+                    if elevated_fallback_activated
+                    else _QA_OVERLAY_MAX_TOTAL_BYTES
+                ),
+                elevated_fallback_activated=elevated_fallback_activated,
+                fallback_reason=(
+                    _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+                    if elevated_fallback_activated
+                    else ""
+                ),
+                inspected_source_bytes=total_bytes,
             )
         _qa_overlay_assert_safe_interpretation(
             path=path,
@@ -7681,6 +7703,48 @@ def _qa_candidate_diff_context(
         if old_path:
             candidate_sources[old_path] = source_entry
 
+    elevated_fallback_activated = bool(oversized_fallback_files)
+    effective_max_total_bytes = (
+        _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+        if elevated_fallback_activated
+        else _QA_OVERLAY_MAX_TOTAL_BYTES
+    )
+    if total_bytes > effective_max_total_bytes:
+        _qa_overlay_fail(
+            "total_source_limit_requires_exact_candidate_snapshot",
+            "candidate overlay total source limit was exceeded",
+            ordinary_max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+            effective_max_total_bytes=effective_max_total_bytes,
+            elevated_fallback_max_total_bytes=(
+                _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+            ),
+            elevated_fallback_activated=elevated_fallback_activated,
+            fallback_reason=(
+                _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+                if elevated_fallback_activated
+                else ""
+            ),
+            inspected_source_bytes=total_bytes,
+        )
+
+    source_inspection_budget = {
+        "schema_version": "qa_review_graph.source_inspection_budget.v1",
+        "ordinary_max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+        "effective_max_total_bytes": effective_max_total_bytes,
+        "elevated_fallback_max_total_bytes": (
+            _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+        ),
+        "elevated_fallback_activated": elevated_fallback_activated,
+        "activation_reason": (
+            _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+            if elevated_fallback_activated
+            else ""
+        ),
+        "fallback_files": sorted(oversized_fallback_files),
+        "inspected_source_bytes": total_bytes,
+        "counts_base_and_candidate_blobs": True,
+    }
+
     impact = {
         kind: sorted(
             {
@@ -7698,6 +7762,7 @@ def _qa_candidate_diff_context(
         "base_commit_sha": base_commit_sha,
         "candidate_commit_sha": candidate_commit_sha,
         "files": overlay_files,
+        "source_inspection_budget": source_inspection_budget,
         "summary": {
             "file_count": len(overlay_files),
             "status_counts": status_counts,
@@ -7709,6 +7774,9 @@ def _qa_candidate_diff_context(
             "max_files": _QA_OVERLAY_MAX_FILES,
             "max_file_bytes": _QA_OVERLAY_MAX_FILE_BYTES,
             "max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+            "max_total_bytes_with_oversized_supported_source": (
+                _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+            ),
             "max_symbols": _QA_OVERLAY_MAX_SYMBOLS,
         },
     }

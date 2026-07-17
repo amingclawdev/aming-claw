@@ -2290,6 +2290,9 @@ def _candidate_overlay_projection(
         "base_snapshot_results_preserved": True,
         "summary": dict(candidate_overlay.get("summary") or {}),
         "impact": dict(candidate_overlay.get("impact") or {}),
+        "source_inspection_budget": dict(
+            candidate_overlay.get("source_inspection_budget") or {}
+        ),
         "query_projection": tool,
     }
 

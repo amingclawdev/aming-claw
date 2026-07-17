@@ -22998,6 +22998,37 @@ def test_qa_candidate_overlay_allows_bounded_oversized_supported_source(
         tmp_path,
         name="qa-candidate-overlay-oversized-supported-source",
     )
+    padding = "# deterministic bounded padding\n" * 104_000
+    base_source = "def candidate_entry():\n    return 'base'\n\n" + padding
+    candidate_source = "def candidate_entry():\n    return 'candidate'\n\n" + padding
+    base_bytes = base_source.encode("utf-8")
+    candidate_bytes = candidate_source.encode("utf-8")
+    assert server._QA_OVERLAY_MAX_FILE_BYTES < len(base_bytes)
+    assert server._QA_OVERLAY_MAX_TOTAL_BYTES < (
+        len(base_bytes) + len(candidate_bytes)
+    )
+    assert (
+        len(base_bytes) + len(candidate_bytes)
+        < server._QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+    )
+    changed_path = fixture.root / "src/oversized_supported.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_bytes(base_bytes)
+    subprocess.run(
+        ["git", "add", "src/oversized_supported.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "oversized supported base source"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base_commit = batch_jobs.git_commit(fixture.root)
     subprocess.run(
         ["git", "checkout", "-b", "candidate-oversized-supported-source"],
         cwd=fixture.root,
@@ -23005,18 +23036,7 @@ def test_qa_candidate_overlay_allows_bounded_oversized_supported_source(
         capture_output=True,
         text=True,
     )
-    source = (
-        "def candidate_entry():\n"
-        "    return True\n\n"
-        + "# deterministic bounded padding\n"
-        * ((server._QA_OVERLAY_MAX_FILE_BYTES // 32) + 256)
-    )
-    source_bytes = source.encode("utf-8")
-    assert server._QA_OVERLAY_MAX_FILE_BYTES < len(source_bytes)
-    assert len(source_bytes) < server._QA_OVERLAY_MAX_TOTAL_BYTES
-    changed_path = fixture.root / "src/oversized_supported.py"
-    changed_path.parent.mkdir(parents=True, exist_ok=True)
-    changed_path.write_bytes(source_bytes)
+    changed_path.write_bytes(candidate_bytes)
     subprocess.run(
         ["git", "add", "src/oversized_supported.py"],
         cwd=fixture.root,
@@ -23044,18 +23064,31 @@ def test_qa_candidate_overlay_allows_bounded_oversized_supported_source(
         fixture.root,
         project_id=PID,
         canonical_project_root=fixture.root,
-        base_commit_sha=fixture.main_head,
+        base_commit_sha=base_commit,
         candidate_commit_sha=candidate_commit,
     )
 
     overlay_file = context["candidate_overlay"]["files"][0]
-    inspection = overlay_file["source_fallbacks"]["candidate"]
-    assert inspection["policy"] == "oversized_supported_source"
-    assert inspection["fallback_reason"] == "oversized_supported_source"
-    assert inspection["file_byte_size"] == len(source_bytes)
-    assert inspection["deterministic_language_adapter"] == "python"
-    assert overlay_file["candidate"]["byte_size"] == len(source_bytes)
-    assert overlay_file["candidate"]["source_inspection"] == inspection
+    for version, expected_size in (
+        ("base", len(base_bytes)),
+        ("candidate", len(candidate_bytes)),
+    ):
+        inspection = overlay_file["source_fallbacks"][version]
+        assert inspection["policy"] == "oversized_supported_source"
+        assert inspection["fallback_reason"] == "oversized_supported_source"
+        assert inspection["file_byte_size"] == expected_size
+        assert inspection["deterministic_language_adapter"] == "python"
+        assert overlay_file[version]["byte_size"] == expected_size
+        assert overlay_file[version]["source_inspection"] == inspection
+    budget = context["candidate_overlay"]["source_inspection_budget"]
+    assert budget["ordinary_max_total_bytes"] == 6 * 1024 * 1024
+    assert budget["effective_max_total_bytes"] == 16 * 1024 * 1024
+    assert budget["elevated_fallback_max_total_bytes"] == 16 * 1024 * 1024
+    assert budget["elevated_fallback_activated"] is True
+    assert budget["activation_reason"] == "oversized_supported_source"
+    assert budget["fallback_files"] == ["src/oversized_supported.py"]
+    assert budget["inspected_source_bytes"] == len(base_bytes) + len(candidate_bytes)
+    assert budget["counts_base_and_candidate_blobs"] is True
     assert context["candidate_overlay_hash"] == server.stable_sha256(
         context["candidate_overlay"]
     )
@@ -23108,7 +23141,7 @@ def test_qa_candidate_overlay_oversized_source_still_obeys_total_byte_limit(
     )
     monkeypatch.setattr(
         server,
-        "_QA_OVERLAY_MAX_TOTAL_BYTES",
+        "_QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES",
         server._QA_OVERLAY_MAX_FILE_BYTES + 128,
     )
 

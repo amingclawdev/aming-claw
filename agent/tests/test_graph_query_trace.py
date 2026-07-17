@@ -770,7 +770,8 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
                         "fallback_reason": "oversized_supported_source",
                         "file_byte_size": 687765,
                         "ordinary_max_file_bytes": 524288,
-                        "max_total_bytes": 6291456,
+                        "ordinary_max_total_bytes": 6291456,
+                        "elevated_fallback_max_total_bytes": 16777216,
                         "deterministic_language_adapter": "python",
                     }
                 },
@@ -783,6 +784,17 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
                 },
             }
         ],
+        "source_inspection_budget": {
+            "schema_version": "qa_review_graph.source_inspection_budget.v1",
+            "ordinary_max_total_bytes": 6291456,
+            "effective_max_total_bytes": 16777216,
+            "elevated_fallback_max_total_bytes": 16777216,
+            "elevated_fallback_activated": True,
+            "activation_reason": "oversized_supported_source",
+            "fallback_files": ["agent/governance/server.py"],
+            "inspected_source_bytes": 687765,
+            "counts_base_and_candidate_blobs": True,
+        },
         "summary": {"file_count": 1},
         "impact": {"source": ["agent/governance/server.py"]},
     }
@@ -909,6 +921,9 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
     assert review_graph["file_matches"][0]["status"] == "M"
     assert review_graph["file_matches"][0]["source_fallbacks"] == (
         candidate_overlay["files"][0]["source_fallbacks"]
+    )
+    assert review_graph["source_inspection_budget"] == (
+        candidate_overlay["source_inspection_budget"]
     )
 
     with pytest.raises(ValueError, match="graph query trace binding mismatch"):
