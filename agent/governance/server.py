@@ -54399,6 +54399,9 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         reconcile_event_created_at=str(
             reconcile.get("reconcile_event_created_at") or ""
         ),
+        expected_contract_execution_id=str(
+            record.get("contract_execution_id") or ""
+        ),
         expected_task_id=str(merge.get("task_id") or ""),
         expected_runtime_context_id=str(
             merge.get("runtime_context_id") or ""

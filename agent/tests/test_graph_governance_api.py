@@ -33,6 +33,7 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
+from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     _mf_parallel_worker_commit_errors,
@@ -2020,6 +2021,9 @@ def test_current_full_state_orders_canonical_qa_acceptance_without_qa_event(conn
     )
 
     assert state["qa_event_id"] == 0
+    assert state["qa_authority_mode"] == (
+        "canonical_contract_runtime_acceptance"
+    )
     assert state["canonical_qa_acceptance_verified"] is True
     assert state["durable_order_verified"] is True
     assert state["db_verified"] is True
@@ -2039,6 +2043,89 @@ def test_current_full_state_orders_canonical_qa_acceptance_without_qa_event(conn
     )
     assert forged["canonical_qa_acceptance_verified"] is False
     assert forged["db_verified"] is False
+
+
+def test_current_full_state_separates_contract_route_and_worker_runtime_scope(conn):
+    commit_sha = "8" * 40
+    snapshot_id = "full-contract-route-worker-runtime-scope"
+    contract_execution_id = "cex-current-full-scope"
+    worker_task_id = "worker-current-full-scope"
+    runtime_context_id = "mfrctx-current-full-scope"
+    runtime_scope = {
+        "project_id": PID,
+        "backlog_id": "AC-CURRENT-FULL-SCOPE",
+        "task_id": worker_task_id,
+        "parent_task_id": "AC-CURRENT-FULL-SCOPE",
+        "runtime_context_id": runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+    }
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id="req-contract-route-worker-runtime-scope",
+        request_started_at="2026-07-17T15:00:00Z",
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "observer_session_route_token_ref",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": runtime_scope["backlog_id"],
+                "task_id": contract_execution_id,
+            },
+            "task_id": worker_task_id,
+            "runtime_context_id": runtime_context_id,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_scope": {
+                **runtime_scope,
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
+        },
+        runtime_context_scope=runtime_scope,
+        reconcile_event_id=12,
+        reconcile_event_created_at="2026-07-17T15:02:00Z",
+        marker_created_at="2026-07-17T15:02:01Z",
+    )
+
+    def state(**overrides):
+        return store.current_full_reconcile_state(
+            conn,
+            PID,
+            commit_sha,
+            merge_event_id=11,
+            merge_event_created_at="2026-07-17T15:01:00Z",
+            reconcile_event_id=12,
+            reconcile_event_created_at="2026-07-17T15:02:00Z",
+            expected_contract_execution_id=overrides.get(
+                "expected_contract_execution_id", contract_execution_id
+            ),
+            expected_task_id=overrides.get("expected_task_id", worker_task_id),
+            expected_runtime_context_id=overrides.get(
+                "expected_runtime_context_id", runtime_context_id
+            ),
+            reconcile_task_id=overrides.get(
+                "reconcile_task_id", worker_task_id
+            ),
+            reconcile_runtime_context_id=overrides.get(
+                "reconcile_runtime_context_id", runtime_context_id
+            ),
+        )
+
+    verified = state()
+    assert verified["contract_execution_scope_verified"] is True
+    assert verified["task_scope_verified"] is True
+    assert verified["runtime_context_scope_verified"] is True
+    assert verified["provenance_scope_verified"] is True
+    assert verified["db_verified"] is True
+    assert state(expected_contract_execution_id="cex-wrong")["db_verified"] is False
+    assert state(expected_task_id="worker-wrong")["db_verified"] is False
+    assert state(expected_runtime_context_id="mfrctx-wrong")["db_verified"] is False
 
 
 def test_current_full_state_fences_explicit_task_but_allows_shared_taskless(conn):
@@ -51333,18 +51420,21 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
 def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     conn,
     tmp_path,
-    monkeypatch,
 ):
-    task_id = "cex-contract-runtime-merge-authority"
+    project_id = "aming-claw"
+    contract_execution_id = "cex-contract-runtime-merge-authority"
+    task_id = "worker-contract-runtime-merge-authority"
     runtime_context_id = "mfrctx-contract-runtime-merge-authority"
     merge_queue_id = "mq-contract-runtime-merge-authority"
     queue_item_id = "mqitem-contract-runtime-merge-authority"
     qa_commit = "a" * 40
-    merged_commit = "b" * 40
+    merged_commit = server._git_head_commit(
+        Path(__file__).resolve().parents[2]
+    )
     target_root = tmp_path / "target-project"
     target_root.mkdir()
     context = BranchTaskRuntimeContext(
-        project_id=PID,
+        project_id=project_id,
         task_id=task_id,
         branch_ref="refs/heads/codex/merge-authority",
         status=STATE_VALIDATED,
@@ -51360,7 +51450,7 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         conn,
         [
             MergeQueueItem(
-                project_id=PID,
+                project_id=project_id,
                 merge_queue_id=merge_queue_id,
                 queue_item_id=queue_item_id,
                 backlog_id=context.backlog_id,
@@ -51376,16 +51466,30 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
             )
         ],
     )
+    runtime = server._contract_runtime(conn)
+    definition = runtime.registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev2",
+    )
+    instruction_bundle = resolve_instruction_bundle(
+        definition,
+        root=runtime.instruction_root,
+        include_content=True,
+    )
     record = {
-        "project_id": PID,
+        "project_id": project_id,
         "backlog_id": context.backlog_id,
-        "contract_execution_id": task_id,
+        "contract_execution_id": contract_execution_id,
         "contract_id": "mf_parallel.v2",
         "version": "v2",
         "revision": "rev2",
+        "definition_hash": definition["definition_hash"],
+        "instruction_bundle_hash": instruction_bundle["instruction_bundle_hash"],
+        "execution_state": {"actor_role": "observer"},
         # Service/prefill revisions are intentionally not derivable from the
-        # number of completed lines.  QA was accepted at immutable revision 3.
-        "execution_state_revision": 9,
+        # number of completed lines. QA was accepted at immutable revision 13.
+        "execution_state_revision": 15,
         "contract_chain_id": "cchain-completed-merge-authority",
         "completed_lines": [
             {
@@ -51395,6 +51499,47 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
                 "evidence_kind": "contract_binding",
                 "payload": {"status": "prefilled"},
             },
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": context.parent_task_id,
+                "worker_role": "mf_sub",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "worker_task_id": task_id,
+                    "parent_task_id": context.parent_task_id,
+                    "worker_role": "mf_sub",
+                },
+            },
+            *[
+                {
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "actor_role": "mf_sub",
+                    "evidence_kind": evidence_kind,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": context.parent_task_id,
+                    "payload": {"status": "passed"},
+                }
+                for stage_id, line_id, evidence_kind in (
+                    ("worker_read", "worker_read_runtime_guide", "read_receipt"),
+                    ("worker_startup", "worker_startup", "mf_subagent_startup"),
+                    ("worker_context", "worker_graph_context", "graph_trace"),
+                    ("worker_implementation", "worker_implementation", "implementation"),
+                    ("worker_commit", "worker_commit", "worker_commit"),
+                    (
+                        "worker_attestation",
+                        "worker_finish_time_attestation",
+                        "record_finish_time_worker_attestation",
+                    ),
+                    ("worker_finish", "worker_finish_gate", "mf_subagent_finish_gate"),
+                )
+            ],
             {
                 "stage_id": "qa_graph_context",
                 "line_id": "qa_graph_context",
@@ -51433,16 +51578,16 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
                     "merge_queue_id": merge_queue_id,
                     "queue_item_id": queue_item_id,
                     "queue_item_status": "merged",
-                    "timeline_event_refs": ["timeline:50"],
+                    "timeline_event_refs": [],
                 },
             },
         ],
     }
-    server._contract_runtime_store(conn).create(record)
+    record = runtime.store.create(record)
     binding_identity = {
-        "project_id": PID,
+        "project_id": project_id,
         "backlog_id": context.backlog_id,
-        "contract_execution_id": task_id,
+        "contract_execution_id": contract_execution_id,
         "contract_id": record["contract_id"],
         "contract_chain_id": record["contract_chain_id"],
         "parent_contract_execution_id": "",
@@ -51459,13 +51604,13 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         [
             (
                 f"completed-qa-acceptance-revision-{revision}",
-                PID,
+                project_id,
                 context.backlog_id,
                 record["contract_chain_id"],
-                task_id,
+                contract_execution_id,
                 "mf_parallel_child_current",
                 revision,
-                f"contract_runtime:{task_id}:revision:{revision}",
+                f"contract_runtime:{contract_execution_id}:revision:{revision}",
                 server.stable_sha256(
                     {
                         **binding_identity,
@@ -51476,34 +51621,115 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
                 created_at,
             )
             for revision, completed_count, created_at in (
-                (2, 2, "2026-07-16T23:27:41Z"),
-                (3, 3, "2026-07-16T23:27:42Z"),
+                (12, 10, "2026-07-16T23:27:41Z"),
+                (13, 11, "2026-07-16T23:27:42Z"),
             )
         ],
     )
     conn.commit()
-    timeline_events = [
-        {
-            "id": 50,
-            "project_id": PID,
-            "backlog_id": context.backlog_id,
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=context.backlog_id,
+        task_id=task_id,
+        event_type="parallel.live_merge",
+        event_kind="parallel.live_merge",
+        phase="merge",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+        payload={
+            "runtime_context_id": runtime_context_id,
             "task_id": task_id,
-            "event_type": "parallel.live_merge",
-            "event_kind": "parallel.live_merge",
-            "actor": "observer",
-            "status": "passed",
-            "commit_sha": merged_commit,
-            "created_at": "2026-07-16T23:27:43Z",
-            "payload": {
-                "merge_commit": merged_commit,
-                "target_head_after_merge": merged_commit,
+            "parent_task_id": context.parent_task_id,
+            "contract_execution_id": contract_execution_id,
+            "merge_commit": merged_commit,
+            "target_head_after_merge": merged_commit,
+        },
+    )
+    reconcile_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=context.backlog_id,
+        task_id=task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+        payload={
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": context.parent_task_id,
+            "contract_execution_id": contract_execution_id,
+            "reconcile_mode": "current_full",
+        },
+    )
+    for event, created_at in (
+        (merge_event, "2026-07-16T23:27:43Z"),
+        (reconcile_event, "2026-07-16T23:29:00Z"),
+    ):
+        conn.execute(
+            "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+            (created_at, int(event["id"])),
+        )
+        event["created_at"] = created_at
+    timeline_events = [merge_event, reconcile_event]
+
+    snapshot_id = "full-contract-runtime-merge-authority"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=project_id,
+        commit_sha=merged_commit,
+    )
+    runtime_scope = {
+        "project_id": project_id,
+        "backlog_id": context.backlog_id,
+        "task_id": task_id,
+        "parent_task_id": context.parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "contract_execution_id": contract_execution_id,
+    }
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        target_commit_sha=merged_commit,
+        request_id="req-contract-runtime-merge-authority",
+        request_started_at="2026-07-16T23:28:59Z",
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "observer_session_route_token_ref",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": context.backlog_id,
+                "task_id": contract_execution_id,
             },
-        }
-    ]
+            "task_id": task_id,
+            "runtime_context_id": runtime_context_id,
+            "merge_queue_id": merge_queue_id,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_scope": {
+                **runtime_scope,
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
+        },
+        runtime_context_scope=runtime_scope,
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at="2026-07-16T23:29:00Z",
+        marker_created_at="2026-07-16T23:29:01Z",
+    )
 
     authority = server._contract_runtime_completed_merge_authority(
         conn,
-        project_id=PID,
+        project_id=project_id,
         record=record,
         context=context,
         timeline_events=timeline_events,
@@ -51513,56 +51739,151 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     assert authority["qa_contract_runtime_verified"] is True
     assert authority["qa_event_id"] == 0
     assert authority["qa_source_ref"] == (
-        f"contract_runtime:{task_id}:completed_lines:2"
+        f"contract_runtime:{contract_execution_id}:completed_lines:10"
     )
     assert authority["qa_acceptance_created_at"] == "2026-07-16T23:27:42Z"
-    assert authority["qa_acceptance_revision"] == 3
-    assert authority["merge_event_id"] == 50
+    assert authority["qa_acceptance_revision"] == 13
+    assert authority["merge_event_id"] == int(merge_event["id"])
     assert authority["merged_commit_sha"] == merged_commit
     assert authority["authority_source"].startswith(
         "contract_runtime_completed_lines"
     )
-    server_reconcile_authority = {
-        **authority,
-        "source": "graph_snapshot_store.current_full_reconcile_state",
-        "db_verified": True,
-        "live_verified": True,
-        "active_snapshot_verified": True,
-        "graph_reconciled": True,
+    composed_authority = (
+        server._contract_runtime_current_full_reconcile_authority_from_merge(
+            conn,
+            project_id=project_id,
+            record=record,
+            merge=authority,
+            reconcile={
+                "reconcile_source_ref": f"timeline:{reconcile_event['id']}",
+                "reconcile_event_id": int(reconcile_event["id"]),
+                "reconcile_event_created_at": str(reconcile_event["created_at"]),
+                "reconcile_task_id": task_id,
+                "reconcile_runtime_context_id": runtime_context_id,
+            },
+        )
+    )
+    assert composed_authority["db_verified"] is True, composed_authority
+    assert composed_authority["live_verified"] is True, composed_authority
+    assert composed_authority["graph_reconciled"] is True, composed_authority
+    projected_reconcile_event = (
+        server._contract_runtime_projection_latest_timeline_event(
+            server._contract_runtime_projection_post_worker_timeline_events(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=context.backlog_id,
+                timeline_events=timeline_events,
+            ),
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            backlog_id=context.backlog_id,
+            kind_tokens={"reconcile", "observer_reconcile"},
+            phase_tokens={"reconcile"},
+            actor_roles={"observer"},
+            related_task_ids={context.parent_task_id, contract_execution_id},
+            direct_parent_task_id=context.parent_task_id,
+        )
+    )
+    assert projected_reconcile_event, {
+        "scope": server._contract_runtime_projection_timeline_scope_values(
+            reconcile_event
+        ),
+        "actor_role": server._contract_runtime_projection_timeline_actor_role(
+            reconcile_event
+        ),
     }
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_current_full_reconcile_authority",
-        lambda *_args, **_kwargs: server_reconcile_authority,
+    projected_scope = server._contract_runtime_projection_timeline_scope_values(
+        projected_reconcile_event
+    )
+    assert projected_scope["task_ids"] == [task_id], projected_scope
+    assert projected_scope["runtime_context_ids"] == [
+        runtime_context_id
+    ], projected_scope
+    assert server._contract_runtime_line_evidence_policy(
+        record,
+        "current_full_reconcile_evidence_policy",
+        line_id="observer_reconcile",
+    )
+    server_reconcile_authority = (
+        server._contract_runtime_completed_merge_reconcile_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            context=context,
+            timeline_events=timeline_events,
+            merge=authority,
+        )
+    )
+    assert server_reconcile_authority["db_verified"] is True
+    assert server_reconcile_authority["graph_reconciled"] is True
+    assert server_reconcile_authority["qa_authority_mode"] == (
+        "canonical_contract_runtime_acceptance"
+    )
+    assert server_reconcile_authority["contract_execution_scope_verified"] is True
+    assert server_reconcile_authority["task_scope_verified"] is True
+    assert server_reconcile_authority["runtime_context_scope_verified"] is True
+    policy = server._contract_runtime_line_evidence_policy(
+        record,
+        "current_full_reconcile_evidence_policy",
+        line_id="observer_reconcile",
     )
     bound = server._contract_runtime_bind_reconcile_authority(
         conn,
-        project_id=PID,
+        project_id=project_id,
         record=record,
         write={
             "payload": {"reconcile_authority": {"db_verified": "forged"}}
         },
-        policy={"authority_object_path": "payload.reconcile_authority"},
+        policy=policy,
     )
-    assert bound["payload"]["reconcile_authority"] == server_reconcile_authority
+    assert bound["payload"]["reconcile_authority"] == composed_authority
     assert bound["payload"]["reconcile_authority"]["qa_event_id"] == 0
     assert not any(
         "qa" in str(event.get("event_kind") or "").lower()
         for event in timeline_events
     )
+    guide = runtime.current_guide(
+        contract_execution_id,
+        actor_role="observer",
+    )
+    next_action = guide["next_legal_action"]
+    assert next_action["line_id"] == "observer_reconcile"
+    current_record = runtime.store.get(contract_execution_id)
+    copy_payload = server._contract_runtime_write_from_record(
+        current_record,
+        actor_role="observer",
+        stage_id=next_action["stage_id"],
+        line_id=next_action["line_id"],
+        evidence_kind=next_action["evidence_kind"],
+    )
+    precheck_write = server._contract_runtime_bind_reconcile_authority(
+        conn,
+        project_id=project_id,
+        record=current_record,
+        write={**copy_payload, "payload": {}},
+        policy=policy,
+    )
+    precheck = runtime.precheck_line_write(
+        contract_execution_id,
+        precheck_write,
+        actor_role="observer",
+    )
+    assert precheck["decision"]["ok"] is True
+    assert precheck["decision"]["errors"] == []
 
-    forged_qa = json.loads(json.dumps(record["completed_lines"][2]))
+    forged_qa = json.loads(json.dumps(record["completed_lines"][10]))
     forged_qa["commit_sha"] = "f" * 40
     assert server._contract_runtime_completed_line_acceptance(
         conn,
-        project_id=PID,
+        project_id=project_id,
         record=record,
-        completed_line_index=2,
+        completed_line_index=10,
         expected_line=forged_qa,
     ) == {}
 
     bypassed = json.loads(json.dumps(record))
-    bypassed["completed_lines"][2].update(
+    bypassed["completed_lines"][10].update(
         {
             "actor_role": "observer",
             "evidence_kind": "contract_line_bypass",
@@ -51572,7 +51893,7 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     )
     assert server._contract_runtime_completed_merge_authority(
         conn,
-        project_id=PID,
+        project_id=project_id,
         record=bypassed,
         context=context,
         timeline_events=timeline_events,

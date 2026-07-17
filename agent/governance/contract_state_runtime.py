@@ -3543,6 +3543,9 @@ def _current_full_reconcile_satisfies_requirement(
     qa_event_created_at = str(
         authority.get("qa_event_created_at") or ""
     ).strip()
+    qa_acceptance_created_at = str(
+        authority.get("qa_acceptance_created_at") or ""
+    ).strip()
     merge_event_created_at = str(
         authority.get("merge_event_created_at") or ""
     ).strip()
@@ -3619,7 +3622,42 @@ def _current_full_reconcile_satisfies_requirement(
         is True
         and authority.get("active_snapshot_matches_canonical_head") is True
     )
-    qa_time = _event_time_order_value(qa_event_created_at)
+    qa_authority_mode = str(
+        authority.get("qa_authority_mode") or ""
+    ).strip()
+    qa_source_ref = str(authority.get("qa_source_ref") or "").strip()
+    qa_acceptance_revision = positive_int(
+        authority.get("qa_acceptance_revision")
+    )
+    timeline_qa_verified = bool(
+        qa_authority_mode == "timeline_event"
+        and authority.get("timeline_qa_acceptance_verified") is True
+        and qa_event_id > 0
+        and qa_event_created_at
+        and not qa_acceptance_created_at
+        and qa_acceptance_revision == 0
+        and authority.get("qa_contract_runtime_verified") is not True
+        and authority.get("canonical_qa_acceptance_verified") is not True
+    )
+    canonical_qa_verified = bool(
+        qa_authority_mode == "canonical_contract_runtime_acceptance"
+        and authority.get("canonical_qa_acceptance_verified") is True
+        and authority.get("qa_contract_runtime_verified") is True
+        and authority.get("qa_completed_line_ref_verified") is True
+        and qa_source_ref.startswith("contract_runtime:")
+        and ":completed_lines:" in qa_source_ref
+        and qa_acceptance_revision > 0
+        and qa_acceptance_created_at
+        and qa_event_id == 0
+        and not qa_event_created_at
+    )
+    qa_time = _event_time_order_value(
+        qa_event_created_at
+        if timeline_qa_verified
+        else qa_acceptance_created_at
+        if canonical_qa_verified
+        else ""
+    )
     merge_time = _event_time_order_value(merge_event_created_at)
     reconcile_time = _event_time_order_value(reconcile_event_created_at)
     return bool(
@@ -3632,10 +3670,18 @@ def _current_full_reconcile_satisfies_requirement(
         and authority.get("provenance_verified") is True
         and authority.get("provenance_scope_verified") is True
         and authority.get("durable_order_verified") is True
-        and qa_event_id > 0
-        and merge_event_id > qa_event_id
+        and (timeline_qa_verified or canonical_qa_verified)
+        and (
+            merge_event_id > qa_event_id
+            if timeline_qa_verified
+            else merge_event_id > 0
+        )
         and reconcile_event_id > merge_event_id
-        and qa_event_created_at
+        and (
+            qa_event_created_at
+            if timeline_qa_verified
+            else qa_acceptance_created_at
+        )
         and merge_event_created_at
         and reconcile_event_created_at
         and qa_time is not None

@@ -453,14 +453,56 @@
           "durable_order_verified"
         ],
         "required_temporal_fields": [
-          "qa_event_id",
-          "qa_event_created_at",
           "merge_event_id",
           "merge_event_created_at",
           "reconcile_event_id",
           "reconcile_event_created_at"
         ],
-        "required_temporal_order": "qa_id_and_timestamp_before_merge_id_and_timestamp_before_reconcile_id_and_timestamp",
+        "qa_authority_alternative_mode": "exactly_one",
+        "qa_authority_alternatives": [
+          {
+            "id": "timeline_event",
+            "authority_mode": "timeline_event",
+            "required_verification_fields": [
+              "timeline_qa_acceptance_verified"
+            ],
+            "required_positive_integer_fields": [
+              "qa_event_id"
+            ],
+            "required_temporal_fields": [
+              "qa_event_created_at"
+            ],
+            "forbidden_fields": [
+              "qa_acceptance_created_at",
+              "qa_acceptance_revision",
+              "qa_contract_runtime_verified",
+              "canonical_qa_acceptance_verified"
+            ]
+          },
+          {
+            "id": "canonical_contract_runtime_acceptance",
+            "authority_mode": "canonical_contract_runtime_acceptance",
+            "required_verification_fields": [
+              "canonical_qa_acceptance_verified",
+              "qa_contract_runtime_verified",
+              "qa_completed_line_ref_verified"
+            ],
+            "required_identity_fields": [
+              "qa_source_ref"
+            ],
+            "required_positive_integer_fields": [
+              "qa_acceptance_revision"
+            ],
+            "required_temporal_fields": [
+              "qa_acceptance_created_at"
+            ],
+            "forbidden_fields": [
+              "qa_event_id",
+              "qa_event_created_at"
+            ]
+          }
+        ],
+        "required_temporal_order": "verified_qa_authority_timestamp_before_merge_id_and_timestamp_before_reconcile_id_and_timestamp",
         "allow_taskless_reconcile_only_for_explicit_shared_batch": true,
         "explicit_task_id_mismatch_policy": "fail_closed",
         "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
