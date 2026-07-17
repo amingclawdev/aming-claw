@@ -53293,7 +53293,16 @@ def _contract_runtime_trusted_merge_projection(
                 )
             )
             if contract_runtime_merge:
-                candidates.append(contract_runtime_merge)
+                candidates.append(
+                    _contract_runtime_completed_merge_reconcile_authority(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        context=context,
+                        timeline_events=timeline_events,
+                        merge=contract_runtime_merge,
+                    )
+                )
                 continue
             projected_lines = _contract_runtime_projection_post_worker_lines(
                 conn=conn,
@@ -53416,6 +53425,118 @@ def _contract_runtime_trusted_merge_projection(
             ],
         }
     return {"timeline_verified": True, **next(iter(unique.values()))}
+
+
+def _contract_runtime_completed_merge_reconcile_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+    merge: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Join current-full reconcile authority onto a completed merge tuple.
+
+    ContractRuntime-completed QA and merge lines intentionally do not require a
+    redundant QA timeline event.  Reconcile authority is still task/runtime
+    scoped and must resolve through the durable current-full provenance store.
+    """
+
+    trusted_merge = dict(merge)
+    if trusted_merge.get("timeline_verified") is not True:
+        return trusted_merge
+
+    reconcile_policy = _contract_runtime_line_evidence_policy(
+        record,
+        "current_full_reconcile_evidence_policy",
+        line_id="observer_reconcile",
+    )
+    if not reconcile_policy:
+        return trusted_merge
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    backlog_id = str(
+        getattr(context, "backlog_id", "") or record.get("backlog_id") or ""
+    )
+    related_task_ids = {
+        str(parent_task_id or "").strip(),
+        str(record.get("contract_execution_id") or "").strip(),
+        str(record.get("parent_contract_execution_id") or "").strip(),
+        str(record.get("root_contract_execution_id") or "").strip(),
+    }
+    related_task_ids = {item for item in related_task_ids if item}
+    allow_taskless_reconcile = bool(
+        reconcile_policy.get(
+            "allow_taskless_reconcile_only_for_explicit_shared_batch"
+        )
+        is True
+        and str(getattr(context, "batch_id", "") or "").strip()
+        and str(getattr(context, "merge_queue_id", "") or "").strip()
+    )
+    projection_events = _contract_runtime_projection_post_worker_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        timeline_events=timeline_events,
+    )
+    reconcile_event = _contract_runtime_projection_latest_timeline_event(
+        projection_events,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        kind_tokens={"reconcile", "observer_reconcile"},
+        phase_tokens={"reconcile"},
+        actor_roles={"observer"},
+        allow_taskless=allow_taskless_reconcile,
+        related_task_ids=related_task_ids,
+        direct_parent_task_id=parent_task_id,
+    )
+    if not reconcile_event:
+        return trusted_merge
+
+    reconcile_scope = _contract_runtime_projection_timeline_scope_values(
+        reconcile_event
+    )
+    reconcile_projection = {
+        "timeline_verified": True,
+        "allow_taskless_reconcile": allow_taskless_reconcile,
+        "reconcile_source_ref": _runtime_context_event_ref(reconcile_event),
+        "reconcile_event_id": (
+            _contract_runtime_projection_timeline_event_id(reconcile_event)
+        ),
+        "reconcile_event_created_at": (
+            _contract_runtime_projection_timeline_event_time(reconcile_event)
+        ),
+        "reconcile_task_id": (
+            reconcile_scope["task_ids"][0]
+            if len(reconcile_scope["task_ids"]) == 1
+            else ""
+        ),
+        "reconcile_runtime_context_id": (
+            reconcile_scope["runtime_context_ids"][0]
+            if len(reconcile_scope["runtime_context_ids"]) == 1
+            else ""
+        ),
+    }
+    reconcile_authority = _contract_runtime_current_full_reconcile_authority_from_merge(
+        conn,
+        project_id=project_id,
+        record=record,
+        merge=trusted_merge,
+        reconcile=reconcile_projection,
+    )
+    if not (
+        reconcile_authority.get("db_verified") is True
+        and reconcile_authority.get("live_verified") is True
+        and reconcile_authority.get("active_snapshot_verified") is True
+        and reconcile_authority.get("graph_reconciled") is True
+    ):
+        return trusted_merge
+    return {**trusted_merge, **reconcile_authority}
 
 
 def _contract_runtime_completed_merge_authority(
