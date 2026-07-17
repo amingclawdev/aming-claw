@@ -7091,6 +7091,7 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
         raw_symbols.extend(
             {
                 "name": item.name,
+                "qualified_name": item.qualified_name,
                 "kind": "function",
                 "lineno": item.lineno,
                 "end_lineno": item.end_lineno,
@@ -7120,7 +7121,12 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
         if not name or name.split(".")[-1].startswith("_"):
             continue
         kind = str(raw_symbol.get("kind") or "symbol").strip()
-        identity = f"{module_name}::{name}"
+        qualified_name = str(raw_symbol.get("qualified_name") or name).strip()
+        identity = (
+            qualified_name
+            if "::" in qualified_name
+            else f"{module_name}::{qualified_name}"
+        )
         if identity in seen:
             _qa_overlay_fail(
                 "ambiguous_symbol_identity_requires_exact_candidate_snapshot",

@@ -23313,6 +23313,45 @@ def test_qa_overlay_hint_projection_rejects_actual_or_malformed_changes(
     assert exc.value.reason == expected_reason
 
 
+def test_qa_overlay_python_symbols_use_qualified_identity_for_same_short_name():
+    facts = server._qa_overlay_source_facts(
+        "src/nested.py",
+        "class First:\n"
+        "    def collect(self):\n"
+        "        return 'first'\n\n"
+        "class Second:\n"
+        "    def collect(self):\n"
+        "        return 'second'\n",
+    )
+
+    collect_symbols = [
+        item
+        for item in facts["symbols"]
+        if item["name"].split(".")[-1] == "collect"
+    ]
+    assert [item["name"] for item in collect_symbols] == [
+        "First.collect",
+        "Second.collect",
+    ]
+    assert {item["identity"] for item in collect_symbols} == {
+        "src.nested::First.collect",
+        "src.nested::Second.collect",
+    }
+
+
+def test_qa_overlay_python_symbols_still_reject_true_qualified_duplicates():
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_overlay_source_facts(
+            "src/duplicate.py",
+            "def collect():\n"
+            "    return 'first'\n\n"
+            "def collect():\n"
+            "    return 'second'\n",
+        )
+    assert exc.value.reason == "ambiguous_symbol_identity_requires_exact_candidate_snapshot"
+    assert exc.value.details["symbol_identity"] == "src.duplicate::collect"
+
+
 @pytest.mark.parametrize(
     ("relative_path", "payload", "expected_reason"),
     [
