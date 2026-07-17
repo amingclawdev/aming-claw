@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -2228,6 +2229,7 @@ def record_current_full_reconcile_provenance(
             "parent_task_id",
             "runtime_context_id",
             "merge_queue_id",
+            "contract_execution_id",
         )
         if str((runtime_context_scope or {}).get(key) or "").strip()
     }
@@ -2262,6 +2264,7 @@ def record_current_full_reconcile_provenance(
             "parent_task_id",
             "runtime_context_id",
             "merge_queue_id",
+            "contract_execution_id",
         ):
             route_value = str(safe_route_evidence.get(field) or "").strip()
             scope_value = safe_runtime_context_scope.get(field, "")
@@ -2358,6 +2361,10 @@ def current_full_reconcile_state(
     *,
     qa_event_id: int = 0,
     qa_event_created_at: str = "",
+    qa_source_ref: str = "",
+    qa_acceptance_created_at: str = "",
+    qa_acceptance_revision: int = 0,
+    qa_contract_runtime_verified: bool = False,
     merge_event_id: int = 0,
     merge_event_created_at: str = "",
     reconcile_event_id: int = 0,
@@ -2526,6 +2533,7 @@ def current_full_reconcile_state(
                     "parent_task_id",
                     "runtime_context_id",
                     "merge_queue_id",
+                    "contract_execution_id",
                 )
                 if str(marker_runtime_context_scope.get(key) or "").strip()
             }
@@ -2538,6 +2546,7 @@ def current_full_reconcile_state(
                     "parent_task_id",
                     "runtime_context_id",
                     "merge_queue_id",
+                    "contract_execution_id",
                 )
                 if str(route_runtime_context_scope.get(key) or "").strip()
             }
@@ -2614,10 +2623,35 @@ def current_full_reconcile_state(
         merge_event_id = 0
         reconcile_event_id = 0
     qa_time = _timestamp_value(qa_event_created_at)
+    qa_acceptance_time = _timestamp_value(qa_acceptance_created_at)
     merge_time = _timestamp_value(merge_event_created_at)
     reconcile_time = _timestamp_value(reconcile_event_created_at)
     marker_time = _timestamp_value(marker.get("marker_created_at"))
-    qa_order_required = bool(qa_event_id or str(qa_event_created_at or "").strip())
+    qa_completed_line_ref = bool(
+        re.fullmatch(
+            r"contract_runtime:[^:]+:completed_lines:\d+",
+            str(qa_source_ref or "").strip(),
+        )
+    )
+    qa_acceptance_claimed = bool(
+        str(qa_source_ref or "").strip()
+        or str(qa_acceptance_created_at or "").strip()
+        or int(qa_acceptance_revision or 0)
+        or qa_contract_runtime_verified
+    )
+    canonical_qa_acceptance = bool(
+        qa_contract_runtime_verified
+        and qa_completed_line_ref
+        and int(qa_acceptance_revision or 0) > 0
+        and qa_acceptance_time is not None
+        and qa_event_id == 0
+        and not str(qa_event_created_at or "").strip()
+    )
+    qa_order_required = bool(
+        qa_event_id
+        or str(qa_event_created_at or "").strip()
+        or qa_acceptance_claimed
+    )
     durable_order_verified = bool(
         merge_event_id > 0
         and reconcile_event_id > merge_event_id
@@ -2635,6 +2669,10 @@ def current_full_reconcile_state(
         and marker_time >= reconcile_time
         and (
             not qa_order_required
+            or (
+                canonical_qa_acceptance
+                and qa_acceptance_time < merge_time
+            )
             or (
                 qa_event_id > 0
                 and merge_event_id > qa_event_id
@@ -2730,6 +2768,15 @@ def current_full_reconcile_state(
         "durable_order_verified": durable_order_verified,
         "qa_event_id": qa_event_id,
         "qa_event_created_at": str(qa_event_created_at or "").strip(),
+        "qa_source_ref": str(qa_source_ref or "").strip(),
+        "qa_acceptance_created_at": str(
+            qa_acceptance_created_at or ""
+        ).strip(),
+        "qa_acceptance_revision": int(qa_acceptance_revision or 0),
+        "qa_contract_runtime_verified": bool(qa_contract_runtime_verified),
+        "qa_acceptance_claimed": qa_acceptance_claimed,
+        "qa_completed_line_ref_verified": qa_completed_line_ref,
+        "canonical_qa_acceptance_verified": canonical_qa_acceptance,
         "merge_event_id": merge_event_id,
         "merge_event_created_at": str(merge_event_created_at or "").strip(),
         "reconcile_event_id": reconcile_event_id,

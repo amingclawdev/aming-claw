@@ -6752,6 +6752,7 @@ def _current_full_reconcile_route_evidence(
             "parent_task_id",
             "runtime_context_id",
             "merge_queue_id",
+            "contract_execution_id",
         )
         if str((runtime_context_scope or {}).get(key) or "").strip()
     }
@@ -6767,6 +6768,7 @@ def _current_full_reconcile_route_evidence(
                     "parent_task_id",
                     "runtime_context_id",
                     "merge_queue_id",
+                    "contract_execution_id",
                 }
             }
         )
@@ -33968,9 +33970,9 @@ def _current_full_reconcile_runtime_context_scope(
     backlog_id = str(
         route_scope.get("backlog_id") or body_scope.get("backlog_id") or ""
     ).strip()
-    task_id = str(
-        route_scope.get("task_id") or body_scope.get("task_id") or ""
-    ).strip()
+    route_task_id = str(route_scope.get("task_id") or "").strip()
+    body_task_id = str(body_scope.get("task_id") or "").strip()
+    task_id = route_task_id or body_task_id
     runtime_context_claims = {
         str(candidate.get("runtime_context_id") or "").strip()
         for candidate in (
@@ -34012,12 +34014,55 @@ def _current_full_reconcile_runtime_context_scope(
 
     from .parallel_branch_runtime import (
         get_branch_context,
+        get_branch_context_by_runtime_context_id,
         runtime_context_id_for_branch_context,
     )
 
     context = get_branch_context(conn, project_id, task_id)
+    contract_record: Mapping[str, Any] = {}
+    contract_execution_id = ""
     if context is None:
-        if claimed_runtime_context_id or (backlog_id and merge_queue_id):
+        try:
+            contract_record = _contract_runtime_store(conn).get(task_id)
+        except (ContractRuntimeError, sqlite3.Error):
+            contract_record = {}
+        if (
+            contract_record
+            and str(contract_record.get("project_id") or "").strip()
+            == project_id
+            and str(contract_record.get("backlog_id") or "").strip()
+            == backlog_id
+        ):
+            trusted_merge = _contract_runtime_trusted_merge_projection(
+                conn,
+                project_id=project_id,
+                record=contract_record,
+            )
+            if trusted_merge.get("timeline_verified") is True:
+                contract_execution_id = str(
+                    contract_record.get("contract_execution_id") or ""
+                ).strip()
+                canonical_runtime_context_id = str(
+                    trusted_merge.get("runtime_context_id") or ""
+                ).strip()
+                if canonical_runtime_context_id:
+                    context = get_branch_context_by_runtime_context_id(
+                        conn,
+                        project_id,
+                        canonical_runtime_context_id,
+                    )
+                if context is None:
+                    context = get_branch_context(
+                        conn,
+                        project_id,
+                        str(trusted_merge.get("task_id") or "").strip(),
+                    )
+    if context is None:
+        if (
+            claimed_runtime_context_id
+            or (backlog_id and merge_queue_id)
+            or contract_record
+        ):
             raise GovernanceError(
                 "current_full_reconcile_runtime_context_not_found",
                 "contract-bound current-full reconcile task has no persisted branch runtime context",
@@ -34050,10 +34095,11 @@ def _current_full_reconcile_runtime_context_scope(
             getattr(context, "merge_queue_id", "") or ""
         ).strip(),
     }
+    if contract_execution_id:
+        canonical_scope["contract_execution_id"] = contract_execution_id
     mismatches: dict[str, dict[str, str]] = {}
     requested_values = {
         "backlog_id": backlog_id,
-        "task_id": task_id,
         "runtime_context_id": claimed_runtime_context_id,
         "merge_queue_id": merge_queue_id,
     }
@@ -34062,6 +34108,18 @@ def _current_full_reconcile_runtime_context_scope(
         if requested and requested != canonical:
             mismatches[field] = {
                 "expected": canonical,
+                "actual": requested,
+            }
+    allowed_task_ids = {canonical_scope["task_id"]}
+    if contract_execution_id:
+        allowed_task_ids.add(contract_execution_id)
+    for source, requested in (
+        ("route_task_id", route_task_id),
+        ("body_task_id", body_task_id),
+    ):
+        if requested and requested not in allowed_task_ids:
+            mismatches[source] = {
+                "expected": "|".join(sorted(allowed_task_ids)),
                 "actual": requested,
             }
     if not canonical_scope["backlog_id"]:
@@ -34115,6 +34173,7 @@ def _record_pending_scope_reconcile_contract_event(
             "parent_task_id",
             "runtime_context_id",
             "merge_queue_id",
+            "contract_execution_id",
         )
         if str((runtime_context_scope or {}).get(key) or "").strip()
     }
@@ -34233,6 +34292,7 @@ def _record_pending_scope_reconcile_contract_event(
                     "parent_task_id",
                     "runtime_context_id",
                     "merge_queue_id",
+                    "contract_execution_id",
                 }
             },
             **(
@@ -53974,6 +54034,21 @@ def _contract_runtime_completed_merge_authority(
         return {}
     if not (qa_graph[0] < qa_verification[0] < merge_line[0]):
         return {}
+    if (
+        not _contract_runtime_line_status_passes(qa_verification[1])
+        or _contract_runtime_value_reports_failed_qa(qa_verification[1])
+    ):
+        return {}
+
+    qa_acceptance = _contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=qa_verification[0],
+        expected_line=qa_verification[1],
+    )
+    if qa_acceptance.get("db_verified") is not True:
+        return {}
 
     qa_graph_payload = (
         qa_graph[1].get("payload")
@@ -54104,13 +54179,18 @@ def _contract_runtime_completed_merge_authority(
             or ""
         ),
         "merged_commit_sha": merged_commit,
-        "qa_source_ref": (
-            "contract_runtime:"
-            f"{record.get('contract_execution_id', '')}:"
-            "line:qa_independent_verification"
-        ),
+        "qa_source_ref": str(qa_acceptance.get("completed_line_ref") or ""),
         "qa_event_id": 0,
         "qa_event_created_at": "",
+        "qa_acceptance_created_at": str(
+            qa_acceptance.get("accepted_at") or ""
+        ),
+        "qa_acceptance_revision": int(
+            qa_acceptance.get("execution_state_revision") or 0
+        ),
+        "qa_acceptance_ref": str(
+            qa_acceptance.get("acceptance_ref") or ""
+        ),
         "qa_contract_runtime_verified": True,
         "qa_graph_completed_line_index": qa_graph[0],
         "qa_completed_line_index": qa_verification[0],
@@ -54120,6 +54200,77 @@ def _contract_runtime_completed_merge_authority(
         "merge_event_created_at": merge_event_created_at,
         "merge_queue_id": merge_queue_id,
         "queue_item_id": queue_item_id,
+    }
+
+
+def _contract_runtime_completed_line_acceptance(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    completed_line_index: int,
+    expected_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one completed line's server-written acceptance revision/time."""
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not execution_id or completed_line_index < 0:
+        return {}
+    try:
+        canonical = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    if (
+        str(canonical.get("project_id") or "").strip() != project_id
+        or str(canonical.get("contract_execution_id") or "").strip()
+        != execution_id
+    ):
+        return {}
+    completed = [
+        item
+        for item in canonical.get("completed_lines") or []
+        if isinstance(item, Mapping)
+    ]
+    if completed_line_index >= len(completed):
+        return {}
+    canonical_line = completed[completed_line_index]
+    if stable_sha256(canonical_line) != stable_sha256(expected_line):
+        return {}
+    current_revision = int(canonical.get("execution_state_revision") or 0)
+    base_revision = current_revision - len(completed)
+    accepted_revision = base_revision + completed_line_index + 1
+    if base_revision < 0 or accepted_revision <= 0:
+        return {}
+    expected_ref = f"contract_runtime:{execution_id}:revision:{accepted_revision}"
+    rows = conn.execute(
+        """
+        SELECT source_ref, created_at
+        FROM backlog_contract_chain_bindings
+        WHERE project_id = ? AND contract_execution_id = ?
+          AND execution_state_revision = ? AND source_ref = ?
+        ORDER BY id
+        LIMIT 2
+        """,
+        (project_id, execution_id, accepted_revision, expected_ref),
+    ).fetchall()
+    if len(rows) != 1:
+        return {}
+    accepted_at = str(rows[0]["created_at"] or "").strip()
+    if _contract_runtime_close_authority_time_order_value(accepted_at) is None:
+        return {}
+    completed_line_ref = (
+        f"contract_runtime:{execution_id}:completed_lines:{completed_line_index}"
+    )
+    return {
+        "schema_version": "contract_runtime.completed_line_acceptance.v1",
+        "source": "backlog_contract_chain_bindings",
+        "db_verified": True,
+        "contract_execution_id": execution_id,
+        "completed_line_index": completed_line_index,
+        "completed_line_ref": completed_line_ref,
+        "execution_state_revision": accepted_revision,
+        "acceptance_ref": expected_ref,
+        "accepted_at": accepted_at,
     }
 
 
@@ -54161,6 +54312,16 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         merged_commit,
         qa_event_id=int(merge.get("qa_event_id") or 0),
         qa_event_created_at=str(merge.get("qa_event_created_at") or ""),
+        qa_source_ref=str(merge.get("qa_source_ref") or ""),
+        qa_acceptance_created_at=str(
+            merge.get("qa_acceptance_created_at") or ""
+        ),
+        qa_acceptance_revision=int(
+            merge.get("qa_acceptance_revision") or 0
+        ),
+        qa_contract_runtime_verified=bool(
+            merge.get("qa_contract_runtime_verified")
+        ),
         merge_event_id=int(merge.get("merge_event_id") or 0),
         merge_event_created_at=str(merge.get("merge_event_created_at") or ""),
         reconcile_event_id=int(reconcile.get("reconcile_event_id") or 0),
