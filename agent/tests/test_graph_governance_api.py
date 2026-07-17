@@ -337,7 +337,9 @@ def test_contract_runtime_worker_commit_proof_accepts_exact_active_worker_commit
     ) == ()
 
 
-def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
+def test_worker_commit_revision_diff_uses_runtime_base_across_rework_commits(
+    tmp_path,
+):
     worktree = tmp_path / "worker-commit-revision-diff"
     worktree.mkdir()
     subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
@@ -377,10 +379,12 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
     revision_diff = server._runtime_context_worker_commit_revision_diff(
         str(worktree),
         current_commit,
+        base_commit=base_commit,
     )
 
     assert revision_diff["parent_commit"] == prior_commit
-    assert revision_diff["changed_files"] == ["current.py"]
+    assert revision_diff["base_commit"] == base_commit
+    assert revision_diff["changed_files"] == ["current.py", "prior.py"]
     assert batch_jobs.git_changed_files(
         worktree,
         base_ref=base_commit,
@@ -388,13 +392,22 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
     ) == ["current.py", "prior.py"]
     assert server._runtime_context_worker_commit_diff_matches(
         revision_diff["changed_files"],
-        ["current.py"],
-        ["current.py"],
+        ["current.py", "prior.py"],
+        ["current.py", "prior.py"],
     )
     assert not server._runtime_context_worker_commit_diff_matches(
         revision_diff["changed_files"],
-        ["prior.py"],
         ["current.py"],
+        ["current.py"],
+    )
+    with pytest.raises(GovernanceError) as missing_base_exc:
+        server._runtime_context_worker_commit_revision_diff(
+            str(worktree),
+            current_commit,
+            base_commit="f" * 40,
+        )
+    assert missing_base_exc.value.code == (
+        "worker_commit_revision_boundary_unresolved"
     )
     assert server._runtime_context_finish_changed_files(
         str(worktree),
@@ -402,7 +415,7 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
         head_commit=current_commit,
         canonical_worker_commit_required=True,
         include_worktree=True,
-    ) == ["current.py"]
+    ) == ["current.py", "prior.py"]
     assert server._runtime_context_finish_changed_files(
         str(worktree),
         base_commit=base_commit,
@@ -420,12 +433,12 @@ def test_worker_commit_revision_diff_uses_immutable_head_parent(tmp_path):
         {"owned_files": ["current.py"]},
         {
             "canonical_worker_commit_required": True,
-            "diff_base_commit": prior_commit,
+            "diff_base_commit": base_commit,
             "owned_files": ["current.py", "prior.py"],
         },
-        ["current.py"],
+        ["current.py", "prior.py"],
     ) == {
-        "base_commit": prior_commit,
+        "base_commit": base_commit,
         "owned_files": ["current.py", "prior.py"],
     }
     assert server._runtime_context_finish_attestation_git_scope(
