@@ -7230,6 +7230,116 @@ def _qa_overlay_symbol_delta(
     }
 
 
+def _qa_overlay_normalized_marker_line(raw: str) -> str:
+    return " ".join(str(raw or "").strip().split())
+
+
+def _qa_overlay_comment_text(raw: str) -> str:
+    text = str(raw or "").lstrip()
+    for marker in ("#", "//", "<!--"):
+        if not text.startswith(marker):
+            continue
+        text = text[len(marker) :].strip()
+        if marker == "<!--" and text.endswith("-->"):
+            text = text[:-3].strip()
+        return text
+    return ""
+
+
+def _qa_overlay_governance_hint_projection(source: str | None) -> dict[str, Any]:
+    lines = str(source or "").splitlines()
+    comment_lines = [
+        _qa_overlay_normalized_marker_line(comment)
+        for raw in lines
+        if "governance-hint" in (comment := _qa_overlay_comment_text(raw)).lower()
+    ]
+    entry_pattern = re.compile(r"^\s*['\"]governance_hints['\"]\s*[:=]")
+    entries: list[list[str]] = []
+    for index, raw in enumerate(lines):
+        if not entry_pattern.match(raw):
+            continue
+        indentation = len(raw) - len(raw.lstrip())
+        entry = [_qa_overlay_normalized_marker_line(raw)]
+        for child in lines[index + 1 :]:
+            if not child.strip():
+                continue
+            child_indentation = len(child) - len(child.lstrip())
+            if child_indentation <= indentation:
+                break
+            entry.append(_qa_overlay_normalized_marker_line(child))
+        entries.append(entry)
+    return {
+        "governance_hint_comment_lines": comment_lines,
+        "governance_hints_entries": entries,
+    }
+
+
+def _qa_overlay_graph_structure_hint_blocks(
+    source: str | None,
+    *,
+    path: str,
+    version: str,
+) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    start_line = 0
+    for line_number, raw in enumerate(str(source or "").splitlines(), start=1):
+        comment = _qa_overlay_comment_text(raw)
+        lowered = comment.lower()
+        has_start = "aming-claw-hint:start" in lowered
+        has_end = "aming-claw-hint:end" in lowered
+        if has_start and has_end:
+            _qa_overlay_fail(
+                "graph_structure_hint_change_requires_exact_candidate_snapshot",
+                "candidate overlay found a malformed graph structure hint block",
+                path=path,
+                version=version,
+                line_number=line_number,
+                malformed_reason="start_and_end_on_same_line",
+            )
+        if has_start:
+            if current is not None:
+                _qa_overlay_fail(
+                    "graph_structure_hint_change_requires_exact_candidate_snapshot",
+                    "candidate overlay found a nested graph structure hint block",
+                    path=path,
+                    version=version,
+                    line_number=line_number,
+                    start_line=start_line,
+                    malformed_reason="nested_start",
+                )
+            current = [_qa_overlay_normalized_marker_line(comment)]
+            start_line = line_number
+            continue
+        if has_end:
+            if current is None:
+                _qa_overlay_fail(
+                    "graph_structure_hint_change_requires_exact_candidate_snapshot",
+                    "candidate overlay found an unmatched graph structure hint end marker",
+                    path=path,
+                    version=version,
+                    line_number=line_number,
+                    malformed_reason="unmatched_end",
+                )
+            current.append(_qa_overlay_normalized_marker_line(comment))
+            blocks.append(current)
+            current = None
+            start_line = 0
+            continue
+        if current is not None:
+            current.append(_qa_overlay_normalized_marker_line(raw))
+    if current is not None:
+        _qa_overlay_fail(
+            "graph_structure_hint_change_requires_exact_candidate_snapshot",
+            "candidate overlay found an unclosed graph structure hint block",
+            path=path,
+            version=version,
+            start_line=start_line,
+            malformed_reason="unclosed_block",
+        )
+    return blocks
+
+
 def _qa_overlay_assert_safe_interpretation(
     *,
     path: str,
@@ -7256,20 +7366,36 @@ def _qa_overlay_assert_safe_interpretation(
             "candidate changes graph interpretation/configuration inputs",
             paths=unsafe_config_paths,
         )
-    combined = "\n".join(item for item in (base_source, candidate_source) if item)
-    marker_reasons = (
-        ("governance-hint", "governance_hint_change_requires_exact_candidate_snapshot"),
-        ('"governance_hints"', "governance_hint_change_requires_exact_candidate_snapshot"),
-        ("aming-claw-hint:start", "graph_structure_hint_change_requires_exact_candidate_snapshot"),
+    base_governance_projection = _qa_overlay_governance_hint_projection(base_source)
+    candidate_governance_projection = _qa_overlay_governance_hint_projection(
+        candidate_source
     )
-    for marker, reason in marker_reasons:
-        if marker.lower() in combined.lower() and base_source != candidate_source:
-            _qa_overlay_fail(
-                reason,
-                "candidate changes source-controlled graph/governance hint inputs",
-                path=path,
-                marker=marker,
-            )
+    if base_governance_projection != candidate_governance_projection:
+        _qa_overlay_fail(
+            "governance_hint_change_requires_exact_candidate_snapshot",
+            "candidate changes source-controlled governance hint entries",
+            path=path,
+            base_projection=base_governance_projection,
+            candidate_projection=candidate_governance_projection,
+        )
+    base_structure_blocks = _qa_overlay_graph_structure_hint_blocks(
+        base_source,
+        path=old_path or path,
+        version="base",
+    )
+    candidate_structure_blocks = _qa_overlay_graph_structure_hint_blocks(
+        candidate_source,
+        path=path,
+        version="candidate",
+    )
+    if base_structure_blocks != candidate_structure_blocks:
+        _qa_overlay_fail(
+            "graph_structure_hint_change_requires_exact_candidate_snapshot",
+            "candidate changes source-controlled graph structure hint blocks",
+            path=path,
+            base_projection=base_structure_blocks,
+            candidate_projection=candidate_structure_blocks,
+        )
 
 
 def _qa_demo_control_marker_is_server_generated(

@@ -23234,6 +23234,86 @@ def test_qa_candidate_overlay_requires_exact_snapshot_for_graph_inputs(
 
 
 @pytest.mark.parametrize(
+    ("base_source", "candidate_source"),
+    [
+        (
+            "MARKERS = ('governance-hint', '\"governance_hints\"', "
+            "'aming-claw-hint:start')\n\ndef value():\n    return 'base'\n",
+            "MARKERS = ('governance-hint', '\"governance_hints\"', "
+            "'aming-claw-hint:start')\n\ndef value():\n    return 'candidate'\n",
+        ),
+        (
+            "# governance-hint: stable binding\n"
+            "# aming-claw-hint:start id=stable op=add_edge edge=tests target=L7.runtime\n"
+            "# reason: stable reason\n"
+            "# aming-claw-hint:end\n"
+            "def value():\n    return 'base'\n",
+            "# governance-hint: stable binding\n"
+            "# aming-claw-hint:start id=stable op=add_edge edge=tests target=L7.runtime\n"
+            "# reason: stable reason\n"
+            "# aming-claw-hint:end\n"
+            "def value():\n    return 'candidate'\n",
+        ),
+    ],
+)
+def test_qa_overlay_hint_projection_allows_unrelated_source_changes(
+    base_source,
+    candidate_source,
+):
+    server._qa_overlay_assert_safe_interpretation(
+        path="src/service.py",
+        old_path="",
+        base_source=base_source,
+        candidate_source=candidate_source,
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_source", "candidate_source", "expected_reason"),
+    [
+        (
+            "# governance-hint: binding-a\ndef value():\n    return True\n",
+            "# governance-hint: binding-b\ndef value():\n    return True\n",
+            "governance_hint_change_requires_exact_candidate_snapshot",
+        ),
+        (
+            "CONFIG = {\n    \"governance_hints\": {\n        \"enabled\": False,\n    },\n}\n",
+            "CONFIG = {\n    \"governance_hints\": {\n        \"enabled\": True,\n    },\n}\n",
+            "governance_hint_change_requires_exact_candidate_snapshot",
+        ),
+        (
+            "# aming-claw-hint:start id=stable op=add_edge edge=tests target=L7.runtime\n"
+            "# reason: before\n"
+            "# aming-claw-hint:end\n",
+            "# aming-claw-hint:start id=stable op=add_edge edge=tests target=L7.runtime\n"
+            "# reason: after\n"
+            "# aming-claw-hint:end\n",
+            "graph_structure_hint_change_requires_exact_candidate_snapshot",
+        ),
+        (
+            "def value():\n    return True\n",
+            "# aming-claw-hint:start id=unclosed op=add_edge edge=tests target=L7.runtime\n"
+            "# reason: missing end\n",
+            "graph_structure_hint_change_requires_exact_candidate_snapshot",
+        ),
+    ],
+)
+def test_qa_overlay_hint_projection_rejects_actual_or_malformed_changes(
+    base_source,
+    candidate_source,
+    expected_reason,
+):
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_overlay_assert_safe_interpretation(
+            path="src/service.py",
+            old_path="",
+            base_source=base_source,
+            candidate_source=candidate_source,
+        )
+    assert exc.value.reason == expected_reason
+
+
+@pytest.mark.parametrize(
     ("relative_path", "payload", "expected_reason"),
     [
         (
