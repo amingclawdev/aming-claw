@@ -287,6 +287,23 @@ def test_parallel_branch_merge_queue_apply_schemas_expose_branch_ref():
         assert "branch_ref" in properties
 
 
+def test_contract_runtime_timeout_schema_bounds_match_across_mcp_entrypoints():
+    timeout_schemas = []
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        submit_line = next(
+            tool for tool in tools if tool["name"] == "contract_runtime_submit_line"
+        )
+        timeout_schema = submit_line["inputSchema"]["properties"]["timeout_seconds"]
+        timeout_schemas.append(
+            {
+                key: timeout_schema[key]
+                for key in ("default", "minimum", "maximum")
+            }
+        )
+
+    assert timeout_schemas[0] == timeout_schemas[1]
+
+
 def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
