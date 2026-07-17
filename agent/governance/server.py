@@ -21894,7 +21894,9 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
     try:
         from .parallel_branch_runtime import (
             BranchRuntimeFenceError,
+            append_branch_contract_revision,
             get_branch_context_by_runtime_context_id,
+            get_latest_branch_contract_revision,
             initial_join_mf_subagent_runtime_session_token,
             runtime_context_id_for_branch_context,
         )
@@ -22052,11 +22054,77 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
             if str(selected_route_identity.get(field) or "").strip()
         }
+        renewed_contract_revision = None
+        if resolved_route_identity and safe_route_identity:
+            previous_revision = get_latest_branch_contract_revision(
+                conn,
+                project_id,
+                runtime_context_id,
+            )
+            renewal_summary = (
+                initial_join_route_lineage_payload.get("renewed_route_token_ref")
+                if isinstance(initial_join_route_lineage_payload, Mapping)
+                and isinstance(
+                    initial_join_route_lineage_payload.get(
+                        "renewed_route_token_ref"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            revision_payload = (
+                dict(previous_revision.payload)
+                if previous_revision is not None
+                and isinstance(previous_revision.payload, Mapping)
+                else {}
+            )
+            revision_payload["route_token_ref_renewal"] = {
+                "schema_version": "runtime_context.route_token_ref_renewal_revision.v1",
+                "status": "accepted_at_initial_join",
+                "previous_route_token_ref": str(
+                    renewal_summary.get("renewed_from")
+                    or expected_route_identity.get("route_token_ref")
+                    or ""
+                ).strip(),
+                "route_token_ref": str(
+                    safe_route_identity.get("route_token_ref") or ""
+                ).strip(),
+                "registry_verified": bool(
+                    renewal_summary.get("registry_verified")
+                ),
+                "raw_route_token_exposed": False,
+            }
+            renewed_contract_revision = append_branch_contract_revision(
+                conn,
+                context,
+                contract_version=(
+                    previous_revision.contract_version
+                    if previous_revision is not None
+                    else "mf_parallel.v2"
+                ),
+                payload=revision_payload,
+                route_gate=(
+                    previous_revision.route_gate
+                    if previous_revision is not None
+                    else {}
+                ),
+                route_identity=safe_route_identity,
+                route_evidence_type="renewed_route_token_ref",
+                actor="observer",
+                now_iso=str(body.get("now_iso") or ""),
+            )
         if safe_route_identity:
             result["route_identity"] = dict(safe_route_identity)
             if initial_join_route_lineage_payload:
                 result["route_lineage"] = dict(initial_join_route_lineage_payload)
                 result["route_identity_source"] = "resolved_renewed_route_token_ref"
+            if renewed_contract_revision is not None:
+                result["route_contract_revision_id"] = (
+                    renewed_contract_revision.revision_id
+                )
+                result["route_contract_revision_source"] = (
+                    "renewed_route_token_ref"
+                )
             host_envelope = result.get("host_envelope")
             if isinstance(host_envelope, dict):
                 host_envelope["route_identity"] = dict(safe_route_identity)
@@ -22066,6 +22134,13 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     )
                     host_envelope["route_identity_source"] = (
                         "resolved_renewed_route_token_ref"
+                    )
+                if renewed_contract_revision is not None:
+                    host_envelope["route_contract_revision_id"] = (
+                        renewed_contract_revision.revision_id
+                    )
+                    host_envelope["route_contract_revision_source"] = (
+                        "renewed_route_token_ref"
                     )
                 result["host_envelope"] = host_envelope
         audit_payload = {

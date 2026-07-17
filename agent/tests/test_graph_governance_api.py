@@ -76,6 +76,7 @@ from agent.governance.parallel_branch_runtime import (
     upsert_batch_merge_runtime,
     upsert_branch_context,
     upsert_merge_queue_items,
+    validate_mf_subagent_graph_query_identity,
 )
 
 
@@ -25786,6 +25787,42 @@ def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_
     host_envelope = result["host_envelope"]
     assert host_envelope["route_identity"] == renewed_identity
     assert host_envelope["route_identity_source"] == "resolved_renewed_route_token_ref"
+    latest_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    assert latest_revision is not None
+    assert {
+        field: latest_revision.route_identity[field]
+        for field in renewed_identity
+    } == renewed_identity
+    assert latest_revision.route_evidence_type == "renewed_route_token_ref"
+    assert latest_revision.payload["route_token_ref_renewal"] == {
+        "schema_version": "runtime_context.route_token_ref_renewal_revision.v1",
+        "status": "accepted_at_initial_join",
+        "previous_route_token_ref": old_ref,
+        "route_token_ref": renewed_ref,
+        "registry_verified": True,
+    }
+    assert "raw_route_token_exposed" not in latest_revision.payload[
+        "route_token_ref_renewal"
+    ]
+    assert result["route_contract_revision_id"] == latest_revision.revision_id
+    assert host_envelope["route_contract_revision_id"] == latest_revision.revision_id
+    graph_context = validate_mf_subagent_graph_query_identity(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id="worker-runtime-initial-join-renewed",
+        parent_task_id="parent-runtime-initial-join-renewed",
+        worker_role="mf_sub",
+        fence_token="fence-runtime-initial-join-renewed",
+        session_token=result["session_token"],
+        target_project_root=str(target_root),
+        route_identity=renewed_identity,
+    )
+    assert graph_context.task_id == "worker-runtime-initial-join-renewed"
     events = task_timeline.list_events(
         conn,
         PID,
