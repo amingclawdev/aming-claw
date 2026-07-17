@@ -763,6 +763,17 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
                 "path": "agent/governance/server.py",
                 "file_kind": "source",
                 "language": "python",
+                "source_fallbacks": {
+                    "candidate": {
+                        "schema_version": "qa_review_graph.source_inspection.v1",
+                        "policy": "oversized_supported_source",
+                        "fallback_reason": "oversized_supported_source",
+                        "file_byte_size": 687765,
+                        "ordinary_max_file_bytes": 524288,
+                        "max_total_bytes": 6291456,
+                        "deterministic_language_adapter": "python",
+                    }
+                },
                 "candidate": {"symbols": [symbol]},
                 "symbol_delta": {
                     "added": [symbol],
@@ -896,6 +907,9 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
     review_graph = queried["result"]["qa_review_graph"]
     assert review_graph["base_snapshot_results_preserved"] is True
     assert review_graph["file_matches"][0]["status"] == "M"
+    assert review_graph["file_matches"][0]["source_fallbacks"] == (
+        candidate_overlay["files"][0]["source_fallbacks"]
+    )
 
     with pytest.raises(ValueError, match="graph query trace binding mismatch"):
         graph_query_trace.traced_query(

@@ -6831,6 +6831,7 @@ _QA_OVERLAY_MAX_FILES = 160
 _QA_OVERLAY_MAX_FILE_BYTES = 512 * 1024
 _QA_OVERLAY_MAX_TOTAL_BYTES = 6 * 1024 * 1024
 _QA_OVERLAY_MAX_SYMBOLS = 10_000
+_QA_OVERLAY_OVERSIZED_SOURCE_POLICY = "oversized_supported_source"
 _QA_OVERLAY_UNSAFE_CONFIG_PATHS = {
     ".aming-claw.yaml",
     ".aming-claw.json",
@@ -6945,12 +6946,36 @@ def _qa_parse_name_status_z(raw: bytes) -> list[dict[str, Any]]:
     return changes
 
 
+def _qa_overlay_deterministic_adapter(path: str) -> Any | None:
+    from .language_adapters import (
+        JavaScriptTypescriptAdapter,
+        PythonAdapter,
+        RubyAdapter,
+    )
+    from .language_policy import DEFAULT_LANGUAGE_POLICY
+
+    if not DEFAULT_LANGUAGE_POLICY.is_source_path(path):
+        return None
+    return next(
+        (
+            adapter
+            for adapter in (
+                PythonAdapter(),
+                JavaScriptTypescriptAdapter(),
+                RubyAdapter(),
+            )
+            if adapter.supports(path)
+        ),
+        None,
+    )
+
+
 def _qa_git_object_source(
     project_root: Path,
     *,
     commit_sha: str,
     path: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, dict[str, Any]]:
     result = _qa_git_bytes(project_root, ["show", f"{commit_sha}:{path}"])
     if result.returncode != 0:
         _qa_overlay_fail(
@@ -6960,14 +6985,6 @@ def _qa_git_object_source(
             path=path,
         )
     raw = result.stdout
-    if len(raw) > _QA_OVERLAY_MAX_FILE_BYTES:
-        _qa_overlay_fail(
-            "oversized_source_requires_exact_candidate_snapshot",
-            "candidate overlay file exceeds the bounded per-file limit",
-            path=path,
-            byte_size=len(raw),
-            max_byte_size=_QA_OVERLAY_MAX_FILE_BYTES,
-        )
     if b"\0" in raw:
         _qa_overlay_fail(
             "binary_source_requires_exact_candidate_snapshot",
@@ -6975,13 +6992,47 @@ def _qa_git_object_source(
             path=path,
         )
     try:
-        return raw.decode("utf-8"), len(raw)
+        source = raw.decode("utf-8")
     except UnicodeDecodeError:
         _qa_overlay_fail(
             "non_utf8_source_requires_exact_candidate_snapshot",
             "candidate overlay requires UTF-8 source",
             path=path,
         )
+    byte_size = len(raw)
+    fallback_reason = ""
+    adapter = None
+    if byte_size > _QA_OVERLAY_MAX_FILE_BYTES:
+        if byte_size > _QA_OVERLAY_MAX_TOTAL_BYTES:
+            _qa_overlay_fail(
+                "total_source_limit_requires_exact_candidate_snapshot",
+                "candidate overlay source exceeds the total inspection limit",
+                path=path,
+                byte_size=byte_size,
+                max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+            )
+        adapter = _qa_overlay_deterministic_adapter(path)
+        if adapter is None:
+            _qa_overlay_fail(
+                "oversized_source_requires_exact_candidate_snapshot",
+                "candidate overlay file exceeds the ordinary per-file limit and has no supported deterministic source adapter",
+                path=path,
+                byte_size=byte_size,
+                max_byte_size=_QA_OVERLAY_MAX_FILE_BYTES,
+                fallback_policy=_QA_OVERLAY_OVERSIZED_SOURCE_POLICY,
+            )
+        fallback_reason = _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+    return source, byte_size, {
+        "schema_version": "qa_review_graph.source_inspection.v1",
+        "policy": fallback_reason or "ordinary_per_file_bound",
+        "fallback_reason": fallback_reason,
+        "file_byte_size": byte_size,
+        "ordinary_max_file_bytes": _QA_OVERLAY_MAX_FILE_BYTES,
+        "max_total_bytes": _QA_OVERLAY_MAX_TOTAL_BYTES,
+        "deterministic_language_adapter": (
+            str(adapter.language() or "") if adapter is not None else ""
+        ),
+    }
 
 
 def _qa_overlay_file_kind(path: str) -> str:
@@ -7006,17 +7057,12 @@ def _qa_overlay_module_name(path: str) -> str:
 
 
 def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
-    from .language_adapters import (
-        JavaScriptTypescriptAdapter,
-        PythonAdapter,
-        RubyAdapter,
-    )
+    from .language_adapters import PythonAdapter
     from .language_policy import DEFAULT_LANGUAGE_POLICY
 
     if not DEFAULT_LANGUAGE_POLICY.is_source_path(path):
         return {"language": "", "symbols": [], "imports": [], "relations": []}
-    adapters = (PythonAdapter(), JavaScriptTypescriptAdapter(), RubyAdapter())
-    adapter = next((item for item in adapters if item.supports(path)), None)
+    adapter = _qa_overlay_deterministic_adapter(path)
     if adapter is None:
         _qa_overlay_fail(
             "unsupported_source_language_requires_exact_candidate_snapshot",
@@ -7130,13 +7176,19 @@ def _qa_overlay_source_facts(path: str, source: str) -> dict[str, Any]:
     }
 
 
-def _qa_overlay_version(path: str, source: str, byte_size: int) -> dict[str, Any]:
+def _qa_overlay_version(
+    path: str,
+    source: str,
+    byte_size: int,
+    source_inspection: Mapping[str, Any],
+) -> dict[str, Any]:
     facts = _qa_overlay_source_facts(path, source)
     return {
         "path": path,
         "source_hash": f"sha256:{hashlib.sha256(source.encode('utf-8')).hexdigest()}",
         "byte_size": byte_size,
         "line_count": len(source.splitlines()),
+        "source_inspection": dict(source_inspection),
         **facts,
     }
 
@@ -7548,12 +7600,14 @@ def _qa_candidate_diff_context(
         candidate_source: str | None = None
         base_bytes = 0
         candidate_bytes = 0
+        base_inspection: dict[str, Any] = {}
+        candidate_inspection: dict[str, Any] = {}
         if status != "A":
-            base_source, base_bytes = _qa_git_object_source(
+            base_source, base_bytes, base_inspection = _qa_git_object_source(
                 canonical_root, commit_sha=base_commit_sha, path=base_path
             )
         if status != "D":
-            candidate_source, candidate_bytes = _qa_git_object_source(
+            candidate_source, candidate_bytes, candidate_inspection = _qa_git_object_source(
                 canonical_root, commit_sha=candidate_commit_sha, path=path
             )
         total_bytes += base_bytes + candidate_bytes
@@ -7570,12 +7624,16 @@ def _qa_candidate_diff_context(
             candidate_source=candidate_source,
         )
         base_version = (
-            _qa_overlay_version(base_path, base_source, base_bytes)
+            _qa_overlay_version(
+                base_path, base_source, base_bytes, base_inspection
+            )
             if base_source is not None
             else None
         )
         candidate_version = (
-            _qa_overlay_version(path, candidate_source, candidate_bytes)
+            _qa_overlay_version(
+                path, candidate_source, candidate_bytes, candidate_inspection
+            )
             if candidate_source is not None
             else None
         )
@@ -7599,6 +7657,14 @@ def _qa_candidate_diff_context(
                 **change,
                 "file_kind": file_kind,
                 "language": language,
+                "source_fallbacks": {
+                    key: dict(inspection)
+                    for key, inspection in (
+                        ("base", base_inspection),
+                        ("candidate", candidate_inspection),
+                    )
+                    if inspection.get("fallback_reason")
+                },
                 "base": base_version,
                 "candidate": candidate_version,
                 "symbol_delta": symbol_delta,

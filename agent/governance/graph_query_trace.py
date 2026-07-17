@@ -2198,6 +2198,7 @@ def _candidate_overlay_compact_file(file_change: Mapping[str, Any]) -> dict[str,
             "similarity",
             "file_kind",
             "language",
+            "source_fallbacks",
             "symbol_delta",
         )
         if file_change.get(key) not in (None, "", [], {})

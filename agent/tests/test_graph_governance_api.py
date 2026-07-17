@@ -22991,6 +22991,138 @@ def test_qa_candidate_overlay_materializes_file_and_public_symbol_deltas(
     assert context["root_identity"]["repository_identity_match"] is True
 
 
+def test_qa_candidate_overlay_allows_bounded_oversized_supported_source(
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-candidate-overlay-oversized-supported-source",
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-oversized-supported-source"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source = (
+        "def candidate_entry():\n"
+        "    return True\n\n"
+        + "# deterministic bounded padding\n"
+        * ((server._QA_OVERLAY_MAX_FILE_BYTES // 32) + 256)
+    )
+    source_bytes = source.encode("utf-8")
+    assert server._QA_OVERLAY_MAX_FILE_BYTES < len(source_bytes)
+    assert len(source_bytes) < server._QA_OVERLAY_MAX_TOTAL_BYTES
+    changed_path = fixture.root / "src/oversized_supported.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_bytes(source_bytes)
+    subprocess.run(
+        ["git", "add", "src/oversized_supported.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "oversized supported source"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    context = server._qa_candidate_diff_context(
+        fixture.root,
+        project_id=PID,
+        canonical_project_root=fixture.root,
+        base_commit_sha=fixture.main_head,
+        candidate_commit_sha=candidate_commit,
+    )
+
+    overlay_file = context["candidate_overlay"]["files"][0]
+    inspection = overlay_file["source_fallbacks"]["candidate"]
+    assert inspection["policy"] == "oversized_supported_source"
+    assert inspection["fallback_reason"] == "oversized_supported_source"
+    assert inspection["file_byte_size"] == len(source_bytes)
+    assert inspection["deterministic_language_adapter"] == "python"
+    assert overlay_file["candidate"]["byte_size"] == len(source_bytes)
+    assert overlay_file["candidate"]["source_inspection"] == inspection
+    assert context["candidate_overlay_hash"] == server.stable_sha256(
+        context["candidate_overlay"]
+    )
+
+
+def test_qa_candidate_overlay_oversized_source_still_obeys_total_byte_limit(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="qa-candidate-overlay-oversized-total-limit",
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "candidate-oversized-total-limit"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = (
+        b"def candidate_entry():\n    return True\n"
+        + b"# bounded padding\n" * 32_000
+    )
+    assert server._QA_OVERLAY_MAX_FILE_BYTES < len(payload)
+    changed_path = fixture.root / "src/oversized_total.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_bytes(payload)
+    subprocess.run(
+        ["git", "add", "src/oversized_total.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "oversized total limit"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(fixture.root)
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_QA_OVERLAY_MAX_TOTAL_BYTES",
+        server._QA_OVERLAY_MAX_FILE_BYTES + 128,
+    )
+
+    with pytest.raises(server._QACandidateOverlayError) as exc:
+        server._qa_candidate_diff_context(
+            fixture.root,
+            project_id=PID,
+            canonical_project_root=fixture.root,
+            base_commit_sha=fixture.main_head,
+            candidate_commit_sha=candidate_commit,
+        )
+    assert exc.value.reason == "total_source_limit_requires_exact_candidate_snapshot"
+
+
 @pytest.mark.parametrize(
     ("relative_path", "source", "expected_reason"),
     [
