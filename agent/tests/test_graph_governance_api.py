@@ -1980,6 +1980,67 @@ def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
     assert predating["db_verified"] is False
 
 
+def test_current_full_state_orders_canonical_qa_acceptance_without_qa_event(conn):
+    commit_sha = "9" * 40
+    snapshot_id = "full-canonical-qa-acceptance"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=snapshot_id,
+        target_commit_sha=commit_sha,
+        request_id="req-canonical-qa-acceptance",
+        request_started_at="2026-07-16T23:27:44Z",
+        route_evidence={
+            "schema_version": "graph_current_full_reconcile.route_evidence.v1",
+            "authenticated_role": "observer",
+            "authentication_source": "test_protected_entrypoint",
+            "raw_route_token_persisted": False,
+            "protected_action": "graph_current_full_reconcile",
+        },
+        reconcile_event_id=52,
+        reconcile_event_created_at="2026-07-16T23:29:00Z",
+        marker_created_at="2026-07-16T23:29:01Z",
+    )
+
+    state = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        qa_source_ref=(
+            "contract_runtime:cex-canonical-qa:completed_lines:10"
+        ),
+        qa_acceptance_created_at="2026-07-16T23:27:42Z",
+        qa_acceptance_revision=12,
+        qa_contract_runtime_verified=True,
+        merge_event_id=50,
+        merge_event_created_at="2026-07-16T23:27:43Z",
+        reconcile_event_id=52,
+        reconcile_event_created_at="2026-07-16T23:29:00Z",
+    )
+
+    assert state["qa_event_id"] == 0
+    assert state["canonical_qa_acceptance_verified"] is True
+    assert state["durable_order_verified"] is True
+    assert state["db_verified"] is True
+
+    forged = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        qa_source_ref="caller:forged",
+        qa_acceptance_created_at="2026-07-16T23:27:42Z",
+        qa_acceptance_revision=12,
+        qa_contract_runtime_verified=True,
+        merge_event_id=50,
+        merge_event_created_at="2026-07-16T23:27:43Z",
+        reconcile_event_id=52,
+        reconcile_event_created_at="2026-07-16T23:29:00Z",
+    )
+    assert forged["canonical_qa_acceptance_verified"] is False
+    assert forged["db_verified"] is False
+
+
 def test_current_full_state_fences_explicit_task_but_allows_shared_taskless(conn):
     commit_sha = "e" * 40
 
@@ -51318,6 +51379,11 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         "project_id": PID,
         "backlog_id": context.backlog_id,
         "contract_execution_id": task_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev2",
+        "execution_state_revision": 4,
+        "contract_chain_id": "cchain-completed-merge-authority",
         "completed_lines": [
             {
                 "stage_id": "qa_graph_context",
@@ -51362,6 +51428,29 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
             },
         ],
     }
+    server._contract_runtime_store(conn).create(record)
+    conn.execute(
+        """
+        INSERT INTO backlog_contract_chain_bindings (
+          idempotency_key, project_id, backlog_id, contract_chain_id,
+          contract_execution_id, binding_kind, execution_state_revision,
+          source_ref, source_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "completed-qa-acceptance-revision-3",
+            PID,
+            context.backlog_id,
+            record["contract_chain_id"],
+            task_id,
+            "mf_parallel_child_current",
+            3,
+            f"contract_runtime:{task_id}:revision:3",
+            "sha256:completed-qa-acceptance",
+            "2026-07-16T23:27:42Z",
+        ),
+    )
+    conn.commit()
     timeline_events = [
         {
             "id": 50,
@@ -51392,6 +51481,11 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     assert authority["authority_verified"] is True
     assert authority["qa_contract_runtime_verified"] is True
     assert authority["qa_event_id"] == 0
+    assert authority["qa_source_ref"] == (
+        f"contract_runtime:{task_id}:completed_lines:1"
+    )
+    assert authority["qa_acceptance_created_at"] == "2026-07-16T23:27:42Z"
+    assert authority["qa_acceptance_revision"] == 3
     assert authority["merge_event_id"] == 50
     assert authority["merged_commit_sha"] == merged_commit
     assert authority["authority_source"].startswith(
