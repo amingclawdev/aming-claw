@@ -1621,6 +1621,13 @@ def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutat
     assert saved.status == "merged"
     assert saved.branch_ref == "refs/heads/codex/PB010-integrated"
     assert saved.merge_commit == "target-after"
+    terminal_row = decide_merge_queue(
+        [saved],
+        scenario_id="mf_parallel-already-integrated",
+    ).dashboard_rows[0]
+    assert terminal_row["durable_status_policy"]["close_satisfying"] is True
+    assert terminal_row["durable_status_policy"]["live_apply_ready"] is False
+    assert "copy_safe_recovery" not in terminal_row
 
     replay = pbr.execute_merge_queue_item(
         conn,
@@ -1646,6 +1653,12 @@ def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutat
     assert len(replayed_rows) == 1
     assert replayed_rows[0].status == "merged"
     assert replayed_rows[0].merge_commit == "target-after"
+    replay_row = decide_merge_queue(
+        replayed_rows,
+        scenario_id="mf_parallel-already-integrated-replay",
+    ).dashboard_rows[0]
+    assert replay_row["durable_status_policy"]["close_satisfying"] is True
+    assert "copy_safe_recovery" not in replay_row
 
 
 def test_runtime_context_worker_views_surface_mf_parallel_happy_path_reminders() -> None:

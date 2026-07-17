@@ -60,6 +60,7 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeRuntime,
     MergeQueueItem,
     STATE_MERGE_FAILED,
+    STATE_MERGED,
     STATE_VALIDATED,
     STATE_WORKTREE_READY,
     append_branch_contract_revision,
@@ -14121,6 +14122,97 @@ def test_materialized_noop_durable_queue_status_projects_recovery(conn):
     assert row["copy_safe_recovery"]["route_local_merge_queue_id_diagnostics"][
         "route_local_merge_queue_id_allowed_for_materialize"
     ] is False
+
+
+def test_terminal_merged_durable_queue_status_projects_close_without_recovery(conn):
+    task_id = "terminal-merged-current-task"
+    queue_id = "mergeq-api-terminal-merged"
+    queue_item_id = "mqitem-terminal-merged"
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-terminal-merged",
+            backlog_id="FEAT-TERMINAL-MERGED",
+            root_task_id="FEAT-TERMINAL-MERGED",
+            task_id=task_id,
+            branch_ref="refs/heads/codex/terminal-merged-current",
+            status=STATE_MERGED,
+            fence_token="fence-terminal-merged-current",
+            base_commit="target-before-terminal-merged",
+            head_commit="head-terminal-merged",
+            target_head_commit="target-after-terminal-merged",
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T08:45:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                branch_ref="refs/heads/codex/terminal-merged-current",
+                queue_index=1,
+                status=STATE_MERGED,
+                target_ref="refs/heads/main",
+                base_commit="target-before-terminal-merged",
+                branch_head="head-terminal-merged",
+                validated_target_head="target-before-terminal-merged",
+                current_target_head="target-after-terminal-merged",
+                merge_commit="target-after-terminal-merged",
+            )
+        ],
+        now_iso="2026-05-17T08:46:00Z",
+    )
+    conn.commit()
+
+    current_state = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context_id_for_branch_context(context),
+            },
+            "observer",
+            query={"view": "all"},
+        )
+    )
+
+    views = current_state["runtime_context_service"]["views"]
+    projection = views["current"]["current_values"][
+        "durable_merge_queue_item_projection"
+    ]
+    assert projection["status"] == STATE_MERGED
+    assert projection["projection_status"] == "terminal_close_satisfying"
+    assert projection["live_apply_ready"] is False
+    assert projection["close_satisfying"] is True
+    assert projection["next_action"] == "none"
+    assert projection["next_actions"] == []
+    assert projection["copy_safe_bootstrap_payload"] == {}
+    assert projection["copy_safe_recovery"] == {}
+    gap_codes = {
+        gap["code"]
+        for gap in views["action_plan"]["close_precheck_gap_projection"]["gaps"]
+    }
+    assert "durable_merge_queue_status_not_live_apply_ready" not in gap_codes
+
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": "PB-api-terminal-merged",
+                "merge_queue_id": queue_id,
+                "limit": "5",
+            },
+        )
+    )
+    row = read["read_model"]["merge_queue"]["rows"][0]
+    assert row["status"] == STATE_MERGED
+    assert row["durable_status_policy"]["terminal_close_satisfying"] is True
+    assert row["durable_status_policy"]["close_satisfying"] is True
+    assert "copy_safe_recovery" not in row
 
 
 def test_parallel_branch_merge_queue_requires_route_token_or_waiver(conn):

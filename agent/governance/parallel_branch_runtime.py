@@ -377,6 +377,8 @@ def _durable_merge_queue_status_policy(status: str) -> dict[str, Any]:
     observed = str(status or "").strip()
     normalized = _normalize_merge_queue_status(observed)
     live_apply_ready = normalized in DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
+    terminal_close_satisfying = normalized in MERGE_DONE_STATES
+    close_satisfying = live_apply_ready or terminal_close_satisfying
     return {
         "schema_version": "merge_queue.durable_status_policy.v1",
         "required_statuses_before_live_apply": list(
@@ -385,12 +387,18 @@ def _durable_merge_queue_status_policy(status: str) -> dict[str, Any]:
         "observed_status": observed,
         "normalized_status": normalized,
         "live_apply_ready": live_apply_ready,
-        "close_satisfying": live_apply_ready,
+        "terminal_close_satisfying": terminal_close_satisfying,
+        "close_satisfying": close_satisfying,
         "materialized_noop_close_satisfying": False,
         "message": (
-            "Durable merge queue live apply requires queued_for_merge or "
-            "merge_ready; materialized/noop only means no live apply can "
-            "proceed and is not close-satisfying."
+            "Durable merge queue status is terminal and close-satisfying; "
+            "no further live apply or materialization recovery is required."
+            if terminal_close_satisfying
+            else (
+                "Durable merge queue live apply requires queued_for_merge or "
+                "merge_ready; materialized/noop only means no live apply can "
+                "proceed and is not close-satisfying."
+            )
         ),
     }
 
@@ -1578,7 +1586,7 @@ class MergeQueueDecision:
                 DURABLE_MERGE_QUEUE_LIVE_APPLY_STATES
             ),
         }
-        if not status_policy.get("live_apply_ready"):
+        if not status_policy.get("close_satisfying"):
             row["copy_safe_recovery"] = _merge_queue_status_copy_safe_recovery_payload(
                 project_id=self.project_id,
                 task_id=self.task_id,
@@ -5555,9 +5563,10 @@ def _runtime_context_durable_merge_queue_item_projection(
         normalized_status = _normalize_merge_queue_status(status)
         status_policy = _durable_merge_queue_status_policy(status)
         live_apply_ready = bool(status_policy.get("live_apply_ready"))
+        close_satisfying = bool(status_policy.get("close_satisfying"))
         bootstrap_payload = (
             {}
-            if live_apply_ready
+            if close_satisfying
             else _runtime_context_merge_queue_bootstrap_payload(
                 values=values,
                 merge_queue_id=merge_queue_id,
@@ -5581,12 +5590,16 @@ def _runtime_context_durable_merge_queue_item_projection(
             "projection_status": (
                 "live_apply_ready"
                 if live_apply_ready
-                else "durable_queue_status_not_live_apply_ready"
+                else (
+                    "terminal_close_satisfying"
+                    if close_satisfying
+                    else "durable_queue_status_not_live_apply_ready"
+                )
             ),
             "queue_state": status,
             "durable_status_policy": status_policy,
             "live_apply_ready": live_apply_ready,
-            "close_satisfying": live_apply_ready,
+            "close_satisfying": close_satisfying,
             "materialized_noop_close_satisfying": False,
             "durable_queue_item_present": True,
             "queue_item_id": queue_item_id,
@@ -5605,10 +5618,14 @@ def _runtime_context_durable_merge_queue_item_projection(
             ),
             "queue_item": item,
             "next_action": (
-                "none" if live_apply_ready else "parallel_branch_merge_queue_materialize"
+                "none"
+                if close_satisfying
+                else "parallel_branch_merge_queue_materialize"
             ),
             "next_actions": (
-                [] if live_apply_ready else ["parallel_branch_merge_queue_materialize"]
+                []
+                if close_satisfying
+                else ["parallel_branch_merge_queue_materialize"]
             ),
             "copy_safe_bootstrap_payload": public_contract_revision_payload(
                 bootstrap_payload
@@ -5620,7 +5637,7 @@ def _runtime_context_durable_merge_queue_item_projection(
             ),
             "message": (
                 ""
-                if live_apply_ready
+                if close_satisfying
                 else (
                     "Durable queue item exists but is not live-apply-ready; "
                     "materialized/noop is not close-satisfying. Re-materialize "
@@ -7865,7 +7882,7 @@ def _runtime_context_close_precheck_gap_projection(
     current_finish_gate_required = durable_status == "waiting_for_current_finish_gate"
     durable_status_not_live_apply_ready = bool(
         durable_merge_queue_item_projection.get("durable_queue_item_present")
-        and durable_merge_queue_item_projection.get("live_apply_ready") is False
+        and durable_merge_queue_item_projection.get("close_satisfying") is False
     )
     if durable_missing:
         _add_gap(
@@ -8051,7 +8068,7 @@ def _runtime_context_next_legal_action(
         )
     if (
         durable_merge_queue_item_projection.get("durable_queue_item_present")
-        and durable_merge_queue_item_projection.get("live_apply_ready") is False
+        and durable_merge_queue_item_projection.get("close_satisfying") is False
     ):
         return (
             _runtime_context_text(durable_merge_queue_item_projection.get("next_action"))
