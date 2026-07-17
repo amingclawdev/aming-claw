@@ -49031,9 +49031,43 @@ def _branch_service_validation_runtime_guide(guide: Mapping[str, Any]) -> dict[s
 
 def _contract_runtime_guide_for_response(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+    guide = dict(guide)
+    safe_copy = (
+        guide.get("writer_role_safe_copy_payload")
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        safe_copy.get("copy_payload")
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    writer_hash = str(copy_payload.get("runtime_guide_hash") or "").strip()
+    bypass_guidance = (
+        guide.get("line_bypass_guidance")
+        if isinstance(guide.get("line_bypass_guidance"), Mapping)
+        else {}
+    )
+    if writer_hash and bypass_guidance:
+        aligned_bypass = dict(bypass_guidance)
+        for key in (
+            "current_line_binding",
+            "create_new_copy_safe_body",
+            "reuse_existing_open_copy_safe_body",
+        ):
+            value = aligned_bypass.get(key)
+            if isinstance(value, Mapping):
+                aligned_value = dict(value)
+                aligned_value["runtime_guide_hash"] = writer_hash
+                aligned_bypass[key] = aligned_value
+        aligned_bypass["runtime_guide_hash_source"] = (
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+        )
+        aligned_bypass["target_writer_role_hash_aligned"] = True
+        guide["line_bypass_guidance"] = aligned_bypass
     if str(record.get("contract_id") or "").strip() == "direct_fix":
         return _branch_service_validation_runtime_guide(guide)
-    return dict(guide)
+    return guide
 
 
 def _contract_runtime_response(
@@ -54099,6 +54133,261 @@ def _contract_runtime_completed_merge_reconcile_authority(
     return {**trusted_merge, **reconcile_authority}
 
 
+_CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION = (
+    "contract_runtime.observer_merge_durable_authority.v1"
+)
+
+
+def _contract_runtime_observer_merge_durable_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Export the one durable merge tuple accepted by observer_merge.
+
+    This is the write-side counterpart of
+    ``_contract_runtime_completed_merge_authority``.  Keeping the queue and
+    timeline join here prevents a caller-shaped merge payload from passing the
+    ContractRuntime gate only to lose authority during reconcile.
+    """
+
+    from .parallel_branch_runtime import get_merge_queue_item_for_branch_context
+
+    expected_identity = _contract_runtime_server_line_identity(record)
+    dispatch_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+    ]
+    candidates: list[dict[str, Any]] = []
+    for dispatch_line in dispatch_lines:
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        ):
+            runtime_context_id, task_id, parent_task_id = (
+                _contract_runtime_context_identity(context)
+            )
+            if expected_identity["runtime_context_id"] and (
+                runtime_context_id != expected_identity["runtime_context_id"]
+            ):
+                continue
+            if expected_identity["task_id"] and (
+                task_id != expected_identity["task_id"]
+            ):
+                continue
+            backlog_id = str(
+                getattr(context, "backlog_id", "")
+                or record.get("backlog_id")
+                or ""
+            ).strip()
+            merge_queue_id = str(
+                getattr(context, "merge_queue_id", "") or ""
+            ).strip()
+            durable_item = get_merge_queue_item_for_branch_context(
+                conn,
+                project_id,
+                task_id,
+                merge_queue_id=merge_queue_id,
+            )
+            if (
+                durable_item is None
+                or durable_item.task_id != task_id
+                or durable_item.status != "merged"
+            ):
+                continue
+            merged_commit = str(durable_item.merge_commit or "").strip().lower()
+            target_head_after_merge = str(
+                durable_item.target_head_after_merge or ""
+            ).strip().lower()
+            branch_head = str(durable_item.branch_head or "").strip().lower()
+            if (
+                not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+                or target_head_after_merge != merged_commit
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head)
+            ):
+                continue
+            timeline_events = _runtime_context_service_timeline_events(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            related_task_ids = {
+                value
+                for value in (
+                    parent_task_id,
+                    str(record.get("contract_execution_id") or "").strip(),
+                    str(record.get("parent_contract_execution_id") or "").strip(),
+                    str(record.get("root_contract_execution_id") or "").strip(),
+                )
+                if value
+            }
+            merge_event = _contract_runtime_projection_latest_timeline_event(
+                timeline_events,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                kind_tokens={"live_merge", "merge", "observer_merge"},
+                phase_tokens={"live_merge", "merge"},
+                actor_roles={"observer"},
+                related_task_ids=related_task_ids,
+                direct_parent_task_id=parent_task_id,
+            )
+            event_payload = (
+                merge_event.get("payload")
+                if isinstance(merge_event.get("payload"), Mapping)
+                else {}
+            )
+            event_commit = str(
+                merge_event.get("commit_sha")
+                or event_payload.get("merge_commit")
+                or event_payload.get("target_head_after_merge")
+                or ""
+            ).strip().lower()
+            event_ref = _runtime_context_event_ref(merge_event)
+            event_id = _contract_runtime_projection_timeline_event_id(merge_event)
+            event_created_at = _contract_runtime_projection_timeline_event_time(
+                merge_event
+            )
+            if (
+                event_commit != merged_commit
+                or not re.fullmatch(r"timeline:\d+", event_ref)
+                or event_id <= 0
+                or not event_created_at
+            ):
+                continue
+            candidates.append(
+                {
+                    "schema_version": (
+                        _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+                    ),
+                    "source": (
+                        "parallel_branch_merge_queue+task_timeline_merge"
+                    ),
+                    "server_derived": True,
+                    "db_verified": True,
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "branch_head": branch_head,
+                    "merge_commit": merged_commit,
+                    "target_head_after_merge": target_head_after_merge,
+                    "merge_gate_passed": True,
+                    "merge_queue_id": durable_item.merge_queue_id,
+                    "queue_item_id": durable_item.queue_item_id,
+                    "queue_item_status": durable_item.status,
+                    "timeline_event_refs": [event_ref],
+                    "merge_event_ref": event_ref,
+                    "merge_event_id": event_id,
+                    "merge_event_created_at": event_created_at,
+                }
+            )
+    unique = {stable_sha256(item): item for item in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else {}
+
+
+def _contract_runtime_bind_observer_merge_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority = _contract_runtime_observer_merge_durable_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    if not authority:
+        raise GovernanceError(
+            "contract_runtime_observer_merge_durable_authority_required",
+            (
+                "observer_merge requires one server-verified merged queue item "
+                "and its matching observer merge timeline event"
+            ),
+            422,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "next_legal_action": (
+                    "complete_durable_merge_queue_apply_then_retry_observer_merge"
+                ),
+                "fail_closed": True,
+            },
+        )
+    payload = (
+        dict(write.get("payload"))
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    expected_values = {
+        "branch_head": authority["branch_head"],
+        "merge_commit": authority["merge_commit"],
+        "target_head_after_merge": authority["target_head_after_merge"],
+        "merge_queue_id": authority["merge_queue_id"],
+        "queue_item_id": authority["queue_item_id"],
+        "queue_item_status": authority["queue_item_status"],
+    }
+    mismatches: list[dict[str, str]] = []
+    supplied_commit = str(write.get("commit_sha") or "").strip().lower()
+    if supplied_commit and supplied_commit != authority["merge_commit"]:
+        mismatches.append(
+            {
+                "field": "commit_sha",
+                "expected": authority["merge_commit"],
+                "actual": supplied_commit,
+            }
+        )
+    for field, expected in expected_values.items():
+        supplied = str(payload.get(field) or "").strip().lower()
+        if supplied and supplied != str(expected).strip().lower():
+            mismatches.append(
+                {"field": field, "expected": str(expected), "actual": supplied}
+            )
+    if payload.get("merge_gate_passed") is False:
+        mismatches.append(
+            {
+                "field": "merge_gate_passed",
+                "expected": "true",
+                "actual": "false",
+            }
+        )
+    if mismatches:
+        raise GovernanceError(
+            "contract_runtime_observer_merge_authority_mismatch",
+            "observer_merge claims conflict with durable server merge authority",
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "mismatches": mismatches,
+                "fail_closed": True,
+            },
+        )
+    payload.update(expected_values)
+    payload["merge_gate_passed"] = True
+    payload["timeline_event_refs"] = list(authority["timeline_event_refs"])
+    payload["durable_merge_authority"] = dict(authority)
+    effective = dict(write)
+    effective["payload"] = payload
+    effective["commit_sha"] = authority["merge_commit"]
+    for field, value in expected_values.items():
+        effective[field] = value
+    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+        effective[field] = authority[field]
+    return effective
+
+
 def _contract_runtime_completed_merge_authority(
     conn,
     *,
@@ -54218,6 +54507,19 @@ def _contract_runtime_completed_merge_authority(
         if isinstance(merge_line[1].get("payload"), Mapping)
         else {}
     )
+    durable_merge_authority = (
+        merge_payload.get("durable_merge_authority")
+        if isinstance(merge_payload.get("durable_merge_authority"), Mapping)
+        else {}
+    )
+    if durable_merge_authority and (
+        str(durable_merge_authority.get("schema_version") or "")
+        != _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+        or durable_merge_authority.get("server_derived") is not True
+        or durable_merge_authority.get("db_verified") is not True
+    ):
+        return {}
+    merge_schema = durable_merge_authority or merge_payload
     qa_commit = str(
         qa_verification[1].get("commit_sha")
         or qa_payload.get("candidate_commit_sha")
@@ -54228,7 +54530,7 @@ def _contract_runtime_completed_merge_authority(
         or graph_evidence.get("candidate_commit")
         or ""
     ).strip().lower()
-    branch_head = str(merge_payload.get("branch_head") or "").strip().lower()
+    branch_head = str(merge_schema.get("branch_head") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", qa_commit):
         return {}
     if graph_candidate_commit and graph_candidate_commit != qa_commit:
@@ -54238,23 +54540,23 @@ def _contract_runtime_completed_merge_authority(
 
     merged_commit = str(
         merge_line[1].get("commit_sha")
-        or merge_payload.get("merge_commit")
-        or merge_payload.get("target_head_after_merge")
+        or merge_schema.get("merge_commit")
+        or merge_schema.get("target_head_after_merge")
         or ""
     ).strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit):
         return {}
     for key in ("merge_commit", "target_head_after_merge"):
-        value = str(merge_payload.get(key) or "").strip().lower()
+        value = str(merge_schema.get(key) or "").strip().lower()
         if value and value != merged_commit:
             return {}
-    if merge_payload.get("merge_gate_passed") is not True:
+    if merge_schema.get("merge_gate_passed") is not True:
         return {}
-    if str(merge_payload.get("queue_item_status") or "").strip() != "merged":
+    if str(merge_schema.get("queue_item_status") or "").strip() != "merged":
         return {}
 
-    merge_queue_id = str(merge_payload.get("merge_queue_id") or "").strip()
-    queue_item_id = str(merge_payload.get("queue_item_id") or "").strip()
+    merge_queue_id = str(merge_schema.get("merge_queue_id") or "").strip()
+    queue_item_id = str(merge_schema.get("queue_item_id") or "").strip()
     if not merge_queue_id or not queue_item_id:
         return {}
     durable_item = get_merge_queue_item(
@@ -54266,6 +54568,25 @@ def _contract_runtime_completed_merge_authority(
     runtime_context_id, task_id, parent_task_id = (
         _contract_runtime_context_identity(context)
     )
+    if durable_merge_authority and any(
+        str(durable_merge_authority.get(field) or "").strip()
+        != str(expected or "").strip()
+        for field, expected in (
+            ("project_id", project_id),
+            (
+                "backlog_id",
+                str(
+                    getattr(context, "backlog_id", "")
+                    or record.get("backlog_id")
+                    or ""
+                ),
+            ),
+            ("runtime_context_id", runtime_context_id),
+            ("task_id", task_id),
+            ("parent_task_id", parent_task_id),
+        )
+    ):
+        return {}
     if (
         durable_item is None
         or durable_item.task_id != task_id
@@ -54278,7 +54599,7 @@ def _contract_runtime_completed_merge_authority(
 
     timeline_refs = {
         str(item or "").strip()
-        for item in merge_payload.get("timeline_event_refs") or []
+        for item in merge_schema.get("timeline_event_refs") or []
         if str(item or "").strip()
     }
     merge_events: list[Mapping[str, Any]] = []
@@ -54317,7 +54638,15 @@ def _contract_runtime_completed_merge_authority(
     return {
         "timeline_verified": True,
         "authority_verified": True,
-        "authority_source": "contract_runtime_completed_lines+durable_merge_queue+task_timeline_merge",
+        "authority_source": (
+            "contract_runtime_completed_lines+server_durable_merge_schema+"
+            "durable_merge_queue+task_timeline_merge"
+            if durable_merge_authority
+            else "contract_runtime_completed_lines+durable_merge_queue+task_timeline_merge"
+        ),
+        "durable_merge_schema_version": str(
+            durable_merge_authority.get("schema_version") or "legacy_flattened"
+        ),
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -55195,6 +55524,13 @@ def _contract_runtime_bind_server_line_authority(
     body: Mapping[str, Any],
 ) -> dict[str, Any]:
     line_id = str(write.get("line_id") or "").strip()
+    if line_id == "observer_merge":
+        return _contract_runtime_bind_observer_merge_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            write=write,
+        )
     qa_policy = _contract_runtime_line_evidence_policy(
         record,
         "bounded_qa_review_policy",

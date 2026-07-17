@@ -51832,6 +51832,74 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         event["created_at"] = created_at
     timeline_events = [merge_event, reconcile_event]
 
+    r6_like_merge_write = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "evidence_kind": "merge",
+        "commit_sha": merged_commit,
+        "payload": {"merge_commit": merged_commit},
+    }
+    conn.execute(
+        "DELETE FROM parallel_branch_merge_queue_items "
+        "WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?",
+        (project_id, merge_queue_id, queue_item_id),
+    )
+    with pytest.raises(GovernanceError) as late_rejection:
+        server._contract_runtime_bind_server_line_authority(
+            _ctx({"project_id": project_id}),
+            conn,
+            project_id=project_id,
+            record=record,
+            write=r6_like_merge_write,
+            body=r6_like_merge_write,
+        )
+    assert late_rejection.value.code == (
+        "contract_runtime_observer_merge_durable_authority_required"
+    )
+    assert late_rejection.value.details["fail_closed"] is True
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=context.backlog_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=1,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=qa_commit,
+                merge_commit=merged_commit,
+                target_head_before_merge="c" * 40,
+                target_head_after_merge=merged_commit,
+            )
+        ],
+    )
+    bound_merge_write = server._contract_runtime_bind_server_line_authority(
+        _ctx({"project_id": project_id}),
+        conn,
+        project_id=project_id,
+        record=record,
+        write=r6_like_merge_write,
+        body=r6_like_merge_write,
+    )
+    durable_merge = bound_merge_write["payload"]["durable_merge_authority"]
+    assert durable_merge["schema_version"] == (
+        "contract_runtime.observer_merge_durable_authority.v1"
+    )
+    assert durable_merge["server_derived"] is True
+    assert durable_merge["db_verified"] is True
+    assert durable_merge["merge_queue_id"] == merge_queue_id
+    assert durable_merge["queue_item_id"] == queue_item_id
+    assert durable_merge["timeline_event_refs"] == [
+        f"timeline:{merge_event['id']}"
+    ]
+    record = json.loads(json.dumps(record))
+    record["completed_lines"][-1] = bound_merge_write
+
     snapshot_id = "full-contract-runtime-merge-authority"
     _activate_basic_graph(
         conn,
@@ -51900,6 +51968,9 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     assert authority["qa_acceptance_revision"] == 13
     assert authority["merge_event_id"] == int(merge_event["id"])
     assert authority["merged_commit_sha"] == merged_commit
+    assert authority["durable_merge_schema_version"] == (
+        "contract_runtime.observer_merge_durable_authority.v1"
+    )
     assert authority["authority_source"].startswith(
         "contract_runtime_completed_lines"
     )
@@ -52153,6 +52224,15 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
                     "evidence_kind": "independent_verification",
                 }
             },
+            "line_bypass_guidance": {
+                "current_line_binding": {"runtime_guide_hash": reader_hash},
+                "create_new_copy_safe_body": {
+                    "runtime_guide_hash": reader_hash,
+                },
+                "reuse_existing_open_copy_safe_body": {
+                    "runtime_guide_hash": reader_hash,
+                },
+            },
             "completed_lines": [
                 {"payload": {"duplicated_runtime_guide": "x" * 150_000}}
             ],
@@ -52227,6 +52307,21 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
     assert guide["runtime_guide"]["writer_role_safe_copy_payload"] == record[
         "runtime_guide"
     ]["writer_role_safe_copy_payload"]
+    for response in (full, observer_current, current, guide):
+        projected_guide = response.get("runtime_guide") or {}
+        bypass = projected_guide.get("line_bypass_guidance") or {}
+        if not bypass:
+            continue
+        assert bypass["target_writer_role_hash_aligned"] is True
+        assert bypass["runtime_guide_hash_source"] == (
+            "writer_role_safe_copy_payload.copy_payload.runtime_guide_hash"
+        )
+        for key in (
+            "current_line_binding",
+            "create_new_copy_safe_body",
+            "reuse_existing_open_copy_safe_body",
+        ):
+            assert bypass[key]["runtime_guide_hash"] == writer_hash
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
