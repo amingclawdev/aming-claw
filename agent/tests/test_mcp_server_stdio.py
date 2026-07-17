@@ -2115,6 +2115,7 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     ]["properties"]
     assert set(tool_by_name["contract_runtime_submit_line"]["inputSchema"]["properties"]) >= {
         "backlog_id",
+        "timeout_seconds",
         "definition_hash",
         "instruction_bundle_hash",
         "runtime_context_id",
@@ -2161,7 +2162,14 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
 def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
     calls = []
 
-    def fake_http(method: str, path: str, data: dict | None = None, *, gov_token=None):
+    def fake_http(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        gov_token=None,
+        timeout_seconds=None,
+    ):
         calls.append((method, path, data, gov_token))
         return {"ok": True}
 
@@ -2264,6 +2272,203 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
         },
         "gov-qa-token",
     )
+
+
+def test_governance_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable(
+    monkeypatch,
+):
+    env_key = "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS"
+    monkeypatch.delenv(env_key, raising=False)
+
+    assert governance_mcp_server._contract_runtime_mcp_timeout_seconds({}) == 120
+    assert (
+        governance_mcp_server._contract_runtime_mcp_timeout_seconds(
+            {"timeout_seconds": 1}
+        )
+        == 10
+    )
+    assert (
+        governance_mcp_server._contract_runtime_mcp_timeout_seconds(
+            {"timeout_seconds": 60 * 60 + 1}
+        )
+        == 60 * 60
+    )
+
+    monkeypatch.setenv(env_key, "75")
+    assert governance_mcp_server._contract_runtime_mcp_timeout_seconds({}) == 75
+    assert (
+        governance_mcp_server._contract_runtime_mcp_timeout_seconds(
+            {"timeout_seconds": 45}
+        )
+        == 45
+    )
+
+    tool_by_name = {
+        tool["name"]: tool for tool in governance_mcp_server.TOOLS
+    }
+    timeout_schema = tool_by_name["contract_runtime_submit_line"]["inputSchema"][
+        "properties"
+    ]["timeout_seconds"]
+    assert timeout_schema["default"] == 120
+    assert timeout_schema["minimum"] == 10
+    assert timeout_schema["maximum"] == 60 * 60
+    assert (
+        tool_by_name["contract_runtime_precheck_line"]["inputSchema"]["properties"]
+        ["timeout_seconds"]
+        == timeout_schema
+    )
+
+
+def test_governance_mcp_contract_runtime_timeout_is_transport_only_with_disposition(
+    monkeypatch,
+):
+    qa_token = "gov-qa-contract-runtime-timeout-secret"
+    calls = []
+
+    def fake_http(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        gov_token=None,
+        timeout_seconds=None,
+    ):
+        calls.append((method, path, data, gov_token, timeout_seconds))
+        return {"ok": False, "error": "request_timeout", "message": "timed out"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    common_args = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-timeout",
+        "execution_state_revision": 10,
+        "stage_id": "qa",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "qa_graph_context",
+        "qa_session_token": qa_token,
+    }
+
+    precheck = governance_mcp_server._dispatch_tool(
+        "contract_runtime_precheck_line",
+        {**common_args, "timeout_seconds": 45},
+    )
+    submit = governance_mcp_server._dispatch_tool(
+        "contract_runtime_submit_line",
+        {**common_args, "timeout_seconds": 75},
+    )
+
+    assert precheck["effective_timeout_seconds"] == 45
+    assert precheck["transport_disposition"] == "ambiguous"
+    assert precheck["write_disposition"] == "not_written"
+    assert precheck["retry_disposition"] == "safe_to_retry_precheck"
+    assert submit["effective_timeout_seconds"] == 75
+    assert submit["transport_disposition"] == "ambiguous"
+    assert submit["write_disposition"] == "ambiguous"
+    assert (
+        submit["retry_disposition"]
+        == "poll_authoritative_current_state_before_retry"
+    )
+    assert submit["retry_guidance"]["automatic_retry"] is False
+    assert submit["retry_guidance"]["exact_once_intent"] is True
+    assert qa_token not in json.dumps(precheck)
+    assert qa_token not in json.dumps(submit)
+
+    assert [call[4] for call in calls] == [45, 75]
+    for _, _, body, header_token, _ in calls:
+        assert body is not None
+        assert "timeout_seconds" not in body
+        assert "qa_session_token" not in body
+        assert header_token == qa_token
+
+
+def test_governance_mcp_contract_runtime_retry_after_unchanged_poll_writes_once(
+    monkeypatch,
+):
+    qa_token = "gov-qa-contract-runtime-exact-once-secret"
+    state = {"revision": 10}
+    submit_attempts = []
+    successful_writes = []
+    current_polls = []
+
+    def fake_http(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        gov_token=None,
+        timeout_seconds=None,
+    ):
+        if "/current-state?" in path:
+            current_polls.append((path, gov_token))
+            return {
+                "ok": True,
+                "execution_state_revision": state["revision"],
+                "completed_lines": [
+                    {"line_id": "qa_graph_context"}
+                    for _ in successful_writes
+                ],
+            }
+        if path.endswith("/line-writes"):
+            submit_attempts.append((data, gov_token, timeout_seconds))
+            if len(submit_attempts) == 1:
+                return {
+                    "ok": False,
+                    "error": "request_timeout",
+                    "message": "timed out",
+                }
+            successful_writes.append(dict(data or {}))
+            state["revision"] += 1
+            return {
+                "ok": True,
+                "execution_state_revision": state["revision"],
+                "completed_line": {"line_id": "qa_graph_context"},
+            }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    submit_args = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-exact-once",
+        "execution_state_revision": 10,
+        "stage_id": "qa",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "qa_graph_context",
+        "qa_session_token": qa_token,
+        "timeout_seconds": 33,
+    }
+
+    timed_out = governance_mcp_server._dispatch_tool(
+        "contract_runtime_submit_line",
+        submit_args,
+    )
+    assert timed_out["write_disposition"] == "ambiguous"
+    assert len(submit_attempts) == 1
+    assert successful_writes == []
+
+    current = governance_mcp_server._dispatch_tool(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-exact-once",
+            "qa_session_token": qa_token,
+        },
+    )
+    assert current["execution_state_revision"] == 10
+    assert current["completed_lines"] == []
+
+    retried = governance_mcp_server._dispatch_tool(
+        "contract_runtime_submit_line",
+        submit_args,
+    )
+    assert retried["ok"] is True
+    assert retried["execution_state_revision"] == 11
+    assert len(submit_attempts) == 2
+    assert len(successful_writes) == 1
+    assert len(current_polls) == 1
+    assert submit_attempts[0][0] == submit_attempts[1][0]
+    assert all(attempt[1] == qa_token for attempt in submit_attempts)
+    assert all(attempt[2] == 33 for attempt in submit_attempts)
+    assert all("timeout_seconds" not in attempt[0] for attempt in submit_attempts)
+    assert qa_token not in json.dumps(timed_out)
 
 
 def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_closed():
@@ -2424,7 +2629,12 @@ def test_governance_mcp_task_timeline_append_rejects_managed_qa_ref_without_regi
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
     calls = []
 
-    def fake_api(method: str, path: str, data: dict | None = None):
+    def fake_api(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        **_kwargs,
+    ):
         calls.append((method, path, data))
         return {"ok": True, "path": path}
 
