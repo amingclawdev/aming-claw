@@ -2168,6 +2168,9 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
     assert "qa_session_token" in tool_by_name["task_timeline_append"][
         "inputSchema"
     ]["properties"]
+    assert "qa_session_token_ref" in tool_by_name["task_timeline_append"][
+        "inputSchema"
+    ]["properties"]
 
     assert governance_mcp_server._dispatch_tool(
         "contract_runtime_current",
@@ -2257,6 +2260,161 @@ def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
         },
         "gov-qa-token",
     )
+
+
+def test_managed_mcp_task_timeline_append_resolves_qa_ref_header_only_and_fails_closed():
+    raw_token = "gov-qa-managed-timeline-secret"
+    commit_sha = "a" * 40
+    api_calls = []
+    auth_calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        api_calls.append((method, path, data))
+        if path == "/api/role/assign":
+            return {
+                "session_id": "ses-qa-managed-timeline",
+                "principal_id": "qa:managed-timeline",
+                "role": "qa",
+                "scope": [],
+                "token": raw_token,
+                "expires_at": "2099-07-17T12:00:00Z",
+            }
+        return {"ok": True}
+
+    def fake_api_with_role_token(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        role_token: str,
+    ):
+        auth_calls.append((method, path, data, role_token))
+        return {"ok": True}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    dispatcher._api_with_role_token = fake_api_with_role_token
+
+    registered = dispatcher.dispatch(
+        "qa_session_register",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-QA-MANAGED-TIMELINE",
+            "task_id": "qa-task",
+            "commit_sha": commit_sha,
+            "contract_execution_id": "cex-qa-managed-timeline",
+            "principal_id": "qa:managed-timeline",
+        },
+    )
+    token_ref = registered["qa_session_token_ref"]
+    timeline_args = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-MANAGED-TIMELINE",
+        "task_id": "qa-task",
+        "commit_sha": commit_sha,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:managed-timeline",
+        "status": "passed",
+        "payload": {"graph_trace_ids": ["gqt-qa-managed-timeline"]},
+        "qa_session_token_ref": token_ref,
+    }
+
+    assert dispatcher.dispatch("task_timeline_append", timeline_args) == {
+        "ok": True
+    }
+    assert auth_calls == [
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {
+                key: value
+                for key, value in timeline_args.items()
+                if key not in {"project_id", "qa_session_token_ref"}
+            },
+            raw_token,
+        )
+    ]
+    forwarded_body = auth_calls[0][2]
+    assert "qa_session_token_ref" not in forwarded_body
+    assert "qa_session_token" not in forwarded_body
+    assert raw_token not in json.dumps(forwarded_body, sort_keys=True)
+
+    unknown = dispatcher.dispatch(
+        "task_timeline_append",
+        {**timeline_args, "qa_session_token_ref": "qa-session-ref-unknown"},
+    )
+    assert unknown["error"] == "qa_session_token_ref_unknown"
+
+    missing_scope = dict(timeline_args)
+    missing_scope.pop("task_id")
+    missing = dispatcher.dispatch("task_timeline_append", missing_scope)
+    assert missing["error"] == "qa_session_token_ref_scope_mismatch"
+    assert "task_id" in missing["mismatched_fields"]
+
+    cross_scope = dispatcher.dispatch(
+        "task_timeline_append",
+        {**timeline_args, "backlog_id": "AC-QA-OTHER"},
+    )
+    assert cross_scope["error"] == "qa_session_token_ref_scope_mismatch"
+    assert "backlog_id" in cross_scope["mismatched_fields"]
+
+    ambiguous = dispatcher.dispatch(
+        "task_timeline_append",
+        {**timeline_args, "qa_session_token": "other-raw-token"},
+    )
+    assert ambiguous["error"] == "qa_session_auth_ambiguous"
+    assert len(auth_calls) == 1
+    assert api_calls == [
+        (
+            "POST",
+            "/api/role/assign",
+            {
+                "project_id": "aming-claw",
+                "principal_id": "qa:managed-timeline",
+                "role": "qa",
+                "backlog_id": "AC-QA-MANAGED-TIMELINE",
+                "task_id": "qa-task",
+                "commit_sha": commit_sha,
+            },
+        )
+    ]
+
+
+def test_governance_mcp_task_timeline_append_rejects_managed_qa_ref_without_registry(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_http(method: str, path: str, data: dict | None = None, *, gov_token=None):
+        calls.append((method, path, data, gov_token))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http_with_optional_gov_token",
+        fake_http,
+    )
+    result = governance_mcp_server._dispatch_tool(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-QA-MANAGED-TIMELINE",
+            "task_id": "qa-task",
+            "commit_sha": "a" * 40,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "qa_session_token_ref": "qa-session-ref-managed-elsewhere",
+        },
+    )
+
+    assert result["error"] == "qa_session_token_ref_unavailable"
+    assert calls == []
 
 
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
