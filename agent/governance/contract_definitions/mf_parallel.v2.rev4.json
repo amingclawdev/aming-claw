@@ -23,20 +23,22 @@
       "Observer owns orchestration, child-contract prefill, dispatch, merge, reconcile, and close-ready evidence only.",
             "mf_sub workers own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence in their assigned worktree/fence.",
       "QA owns QA graph context and independent verification evidence; observer must not write or reconstruct QA evidence.",
-      "Prefer explicit parallel child contracts with owned_files fences before dispatching workers."
+      "Prefer explicit parallel child contracts with owned_files fences before dispatching workers.",
+      "For observer_reconcile, first run graph_current_full_reconcile with a reconcile-only route whose canonical task_id comes from the dispatched runtime_context.task_id; then submit the ContractRuntime observer_reconcile line with the child contract execution route. These route scopes are not interchangeable.",
+      "Copy only observer_session_id, route_token_ref, backlog_id, contract_execution_id, runtime_context_id, task_id, and target_project_root between the observer guide and current-full reconcile. Never copy a raw route token, and accept reconcile evidence only from the live authoritative snapshot returned by graph_snapshot_store.current_full_reconcile_state."
     ],
     "refs": []
   },
   "metadata": {
-    "backlog_id": "AC-MF-PARALLEL-DISPATCH-ROOT-ALIAS-PRECHECK-20260714",
+    "backlog_id": "AC-CONTRACT-RUNTIME-RECONCILE-NEXT-ACTION-GUIDE-R1-20260717",
     "legacy_template_id": "mf_parallel.v1",
-    "previous_revision": "mf_parallel.v2.rev2",
-    "revision_reason": "Bind dispatch tickets to distinct canonical project and assigned worktree roots plus server-resolved child route authority before append.",
+    "previous_revision": "mf_parallel.v2.rev3",
+    "revision_reason": "Encode the task-scoped current-full reconcile next action without mutating the active rev3 definition pinned by in-flight executions.",
     "runtime_dogfood": true,
-    "updated_by_contract": "contract_update.v1",
-    "updated_by_contract_execution": "cex-mf-parallel-f14ffe63379b2605debb"
+    "updated_by_contract": "operator_supervised_direct_main",
+    "updated_by_contract_execution": "AC-CONTRACT-RUNTIME-ACTIVE-PIN-DEFINITION-INPLACE-DRIFT-R1-20260717"
   },
-  "revision": "rev3",
+  "revision": "rev4",
   "role": "observer",
   "rule_layer": {
     "stages": [
@@ -257,7 +259,7 @@
             "allowed_writer_roles": [
               "observer"
             ],
-            "description": "Observer graph reconcile/update evidence after merge lands on the target ref.",
+            "description": "After merge lands on the target ref, run task-scoped graph_current_full_reconcile with the reconcile-only route bound to dispatched runtime_context.task_id, verify the live authoritative snapshot, then submit this observer_reconcile ContractRuntime line with the child contract execution route.",
             "evidence_kind": "reconcile",
             "line_id": "observer_reconcile",
             "owner_role": "observer",
@@ -505,9 +507,70 @@
           "reconcile_event_created_at"
         ],
         "required_temporal_order": "qa_id_and_timestamp_before_merge_id_and_timestamp_before_reconcile_id_and_timestamp",
-        "allow_taskless_reconcile_only_for_explicit_shared_batch": true,
-        "explicit_task_id_mismatch_policy": "fail_closed",
-        "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
+      "allow_taskless_reconcile_only_for_explicit_shared_batch": true,
+      "explicit_task_id_mismatch_policy": "fail_closed",
+      "observer_reconcile_next_action": {
+        "schema_version": "mf_parallel.observer_reconcile_next_action.v1",
+        "source_backed": true,
+        "copy_safe": true,
+        "route_scopes_interchangeable": false,
+        "canonical_runtime_task": {
+          "task_id_source": "dispatched_runtime_context.task_id",
+          "runtime_context_id_source": "dispatched_runtime_context.runtime_context_id",
+          "target_project_root_source": "dispatched_runtime_context.target_project_root",
+          "explicit_task_id_mismatch_policy": "fail_closed"
+        },
+        "sequence": [
+          {
+            "order": 1,
+            "action": "graph_current_full_reconcile",
+            "route_kind": "reconcile_only",
+            "route_task_id_source": "dispatched_runtime_context.task_id",
+            "protected_action": "graph_current_full_reconcile",
+            "required_copy_safe_fields": [
+              "observer_session_id",
+              "route_token_ref",
+              "backlog_id",
+              "contract_execution_id",
+              "runtime_context_id",
+              "task_id",
+              "target_project_root"
+            ],
+            "raw_route_token_required": false,
+            "produces": [
+              "active_snapshot_id",
+              "active_snapshot_commit",
+              "current_full_reconcile_provenance"
+            ]
+          },
+          {
+            "order": 2,
+            "action": "contract_runtime_submit_line",
+            "route_kind": "contract_runtime_submit",
+            "route_task_id_source": "contract_execution_id",
+            "line_id": "observer_reconcile",
+            "requires": [
+              "task_scoped_current_full_reconcile",
+              "authoritative_snapshot_verified"
+            ],
+            "raw_route_token_required": false
+          }
+        ],
+        "authoritative_snapshot": {
+          "source": "graph_snapshot_store.current_full_reconcile_state",
+          "strategy": "current_full_reconcile",
+          "caller_claims_trusted": false,
+          "required_checks": [
+            "db_verified",
+            "live_verified",
+            "canonical_head_verified",
+            "active_snapshot_verified",
+            "provenance_scope_verified",
+            "durable_order_verified"
+          ]
+        }
+      },
+      "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
         "strategy": "current_full_reconcile"
       },
       "source_asset_materialization_required": true,

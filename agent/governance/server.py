@@ -53956,35 +53956,89 @@ def _contract_runtime_bind_reconcile_authority(
     return effective
 
 
-def _contract_runtime_is_rev3_mf_parallel_dispatch(
+def _contract_runtime_mf_parallel_dispatch_authority_policy(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "").strip()
+    ):
+        return {}
+    if not str(record.get("version") or "").strip() or not str(
+        record.get("revision") or ""
+    ).strip():
+        return {}
+    definition = _contract_runtime_definition_for_record(record)
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    policy = (
+        system_layer.get("dispatch_ticket_authority_policy")
+        if isinstance(
+            system_layer.get("dispatch_ticket_authority_policy"), Mapping
+        )
+        else {}
+    )
+    if (
+        policy.get("enabled") is not True
+        or policy.get("validate_before_precheck_and_submit") is not True
+    ):
+        return {}
+    return dict(policy)
+
+
+def _contract_runtime_is_policy_bound_mf_parallel_dispatch(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> bool:
+    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    line_ids = {
+        str(value or "").strip()
+        for value in policy.get("line_ids") or []
+        if str(value or "").strip()
+    }
     return bool(
-        _is_mf_parallel_record_contract_id(
-            str(record.get("contract_id") or "").strip()
-        )
-        and str(record.get("revision") or "").strip() == "rev3"
+        policy
         and str(write.get("stage_id") or "").strip() == "dispatch"
         and str(write.get("line_id") or "").strip()
         == "observer_dispatch_bounded_workers"
+        and (
+            not line_ids
+            or str(write.get("line_id") or "").strip() in line_ids
+        )
         and str(write.get("evidence_kind") or "").strip()
         == "dispatch_bounded_worker"
     )
 
 
-def _contract_runtime_rev3_dispatch_authority(
+def _contract_runtime_bind_mf_parallel_dispatch_authority(
     conn,
     *,
     project_id: str,
     record: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Bind one rev3 dispatch to persisted worker and child-route authority."""
+    """Bind a policy-enabled dispatch to persisted worker and route authority."""
 
     effective = dict(write)
-    if not _contract_runtime_is_rev3_mf_parallel_dispatch(record, effective):
+    if not _contract_runtime_is_policy_bound_mf_parallel_dispatch(
+        record, effective
+    ):
         return effective, []
+    authority_policy = (
+        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
+    required_dispatch_fields = {
+        str(value or "").strip()
+        for value in authority_policy.get("required_dispatch_fields") or []
+        if str(value or "").strip()
+    }
+    required_child_route_fields = {
+        str(value or "").strip()
+        for value in authority_policy.get("required_child_route_fields") or []
+        if str(value or "").strip()
+    }
 
     payload = (
         dict(effective.get("payload"))
@@ -54001,7 +54055,7 @@ def _contract_runtime_rev3_dispatch_authority(
             or not isinstance(bounded_workers[0], Mapping)
         ):
             errors.append(
-                "mf_parallel rev3 dispatch must identify exactly one bounded worker"
+                "mf_parallel policy-bound dispatch must identify exactly one bounded worker"
             )
         else:
             bounded_worker = dict(bounded_workers[0])
@@ -54071,7 +54125,11 @@ def _contract_runtime_rev3_dispatch_authority(
         "target_head_commit": target_head_commit,
         "merge_queue_id": merge_queue_id,
     }
-    missing = [field for field, value in required_text.items() if not value]
+    missing = [
+        field
+        for field, value in required_text.items()
+        if field in required_dispatch_fields and not value
+    ]
 
     owned_sources = [
         tuple(
@@ -54095,7 +54153,7 @@ def _contract_runtime_rev3_dispatch_authority(
     if len(set(owned_sources)) > 1:
         errors.append("dispatch contains conflicting owned_files values")
     owned_files = list(owned_sources[0]) if owned_sources else []
-    if not owned_files:
+    if "owned_files" in required_dispatch_fields and not owned_files:
         missing.append("owned_files")
 
     def supplied_mapping(field: str) -> dict[str, Any]:
@@ -54110,13 +54168,16 @@ def _contract_runtime_rev3_dispatch_authority(
 
     profile_requirements = supplied_mapping("profile_requirements")
     retry_policy = supplied_mapping("retry_policy")
-    if not profile_requirements:
+    if (
+        "profile_requirements" in required_dispatch_fields
+        and not profile_requirements
+    ):
         missing.append("profile_requirements")
-    if not retry_policy:
+    if "retry_policy" in required_dispatch_fields and not retry_policy:
         missing.append("retry_policy")
     if missing:
         errors.append(
-            "mf_parallel rev3 dispatch is missing required authority: "
+            "mf_parallel policy-bound dispatch is missing required authority: "
             + ", ".join(sorted(set(missing)))
         )
 
@@ -54130,7 +54191,9 @@ def _contract_runtime_rev3_dispatch_authority(
             runtime_context_id,
         )
     if context is None:
-        errors.append("mf_parallel rev3 dispatch requires a persisted runtime context")
+        errors.append(
+            "mf_parallel policy-bound dispatch requires a persisted runtime context"
+        )
     else:
         canonical_task_id = str(getattr(context, "task_id", "") or "").strip()
         contract_task_id = str(record.get("contract_execution_id") or "").strip()
@@ -54227,7 +54290,10 @@ def _contract_runtime_rev3_dispatch_authority(
     canonical_route_identity: dict[str, str] = {}
     resolved = None
     if not route_token_ref:
-        errors.append("mf_parallel rev3 dispatch is missing route_token_ref")
+        if required_child_route_fields:
+            errors.append(
+                "mf_parallel policy-bound dispatch is missing route_token_ref"
+            )
     else:
         from . import observer_route_context
 
@@ -54284,7 +54350,9 @@ def _contract_runtime_rev3_dispatch_authority(
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         }
         incomplete_route = [
-            field for field, value in canonical_route_identity.items() if not value
+            field
+            for field in required_child_route_fields
+            if not canonical_route_identity.get(field)
         ]
         if incomplete_route:
             errors.append(
@@ -71891,6 +71959,9 @@ def _contract_runtime_dispatch_ticket_authority(
         str(record.get("contract_id") or "").strip()
     ):
         return {}
+    authority_policy = (
+        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
     dispatch_lines: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
     for index, line in _contract_runtime_completed_lines(record):
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
@@ -72077,33 +72148,14 @@ def _contract_runtime_dispatch_ticket_authority(
             action[field] = dict(value)
         elif field in payload:
             conflicts.append(field)
-    if str(record.get("revision") or "").strip() == "rev3":
-        missing = [
-            field
-            for field in (
-                "runtime_context_id",
-                "task_id",
-                "worker_id",
-                "worker_slot_id",
-                "observer_command_id",
-                "parent_task_id",
-                "worker_role",
-                "target_project_root",
-                "worktree_path",
-                "branch_ref",
-                "base_commit",
-                "target_head_commit",
-                "merge_queue_id",
-                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
-            )
-            if not action.get(field)
-        ]
-        if not action.get("owned_files"):
-            missing.append("owned_files")
-        if not action.get("profile_requirements"):
-            missing.append("profile_requirements")
-        if not action.get("retry_policy"):
-            missing.append("retry_policy")
+    if authority_policy:
+        required_fields = _runtime_context_service_dedupe(
+            [
+                *authority_policy.get("required_dispatch_fields", []),
+                *authority_policy.get("required_child_route_fields", []),
+            ]
+        )
+        missing = [field for field in required_fields if not action.get(field)]
         dispatch_ticket_authority = (
             payload.get("dispatch_ticket_authority")
             if isinstance(payload.get("dispatch_ticket_authority"), Mapping)
@@ -72117,7 +72169,7 @@ def _contract_runtime_dispatch_ticket_authority(
             return {
                 "status": "invalid",
                 "error": (
-                    "canonical ContractRuntime dispatch is missing rev3 ticket "
+                    "canonical ContractRuntime dispatch is missing policy-bound ticket "
                     "authority: "
                     + ", ".join(sorted(set(missing)))
                 ),
@@ -79366,11 +79418,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                     write=write,
                     body=body,
                 )
-                write, dispatch_errors = _contract_runtime_rev3_dispatch_authority(
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    write=write,
+                write, dispatch_errors = (
+                    _contract_runtime_bind_mf_parallel_dispatch_authority(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        write=write,
+                    )
                 )
                 if dispatch_errors:
                     result = _contract_runtime_unchanged_line_rejection(
@@ -79682,11 +79736,13 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                     write=write,
                     body=body,
                 )
-                write, dispatch_errors = _contract_runtime_rev3_dispatch_authority(
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    write=write,
+                write, dispatch_errors = (
+                    _contract_runtime_bind_mf_parallel_dispatch_authority(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        write=write,
+                    )
                 )
                 if dispatch_errors:
                     result = _contract_runtime_unchanged_line_rejection(

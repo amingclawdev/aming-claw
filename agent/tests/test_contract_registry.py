@@ -232,7 +232,7 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     parallel_rev2 = registry.get("mf_parallel.v2", version="v2", revision="rev2")
 
     assert registry.get("direct_fix", version="v1")["revision"] == "rev2"
-    assert registry.get("mf_parallel.v2", version="v2")["revision"] == "rev2"
+    assert registry.get("mf_parallel.v2", version="v2")["revision"] == "rev4"
     assert direct_rev1["definition_hash"] == (
         "sha256:aada5b4fd59b49bdfda85c17839194432e4b4d690d78bfe6a35cff138c96a383"
     )

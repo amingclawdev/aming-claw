@@ -40902,8 +40902,8 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     definition_v2 = json.loads(
         Path("agent/governance/contract_definitions/mf_parallel.v2.rev1.json").read_text()
     )
-    definition_v2_rev3 = json.loads(
-        Path("agent/governance/contract_definitions/mf_parallel.v2.rev3.json").read_text()
+    definition_v2_rev4 = json.loads(
+        Path("agent/governance/contract_definitions/mf_parallel.v2.rev4.json").read_text()
     )
 
     assert batch["template_id"] == "mf_batch_parallel.v1"
@@ -40932,13 +40932,13 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
         "mf_batch_parallel.v1"
     )
     assert row_v2["runtime_contract_hints"]["contract_definition_revision"] == (
-        "rev3"
+        "rev4"
     )
-    assert definition_v2_rev3["revision"] == "rev3"
-    assert definition_v2_rev3["metadata"]["previous_revision"] == (
-        "mf_parallel.v2.rev2"
+    assert definition_v2_rev4["revision"] == "rev4"
+    assert definition_v2_rev4["metadata"]["previous_revision"] == (
+        "mf_parallel.v2.rev3"
     )
-    assert definition_v2_rev3["system_layer"][
+    assert definition_v2_rev4["system_layer"][
         "dispatch_ticket_authority_policy"
     ]["validate_before_precheck_and_submit"] is True
     parent_contracts = {
@@ -40959,7 +40959,7 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     from agent.governance.contracts.registry import ContractDefinitionRegistry
 
     latest = ContractDefinitionRegistry().get("mf_parallel.v2", version="v2")
-    assert latest["revision"] == "rev3"
+    assert latest["revision"] == "rev4"
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
@@ -48372,15 +48372,17 @@ def test_contract_runtime_desktop_launch_identity_falls_back_to_canonical_root()
         ("submit", "mixed_route", "mixes parent and child route_id"),
     ],
 )
-def test_mf_parallel_rev3_dispatch_rejection_is_atomic(
+@pytest.mark.parametrize("pinned_revision", ["rev3", "rev4"])
+def test_mf_parallel_policy_bound_dispatch_rejection_is_atomic(
     conn,
     mode,
     mutation,
     error_fragment,
+    pinned_revision,
 ):
-    suffix = f"{mode}-{mutation}"
-    backlog_id = f"AC-MF-PARALLEL-REV3-ATOMIC-{suffix}"
-    worker_task_id = f"mf-parallel-rev3-atomic-{suffix}"
+    suffix = f"{pinned_revision}-{mode}-{mutation}"
+    backlog_id = f"AC-MF-PARALLEL-POLICY-ATOMIC-{suffix}"
+    worker_task_id = f"mf-parallel-policy-atomic-{suffix}"
     target_project_root = f"/tmp/{worker_task_id}-root"
     worktree_path = f"/tmp/{worker_task_id}-worktree"
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
@@ -48393,10 +48395,11 @@ def test_mf_parallel_rev3_dispatch_rejection_is_atomic(
         target_project_root=target_project_root,
         worktree_path=worktree_path,
         submit_dispatch=False,
+        pinned_revision=pinned_revision,
     )
     execution_id = successor["contract_execution_id"]
     before = server._contract_runtime_store(conn).get(execution_id)
-    assert before["revision"] == "rev3"
+    assert before["revision"] == pinned_revision
     before_completed_lines = json.loads(json.dumps(before["completed_lines"]))
     before_revision = before["execution_state_revision"]
     before_state_hash = before["execution_state"]["execution_state_hash"]
@@ -48486,7 +48489,7 @@ def test_mf_parallel_rev3_dispatch_rejection_is_atomic(
     ] == before_state_hash
 
 
-def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_scope(
+def test_mf_parallel_rev4_dispatch_separates_worker_task_from_contract_route_scope(
     conn,
 ):
     backlog_id = "AC-MF-PARALLEL-REV3-CONTRACT-ROUTE-SCOPE"
@@ -48536,7 +48539,7 @@ def test_mf_parallel_rev3_dispatch_separates_worker_task_from_contract_route_sco
     )
 
 
-def test_mf_parallel_rev3_dispatch_rejects_wrong_top_level_contract_task_id(
+def test_mf_parallel_rev4_dispatch_rejects_wrong_top_level_contract_task_id(
     conn,
 ):
     backlog_id = "AC-MF-PARALLEL-REV3-WRONG-CONTRACT-TASK"
@@ -48614,12 +48617,6 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
         "route_token_ref": f"rtok-{worker_task_id}",
         "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
     }
-    _persist_append_route_token_ref(
-        conn,
-        backlog_id=backlog_id,
-        task_id=worker_task_id,
-        **route_identity,
-    )
     append_branch_contract_revision(
         conn,
         runtime_context,
@@ -48645,7 +48642,7 @@ def test_source_backed_mf_parallel_dispatch_issues_ticket_only_before_worker_rea
         )
     )
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
-    assert current["contract_revision_id"] == "rev3"
+    assert current["contract_revision_id"] == "rev4"
     assert current["contract_revision_id"] == current[
         "contract_runtime_current_state"
     ]["contract_revision_id"]
@@ -51066,7 +51063,7 @@ def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
 
     assert current["actor_role"] == "mf_sub"
     assert current["next_legal_action"]["line_id"] == "worker_read_runtime_guide"
-    assert current["contract_revision_id"] == "rev3"
+    assert current["contract_revision_id"] == "rev4"
     assert current["contract_revision_id"] == current[
         "contract_runtime_current_state"
     ]["contract_revision_id"]

@@ -8,7 +8,7 @@ DEFINITION_PATH = (
     Path(__file__).resolve().parents[1]
     / "governance"
     / "contract_definitions"
-    / "mf_parallel.v2.rev3.json"
+    / "mf_parallel.v2.rev4.json"
 )
 
 
@@ -126,7 +126,7 @@ def test_registry_materializes_reconcile_route_guidance_into_read_model():
     registered = ContractDefinitionRegistry().get(
         "mf_parallel.v2",
         version="v2",
-        revision="rev3",
+        revision="rev4",
     )
     next_action = registered["system_layer"]["graph_binding_policy"][
         "current_full_reconcile_evidence_policy"
@@ -146,3 +146,19 @@ def test_registry_materializes_reconcile_route_guidance_into_read_model():
     assert "task-scoped graph_current_full_reconcile" in reconcile_line[
         "description"
     ]
+
+
+def test_registry_preserves_active_rev3_pin_when_rev4_becomes_latest():
+    registry = ContractDefinitionRegistry()
+    pinned = registry.get("mf_parallel.v2", version="v2", revision="rev3")
+    latest = registry.get("mf_parallel.v2", version="v2")
+
+    assert pinned["definition_hash"] == (
+        "sha256:31a20dd7897da4a76b482a6ba29d0341163416df84187c2b9b44fc5f35bb4a4e"
+    )
+    assert pinned["source_sha256"] == (
+        "sha256:f0d9e997649e9ccd1bc46aaced8191b3506a9cd9b0d2f6588c0d52211b9dde22"
+    )
+    assert latest["revision"] == "rev4"
+    assert latest["metadata"]["previous_revision"] == "mf_parallel.v2.rev3"
+    assert latest["definition_hash"] != pinned["definition_hash"]
