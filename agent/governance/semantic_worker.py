@@ -31,10 +31,14 @@ cross-thread write serialization.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
-from dataclasses import asdict
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -46,9 +50,17 @@ _executor_guard = threading.Lock()
 _busy_locks: dict[tuple[str, str], threading.Lock] = {}
 _busy_locks_guard = threading.Lock()
 _registered = False
+_startup_catchup_thread: threading.Thread | None = None
+_startup_catchup_cancel = threading.Event()
+_startup_catchup_guard = threading.Lock()
+_startup_scan_lock = threading.Lock()
 _DEFAULT_WORKER_MAX_CONCURRENCY = 4
 _DEFAULT_DRAIN_BATCH_SIZE = 4
 _DEFAULT_DRAIN_LEASE_SECONDS = 600
+_DEFAULT_GOVERNANCE_PORT = 40000
+_STARTUP_DRAIN_MAX_CONCURRENCY = 1
+_STARTUP_LISTENER_POLL_SECONDS = 0.1
+_STARTUP_LISTENER_TIMEOUT_SECONDS = 60.0
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -117,6 +129,7 @@ def _get_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
 
 def _reset_worker_runtime_for_tests() -> None:
     global _executor, _executor_max_workers, _busy_locks, _registered
+    global _startup_catchup_thread, _startup_catchup_cancel
     with _executor_guard:
         old_executor = _executor
         _executor = None
@@ -125,7 +138,71 @@ def _reset_worker_runtime_for_tests() -> None:
         old_executor.shutdown(wait=False, cancel_futures=True)
     with _busy_locks_guard:
         _busy_locks = {}
+    with _startup_catchup_guard:
+        startup_thread = _startup_catchup_thread
+        _startup_catchup_cancel.set()
+        _startup_catchup_thread = None
+        _startup_catchup_cancel = threading.Event()
+    if startup_thread is not None and startup_thread.is_alive():
+        startup_thread.join(timeout=0.5)
     _registered = False
+
+
+def _governance_listener_ready() -> bool:
+    """Return true only when this process serves its own health endpoint."""
+    port = _positive_int(os.environ.get("GOVERNANCE_PORT"), _DEFAULT_GOVERNANCE_PORT)
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/health",
+            headers={"Accept": "application/json"},
+        )
+        # S310 is safe here: the URL is a fixed localhost health endpoint.
+        with urllib.request.urlopen(request, timeout=0.25) as response:  # noqa: S310
+            if int(getattr(response, "status", 0) or 0) != 200:
+                return False
+            health = json.load(response)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(health, Mapping)
+        and str(health.get("status") or "").lower() == "ok"
+        and int(health.get("pid") or 0) == os.getpid()
+    )
+
+
+def _run_startup_catchup_after_listener(cancel_event: threading.Event) -> None:
+    """Wait for the core listener, then run one restart-safe catchup scan."""
+    deadline = time.monotonic() + _STARTUP_LISTENER_TIMEOUT_SECONDS
+    while not cancel_event.is_set():
+        if _governance_listener_ready():
+            on_governance_startup({"source": "governance_listener_ready"})
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning(
+                "semantic_worker: startup catchup deferred; governance listener "
+                "did not become ready within %.1fs (pending jobs remain durable)",
+                _STARTUP_LISTENER_TIMEOUT_SECONDS,
+            )
+            return
+        cancel_event.wait(min(_STARTUP_LISTENER_POLL_SECONDS, remaining))
+
+
+def _schedule_startup_catchup_after_listener() -> None:
+    """Schedule at most one daemon catchup without delaying core startup."""
+    global _startup_catchup_thread, _startup_catchup_cancel
+    with _startup_catchup_guard:
+        if _startup_catchup_thread is not None and _startup_catchup_thread.is_alive():
+            return
+        _startup_catchup_cancel = threading.Event()
+        thread = threading.Thread(
+            target=_run_startup_catchup_after_listener,
+            args=(_startup_catchup_cancel,),
+            name="semantic-startup-catchup",
+            daemon=True,
+        )
+        _startup_catchup_thread = thread
+        thread.start()
 
 
 def _drain_lock_for(project_id: str, snapshot_id: str) -> threading.Lock:
@@ -1215,6 +1292,21 @@ def _drain_node(
     claim ownership; each node uses its own DB connection.
     """
     runtime_config = _worker_runtime_config(project_id)
+    if max_batches is not None:
+        # Startup recovery is intentionally lower-throughput than live
+        # event-driven work.  A batch of four concurrent model calls was
+        # enough to exhaust the service process before it could stay healthy.
+        # Keep restart catchup to one claimed node at a time; unclaimed rows
+        # remain durable and the next startup/enqueue scan will resume them.
+        runtime_config = dict(runtime_config)
+        runtime_config["max_workers"] = min(
+            runtime_config["max_workers"],
+            _STARTUP_DRAIN_MAX_CONCURRENCY,
+        )
+        runtime_config["claim_batch_size"] = min(
+            runtime_config["claim_batch_size"],
+            _STARTUP_DRAIN_MAX_CONCURRENCY,
+        )
     lock = _drain_lock_for(project_id, snapshot_id)
     if not lock.acquire(blocking=False):
         log.debug("semantic_worker: drain skipped (busy) %s/%s", project_id, snapshot_id)
@@ -2626,7 +2718,7 @@ def on_semantic_job_enqueued(payload: Any) -> None:
         log.exception("semantic_worker: on_semantic_job_enqueued failed: %s", exc)
 
 
-def on_governance_startup(payload: Any = None) -> None:
+def _run_governance_startup_catchup(payload: Any = None) -> None:
     """EventBus listener for `system.startup`. Catches up on rows
     that were enqueued before this process started.
 
@@ -2761,8 +2853,24 @@ def on_governance_startup(payload: Any = None) -> None:
         log.exception("semantic_worker: on_governance_startup failed: %s", exc)
 
 
+def on_governance_startup(payload: Any = None) -> None:
+    """Run one startup scan; overlapping scans collapse into the active scan.
+
+    The pending rows are durable in SQLite, so skipping a duplicate scan does
+    not lose work.  The active scan or a later enqueue/startup event will see
+    the same rows.
+    """
+    if not _startup_scan_lock.acquire(blocking=False):
+        log.info("semantic_worker: startup catchup skipped (scan already active)")
+        return
+    try:
+        _run_governance_startup_catchup(payload)
+    finally:
+        _startup_scan_lock.release()
+
+
 def register() -> None:
-    """Subscribe listeners + run startup catchup. Idempotent."""
+    """Subscribe listeners and defer catchup until core health is serving."""
     global _registered
     if _registered:
         return
@@ -2773,8 +2881,10 @@ def register() -> None:
         bus.subscribe("system.startup", on_governance_startup)
         _registered = True
         log.info("semantic_worker: registered EventBus subscribers")
-        # Fire startup catchup immediately (don't wait for system.startup
-        # event publication — register() is called during startup itself).
-        on_governance_startup({})
+        # register() runs before create_server()/serve_forever().  A synchronous
+        # catchup here can starve the process before the health listener binds.
+        # Pending jobs are durable, so wait for this PID's health endpoint and
+        # run one bounded scan from a daemon thread instead.
+        _schedule_startup_catchup_after_listener()
     except Exception as exc:  # noqa: BLE001 - registration failure should not block governance
         log.exception("semantic_worker: register failed: %s", exc)
