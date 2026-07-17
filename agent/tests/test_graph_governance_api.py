@@ -48812,6 +48812,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     target_project_root: str | None = None,
     submit_dispatch: bool = True,
     pinned_revision: str = "",
+    contract_execution_id: str = "",
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -48835,6 +48836,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
             backlog_id,
             parent_execution_id,
             task_id,
+            contract_execution_id=contract_execution_id,
         )
         runtime.start_execution(
             server.MF_PARALLEL_CONTRACT_ID,
@@ -48874,6 +48876,7 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
                 "reason": "Human approved parallel worker repair.",
                 "backlog_id": backlog_id,
                 "task_id": task_id,
+                "contract_execution_id": contract_execution_id,
                 "route_token_ref": f"rtok-{backlog_id.lower()}-root",
                 "worker_fence": {
                     "fence_token": fence_token,
@@ -50959,6 +50962,9 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
             token=worker_token,
             worktree_path=str(worker_root),
             pinned_revision=pinned_revision,
+            contract_execution_id=(
+                "worker-commit-facade-noncex-r6-regression"
+            ),
         )
     )
     actual_worker_id = runtime_context.worker_slot_id
@@ -50978,6 +50984,10 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         ),
     )
     contract_execution_id = successor["contract_execution_id"]
+    assert contract_execution_id == (
+        "worker-commit-facade-noncex-r6-regression"
+    )
+    assert not contract_execution_id.startswith("cex-")
     route_identity = {
         "route_id": "route-contract-canonical-worker",
         "route_context_hash": "sha256:route-contract-canonical-worker",
@@ -51342,10 +51352,22 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
         "implementation_lineage_ref"
     ] == implementation_lineage["implementation_lineage_ref"]
     assert "implementation_event_ref" not in worker_commit_response["worker_commit"]
+    worker_commit_gate = worker_commit_response[
+        "contract_runtime_close_evidence_gate"
+    ]
+    assert worker_commit_gate["accepted"] is True
+    assert worker_commit_gate["status"] == "passed"
+    assert worker_commit_gate["contract_execution_id"] == contract_execution_id
+    assert worker_commit_gate["line_id"] == "worker_commit"
+    assert worker_commit_gate["execution_state_revision"] == 8
     committed_record = server._contract_runtime_store(conn).get(
         contract_execution_id
     )
+    assert committed_record["execution_state_revision"] == 8
     assert committed_record["completed_lines"][-1]["line_id"] == "worker_commit"
+    assert committed_record["completed_lines"][-1]["payload"][
+        "contract_execution_id"
+    ] == contract_execution_id
     assert task_timeline.list_events(
         conn,
         PID,
