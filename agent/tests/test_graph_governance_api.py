@@ -51333,6 +51333,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
 def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     conn,
     tmp_path,
+    monkeypatch,
 ):
     task_id = "cex-contract-runtime-merge-authority"
     runtime_context_id = "mfrctx-contract-runtime-merge-authority"
@@ -51382,9 +51383,18 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         "contract_id": "mf_parallel.v2",
         "version": "v2",
         "revision": "rev2",
-        "execution_state_revision": 4,
+        # Service/prefill revisions are intentionally not derivable from the
+        # number of completed lines.  QA was accepted at immutable revision 3.
+        "execution_state_revision": 9,
         "contract_chain_id": "cchain-completed-merge-authority",
         "completed_lines": [
+            {
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "actor_role": "observer",
+                "evidence_kind": "contract_binding",
+                "payload": {"status": "prefilled"},
+            },
             {
                 "stage_id": "qa_graph_context",
                 "line_id": "qa_graph_context",
@@ -51429,7 +51439,16 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         ],
     }
     server._contract_runtime_store(conn).create(record)
-    conn.execute(
+    binding_identity = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": task_id,
+        "contract_id": record["contract_id"],
+        "contract_chain_id": record["contract_chain_id"],
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": "",
+    }
+    conn.executemany(
         """
         INSERT INTO backlog_contract_chain_bindings (
           idempotency_key, project_id, backlog_id, contract_chain_id,
@@ -51437,18 +51456,30 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
           source_ref, source_hash, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            "completed-qa-acceptance-revision-3",
-            PID,
-            context.backlog_id,
-            record["contract_chain_id"],
-            task_id,
-            "mf_parallel_child_current",
-            3,
-            f"contract_runtime:{task_id}:revision:3",
-            "sha256:completed-qa-acceptance",
-            "2026-07-16T23:27:42Z",
-        ),
+        [
+            (
+                f"completed-qa-acceptance-revision-{revision}",
+                PID,
+                context.backlog_id,
+                record["contract_chain_id"],
+                task_id,
+                "mf_parallel_child_current",
+                revision,
+                f"contract_runtime:{task_id}:revision:{revision}",
+                server.stable_sha256(
+                    {
+                        **binding_identity,
+                        "execution_state_revision": revision,
+                        "completed_line_count": completed_count,
+                    }
+                ),
+                created_at,
+            )
+            for revision, completed_count, created_at in (
+                (2, 2, "2026-07-16T23:27:41Z"),
+                (3, 3, "2026-07-16T23:27:42Z"),
+            )
+        ],
     )
     conn.commit()
     timeline_events = [
@@ -51482,7 +51513,7 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     assert authority["qa_contract_runtime_verified"] is True
     assert authority["qa_event_id"] == 0
     assert authority["qa_source_ref"] == (
-        f"contract_runtime:{task_id}:completed_lines:1"
+        f"contract_runtime:{task_id}:completed_lines:2"
     )
     assert authority["qa_acceptance_created_at"] == "2026-07-16T23:27:42Z"
     assert authority["qa_acceptance_revision"] == 3
@@ -51491,9 +51522,47 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     assert authority["authority_source"].startswith(
         "contract_runtime_completed_lines"
     )
+    server_reconcile_authority = {
+        **authority,
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": True,
+        "live_verified": True,
+        "active_snapshot_verified": True,
+        "graph_reconciled": True,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority",
+        lambda *_args, **_kwargs: server_reconcile_authority,
+    )
+    bound = server._contract_runtime_bind_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write={
+            "payload": {"reconcile_authority": {"db_verified": "forged"}}
+        },
+        policy={"authority_object_path": "payload.reconcile_authority"},
+    )
+    assert bound["payload"]["reconcile_authority"] == server_reconcile_authority
+    assert bound["payload"]["reconcile_authority"]["qa_event_id"] == 0
+    assert not any(
+        "qa" in str(event.get("event_kind") or "").lower()
+        for event in timeline_events
+    )
+
+    forged_qa = json.loads(json.dumps(record["completed_lines"][2]))
+    forged_qa["commit_sha"] = "f" * 40
+    assert server._contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=PID,
+        record=record,
+        completed_line_index=2,
+        expected_line=forged_qa,
+    ) == {}
 
     bypassed = json.loads(json.dumps(record))
-    bypassed["completed_lines"][0].update(
+    bypassed["completed_lines"][2].update(
         {
             "actor_role": "observer",
             "evidence_kind": "contract_line_bypass",

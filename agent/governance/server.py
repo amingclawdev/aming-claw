@@ -54236,26 +54236,97 @@ def _contract_runtime_completed_line_acceptance(
     canonical_line = completed[completed_line_index]
     if stable_sha256(canonical_line) != stable_sha256(expected_line):
         return {}
-    current_revision = int(canonical.get("execution_state_revision") or 0)
-    base_revision = current_revision - len(completed)
-    accepted_revision = base_revision + completed_line_index + 1
-    if base_revision < 0 or accepted_revision <= 0:
+    payload = (
+        canonical_line.get("payload")
+        if isinstance(canonical_line.get("payload"), Mapping)
+        else {}
+    )
+    if (
+        not _contract_runtime_line_status_passes(canonical_line)
+        or _contract_runtime_value_reports_failed_qa(canonical_line)
+        or str(canonical_line.get("status") or "").strip().lower()
+        in {"waived", "bypassed"}
+        or payload.get("no_pass_claim") is True
+        or str(payload.get("disposition") or "").strip()
+        == "proceeded_with_exception"
+    ):
         return {}
-    expected_ref = f"contract_runtime:{execution_id}:revision:{accepted_revision}"
+
+    # Revisions also advance for prefill, service, and projection writes.  Join
+    # the exact completed-line count transition through the immutable binding
+    # snapshot hash instead of inferring a revision from the current count.
     rows = conn.execute(
         """
-        SELECT source_ref, created_at
+        SELECT execution_state_revision, source_ref, source_hash, created_at
         FROM backlog_contract_chain_bindings
         WHERE project_id = ? AND contract_execution_id = ?
-          AND execution_state_revision = ? AND source_ref = ?
-        ORDER BY id
-        LIMIT 2
+        ORDER BY execution_state_revision, id
         """,
-        (project_id, execution_id, accepted_revision, expected_ref),
+        (project_id, execution_id),
     ).fetchall()
-    if len(rows) != 1:
+    identity = {
+        "project_id": str(canonical.get("project_id") or ""),
+        "backlog_id": str(canonical.get("backlog_id") or ""),
+        "contract_execution_id": execution_id,
+        "contract_id": str(canonical.get("contract_id") or ""),
+        "contract_chain_id": str(canonical.get("contract_chain_id") or ""),
+        "parent_contract_execution_id": str(
+            canonical.get("parent_contract_execution_id") or ""
+        ),
+        "root_contract_execution_id": str(
+            canonical.get("root_contract_execution_id") or ""
+        ),
+    }
+    decoded: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        revision = int(row["execution_state_revision"] or 0)
+        source_ref = str(row["source_ref"] or "").strip()
+        source_hash = str(row["source_hash"] or "").strip()
+        if revision <= 0 or source_ref != (
+            f"contract_runtime:{execution_id}:revision:{revision}"
+        ):
+            continue
+        matching_counts = [
+            count
+            for count in range(len(completed) + 1)
+            if source_hash
+            == stable_sha256(
+                {
+                    **identity,
+                    "execution_state_revision": revision,
+                    "completed_line_count": count,
+                }
+            )
+        ]
+        if len(matching_counts) != 1:
+            continue
+        candidate = {
+            "execution_state_revision": revision,
+            "completed_line_count": matching_counts[0],
+            "source_ref": source_ref,
+            "source_hash": source_hash,
+            "created_at": str(row["created_at"] or "").strip(),
+        }
+        previous = decoded.get(revision)
+        if previous is not None and previous != candidate:
+            return {}
+        decoded[revision] = candidate
+
+    ordered = [decoded[key] for key in sorted(decoded)]
+    target_count = completed_line_index + 1
+    acceptance_candidates = [
+        candidate
+        for index, candidate in enumerate(ordered)
+        if index > 0
+        and candidate["completed_line_count"] == target_count
+        and ordered[index - 1]["completed_line_count"] == target_count - 1
+    ]
+    if len(acceptance_candidates) != 1:
         return {}
-    accepted_at = str(rows[0]["created_at"] or "").strip()
+    acceptance = acceptance_candidates[0]
+    accepted_revision = int(acceptance["execution_state_revision"] or 0)
+    expected_ref = f"contract_runtime:{execution_id}:revision:{accepted_revision}"
+    accepted_at = str(acceptance["created_at"] or "").strip()
     if _contract_runtime_close_authority_time_order_value(accepted_at) is None:
         return {}
     completed_line_ref = (
