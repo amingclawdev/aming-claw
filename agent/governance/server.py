@@ -64315,11 +64315,32 @@ def _contract_runtime_close_mapping_containers(
     return containers
 
 
-def _contract_runtime_close_execution_id(body: Mapping[str, Any]) -> str:
+def _contract_runtime_close_execution_id(
+    body: Mapping[str, Any],
+    *,
+    conn=None,
+) -> str:
+    runtime = None
     for container in _contract_runtime_close_mapping_containers(body):
         for key in _CONTRACT_RUNTIME_EXECUTION_ID_FIELDS:
             token = str(container.get(key) or "").strip()
-            if token and token.startswith("cex-"):
+            if not token:
+                continue
+            if token.startswith("cex-"):
+                return token
+            if conn is None:
+                continue
+            if runtime is None:
+                runtime = _contract_runtime(conn)
+            try:
+                record = runtime.store.get(token)
+            except ContractRuntimeError:
+                continue
+            if (
+                str(record.get("contract_execution_id") or "").strip() == token
+                and str(record.get("definition_hash") or "").strip()
+                and str(record.get("instruction_bundle_hash") or "").strip()
+            ):
                 return token
     return ""
 
@@ -64986,7 +65007,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     event_kind: str,
     trusted_actor_role: str = "",
 ) -> dict[str, Any]:
-    contract_execution_id = _contract_runtime_close_execution_id(body)
+    contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
     if (
         not contract_execution_id
         or not _contract_runtime_close_event_kind_supported(event_kind)
@@ -65089,7 +65110,7 @@ def _contract_runtime_close_gate(
     trusted_actor_role: str = "",
     trusted_worker_commit_facade: bool = False,
 ) -> dict[str, Any]:
-    contract_execution_id = _contract_runtime_close_execution_id(body)
+    contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
     if not contract_execution_id:
         return {}
     if (
@@ -68958,7 +68979,7 @@ def _contract_runtime_close_authority_projection(
     close_commit: str,
     timeline_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    contract_execution_id = _contract_runtime_close_execution_id(body)
+    contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
     if not contract_execution_id:
         requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
         if requested_execution_id.startswith("onboard-service-"):
@@ -70205,7 +70226,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                 },
             )
         contract_runtime_close_evidence_requested = bool(
-            _contract_runtime_close_execution_id(ctx.body or {})
+            _contract_runtime_close_execution_id(ctx.body or {}, conn=conn)
             and _contract_runtime_close_event_kind_supported(norm_event_kind)
         )
         source_authority_before_runtime = (
@@ -76466,7 +76487,7 @@ def _timeline_gate_contract_runtime_projection_body(
     route_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = dict(query or {})
-    if _contract_runtime_close_execution_id(body):
+    if _contract_runtime_close_execution_id(body, conn=conn):
         return body
     requested_body_execution_id = _contract_runtime_close_requested_execution_ref(body)
     if requested_body_execution_id.startswith("onboard-service-"):

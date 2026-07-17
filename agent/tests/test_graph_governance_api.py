@@ -779,6 +779,39 @@ def test_generic_timeline_path_cannot_author_contract_worker_commit():
     assert rejected.value.code == "contract_worker_commit_facade_required"
 
 
+def test_contract_runtime_close_execution_id_resolves_pinned_non_cex_only(conn):
+    contract_execution_id = "worker-commit-facade-non-cex-regression"
+    runtime = server._contract_runtime(conn)
+    record = runtime.start_execution(
+        server.ONBOARD_CONTRACT_ID,
+        project_id=PID,
+        backlog_id="AC-WORKER-COMMIT-FACADE-NON-CEX-REGRESSION",
+        contract_execution_id=contract_execution_id,
+        actor_role="observer",
+    )
+
+    assert record["definition_hash"]
+    assert record["instruction_bundle_hash"]
+    assert server._contract_runtime_close_execution_id(
+        {"contract_execution_id": contract_execution_id},
+        conn=conn,
+    ) == contract_execution_id
+    assert server._contract_runtime_close_execution_id(
+        {
+            "task_id": contract_execution_id,
+            "payload": {
+                "route_id": contract_execution_id,
+                "parent_task_id": contract_execution_id,
+            },
+        },
+        conn=conn,
+    ) == ""
+    assert server._contract_runtime_close_execution_id(
+        {"contract_execution_id": "unknown-non-cex-execution"},
+        conn=conn,
+    ) == ""
+
+
 def test_contract_runtime_worker_implementation_preserves_top_level_lineage_proof():
     record = {
         "project_id": PID,
