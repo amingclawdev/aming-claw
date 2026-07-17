@@ -11,6 +11,7 @@ from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_p
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
     ACTION_BLOCKED_BY_DEPENDENCY,
+    ACTION_LEAVE_MERGED,
     ACTION_NOOP,
     ACTION_OPERATOR_APPROVE_LIVE_MERGE,
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
@@ -22,6 +23,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_READY,
     STATE_MERGED,
+    STATE_QUEUED_FOR_MERGE,
     STATE_RUNNING,
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
     STATE_WAITING_DEPENDENCY,
@@ -165,6 +167,88 @@ def test_materialized_noop_queue_status_is_not_live_apply_ready() -> None:
     assert recovery["route_local_merge_queue_id_diagnostics"][
         "route_local_merge_queue_id_allowed_for_materialize"
     ] is False
+
+
+def test_terminal_merged_queue_status_is_close_satisfying_without_recovery() -> None:
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-terminal-merged",
+        queue_item_id="mqitem-terminal-merged",
+        task_id="T-terminal-merged",
+        branch_ref="refs/heads/codex/terminal-merged",
+        queue_index=1,
+        status=STATE_MERGED,
+        target_ref=TARGET_REF,
+        base_commit="target-before",
+        branch_head="branch-merged",
+        validated_target_head="target-before",
+        current_target_head="target-after",
+        merge_commit="target-after",
+    )
+
+    plan = decide_merge_queue([item], scenario_id="mf_parallel-terminal")
+    decision = plan.decisions[0]
+    row = decision.to_read_model_row()
+
+    assert decision.action == ACTION_LEAVE_MERGED
+    assert decision.merge_allowed is False
+    assert decision.target_branch_mutation_allowed is False
+    assert row["live_apply_ready"] is False
+    assert row["durable_status_policy"]["live_apply_ready"] is False
+    assert row["durable_status_policy"]["terminal_close_satisfying"] is True
+    assert row["durable_status_policy"]["close_satisfying"] is True
+    assert "copy_safe_recovery" not in row
+
+
+def test_mf_batch_parallel_uses_shared_terminal_and_pending_status_policy() -> None:
+    items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-batch-status-policy",
+            queue_item_id="mqitem-batch-merged",
+            task_id="T-batch-merged",
+            branch_ref="refs/heads/codex/batch-merged",
+            queue_index=1,
+            status=STATE_MERGED,
+            target_ref=TARGET_REF,
+            merge_commit="target-after-merged",
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-batch-status-policy",
+            queue_item_id="mqitem-batch-queued",
+            task_id="T-batch-queued",
+            branch_ref="refs/heads/codex/batch-queued",
+            queue_index=2,
+            status=STATE_QUEUED_FOR_MERGE,
+            target_ref=TARGET_REF,
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-batch-status-policy",
+            queue_item_id="mqitem-batch-ready",
+            task_id="T-batch-ready",
+            branch_ref="refs/heads/codex/batch-ready",
+            queue_index=3,
+            status=STATE_MERGE_READY,
+            target_ref=TARGET_REF,
+        ),
+    ]
+
+    rows = decide_merge_queue(
+        items,
+        scenario_id="mf_batch_parallel-status-policy",
+    ).dashboard_rows
+    merged, queued, merge_ready = rows
+
+    assert merged["durable_status_policy"]["terminal_close_satisfying"] is True
+    assert merged["durable_status_policy"]["live_apply_ready"] is False
+    assert "copy_safe_recovery" not in merged
+    for pending in (queued, merge_ready):
+        assert pending["durable_status_policy"]["terminal_close_satisfying"] is False
+        assert pending["durable_status_policy"]["live_apply_ready"] is True
+        assert pending["durable_status_policy"]["close_satisfying"] is True
+        assert "copy_safe_recovery" not in pending
 
 
 def test_pb002_persisted_merge_queue_replays_dependency_blockers_after_restart(tmp_path) -> None:
