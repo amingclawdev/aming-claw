@@ -163,6 +163,7 @@ class _AuthRecorder(_Recorder):
         data: dict | None = None,
         *,
         role_token: str,
+        timeout_seconds: int = 15,
     ) -> dict:
         self.auth_calls.append((method, path, data, role_token))
         return {
@@ -1653,6 +1654,10 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
         "qa_evidence_provenance",
     }
     assert _tool_properties("contract_runtime_precheck_line") == submit_properties
+    timeout_schema = submit_properties["timeout_seconds"]
+    assert timeout_schema["default"] == 120
+    assert timeout_schema["minimum"] == 10
+    assert timeout_schema["maximum"] == 60 * 60
 
     recorder = _Recorder()
     dispatcher = ToolDispatcher(
@@ -1759,6 +1764,133 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
             },
         ),
     ]
+
+
+def test_managed_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable(
+    monkeypatch,
+):
+    env_key = "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS"
+    monkeypatch.delenv(env_key, raising=False)
+
+    assert mcp_tools._contract_runtime_mcp_timeout_seconds({}) == 120
+    assert mcp_tools._contract_runtime_mcp_timeout_seconds(
+        {"timeout_seconds": 1}
+    ) == 10
+    assert mcp_tools._contract_runtime_mcp_timeout_seconds(
+        {"timeout_seconds": 60 * 60 + 1}
+    ) == 60 * 60
+
+    monkeypatch.setenv(env_key, "75")
+    assert mcp_tools._contract_runtime_mcp_timeout_seconds({}) == 75
+    assert mcp_tools._contract_runtime_mcp_timeout_seconds(
+        {"timeout_seconds": 45}
+    ) == 45
+
+
+def test_managed_mcp_contract_runtime_timeout_is_transport_only_and_exact_once(
+):
+    calls = []
+    state = {"revision": 10, "completed_lines": []}
+    submit_attempts = 0
+
+    def api(method: str, path: str, data: dict | None = None) -> dict:
+        if path.endswith("/current-state?response_view=cli_current"):
+            calls.append((method, path, data, "", None))
+            return {
+                "ok": True,
+                "execution_state_revision": state["revision"],
+                "completed_lines": list(state["completed_lines"]),
+            }
+        raise AssertionError(f"unexpected generic request: {method} {path}")
+
+    def api_with_role_token(
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        role_token: str,
+        timeout_seconds: int = 15,
+    ) -> dict:
+        nonlocal submit_attempts
+        calls.append((method, path, data, role_token, timeout_seconds))
+        if path.endswith("/line-writes/precheck"):
+            return {"ok": False, "error": "request_timeout", "message": "timed out"}
+        if path.endswith("/line-writes"):
+            submit_attempts += 1
+            if submit_attempts == 1:
+                return {
+                    "ok": False,
+                    "error": "request_timeout",
+                    "message": "timed out",
+                }
+            state["revision"] += 1
+            state["completed_lines"].append({"line_id": "qa_graph_context"})
+            return {
+                "ok": True,
+                "execution_state_revision": state["revision"],
+                "completed_line": {"line_id": "qa_graph_context"},
+            }
+        raise AssertionError(f"unexpected role request: {method} {path}")
+
+    dispatcher = ToolDispatcher(
+        api_fn=api,
+        worker_pool=None,
+        manager_api_fn=api,
+        workspace="/repo",
+    )
+    dispatcher._api_with_role_token = api_with_role_token
+    common = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA",
+        "contract_execution_id": "cex-timeout",
+        "execution_state_revision": 10,
+        "stage_id": "qa",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "qa_graph_context",
+        "qa_session_token": "gov-qa-timeout-secret",
+    }
+
+    precheck = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        {**common, "timeout_seconds": 45},
+    )
+    timed_out = dispatcher.dispatch(
+        "contract_runtime_submit_line",
+        {**common, "timeout_seconds": 75},
+    )
+
+    assert precheck["write_disposition"] == "not_written"
+    assert precheck["effective_timeout_seconds"] == 45
+    assert precheck["retry_disposition"] == "safe_to_retry_precheck"
+    assert timed_out["write_disposition"] == "ambiguous"
+    assert timed_out["effective_timeout_seconds"] == 75
+    assert timed_out["retry_disposition"] == (
+        "poll_authoritative_current_state_before_retry"
+    )
+    assert timed_out["retry_guidance"]["automatic_retry"] is False
+    assert "gov-qa-timeout-secret" not in json.dumps(precheck)
+    assert "gov-qa-timeout-secret" not in json.dumps(timed_out)
+    assert all("timeout_seconds" not in (call[2] or {}) for call in calls)
+
+    current = dispatcher.dispatch(
+        "contract_runtime_current",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-timeout",
+        },
+    )
+    assert current["execution_state_revision"] == 10
+    assert current["completed_lines"] == []
+
+    retried = dispatcher.dispatch(
+        "contract_runtime_submit_line",
+        {**common, "timeout_seconds": 75},
+    )
+    assert retried["ok"] is True
+    assert retried["execution_state_revision"] == 11
+    assert submit_attempts == 2
+    assert len(state["completed_lines"]) == 1
+    assert [call[4] for call in calls if call[4] is not None] == [45, 75, 75]
 
 
 def test_mcp_contract_runtime_bypass_line_routes_no_pass_payload_without_token_leak():

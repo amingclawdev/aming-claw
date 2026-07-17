@@ -35,6 +35,13 @@ _RECONCILE_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_RECONCILE_MCP_TIMEOUT_SECONDS",
 )
 _RECONCILE_PROGRESS_POLL_TIMEOUT_SECONDS = 10
+_CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS = 120
+_CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS = 10
+_CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS = 60 * 60
+_CONTRACT_RUNTIME_MCP_TIMEOUT_LEGACY_SECONDS = 15
+_CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
+    "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS",
+)
 _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
@@ -81,6 +88,27 @@ def _reconcile_mcp_timeout_seconds(args: dict) -> int:
     return _RECONCILE_MCP_TIMEOUT_DEFAULT_SECONDS
 
 
+def _contract_runtime_mcp_timeout_seconds(args: dict) -> int:
+    value = args.get("timeout_seconds")
+    if value is None:
+        for key in _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS:
+            if os.environ.get(key):
+                value = os.environ.get(key)
+                break
+    if value is None:
+        return _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS
+    if parsed <= 0:
+        return _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS
+    return max(
+        _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+        min(parsed, _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS),
+    )
+
+
 def _is_timeout_result(result: Any) -> bool:
     if not isinstance(result, dict):
         return False
@@ -93,6 +121,59 @@ def _is_timeout_result(result: Any) -> bool:
         or "timed out" in text
         or "timeout" in text
     )
+
+
+def _contract_runtime_timeout_response(
+    *,
+    operation: str,
+    timeout_seconds: int,
+    result: dict,
+) -> dict:
+    is_submit = operation == "submit_line"
+    write_disposition = "ambiguous" if is_submit else "not_written"
+    retry_disposition = (
+        "poll_authoritative_current_state_before_retry"
+        if is_submit
+        else "safe_to_retry_precheck"
+    )
+    return {
+        "ok": False,
+        "error": "request_timeout",
+        "message": (
+            f"ContractRuntime {operation} transport timed out after "
+            f"{timeout_seconds} seconds."
+        ),
+        "operation": operation,
+        "timeout_seconds": timeout_seconds,
+        "effective_timeout_seconds": timeout_seconds,
+        "legacy_timeout_seconds": _CONTRACT_RUNTIME_MCP_TIMEOUT_LEGACY_SECONDS,
+        "transport_only_timeout": True,
+        "transport_disposition": "ambiguous",
+        "write_disposition": write_disposition,
+        "disposition": write_disposition,
+        "retry_disposition": retry_disposition,
+        "retry_guidance": {
+            "automatic_retry": False,
+            "exact_once_intent": True,
+            "poll_tool": "contract_runtime_current" if is_submit else "",
+            "required_before_retry": (
+                "authoritative_contract_runtime_current_state_poll"
+                if is_submit
+                else "none"
+            ),
+            "retry_when": (
+                "execution_state_revision_unchanged_and_line_missing"
+                if is_submit
+                else "precheck_may_be_reissued"
+            ),
+            "do_not_retry_when": (
+                "line_completed_or_execution_state_revision_changed"
+                if is_submit
+                else ""
+            ),
+        },
+        "request_id": str(result.get("request_id") or ""),
+    }
 
 
 def _summarize_reconcile_progress(queue: Any, run_id: str) -> dict:
@@ -533,6 +614,16 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
         "project_id": {"type": "string"},
         "backlog_id": {"type": "string"},
         "contract_execution_id": {"type": "string"},
+        "timeout_seconds": {
+            "type": "integer",
+            "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+            "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+            "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+            "description": (
+                "MCP-to-governance transport timeout only; never forwarded in "
+                "the ContractRuntime HTTP request body."
+            ),
+        },
         "definition_hash": {"type": "string"},
         "instruction_bundle_hash": {"type": "string"},
         "execution_state_revision": {"type": "integer"},
@@ -3999,6 +4090,7 @@ class ToolDispatcher:
         data: dict | None = None,
         *,
         role_token: str,
+        timeout_seconds: int = _CONTRACT_RUNTIME_MCP_TIMEOUT_LEGACY_SECONDS,
     ) -> dict:
         """Call governance with a role token without leaking it into evidence bodies."""
         token = str(role_token or "").strip()
@@ -4012,7 +4104,7 @@ class ToolDispatcher:
             headers["Content-Type"] = "application/json"
         try:
             req = urllib.request.Request(url, data=body, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode() if exc.fp else ""
@@ -4625,23 +4717,41 @@ class ToolDispatcher:
             )
             if qa_ref_error:
                 return qa_ref_error
+            timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
+                if key
+                not in {
+                    "project_id",
+                    "contract_execution_id",
+                    "qa_session_token",
+                    "timeout_seconds",
+                }
+                and value is not None
             }
             if qa_session_token:
-                return self._api_with_role_token(
+                result = self._api_with_role_token(
                     "POST",
                     f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
                     body,
                     role_token=qa_session_token,
+                    timeout_seconds=timeout_seconds,
                 )
-            return self._api(
-                "POST",
-                f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
-                body,
-            )
+            else:
+                result = self._governance_api_with_timeout(
+                    "POST",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes",
+                    body,
+                    timeout_seconds=timeout_seconds,
+                )
+            if _is_timeout_result(result):
+                return _contract_runtime_timeout_response(
+                    operation="submit_line",
+                    timeout_seconds=timeout_seconds,
+                    result=result,
+                )
+            return result
 
         if name == "contract_runtime_bypass_line":
             pid = args["project_id"]
@@ -4691,23 +4801,41 @@ class ToolDispatcher:
             )
             if qa_ref_error:
                 return qa_ref_error
+            timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "contract_execution_id", "qa_session_token"} and value is not None
+                if key
+                not in {
+                    "project_id",
+                    "contract_execution_id",
+                    "qa_session_token",
+                    "timeout_seconds",
+                }
+                and value is not None
             }
             if qa_session_token:
-                return self._api_with_role_token(
+                result = self._api_with_role_token(
                     "POST",
                     f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
                     body,
                     role_token=qa_session_token,
+                    timeout_seconds=timeout_seconds,
                 )
-            return self._api(
-                "POST",
-                f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
-                body,
-            )
+            else:
+                result = self._governance_api_with_timeout(
+                    "POST",
+                    f"/api/projects/{pid}/contract-runtime/{execution_id}/line-writes/precheck",
+                    body,
+                    timeout_seconds=timeout_seconds,
+                )
+            if _is_timeout_result(result):
+                return _contract_runtime_timeout_response(
+                    operation="precheck_line",
+                    timeout_seconds=timeout_seconds,
+                    result=result,
+                )
+            return result
 
         if name == "observer_repair_run_plan":
             pid = args["project_id"]
