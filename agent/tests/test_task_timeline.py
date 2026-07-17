@@ -77,6 +77,46 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
+def test_recent_timeline_compact_view_omits_raw_payload(tmp_path):
+    from agent.governance import server, task_timeline
+
+    conn = _conn(str(tmp_path))
+    try:
+        event = task_timeline.record_event(
+            conn,
+            project_id="proj",
+            backlog_id="AC-RECENT-COMPACT",
+            task_id="recent-compact-task",
+            event_type="worker.finish_gate",
+            phase="verification",
+            event_kind="worker_finish_gate",
+            actor="mf_sub",
+            status="passed",
+            payload={"large_evidence": "x" * 100_000},
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    compact = server.handle_task_timeline_recent(
+        _ctx({"limit": "10", "view": "compact"})
+    )
+    full = server.handle_task_timeline_recent(
+        _ctx({"limit": "10", "view": "full"})
+    )
+
+    assert compact["response_view"] == "compact"
+    assert compact["raw_event_payloads_omitted"] is True
+    assert compact["events"][0]["id"] == event["id"]
+    assert compact["events"][0]["payload"]["raw_payload_omitted"] is True
+    assert compact["events"][0]["payload_ref"]["payload_bytes"] > 100_000
+    assert "large_evidence" not in json.dumps(compact["events"])
+    assert len(json.dumps(compact)) < 25_000
+    assert full["response_view"] == "full"
+    assert full["raw_event_payloads_omitted"] is False
+    assert full["events"][0]["payload"]["large_evidence"] == "x" * 100_000
+
+
 def _route_context_consumption_events(identity=None):
     route_identity = dict(identity or ROUTE_IDENTITY)
     return [

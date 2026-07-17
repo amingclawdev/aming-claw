@@ -27867,6 +27867,116 @@ def handle_graph_governance_parallel_branch_merge_gate(ctx: RequestContext):
         conn.close()
 
 
+def _parallel_branch_merge_repo_root_authority(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    merge_queue_id: str = "",
+    queue_item_id: str = "",
+    task_id: str = "",
+    target_ref: str = "refs/heads/main",
+) -> tuple[str, str]:
+    """Resolve merge git operations from durable runtime identity, never cwd."""
+
+    from .parallel_branch_runtime import (
+        get_branch_context,
+        list_merge_queue_items,
+        select_merge_queue_item,
+    )
+
+    explicit = str(
+        body.get("repo_root_path") or body.get("workspace_root") or ""
+    ).strip()
+    selected_task_id = str(task_id or "").strip()
+    if merge_queue_id:
+        items = list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        )
+        if not items and target_ref:
+            items = list_merge_queue_items(
+                conn,
+                project_id,
+                merge_queue_id,
+            )
+        item = select_merge_queue_item(
+            items,
+            queue_item_id=str(queue_item_id or "").strip(),
+            task_id=selected_task_id,
+        )
+        selected_task_id = item.task_id
+
+    context = (
+        get_branch_context(conn, project_id, selected_task_id)
+        if selected_task_id
+        else None
+    )
+    canonical_root = ""
+    canonical_source = ""
+    if context is not None and str(context.target_project_root or "").strip():
+        canonical_root = str(Path(context.target_project_root).resolve())
+        canonical_source = "runtime_context.target_project_root"
+    elif context is not None and str(context.target_project_id or "").strip():
+        registered = project_service.resolve_project_root(
+            context.target_project_id,
+            None,
+            fallback_self=False,
+        )
+        if registered:
+            canonical_root = str(registered.resolve())
+            canonical_source = (
+                "runtime_context.target_project_id.registered_project"
+            )
+    if not canonical_root:
+        registered = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
+        if registered:
+            canonical_root = str(registered.resolve())
+            canonical_source = "registered_project"
+
+    if explicit:
+        resolved_explicit = str(Path(explicit).resolve())
+        if (
+            canonical_source.startswith("runtime_context")
+            and canonical_root
+            and resolved_explicit != canonical_root
+        ):
+            raise ValidationError(
+                "explicit merge repo root conflicts with canonical runtime context",
+                {
+                    "explicit_repo_root_path": resolved_explicit,
+                    "canonical_repo_root_path": canonical_root,
+                    "canonical_repo_root_source": canonical_source,
+                    "merge_queue_id": merge_queue_id,
+                    "queue_item_id": queue_item_id,
+                    "task_id": selected_task_id,
+                },
+            )
+        return (
+            resolved_explicit,
+            "explicit_verified_against_runtime_context"
+            if canonical_source.startswith("runtime_context")
+            else "explicit",
+        )
+    if canonical_root:
+        return canonical_root, canonical_source
+    raise ValidationError(
+        "canonical merge repo root is unavailable",
+        {
+            "project_id": project_id,
+            "merge_queue_id": merge_queue_id,
+            "queue_item_id": queue_item_id,
+            "task_id": selected_task_id,
+        },
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-preview")
 def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
     """Return side-effect-free git merge preview evidence for a queued branch."""
@@ -27879,11 +27989,6 @@ def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
         select_merge_queue_item,
     )
 
-    repo_root = str(
-        ctx.body.get("repo_root_path")
-        or ctx.body.get("workspace_root")
-        or os.getcwd()
-    )
     merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
     target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
     branch_ref = str(ctx.body.get("branch_ref") or "")
@@ -27921,6 +28026,16 @@ def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
         if not branch_ref:
             raise ValidationError("branch_ref is required when merge_queue_id is not provided")
 
+        repo_root, repo_root_source = _parallel_branch_merge_repo_root_authority(
+            conn,
+            project_id=project_id,
+            body=ctx.body,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
+            target_ref=target_ref,
+        )
+
         preview = git_merge_preview_evidence(
             repo_root_path=repo_root,
             target_ref=target_ref,
@@ -27954,6 +28069,8 @@ def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
             "merge_queue_id": merge_queue_id,
             "queue_item_id": queue_item_id,
             "task_id": task_id,
+            "repo_root_path": repo_root,
+            "repo_root_source": repo_root_source,
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan) if gate_plan is not None else None,
         }
@@ -27979,13 +28096,6 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
         raise ValidationError("status is required")
 
     target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
-    repo_root = Path(
-        str(
-            ctx.body.get("repo_root_path")
-            or ctx.body.get("workspace_root")
-            or os.getcwd()
-        )
-    )
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(
@@ -28000,6 +28110,18 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             action="merge_result",
             task_id=str(ctx.body.get("task_id") or ""),
         )
+        repo_root_value, repo_root_source = (
+            _parallel_branch_merge_repo_root_authority(
+                conn,
+                project_id=project_id,
+                body=ctx.body,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+                task_id=str(ctx.body.get("task_id") or ""),
+                target_ref=target_ref,
+            )
+        )
+        repo_root = Path(repo_root_value)
         allow_reclaimed_fence = (
             _parallel_branch_merge_result_allows_reclaimed_fence_without_token(
                 ctx.body,
@@ -28076,6 +28198,8 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
             "ok": True,
             "project_id": project_id,
             "route_token_gate": route_gate,
+            "repo_root_path": str(repo_root),
+            "repo_root_source": repo_root_source,
             "merge_commit_canonicalized": status == "merged",
             "merge_commit_source": (
                 "server_git_rev_parse" if status == "merged" else ""
@@ -28111,11 +28235,6 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
     evidence = ctx.body.get("evidence") or {}
     if not isinstance(evidence, dict):
         raise ValidationError("evidence must be an object when provided")
-    repo_root = str(
-        ctx.body.get("repo_root_path")
-        or ctx.body.get("workspace_root")
-        or os.getcwd()
-    )
     target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
 
     conn = get_connection(project_id)
@@ -28140,6 +28259,15 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 ctx.body,
                 route_gate,
             )
+        )
+        repo_root, repo_root_source = _parallel_branch_merge_repo_root_authority(
+            conn,
+            project_id=project_id,
+            body=ctx.body,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+            task_id=str(ctx.body.get("task_id") or ""),
+            target_ref=target_ref,
         )
         with sqlite_write_lock():
             result = execute_merge_queue_item(
@@ -28284,6 +28412,8 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
             "ok": bool(result.get("ok")),
             "project_id": project_id,
             "route_token_gate": route_gate or None,
+            "repo_root_path": repo_root,
+            "repo_root_source": repo_root_source,
             **result,
             "timeline_events_recorded": [
                 {
@@ -48374,14 +48504,14 @@ def _contract_runtime_response(
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
-    if actor_role != "qa" or response_view not in {"cli_current", "cli_guide"}:
+    if response_view not in {"cli_current", "cli_guide"}:
         return response
 
     response.pop("contract_runtime_current_state", None)
     response.pop("runtime_guide", None)
     response.update(
         {
-            "schema_version": "contract_runtime.compact_qa_response.v1",
+            "schema_version": "contract_runtime.compact_cli_response.v1",
             "response_view": response_view,
             "source_of_authority": "ContractRuntime",
             "actor_role": actor_role,
@@ -53153,6 +53283,18 @@ def _contract_runtime_trusted_merge_projection(
                 task_id=task_id,
                 backlog_id=backlog_id,
             )
+            contract_runtime_merge = (
+                _contract_runtime_completed_merge_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    context=context,
+                    timeline_events=timeline_events,
+                )
+            )
+            if contract_runtime_merge:
+                candidates.append(contract_runtime_merge)
+                continue
             projected_lines = _contract_runtime_projection_post_worker_lines(
                 conn=conn,
                 project_id=project_id,
@@ -53274,6 +53416,238 @@ def _contract_runtime_trusted_merge_projection(
             ],
         }
     return {"timeline_verified": True, **next(iter(unique.values()))}
+
+
+def _contract_runtime_completed_merge_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Derive merge authority from accepted ContractRuntime lines plus durable merge state.
+
+    Bounded QA and its ordering are ContractRuntime facts.  A redundant QA
+    timeline event is audit material, not an authority prerequisite.  The
+    merge itself remains cross-checked against both the durable merge queue and
+    its observer-authored timeline event.
+    """
+
+    from .parallel_branch_runtime import get_merge_queue_item
+
+    completed = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+
+    def usable_line(
+        line: Mapping[str, Any],
+        *,
+        line_id: str,
+        actor_role: str,
+        evidence_kind: str,
+    ) -> bool:
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        return bool(
+            str(line.get("line_id") or "").strip() == line_id
+            and str(line.get("actor_role") or "").strip() == actor_role
+            and str(line.get("evidence_kind") or "").strip() == evidence_kind
+            and str(line.get("status") or "").strip().lower() not in {"waived", "bypassed"}
+            and payload.get("no_pass_claim") is not True
+            and str(payload.get("disposition") or "").strip()
+            != "proceeded_with_exception"
+        )
+
+    qa_graph: tuple[int, Mapping[str, Any]] | None = None
+    qa_verification: tuple[int, Mapping[str, Any]] | None = None
+    merge_line: tuple[int, Mapping[str, Any]] | None = None
+    for index, line in enumerate(completed):
+        if usable_line(
+            line,
+            line_id="qa_graph_context",
+            actor_role="qa",
+            evidence_kind="graph_trace",
+        ):
+            payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+            graph_evidence = (
+                payload.get("graph_trace_evidence")
+                if isinstance(payload.get("graph_trace_evidence"), Mapping)
+                else {}
+            )
+            if (
+                graph_evidence.get("db_verified") is True
+                and not list(graph_evidence.get("identity_mismatches") or [])
+                and list(graph_evidence.get("verified_trace_ids") or graph_evidence.get("trace_ids") or [])
+            ):
+                qa_graph = (index, line)
+        if usable_line(
+            line,
+            line_id="qa_independent_verification",
+            actor_role="qa",
+            evidence_kind="independent_verification",
+        ) and line.get("observer_impersonation") is not True:
+            qa_verification = (index, line)
+        if usable_line(
+            line,
+            line_id="observer_merge",
+            actor_role="observer",
+            evidence_kind="merge",
+        ):
+            merge_line = (index, line)
+
+    if not qa_graph or not qa_verification or not merge_line:
+        return {}
+    if not (qa_graph[0] < qa_verification[0] < merge_line[0]):
+        return {}
+
+    qa_graph_payload = (
+        qa_graph[1].get("payload")
+        if isinstance(qa_graph[1].get("payload"), Mapping)
+        else {}
+    )
+    graph_evidence = (
+        qa_graph_payload.get("graph_trace_evidence")
+        if isinstance(qa_graph_payload.get("graph_trace_evidence"), Mapping)
+        else {}
+    )
+    qa_payload = (
+        qa_verification[1].get("payload")
+        if isinstance(qa_verification[1].get("payload"), Mapping)
+        else {}
+    )
+    merge_payload = (
+        merge_line[1].get("payload")
+        if isinstance(merge_line[1].get("payload"), Mapping)
+        else {}
+    )
+    qa_commit = str(
+        qa_verification[1].get("commit_sha")
+        or qa_payload.get("candidate_commit_sha")
+        or ""
+    ).strip().lower()
+    graph_candidate_commit = str(
+        graph_evidence.get("candidate_commit_sha")
+        or graph_evidence.get("candidate_commit")
+        or ""
+    ).strip().lower()
+    branch_head = str(merge_payload.get("branch_head") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", qa_commit):
+        return {}
+    if graph_candidate_commit and graph_candidate_commit != qa_commit:
+        return {}
+    if branch_head and branch_head != qa_commit:
+        return {}
+
+    merged_commit = str(
+        merge_line[1].get("commit_sha")
+        or merge_payload.get("merge_commit")
+        or merge_payload.get("target_head_after_merge")
+        or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit):
+        return {}
+    for key in ("merge_commit", "target_head_after_merge"):
+        value = str(merge_payload.get(key) or "").strip().lower()
+        if value and value != merged_commit:
+            return {}
+    if merge_payload.get("merge_gate_passed") is not True:
+        return {}
+    if str(merge_payload.get("queue_item_status") or "").strip() != "merged":
+        return {}
+
+    merge_queue_id = str(merge_payload.get("merge_queue_id") or "").strip()
+    queue_item_id = str(merge_payload.get("queue_item_id") or "").strip()
+    if not merge_queue_id or not queue_item_id:
+        return {}
+    durable_item = get_merge_queue_item(
+        conn,
+        project_id,
+        merge_queue_id,
+        queue_item_id,
+    )
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    if (
+        durable_item is None
+        or durable_item.task_id != task_id
+        or durable_item.status != "merged"
+        or str(durable_item.merge_commit or "").strip().lower() != merged_commit
+        or str(durable_item.target_head_after_merge or "").strip().lower()
+        != merged_commit
+    ):
+        return {}
+
+    timeline_refs = {
+        str(item or "").strip()
+        for item in merge_payload.get("timeline_event_refs") or []
+        if str(item or "").strip()
+    }
+    merge_events: list[Mapping[str, Any]] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        event_commit = str(
+            event.get("commit_sha")
+            or event_payload.get("merge_commit")
+            or event_payload.get("target_head_after_merge")
+            or ""
+        ).strip().lower()
+        source_ref = _runtime_context_event_ref(event)
+        event_kind = str(event.get("event_kind") or event.get("event_type") or "").lower()
+        if (
+            event_commit == merged_commit
+            and ("merge" in event_kind)
+            and (not timeline_refs or source_ref in timeline_refs)
+        ):
+            merge_events.append(event)
+    if len(merge_events) != 1:
+        return {}
+    merge_event = merge_events[0]
+    merge_event_id = _contract_runtime_projection_timeline_event_id(merge_event)
+    merge_event_created_at = _contract_runtime_projection_timeline_event_time(
+        merge_event
+    )
+    if merge_event_id <= 0 or not merge_event_created_at:
+        return {}
+
+    return {
+        "timeline_verified": True,
+        "authority_verified": True,
+        "authority_source": "contract_runtime_completed_lines+durable_merge_queue+task_timeline_merge",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": str(
+            getattr(context, "backlog_id", "")
+            or record.get("backlog_id")
+            or ""
+        ),
+        "merged_commit_sha": merged_commit,
+        "qa_source_ref": (
+            "contract_runtime:"
+            f"{record.get('contract_execution_id', '')}:"
+            "line:qa_independent_verification"
+        ),
+        "qa_event_id": 0,
+        "qa_event_created_at": "",
+        "qa_contract_runtime_verified": True,
+        "qa_graph_completed_line_index": qa_graph[0],
+        "qa_completed_line_index": qa_verification[0],
+        "merge_completed_line_index": merge_line[0],
+        "merge_source_ref": _runtime_context_event_ref(merge_event),
+        "merge_event_id": merge_event_id,
+        "merge_event_created_at": merge_event_created_at,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+    }
 
 
 def _contract_runtime_current_full_reconcile_authority(
@@ -69301,6 +69675,49 @@ def handle_task_timeline_list(ctx: RequestContext):
     return response
 
 
+def _task_timeline_recent_compact_event(
+    event: Mapping[str, Any],
+    *,
+    task_timeline_module: Any,
+) -> dict[str, Any]:
+    """Project one recent event without embedding raw evidence bodies."""
+
+    compact = {
+        key: event.get(key)
+        for key in (
+            "id",
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "mf_id",
+            "attempt_num",
+            "event_type",
+            "phase",
+            "event_kind",
+            "scenario_id",
+            "parent_event_id",
+            "correlation_id",
+            "severity",
+            "decision",
+            "schema_version",
+            "actor",
+            "status",
+            "trace_id",
+            "commit_sha",
+            "created_at",
+        )
+        if event.get(key) not in (None, "", [], {})
+    }
+    payload_ref = task_timeline_module._compact_payload_ref(event)
+    compact["payload_ref"] = payload_ref
+    compact["payload"] = {
+        "schema_version": "task_timeline.compact_payload_ref.v1",
+        **payload_ref,
+        "raw_payload_omitted": True,
+    }
+    return compact
+
+
 @route("GET", "/api/task/{project_id}/timeline/recent")
 def handle_task_timeline_recent(ctx: RequestContext):
     """Project-wide recent timeline events, newest-first, cross-row.
@@ -69323,6 +69740,12 @@ def handle_task_timeline_recent(ctx: RequestContext):
         limit = max(1, min(limit, 500))
     except (TypeError, ValueError):
         limit = 100
+    response_view = str(
+        _first_query_value(ctx.query, "response_view")
+        or _first_query_value(ctx.query, "view")
+        or "full"
+    ).strip().lower()
+    compact_response = response_view in {"compact", "agent", "cli"}
     from . import task_timeline
 
     with DBContext(project_id) as conn:
@@ -69350,16 +69773,29 @@ def handle_task_timeline_recent(ctx: RequestContext):
         contract_runtime_projection_events = (
             task_timeline.compact_ledger_to_timeline_events(compact_ledger)
         )
+        response_events = (
+            [
+                _task_timeline_recent_compact_event(
+                    event,
+                    task_timeline_module=task_timeline,
+                )
+                for event in events
+            ]
+            if compact_response
+            else events
+        )
     return {
         "ok": True,
         "project_id": project_id,
-        "events": events,
+        "events": response_events,
         "count": len(events),
         "compact_ledger": compact_ledger,
         "contract_runtime_projection_events": contract_runtime_projection_events,
         "contract_runtime_projection_event_count": len(contract_runtime_projection_events),
         "order": "newest_first",
         "cross_row": True,
+        "response_view": "compact" if compact_response else "full",
+        "raw_event_payloads_omitted": compact_response,
     }
 
 

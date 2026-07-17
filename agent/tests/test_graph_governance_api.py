@@ -50719,7 +50719,213 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     ]["worker_session_id"] == native_worker_session_id
 
 
-def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
+def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
+    conn,
+    tmp_path,
+):
+    task_id = "cex-contract-runtime-merge-authority"
+    runtime_context_id = "mfrctx-contract-runtime-merge-authority"
+    merge_queue_id = "mq-contract-runtime-merge-authority"
+    queue_item_id = "mqitem-contract-runtime-merge-authority"
+    qa_commit = "a" * 40
+    merged_commit = "b" * 40
+    target_root = tmp_path / "target-project"
+    target_root.mkdir()
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id,
+        branch_ref="refs/heads/codex/merge-authority",
+        status=STATE_VALIDATED,
+        runtime_context_id=runtime_context_id,
+        backlog_id="AC-CONTRACT-RUNTIME-MERGE-AUTHORITY",
+        parent_task_id="AC-CONTRACT-RUNTIME-MERGE-AUTHORITY",
+        target_project_root=str(target_root),
+        target_project_id="target-project",
+        merge_queue_id=merge_queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=context.backlog_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=1,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=qa_commit,
+                merge_commit=merged_commit,
+                target_head_before_merge="c" * 40,
+                target_head_after_merge=merged_commit,
+            )
+        ],
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": task_id,
+        "completed_lines": [
+            {
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "actor_role": "qa",
+                "evidence_kind": "graph_trace",
+                "payload": {
+                    "graph_trace_evidence": {
+                        "db_verified": True,
+                        "verified_trace_ids": ["gqt-completed-qa"],
+                        "identity_mismatches": [],
+                        "candidate_commit_sha": qa_commit,
+                    }
+                },
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "authorization_source": "qa_role_session",
+                "observer_impersonation": False,
+                "commit_sha": qa_commit,
+                "payload": {"verdict": "PASS"},
+            },
+            {
+                "stage_id": "observer_integration",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge",
+                "commit_sha": merged_commit,
+                "payload": {
+                    "branch_head": qa_commit,
+                    "merge_commit": merged_commit,
+                    "target_head_after_merge": merged_commit,
+                    "merge_gate_passed": True,
+                    "merge_queue_id": merge_queue_id,
+                    "queue_item_id": queue_item_id,
+                    "queue_item_status": "merged",
+                    "timeline_event_refs": ["timeline:50"],
+                },
+            },
+        ],
+    }
+    timeline_events = [
+        {
+            "id": 50,
+            "project_id": PID,
+            "backlog_id": context.backlog_id,
+            "task_id": task_id,
+            "event_type": "parallel.live_merge",
+            "event_kind": "parallel.live_merge",
+            "actor": "observer",
+            "status": "passed",
+            "commit_sha": merged_commit,
+            "created_at": "2026-07-16T23:27:43Z",
+            "payload": {
+                "merge_commit": merged_commit,
+                "target_head_after_merge": merged_commit,
+            },
+        }
+    ]
+
+    authority = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+    )
+
+    assert authority["authority_verified"] is True
+    assert authority["qa_contract_runtime_verified"] is True
+    assert authority["qa_event_id"] == 0
+    assert authority["merge_event_id"] == 50
+    assert authority["merged_commit_sha"] == merged_commit
+    assert authority["authority_source"].startswith(
+        "contract_runtime_completed_lines"
+    )
+
+    bypassed = json.loads(json.dumps(record))
+    bypassed["completed_lines"][0].update(
+        {
+            "actor_role": "observer",
+            "evidence_kind": "contract_line_bypass",
+            "status": "waived",
+            "payload": {"no_pass_claim": True},
+        }
+    )
+    assert server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=PID,
+        record=bypassed,
+        context=context,
+        timeline_events=timeline_events,
+    ) == {}
+
+
+def test_parallel_merge_repo_root_comes_from_runtime_context(conn, tmp_path):
+    task_id = "merge-root-task"
+    merge_queue_id = "mq-merge-root"
+    queue_item_id = "mqitem-merge-root"
+    target_root = tmp_path / "canonical-target"
+    wrong_root = tmp_path / "wrong-target"
+    target_root.mkdir()
+    wrong_root.mkdir()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            branch_ref="refs/heads/codex/merge-root",
+            status=STATE_VALIDATED,
+            runtime_context_id="mfrctx-merge-root",
+            target_project_id="external-project",
+            target_project_root=str(target_root),
+            merge_queue_id=merge_queue_id,
+        ),
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                branch_ref="refs/heads/codex/merge-root",
+                queue_index=1,
+                status="validated",
+                target_ref="refs/heads/main",
+            )
+        ],
+    )
+
+    root, source = server._parallel_branch_merge_repo_root_authority(
+        conn,
+        project_id=PID,
+        body={},
+        merge_queue_id=merge_queue_id,
+        queue_item_id=queue_item_id,
+        task_id=task_id,
+    )
+
+    assert root == str(target_root.resolve())
+    assert source == "runtime_context.target_project_root"
+    with pytest.raises(ValidationError, match="conflicts with canonical"):
+        server._parallel_branch_merge_repo_root_authority(
+            conn,
+            project_id=PID,
+            body={"repo_root_path": str(wrong_root)},
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
+        )
+
+
+def test_contract_runtime_cli_views_are_compact_and_role_actionable():
     reader_hash = "sha256:" + "1" * 64
     writer_hash = "sha256:" + "2" * 64
     record = {
@@ -50765,7 +50971,13 @@ def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
     }
 
     full = server._contract_runtime_response(
-        record, actor_role="observer", response_view="cli_current"
+        record, actor_role="observer"
+    )
+    observer_current = server._contract_runtime_response(
+        record,
+        actor_role="observer",
+        response_view="cli_current",
+        request_id="req-compact-observer-current",
     )
     current = server._contract_runtime_response(
         record,
@@ -50781,10 +50993,13 @@ def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
     )
 
     assert len(json.dumps(full)) > 150_000
+    assert len(json.dumps(observer_current)) < 16_384
     assert len(json.dumps(current)) < 16_384
     assert len(json.dumps(guide)) < 16_384
-    assert "duplicated_runtime_guide" not in json.dumps([current, guide])
-    for response in (current, guide):
+    assert "duplicated_runtime_guide" not in json.dumps(
+        [observer_current, current, guide]
+    )
+    for response in (observer_current, current, guide):
         assert response["source_of_authority"] == "ContractRuntime"
         assert response["execution_state_revision"] == 10
         assert response["execution_state_hash"] == "sha256:" + "4" * 64
@@ -50793,7 +51008,6 @@ def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
         assert response["contract_hash"] == "sha256:" + "3" * 64
         assert response["runtime_guide_hash"] == reader_hash
         assert response["route_token_ref"] == "rtok-contract-runtime-compact-qa"
-        assert response["actor_role"] == "qa"
         assert response["next_legal_action"]["line_id"] == (
             "qa_independent_verification"
         )
@@ -50801,6 +51015,14 @@ def test_contract_runtime_qa_cli_views_are_compact_and_role_actionable():
         assert response["submit_line_guidance"][
             "current_required_runtime_guide_hash"
         ] == writer_hash
+    assert observer_current["actor_role"] == "observer"
+    assert observer_current["response_view"] == "cli_current"
+    assert observer_current["request_id"] == "req-compact-observer-current"
+    assert observer_current["schema_version"] == (
+        "contract_runtime.compact_cli_response.v1"
+    )
+    assert current["actor_role"] == "qa"
+    assert guide["actor_role"] == "qa"
     assert "runtime_guide" not in current
     assert "contract_runtime_current_state" not in current
     assert current["response_view"] == "cli_current"
