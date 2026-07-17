@@ -2369,6 +2369,7 @@ def current_full_reconcile_state(
     merge_event_created_at: str = "",
     reconcile_event_id: int = 0,
     reconcile_event_created_at: str = "",
+    expected_contract_execution_id: str = "",
     expected_task_id: str = "",
     expected_runtime_context_id: str = "",
     reconcile_task_id: str = "",
@@ -2633,11 +2634,20 @@ def current_full_reconcile_state(
             str(qa_source_ref or "").strip(),
         )
     )
-    qa_acceptance_claimed = bool(
-        str(qa_source_ref or "").strip()
+    qa_source_ref = str(qa_source_ref or "").strip()
+    canonical_qa_acceptance_claimed = bool(
+        qa_source_ref.startswith("contract_runtime:")
         or str(qa_acceptance_created_at or "").strip()
         or int(qa_acceptance_revision or 0)
         or qa_contract_runtime_verified
+    )
+    timeline_qa_acceptance_claimed = bool(
+        qa_source_ref.startswith("timeline:")
+        or qa_event_id
+        or str(qa_event_created_at or "").strip()
+    )
+    qa_acceptance_claimed = bool(
+        canonical_qa_acceptance_claimed or timeline_qa_acceptance_claimed
     )
     canonical_qa_acceptance = bool(
         qa_contract_runtime_verified
@@ -2647,11 +2657,19 @@ def current_full_reconcile_state(
         and qa_event_id == 0
         and not str(qa_event_created_at or "").strip()
     )
-    qa_order_required = bool(
-        qa_event_id
-        or str(qa_event_created_at or "").strip()
-        or qa_acceptance_claimed
+    timeline_qa_acceptance = bool(
+        not canonical_qa_acceptance_claimed
+        and qa_event_id > 0
+        and qa_time is not None
     )
+    qa_authority_mode = (
+        "canonical_contract_runtime_acceptance"
+        if canonical_qa_acceptance
+        else "timeline_event"
+        if timeline_qa_acceptance
+        else ""
+    )
+    qa_order_required = qa_acceptance_claimed
     durable_order_verified = bool(
         merge_event_id > 0
         and reconcile_event_id > merge_event_id
@@ -2674,9 +2692,8 @@ def current_full_reconcile_state(
                 and qa_acceptance_time < merge_time
             )
             or (
-                qa_event_id > 0
+                timeline_qa_acceptance
                 and merge_event_id > qa_event_id
-                and qa_time is not None
                 and qa_time < merge_time
             )
         )
@@ -2686,19 +2703,47 @@ def current_full_reconcile_state(
         if isinstance(stored_route_evidence.get("route_token_scope"), Mapping)
         else {}
     )
+    expected_contract_execution_id = str(
+        expected_contract_execution_id or ""
+    ).strip()
     expected_task_id = str(expected_task_id or "").strip()
     expected_runtime_context_id = str(expected_runtime_context_id or "").strip()
+    route_task_id = str(route_scope.get("task_id") or "").strip()
     task_claims = {
         str(value or "").strip()
         for value in (
             reconcile_task_id,
             stored_route_evidence.get("task_id"),
-            route_scope.get("task_id"),
             marker_runtime_context_scope.get("task_id"),
             route_runtime_context_scope.get("task_id"),
         )
         if str(value or "").strip()
     }
+    contract_execution_claims = {
+        str(value or "").strip()
+        for value in (
+            stored_route_evidence.get("contract_execution_id"),
+            marker_runtime_context_scope.get("contract_execution_id"),
+            route_runtime_context_scope.get("contract_execution_id"),
+        )
+        if str(value or "").strip()
+    }
+    if expected_contract_execution_id:
+        if route_task_id:
+            contract_execution_claims.add(route_task_id)
+    elif route_task_id:
+        # Legacy/non-contract callers use route task scope as the worker task.
+        task_claims.add(route_task_id)
+    if (
+        expected_contract_execution_id
+        and expected_contract_execution_id == expected_task_id
+        and not contract_execution_claims
+        and task_claims == {expected_task_id}
+    ):
+        # Older single-lane provenance used one shared task identity for both
+        # the contract execution and its worker. Preserve that exact legacy
+        # shape without weakening separated CEX/worker scope verification.
+        contract_execution_claims.add(expected_contract_execution_id)
     runtime_context_claims = {
         str(value or "").strip()
         for value in (
@@ -2711,20 +2756,37 @@ def current_full_reconcile_state(
         if str(value or "").strip()
     }
 
-    def scope_dimension_verified(expected: str, claims: set[str]) -> bool:
+    def scope_dimension_verified(
+        expected: str,
+        claims: set[str],
+        *,
+        allow_missing: bool,
+    ) -> bool:
         if not expected:
             return not claims or len(claims) == 1
         if claims:
             return claims == {expected}
-        return bool(allow_taskless)
+        return bool(allow_missing)
 
-    task_scope_verified = scope_dimension_verified(expected_task_id, task_claims)
+    contract_execution_scope_verified = scope_dimension_verified(
+        expected_contract_execution_id,
+        contract_execution_claims,
+        allow_missing=False,
+    )
+    task_scope_verified = scope_dimension_verified(
+        expected_task_id,
+        task_claims,
+        allow_missing=allow_taskless,
+    )
     runtime_context_scope_verified = scope_dimension_verified(
         expected_runtime_context_id,
         runtime_context_claims,
+        allow_missing=allow_taskless,
     )
     provenance_scope_verified = bool(
-        task_scope_verified and runtime_context_scope_verified
+        contract_execution_scope_verified
+        and task_scope_verified
+        and runtime_context_scope_verified
     )
     reconcile_snapshot_verified = bool(
         reconcile_snapshot_id
@@ -2768,15 +2830,19 @@ def current_full_reconcile_state(
         "durable_order_verified": durable_order_verified,
         "qa_event_id": qa_event_id,
         "qa_event_created_at": str(qa_event_created_at or "").strip(),
-        "qa_source_ref": str(qa_source_ref or "").strip(),
+        "qa_source_ref": qa_source_ref,
         "qa_acceptance_created_at": str(
             qa_acceptance_created_at or ""
         ).strip(),
         "qa_acceptance_revision": int(qa_acceptance_revision or 0),
         "qa_contract_runtime_verified": bool(qa_contract_runtime_verified),
         "qa_acceptance_claimed": qa_acceptance_claimed,
+        "canonical_qa_acceptance_claimed": canonical_qa_acceptance_claimed,
+        "timeline_qa_acceptance_claimed": timeline_qa_acceptance_claimed,
         "qa_completed_line_ref_verified": qa_completed_line_ref,
         "canonical_qa_acceptance_verified": canonical_qa_acceptance,
+        "timeline_qa_acceptance_verified": timeline_qa_acceptance,
+        "qa_authority_mode": qa_authority_mode,
         "merge_event_id": merge_event_id,
         "merge_event_created_at": str(merge_event_created_at or "").strip(),
         "reconcile_event_id": reconcile_event_id,
@@ -2784,11 +2850,15 @@ def current_full_reconcile_state(
             reconcile_event_created_at or ""
         ).strip(),
         "provenance_scope_verified": provenance_scope_verified,
+        "contract_execution_scope_verified": (
+            contract_execution_scope_verified
+        ),
         "task_scope_verified": task_scope_verified,
         "runtime_context_scope_verified": runtime_context_scope_verified,
         "runtime_context_scope_link_verified": (
             runtime_context_scope_link_verified
         ),
+        "expected_contract_execution_id": expected_contract_execution_id,
         "expected_task_id": expected_task_id,
         "expected_runtime_context_id": expected_runtime_context_id,
         "reconcile_task_id": str(reconcile_task_id or "").strip(),

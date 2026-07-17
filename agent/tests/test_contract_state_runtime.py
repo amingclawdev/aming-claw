@@ -2722,6 +2722,8 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
         "provenance_verified": True,
         "provenance_scope_verified": True,
         "durable_order_verified": True,
+        "qa_authority_mode": "timeline_event",
+        "timeline_qa_acceptance_verified": True,
         "qa_event_id": 10,
         "qa_event_created_at": "2026-07-11T00:59:00Z",
         "merge_event_id": 11,
@@ -2746,6 +2748,32 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
     assert _current_full_reconcile_satisfies_requirement(
         {"payload": {"reconcile_authority": reconcile_authority}}
     ) is True
+    canonical_qa_authority = {
+        **reconcile_authority,
+        "qa_authority_mode": "canonical_contract_runtime_acceptance",
+        "timeline_qa_acceptance_verified": False,
+        "qa_event_id": 0,
+        "qa_event_created_at": "",
+        "qa_source_ref": "contract_runtime:cex-current-full:completed_lines:10",
+        "qa_acceptance_created_at": "2026-07-11T00:59:00Z",
+        "qa_acceptance_revision": 12,
+        "qa_contract_runtime_verified": True,
+        "qa_completed_line_ref_verified": True,
+        "canonical_qa_acceptance_verified": True,
+    }
+    assert _current_full_reconcile_satisfies_requirement(
+        {"payload": {"reconcile_authority": canonical_qa_authority}}
+    ) is True
+    assert _current_full_reconcile_satisfies_requirement(
+        {
+            "payload": {
+                "reconcile_authority": {
+                    **canonical_qa_authority,
+                    "qa_event_id": 10,
+                }
+            }
+        }
+    ) is False
     split_reconcile = dict(reconcile_authority)
     active_snapshot_commit = split_reconcile.pop("active_snapshot_commit")
     assert _current_full_reconcile_satisfies_requirement(
@@ -2800,6 +2828,8 @@ def test_rev2_projection_requires_ids_and_timestamps_for_qa_merge_reconcile():
         "provenance_verified": True,
         "provenance_scope_verified": True,
         "durable_order_verified": True,
+        "qa_authority_mode": "timeline_event",
+        "timeline_qa_acceptance_verified": True,
         "qa_event_id": 1,
         "qa_event_created_at": "2026-07-11T01:01:00Z",
         "merge_event_id": 2,

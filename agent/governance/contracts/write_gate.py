@@ -470,6 +470,53 @@ def _validate_current_full_reconcile_evidence(
     for field in policy.get("required_temporal_fields") or ():
         if not str(authority.get(field) or "").strip():
             errors.append(f"{line_id} requires authority.{field}")
+    qa_alternatives = [
+        dict(item)
+        for item in policy.get("qa_authority_alternatives") or ()
+        if isinstance(item, Mapping)
+    ]
+    if qa_alternatives:
+        valid_qa_alternatives: list[str] = []
+        for alternative in qa_alternatives:
+            alternative_id = str(alternative.get("id") or "").strip()
+            authority_mode = str(
+                alternative.get("authority_mode") or alternative_id
+            ).strip()
+            valid = bool(
+                alternative_id
+                and str(authority.get("qa_authority_mode") or "").strip()
+                == authority_mode
+            )
+            valid = valid and all(
+                authority.get(field) is True
+                for field in alternative.get("required_verification_fields")
+                or ()
+            )
+            valid = valid and all(
+                bool(str(authority.get(field) or "").strip())
+                for field in (
+                    list(alternative.get("required_identity_fields") or ())
+                    + list(alternative.get("required_temporal_fields") or ())
+                )
+            )
+            valid = valid and all(
+                _int_value(authority.get(field)) > 0
+                for field in alternative.get("required_positive_integer_fields")
+                or ()
+            )
+            valid = valid and all(
+                authority.get(field) in (None, "", 0, False, [])
+                for field in alternative.get("forbidden_fields") or ()
+            )
+            if valid:
+                valid_qa_alternatives.append(alternative_id)
+        required_mode = str(
+            policy.get("qa_authority_alternative_mode") or "exactly_one"
+        ).strip()
+        if required_mode == "exactly_one" and len(valid_qa_alternatives) != 1:
+            errors.append(
+                f"{line_id} requires exactly one verified QA authority alternative"
+            )
     try:
         merge_event_id = int(authority.get("merge_event_id") or 0)
         reconcile_event_id = int(authority.get("reconcile_event_id") or 0)
