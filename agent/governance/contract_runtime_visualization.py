@@ -23,6 +23,14 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _scalar_text(value: Any) -> str:
+    if isinstance(value, Mapping) or (
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+    ):
+        return ""
+    return _text(value)
+
+
 def _int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -41,7 +49,7 @@ def _nested_text(value: Mapping[str, Any], *keys: str) -> str:
     ]
     for container in containers:
         for key in keys:
-            text = _text(container.get(key))
+            text = _scalar_text(container.get(key))
             if text:
                 return text
     return ""
@@ -57,6 +65,8 @@ def _safe_refs(values: Any, *, limit: int = 24) -> list[str]:
     forbidden = ("token", "session", "worktree", "fence", "credential", "secret")
     refs: list[str] = []
     for item in items:
+        if not isinstance(item, str):
+            continue
         ref = _text(item)
         if not ref or any(term in ref.lower() for term in forbidden):
             continue
@@ -101,6 +111,10 @@ def _next_action_summary(value: Any) -> dict[str, Any]:
     ):
         if key in action and action.get(key) not in (None, "", [], {}):
             value = action.get(key)
+            if isinstance(value, Mapping) or (
+                isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+            ):
+                continue
             result[key] = _text(value) if isinstance(value, str) else value
     roles = action.get("allowed_writer_roles")
     if isinstance(roles, Sequence) and not isinstance(roles, (str, bytes)):
@@ -309,6 +323,31 @@ def build_contract_runtime_visualization(
         records[0] if records else {},
     )
     runtime_current = _runtime_record_summary(current_record) if current_record else {}
+    embedded_current = _mapping(current.get("contract_runtime_current_state"))
+    if not runtime_current and current:
+        runtime_current = {
+            "contract_execution_id": current_execution_id,
+            "root_contract_execution_id": _text(
+                current.get("root_contract_execution_id")
+            ),
+            "contract_chain_id": _text(current.get("contract_chain_id")),
+            "contract_id": _text(current.get("current_contract_id")),
+            "contract_revision_id": _text(
+                embedded_current.get("contract_revision_id")
+            ),
+            "contract_hash": _text(embedded_current.get("contract_hash")),
+            "execution_state_revision": _int(
+                embedded_current.get("execution_state_revision")
+                or current.get("generation")
+            ),
+            "execution_state_hash": _text(
+                embedded_current.get("execution_state_hash")
+            ),
+            "runtime_guide_hash": _text(embedded_current.get("runtime_guide_hash")),
+            "readiness_state": _text(current.get("readiness_state")),
+            "next_legal_action": {},
+            "updated_at": _text(current.get("updated_at")),
+        }
     chain_next_action = _next_action_summary(current.get("next_legal_action"))
     if chain_next_action:
         runtime_current["next_legal_action"] = chain_next_action
@@ -370,8 +409,7 @@ def build_contract_runtime_visualization(
                 "runtime_value": runtime_current.get("contract_execution_id"),
             }
         )
-    embedded_state = _mapping(current.get("contract_runtime_current_state"))
-    embedded_revision = _int(embedded_state.get("execution_state_revision"))
+    embedded_revision = _int(embedded_current.get("execution_state_revision"))
     runtime_revision = _int(runtime_current.get("execution_state_revision"))
     if embedded_revision and runtime_revision and embedded_revision != runtime_revision:
         conflicts.append(
@@ -585,6 +623,7 @@ def build_contract_runtime_visualization(
             "limit": max(1, int(timeline_limit or 100)),
             "truncated": bool(timeline_has_more),
             "next_cursor": _text(next_cursor) if timeline_has_more else "",
+            "next_cursor_parameter": "before_event_id" if timeline_has_more else "",
             "append_only": True,
             "current_snapshot_in_playback": False,
         },
@@ -609,7 +648,13 @@ def build_contract_runtime_visualization(
         "bypass_records": bypass_records,
         "legacy_advisories": advisories,
         "projection_freshness": {
-            "status": "degraded" if current.get("degraded") else "current",
+            "status": (
+                "missing"
+                if not current
+                else "degraded"
+                if current.get("degraded")
+                else "current"
+            ),
             "projection_generation": _int(current.get("generation")),
             "projection_watermark": _int(current.get("projection_watermark")),
             "projection_hash": _text(current.get("projection_hash")),

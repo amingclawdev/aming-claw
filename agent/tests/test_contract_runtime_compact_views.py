@@ -150,7 +150,10 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
                 "line_id": "runtime_block_bypass",
                 "evidence_kind": "audited_bypass",
                 "classification": "system_block",
-                "decision": "bypass",
+                "decision": {
+                    "decision": "bypass",
+                    "raw_secret": "nested-decision-secret",
+                },
                 "reason": "continue correct lane while diagnostic is repaired",
                 "diagnostic_backlog_id": "AC-DIAGNOSTIC",
                 "status": "accepted",
@@ -230,6 +233,7 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         "/private/worker/worktree",
         "raw-secret",
         "private-body",
+        "nested-decision-secret",
     ):
         assert forbidden not in encoded
     for forbidden_key in (
