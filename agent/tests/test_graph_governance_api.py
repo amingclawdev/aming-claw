@@ -52841,6 +52841,7 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
                     "runtime_guide_hash": writer_hash,
                     "stage_id": "qa",
                     "line_id": "qa_independent_verification",
+                    "actor_role": "qa",
                     "evidence_kind": "independent_verification",
                 }
             },
@@ -52942,6 +52943,72 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
             "reuse_existing_open_copy_safe_body",
         ):
             assert bypass[key]["runtime_guide_hash"] == writer_hash
+
+
+def test_contract_runtime_write_uses_exact_writer_line_hash_without_mutating_reader_guide():
+    reader_hash = "sha256:" + "1" * 64
+    writer_hash = "sha256:" + "2" * 64
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-CONTRACT-RUNTIME-WRITER-HASH",
+        "contract_execution_id": "cex-contract-runtime-writer-hash",
+        "definition_hash": "sha256:" + "3" * 64,
+        "instruction_bundle_hash": "sha256:" + "4" * 64,
+        "execution_state": {"execution_state_revision": 7},
+        "runtime_guide": {
+            "runtime_guide_hash": reader_hash,
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "runtime_guide_hash": writer_hash,
+                    "stage_id": "worker_commit",
+                    "line_id": "worker_commit",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "worker_commit",
+                }
+            },
+        },
+    }
+
+    write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+
+    assert write["runtime_guide_hash"] == writer_hash
+    assert record["runtime_guide"]["runtime_guide_hash"] == reader_hash
+
+
+def test_contract_runtime_write_fails_closed_for_mismatched_writer_line_binding():
+    reader_hash = "sha256:" + "1" * 64
+    record = {
+        "execution_state": {"execution_state_revision": 7},
+        "runtime_guide": {
+            "runtime_guide_hash": reader_hash,
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "runtime_guide_hash": "sha256:" + "2" * 64,
+                    "stage_id": "worker_commit",
+                    "line_id": "different_line",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "worker_commit",
+                }
+            },
+        },
+    }
+
+    write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+
+    assert write["runtime_guide_hash"] == ""
+    assert write["runtime_guide_hash"] != reader_hash
 
 
 def test_contract_runtime_current_accepts_copy_safe_mf_sub_worker_proof(conn):
