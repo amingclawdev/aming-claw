@@ -80673,6 +80673,165 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     return response
 
 
+@route("GET", "/api/projects/{project_id}/visualization/backlogs/{backlog_id}")
+def handle_project_contract_runtime_visualization(ctx: RequestContext):
+    """Return the canonical public-safe visualization read model for one row."""
+
+    project_id = ctx.get_project_id()
+    backlog_id = str(ctx.path_params.get("backlog_id") or "").strip()
+    if not backlog_id:
+        raise ValidationError("backlog_id is required")
+    try:
+        limit = int(_first_query_value(ctx.query, "limit", "100") or "100")
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    try:
+        before_event_id = int(
+            _first_query_value(ctx.query, "before_event_id", "0") or "0"
+        )
+    except (TypeError, ValueError):
+        before_event_id = 0
+
+    from . import task_timeline
+    from .contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    with DBContext(project_id) as conn:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {backlog_id} not found", 404)
+        backlog = _backlog_compact_bug(row)
+        if not backlog.get("public_safe", True):
+            raise PermissionDeniedError(
+                "anonymous",
+                "read_private_contract_runtime_visualization",
+                {
+                    "backlog_id": backlog_id,
+                    "public_safe": False,
+                },
+            )
+
+        task_timeline.ensure_schema(conn)
+        current = _contract_chain_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            rebuild_if_missing=False,
+        )
+        runtime_store = _contract_runtime_store(conn)
+        records = runtime_store.list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        runtime_updated_at = {
+            str(item["contract_execution_id"]): str(item["updated_at"] or "")
+            for item in conn.execute(
+                """
+                SELECT contract_execution_id, updated_at
+                FROM contract_runtime_executions
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ).fetchall()
+        }
+        for record in records:
+            record["updated_at"] = runtime_updated_at.get(
+                str(record.get("contract_execution_id") or ""),
+                "",
+            )
+
+        chain_edges = [
+            dict(edge)
+            for edge in conn.execute(
+                """
+                SELECT parent_contract_execution_id,
+                       child_contract_execution_id,
+                       edge_kind,
+                       source_ref,
+                       generation,
+                       created_at
+                FROM contract_chain_edges
+                WHERE project_id = ? AND backlog_id = ?
+                ORDER BY id
+                """,
+                (project_id, backlog_id),
+            ).fetchall()
+        ]
+        event_where = "project_id = ? AND backlog_id = ?"
+        event_params: list[Any] = [project_id, backlog_id]
+        if before_event_id > 0:
+            event_where += " AND id < ?"
+            event_params.append(before_event_id)
+        event_rows = conn.execute(
+            f"""
+            SELECT * FROM task_timeline_events
+            WHERE {event_where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*event_params, limit + 1),
+        ).fetchall()
+        has_more = len(event_rows) > limit
+        event_rows = event_rows[:limit]
+        events = [task_timeline._row_to_dict(event) for event in event_rows]
+        compact_events = [
+            _task_timeline_recent_compact_event(
+                event,
+                task_timeline_module=task_timeline,
+            )
+            for event in events
+        ]
+        timeline_total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM task_timeline_events
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ).fetchone()["count"]
+            or 0
+        )
+        event_ledger = task_timeline.build_compact_ledger(
+            conn,
+            project_id,
+            events,
+        )
+        compact_row = next(
+            (
+                item
+                for item in event_ledger.get("rows") or []
+                if str(item.get("backlog_id") or "") == backlog_id
+            ),
+            {},
+        )
+        response = build_contract_runtime_visualization(
+            project_id=project_id,
+            backlog=backlog,
+            runtime_records=records,
+            chain_current=current,
+            chain_edges=chain_edges,
+            timeline_events=compact_events,
+            compact_ledger_row=compact_row,
+            timeline_total=timeline_total,
+            timeline_limit=limit,
+            timeline_has_more=has_more,
+            next_cursor=(
+                str(compact_events[-1].get("id") or "")
+                if has_more and compact_events
+                else ""
+            ),
+            generated_at=_utc_now(),
+        )
+    response["request_id"] = ctx.request_id
+    return response
+
+
 @route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-writes")
 def handle_project_contract_runtime_line_write(ctx: RequestContext):
     """Submit one role-bound source-backed ContractRuntime line write."""
