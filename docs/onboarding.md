@@ -340,6 +340,19 @@ Classify direct-fix topology before action:
    `mf_batch_parallel_enter`; row-scoped workers finish into the merge queue
    rather than direct parent mutation.
 
+For `operator_supervised_direct_main`, the canonical close path is strictly:
+pre-mutation exception -> commit-bound implementation -> independent
+role-bound QA -> redeploy -> live regression -> graph reconcile/preflight ->
+`close_ready` -> `backlog_close`. The implementation event carries
+`changed_files` plus either `diff_check` or `dirty_scope_check`. Verification is
+QA-authored `verification` or `independent_verification` authorized by a
+managed QA session ref; an observer receipt/transcription is not QA authority,
+and raw QA tokens are never persisted. `close_ready` accepts the redeploy
+synonyms `redeployed`, `governance_redeploy`, `runtime_sync`, and
+`runtime_version_sync`, and the regression synonyms
+`live_regression_evidence` and `live_regression`; it also requires both
+`graph_reconciled` and `preflight_ok` before protected backlog close.
+
 Before stopping or replacing a worker, audit progress from the latest runtime
 current state, worker guide, task timeline, graph traces, branch head, changed
 files, tests, finish gate, and blockers. Complete direct-fix work with

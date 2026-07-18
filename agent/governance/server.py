@@ -57827,8 +57827,8 @@ def _onboard_contract_route_guide(
         "next_action": (
             "run graph_query first, record observer_direct_mutation_exception "
             "with DB-verified graph trace ids bound to this contract task_id "
-            "before mutation, then edit only approved row-scoped files and "
-            "record tests"
+            "before mutation, then follow ordered_close_path using only "
+            "approved row-scoped files"
         ),
         "full_round_route_issue": {
             "schema_version": (
@@ -57948,30 +57948,112 @@ def _onboard_contract_route_guide(
                     "graph_trace_ids or graph_query_trace_ids",
                 ],
             },
+            "ordered_close_path": [
+                {
+                    "order": 1,
+                    "id": "pre_mutation_exception",
+                    "owner_role": "observer",
+                    "evidence": "observer_direct_implementation_exception",
+                },
+                {
+                    "order": 2,
+                    "id": "commit_bound_implementation",
+                    "owner_role": "observer",
+                    "evidence": "implementation",
+                },
+                {
+                    "order": 3,
+                    "id": "independent_role_bound_qa",
+                    "owner_role": "qa",
+                    "evidence": "verification or independent_verification",
+                },
+                {
+                    "order": 4,
+                    "id": "redeploy",
+                    "owner_role": "observer",
+                    "evidence": "redeployed governance/runtime",
+                },
+                {
+                    "order": 5,
+                    "id": "live_regression",
+                    "owner_role": "qa or observer",
+                    "evidence": "live_regression_evidence or live_regression",
+                },
+                {
+                    "order": 6,
+                    "id": "graph_reconcile_preflight",
+                    "owner_role": "observer",
+                    "evidence": "graph_reconciled + preflight_ok",
+                },
+                {
+                    "order": 7,
+                    "id": "close_ready",
+                    "owner_role": "observer",
+                    "evidence": "close_ready",
+                },
+                {
+                    "order": 8,
+                    "id": "backlog_close",
+                    "owner_role": "observer",
+                    "evidence": "protected backlog_close",
+                },
+            ],
             "post_mutation_events": [
                 {
+                    "event_type": "observer.implementation",
                     "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "commit_binding": "commit_sha must equal the close commit",
                     "required_payload_fields": [
                         "changed_files",
-                        "dirty_scope_check",
+                        "diff_check or dirty_scope_check",
                     ],
                 },
                 {
-                    "event_kind": "verification",
-                    "required_actor": "independent QA/verifier",
+                    "event_type": "qa.independent_verification",
+                    "accepted_event_kinds": [
+                        "verification",
+                        "independent_verification",
+                    ],
+                    "phase": "qa",
+                    "status": "passed",
+                    "required_actor_role": "qa",
+                    "commit_binding": "commit_sha must equal the close commit",
+                    "managed_qa_session": {
+                        "entrypoint": "qa_session_register or qa_session_rejoin",
+                        "authorization": "managed qa_session_token_ref",
+                        "qa_authored": True,
+                        "observer_receipt_or_transcription_satisfies": False,
+                        "raw_qa_session_token_persisted": False,
+                    },
                     "required_payload_fields": [
                         "tests_run or test_results",
-                        "diff_check",
-                        "live_regression",
+                        "diff_check or dirty_scope_check",
+                        "live_regression_evidence or live_regression",
                     ],
                 },
                 {
+                    "event_type": "observer.close_ready",
                     "event_kind": "close_ready",
+                    "phase": "close_ready",
+                    "status": "passed",
+                    "commit_binding": "commit_sha must equal the close commit",
+                    "accepted_redeploy_fields": [
+                        "redeployed",
+                        "governance_redeploy",
+                        "runtime_sync",
+                        "runtime_version_sync",
+                    ],
+                    "accepted_live_regression_fields": [
+                        "live_regression_evidence",
+                        "live_regression",
+                    ],
                     "required_payload_fields": [
-                        "governance_redeploy or runtime_version_sync",
+                        "one accepted_redeploy_fields value",
+                        "one accepted_live_regression_fields value",
                         "graph_reconciled",
                         "preflight_ok",
-                        "live_regression",
                     ],
                 },
             ],
@@ -57979,6 +58061,7 @@ def _onboard_contract_route_guide(
                 "mcp_tool": "backlog_close",
                 "requires_contract_execution_id": contract_execution_id,
                 "requires_route_token_ref": True,
+                "requires_ordered_close_path_complete": True,
             },
         },
         "raw_operator_token_required": False,
