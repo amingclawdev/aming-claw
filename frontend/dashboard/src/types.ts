@@ -883,6 +883,144 @@ export interface TaskTimelineResponse {
   request_id?: string;
 }
 
+export interface ContractRuntimeVisualizationNextAction {
+  id?: string;
+  action?: string;
+  stage_id?: string;
+  line_id?: string;
+  line_instance_id?: string;
+  evidence_kind?: string;
+  owner_role?: string;
+  worker_role?: string;
+  lane_id?: string;
+  status?: string;
+  required?: boolean;
+  source?: string;
+  precedence?: string | number;
+  contract_execution_id?: string;
+  execution_state_revision?: number;
+  mode?: string;
+  block_reason?: string;
+  diagnostic_backlog_id?: string;
+  audited_bypass_continuation?: boolean;
+  no_pass_claim?: boolean;
+  allowed_writer_roles?: string[];
+}
+
+export interface ContractRuntimeVisualizationLineState {
+  id: string;
+  contract_execution_id: string;
+  index: number;
+  stage_id: string;
+  line_id: string;
+  evidence_kind: string;
+  owner_role: string;
+  status: string;
+  recorded_at: string;
+  source_ref: string;
+  bypassed: boolean;
+  bypass?: {
+    classification?: string;
+    decision?: string;
+    reason?: string;
+    diagnostic_backlog_id?: string;
+    no_pass_claim?: boolean;
+  };
+}
+
+export interface ContractRuntimeVisualizationResponse {
+  schema_version: "contract_runtime.visualization.v1" | string;
+  ok: boolean;
+  public_safe: boolean;
+  read_only: boolean;
+  project_id: string;
+  backlog_id: string;
+  generated_at: string;
+  authority: {
+    schema_version?: string;
+    source_order: string[];
+    source_of_authority: string;
+    authority_decision_source: string;
+    axes: string[];
+    legacy_sources_advisory_only: boolean;
+  };
+  backlog: {
+    backlog_id: string;
+    title: string;
+    status: string;
+    priority: string;
+    commit: string;
+    updated_at: string;
+  };
+  contract_execution_progress: {
+    contract_execution_id?: string;
+    parent_contract_execution_id?: string;
+    root_contract_execution_id?: string;
+    contract_chain_id?: string;
+    contract_id?: string;
+    contract_revision_id?: string;
+    contract_hash?: string;
+    execution_state_revision?: number;
+    execution_state_hash?: string;
+    runtime_guide_hash?: string;
+    readiness_state?: string;
+    next_legal_action?: ContractRuntimeVisualizationNextAction;
+    updated_at?: string;
+    line_states: ContractRuntimeVisualizationLineState[];
+    line_state_count: number;
+    line_state_total: number;
+    line_states_truncated: boolean;
+    runtime_record_count: number;
+    runtime_record_total: number;
+    runtime_records_truncated: boolean;
+  };
+  backlog_close_readiness: {
+    state: string;
+    backlog_status: string;
+    contract_execution_state: string;
+    contract_complete_implies_backlog_close: boolean;
+    legacy_advisory_count: number;
+  };
+  contract_chain: {
+    contract_chain_id: string;
+    root_contract_execution_id: string;
+    current_contract_execution_id: string;
+    current_contract_id: string;
+    parent_to_resume_contract_execution_id: string;
+    active_child_contract_execution_id: string;
+    readiness_state: string;
+    next_legal_action: ContractRuntimeVisualizationNextAction;
+    degraded: boolean;
+    source_refs: string[];
+  };
+  timeline: {
+    events: TaskTimelineEvent[];
+    returned_count: number;
+    total_count: number;
+    limit: number;
+    truncated: boolean;
+    next_cursor: string;
+    next_cursor_parameter: string;
+    append_only: boolean;
+    current_snapshot_in_playback: false;
+  };
+  dag: {
+    schema_version: string;
+    nodes: Record<string, unknown>[];
+    edges: Record<string, unknown>[];
+    node_count: number;
+    edge_count: number;
+    typed_edges: boolean;
+  };
+  compact_ledger: Record<string, unknown>;
+  bypass_records: Record<string, unknown>[];
+  legacy_advisories: Record<string, unknown>[];
+  projection_freshness: Record<string, unknown>;
+  projection_conflicts: Record<string, unknown>[];
+  projection_conflict_count: number;
+  request_id?: string;
+}
+
 export interface BacklogTimelineGateResponse {
   ok?: boolean;
   project_id: string;

@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
-import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent } from "../types";
+import type { BacklogBug, BacklogTimelineGateResponse, ContractRuntimeVisualizationResponse, TaskTimelineEvent } from "../types";
 import {
+  contractRuntimeAuthorityDisplayStatus,
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
   normalizeTaskPlaybackCompactLedger,
+  projectContractRuntimeAuthorityViewModel,
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
@@ -27,7 +29,7 @@ import {
   type TaskPlaybackFrame,
   type TaskPlaybackEvidenceRef,
 } from "./taskPlayback";
-import { projectTaskTimelineEvent, projectGateMatrix } from "./taskTimelineSemantics";
+import { projectTaskTimelineEvent, projectGateMatrix, timelineStatusFromEvent } from "./taskTimelineSemantics";
 import type { GateMatrixProjection } from "./taskTimelineSemantics";
 // Note: BacklogView cannot be imported in Node (uses import.meta.env via api.ts).
 // Lane attribution (AC-3) and DAG headline (AC-2) are verified below via semantic
@@ -1176,11 +1178,126 @@ export const taskPlaybackHistoricalSemanticFixtureSummary = [
   ...taskPlaybackNarrativeFocusFixtureAssertions(),
   ...taskPlaybackWorkModeFixtureAssertions(),
   ...taskPlaybackRouteContextEvidenceFixtureAssertions(),
+  ...taskPlaybackAuthorityAdapterAssertions(),
   ...taskPlaybackCompactLedgerProjectionAssertions(),
 ];
 
 function assertFixture(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
+}
+
+function taskPlaybackAuthorityAdapterAssertions(): string[] {
+  const response = {
+    schema_version: "contract_runtime.visualization.v1",
+    ok: true,
+    public_safe: true,
+    read_only: true,
+    project_id: "aming-claw",
+    backlog_id: "AC-FRONTEND-AUTHORITY-FIXTURE",
+    generated_at: "2026-07-18T20:00:00Z",
+    authority: {
+      source_order: ["contract_runtime_current", "backlog_contract_chain_current", "task_timeline_compact_ledger"],
+      source_of_authority: "contract_runtime",
+      authority_decision_source: "backlog_contract_chain_current",
+      axes: ["contract_execution_progress", "backlog_close_readiness", "historical_diagnostics"],
+      legacy_sources_advisory_only: true,
+    },
+    backlog: {
+      backlog_id: "AC-FRONTEND-AUTHORITY-FIXTURE",
+      title: "Frontend authority fixture",
+      status: "WAIVED",
+      priority: "P1",
+      commit: "abc123",
+      updated_at: "2026-07-18T20:00:00Z",
+    },
+    contract_execution_progress: {
+      contract_execution_id: "cex-current-1",
+      execution_state_revision: 17,
+      readiness_state: "contract_active",
+      next_legal_action: { id: "worker_implementation", action: "record implementation evidence" },
+      line_states: [{
+        id: "contract-line:cex-current-1:1:qa",
+        contract_execution_id: "cex-current-1",
+        index: 1,
+        stage_id: "qa",
+        line_id: "qa",
+        evidence_kind: "verification",
+        owner_role: "qa",
+        status: "accepted",
+        recorded_at: "2026-07-18T19:59:00Z",
+        source_ref: "timeline:41",
+        bypassed: true,
+      }],
+      line_state_count: 1,
+      line_state_total: 1,
+      line_states_truncated: false,
+      runtime_record_count: 1,
+      runtime_record_total: 1,
+      runtime_records_truncated: false,
+    },
+    backlog_close_readiness: {
+      state: "open",
+      backlog_status: "WAIVED",
+      contract_execution_state: "contract_active",
+      contract_complete_implies_backlog_close: false,
+      legacy_advisory_count: 1,
+    },
+    contract_chain: {
+      contract_chain_id: "cchain-1",
+      root_contract_execution_id: "cex-root-1",
+      current_contract_execution_id: "cex-current-1",
+      current_contract_id: "mf_parallel.v1",
+      parent_to_resume_contract_execution_id: "cex-root-1",
+      active_child_contract_execution_id: "",
+      readiness_state: "contract_active",
+      next_legal_action: { id: "legacy_chain_action", action: "do not prefer this over runtime current" },
+      degraded: false,
+      source_refs: [],
+    },
+    timeline: {
+      events: [{ id: 42, event_id: "42", event_type: "legacy.timeline", event_kind: "route_action_precheck", status: "bypassed" }],
+      returned_count: 1,
+      total_count: 1,
+      limit: 100,
+      truncated: false,
+      next_cursor: "",
+      next_cursor_parameter: "",
+      append_only: true,
+      current_snapshot_in_playback: false,
+    },
+    dag: { schema_version: "contract_runtime.visualization.dag.v1", nodes: [], edges: [], node_count: 0, edge_count: 0, typed_edges: true },
+    compact_ledger: {},
+    bypass_records: [{ status: "bypassed", no_pass_claim: true }],
+    legacy_advisories: [{ id: "route_action_precheck", advisory_only: true }],
+    projection_freshness: { status: "current" },
+    projection_conflicts: [],
+    projection_conflict_count: 0,
+  } as ContractRuntimeVisualizationResponse;
+
+  const view = projectContractRuntimeAuthorityViewModel(response);
+  assertFixture(view.contract_execution_progress.current_action.id === "worker_implementation", "authority adapter should prefer ContractRuntime current action over historical/legacy candidates");
+  assertFixture(view.contract_execution_progress.current_action_source === "contract_runtime_current", "authority adapter should identify the current action authority source");
+  assertFixture(view.cache_identity.backlog_id === response.backlog_id && view.cache_identity.contract_execution_id === "cex-current-1", "authority cache identity should include backlog and execution ids");
+  assertFixture(view.cache_identity.execution_state_revision === 17 && view.cache_identity.event_id === "42", "authority cache identity should include revision and event id");
+  assertFixture(view.cache_identity.key === "AC-FRONTEND-AUTHORITY-FIXTURE:cex-current-1:17:42", "authority cache key should contain all four canonical identity parts");
+  assertFixture(view.contract_execution_progress.line_states[0]?.display_status === "BYPASSED", "bypassed contract lines must not display PASS");
+  assertFixture(view.backlog_close_readiness.display_status === "WAIVED", "waived backlog rows must not display PASS");
+  assertFixture(contractRuntimeAuthorityDisplayStatus("BYPASSED") !== "PASS" && contractRuntimeAuthorityDisplayStatus("WAIVED") !== "PASS", "bypassed/waived authority statuses must never normalize to PASS");
+  assertFixture(timelineStatusFromEvent(response.timeline.events[0]) === "recorded", "bypassed timeline text must not be misclassified by the passed substring");
+  assertFixture(view.historical_diagnostics.timeline_events.length === 1 && view.historical_diagnostics.current_snapshot_in_playback === false, "current authority snapshot must stay separate from append-only playback history");
+
+  const chainFallback = projectContractRuntimeAuthorityViewModel({
+    ...response,
+    contract_execution_progress: { ...response.contract_execution_progress, next_legal_action: {} },
+  });
+  assertFixture(chainFallback.contract_execution_progress.current_action.id === "legacy_chain_action" && chainFallback.contract_execution_progress.current_action_source === "backlog_contract_chain_current", "contract-chain current should be the fallback current-action authority");
+
+  return [
+    "canonical visualization projects ContractRuntime current action before chain fallback",
+    "authority cache identity includes backlog, execution, revision, and event",
+    "bypassed and waived states never display PASS",
+    "current authority snapshot stays out of playback history",
+  ];
 }
 
 function taskPlaybackCompactLedgerProjectionAssertions(): string[] {

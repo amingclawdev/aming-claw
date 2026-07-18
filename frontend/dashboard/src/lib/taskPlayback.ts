@@ -1,4 +1,11 @@
-import type { BacklogBug, BacklogTimelineGateResponse, TaskTimelineEvent, TaskTimelineResponse } from "../types";
+import type {
+  BacklogBug,
+  BacklogTimelineGateResponse,
+  ContractRuntimeVisualizationNextAction,
+  ContractRuntimeVisualizationResponse,
+  TaskTimelineEvent,
+  TaskTimelineResponse,
+} from "../types";
 import {
   projectGateMatrix,
   isPrivateTimelineText,
@@ -287,6 +294,56 @@ export interface RecentTimelineProjectionInput {
   generated_at?: string;
 }
 
+export type ContractRuntimeAuthorityDisplayStatus =
+  | "PASS"
+  | "BYPASSED"
+  | "WAIVED"
+  | "BLOCKED"
+  | "FAILED"
+  | "RUNNING"
+  | "WAITING"
+  | "RECORDED"
+  | "OPEN"
+  | "UNKNOWN";
+
+export interface ContractRuntimeAuthorityCacheIdentity {
+  backlog_id: string;
+  contract_execution_id: string;
+  execution_state_revision: number;
+  event_id: string;
+  key: string;
+}
+
+export interface ContractRuntimeAuthorityViewModel {
+  schema_version: "contract_runtime.authority_view_model.v1";
+  project_id: string;
+  backlog_id: string;
+  generated_at: string;
+  authority_source: "contract_runtime";
+  cache_identity: ContractRuntimeAuthorityCacheIdentity;
+  contract_execution_progress: ContractRuntimeVisualizationResponse["contract_execution_progress"] & {
+    current_action: ContractRuntimeVisualizationNextAction;
+    current_action_source: "contract_runtime_current" | "backlog_contract_chain_current" | "none";
+    display_status: ContractRuntimeAuthorityDisplayStatus;
+    line_states: Array<ContractRuntimeVisualizationResponse["contract_execution_progress"]["line_states"][number] & {
+      display_status: ContractRuntimeAuthorityDisplayStatus;
+    }>;
+  };
+  backlog_close_readiness: ContractRuntimeVisualizationResponse["backlog_close_readiness"] & {
+    display_status: ContractRuntimeAuthorityDisplayStatus;
+  };
+  historical_diagnostics: {
+    timeline_events: TaskTimelineEvent[];
+    legacy_advisories: Record<string, unknown>[];
+    bypass_records: Record<string, unknown>[];
+    projection_conflicts: Record<string, unknown>[];
+    current_snapshot_in_playback: false;
+    append_only: boolean;
+    truncated: boolean;
+    next_cursor: string;
+  };
+}
+
 const FRAME_STATUS_ORDER: TaskPlaybackFrameStatus[] = ["blocked", "failed", "missing", "running", "waiting", "passed", "recorded", "unknown"];
 export const PRIVATE_EVIDENCE_KEY =
   /(^|[._\s-])(raw_prompt|raw_private_prompt_text|private_prompt|prompt_text|prompt_body|prompt_payload|hidden_prompt|hidden_context|system_prompt|developer_prompt|secret|credential|credentials|password|api_key|access_token|refresh_token|auth_token|one_time_auth|filesystem|cwd|worktree_path|host_path|host_paths|host_home|raw_private_context|private_context|private_context_body|raw_private_route_body|private_route_context_body|private_body|observer_only_context|unmanifested_prompt_text)([._\s-]|$)|(^|[._\s-])token([._\s-]|$)(?!hash)/i;
@@ -311,6 +368,89 @@ export function isBacklogRowPrivate(bug: BacklogBug): boolean {
 
 export function sanitizeTaskPlaybackEvidenceText(value: string, path = ""): string {
   return sanitizeEvidenceString(value, path);
+}
+
+export function contractRuntimeAuthorityDisplayStatus(
+  value: unknown,
+  options: { bypassed?: boolean; waived?: boolean } = {},
+): ContractRuntimeAuthorityDisplayStatus {
+  const status = safeText(String(value ?? "")).toLowerCase();
+  if (options.bypassed || status.includes("bypass")) return "BYPASSED";
+  if (options.waived || status.includes("waiv")) return "WAIVED";
+  if (status.includes("block") || status.includes("missing")) return "BLOCKED";
+  if (status.includes("fail") || status.includes("error") || status.includes("reject")) return "FAILED";
+  if (status.includes("running") || status.includes("active") || status.includes("progress")) return "RUNNING";
+  if (status.includes("waiting") || status.includes("pending") || status.includes("queued")) return "WAITING";
+  if (status === "open") return "OPEN";
+  if (status.includes("pass") || status.includes("success") || status.includes("complete") || status === "fixed" || status === "closed") return "PASS";
+  if (status.includes("record") || status.includes("accept") || status.includes("acknowledg")) return "RECORDED";
+  return "UNKNOWN";
+}
+
+export function projectContractRuntimeAuthorityViewModel(
+  response: ContractRuntimeVisualizationResponse,
+): ContractRuntimeAuthorityViewModel {
+  const runtimeAction = response.contract_execution_progress.next_legal_action ?? {};
+  const chainAction = response.contract_chain.next_legal_action ?? {};
+  const runtimeActionPresent = Object.keys(runtimeAction).length > 0;
+  const chainActionPresent = Object.keys(chainAction).length > 0;
+  const currentAction = runtimeActionPresent ? runtimeAction : chainActionPresent ? chainAction : {};
+  const currentActionSource = runtimeActionPresent
+    ? "contract_runtime_current"
+    : chainActionPresent
+      ? "backlog_contract_chain_current"
+      : "none";
+  const contractExecutionId = safeText(
+    response.contract_execution_progress.contract_execution_id
+      || response.contract_chain.current_contract_execution_id,
+  );
+  const executionStateRevision = Number(response.contract_execution_progress.execution_state_revision ?? 0) || 0;
+  const latestEvent = response.timeline.events[0];
+  const eventId = safeText(String(latestEvent?.event_id ?? latestEvent?.id ?? ""));
+  const identityParts = [response.backlog_id, contractExecutionId, String(executionStateRevision), eventId];
+  const lineStates = response.contract_execution_progress.line_states.map((line) => ({
+    ...line,
+    display_status: contractRuntimeAuthorityDisplayStatus(line.status, { bypassed: line.bypassed }),
+  }));
+
+  return {
+    schema_version: "contract_runtime.authority_view_model.v1",
+    project_id: response.project_id,
+    backlog_id: response.backlog_id,
+    generated_at: response.generated_at,
+    authority_source: "contract_runtime",
+    cache_identity: {
+      backlog_id: response.backlog_id,
+      contract_execution_id: contractExecutionId,
+      execution_state_revision: executionStateRevision,
+      event_id: eventId,
+      key: identityParts.map((part) => encodeURIComponent(part)).join(":"),
+    },
+    contract_execution_progress: {
+      ...response.contract_execution_progress,
+      next_legal_action: currentAction,
+      current_action: currentAction,
+      current_action_source: currentActionSource,
+      display_status: contractRuntimeAuthorityDisplayStatus(response.contract_execution_progress.readiness_state),
+      line_states: lineStates,
+    },
+    backlog_close_readiness: {
+      ...response.backlog_close_readiness,
+      display_status: contractRuntimeAuthorityDisplayStatus(
+        response.backlog.status || response.backlog_close_readiness.backlog_status || response.backlog_close_readiness.state,
+      ),
+    },
+    historical_diagnostics: {
+      timeline_events: [...response.timeline.events],
+      legacy_advisories: [...response.legacy_advisories],
+      bypass_records: [...response.bypass_records],
+      projection_conflicts: [...response.projection_conflicts],
+      current_snapshot_in_playback: false,
+      append_only: response.timeline.append_only,
+      truncated: response.timeline.truncated,
+      next_cursor: response.timeline.next_cursor,
+    },
+  };
 }
 
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {

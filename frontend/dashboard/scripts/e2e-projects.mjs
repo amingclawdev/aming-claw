@@ -814,6 +814,11 @@ function verifyBacklogEvidenceContract() {
   const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
   assert(apiSource.includes("backlogTimelineGateFor"), "Backlog API client should fetch per-row timeline gate evidence");
   assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
+  assert(apiSource.includes("contractRuntimeVisualizationFor") && apiSource.includes("/visualization/backlogs/"), "Dashboard API should use the canonical ContractRuntime visualization endpoint");
+  assert(typeSource.includes("ContractRuntimeVisualizationResponse") && typeSource.includes("contract_runtime.visualization.v1"), "Dashboard types should expose the public-safe ContractRuntime visualization schema");
+  assert(playbackSource.includes("projectContractRuntimeAuthorityViewModel") && playbackSource.includes("contract_runtime.authority_view_model.v1"), "Playback library should expose the canonical three-axis authority adapter");
+  assert(playbackSource.includes("backlog_id: response.backlog_id") && playbackSource.includes("execution_state_revision: executionStateRevision") && playbackSource.includes("event_id: eventId"), "Authority adapter cache identity should include backlog, execution revision, and event identity");
+  assert(playbackSource.includes("current_snapshot_in_playback: false") && semanticSource.includes('text.includes("bypass") || text.includes("waiv")'), "Current authority snapshots must stay out of playback and bypass/waiver evidence must not render as PASS");
   assert(viewSource.includes("ContractGatePanel"), "Backlog detail should render a dedicated Contract & Gate tab panel");
   assert(viewSource.includes("NoGateNotice"), "Backlog gate UI should render explicit no-gate/not-applicable state");
   assert(viewSource.includes("BacklogDetailModal"), "Backlog rows should open a detail modal");

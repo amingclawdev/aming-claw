@@ -234,6 +234,9 @@ export function timelineStatusFromEvent(event: TaskTimelineEvent): TaskTimelineS
   if (text.includes("fail") || text.includes("error") || text.includes("reject")) return "failed";
   if (text.includes("running") || text.includes("claimed") || text.includes("progress") || text.includes("started")) return "running";
   if (text.includes("pending") || text.includes("queued") || text.includes("waiting") || text.includes("requested")) return "waiting";
+  // "bypassed" contains the substring "passed". Keep audited bypass/waiver
+  // evidence neutral so it can never be rendered as a successful gate.
+  if (text.includes("bypass") || text.includes("waiv")) return "recorded";
   if (verification.passed === true || text.includes("pass") || text.includes("success") || text.includes("accepted") || text.includes("complete")) return "passed";
   if (text.includes("record") || text.includes("acknowledged") || text.includes("upserted")) return "recorded";
   return "unknown";

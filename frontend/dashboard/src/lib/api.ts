@@ -11,6 +11,7 @@ import type {
   BacklogTimelineGateResponse,
   BacklogBug,
   BacklogResponse,
+  ContractRuntimeVisualizationResponse,
   EdgesResponse,
   FeedbackQueueResponse,
   FileHygieneActionResponse,
@@ -482,6 +483,13 @@ export const api = {
     const q = backlogTimelineGateQuery(limit);
     return getJSON<BacklogTimelineGateResponse>(
       `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
+      signal,
+    );
+  },
+  contractRuntimeVisualizationFor(projectId: string, backlogId: string, limit = 100, signal?: AbortSignal) {
+    const q = new URLSearchParams({ limit: String(limit) }).toString();
+    return getJSON<ContractRuntimeVisualizationResponse>(
+      `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
     );
   },
