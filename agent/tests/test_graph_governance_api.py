@@ -695,6 +695,8 @@ def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift
         "worker_commit_sha": worker_commit,
         "changed_files": ["owned.py"],
         "commit_diff_files": ["owned.py"],
+        "commit_parent_sha": base_commit,
+        "diff_base_commit": base_commit,
         "owned_files": ["owned.py"],
         "implementation_event_ref": "timeline:202",
         "worker_session_id": "worker-session-drift",
@@ -760,6 +762,81 @@ def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift
     with pytest.raises(GovernanceError) as drift:
         server._runtime_context_contract_worker_commit_projection(None, **kwargs)
     assert drift.value.code == "contract_worker_commit_drift"
+
+
+def test_worker_commit_bypass_continuation_preserves_current_candidate_without_pass(monkeypatch):
+    candidate_commit, old_commit, base_commit = "b" * 40, "a" * 40, "c" * 40
+    runtime_context_id = "mfrctx-worker-commit-bypass"
+    task_id = "worker-commit-bypass-task"
+    backlog_id = "AC-WORKER-COMMIT-BYPASS-CONTINUATION"
+    identity = {"runtime_context_id": runtime_context_id, "task_id": task_id}
+    context = SimpleNamespace(**identity, parent_task_id=backlog_id, worktree_path="/worker", base_commit=base_commit)
+    dispatch = {
+        "line_id": "observer_dispatch_bounded_workers",
+        "payload": {"worker_role": "mf_sub", **identity},
+    }
+    implementation = {
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "commit_sha": candidate_commit,
+        **identity,
+        "parent_task_id": backlog_id,
+        "payload": {"changed_files": ["owned.py"]},
+    }
+    bypass = {
+        "line_id": "worker_commit",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": {
+            "blocked_evidence_kind": "worker_commit",
+            "no_pass_claim": True,
+            "evidence_refs": [f"commit:{candidate_commit}"],
+        },
+    }
+    record = {
+        "project_id": PID,
+        "contract_execution_id": "cex-worker-commit-bypass",
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "completed_lines": [
+            dispatch,
+            {"line_id": "worker_commit", "commit_sha": old_commit},
+            implementation,
+            bypass,
+        ],
+    }
+    monkeypatch.setattr(server, "_contract_runtime_contexts_for_dispatch_line", lambda *_a, **_k: [context])
+    monkeypatch.setattr(server, "_runtime_context_git_dirty_files", lambda _path: [])
+    monkeypatch.setattr(server, "_runtime_context_git_head_commit", lambda _path: candidate_commit)
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_commit_revision_diff",
+        lambda *_args, **_kwargs: {
+            "parent_commit": base_commit,
+            "base_commit": base_commit,
+            "changed_files": ["owned.py"],
+        },
+    )
+    policy = {"enabled": True, "candidate_commit_path": "commit_sha", "line_ids": ["worker_commit"]}
+    definition = {"system_layer": {"graph_binding_policy": {"candidate_commit_evidence_policy": policy}}}
+    monkeypatch.setattr(server, "_contract_runtime_definition_for_record", lambda _record: definition)
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None, project_id=PID, record=record, request=bypass
+    )
+
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["commit_sha"] == candidate_commit
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["diff_base_commit"] == base_commit
+    assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=record) == candidate_commit
+
+    forged = json.loads(json.dumps(record))
+    forged["completed_lines"][-1]["payload"]["evidence_refs"] = [f"commit:{'f' * 40}"]
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None, project_id=PID, record=forged, request=forged["completed_lines"][-1]
+    ) == {}
+    assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=forged) == old_commit
 
 
 def test_generic_timeline_path_cannot_author_contract_worker_commit():

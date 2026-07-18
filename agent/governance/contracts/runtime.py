@@ -3635,6 +3635,9 @@ class ContractRuntime:
         request = dict(bypass)
         effective_actor_role = _effective_actor_role(request, actor_role=actor_role)
         evidence_refs = _sanitize_line_evidence_value(request.get("evidence_refs") or [])
+        continuation_authority = _sanitize_line_evidence_value(
+            request.get("continuation_authority") or {}
+        )
         request_fields = {
             "bypass_identity": str(request.get("bypass_identity") or "").strip(),
             "line_id": str(request.get("line_id") or "").strip(),
@@ -3648,6 +3651,7 @@ class ContractRuntime:
             "decision": str(request.get("decision") or "").strip(),
             "actor_role": effective_actor_role,
             "evidence_refs": evidence_refs,
+            "continuation_authority": continuation_authority,
         }
         request_hash = stable_sha256(request_fields)
 
@@ -3758,6 +3762,8 @@ class ContractRuntime:
             "no_pass_claim": True,
             "evidence_refs": evidence_refs,
         }
+        if continuation_authority:
+            payload["continuation_authority"] = continuation_authority
         written_line = {
             "stage_id": str(next_action.get("stage_id") or ""),
             "line_id": request_fields["line_id"],
@@ -3768,6 +3774,16 @@ class ContractRuntime:
             "no_pass_claim": True,
             "payload": payload,
         }
+        if isinstance(continuation_authority, Mapping):
+            for key in (
+                "commit_sha",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+            ):
+                value = str(continuation_authority.get(key) or "").strip()
+                if value:
+                    written_line[key] = value
         line_instance_id = str(next_action.get("line_instance_id") or "").strip()
         if line_instance_id:
             written_line["line_instance_id"] = line_instance_id

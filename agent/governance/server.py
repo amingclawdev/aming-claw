@@ -23786,6 +23786,25 @@ def _runtime_context_actual_worker_commit_line(
             "runtime_context_id",
         )
         line_task_id = _timeline_first_deep_text(raw_line, "task_id")
+        if str(raw_line.get("evidence_kind") or "").strip() == "contract_line_bypass":
+            continuation = (
+                payload.get("continuation_authority")
+                if isinstance(payload.get("continuation_authority"), Mapping)
+                else _contract_runtime_worker_commit_bypass_continuation_authority(
+                    conn,
+                    project_id=str(record.get("project_id") or ""),
+                    record=record,
+                    request=raw_line,
+                )
+            )
+            if continuation.get("server_derived") is True:
+                enriched_line = {**dict(raw_line), **{
+                    key: continuation[key]
+                    for key in ("commit_sha", "runtime_context_id", "task_id", "parent_task_id")
+                    if continuation.get(key)
+                }}
+                enriched_payload = {**dict(payload), **dict(continuation)}
+                return enriched_line, enriched_payload
         if line_runtime_context_id != runtime_context_id or line_task_id != task_id:
             continue
         return dict(raw_line), dict(payload)
@@ -51011,7 +51030,11 @@ def _contract_runtime_projection_post_worker_lines(
             break
         qa_event = candidate_qa_event
         expected_candidate_commit = (
-            _contract_runtime_server_candidate_commit(record)
+            _contract_runtime_server_candidate_commit(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
             if bounded_qa_policy
             else ""
         )
@@ -54105,7 +54128,137 @@ def _contract_runtime_assigned_target_project_root(
     }
 
 
-def _contract_runtime_server_candidate_commit(record: Mapping[str, Any]) -> str:
+def _contract_runtime_worker_commit_bypass_continuation_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover candidate identity without treating a worker-commit bypass as PASS."""
+
+    payload = request.get("payload") if isinstance(request.get("payload"), Mapping) else {}
+    if str(request.get("line_id") or payload.get("line_id") or "").strip() != "worker_commit":
+        return {}
+    evidence_kind = str(request.get("evidence_kind") or "").strip()
+    if evidence_kind and evidence_kind != "contract_line_bypass":
+        return {}
+    evidence_refs = [
+        str(item or "").strip()
+        for item in (request.get("evidence_refs") or payload.get("evidence_refs") or [])
+        if str(item or "").strip()
+    ]
+    commit_candidates = {
+        str(source.get(key) or "").strip()
+        for source in (request, payload)
+        for key in ("commit_sha", "worker_commit_sha", "head_commit")
+        if str(source.get(key) or "").strip()
+    }
+    commit_candidates.update(
+        ref.split(":", 1)[1].strip()
+        for ref in evidence_refs
+        if ref.startswith("commit:")
+    )
+    commit_candidates = {
+        value.lower()
+        for value in commit_candidates
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+    }
+    if len(commit_candidates) != 1:
+        return {}
+    commit_sha = next(iter(commit_candidates))
+
+    completed = [
+        line for line in record.get("completed_lines") or [] if isinstance(line, Mapping)
+    ]
+    stop = len(completed)
+    for index, line in enumerate(completed):
+        if line is request or line == request:
+            stop = index
+            break
+    implementation = next(
+        (
+            line
+            for line in reversed(completed[:stop])
+            if str(line.get("line_id") or "").strip() == "worker_implementation"
+            and str(line.get("evidence_kind") or "").strip() == "implementation"
+            and str(line.get("commit_sha") or "").strip().lower() == commit_sha
+        ),
+        {},
+    )
+    if not implementation:
+        return {}
+    runtime_context_id = _timeline_first_deep_text(
+        implementation, "runtime_context_id"
+    )
+    task_id = _timeline_first_deep_text(implementation, "task_id")
+    parent_task_id = _timeline_first_deep_text(implementation, "parent_task_id")
+    contexts: dict[str, Any] = {}
+    for dispatch in completed:
+        if str(dispatch.get("line_id") or "").strip() != "observer_dispatch_bounded_workers":
+            continue
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn, project_id=project_id, record=record, line=dispatch
+        ):
+            identity = _contract_runtime_context_identity(context)
+            if identity[:2] != (runtime_context_id, task_id):
+                continue
+            contexts[identity[0]] = context
+    if len(contexts) != 1:
+        return {}
+    context = next(iter(contexts.values()))
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    base_commit = str(getattr(context, "base_commit", "") or "").strip()
+    if not worktree_path or _runtime_context_git_dirty_files(worktree_path):
+        return {}
+    try:
+        actual_head = _runtime_context_git_head_commit(worktree_path)
+        revision_diff = _runtime_context_worker_commit_revision_diff(
+            worktree_path, actual_head, base_commit=base_commit
+        )
+    except GovernanceError:
+        return {}
+    changed_files = list(revision_diff.get("changed_files") or [])
+    implementation_payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    implementation_files = [
+        str(item or "").strip()
+        for item in (
+            implementation.get("changed_files")
+            or implementation_payload.get("changed_files")
+            or []
+        )
+        if str(item or "").strip()
+    ]
+    if actual_head != commit_sha or set(implementation_files) != set(changed_files):
+        return {}
+    return {
+        "schema_version": "contract_runtime.worker_commit_bypass_continuation.v1",
+        "server_derived": True,
+        "db_verified": True,
+        "source": "canonical_worker_implementation+runtime_context_git",
+        "no_pass_claim": True,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "commit_sha": commit_sha,
+        "worker_commit_sha": commit_sha,
+        "changed_files": changed_files,
+        "commit_diff_files": changed_files,
+        "commit_parent_sha": str(revision_diff.get("parent_commit") or ""),
+        "diff_base_commit": str(revision_diff.get("base_commit") or ""),
+    }
+
+
+def _contract_runtime_server_candidate_commit(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> str:
     definition = _contract_runtime_definition_for_record(record)
     system_layer = (
         definition.get("system_layer")
@@ -54137,6 +54290,16 @@ def _contract_runtime_server_candidate_commit(record: Mapping[str, Any]) -> str:
         [item for item in record.get("completed_lines") or [] if isinstance(item, Mapping)]
     ):
         if str(line.get("line_id") or "").strip() not in trusted_line_ids:
+            continue
+        if str(line.get("evidence_kind") or "").strip() == "contract_line_bypass":
+            continuation = _contract_runtime_worker_commit_bypass_continuation_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+                request=line,
+            )
+            if continuation.get("server_derived") is True:
+                return str(continuation.get("commit_sha") or "").strip().lower()
             continue
         value = str(line.get(candidate_path) or "").strip().lower()
         if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
@@ -54224,7 +54387,11 @@ def _contract_runtime_bind_qa_graph_authority(
             },
         )
     session = ctx.require_auth(conn)
-    expected_candidate_commit = _contract_runtime_server_candidate_commit(record)
+    expected_candidate_commit = _contract_runtime_server_candidate_commit(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
     if not re.fullmatch(
         r"[0-9a-f]{40}|[0-9a-f]{64}", expected_candidate_commit
     ):
@@ -81466,6 +81633,31 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                 record=record,
                 actor_role=actor_role,
             )
+            continuation_authority = {}
+            if str(body.get("line_id") or "").strip() == "worker_commit":
+                continuation_authority = (
+                    _contract_runtime_worker_commit_bypass_continuation_authority(
+                        conn,
+                        project_id=project_id,
+                        record=record,
+                        request=body,
+                    )
+                )
+                if not continuation_authority:
+                    raise GovernanceError(
+                        "contract_runtime_worker_commit_bypass_continuation_required",
+                        (
+                            "worker_commit bypass requires one server-verified current "
+                            "implementation commit and clean runtime-context diff"
+                        ),
+                        422,
+                        {
+                            "contract_execution_id": execution_id,
+                            "line_id": "worker_commit",
+                            "no_pass_claim": True,
+                            "fail_closed": True,
+                        },
+                    )
             result = runtime.bypass_current_line(
                 execution_id,
                 {
@@ -81479,6 +81671,7 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                     "reason": body.get("reason"),
                     "decision": body.get("decision"),
                     "evidence_refs": body.get("evidence_refs") or [],
+                    "continuation_authority": continuation_authority,
                 },
                 actor_role=actor_role,
                 projected_completed_lines=(
