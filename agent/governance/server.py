@@ -22493,8 +22493,18 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             else {}
         )
         route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+        contract_runtime_worker_sequence = (
+            payload.get("contract_runtime_worker_sequence")
+            if isinstance(
+                payload.get("contract_runtime_worker_sequence"),
+                Mapping,
+            )
+            else {}
+        )
         marker_contract_execution_id = str(
-            contract_runtime_failed_qa.get("contract_execution_id") or ""
+            contract_runtime_failed_qa.get("contract_execution_id")
+            or contract_runtime_worker_sequence.get("contract_execution_id")
+            or ""
         ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",

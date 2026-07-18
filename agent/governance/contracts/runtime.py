@@ -3809,10 +3809,7 @@ class ContractRuntime:
             marker_contract_execution_id = str(
                 session_token_ref_rotation.get("contract_execution_id") or ""
             ).strip()
-            if (
-                marker_contract_execution_id
-                and marker_contract_execution_id != contract_execution_id
-            ):
+            if marker_contract_execution_id != contract_execution_id:
                 rotation_errors.append("rejoin contract_execution_id must match")
             if str(
                 session_token_ref_rotation.get("revision_event_ref") or ""

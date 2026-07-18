@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import copy
 import hashlib
 import io
 import json
@@ -72,6 +73,7 @@ from agent.governance.parallel_branch_runtime import (
     list_merge_queue_items,
     mf_subagent_session_token_hash,
     runtime_context_id_for_branch_context,
+    runtime_context_secret_hash,
     runtime_context_session_token_ref,
     upsert_batch_merge_runtime,
     upsert_branch_context,
@@ -27754,6 +27756,98 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         text=True,
     )
     revised_head = batch_jobs.git_commit(target_root)
+
+    saved_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert saved_context is not None
+    revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        context=saved_context,
+        runtime_context_id=saved_context.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=saved_context.task_id,
+            backlog_id=saved_context.backlog_id,
+            limit=1000,
+        ),
+    )
+    assert revision_marker["session_token_ref_rotation"][
+        "contract_execution_id"
+    ] == successor["contract_execution_id"]
+    assert revision_marker["session_token_ref_rotation"][
+        "active_session_token_ref"
+    ] == rejoin["session_token_ref"]
+
+    negative_payload = {
+        **partial_payload,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "target_project_root": str(target_root),
+        "session_token_ref": rejoin["session_token_ref"],
+        "fence_token_hash": runtime_context_secret_hash(rejoin["fence_token"]),
+        "changed_files": changed_files,
+        "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+        },
+        "failed_qa_revision_rejoin_marker": revision_marker,
+        "canonical_rework_lineage_revision_authority": {
+            "source": "runtime_context_clean_cumulative_git_revision",
+            "server_derived": True,
+            "actual_head_commit": revised_head,
+            "clean_worktree": True,
+            "cumulative_changed_files": changed_files,
+            "owned_files": changed_files,
+            "revision_event_ref": revision_marker["revision_event_ref"],
+        },
+    }
+    negative_write = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "commit_sha": revised_head,
+        "changed_files": changed_files,
+        "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+        "payload": negative_payload,
+    }
+    negative_rotation_cases = {
+        "missing_contract_execution": {"contract_execution_id": ""},
+        "cross_contract": {"contract_execution_id": "cex-cross-contract"},
+        "stale_session_ref": {
+            "active_session_token_ref": prior_session_token_ref,
+        },
+        "forged_source": {"source": "client_claimed_rejoin"},
+        "not_server_derived": {"server_derived": False},
+        "cross_runtime": {"runtime_context_id": "mfrctx-cross-runtime"},
+        "cross_task": {"task_id": "worker-cross-task"},
+        "cross_worker": {"worker_id": "worker-cross-owner"},
+        "cross_fence": {"fence_token_hash": _fake_sha("cross-fence")},
+    }
+    revision_before_negative_matrix = runtime.store.get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"]
+    for case_name, rotation_override in negative_rotation_cases.items():
+        case_marker = copy.deepcopy(revision_marker)
+        case_marker["session_token_ref_rotation"].update(rotation_override)
+        case_write = copy.deepcopy(negative_write)
+        case_write["payload"]["failed_qa_revision_rejoin_marker"] = case_marker
+        rejected = runtime.revise_failed_qa_worker_implementation(
+            successor["contract_execution_id"],
+            case_write,
+            actor_role="mf_sub",
+        )
+        assert rejected["ok"] is False, case_name
+        assert any(
+            "audited same-worker rejoin" in error
+            for error in rejected["decision"]["errors"]
+        ), case_name
+        assert runtime.store.get(successor["contract_execution_id"])[
+            "execution_state_revision"
+        ] == revision_before_negative_matrix
 
     corrected = server.handle_graph_governance_runtime_context_implementation_evidence(
         _ctx_with_role(
