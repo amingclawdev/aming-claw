@@ -34511,7 +34511,7 @@ def test_mf_parallel_close_authority_rejects_source_merge_before_qa_even_when_in
     assert merge_after_qa["after_source_event_id"] == 202
 
 
-def test_rev2_close_authority_rejects_ids_with_contradictory_timestamps():
+def test_rev2_close_authority_rejects_caller_temporal_fields_without_server_authority():
     contract_execution_id = "cex-mf-parallel-rev2-source-time-fail"
     close_commit = "a" * 40
     worker_commit = "b" * 40
@@ -34614,9 +34614,17 @@ def test_rev2_close_authority_rejects_ids_with_contradictory_timestamps():
     diagnostic = {
         item["requirement_id"]: item for item in gate["ordering_diagnostics"]
     }["contract_runtime.merge_after_qa"]
-    assert diagnostic["ordering_source"] == "source_event_id_and_time"
-    assert diagnostic["source_event_id_order_passed"] is True
+    assert diagnostic["ordering_source"] == (
+        "server_derived_contract_runtime_acceptance_to_durable_merge"
+    )
+    assert diagnostic["source_event_id_order_passed"] is False
     assert diagnostic["source_event_timestamp_order_passed"] is False
+    assert diagnostic["server_authority_checks"][
+        "durable_merge_trusted"
+    ] is False
+    assert diagnostic["server_authority_checks"][
+        "reconcile_authority_trusted"
+    ] is False
 
 
 def test_mf_parallel_close_authority_accepts_batch_final_commit_bridge():
@@ -52222,6 +52230,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
                     "line_id": line_id,
                     "actor_role": "mf_sub",
                     "evidence_kind": evidence_kind,
+                    "commit_sha": qa_commit,
                     "runtime_context_id": runtime_context_id,
                     "task_id": task_id,
                     "parent_task_id": context.parent_task_id,
@@ -52384,7 +52393,14 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "actor_role": "observer",
         "evidence_kind": "merge",
         "commit_sha": merged_commit,
-        "payload": {"merge_commit": merged_commit},
+        "payload": {
+            "merge_commit": merged_commit,
+            "durable_merge_authority": {
+                "server_derived": True,
+                "db_verified": True,
+                "merge_event_id": 999999,
+            },
+        },
     }
     conn.execute(
         "DELETE FROM parallel_branch_merge_queue_items "
@@ -52443,6 +52459,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert durable_merge["timeline_event_refs"] == [
         f"timeline:{merge_event['id']}"
     ]
+    assert durable_merge["merge_event_id"] == int(merge_event["id"])
     record = json.loads(json.dumps(record))
     record["completed_lines"][-1] = bound_merge_write
     runtime.store.update(
@@ -52717,6 +52734,100 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert submitted["record"]["runtime_guide"]["next_legal_action"][
         "line_id"
     ] == "observer_close_ready"
+
+    close_action = submitted["record"]["runtime_guide"]["next_legal_action"]
+    close_write = server._contract_runtime_write_from_record(
+        submitted["record"],
+        actor_role="observer",
+        stage_id=close_action["stage_id"],
+        line_id=close_action["line_id"],
+        evidence_kind=close_action["evidence_kind"],
+    )
+    close_write["commit_sha"] = merged_commit
+    close_write["payload"] = {"merge_commit": merged_commit}
+    close_gate = server._contract_runtime_mf_parallel_close_ready_precheck(
+        submitted["record"],
+        close_write,
+    )
+    assert close_gate["passed"] is True, json.dumps(
+        close_gate,
+        indent=2,
+        sort_keys=True,
+    )
+    ordering_by_requirement = {
+        item["requirement_id"]: item
+        for item in close_gate["ordering_diagnostics"]
+    }
+    qa_to_merge = ordering_by_requirement["contract_runtime.merge_after_qa"]
+    assert qa_to_merge["ordering_source"] == (
+        "server_derived_contract_runtime_acceptance_to_durable_merge"
+    )
+    assert qa_to_merge["before_source_event_id"] == 0
+    assert qa_to_merge["server_authority_checks"][
+        "qa_acceptance_trusted"
+    ] is True
+    merge_to_reconcile = ordering_by_requirement[
+        "contract_runtime.reconcile_after_merge"
+    ]
+    assert merge_to_reconcile["ordering_source"] == (
+        "server_derived_durable_merge_to_reconcile"
+    )
+    assert merge_to_reconcile["passed"] is True
+
+    contradictory_record = json.loads(json.dumps(submitted["record"]))
+    contradictory_reconcile = next(
+        line
+        for line in contradictory_record["completed_lines"]
+        if line.get("line_id") == "observer_reconcile"
+    )
+    contradictory_authority = contradictory_reconcile["payload"][
+        "reconcile_authority"
+    ]
+    contradictory_authority["reconcile_event_id"] = int(
+        contradictory_authority["merge_event_id"]
+    )
+    contradictory_authority["reconcile_source_ref"] = (
+        f"timeline:{contradictory_authority['reconcile_event_id']}"
+    )
+    contradictory_authority["reconcile_event_created_at"] = (
+        contradictory_authority["merge_event_created_at"]
+    )
+    unsigned_authority = dict(contradictory_authority)
+    unsigned_authority.pop("authority_hash", None)
+    contradictory_authority["authority_hash"] = server.stable_sha256(
+        unsigned_authority
+    )
+    contradictory_gate = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            contradictory_record,
+            close_write,
+        )
+    )
+    assert contradictory_gate["passed"] is False
+    assert "contract_runtime.reconcile_after_merge" in (
+        contradictory_gate["missing_requirement_ids"]
+    )
+
+    missing_authority_record = json.loads(json.dumps(submitted["record"]))
+    missing_reconcile = next(
+        line
+        for line in missing_authority_record["completed_lines"]
+        if line.get("line_id") == "observer_reconcile"
+    )
+    missing_reconcile["payload"].pop("reconcile_authority")
+    missing_authority_gate = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            missing_authority_record,
+            close_write,
+        )
+    )
+    assert missing_authority_gate["passed"] is False
+    assert "contract_runtime.merge_after_qa" in (
+        missing_authority_gate["missing_requirement_ids"]
+    )
+    assert "contract_runtime.reconcile_after_merge" in (
+        missing_authority_gate["missing_requirement_ids"]
+    )
 
     forged_qa = json.loads(json.dumps(record["completed_lines"][10]))
     forged_qa["commit_sha"] = "f" * 40

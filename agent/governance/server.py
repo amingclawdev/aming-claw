@@ -55647,9 +55647,30 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         ),
         "target_project_root": target_project_root,
         "merge_source_ref": str(merge.get("merge_source_ref") or ""),
+        "merge_event_id": int(merge.get("merge_event_id") or 0),
+        "merge_event_created_at": str(
+            merge.get("merge_event_created_at") or ""
+        ),
         "merge_projection_verified": merge.get("timeline_verified") is True,
+        "qa_source_ref": str(merge.get("qa_source_ref") or ""),
+        "qa_acceptance_ref": str(merge.get("qa_acceptance_ref") or ""),
+        "qa_acceptance_revision": int(
+            merge.get("qa_acceptance_revision") or 0
+        ),
+        "qa_acceptance_created_at": str(
+            merge.get("qa_acceptance_created_at") or ""
+        ),
+        "qa_contract_runtime_verified": bool(
+            merge.get("qa_contract_runtime_verified")
+        ),
         "reconcile_source_ref": str(
             reconcile.get("reconcile_source_ref") or ""
+        ),
+        "reconcile_event_id": int(
+            reconcile.get("reconcile_event_id") or 0
+        ),
+        "reconcile_event_created_at": str(
+            reconcile.get("reconcile_event_created_at") or ""
         ),
         "identity_mismatches": list(merge.get("identity_mismatches") or []),
     }
@@ -67791,6 +67812,46 @@ def _contract_runtime_close_authority_source_event_time(
     return ""
 
 
+def _contract_runtime_close_authority_payload_mapping(
+    line: Mapping[str, Any],
+    key: str,
+) -> dict[str, Any]:
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    value = payload.get(key)
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _contract_runtime_close_authority_hash_matches(
+    authority: Mapping[str, Any],
+) -> bool:
+    claimed = str(authority.get("authority_hash") or "").strip()
+    if not claimed:
+        return False
+    unsigned = dict(authority)
+    unsigned.pop("authority_hash", None)
+    return claimed == stable_sha256(unsigned)
+
+
+def _contract_runtime_close_authority_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _contract_runtime_close_authority_line_index(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return parsed if parsed >= 0 else -1
+
+
 def _contract_runtime_close_authority_time_order_value(value: str) -> float | None:
     text = str(value or "").strip()
     if not text:
@@ -67803,6 +67864,254 @@ def _contract_runtime_close_authority_time_order_value(value: str) -> float | No
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.timestamp()
+
+
+def _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
+    *,
+    before: str,
+    after: str,
+    missing_id: str,
+    before_line: Mapping[str, Any],
+    after_line: Mapping[str, Any],
+    qa_line: Mapping[str, Any],
+    merge_line: Mapping[str, Any],
+    reconcile_line: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify strict ordering from server-bound merge/reconcile authority only.
+
+    QA acceptance is a ContractRuntime store fact and therefore has no
+    redundant timeline event.  Merge and reconcile remain ordered by the
+    immutable server-derived timeline ids/timestamps bound onto their lines.
+    Caller-shaped source_event_* fields are deliberately ignored here.
+    """
+
+    durable_merge = _contract_runtime_close_authority_payload_mapping(
+        merge_line,
+        "durable_merge_authority",
+    )
+    reconcile_authority = _contract_runtime_close_authority_payload_mapping(
+        reconcile_line,
+        "reconcile_authority",
+    )
+    merge_event_id = _contract_runtime_close_authority_positive_int(
+        durable_merge.get("merge_event_id")
+    )
+    merge_event_time = str(
+        durable_merge.get("merge_event_created_at") or ""
+    ).strip()
+    merge_event_ref = str(durable_merge.get("merge_event_ref") or "").strip()
+    reconcile_event_id = _contract_runtime_close_authority_positive_int(
+        reconcile_authority.get("reconcile_event_id")
+    )
+    reconcile_event_time = str(
+        reconcile_authority.get("reconcile_event_created_at") or ""
+    ).strip()
+    reconcile_source_ref = str(
+        reconcile_authority.get("reconcile_source_ref") or ""
+    ).strip()
+    qa_acceptance_revision = _contract_runtime_close_authority_positive_int(
+        reconcile_authority.get("qa_acceptance_revision")
+    )
+    qa_acceptance_time = str(
+        reconcile_authority.get("qa_acceptance_created_at") or ""
+    ).strip()
+    qa_source_ref = str(reconcile_authority.get("qa_source_ref") or "").strip()
+    authority_execution_id = str(
+        reconcile_authority.get("contract_execution_id") or ""
+    ).strip()
+    expected_qa_acceptance_ref = (
+        f"contract_runtime:{authority_execution_id}:revision:"
+        f"{qa_acceptance_revision}"
+        if authority_execution_id and qa_acceptance_revision > 0
+        else ""
+    )
+    claimed_qa_acceptance_ref = str(
+        reconcile_authority.get("qa_acceptance_ref") or ""
+    ).strip()
+    qa_acceptance_ref = (
+        claimed_qa_acceptance_ref or expected_qa_acceptance_ref
+    )
+
+    merge_event_order = _contract_runtime_close_authority_time_order_value(
+        merge_event_time
+    )
+    reconcile_event_order = _contract_runtime_close_authority_time_order_value(
+        reconcile_event_time
+    )
+    qa_acceptance_order = _contract_runtime_close_authority_time_order_value(
+        qa_acceptance_time
+    )
+    durable_merge_trusted = bool(
+        str(durable_merge.get("schema_version") or "")
+        == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+        and durable_merge.get("server_derived") is True
+        and durable_merge.get("db_verified") is True
+        and merge_event_id > 0
+        and re.fullmatch(r"timeline:\d+", merge_event_ref)
+        and merge_event_ref == f"timeline:{merge_event_id}"
+        and merge_event_order is not None
+        and merge_event_ref
+        in {
+            str(item or "").strip()
+            for item in durable_merge.get("timeline_event_refs") or []
+            if str(item or "").strip()
+        }
+    )
+    reconcile_authority_trusted = bool(
+        str(reconcile_authority.get("source") or "")
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and reconcile_authority.get("db_verified") is True
+        and reconcile_authority.get("live_verified") is True
+        and reconcile_authority.get("active_snapshot_verified") is True
+        and reconcile_authority.get("graph_reconciled") is True
+        and _contract_runtime_close_authority_hash_matches(reconcile_authority)
+    )
+    identity_fields = (
+        "project_id",
+        "backlog_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+    )
+    identity_matches = bool(
+        durable_merge
+        and reconcile_authority
+        and all(
+            str(durable_merge.get(field) or "").strip()
+            and str(durable_merge.get(field) or "").strip()
+            == str(reconcile_authority.get(field) or "").strip()
+            for field in identity_fields
+        )
+    )
+    durable_merge_commit = str(
+        durable_merge.get("merge_commit")
+        or durable_merge.get("target_head_after_merge")
+        or ""
+    ).strip().lower()
+    reconcile_merge_commit = str(
+        reconcile_authority.get("merged_commit_sha") or ""
+    ).strip().lower()
+    merge_commit_matches = bool(
+        durable_merge_commit
+        and durable_merge_commit == reconcile_merge_commit
+        and durable_merge_commit
+        == _contract_runtime_close_authority_explicit_commit(merge_line).lower()
+    )
+    reconcile_merge_event_matches = bool(
+        _contract_runtime_close_authority_positive_int(
+            reconcile_authority.get("merge_event_id")
+        )
+        == merge_event_id
+        and str(
+            reconcile_authority.get("merge_event_created_at") or ""
+        ).strip()
+        == merge_event_time
+        and str(reconcile_authority.get("merge_source_ref") or "").strip()
+        == merge_event_ref
+    )
+    qa_acceptance_trusted = bool(
+        reconcile_authority.get("qa_contract_runtime_verified") is True
+        and qa_acceptance_revision > 0
+        and qa_source_ref
+        == str(qa_line.get("_source_ref") or "").strip()
+        and qa_acceptance_ref == expected_qa_acceptance_ref
+        and qa_acceptance_order is not None
+    )
+    qa_line_index = _contract_runtime_close_authority_line_index(
+        qa_line.get("_completed_line_index", -1)
+    )
+    merge_line_index = _contract_runtime_close_authority_line_index(
+        merge_line.get("_completed_line_index", -1)
+    )
+    reconcile_line_index = _contract_runtime_close_authority_line_index(
+        reconcile_line.get("_completed_line_index", -1)
+    )
+    completed_line_order_passed = bool(
+        qa_line_index >= 0
+        and qa_line_index < merge_line_index < reconcile_line_index
+    )
+    qa_before_merge = bool(
+        qa_acceptance_trusted
+        and merge_event_order is not None
+        and qa_acceptance_order is not None
+        and merge_event_order > qa_acceptance_order
+    )
+    merge_before_reconcile = bool(
+        merge_event_id > 0
+        and reconcile_event_id > merge_event_id
+        and reconcile_event_order is not None
+        and merge_event_order is not None
+        and reconcile_event_order > merge_event_order
+        and reconcile_source_ref == f"timeline:{reconcile_event_id}"
+    )
+    common_authority_passed = bool(
+        durable_merge_trusted
+        and reconcile_authority_trusted
+        and identity_matches
+        and merge_commit_matches
+        and reconcile_merge_event_matches
+        and completed_line_order_passed
+    )
+    is_qa_to_merge = (before, after) == (
+        "qa_independent_verification",
+        "observer_merge",
+    )
+    passed = bool(
+        common_authority_passed
+        and (qa_before_merge if is_qa_to_merge else merge_before_reconcile)
+    )
+    before_index = _contract_runtime_close_authority_line_index(
+        before_line.get("_completed_line_index", -1)
+    )
+    after_index = _contract_runtime_close_authority_line_index(
+        after_line.get("_completed_line_index", -1)
+    )
+    before_source_id = 0 if is_qa_to_merge else merge_event_id
+    after_source_id = merge_event_id if is_qa_to_merge else reconcile_event_id
+    before_source_time = qa_acceptance_time if is_qa_to_merge else merge_event_time
+    after_source_time = merge_event_time if is_qa_to_merge else reconcile_event_time
+    return {
+        "requirement_id": missing_id,
+        "before": before,
+        "after": after,
+        "passed": passed,
+        "ordering_source": (
+            "server_derived_contract_runtime_acceptance_to_durable_merge"
+            if is_qa_to_merge
+            else "server_derived_durable_merge_to_reconcile"
+        ),
+        "before_order": qa_acceptance_revision if is_qa_to_merge else merge_event_id,
+        "after_order": merge_event_id if is_qa_to_merge else reconcile_event_id,
+        "before_completed_line_index": before_index,
+        "after_completed_line_index": after_index,
+        "before_source_ref": str(before_line.get("_source_ref") or ""),
+        "after_source_ref": str(after_line.get("_source_ref") or ""),
+        "before_source_event_id": before_source_id,
+        "after_source_event_id": after_source_id,
+        "before_source_event_time": before_source_time,
+        "after_source_event_time": after_source_time,
+        "source_event_id_order_passed": (
+            merge_before_reconcile if not is_qa_to_merge else False
+        ),
+        "source_event_timestamp_order_passed": (
+            qa_before_merge if is_qa_to_merge else merge_before_reconcile
+        ),
+        "source_event_id_and_timestamp_required": not is_qa_to_merge,
+        "qa_acceptance_revision": qa_acceptance_revision,
+        "qa_acceptance_ref": qa_acceptance_ref,
+        "qa_acceptance_ref_was_explicit": bool(claimed_qa_acceptance_ref),
+        "server_authority_checks": {
+            "durable_merge_trusted": durable_merge_trusted,
+            "reconcile_authority_trusted": reconcile_authority_trusted,
+            "identity_matches": identity_matches,
+            "merge_commit_matches": merge_commit_matches,
+            "reconcile_merge_event_matches": reconcile_merge_event_matches,
+            "qa_acceptance_trusted": qa_acceptance_trusted,
+            "completed_line_order_passed": completed_line_order_passed,
+            "qa_before_merge": qa_before_merge,
+            "merge_before_reconcile": merge_before_reconcile,
+        },
+    }
 
 
 def _contract_runtime_mf_parallel_ordering_diagnostic(
@@ -68064,21 +68373,35 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         after_line = found.get(after)
         if not before_line or not after_line:
             continue
-        ordering = _contract_runtime_mf_parallel_ordering_diagnostic(
-            before=before,
-            after=after,
-            missing_id=missing_id,
-            before_line=before_line,
-            after_line=after_line,
-            require_source_id_and_time=bool(
-                strict_temporal_order
-                and (before, after)
-                in {
-                    ("qa_independent_verification", "observer_merge"),
-                    ("observer_merge", "observer_reconcile"),
-                }
-            ),
+        strict_pair = bool(
+            strict_temporal_order
+            and (before, after)
+            in {
+                ("qa_independent_verification", "observer_merge"),
+                ("observer_merge", "observer_reconcile"),
+            }
         )
+        if strict_pair:
+            ordering = (
+                _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
+                    before=before,
+                    after=after,
+                    missing_id=missing_id,
+                    before_line=before_line,
+                    after_line=after_line,
+                    qa_line=found.get("qa_independent_verification", {}),
+                    merge_line=found.get("observer_merge", {}),
+                    reconcile_line=found.get("observer_reconcile", {}),
+                )
+            )
+        else:
+            ordering = _contract_runtime_mf_parallel_ordering_diagnostic(
+                before=before,
+                after=after,
+                missing_id=missing_id,
+                before_line=before_line,
+                after_line=after_line,
+            )
         ordering_diagnostics.append(ordering)
         if not bool(ordering.get("passed")):
             missing.append(missing_id)
@@ -68193,6 +68516,48 @@ def _contract_runtime_mf_parallel_close_authority_gate(
             "observer_close_commit_matches": not commit_mismatches,
         },
     }
+
+
+def _contract_runtime_mf_parallel_close_ready_precheck(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose the authoritative temporal close gate before close_ready writes."""
+
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(write.get("line_id") or "").strip()
+        != "observer_close_ready"
+    ):
+        return {}
+    completed_lines = [
+        dict(line)
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    completed_lines.append(dict(write))
+    prospective = dict(record)
+    prospective["completed_lines"] = completed_lines
+    runtime_guide = (
+        dict(record.get("runtime_guide"))
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    runtime_guide["completed_lines"] = completed_lines
+    prospective["runtime_guide"] = runtime_guide
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    close_commit = _contract_runtime_close_authority_explicit_commit(write)
+    return _contract_runtime_mf_parallel_close_authority_gate(
+        [prospective],
+        chain_projection={
+            "projection_source": "backlog_contract_chain_current",
+            "source_of_proof": "contract_runtime_executions.completed_lines",
+            "active_chain": {"execution_ids": [execution_id]},
+        },
+        close_commit=close_commit,
+    )
 
 
 def _contract_runtime_direct_fix_close_authority_gate(
@@ -81571,10 +81936,34 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         write=write,
                     )
                 )
+                close_authority_precheck = (
+                    _contract_runtime_mf_parallel_close_ready_precheck(
+                        record,
+                        write,
+                    )
+                )
                 if dispatch_errors:
                     result = _contract_runtime_unchanged_line_rejection(
                         record,
                         dispatch_errors,
+                    )
+                elif (
+                    close_authority_precheck
+                    and not close_authority_precheck.get("passed")
+                ):
+                    missing = list(
+                        close_authority_precheck.get("missing_requirement_ids")
+                        or []
+                    )
+                    result = _contract_runtime_unchanged_line_rejection(
+                        record,
+                        [
+                            "contract_runtime_close_authority_incomplete: "
+                            + ", ".join(missing)
+                        ],
+                    )
+                    result["close_authority_precheck"] = (
+                        close_authority_precheck
                     )
                 else:
                     result = runtime.submit_line_write(
@@ -81627,6 +82016,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["actor_role"] = actor_role
     if "dispatch_timeline_event" in locals() and dispatch_timeline_event:
         response["contract_runtime_dispatch_timeline_event"] = dispatch_timeline_event
+    if isinstance(result.get("close_authority_precheck"), Mapping):
+        response["close_authority_precheck"] = result[
+            "close_authority_precheck"
+        ]
     return response
 
 
@@ -81915,10 +82308,34 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         write=write,
                     )
                 )
+                close_authority_precheck = (
+                    _contract_runtime_mf_parallel_close_ready_precheck(
+                        record,
+                        write,
+                    )
+                )
                 if dispatch_errors:
                     result = _contract_runtime_unchanged_line_rejection(
                         record,
                         dispatch_errors,
+                    )
+                elif (
+                    close_authority_precheck
+                    and not close_authority_precheck.get("passed")
+                ):
+                    missing = list(
+                        close_authority_precheck.get("missing_requirement_ids")
+                        or []
+                    )
+                    result = _contract_runtime_unchanged_line_rejection(
+                        record,
+                        [
+                            "contract_runtime_close_authority_incomplete: "
+                            + ", ".join(missing)
+                        ],
+                    )
+                    result["close_authority_precheck"] = (
+                        close_authority_precheck
                     )
                 else:
                     result = runtime.precheck_line_write(
@@ -81969,6 +82386,10 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
         response["execution_state_revision"] = result.get("execution_state_revision")
         response["runtime_guide_hash"] = result.get("runtime_guide_hash")
         response["agent_facing_decision_source"] = "contract_runtime_line_write_precheck"
+    if isinstance(result.get("close_authority_precheck"), Mapping):
+        response["close_authority_precheck"] = result[
+            "close_authority_precheck"
+        ]
     return response
 
 
