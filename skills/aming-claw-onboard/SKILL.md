@@ -62,7 +62,16 @@ instructions.
 - Do not mutate governed files until a backlog row and route/contract evidence
   exist.
 - For operator-supervised direct work, record the onboard/direct exception
-  evidence before mutation and stay inside the approved target files.
+  evidence before mutation and stay inside the approved target files. The
+  canonical close order is pre-mutation exception -> commit-bound
+  implementation -> independent role-bound QA -> redeploy -> live regression
+  -> graph reconcile/preflight -> close_ready -> backlog_close. Implementation
+  records `changed_files` plus `diff_check` or `dirty_scope_check`; QA is
+  QA-authored `verification`/`independent_verification` authorized by a managed
+  QA session ref, never observer receipt/transcription or a persisted raw QA
+  token. `close_ready` accepts `redeployed`/`governance_redeploy`/
+  `runtime_sync`/`runtime_version_sync`, `live_regression_evidence`/
+  `live_regression`, and requires both `graph_reconciled` and `preflight_ok`.
 - For worker or QA work, use the runtime context or QA session entry returned
   by the onboard guide.
 - For QA evidence that is materialized by a parent observer, keep the QA owner,

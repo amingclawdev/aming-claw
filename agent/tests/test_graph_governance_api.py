@@ -3845,6 +3845,7 @@ def _append_authenticated_qa_verification(
     commit_sha: str,
     snapshot_id: str,
     principal_id: str = "qa:direct-main",
+    verification: dict[str, Any] | None = None,
 ) -> dict:
     _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
     qa_scope_binding_ref = server._qa_scope_binding_ref(
@@ -3902,7 +3903,8 @@ def _append_authenticated_qa_verification(
             "status": "passed",
             "actor": principal_id,
             "commit_sha": commit_sha,
-            "verification": {
+            "verification": verification
+            or {
                 "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
                 "diff_check": {"unexpected_files": []},
                 "live_regression": {"status": "passed"},
@@ -37666,6 +37668,258 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert closed["ok"] is True
     assert closed["status"] == "FIXED"
     assert closed["gate_summary"]["can_close"] is True
+
+
+def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-PARENTLESS-DIRECT-MAIN-GUIDE-SHAPES"
+    project_root = tmp_path / "parentless-direct-main-guide-shapes"
+    close_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    route_token_ref = "rtok-parentless-direct-main-guide-shapes"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": f"{route_token_ref}-parent",
+            },
+        )
+    )
+    parent_execution_id = guide["contract_chain_current"][
+        "current_contract_execution_id"
+    ]
+    template = guide["onboard_route_guide"]["role_entries"]["observer"][
+        "direct_main"
+    ]["close_satisfying_evidence_template"]
+    assert [step["id"] for step in template["ordered_close_path"]] == [
+        "pre_mutation_exception",
+        "commit_bound_implementation",
+        "independent_role_bound_qa",
+        "redeploy",
+        "live_regression",
+        "graph_reconcile_preflight",
+        "close_ready",
+        "backlog_close",
+    ]
+    implementation_shape, qa_shape, close_ready_shape = template[
+        "post_mutation_events"
+    ]
+    assert implementation_shape["required_payload_fields"] == [
+        "changed_files",
+        "diff_check or dirty_scope_check",
+    ]
+    assert qa_shape["accepted_event_kinds"] == [
+        "verification",
+        "independent_verification",
+    ]
+    assert qa_shape["managed_qa_session"] == {
+        "entrypoint": "qa_session_register or qa_session_rejoin",
+        "authorization": "managed qa_session_token_ref",
+        "qa_authored": True,
+        "observer_receipt_or_transcription_satisfies": False,
+        "raw_qa_session_token_persisted": False,
+    }
+    assert qa_shape["required_payload_fields"] == [
+        "tests_run or test_results",
+        "diff_check or dirty_scope_check",
+    ]
+    assert close_ready_shape["accepted_redeploy_fields"] == [
+        "redeployed",
+        "governance_redeploy",
+        "runtime_sync",
+        "runtime_version_sync",
+    ]
+    assert close_ready_shape["accepted_live_regression_fields"] == [
+        "live_regression_evidence",
+        "live_regression",
+    ]
+
+    route_identity = {
+        "route_id": "route-parentless-direct-main-guide-shapes",
+        "route_context_hash": _fake_sha(
+            "route-parentless-direct-main-guide-shapes"
+        ),
+        "prompt_contract_id": "rprompt-parentless-direct-main-guide-shapes",
+        "prompt_contract_hash": _fake_sha(
+            "prompt-parentless-direct-main-guide-shapes"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-parentless-direct-main-guide-shapes"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["backlog_close", "task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
+        },
+    )
+    graph_trace_id = "gqt-20260718-c10e5e01"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        task_id=parent_execution_id,
+    )
+    append_base = {
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+        "route_token_ref": route_token_ref,
+    }
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "actor": "observer",
+                "payload": {
+                    **route_identity,
+                    "reason": "operator-supervised guide-shaped direct-main repair",
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                    },
+                    "dirty_scope_check": {"dirty_files": []},
+                    "allowed_files": template["allowed_files"],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            },
+        )
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": implementation_shape["event_type"],
+                "event_kind": implementation_shape["event_kind"],
+                "phase": implementation_shape["phase"],
+                "status": implementation_shape["status"],
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    **route_identity,
+                    "changed_files": template["allowed_files"],
+                    "diff_check": {"unexpected_files": []},
+                },
+            },
+        )
+    )
+    _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        commit_sha=close_commit,
+        snapshot_id="full-parentless-direct-main-guide-shapes",
+        verification={
+            "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
+            "diff_check": {"unexpected_files": []},
+        },
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": close_ready_shape["event_type"],
+                "event_kind": close_ready_shape["event_kind"],
+                "phase": close_ready_shape["phase"],
+                "status": close_ready_shape["status"],
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "verification": {
+                    "redeployed": True,
+                    "runtime_sync": {"status": "passed"},
+                    "live_regression_evidence": {"status": "passed"},
+                    "graph_reconciled": True,
+                    "preflight_ok": True,
+                },
+                "payload": {**route_identity, "close_commit": close_commit},
+            },
+        )
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_child_lane_close_authority_projection",
+        lambda **_kwargs: {
+            **server._contract_runtime_close_authority_payload_fields(),
+            "schema_version": server._CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+            "accepted": False,
+            "status": "incomplete",
+            "source_of_authority": "contract_runtime",
+            "authority_decision_source": "contract_runtime_close_authority_projection",
+            "contract_execution_id": parent_execution_id,
+            "missing_requirement_ids": ["runtime_context.child_lane_incomplete"],
+        },
+    )
+    precheck = server.handle_backlog_timeline_gate(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            query={"close_commit": close_commit},
+        )
+    )
+
+    projection = precheck["timeline_gate"][
+        "contract_runtime_close_authority_projection"
+    ]
+    direct_gate = projection["parentless_direct_main_close_authority_gate"]
+    assert projection["accepted"] is True
+    assert projection["status"] == "projected_parentless_direct_main"
+    assert projection["authority_selection"]["selected_authority"] == (
+        "parentless_direct_main"
+    )
+    assert direct_gate["passed"] is True
+    assert direct_gate["checks"]["worker_or_successor_contract_required"] is False
+    assert direct_gate["pre_implementation_graph_trace_gate"][
+        "verified_trace_ids"
+    ] == [graph_trace_id]
+    assert "direct_fix_close_authority_gate" not in projection
+    assert "line_bypass" not in json.dumps(projection, sort_keys=True)
+    assert precheck["can_close"] is True
 
 
 def test_parentless_direct_main_rejects_loose_operator_approval_shape(
