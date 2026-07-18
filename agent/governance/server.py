@@ -49443,6 +49443,35 @@ def _observer_onboarding_runtime_projection(
     }
 
 
+def _contract_runtime_writer_line_guide_hash(
+    guide: Mapping[str, Any],
+    *,
+    actor_role: str,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+) -> str:
+    safe_copy = guide.get("writer_role_safe_copy_payload")
+    if not isinstance(safe_copy, Mapping):
+        return str(guide.get("runtime_guide_hash") or "")
+    copy_payload = safe_copy.get("copy_payload")
+    if not isinstance(copy_payload, Mapping):
+        return ""
+    expected_binding = {
+        "actor_role": actor_role,
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+    }
+    if any(
+        str(copy_payload.get(field) or "").strip()
+        != str(expected_value or "").strip()
+        for field, expected_value in expected_binding.items()
+    ):
+        return ""
+    return str(copy_payload.get("runtime_guide_hash") or "").strip()
+
+
 def _contract_runtime_write_from_record(
     record: Mapping[str, Any],
     *,
@@ -49464,7 +49493,13 @@ def _contract_runtime_write_from_record(
         "definition_hash": record.get("definition_hash"),
         "instruction_bundle_hash": record.get("instruction_bundle_hash"),
         "execution_state_revision": state.get("execution_state_revision"),
-        "runtime_guide_hash": guide.get("runtime_guide_hash"),
+        "runtime_guide_hash": _contract_runtime_writer_line_guide_hash(
+            guide,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        ),
         "stage_id": stage_id,
         "line_id": line_id,
         "actor_role": actor_role,
