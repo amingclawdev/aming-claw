@@ -2650,6 +2650,148 @@ def test_current_full_reconcile_accepts_observer_route_token_proof(
     assert calls[0]["activate"] is False
 
 
+def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_runtime(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-ONBOARD-DIRECT-MAIN"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-onboard-direct-main",
+    )
+    route_token_ref = "rtok-current-full-onboard-direct-main"
+    record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    execution_id = record["contract_execution_id"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+    )
+
+    def reconcile(*, activate: bool):
+        return server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": activate,
+                    "semantic_enrich": False,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    preflight_status, preflight = reconcile(activate=False)
+    deployed_status, deployed = reconcile(activate=True)
+
+    assert preflight_status == 201
+    assert preflight["current_full_reconcile"] is True
+    assert preflight["activated"] is False
+    assert deployed_status == 201
+    assert deployed["current_full_reconcile"] is True
+    assert [call["activate"] for call in calls] == [False, True]
+    assert all(
+        "current_full_reconcile_runtime_context_scope" not in result
+        for result in (preflight, deployed)
+    )
+
+
+@pytest.mark.parametrize(
+    ("contract_id", "merge_queue_id"),
+    [
+        ("mf_parallel.v2", ""),
+        ("mf_batch_parallel.v1", ""),
+        (server.ONBOARD_ROUTE_GUIDE_SERVICE_ID, "mq-context-required"),
+    ],
+)
+def test_current_full_reconcile_contextless_route_rejects_parallel_contracts(
+    conn,
+    monkeypatch,
+    tmp_path,
+    contract_id,
+    merge_queue_id,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    suffix = contract_id.replace(".", "-")
+    backlog_id = f"AC-CURRENT-FULL-CONTEXTLESS-{suffix}"
+    execution_id = f"cex-current-full-contextless-{suffix}"
+    route_token_ref = f"rtok-current-full-contextless-{suffix}"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-current-full-contextless-{suffix}",
+    )
+    if contract_id == server.ONBOARD_ROUTE_GUIDE_SERVICE_ID:
+        record = server._onboard_service_materialize_parent_record(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
+        execution_id = record["contract_execution_id"]
+    else:
+        server._contract_runtime_store(conn).create(
+            {
+                "schema_version": "contract_runtime_execution_record.v1",
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "contract_id": contract_id,
+                "version": "v1",
+                "revision": "rev1",
+                "definition_hash": _fake_sha(f"{contract_id}:definition"),
+                "completed_lines": [],
+                "execution_state_revision": 0,
+                "runtime_guide": {},
+            }
+        )
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": True,
+                    "semantic_enrich": False,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "merge_queue_id": merge_queue_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "current_full_reconcile_runtime_context_not_found"
+    assert exc.value.details["fail_closed"] is True
+    assert calls == []
+
+
 def test_current_full_reconcile_operator_token_path_unchanged(
     conn,
     monkeypatch,
