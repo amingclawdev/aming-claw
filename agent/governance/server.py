@@ -13650,6 +13650,16 @@ def _runtime_context_contract_runtime_worker_projection(
     try:
         runtime.current_guide(execution_id, actor_role="mf_sub")
         canonical_record = runtime.store.get(execution_id)
+        canonical_record, _context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=str(
+                    canonical_record.get("project_id") or ""
+                ),
+                record=canonical_record,
+                actor_role="mf_sub",
+            )
+        )
         canonical_implementation = _worker_commit_completed_implementation(
             canonical_record,
             runtime_context_id=runtime_context_id,
@@ -14133,6 +14143,18 @@ def _runtime_context_executable_contract_envelope(
         or action_plan.get("next_legal_action")
         or ""
     )
+    contract_runtime_next_action = dict(
+        current_state_response.get("contract_runtime_next_legal_action") or {}
+    )
+    if _runtime_context_contract_next_action_override_eligible(
+        contract_runtime_next_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        current_next_legal_action=next_legal_action,
+    ):
+        next_legal_action = str(
+            contract_runtime_next_action.get("action") or next_legal_action
+        ).strip()
     next_required_evidence = list(
         control_plane.get("next_required_evidence")
         or action_plan.get("next_required_evidence")
@@ -15146,7 +15168,7 @@ def _runtime_context_worker_guide_response(
             parent_task_id=parent_task_id,
             worker_id=worker_id,
             worker_slot_id=worker_slot_id,
-            route_identity=_runtime_context_latest_route_identity(conn, context),
+            route_identity=route_identity,
         )
     corrected_request_shapes = dict(
         target_root_projection.get("corrected_request_shapes") or {}

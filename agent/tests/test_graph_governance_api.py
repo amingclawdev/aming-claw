@@ -27311,7 +27311,7 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
         )
     )
     action_plan = runtime_current["executable_contract"]
-    assert action_plan["next_legal_action"] == "record_implementation_evidence"
+    assert action_plan["next_legal_action"] == "record_implementation"
     required = action_plan["next_required_evidence"][0]
     assert required["id"] == "implementation_evidence"
     assert required["expected_source"] == "task_timeline.implementation"
@@ -27327,6 +27327,14 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert runtime_current["contract_runtime_failed_qa_revision"][
         "raw_tokens_exposed"
     ] is False
+    worker_guide = server._runtime_context_worker_guide_response(runtime_current)
+    assert worker_guide["next_legal_action"] == "record_implementation"
+    assert worker_guide["executable_contract"]["next_legal_action"] == (
+        "record_implementation"
+    )
+    assert worker_guide["contract_runtime_next_legal_action"]["line_id"] == (
+        "worker_implementation"
+    )
 
     revised_implementation = (
         server.handle_graph_governance_runtime_context_implementation_evidence(
@@ -27373,6 +27381,90 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     assert revised_record["completed_lines"][-1]["commit_sha"] == hashlib.sha1(
         b"contract-failed-qa-revised-worker-head"
     ).hexdigest()
+
+    revised_head = hashlib.sha1(
+        b"contract-failed-qa-revised-worker-head"
+    ).hexdigest()
+    retry_common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
+        "commit_sha": revised_head,
+        "status": "passed",
+    }
+    completed_retry_lines = [
+        {
+            **retry_common,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "payload": {**retry_common, "status": "passed"},
+        }
+        for stage_id, line_id, actor_role, evidence_kind in (
+            ("worker_commit", "worker_commit", "mf_sub", "worker_commit"),
+            (
+                "worker_attestation",
+                "worker_finish_time_attestation",
+                "mf_sub",
+                "record_finish_time_worker_attestation",
+            ),
+            (
+                "worker_finish",
+                "worker_finish_gate",
+                "mf_sub",
+                "mf_subagent_finish_gate",
+            ),
+            ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
+            (
+                "qa",
+                "qa_independent_verification",
+                "qa",
+                "independent_verification",
+            ),
+        )
+    ]
+    retry_record = dict(revised_record)
+    retry_record["completed_lines"] = [
+        *list(revised_record["completed_lines"]),
+        *completed_retry_lines,
+    ]
+    retry_record["execution_state_revision"] = int(
+        revised_record["execution_state_revision"]
+    ) + 1
+    runtime = server._contract_runtime(conn)
+    runtime.store.update(successor["contract_execution_id"], retry_record)
+
+    rejoin_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_kind="observer_command",
+    )
+    assert any(
+        (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_rejoin"
+        for event in rejoin_events
+    )
+    after_retry = runtime.current_guide(
+        successor["contract_execution_id"], actor_role="observer"
+    )
+    assert after_retry["next_legal_action"]["line_id"] == "observer_merge"
+    projection = server._runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        context=get_branch_context(conn, PID, runtime_context.task_id),
+    )
+    assert projection["contract_runtime_next_legal_action"]["line_id"] == (
+        "observer_merge"
+    )
+    assert projection["contract_runtime_current_state"]["next_legal_action"][
+        "line_id"
+    ] == "observer_merge"
 
 
 def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_backfill(
