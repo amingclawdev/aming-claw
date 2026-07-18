@@ -37322,6 +37322,10 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "observer_receipt_or_transcription_satisfies": False,
         "raw_qa_session_token_persisted": False,
     }
+    assert qa_shape["required_payload_fields"] == [
+        "tests_run or test_results",
+        "diff_check or dirty_scope_check",
+    ]
     assert close_ready_shape["accepted_redeploy_fields"] == [
         "redeployed",
         "governance_redeploy",
@@ -37431,7 +37435,6 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         verification={
             "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
             "diff_check": {"unexpected_files": []},
-            "live_regression_evidence": {"status": "passed"},
         },
     )
     server.handle_task_timeline_append(

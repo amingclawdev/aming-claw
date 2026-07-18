@@ -58030,7 +58030,6 @@ def _onboard_contract_route_guide(
                     "required_payload_fields": [
                         "tests_run or test_results",
                         "diff_check or dirty_scope_check",
-                        "live_regression_evidence or live_regression",
                     ],
                 },
                 {
