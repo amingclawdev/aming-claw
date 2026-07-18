@@ -1286,6 +1286,44 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   assertFixture(timelineStatusFromEvent(response.timeline.events[0]) === "recorded", "bypassed timeline text must not be misclassified by the passed substring");
   assertFixture(view.historical_diagnostics.timeline_events.length === 1 && view.historical_diagnostics.current_snapshot_in_playback === false, "current authority snapshot must stay separate from append-only playback history");
 
+  const completedContractResponse: ContractRuntimeVisualizationResponse = {
+    ...response,
+    backlog: { ...response.backlog, status: "OPEN" },
+    contract_execution_progress: {
+      ...response.contract_execution_progress,
+      readiness_state: "contract_complete",
+      next_legal_action: {},
+    },
+    backlog_close_readiness: {
+      ...response.backlog_close_readiness,
+      state: "open",
+      backlog_status: "OPEN",
+      contract_execution_state: "contract_complete",
+    },
+    contract_chain: { ...response.contract_chain, readiness_state: "contract_complete", next_legal_action: {} },
+  };
+  const completedContractView = projectContractRuntimeAuthorityViewModel(completedContractResponse);
+  assertFixture(completedContractView.contract_execution_progress.display_status === "COMPLETED", "contract_complete should remain a neutral completed contract-progress state");
+  assertFixture(completedContractView.contract_execution_progress.display_status !== "PASS", "contract_complete must never imply PASS");
+  assertFixture(completedContractView.backlog_close_readiness.display_status === "OPEN", "contract completion must not independently close the backlog row");
+
+  const consumedTrace = normalizeTaskPlaybackTrace({
+    projectId: response.project_id,
+    backlog: { bug_id: response.backlog_id, title: response.backlog.title, status: "OPEN", priority: "P1" },
+    taskTimeline: {
+      project_id: response.project_id,
+      backlog_id: response.backlog_id,
+      events: [],
+      count: 0,
+      contract_runtime_visualization: completedContractResponse,
+    },
+    gateResponse: null,
+    source: "governed",
+  });
+  assertFixture(consumedTrace.authority_view?.cache_identity.contract_execution_id === "cex-current-1", "real playback normalizer should consume the canonical authority view carried by task timeline data");
+  assertFixture(consumedTrace.authority_view?.contract_execution_progress.display_status === "COMPLETED", "playback trace should carry canonical current contract progress separately");
+  assertFixture(consumedTrace.frames.length === 0 && consumedTrace.authority_view?.historical_diagnostics.timeline_events.length === 1, "canonical current snapshot must not be synthesized into playback frames/history");
+
   const chainFallback = projectContractRuntimeAuthorityViewModel({
     ...response,
     contract_execution_progress: { ...response.contract_execution_progress, next_legal_action: {} },
@@ -1296,6 +1334,8 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "canonical visualization projects ContractRuntime current action before chain fallback",
     "authority cache identity includes backlog, execution, revision, and event",
     "bypassed and waived states never display PASS",
+    "contract_complete remains neutral while backlog close readiness stays independent",
+    "task timeline consumer carries canonical authority axes without adding playback frames",
     "current authority snapshot stays out of playback history",
   ];
 }

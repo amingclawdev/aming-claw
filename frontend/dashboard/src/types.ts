@@ -880,6 +880,7 @@ export interface TaskTimelineResponse {
   trace_id?: string;
   events: TaskTimelineEvent[];
   count: number;
+  contract_runtime_visualization?: ContractRuntimeVisualizationResponse;
   request_id?: string;
 }
 

@@ -470,7 +470,12 @@ export const api = {
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineQuery(backlogId, limit);
-    return getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+    const taskTimelineRequest = getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+    const authorityRequest = api.contractRuntimeVisualizationFor(projectId, backlogId, limit, signal);
+    return Promise.all([taskTimelineRequest, authorityRequest]).then(([taskTimeline, contractRuntimeVisualization]) => ({
+      ...taskTimeline,
+      contract_runtime_visualization: contractRuntimeVisualization,
+    }));
   },
   /** Project-wide recent timeline events, newest-first, cross-row.
    *  Each event carries backlog_id and task_id for row-tag rendering.

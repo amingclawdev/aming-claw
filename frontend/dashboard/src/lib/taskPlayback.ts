@@ -269,6 +269,8 @@ export interface TaskPlaybackTrace {
   statuses: TaskPlaybackStatusSummary;
   evidence_refs: TaskPlaybackEvidenceRef[];
   artifact_refs: TaskPlaybackArtifactRef[];
+  /** Canonical current authority axes. Never projected into playback frames. */
+  authority_view: ContractRuntimeAuthorityViewModel | null;
   compact_ledger: TaskPlaybackCompactLedger;
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
@@ -303,6 +305,7 @@ export type ContractRuntimeAuthorityDisplayStatus =
   | "RUNNING"
   | "WAITING"
   | "RECORDED"
+  | "COMPLETED"
   | "OPEN"
   | "UNKNOWN";
 
@@ -382,6 +385,7 @@ export function contractRuntimeAuthorityDisplayStatus(
   if (status.includes("running") || status.includes("active") || status.includes("progress")) return "RUNNING";
   if (status.includes("waiting") || status.includes("pending") || status.includes("queued")) return "WAITING";
   if (status === "open") return "OPEN";
+  if (status.replace(/[-\s]+/g, "_") === "contract_complete") return "COMPLETED";
   if (status.includes("pass") || status.includes("success") || status.includes("complete") || status === "fixed" || status === "closed") return "PASS";
   if (status.includes("record") || status.includes("accept") || status.includes("acknowledg")) return "RECORDED";
   return "UNKNOWN";
@@ -455,6 +459,9 @@ export function projectContractRuntimeAuthorityViewModel(
 
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
   const timelineEvents = input.taskTimeline?.events ?? [];
+  const authorityView = input.taskTimeline?.contract_runtime_visualization
+    ? projectContractRuntimeAuthorityViewModel(input.taskTimeline.contract_runtime_visualization)
+    : null;
   const gateEvents = input.gateResponse?.events ?? [];
   const compactLedger = normalizeTaskPlaybackCompactLedger(
     firstCompactLedgerSource(input.compactLedger, input.taskTimeline, input.gateResponse),
@@ -466,7 +473,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
   const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
   const closeGateMatrix = projectGateMatrix(timelineGateWithAuditClose(input.gateResponse), closeGateSummary.applicable);
-  const source = input.source ?? (input.taskTimeline || input.gateResponse || compactLedger.rows.length > 0 ? "governed" : "fallback_sample");
+  const source = input.source ?? (input.taskTimeline || input.gateResponse || authorityView || compactLedger.rows.length > 0 ? "governed" : "fallback_sample");
   const evidenceRefs = stableEvidence(frames.flatMap((frame) => frame.evidence_refs));
   const artifactRefs = stableArtifacts(frames.flatMap((frame) => frame.artifact_refs));
   const statuses = summarizeFrames(frames, closeGateSummary, source);
@@ -483,6 +490,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     statuses,
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
+    authority_view: authorityView,
     compact_ledger: compactLedger,
     privacy_boundary: {
       raw_prompt_text: "not_displayed",
