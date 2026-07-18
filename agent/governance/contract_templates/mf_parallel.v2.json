@@ -57,7 +57,7 @@
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
-    "contract_definition_revision": "rev4"
+    "contract_definition_revision": "rev5"
   },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",
@@ -379,7 +379,7 @@
     },
     "dispatch_ticket_authority": {
       "schema_version": "mf_parallel.dispatch_ticket_authority_policy.v1",
-      "source_revision": "rev4",
+      "source_revision": "rev5",
       "validate_before_precheck_and_submit": true,
       "server_resolved_child_route_identity_required": true,
       "mixed_parent_child_identity_policy": "fail_closed",
