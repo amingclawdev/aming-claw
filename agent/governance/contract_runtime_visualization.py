@@ -20,6 +20,10 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _text(value: Any) -> str:
+    if isinstance(value, Mapping) or (
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+    ):
+        return ""
     return str(value or "").strip()
 
 
@@ -244,23 +248,38 @@ def _legacy_advisory(value: Any) -> dict[str, Any]:
     advisory = _mapping(value)
     if not advisory:
         return {}
-    return {
-        key: advisory.get(key)
-        for key in (
-            "id",
-            "legacy",
-            "historical",
-            "advisory_only",
-            "required",
-            "authorization_blocker",
-            "ignored_as_next_legal_action",
-            "source",
-            "replacement_authority",
-            "semantic_blocker_reason",
-            "message",
-        )
-        if advisory.get(key) not in (None, "", [], {})
-    }
+    result: dict[str, Any] = {}
+    for key in ("id", "source", "semantic_blocker_reason", "message"):
+        text = _scalar_text(advisory.get(key))
+        if text:
+            result[key] = text
+    for key in (
+        "legacy",
+        "historical",
+        "advisory_only",
+        "required",
+        "authorization_blocker",
+        "ignored_as_next_legal_action",
+    ):
+        flag = advisory.get(key)
+        if isinstance(flag, bool):
+            result[key] = flag
+    replacement = advisory.get("replacement_authority")
+    if isinstance(replacement, str):
+        replacement_text = _text(replacement)
+        if replacement_text:
+            result["replacement_authority"] = replacement_text
+    elif isinstance(replacement, Sequence) and not isinstance(
+        replacement, (str, bytes)
+    ):
+        replacement_values = [
+            text
+            for item in replacement
+            if (text := _scalar_text(item))
+        ]
+        if replacement_values:
+            result["replacement_authority"] = replacement_values
+    return result
 
 
 def _edge(
@@ -309,7 +328,6 @@ def build_contract_runtime_visualization(
         dict(record) for record in runtime_records if isinstance(record, Mapping)
     ]
     runtime_record_total = len(all_records)
-    records = all_records[:50]
     current_execution_id = _text(
         current.get("current_contract_execution_id")
         or current.get("root_contract_execution_id")
@@ -317,11 +335,14 @@ def build_contract_runtime_visualization(
     current_record = next(
         (
             record
-            for record in records
+            for record in all_records
             if _text(record.get("contract_execution_id")) == current_execution_id
         ),
-        records[0] if records else {},
+        all_records[0] if all_records else {},
     )
+    records = all_records[:50]
+    if current_record and not any(record is current_record for record in records):
+        records = [current_record, *records[:49]]
     runtime_current = _runtime_record_summary(current_record) if current_record else {}
     embedded_current = _mapping(current.get("contract_runtime_current_state"))
     if not runtime_current and current:

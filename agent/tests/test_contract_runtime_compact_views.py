@@ -132,6 +132,7 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         **_contract_record(),
         "root_contract_execution_id": "cex-compact-view",
         "contract_chain_id": "cchain-compact-view",
+        "execution_state": {"execution_state_hash": {"raw": "STATE_SECRET"}},
         "session_token_ref": "sesref-secret",
         "worktree_path": "/private/worker/worktree",
         "completed_lines": [
@@ -160,11 +161,15 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
             },
         ],
     }
+    record["runtime_guide"]["next_legal_action"]["allowed_writer_roles"] = [
+        "qa",
+        {"raw": "ROLE_SECRET"},
+    ]
     result = build_contract_runtime_visualization(
         project_id="proj",
         backlog={
             "bug_id": "AC-COMPACT-VIEW",
-            "title": "Visualization boundary",
+            "title": {"raw": "BACKLOG_SECRET"},
             "status": "OPEN",
             "priority": "P0",
         },
@@ -183,6 +188,11 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
                 "legacy": True,
                 "advisory_only": True,
                 "required": False,
+                "message": {"raw": "ADVISORY_SECRET"},
+                "replacement_authority": [
+                    "ContractRuntime",
+                    {"raw": "REPLACEMENT_SECRET"},
+                ],
                 "route_token_ref": "rtok-advisory-secret",
             },
         },
@@ -234,8 +244,22 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         "raw-secret",
         "private-body",
         "nested-decision-secret",
+        "BACKLOG_SECRET",
+        "STATE_SECRET",
+        "ROLE_SECRET",
+        "ADVISORY_SECRET",
+        "REPLACEMENT_SECRET",
     ):
         assert forbidden not in encoded
+    assert result["backlog"]["title"] == ""
+    assert result["contract_execution_progress"]["execution_state_hash"] == ""
+    assert result["contract_execution_progress"]["next_legal_action"][
+        "allowed_writer_roles"
+    ] == ["qa"]
+    assert result["legacy_advisories"][0]["replacement_authority"] == [
+        "ContractRuntime"
+    ]
+    assert "message" not in result["legacy_advisories"][0]
     for forbidden_key in (
         "route_token_ref",
         "session_token_ref",
@@ -243,6 +267,50 @@ def test_visualization_builder_is_public_safe_and_keeps_authority_axes_separate(
         "session_token",
     ):
         assert forbidden_key not in encoded
+
+
+def test_visualization_selects_chain_current_before_runtime_record_cap():
+    from agent.governance.contract_runtime_visualization import (
+        build_contract_runtime_visualization,
+    )
+
+    records = []
+    for index in range(51):
+        record = _contract_record()
+        record["contract_execution_id"] = f"cex-{index}"
+        record["root_contract_execution_id"] = "cex-0"
+        record["contract_chain_id"] = "cchain-cap"
+        records.append(record)
+
+    result = build_contract_runtime_visualization(
+        project_id="proj",
+        backlog={
+            "bug_id": "AC-RUNTIME-CAP",
+            "title": "Runtime cap",
+            "status": "OPEN",
+            "priority": "P1",
+        },
+        runtime_records=records,
+        chain_current={
+            "contract_chain_id": "cchain-cap",
+            "root_contract_execution_id": "cex-0",
+            "current_contract_execution_id": "cex-50",
+            "current_contract_id": "mf_parallel.v2",
+            "readiness_state": "contract_active",
+        },
+        chain_edges=[],
+        timeline_events=[],
+    )
+
+    progress = result["contract_execution_progress"]
+    assert progress["contract_execution_id"] == "cex-50"
+    assert progress["runtime_record_count"] == 50
+    assert progress["runtime_record_total"] == 51
+    assert progress["runtime_records_truncated"] is True
+    assert not any(
+        item["kind"] == "current_execution_mismatch"
+        for item in result["projection_conflicts"]
+    )
 
 
 def test_visualization_endpoint_returns_cursor_bounded_runtime_projection(
