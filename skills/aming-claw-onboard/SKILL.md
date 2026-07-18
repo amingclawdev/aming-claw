@@ -129,8 +129,10 @@ instructions.
   `project_root`, and that worktree's full HEAD. Use the returned
   `candidate_snapshot_id` in the same QA session's next `graph_query`. This is
   a non-activating pre-QA candidate build: it is not merge/redeploy/reconcile
-  evidence and must not be used to advance the active graph. After QA and
-  merge, run the ordinary activated current-full path separately.
+  evidence and must not be used to advance the active graph. Its clean check
+  cannot be waived with `require_clean=false`; omit merge-queue ids unless both
+  identify an already-scoped queue item. After QA and merge, run the ordinary
+  activated current-full path separately.
 - For post-merge current-full route proof, the submitted `task_id` or
   `contract_execution_id` must exactly match the selected observer
   `route_token_ref` server-registered task scope. A parent observer ref uses its

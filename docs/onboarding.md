@@ -367,8 +367,10 @@ trace and do not make QA build or activate the graph. The observer calls
 `project_root`, and that worktree's full HEAD. The returned
 `candidate_snapshot_id` is supplied to the same bounded QA session's next
 `graph_query`. This pre-QA candidate build never advances the active graph and
-does not count as merge, redeploy, or post-merge reconcile evidence; run the
-ordinary activated current-full reconcile only after QA and merge.
+does not count as merge, redeploy, or post-merge reconcile evidence. Its clean
+check cannot be waived with `require_clean=false`; omit merge-queue ids unless
+both identify an already-scoped queue item. Run the ordinary activated
+current-full reconcile only after QA and merge.
 
 The normal worker order is:
 

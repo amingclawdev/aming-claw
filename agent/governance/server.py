@@ -35636,9 +35636,15 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "target_commit_sha": target_commit,
                 "head_commit": head_commit,
             }
+        activate_requested = bool(body.get("activate", True))
+        require_clean = (
+            True
+            if not activate_requested
+            else bool(body.get("require_clean", True))
+        )
         dirty_paths = (
             filter_dirty_files(_git_dirty_paths(root))
-            if bool(body.get("require_clean", True))
+            if require_clean
             else []
         )
         if dirty_paths:
@@ -35653,7 +35659,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
             }
 
-        activate_requested = bool(body.get("activate", True))
         runtime_context_scope = _current_full_reconcile_runtime_context_scope(
             conn,
             project_id=project_id,
@@ -35781,18 +35786,29 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 snapshot_id=graph_epoch_snapshot_id,
                 result=result,
             )
-            result["merge_queue_graph_epoch_auto_record"] = (
-                record_merge_queue_graph_epoch_after_reconcile(
-                    conn,
-                    project_id=project_id,
-                    target_head_commit=target_commit,
-                    snapshot_id=graph_epoch_snapshot_id,
-                    projection_id=graph_epoch_projection_id,
-                    merge_queue_id=str(body.get("merge_queue_id") or ""),
-                    queue_item_id=str(body.get("queue_item_id") or ""),
-                    now_iso=_utc_now(),
+            merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+            queue_item_id = str(body.get("queue_item_id") or "").strip()
+            if activate_requested or (merge_queue_id and queue_item_id):
+                result["merge_queue_graph_epoch_auto_record"] = (
+                    record_merge_queue_graph_epoch_after_reconcile(
+                        conn,
+                        project_id=project_id,
+                        target_head_commit=target_commit,
+                        snapshot_id=graph_epoch_snapshot_id,
+                        projection_id=graph_epoch_projection_id,
+                        merge_queue_id=merge_queue_id,
+                        queue_item_id=queue_item_id,
+                        now_iso=_utc_now(),
+                    )
                 )
-            )
+            else:
+                result["merge_queue_graph_epoch_auto_record"] = {
+                    "status": "skipped",
+                    "recorded": False,
+                    "reason": (
+                        "candidate_only_without_explicit_merge_queue_scope"
+                    ),
+                }
             if activate_requested:
                 timeline_event = _record_pending_scope_reconcile_contract_event(
                     conn,

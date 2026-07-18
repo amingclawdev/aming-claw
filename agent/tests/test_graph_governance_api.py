@@ -2749,8 +2749,45 @@ def test_current_full_reconcile_accepts_observer_route_token_proof(
     }
     assert "timeline_event_recorded" not in result
     assert "current_full_reconcile_provenance" not in result
+    assert result["merge_queue_graph_epoch_auto_record"] == {
+        "status": "skipped",
+        "recorded": False,
+        "reason": "candidate_only_without_explicit_merge_queue_scope",
+    }
     assert calls[0]["commit_sha"] == head
     assert calls[0]["activate"] is False
+
+
+def test_current_full_candidate_cannot_waive_clean_worktree(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_git_dirty_paths",
+        lambda _root: ["agent/governance/server.py"],
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "require_clean": False,
+                "semantic_enrich": False,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "dirty_worktree"
+    assert result["dirty_files"] == ["agent/governance/server.py"]
+    assert calls == []
 
 
 def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_runtime(
