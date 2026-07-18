@@ -2678,6 +2678,16 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
             server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
         ),
     )
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_contract_merge_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "an unrelated direct-main route must not scan for or bind "
+                "another contract's durable merge"
+            )
+        ),
+    )
 
     def reconcile(*, activate: bool):
         return server.handle_graph_governance_current_full_reconcile(
@@ -26517,6 +26527,63 @@ def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_work
         event_kind="mf_subagent_startup",
     )
     assert startup_events_before == []
+    route_identity = {
+        "route_id": f"route-{context.task_id}",
+        "route_context_hash": f"sha256:route-{context.task_id}",
+        "prompt_contract_id": f"rprompt-{context.task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{context.task_id}",
+        "route_token_ref": f"rtok-{context.task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{context.task_id}",
+    }
+    guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": backlog_id,
+                    "fence_token": context.fence_token,
+                    "session_token": "lost-runtime-rejoin-contract-token",
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    )
+    rejoin_copy_safe_body = guide["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["copy_safe_body"]
+    assert rejoin_copy_safe_body["contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
+
+    with pytest.raises(GovernanceError) as unrelated_contract:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": context.task_id,
+                    "parent_task_id": backlog_id,
+                    "contract_execution_id": "cex-unrelated-runtime-rejoin",
+                    "target_project_root": str(target_root),
+                    "reason": "reject an unrelated child contract alias",
+                    **route_identity,
+                },
+            )
+        )
+    assert unrelated_contract.value.code == (
+        "runtime_context_rejoin_contract_execution_id_mismatch"
+    )
+    assert unrelated_contract.value.details["expected_contract_execution_id"] == (
+        successor["contract_execution_id"]
+    )
 
     result = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
@@ -26526,16 +26593,20 @@ def test_runtime_context_session_token_rejoin_accepts_contract_runtime_only_work
             body={
                 "task_id": context.task_id,
                 "parent_task_id": backlog_id,
+                "contract_execution_id": successor["contract_execution_id"],
                 "target_project_root": str(target_root),
                 "reason": "same worker lost host auth after ContractRuntime startup",
                 "ttl_seconds": 1200,
                 "now_iso": "2026-07-15T06:00:00Z",
+                **route_identity,
             },
         )
     )
 
     assert result["ok"] is True
     assert result["status"] == "session_token_rejoin_issued"
+    assert result["route_identity"] == route_identity
+    assert result["route_identity_source"] == "resolved_active_route_token_ref"
     assert result["raw_tokens_persisted_to_timeline"] is False
     audit_events = task_timeline.list_events(
         conn,
@@ -52205,6 +52276,65 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     ]
     record = json.loads(json.dumps(record))
     record["completed_lines"][-1] = bound_merge_write
+    runtime.store.update(
+        contract_execution_id,
+        record,
+        expected_revision=int(record["execution_state_revision"]),
+    )
+
+    route_bound_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={
+            "backlog_id": context.backlog_id,
+            "task_id": task_id,
+        },
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": context.backlog_id,
+                "task_id": task_id,
+            },
+            "route_token_allowed_actions": ["graph_current_full_reconcile"],
+        },
+        target_commit_sha=merged_commit,
+    )
+    assert route_bound_scope["contract_execution_id"] == contract_execution_id
+    assert route_bound_scope["runtime_context_id"] == runtime_context_id
+    assert route_bound_scope["task_id"] == task_id
+    assert route_bound_scope["merge_queue_id"] == merge_queue_id
+    assert route_bound_scope["contract_merge_authority"]["queue_item_id"] == (
+        queue_item_id
+    )
+    assert route_bound_scope["contract_merge_authority"][
+        "merged_commit_sha"
+    ] == merged_commit
+    with pytest.raises(GovernanceError) as wrong_commit:
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={
+                "backlog_id": context.backlog_id,
+                "task_id": task_id,
+            },
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": context.backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha="f" * 40,
+        )
+    assert wrong_commit.value.code == (
+        "current_full_reconcile_contract_merge_authority_required"
+    )
+    assert wrong_commit.value.details["fail_closed"] is True
 
     snapshot_id = "full-contract-runtime-merge-authority"
     _activate_basic_graph(
@@ -56768,7 +56898,10 @@ def test_onboard_route_guide_marks_onboard_service_ref_enter_only_for_mf_paralle
     ]["route_token_ref"] == ""
 
 
-def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
+def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
+    conn,
+    monkeypatch,
+):
     backlog_id = "AC-MF-BATCH-PARALLEL-ROUTE"
     child_a = "AC-MF-BATCH-PARALLEL-ROW-A"
     child_b = "AC-MF-BATCH-PARALLEL-ROW-B"
@@ -56881,6 +57014,79 @@ def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(conn):
     assert payload["fanout_policy"]["fanout_ready"] is True
     assert payload["fanout_policy"]["shared_backlog_close_token_allowed"] is False
     assert payload["fanout_policy"]["successor_contract_template_id"] == "mf_parallel.v2"
+
+    # A materialized batch runtime context remains on the existing batch
+    # authority path.  The stricter mf_parallel durable-merge projection must
+    # not be applied merely because both lanes share branch runtime storage.
+    batch_item = result["merge_queue_plan"]["planned_items"][0]
+    batch_context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=batch_item["task_id"],
+            backlog_id=batch_item["backlog_id"],
+            parent_task_id=result["batch_id"],
+            branch_ref=f"refs/heads/codex/{batch_item['task_id']}",
+            status=STATE_WORKTREE_READY,
+            worktree_path=f"/tmp/{batch_item['task_id']}",
+            base_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id=result["merge_queue_plan"]["merge_queue_id"],
+        ),
+    )
+    append_branch_contract_revision(
+        conn,
+        batch_context,
+        revision_id="crev-mf-batch-current-full-non-regression",
+        contract_version=server.MF_BATCH_PARALLEL_CONTRACT_ID,
+        payload={
+            "contract_id": server.MF_BATCH_PARALLEL_RECORD_CONTRACT_ID,
+            "batch_id": result["batch_id"],
+        },
+        actor="observer",
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_contract_merge_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "mf_batch_parallel must retain its existing batch authority path"
+            )
+        ),
+    )
+
+    assert server._current_full_reconcile_runtime_successor_contract_kind(
+        conn,
+        project_id=PID,
+        context=batch_context,
+    ) == "mf_batch_parallel"
+    batch_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=PID,
+        body={
+            "backlog_id": batch_context.backlog_id,
+            "task_id": batch_context.task_id,
+            "merge_queue_id": batch_context.merge_queue_id,
+        },
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": batch_context.backlog_id,
+                "task_id": batch_context.task_id,
+            },
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha="a" * 40,
+    )
+
+    assert batch_scope["runtime_context_id"] == (
+        runtime_context_id_for_branch_context(batch_context)
+    )
+    assert "contract_merge_authority" not in batch_scope
 
 
 def test_observer_route_context_issue_blocks_multi_backlog_task_mismatch(conn):
