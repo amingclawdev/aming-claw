@@ -41736,8 +41736,8 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     definition_v2 = json.loads(
         Path("agent/governance/contract_definitions/mf_parallel.v2.rev1.json").read_text()
     )
-    definition_v2_rev4 = json.loads(
-        Path("agent/governance/contract_definitions/mf_parallel.v2.rev4.json").read_text()
+    definition_v2_rev5 = json.loads(
+        Path("agent/governance/contract_definitions/mf_parallel.v2.rev5.json").read_text()
     )
 
     assert batch["template_id"] == "mf_batch_parallel.v1"
@@ -41766,15 +41766,50 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
         "mf_batch_parallel.v1"
     )
     assert row_v2["runtime_contract_hints"]["contract_definition_revision"] == (
-        "rev4"
+        "rev5"
     )
-    assert definition_v2_rev4["revision"] == "rev4"
-    assert definition_v2_rev4["metadata"]["previous_revision"] == (
-        "mf_parallel.v2.rev3"
+    assert row_v2["worker_contract"]["dispatch_ticket_authority"][
+        "source_revision"
+    ] == "rev5"
+    assert definition_v2_rev5["revision"] == "rev5"
+    assert definition_v2_rev5["metadata"]["previous_revision"] == (
+        "mf_parallel.v2.rev4"
     )
-    assert definition_v2_rev4["system_layer"][
+    assert definition_v2_rev5["system_layer"][
         "dispatch_ticket_authority_policy"
     ]["validate_before_precheck_and_submit"] is True
+    reconcile_policy = definition_v2_rev5["system_layer"]["graph_binding_policy"][
+        "current_full_reconcile_evidence_policy"
+    ]
+    assert reconcile_policy["qa_authority_alternative_mode"] == "exactly_one"
+    alternatives = {
+        alternative["authority_mode"]: alternative
+        for alternative in reconcile_policy["qa_authority_alternatives"]
+    }
+    assert set(alternatives) == {
+        "timeline_event",
+        "canonical_contract_runtime_acceptance",
+    }
+    assert alternatives["timeline_event"]["required_positive_integer_fields"] == [
+        "qa_event_id"
+    ]
+    assert alternatives["timeline_event"]["required_temporal_fields"] == [
+        "qa_event_created_at"
+    ]
+    assert alternatives["canonical_contract_runtime_acceptance"][
+        "required_identity_fields"
+    ] == ["qa_source_ref"]
+    assert alternatives["canonical_contract_runtime_acceptance"][
+        "required_positive_integer_fields"
+    ] == ["qa_acceptance_revision"]
+    assert alternatives["canonical_contract_runtime_acceptance"][
+        "required_temporal_fields"
+    ] == ["qa_acceptance_created_at"]
+    assert alternatives["canonical_contract_runtime_acceptance"][
+        "forbidden_fields"
+    ] == ["qa_event_id", "qa_event_created_at"]
+    assert "qa_event_id" not in reconcile_policy["required_temporal_fields"]
+    assert "qa_event_created_at" not in reconcile_policy["required_temporal_fields"]
     parent_contracts = {
         (item["contract_id"], item["version"])
         for item in definition["system_layer"]["successor_policy"][
@@ -41793,7 +41828,7 @@ def test_multi_backlog_parallel_templates_are_row_scoped():
     from agent.governance.contracts.registry import ContractDefinitionRegistry
 
     latest = ContractDefinitionRegistry().get("mf_parallel.v2", version="v2")
-    assert latest["revision"] == "rev4"
+    assert latest["revision"] == "rev5"
 
 
 def test_onboard_contract_start_rejects_custom_root_execution_id(conn):
@@ -51572,7 +51607,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
     ]["worker_session_id"] == native_worker_session_id
 
 
-def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
+def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
     conn,
     tmp_path,
 ):
@@ -51625,7 +51660,7 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     definition = runtime.registry.get(
         "mf_parallel.v2",
         version="v2",
-        revision="rev2",
+        revision="rev5",
     )
     instruction_bundle = resolve_instruction_bundle(
         definition,
@@ -51638,7 +51673,7 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
         "contract_execution_id": contract_execution_id,
         "contract_id": "mf_parallel.v2",
         "version": "v2",
-        "revision": "rev2",
+        "revision": "rev5",
         "definition_hash": definition["definition_hash"],
         "instruction_bundle_hash": instruction_bundle["instruction_bundle_hash"],
         "execution_state": {"actor_role": "observer"},
@@ -52097,6 +52132,18 @@ def test_contract_runtime_merge_authority_uses_completed_qa_without_qa_timeline(
     )
     assert precheck["decision"]["ok"] is True
     assert precheck["decision"]["errors"] == []
+    submitted = runtime.submit_line_write(
+        contract_execution_id,
+        precheck_write,
+        actor_role="observer",
+    )
+    assert submitted["ok"] is True
+    assert submitted["record"]["completed_lines"][-1]["line_id"] == (
+        "observer_reconcile"
+    )
+    assert submitted["record"]["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "observer_close_ready"
 
     forged_qa = json.loads(json.dumps(record["completed_lines"][10]))
     forged_qa["commit_sha"] = "f" * 40
