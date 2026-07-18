@@ -2728,9 +2728,37 @@ def current_full_reconcile_state(
         )
         if str(value or "").strip()
     }
+    canonical_runtime_parent_claims = {
+        str(value or "").strip()
+        for value in (
+            marker_runtime_context_scope.get("parent_task_id"),
+            route_runtime_context_scope.get("parent_task_id"),
+        )
+        if str(value or "").strip()
+    }
     if expected_contract_execution_id:
         if route_task_id:
-            contract_execution_claims.add(route_task_id)
+            if route_task_id == expected_task_id:
+                # Current mf_parallel reconcile routes are worker-task scoped.
+                # That route proves the task dimension only. The corresponding
+                # contract is derived exclusively from the sealed, duplicated
+                # server-owned runtime-context parent scope; caller-supplied
+                # reconcile arguments cannot manufacture this relationship.
+                task_claims.add(route_task_id)
+                if (
+                    runtime_context_scope_link_verified
+                    and marker_runtime_context_scope
+                    and route_runtime_context_scope
+                    and canonical_runtime_parent_claims
+                    == {expected_contract_execution_id}
+                ):
+                    contract_execution_claims.add(
+                        expected_contract_execution_id
+                    )
+            else:
+                # Preserve contract-scoped routes and make an unrelated route
+                # task a conflicting contract claim so the check fails closed.
+                contract_execution_claims.add(route_task_id)
     elif route_task_id:
         # Legacy/non-contract callers use route task scope as the worker task.
         task_claims.add(route_task_id)

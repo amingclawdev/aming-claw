@@ -2162,6 +2162,118 @@ def test_current_full_state_separates_contract_route_and_worker_runtime_scope(co
     assert state(expected_runtime_context_id="mfrctx-wrong")["db_verified"] is False
 
 
+def test_current_full_state_uses_server_runtime_parent_for_worker_task_route(conn):
+    commit_sha = "9" * 40
+    contract_execution_id = "cex-worker-task-route"
+    worker_task_id = "worker-task-route"
+    runtime_context_id = "mfrctx-worker-task-route"
+    backlog_id = "AC-WORKER-TASK-ROUTE"
+
+    def record(
+        snapshot_id: str,
+        *,
+        route_task_id: str,
+        runtime_parent_task_id: str,
+    ) -> None:
+        runtime_scope = {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": worker_task_id,
+            "parent_task_id": runtime_parent_task_id,
+            "runtime_context_id": runtime_context_id,
+        }
+        _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+        store.record_current_full_reconcile_provenance(
+            conn,
+            project_id=PID,
+            snapshot_id=snapshot_id,
+            target_commit_sha=commit_sha,
+            request_id=f"req-{snapshot_id}",
+            request_started_at="2026-07-18T00:00:00Z",
+            route_evidence={
+                "schema_version": (
+                    "graph_current_full_reconcile.route_evidence.v1"
+                ),
+                "authenticated_role": "observer",
+                "authentication_source": "observer_session_route_token_ref",
+                "raw_route_token_persisted": False,
+                "protected_action": "graph_current_full_reconcile",
+                "route_token_scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": route_task_id,
+                },
+                "task_id": worker_task_id,
+                "runtime_context_id": runtime_context_id,
+                "runtime_context_scope": {
+                    **runtime_scope,
+                    "source": "parallel_branch_runtime_context",
+                    "server_derived": True,
+                },
+            },
+            runtime_context_scope=runtime_scope,
+            reconcile_event_id=22,
+            reconcile_event_created_at="2026-07-18T00:02:00Z",
+            marker_created_at="2026-07-18T00:02:01Z",
+        )
+
+    def state() -> dict[str, object]:
+        return store.current_full_reconcile_state(
+            conn,
+            PID,
+            commit_sha,
+            merge_event_id=21,
+            merge_event_created_at="2026-07-18T00:01:00Z",
+            reconcile_event_id=22,
+            reconcile_event_created_at="2026-07-18T00:02:00Z",
+            expected_contract_execution_id=contract_execution_id,
+            expected_task_id=worker_task_id,
+            expected_runtime_context_id=runtime_context_id,
+            reconcile_task_id=worker_task_id,
+            reconcile_runtime_context_id=runtime_context_id,
+        )
+
+    record(
+        "full-worker-task-route",
+        route_task_id=worker_task_id,
+        runtime_parent_task_id=contract_execution_id,
+    )
+    worker_scoped = state()
+    assert worker_scoped["contract_execution_scope_verified"] is True
+    assert worker_scoped["task_scope_verified"] is True
+    assert worker_scoped["runtime_context_scope_verified"] is True
+    assert worker_scoped["provenance_scope_verified"] is True
+    assert worker_scoped["db_verified"] is True
+
+    record(
+        "full-worker-task-route-wrong-parent",
+        route_task_id=worker_task_id,
+        runtime_parent_task_id="cex-wrong-parent",
+    )
+    wrong_parent = state()
+    assert wrong_parent["contract_execution_scope_verified"] is False
+    assert wrong_parent["db_verified"] is False
+
+    record(
+        "full-worker-task-route-wrong-route",
+        route_task_id="worker-wrong-route",
+        runtime_parent_task_id=contract_execution_id,
+    )
+    wrong_route = state()
+    assert wrong_route["contract_execution_scope_verified"] is False
+    assert wrong_route["db_verified"] is False
+
+    record(
+        "full-contract-task-route-compatible",
+        route_task_id=contract_execution_id,
+        runtime_parent_task_id=contract_execution_id,
+    )
+    contract_scoped = state()
+    assert contract_scoped["contract_execution_scope_verified"] is True
+    assert contract_scoped["provenance_scope_verified"] is True
+    assert contract_scoped["db_verified"] is True
+
+
 def test_current_full_state_fences_explicit_task_but_allows_shared_taskless(conn):
     commit_sha = "e" * 40
 
