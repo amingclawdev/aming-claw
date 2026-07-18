@@ -27690,6 +27690,9 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         )
     )
     assert rejoin["reopen_for_revision"] is True
+    prior_session_token_ref = runtime_context_session_token_ref(runtime_context)
+    assert prior_session_token_ref
+    assert rejoin["session_token_ref"] != prior_session_token_ref
 
     # Seed the already-accepted bad retry line that this regression repairs.
     # The production correction and subsequent worker_commit still run through
@@ -27704,6 +27707,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
     partial_payload["changed_files"] = ["agent/governance/server.py"]
+    partial_payload["session_token_ref"] = prior_session_token_ref
     partial_payload["graph_trace_db_evidence"] = {
         "db_verified": True,
         "verified_trace_ids": ["gqt-failed-qa-cumulative-worker"],
@@ -27722,6 +27726,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
             "parent_task_id": backlog_id,
             "worker_id": runtime_context.worker_id,
             "worker_slot_id": runtime_context.worker_slot_id,
+            "session_token_ref": prior_session_token_ref,
             "changed_files": ["agent/governance/server.py"],
             "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
             "payload": partial_payload,
@@ -27795,6 +27800,15 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     ]
     assert revision_audit["append_only_history_preserved"] is True
     assert revision_audit["revision_event_ref"].startswith("timeline:")
+    assert revision_audit["session_token_ref_rotation"] == {
+        "applied": True,
+        "source": "accepted_runtime_context_rejoin_event",
+        "revision_event_ref": revision_audit["revision_event_ref"],
+        "raw_session_tokens_persisted": False,
+    }
+    assert retry_implementations[-1]["session_token_ref"] == (
+        rejoin["session_token_ref"]
+    )
 
     latest_lineage = _worker_implementation_lineage(
         revised_record,

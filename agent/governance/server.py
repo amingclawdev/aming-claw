@@ -22375,6 +22375,24 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
     parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
     expected_attempt = int(getattr(context, "attempt", 0) or 0)
     expected_retry_round = int(getattr(context, "retry_round", 0) or 0)
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    active_session_token_ref = runtime_context_session_token_ref(context)
+    expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    expected_worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    expected_target_project_root = _runtime_context_effective_target_project_root(
+        context
+    )
+    expected_fence_token_hash = runtime_context_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
     if (
         not runtime_context_id
         or not task_id
@@ -22443,6 +22461,24 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             continue
         if str(payload.get("current_status") or "").strip() != "worktree_ready":
             continue
+        event_session_token_ref = str(
+            payload.get("session_token_ref") or ""
+        ).strip()
+        if (
+            not active_session_token_ref
+            or event_session_token_ref != active_session_token_ref
+        ):
+            continue
+        if str(payload.get("worker_id") or "").strip() != expected_worker_id:
+            continue
+        if str(
+            payload.get("worker_slot_id") or payload.get("worker_id") or ""
+        ).strip() != expected_worker_slot_id:
+            continue
+        if str(payload.get("fence_token_hash") or "").strip() != (
+            expected_fence_token_hash
+        ):
+            continue
         event_backlog_id = str(
             event.get("backlog_id") or payload.get("backlog_id") or ""
         ).strip()
@@ -22457,6 +22493,9 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             else {}
         )
         route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
+        marker_contract_execution_id = str(
+            contract_runtime_failed_qa.get("contract_execution_id") or ""
+        ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
             "source": "accepted_runtime_context_rejoin_event",
@@ -22476,6 +22515,24 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             "route_token_ref": route_token_ref,
             "route_identity_rebound": bool(payload.get("route_identity_rebound")),
             "evidence_backfill": False,
+            "session_token_ref_rotation": {
+                "schema_version": (
+                    "contract_runtime.failed_qa_rejoin_session_ref_rotation.v1"
+                ),
+                "source": "accepted_runtime_context_rejoin_event",
+                "server_derived": True,
+                "revision_event_ref": f"timeline:{event_id}",
+                "contract_execution_id": marker_contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_id": expected_worker_id,
+                "worker_slot_id": expected_worker_slot_id,
+                "target_project_root": expected_target_project_root,
+                "fence_token_hash": expected_fence_token_hash,
+                "active_session_token_ref": active_session_token_ref,
+                "raw_session_tokens_persisted": False,
+            },
         }
     return {}
 
