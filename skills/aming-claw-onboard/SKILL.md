@@ -113,6 +113,15 @@ instructions.
   never start a concurrent retry. If an unready AI provider leaves the candidate
   running, first confirm it is the same run, then have the observer stop it
   through a manager-owned redeploy and issue exactly one non-AI retry.
+- If bounded QA receives
+  `non_descendant_candidate_requires_exact_candidate_snapshot` (or another
+  unsafe-overlay reason), the observer must call
+  `graph_current_full_reconcile` with `activate=false`, the exact clean worker
+  `project_root`, and that worktree's full HEAD. Use the returned
+  `candidate_snapshot_id` in the same QA session's next `graph_query`. This is
+  a non-activating pre-QA candidate build: it is not merge/redeploy/reconcile
+  evidence and must not be used to advance the active graph. After QA and
+  merge, run the ordinary activated current-full path separately.
 - For post-merge current-full route proof, the submitted `task_id` or
   `contract_execution_id` must exactly match the selected observer
   `route_token_ref` server-registered task scope. A parent observer ref uses its

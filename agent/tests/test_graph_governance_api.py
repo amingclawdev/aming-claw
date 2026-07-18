@@ -2725,6 +2725,30 @@ def test_current_full_reconcile_accepts_observer_route_token_proof(
 
     assert status == 201
     assert result["current_full_reconcile"] is True
+    assert result["candidate_only"] is True
+    assert result["exact_candidate_snapshot"] is True
+    assert result["candidate_snapshot_id"] == "full-current"
+    assert result["activated"] is False
+    assert result["next_action"] == {
+        "schema_version": "graph_exact_candidate_snapshot.next_action.v1",
+        "action": "qa_graph_query_exact_candidate_snapshot",
+        "description": (
+            "Retry the bounded independent QA graph query with this exact "
+            "candidate snapshot; do not activate it or reuse an older trace."
+        ),
+        "tool": "graph_query",
+        "request": {
+            "snapshot_id": "full-current",
+            "commit_sha": head,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+        },
+        "candidate_only": True,
+        "activates_graph": False,
+        "raw_qa_session_token_persisted": False,
+    }
+    assert "timeline_event_recorded" not in result
+    assert "current_full_reconcile_provenance" not in result
     assert calls[0]["commit_sha"] == head
     assert calls[0]["activate"] is False
 
@@ -53110,6 +53134,32 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "current_full_reconcile_contract_merge_authority_required"
     )
     assert wrong_commit.value.details["fail_closed"] is True
+
+    candidate_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={
+            "backlog_id": context.backlog_id,
+            "task_id": task_id,
+        },
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": context.backlog_id,
+                "task_id": task_id,
+            },
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha="f" * 40,
+        candidate_only=True,
+    )
+    assert candidate_scope["candidate_only"] is True
+    assert candidate_scope["post_merge_reconcile_authority_required"] is False
+    assert "contract_merge_authority" not in candidate_scope
+    assert candidate_scope["runtime_context_id"] == runtime_context_id
 
     snapshot_id = "full-contract-runtime-merge-authority"
     _activate_basic_graph(

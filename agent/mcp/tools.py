@@ -2779,7 +2779,10 @@ TOOLS: list[dict] = [
             "calls use observer_session_id with exactly one of "
             "observer_route_token_ref or route_token_ref plus backlog_id and "
             "task_id/contract_execution_id; failures return public-safe "
-            "route_proof_diagnostics and never require raw route tokens."
+            "route_proof_diagnostics and never require raw route tokens. "
+            "For pre-QA non-descendant review, pass an explicit clean "
+            "project_root with activate=false to build a non-activated exact "
+            "candidate snapshot."
         ),
         "inputSchema": {
             "type": "object",
@@ -2790,6 +2793,19 @@ TOOLS: list[dict] = [
                 "run_id": {"type": "string"},
                 "snapshot_id": {"type": "string"},
                 "expected_old_snapshot_id": {"type": "string"},
+                "project_root": {
+                    "type": "string",
+                    "description": (
+                        "Explicit clean git worktree root. Use with activate=false "
+                        "to materialize an exact candidate snapshot for bounded QA."
+                    ),
+                },
+                "worktree_path": {
+                    "type": "string",
+                    "description": "Alias for project_root on candidate-only builds.",
+                },
+                "ref_name": {"type": "string"},
+                "branch_ref": {"type": "string"},
                 "actor": {"type": "string"},
                 "backlog_id": {"type": "string"},
                 "bug_id": {"type": "string", "description": "Alias for backlog_id."},

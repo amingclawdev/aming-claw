@@ -479,6 +479,10 @@ def test_mcp_graph_current_full_reconcile_schema_exposes_route_proof_fields():
         "observer_session_id",
         "observer_route_token_ref",
         "route_token_ref",
+        "project_root",
+        "worktree_path",
+        "ref_name",
+        "branch_ref",
     ):
         assert key in props
 
@@ -489,6 +493,10 @@ def test_mcp_graph_current_full_reconcile_schema_exposes_route_proof_fields():
         "description"
     ]
     assert props["route_token_ref"]["description"] == "Alias for observer_route_token_ref."
+    assert "activate=false" in props["project_root"]["description"]
+    assert props["worktree_path"]["description"] == (
+        "Alias for project_root on candidate-only builds."
+    )
 
 
 def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
@@ -506,6 +514,8 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
             "contract_execution_id": "cex-current-full",
             "observer_session_id": "obs-current-full",
             "observer_route_token_ref": "rtok-current-full",
+            "project_root": "/tmp/ac-candidate",
+            "ref_name": "refs/heads/codex/ac-candidate",
         },
     )
 
@@ -521,6 +531,8 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
                 "contract_execution_id": "cex-current-full",
                 "observer_session_id": "obs-current-full",
                 "observer_route_token_ref": "rtok-current-full",
+                "project_root": "/tmp/ac-candidate",
+                "ref_name": "refs/heads/codex/ac-candidate",
             },
         )
     ]

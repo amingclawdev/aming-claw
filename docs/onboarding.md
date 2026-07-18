@@ -347,6 +347,16 @@ independent QA, branch-service validation on canonical governance port when
 runtime code changed, merge or redeploy, full graph reconcile, and protected
 backlog close.
 
+When a bounded QA graph query rejects a non-descendant or otherwise unsafe
+candidate overlay and requires an exact candidate snapshot, do not reuse an old
+trace and do not make QA build or activate the graph. The observer calls
+`graph_current_full_reconcile` with `activate=false`, the exact clean worker
+`project_root`, and that worktree's full HEAD. The returned
+`candidate_snapshot_id` is supplied to the same bounded QA session's next
+`graph_query`. This pre-QA candidate build never advances the active graph and
+does not count as merge, redeploy, or post-merge reconcile evidence; run the
+ordinary activated current-full reconcile only after QA and merge.
+
 The normal worker order is:
 
 1. Read the worker guide and confirm the next legal action. A fresh worker

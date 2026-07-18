@@ -30854,6 +30854,32 @@ def _candidate_snapshot_finalize_guidance(
     }
 
 
+def _exact_candidate_snapshot_qa_retry_guidance(
+    *,
+    snapshot_id: str,
+    target_commit_sha: str,
+) -> dict[str, Any]:
+    """Return the copy-safe next step for bounded QA exact-snapshot review."""
+    return {
+        "schema_version": "graph_exact_candidate_snapshot.next_action.v1",
+        "action": "qa_graph_query_exact_candidate_snapshot",
+        "description": (
+            "Retry the bounded independent QA graph query with this exact "
+            "candidate snapshot; do not activate it or reuse an older trace."
+        ),
+        "tool": "graph_query",
+        "request": {
+            "snapshot_id": str(snapshot_id or ""),
+            "commit_sha": str(target_commit_sha or ""),
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+        },
+        "candidate_only": True,
+        "activates_graph": False,
+        "raw_qa_session_token_persisted": False,
+    }
+
+
 def _graph_stale_scope_operation(
     project_id: str,
     *,
@@ -34894,8 +34920,16 @@ def _current_full_reconcile_runtime_context_scope(
     body: Mapping[str, Any],
     auth: Mapping[str, Any],
     target_commit_sha: str,
+    candidate_only: bool = False,
 ) -> dict[str, Any]:
-    """Resolve current-full runtime provenance from persisted branch identity."""
+    """Resolve current-full runtime provenance from persisted branch identity.
+
+    A non-activated full snapshot may be materialized before QA so an exact
+    branch candidate can be reviewed when a canonical-base overlay is unsafe.
+    That candidate-only operation is not a merge or a post-merge reconcile, so
+    it must not require (or claim) durable merge authority.  Activated
+    current-full reconcile keeps the stricter post-merge authority gate.
+    """
 
     body_scope = _contract_timeline_scope_from_graph_body(body)
     route_scope = (
@@ -35122,7 +35156,7 @@ def _current_full_reconcile_runtime_context_scope(
         )
     )
     contract_merge_authority: dict[str, Any] = {}
-    if successor_contract_kind == "mf_parallel":
+    if successor_contract_kind == "mf_parallel" and not candidate_only:
         contract_merge_authority = (
             _current_full_reconcile_contract_merge_authority(
                 conn,
@@ -35132,7 +35166,11 @@ def _current_full_reconcile_runtime_context_scope(
                 contract_record=contract_record,
             )
         )
-    if successor_contract_kind == "mf_parallel" and not contract_merge_authority:
+    if (
+        successor_contract_kind == "mf_parallel"
+        and not candidate_only
+        and not contract_merge_authority
+    ):
         raise GovernanceError(
             "current_full_reconcile_contract_merge_authority_required",
             (
@@ -35176,6 +35214,13 @@ def _current_full_reconcile_runtime_context_scope(
         "source": "parallel_branch_runtime_context",
         "server_derived": True,
     }
+    if candidate_only:
+        result.update(
+            {
+                "candidate_only": True,
+                "post_merge_reconcile_authority_required": False,
+            }
+        )
     if contract_merge_authority:
         result["contract_merge_authority"] = contract_merge_authority
     return result
@@ -35608,16 +35653,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
             }
 
+        activate_requested = bool(body.get("activate", True))
         runtime_context_scope = _current_full_reconcile_runtime_context_scope(
             conn,
             project_id=project_id,
             body=body,
             auth=current_full_auth,
             target_commit_sha=target_commit,
+            candidate_only=not activate_requested,
         )
         semantic_use_ai = _semantic_use_ai_from_body(body)
         semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
-        activate_requested = bool(body.get("activate", True))
         notes_extra = (
             dict(body.get("notes_extra"))
             if isinstance(body.get("notes_extra"), Mapping)
@@ -35713,6 +35759,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             else:
                 result["activated"] = False
                 result.setdefault("candidate_only", True)
+                candidate_snapshot_id = _current_full_reconcile_snapshot_id(
+                    result
+                )
+                result["candidate_snapshot_id"] = candidate_snapshot_id
+                result["exact_candidate_snapshot"] = True
+                result["next_action"] = (
+                    _exact_candidate_snapshot_qa_retry_guidance(
+                        snapshot_id=candidate_snapshot_id,
+                        target_commit_sha=target_commit,
+                    )
+                )
             from .parallel_branch_runtime import (
                 record_merge_queue_graph_epoch_after_reconcile,
             )
@@ -35736,14 +35793,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     now_iso=_utc_now(),
                 )
             )
-            timeline_event = _record_pending_scope_reconcile_contract_event(
-                conn,
-                project_id=project_id,
-                body=body,
-                result=result,
-                target_commit_sha=target_commit,
-                runtime_context_scope=runtime_context_scope,
-            )
+            if activate_requested:
+                timeline_event = _record_pending_scope_reconcile_contract_event(
+                    conn,
+                    project_id=project_id,
+                    body=body,
+                    result=result,
+                    target_commit_sha=target_commit,
+                    runtime_context_scope=runtime_context_scope,
+                )
+            else:
+                timeline_event = {}
             if timeline_event:
                 result["timeline_event_recorded"] = {
                     "id": timeline_event.get("id"),
