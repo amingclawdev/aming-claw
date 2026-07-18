@@ -44441,12 +44441,13 @@ def _record_backlog_close_blocked_event(
         body.get("contract_execution_id")
         or _onboard_service_execution_id(project_id, backlog_id)
     ).strip()
-    next_action = _backlog_close_direct_fix_next_action(
+    next_action = _backlog_close_audited_bypass_next_action(
         project_id=project_id,
         backlog_id=backlog_id,
         parent_contract_execution_id=parent_execution_id,
         route_token_ref=str(route_gate.get("route_token_ref") or ""),
         blocked_gate=gate_error.code,
+        close_commit=commit_sha,
     )
     payload = {
         "schema_version": "backlog_close.blocked_projection.v1",
@@ -44513,13 +44514,14 @@ def _record_backlog_close_blocked_event(
         },
         commit_sha=commit_sha,
     )
-    payload["next_legal_action"] = _backlog_close_direct_fix_next_action(
+    payload["next_legal_action"] = _backlog_close_audited_bypass_next_action(
         project_id=project_id,
         backlog_id=backlog_id,
         parent_contract_execution_id=parent_execution_id,
         blocked_event_id=int(event.get("id") or 0),
         route_token_ref=str(route_gate.get("route_token_ref") or ""),
         blocked_gate=gate_error.code,
+        close_commit=commit_sha,
     )
     event["payload"] = payload
     try:
@@ -47783,6 +47785,16 @@ def _runtime_next_action_from_guide(
         "blocked_by_line",
         "blocked_next_action",
         "body",
+        "interface",
+        "mutation_required",
+        "diagnostic_required",
+        "diagnostic_backlog_id",
+        "no_pass_claim",
+        "source_row_must_remain_open",
+        "direct_fix_required",
+        "audited_bypass_continuation",
+        "current_line_blocker_policy",
+        "original_contract_action",
         "child_route_token_required",
         "endpoint",
         "mode",
@@ -48181,7 +48193,7 @@ def _backlog_close_route_gate_is_source_backed(route_gate: Mapping[str, Any]) ->
     )
 
 
-def _backlog_close_direct_fix_next_action(
+def _backlog_close_audited_bypass_next_action(
     *,
     project_id: str,
     backlog_id: str,
@@ -48189,78 +48201,80 @@ def _backlog_close_direct_fix_next_action(
     blocked_event_id: int = 0,
     route_token_ref: str = "",
     blocked_gate: str = "mf_timeline_gate_failed",
+    close_commit: str = "",
 ) -> dict[str, Any]:
     parent_execution_id = str(parent_contract_execution_id or "").strip()
     if not parent_execution_id:
         return {}
     blocker_id = str(blocked_gate or "").strip() or "mf_timeline_gate_failed"
-    successor_execution_id = _direct_fix_successor_execution_id(
-        project_id,
-        backlog_id,
-        parent_execution_id,
-    )
-    return_to_parent = {
-        "schema_version": "direct_fix.return_to_parent_projection.v1",
+    blocker_ref = f"timeline:{blocked_event_id}" if blocked_event_id else ""
+    continuation = {
+        "schema_version": "backlog_close.audited_bypass_continuation.v1",
+        "status": "proceeded_with_exception",
+        "disposition": "completed_with_exception",
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "backlog_close_not_satisfied": True,
         "parent_contract_execution_id": parent_execution_id,
-        "return_to_stage_id": "backlog_close",
-        "return_to_line_id": "backlog_close",
         "blocked_gate": blocker_id,
         "latest_timeline_event_id": blocked_event_id,
-        "parent_close_gate_recheck_required": True,
-        "child_must_not_write_parent_close_evidence": True,
+        "blocker_event_ref": blocker_ref,
+        "retry_backlog_close_after_repair": True,
+        "direct_fix_required": False,
     }
     body = {
         "backlog_id": backlog_id,
-        "parent_contract_execution_id": parent_execution_id,
-        "contract_execution_id": successor_execution_id,
-        "reason": (
-            "Repair authoritative backlog_close close-gate blockers and "
-            "return to parent."
-        ),
-        "blocked_successor_entry": {
-            "status": "blocked",
-            "blocked_successor_contract_id": "backlog_close",
-            "blocker_id": blocker_id,
-            "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-            "recommended_next_action": "enter_direct_fix_successor",
-            "latest_timeline_event_id": blocked_event_id,
-        },
-        "return_to_parent": return_to_parent,
+        "contract_execution_id": parent_execution_id,
+        "blocked_gate": blocker_id,
+        "blocker_event_ref": blocker_ref,
+        "decision": "continue_with_audited_bypass",
+        "disposition": "completed_with_exception",
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
     }
+    if close_commit:
+        body["close_commit"] = close_commit
+        continuation["close_commit"] = close_commit
     if route_token_ref:
         body["route_token_ref"] = route_token_ref
+        continuation["route_token_ref"] = route_token_ref
     return {
         "schema_version": "backlog_contract_chain.next_action.v1",
-        "id": "direct_fix_successor",
-        "action": "enter_direct_fix_successor",
-        "mode": "resume_blocked_contract",
+        "id": "backlog_close_audited_bypass",
+        "action": "continue_with_audited_bypass",
+        "mode": "complete_with_exception",
         "source": "task_timeline.backlog_close_blocked",
         "precedence": "authoritative_backlog_close_blocker",
         "project_id": project_id,
         "backlog_id": backlog_id,
-        "stage_id": "blocked",
-        "line_id": "direct_fix_successor",
+        "stage_id": "backlog_close",
+        "line_id": "backlog_close_audited_bypass",
         "owner_role": "observer",
         "allowed_writer_roles": ["observer"],
-        "evidence_kind": "blocked_backlog_close_gate",
-        "status": "blocked",
-        "required": True,
-        "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-        "recommended_successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-        "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-        "successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
+        "evidence_kind": "backlog_close_completed_with_exception",
+        "status": "proceeded_with_exception",
+        "required": False,
+        "mutation_required": False,
+        "interface": "authoritative_backlog_close_blocked_event",
         "parent_contract_execution_id": parent_execution_id,
-        "successor_contract_execution_id": successor_execution_id,
-        "requires_route_token_ref": True,
-        "child_route_token_required": True,
-        "endpoint": f"/api/projects/{project_id}/direct-fix/enter",
+        "contract_runtime_complete": True,
+        "current_line_bypass_applicable": False,
+        "current_line_bypass_unavailable_reason": (
+            "parent ContractRuntime is complete; backlog_close is not a ContractRuntime line"
+        ),
+        "diagnostic_required": True,
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "requires_route_token_ref": False,
+        "direct_fix_required": False,
         "body": body,
-        "return_to_parent": return_to_parent,
+        "audited_bypass_continuation": continuation,
         "latest_timeline_event_id": blocked_event_id,
-        "next_operator_action": "enter_direct_fix_successor",
+        "next_operator_action": "continue_with_audited_bypass",
         "block_reason": (
             "authoritative backlog_close reported close-gate blockers after a "
-            "source-backed close attempt"
+            "source-backed close attempt; keep the row OPEN and continue without "
+            "claiming PASS, close_ready, or FIXED"
         ),
         "meta_contract_gate_decision_source": False,
     }
@@ -48342,7 +48356,7 @@ def _contract_chain_current_with_backlog_close_blocker(
         or _onboard_service_execution_id(project_id, backlog_id)
     )
     blocked_gate = str(payload.get("blocked_gate") or "").strip()
-    action = _backlog_close_direct_fix_next_action(
+    action = _backlog_close_audited_bypass_next_action(
         project_id=project_id,
         backlog_id=backlog_id,
         parent_contract_execution_id=parent_execution_id,
@@ -48350,6 +48364,7 @@ def _contract_chain_current_with_backlog_close_blocker(
         route_token_ref=route_token_ref
         or str(payload.get("route_token_ref") or "").strip(),
         blocked_gate=blocked_gate,
+        close_commit=str(payload.get("close_commit") or ""),
     )
     if not action:
         return current
@@ -48359,12 +48374,12 @@ def _contract_chain_current_with_backlog_close_blocker(
             "current_contract_execution_id": parent_execution_id,
             "parent_to_resume_contract_execution_id": "",
             "active_child_contract_execution_id": "",
-            "readiness_state": "blocked",
+            "readiness_state": "completed_with_exception",
             "next_legal_action": dict(action),
             "source_of_proof": "task_timeline.backlog_close_blocked",
             "blocked_parent_state": {
                 "schema_version": "backlog_contract_chain.blocked_parent_state.v1",
-                "status": "blocked",
+                "status": "proceeded_with_exception",
                 "source": "authoritative_backlog_close",
                 "event_ref": f"timeline:{event.get('id')}",
                 "event_kind": str(event.get("event_kind") or ""),
@@ -48383,6 +48398,9 @@ def _contract_chain_current_with_backlog_close_blocker(
                 ),
                 "close_commit": str(payload.get("close_commit") or ""),
                 "route_token_ref": str(payload.get("route_token_ref") or ""),
+                "no_pass_claim": True,
+                "source_row_must_remain_open": True,
+                "direct_fix_required": False,
             },
             "shadowed_current_projection": {
                 "readiness_state": str(current.get("readiness_state") or ""),
@@ -58592,7 +58610,7 @@ def _onboard_runtime_resume_is_complete(runtime_resume: Mapping[str, Any]) -> bo
     ).strip()
 
 
-def _onboard_direct_fix_next_action_from_runtime(
+def _onboard_blocked_next_action_from_runtime(
     *,
     project_id: str,
     backlog_id: str,
@@ -58602,14 +58620,30 @@ def _onboard_direct_fix_next_action_from_runtime(
     next_action = guide.get("next_legal_action")
     if not isinstance(next_action, Mapping):
         return {}
-    if str(next_action.get("status") or "") != "blocked":
-        return {}
-    if str(next_action.get("recommended_successor_contract_id") or "") != DIRECT_FIX_CONTRACT_ID:
-        return {}
+    is_audited_bypass = (
+        str(next_action.get("action") or "") == "continue_with_audited_bypass"
+        and str(next_action.get("status") or "") == "proceeded_with_exception"
+    )
+    if not is_audited_bypass:
+        if str(next_action.get("status") or "") != "blocked":
+            return {}
+        if (
+            str(next_action.get("recommended_successor_contract_id") or "")
+            != DIRECT_FIX_CONTRACT_ID
+        ):
+            return {}
     projected = dict(next_action)
     projected.setdefault("schema_version", "onboard_route_guide.next_action.v1")
-    projected.setdefault("id", "resume_blocked_contract_chain")
-    projected.setdefault("mode", "resume_blocked_contract")
+    projected.setdefault(
+        "id",
+        "continue_blocked_contract_with_audited_bypass"
+        if is_audited_bypass
+        else "resume_blocked_contract_chain",
+    )
+    projected.setdefault(
+        "mode",
+        "resume_original_contract" if is_audited_bypass else "resume_blocked_contract",
+    )
     projected.setdefault("source", "contract_runtime_blocked_projection")
     projected.setdefault("precedence", "backlog_bound_contract_chain")
     projected.setdefault("backlog_id", backlog_id)
@@ -58621,7 +58655,7 @@ def _onboard_direct_fix_next_action_from_runtime(
     return projected
 
 
-def _onboard_direct_fix_next_action_from_ledger_row(
+def _onboard_blocked_next_action_from_ledger_row(
     *,
     project_id: str,
     backlog_id: str,
@@ -58633,72 +58667,77 @@ def _onboard_direct_fix_next_action_from_ledger_row(
     parent_execution_id = str(row.get("contract_execution_id") or "").strip()
     if not parent_execution_id:
         return {}
-    successor_execution_id = _direct_fix_successor_execution_id(
-        project_id,
-        backlog_id,
-        parent_execution_id,
-    )
     latest_event_id = int(row.get("latest_event_id") or 0)
-    return_to_parent = {
-        "schema_version": "direct_fix.return_to_parent_projection.v1",
+    latest_event_ref = f"timeline:{latest_event_id}" if latest_event_id else ""
+    blocked_next = (
+        row.get("next_legal_action")
+        if isinstance(row.get("next_legal_action"), Mapping)
+        else {}
+    )
+    blocked_gate = str(
+        blocked_next.get("evidence_kind")
+        or row.get("latest_event_kind")
+        or ""
+    )
+    continuation = {
+        "schema_version": "contract_runtime.audited_bypass_continuation.v1",
+        "status": "proceeded_with_exception",
+        "disposition": "resume_original_contract",
         "parent_contract_execution_id": parent_execution_id,
-        "contract_chain_id": "",
-        "return_to_stage_id": "",
-        "return_to_line_id": "",
-        "blocked_gate": str(
-            (
-                row.get("next_legal_action")
-                if isinstance(row.get("next_legal_action"), Mapping)
-                else {}
-            ).get("evidence_kind")
-            or row.get("latest_event_kind")
-            or ""
-        ),
+        "blocked_gate": blocked_gate,
         "latest_timeline_event_id": latest_event_id,
-        "parent_close_gate_recheck_required": True,
-        "child_must_not_write_parent_close_evidence": True,
+        "blocker_event_ref": latest_event_ref,
+        "diagnostic_required": True,
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "direct_fix_required": False,
     }
     body = {
         "backlog_id": backlog_id,
-        "parent_contract_execution_id": parent_execution_id,
-        "contract_execution_id": successor_execution_id,
-        "reason": "Repair blocked backlog-bound contract chain and return to parent.",
-        "return_to_parent": return_to_parent,
+        "contract_execution_id": parent_execution_id,
+        "blocked_gate": blocked_gate,
+        "blocker_event_ref": latest_event_ref,
+        "decision": "continue_with_audited_bypass",
+        "disposition": "resume_original_contract",
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
     }
     if route_token_ref:
         body["route_token_ref"] = route_token_ref
     return {
         "schema_version": "onboard_route_guide.next_action.v1",
-        "id": "resume_blocked_contract_chain",
-        "action": "enter_direct_fix_successor",
-        "mode": "resume_blocked_contract",
+        "id": "continue_blocked_contract_with_audited_bypass",
+        "action": "continue_with_audited_bypass",
+        "mode": "resume_original_contract",
         "source": "task_timeline_compact_ledger",
         "precedence": "backlog_bound_contract_chain",
         "project_id": project_id,
         "backlog_id": backlog_id,
-        "stage_id": "blocked",
-        "line_id": "direct_fix_successor",
+        "stage_id": str(blocked_next.get("stage_id") or "blocked"),
+        "line_id": str(blocked_next.get("line_id") or "audited_bypass_continuation"),
         "owner_role": "observer",
         "allowed_writer_roles": ["observer"],
-        "status": "blocked",
-        "required": True,
-        "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-        "recommended_successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-        "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-        "successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
+        "status": "proceeded_with_exception",
+        "required": False,
+        "mutation_required": False,
+        "diagnostic_required": True,
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "direct_fix_required": False,
         "parent_contract_execution_id": parent_execution_id,
-        "successor_contract_execution_id": successor_execution_id,
-        "requires_route_token_ref": True,
-        "child_route_token_required": True,
-        "endpoint": f"/api/projects/{project_id}/direct-fix/enter",
+        "requires_route_token_ref": False,
+        "interface": "onboard_route_guide",
         "body": body,
-        "return_to_parent": return_to_parent,
+        "audited_bypass_continuation": continuation,
         "blocker_summary": dict(row.get("blocker_summary") or {}),
         "latest_timeline_event_id": latest_event_id,
-        "next_operator_action": "enter_direct_fix_successor",
+        "next_operator_action": (
+            "file_open_diagnostic_then_continue_original_contract"
+        ),
         "block_reason": (
-            "timeline compact ledger marks this backlog row blocked; enter a "
-            "direct_fix successor or recover the parent runtime before continuing"
+            "timeline compact ledger marks this backlog row blocked; retain the "
+            "OPEN diagnostic and continue the original contract without claiming "
+            "PASS, close_ready, or FIXED"
         ),
         "legacy_onboard_contract_waived": True,
         "meta_contract_gate_decision_source": False,
@@ -58773,16 +58812,20 @@ def _onboard_blocked_contract_resume_projection(
                     "next_legal_action": next_action,
                     "successor_return": dict(successor_return),
                 }
-            next_action = _onboard_direct_fix_next_action_from_runtime(
+            next_action = _onboard_blocked_next_action_from_runtime(
                 project_id=project_id,
                 backlog_id=backlog_id,
                 record=projected,
             )
             if next_action:
+                resume_status = str(next_action.get("status") or "blocked")
+                resume_mode = str(
+                    next_action.get("mode") or "resume_blocked_contract"
+                )
                 return {
                     "schema_version": "onboard_route_guide.runtime_resume.v1",
-                    "status": "blocked",
-                    "mode": "resume_blocked_contract",
+                    "status": resume_status,
+                    "mode": resume_mode,
                     "source": "onboard_route_guide_service_parent",
                     "project_id": project_id,
                     "backlog_id": backlog_id,
@@ -58810,16 +58853,18 @@ def _onboard_blocked_contract_resume_projection(
             record=record,
             actor_role=actor_role or "observer",
         )
-        next_action = _onboard_direct_fix_next_action_from_runtime(
+        next_action = _onboard_blocked_next_action_from_runtime(
             project_id=project_id,
             backlog_id=backlog_id,
             record=projected,
         )
         if next_action:
+            resume_status = str(next_action.get("status") or "blocked")
+            resume_mode = str(next_action.get("mode") or "resume_blocked_contract")
             return {
                 "schema_version": "onboard_route_guide.runtime_resume.v1",
-                "status": "blocked",
-                "mode": "resume_blocked_contract",
+                "status": resume_status,
+                "mode": resume_mode,
                 "source": "contract_runtime_store",
                 "project_id": project_id,
                 "backlog_id": backlog_id,
@@ -58849,7 +58894,7 @@ def _onboard_blocked_contract_resume_projection(
             continue
         if str(row.get("backlog_id") or "") != backlog_id:
             continue
-        next_action = _onboard_direct_fix_next_action_from_ledger_row(
+        next_action = _onboard_blocked_next_action_from_ledger_row(
             project_id=project_id,
             backlog_id=backlog_id,
             row=row,
@@ -58858,8 +58903,10 @@ def _onboard_blocked_contract_resume_projection(
         if next_action:
             return {
                 "schema_version": "onboard_route_guide.runtime_resume.v1",
-                "status": "blocked",
-                "mode": "resume_blocked_contract",
+                "status": str(next_action.get("status") or "blocked"),
+                "mode": str(
+                    next_action.get("mode") or "resume_blocked_contract"
+                ),
                 "source": "task_timeline_compact_ledger",
                 "project_id": project_id,
                 "backlog_id": backlog_id,
@@ -58899,7 +58946,7 @@ def _onboard_blocked_contract_resume_projection(
                 "blockers": blockers,
             },
         }
-        next_action = _onboard_direct_fix_next_action_from_ledger_row(
+        next_action = _onboard_blocked_next_action_from_ledger_row(
             project_id=project_id,
             backlog_id=backlog_id,
             row=row,
@@ -58908,8 +58955,10 @@ def _onboard_blocked_contract_resume_projection(
         if next_action:
             return {
                 "schema_version": "onboard_route_guide.runtime_resume.v1",
-                "status": "blocked",
-                "mode": "resume_blocked_contract",
+                "status": str(next_action.get("status") or "blocked"),
+                "mode": str(
+                    next_action.get("mode") or "resume_blocked_contract"
+                ),
                 "source": "task_timeline_compact_ledger",
                 "project_id": project_id,
                 "backlog_id": backlog_id,
@@ -61902,6 +61951,164 @@ def _contract_runtime_successor_complete(
     return _runtime_record_is_complete(successor)
 
 
+def _contract_runtime_audited_bypass_next_action(
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    blocked_line: Mapping[str, Any],
+    fallback: Mapping[str, Any],
+) -> dict[str, Any]:
+    parent_execution_id = str(record.get("contract_execution_id") or "").strip()
+    blocked_payload = (
+        blocked_line.get("payload")
+        if isinstance(blocked_line.get("payload"), Mapping)
+        else {}
+    )
+    blocked_refs = (
+        blocked_line.get("artifact_refs")
+        if isinstance(blocked_line.get("artifact_refs"), Mapping)
+        else {}
+    )
+    blocked_by_line = {
+        "stage_id": str(blocked_line.get("stage_id") or ""),
+        "line_id": str(blocked_line.get("line_id") or ""),
+        "actor_role": str(blocked_line.get("actor_role") or ""),
+        "evidence_kind": str(blocked_line.get("evidence_kind") or ""),
+        "payload": dict(blocked_payload),
+        "artifact_refs": dict(blocked_refs),
+    }
+    diagnostic_backlog_id = str(
+        blocked_payload.get("diagnostic_backlog_id")
+        or blocked_payload.get("filed_backlog_id")
+        or blocked_payload.get("blocker_backlog_id")
+        or ""
+    ).strip()
+    continuation = {
+        "schema_version": "contract_runtime.audited_bypass_continuation.v1",
+        "status": "proceeded_with_exception",
+        "disposition": "resume_original_contract",
+        "parent_contract_execution_id": parent_execution_id,
+        "blocked_by_line": blocked_by_line,
+        "diagnostic_required": True,
+        "diagnostic_backlog_id": diagnostic_backlog_id,
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "direct_fix_required": False,
+    }
+    if not fallback:
+        return {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "contract_runtime_completed_with_exception",
+            "action": "continue_with_audited_bypass",
+            "mode": "complete_with_exception",
+            "source": "completed_blocked_line_audited_bypass",
+            "precedence": "contract_runtime_completed_blocker",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": parent_execution_id,
+            "stage_id": "contract_complete",
+            "line_id": "contract_runtime_completed_with_exception",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "contract_runtime_completed_with_exception",
+            "status": "proceeded_with_exception",
+            "required": False,
+            "mutation_required": False,
+            "diagnostic_required": True,
+            "diagnostic_backlog_id": diagnostic_backlog_id,
+            "no_pass_claim": True,
+            "source_row_must_remain_open": True,
+            "direct_fix_required": False,
+            "blocked_by_line": blocked_by_line,
+            "audited_bypass_continuation": continuation,
+            "next_operator_action": "retain_open_diagnostic",
+            "block_reason": (
+                "the completed ContractRuntime recorded a blocked exception; retain "
+                "the diagnostic OPEN without claiming PASS, close_ready, or FIXED"
+            ),
+        }
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    safe_copy = (
+        guide.get("writer_role_safe_copy_payload")
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        safe_copy.get("copy_payload")
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    body = dict(copy_payload)
+    body.setdefault("project_id", project_id)
+    body.setdefault("backlog_id", backlog_id)
+    body.setdefault("contract_execution_id", parent_execution_id)
+    body.setdefault("stage_id", str(fallback.get("stage_id") or ""))
+    body.setdefault("line_id", str(fallback.get("line_id") or ""))
+    body.setdefault("evidence_kind", str(fallback.get("evidence_kind") or ""))
+    original_action = str(fallback.get("action") or "").strip()
+    if not original_action:
+        evidence_kind = str(fallback.get("evidence_kind") or "").strip()
+        original_action = (
+            f"record_{evidence_kind}" if evidence_kind else "record_contract_line"
+        )
+    return {
+        "schema_version": "contract_runtime_next_legal_action.v1",
+        "id": str(fallback.get("id") or fallback.get("line_id") or ""),
+        "action": "continue_with_audited_bypass",
+        "mode": "resume_original_contract",
+        "source": "completed_blocked_line_audited_bypass",
+        "precedence": "contract_runtime_first_missing_line",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": parent_execution_id,
+        "stage_id": str(fallback.get("stage_id") or ""),
+        "line_id": str(fallback.get("line_id") or ""),
+        "owner_role": str(fallback.get("owner_role") or ""),
+        "allowed_writer_roles": list(fallback.get("allowed_writer_roles") or []),
+        "evidence_kind": str(fallback.get("evidence_kind") or ""),
+        "status": "proceeded_with_exception",
+        "required": bool(fallback.get("required", True)),
+        "mutation_required": True,
+        "interface": "contract_runtime_submit_line",
+        "endpoint": (
+            f"/api/projects/{project_id}/contract-runtime/"
+            f"{parent_execution_id}/line-writes"
+        ),
+        "body": body,
+        "original_contract_action": original_action,
+        "diagnostic_required": True,
+        "diagnostic_backlog_id": diagnostic_backlog_id,
+        "no_pass_claim": True,
+        "source_row_must_remain_open": True,
+        "direct_fix_required": False,
+        "blocked_by_line": blocked_by_line,
+        "audited_bypass_continuation": continuation,
+        "current_line_blocker_policy": {
+            "action": "contract_runtime_bypass_line",
+            "interface": "contract_runtime_bypass_line",
+            "endpoint": (
+                f"/api/projects/{project_id}/contract-runtime/"
+                f"{parent_execution_id}/line-bypasses"
+            ),
+            "use_only_if_current_missing_line_blocks": True,
+            "reuse_existing_open_diagnostic": True,
+            "source_row_must_remain_open": True,
+            "no_pass_claim": True,
+        },
+        "next_operator_action": "submit_original_contract_next_line",
+        "block_reason": (
+            "the previous completed line recorded a blocker; keep its diagnostic "
+            "OPEN and continue the original contract at the first missing line"
+        ),
+    }
+
+
 def _contract_runtime_blocked_successor_next_action(
     conn,
     *,
@@ -61954,48 +62161,29 @@ def _contract_runtime_blocked_successor_next_action(
             == "parent_resume_required_after_direct_fix_qa"
         ):
             return {}
-        return_to_parent = _direct_fix_return_to_parent_projection(
-            parent_record=record,
-            blocked_line=blocked_line,
+        guide = (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
         )
-        return {
-            "stage_id": "blocked",
-            "line_id": "direct_fix_successor",
-            "owner_role": "observer",
-            "allowed_writer_roles": ["observer"],
-            "evidence_kind": "blocked_contract_runtime_line",
-            "required": True,
-            "status": "blocked",
-            "mode": "resume_blocked_contract",
-            "action": "enter_direct_fix_successor",
-            "recommended_successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-            "recommended_successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-            "successor_contract_id": DIRECT_FIX_CONTRACT_ID,
-            "successor_contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-            "successor_contract_execution_id": successor_execution_id,
-            "requires_route_token_ref": True,
-            "child_route_token_required": True,
-            "endpoint": f"/api/projects/{project_id}/direct-fix/enter",
-            "body": {
-                "backlog_id": backlog_id,
-                "parent_contract_execution_id": parent_execution_id,
-                "contract_execution_id": successor_execution_id,
-                "reason": "Repair blocked parent contract gate and return to parent.",
-                "return_to_parent": return_to_parent,
-            },
-            "return_to_parent": return_to_parent,
-            "blocked_by_line": {
-                "stage_id": str(blocked_line.get("stage_id") or ""),
-                "line_id": str(blocked_line.get("line_id") or ""),
-                "actor_role": str(blocked_line.get("actor_role") or ""),
-                "evidence_kind": str(blocked_line.get("evidence_kind") or ""),
-            },
-            "next_operator_action": "enter_direct_fix_successor",
-            "block_reason": (
-                "latest completed contract line reported status=blocked and "
-                "requested an eligible direct_fix successor before continuing"
-            ),
-        }
+        fallback = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        fallback = _contract_runtime_next_rule_line_after_blocked_line(
+            conn,
+            record=record,
+            blocked_line=blocked_line,
+            fallback=fallback,
+        )
+        return _contract_runtime_audited_bypass_next_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            record=record,
+            blocked_line=blocked_line,
+            fallback=fallback,
+        )
     return {
         "stage_id": "blocked",
         "line_id": "observer_hotfix_successor",
@@ -62233,17 +62421,35 @@ def _contract_runtime_apply_blocked_projection(
             )
         )
     guide["next_legal_action"] = projected
-    guide["blocked_contract_runtime"] = {
-        "schema_version": "contract_runtime_blocked_projection.v1",
-        "status": "blocked",
-        "source": "completed_line_payload",
-        "successor_contract_id": projected["recommended_successor_contract_id"],
-        "successor_contract_template_id": projected.get(
-            "recommended_successor_contract_template_id", ""
-        ),
-        "mode": projected.get("mode", "resume_blocked_contract"),
-        "return_to_parent": projected.get("return_to_parent") or {},
-    }
+    if str(projected.get("action") or "") == "continue_with_audited_bypass":
+        guide["blocked_contract_runtime"] = {
+            "schema_version": "contract_runtime_blocked_projection.v1",
+            "status": "proceeded_with_exception",
+            "source": "completed_line_payload",
+            "mode": projected.get("mode", "resume_original_contract"),
+            "blocked_by_line": projected.get("blocked_by_line") or {},
+            "diagnostic_required": True,
+            "diagnostic_backlog_id": str(
+                projected.get("diagnostic_backlog_id") or ""
+            ),
+            "no_pass_claim": True,
+            "source_row_must_remain_open": True,
+            "direct_fix_required": False,
+        }
+    else:
+        guide["blocked_contract_runtime"] = {
+            "schema_version": "contract_runtime_blocked_projection.v1",
+            "status": "blocked",
+            "source": "completed_line_payload",
+            "successor_contract_id": projected[
+                "recommended_successor_contract_id"
+            ],
+            "successor_contract_template_id": projected.get(
+                "recommended_successor_contract_template_id", ""
+            ),
+            "mode": projected.get("mode", "resume_blocked_contract"),
+            "return_to_parent": projected.get("return_to_parent") or {},
+        }
     guide["runtime_guide_hash"] = stable_sha256(
         {key: value for key, value in guide.items() if key != "runtime_guide_hash"}
     )
@@ -69390,7 +69596,6 @@ def _contract_runtime_close_authority_projection(
         return {}
     runtime = _contract_runtime(conn)
     try:
-        runtime.current_guide(contract_execution_id, actor_role="observer")
         record = runtime.store.get(contract_execution_id)
     except ContractRuntimeError as exc:
         raise GovernanceError(
@@ -69416,7 +69621,34 @@ def _contract_runtime_close_authority_projection(
                 ),
             },
         ) from exc
-
+    if not _onboard_service_record(record):
+        try:
+            runtime.current_guide(contract_execution_id, actor_role="observer")
+            record = runtime.store.get(contract_execution_id)
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "contract_runtime_close_authority_rejected",
+                str(exc),
+                422,
+                {
+                    "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+                    "accepted": False,
+                    "source_of_authority": "contract_runtime",
+                    "authority_decision_source": (
+                        "contract_runtime_close_authority_projection"
+                    ),
+                    "contract_execution_id": contract_execution_id,
+                    "error": str(exc),
+                    "public_safe_diagnostics": (
+                        _contract_runtime_close_authority_public_diagnostics(
+                            project_id=project_id,
+                            backlog_id=bug_id,
+                            contract_execution_id=contract_execution_id,
+                            status="runtime_error",
+                        )
+                    ),
+                },
+            ) from exc
     record_project = str(record.get("project_id") or "").strip()
     record_backlog = str(record.get("backlog_id") or "").strip()
     if record_project != project_id or record_backlog != bug_id:
@@ -69528,6 +69760,7 @@ def _contract_runtime_close_authority_projection(
                     ],
                 },
             }
+        return {}
 
     try:
         record, _runtime_context_projection = (

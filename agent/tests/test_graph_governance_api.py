@@ -41671,7 +41671,9 @@ def test_onboard_route_guide_completed_projection_returns_selected_successor_ent
         )
 
 
-def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
+def test_onboard_route_guide_service_continues_blocked_candidate_with_audited_bypass(
+    conn,
+):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-RESUME-DIRECT-FIX"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     task_timeline.record_event(
@@ -41714,15 +41716,23 @@ def test_onboard_route_guide_service_resumes_blocked_direct_fix_candidate(conn):
     )
 
     next_action = result["next_legal_action"]
-    assert next_action["id"] == "resume_blocked_contract_chain"
-    assert next_action["action"] == "enter_direct_fix_successor"
-    assert next_action["recommended_successor_contract_id"] == "direct_fix"
-    assert next_action["successor_contract_template_id"] == "direct_fix.v1"
+    assert next_action["id"] == "continue_blocked_contract_with_audited_bypass"
+    assert next_action["action"] == "continue_with_audited_bypass"
+    assert next_action["status"] == "proceeded_with_exception"
+    assert next_action["mode"] == "resume_original_contract"
+    assert next_action["mutation_required"] is False
+    assert next_action["diagnostic_required"] is True
+    assert next_action["no_pass_claim"] is True
+    assert next_action["source_row_must_remain_open"] is True
+    assert next_action["direct_fix_required"] is False
     assert next_action["parent_contract_execution_id"] == (
         "cex-mf-parallel-blocked-parent"
     )
-    assert next_action["endpoint"] == f"/api/projects/{PID}/direct-fix/enter"
-    assert result["runtime_resume"]["mode"] == "resume_blocked_contract"
+    assert "endpoint" not in next_action
+    assert "successor_contract_id" not in next_action
+    assert "successor_contract_template_id" not in next_action
+    assert result["runtime_resume"]["status"] == "proceeded_with_exception"
+    assert result["runtime_resume"]["mode"] == "resume_original_contract"
     assert result["runtime_resume"]["source"] == "task_timeline_compact_ledger"
     route_guide = result["onboard_route_guide"]
     assert route_guide["backlog_chain_binding"]["runtime_resume"][
@@ -42528,7 +42538,7 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
     )
 
 
-def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
+def test_contract_update_blocked_precheck_continues_with_audited_bypass(conn):
     backlog_id = "AC-CONTRACT-UPDATE-BLOCKED-DIRECT-FIX"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
     onboard = server.handle_project_onboard_contract_start(
@@ -42542,7 +42552,7 @@ def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
             },
         )
     )
-    parent = _complete_source_backed_onboarding(
+    _complete_source_backed_onboarding(
         conn,
         onboard["contract_execution_id"],
     )
@@ -42617,38 +42627,51 @@ def test_contract_update_blocked_precheck_can_enter_direct_fix_successor(conn):
         )
     )
     next_action = current["next_legal_action"]
-    assert next_action["id"] == "direct_fix_successor"
-    assert next_action["action"] == "enter_direct_fix_successor"
-    assert next_action["recommended_successor_contract_id"] == "direct_fix"
-    assert next_action["successor_contract_template_id"] == "direct_fix.v1"
-    assert next_action["return_to_parent"]["parent_contract_execution_id"] == (
-        execution_id
+    assert next_action["id"] == "worker_revision_source_proof"
+    assert next_action["action"] == "continue_with_audited_bypass"
+    assert next_action["mode"] == "resume_original_contract"
+    assert next_action["status"] == "proceeded_with_exception"
+    assert next_action["line_id"] == "worker_revision_source_proof"
+    assert next_action["original_contract_action"] == (
+        "record_contract_revision_source_proof"
     )
+    assert next_action["blocked_by_line"]["line_id"] == "worker_revision_precheck"
+    assert next_action["blocked_by_line"]["payload"]["status"] == "blocked"
+    assert next_action["diagnostic_required"] is True
+    assert next_action["no_pass_claim"] is True
+    assert next_action["source_row_must_remain_open"] is True
+    assert next_action["direct_fix_required"] is False
+    assert next_action["current_line_blocker_policy"]["action"] == (
+        "contract_runtime_bypass_line"
+    )
+    assert next_action["endpoint"].endswith(f"/{execution_id}/line-writes")
+    assert next_action["body"]["stage_id"] == "worker_source"
+    assert next_action["body"]["line_id"] == "worker_revision_source_proof"
+    assert next_action["body"]["evidence_kind"] == (
+        "contract_revision_source_proof"
+    )
+    assert next_action["body"]["runtime_guide_hash"] == next_action[
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]["runtime_guide_hash"]
+    assert "recommended_successor_contract_id" not in next_action
+    assert "successor_contract_template_id" not in next_action
 
-    entered = server.handle_project_direct_fix_enter(
+    continued = server.handle_project_contract_update_line_write(
         _ctx_with_role(
-            {"project_id": PID},
-            "observer",
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "mf_sub",
             method="POST",
             body={
-                "actor": "operator",
-                "reason": "Repair blocked contract_update runtime gate.",
-                "backlog_id": backlog_id,
-                "task_id": "blocked-contract-update-direct-fix",
-                "parent_contract_execution_id": execution_id,
-                "route_token_ref": "rtok-contract-update-direct",
+                "stage_id": "worker_source",
+                "line_id": "worker_revision_source_proof",
+                "evidence_kind": "contract_revision_source_proof",
             },
         )
     )
-
-    assert entered["contract_id"] == "direct_fix"
-    assert entered["parent_contract_execution_id"] == execution_id
-    assert entered["root_contract_execution_id"] == parent["root_contract_execution_id"]
-    assert entered["contract_chain_id"] == parent["contract_chain_id"]
-    assert entered["return_to_parent"]["parent_contract_execution_id"] == execution_id
-    assert entered["parent_close_gate"]["parent_close_gate_recheck_required"] is True
-    assert entered["next_legal_action"]["line_id"] == "direct_fix_operator_approval"
-    assert entered["next_legal_action"]["owner_role"] == "observer"
+    assert continued["ok"] is True
+    assert continued["next_legal_action"]["id"] == (
+        "worker_runtime_visibility_proof"
+    )
 
 
 def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
@@ -43012,8 +43035,9 @@ def test_direct_fix_enter_accepts_blocked_onboard_service_parent(conn):
     assert blocked_line["status"] == "blocked"
     assert blocked_line["payload"]["blocked_successor_contract_id"] == "mf_parallel"
     assert parent["runtime_guide"]["next_legal_action"]["action"] == (
-        "enter_direct_fix_successor"
+        "continue_with_audited_bypass"
     )
+    assert parent["runtime_guide"]["next_legal_action"]["direct_fix_required"] is False
 
 
 def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
@@ -48026,30 +48050,28 @@ def test_backlog_close_rejects_runtime_gate_projection_as_close_evidence(conn):
     assert task_timeline.list_events(conn, PID, backlog_id=backlog_id) == []
 
 
-def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_complete_current(
+def test_source_backed_backlog_close_blocker_projects_audited_bypass_from_complete_current(
     conn,
     monkeypatch,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-BLOCKED-PROJECTS-DIRECT-FIX"
     close_commit = "8b567b087c2e48f33a0f1aa7c76fc92752e0bd25"
     close_ref = "rtok-blocked-close-direct-fix"
-    _insert_simple_mf_close_backlog(conn, backlog_id)
-    first = server.handle_project_onboard_route_guide(
+    expected_blocked_gate = "mf_timeline_gate_failed"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    first = server.handle_project_onboard_contract_start(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
             body={
                 "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "continue_contract_chain",
                 "route_token_ref": "rtok-blocked-close-parent",
             },
         )
     )
-    parent_execution_id = first["contract_chain_current"][
-        "current_contract_execution_id"
-    ]
+    parent_execution_id = first["contract_execution_id"]
+    _complete_source_backed_onboarding(conn, parent_execution_id)
 
     before = server.handle_project_contract_chain_current(
         _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
@@ -48081,12 +48103,13 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
                 body={
                     "actor": "observer",
                     "commit": close_commit,
+                    "contract_execution_id": parent_execution_id,
                     "route_token_ref": close_ref,
                 },
             )
         )
 
-    assert exc.value.code == "missing_contract_runtime_close_authority"
+    assert exc.value.code == expected_blocked_gate
     prechecks = task_timeline.list_events(
         conn,
         PID,
@@ -48110,36 +48133,51 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
     blocked_payload = blocked[0]["payload"]
     assert blocked_payload["status"] == "blocked"
     assert blocked_payload["source"] == "authoritative_backlog_close"
-    assert blocked_payload["blocked_gate"] == (
-        "missing_contract_runtime_close_authority"
-    )
+    assert blocked_payload["blocked_gate"] == expected_blocked_gate
     assert blocked_payload["candidate_runtime_target_truth_activated"] is False
     assert blocked_payload["route_action_precheck_event_ref"] == (
         f"timeline:{prechecks[0]['id']}"
     )
-    assert blocked_payload["next_legal_action"]["action"] == (
-        "enter_direct_fix_successor"
+    blocked_action = blocked_payload["next_legal_action"]
+    assert blocked_action["id"] == "backlog_close_audited_bypass"
+    assert blocked_action["action"] == "continue_with_audited_bypass"
+    assert blocked_action["status"] == "proceeded_with_exception"
+    assert blocked_action["mode"] == "complete_with_exception"
+    assert blocked_action["mutation_required"] is False
+    assert blocked_action["diagnostic_required"] is True
+    assert blocked_action["no_pass_claim"] is True
+    assert blocked_action["source_row_must_remain_open"] is True
+    assert blocked_action["direct_fix_required"] is False
+    assert blocked_action["body"]["blocked_gate"] == expected_blocked_gate
+    assert blocked_action["audited_bypass_continuation"]["blocked_gate"] == (
+        expected_blocked_gate
     )
-    assert blocked_payload["next_legal_action"]["successor_contract_id"] == "direct_fix"
-    assert blocked_payload["next_legal_action"]["body"][
-        "blocked_successor_entry"
-    ]["blocker_id"] == "missing_contract_runtime_close_authority"
-    assert blocked_payload["next_legal_action"]["return_to_parent"][
-        "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
-    assert blocked_payload["next_legal_action"]["body"]["return_to_parent"][
-        "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
+    assert blocked_action["body"]["blocker_event_ref"] == (
+        f"timeline:{blocked[0]['id']}"
+    )
+    assert blocked_action["body"]["close_commit"] == close_commit
+    assert blocked_action["body"]["route_token_ref"] == close_ref
+    assert blocked_action["audited_bypass_continuation"]["blocker_event_ref"] == (
+        f"timeline:{blocked[0]['id']}"
+    )
+    assert blocked_action["audited_bypass_continuation"]["close_commit"] == (
+        close_commit
+    )
+    assert blocked_action["audited_bypass_continuation"]["route_token_ref"] == (
+        close_ref
+    )
+    assert "endpoint" not in blocked_action
+    assert "successor_contract_id" not in blocked_action
+    assert "successor_contract_template_id" not in blocked_action
 
     stale_payload = json.loads(json.dumps(blocked_payload))
     stale_action = stale_payload["next_legal_action"]
-    stale_action["body"]["blocked_successor_entry"][
-        "blocker_id"
-    ] = "mf_timeline_gate_failed"
-    stale_action["return_to_parent"]["blocked_gate"] = "mf_timeline_gate_failed"
-    stale_action["body"]["return_to_parent"][
-        "blocked_gate"
-    ] = "mf_timeline_gate_failed"
+    stale_action["body"]["blocked_gate"] = (
+        "missing_contract_runtime_close_authority"
+    )
+    stale_action["audited_bypass_continuation"]["blocked_gate"] = (
+        "missing_contract_runtime_close_authority"
+    )
     conn.execute(
         "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
         (
@@ -48152,54 +48190,33 @@ def test_source_backed_backlog_close_blocker_projects_direct_fix_successor_from_
     current = server.handle_project_contract_chain_current(
         _ctx({"project_id": PID}, query={"backlog_id": backlog_id})
     )["contract_chain_current"]
-    assert current["readiness_state"] == "blocked"
+    assert current["readiness_state"] == "completed_with_exception"
     assert current["source_of_proof"] == "task_timeline.backlog_close_blocked"
     assert current["blocked_parent_state"]["event_ref"] == f"timeline:{blocked[0]['id']}"
-    assert current["next_legal_action"]["action"] == "enter_direct_fix_successor"
+    assert current["next_legal_action"]["action"] == (
+        "continue_with_audited_bypass"
+    )
     assert current["next_legal_action"]["parent_contract_execution_id"] == (
         parent_execution_id
     )
-    assert current["next_legal_action"]["body"]["blocked_successor_entry"][
-        "blocker_id"
-    ] == "missing_contract_runtime_close_authority"
-    assert current["next_legal_action"]["return_to_parent"][
-        "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
-    assert current["next_legal_action"]["body"]["return_to_parent"][
-        "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
-    assert current["authority_projection"]["next_legal_action"][
-        "return_to_parent"
-    ]["blocked_gate"] == "missing_contract_runtime_close_authority"
-
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "continue_contract_chain",
-                "route_token_ref": close_ref,
-            },
-        )
+    assert current["next_legal_action"]["body"]["blocked_gate"] == (
+        expected_blocked_gate
     )
-    assert guide["contract_chain_current"]["readiness_state"] == "blocked"
-    assert guide["runtime_resume"]["status"] == "blocked"
-    assert guide["next_legal_action"]["action"] == "enter_direct_fix_successor"
-    assert guide["next_legal_action"]["body"]["blocked_successor_entry"][
-        "blocker_id"
-    ] == "missing_contract_runtime_close_authority"
-    assert guide["next_legal_action"]["return_to_parent"][
+    assert current["next_legal_action"]["audited_bypass_continuation"][
         "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
-    assert guide["runtime_resume"]["next_legal_action"]["body"][
-        "blocked_successor_entry"
-    ]["blocker_id"] == "missing_contract_runtime_close_authority"
-    assert guide["runtime_resume"]["next_legal_action"]["return_to_parent"][
-        "blocked_gate"
-    ] == "missing_contract_runtime_close_authority"
+    ] == expected_blocked_gate
+    assert current["next_legal_action"]["audited_bypass_continuation"][
+        "close_commit"
+    ] == close_commit
+    assert current["next_legal_action"]["audited_bypass_continuation"][
+        "route_token_ref"
+    ] == close_ref
+    assert current["authority_projection"]["next_legal_action"][
+        "audited_bypass_continuation"
+    ]["blocked_gate"] == expected_blocked_gate
+    assert current["blocked_parent_state"]["no_pass_claim"] is True
+    assert current["blocked_parent_state"]["source_row_must_remain_open"] is True
+    assert current["blocked_parent_state"]["direct_fix_required"] is False
 
 
 def test_backlog_close_blocker_projection_requires_source_backed_route_token_ref(
