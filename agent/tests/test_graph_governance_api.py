@@ -51863,6 +51863,196 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
+def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-CONTRACT-FINISH-ACTIVE-FAILED-QA-LINEAGE"
+    target_root = tmp_path / "contract-finish-active-failed-qa-lineage"
+    head_commit = _init_test_git_repo(target_root)
+    changed_files = ["agent/governance/server.py"]
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-finish-active-lineage-parent",
+        worker_task_id="contract-finish-active-lineage-worker",
+        fence_token="fence-contract-finish-active-lineage",
+        token="contract-finish-active-lineage-token",
+        worktree_path=str(target_root),
+        base_commit=head_commit,
+        owned_files=tuple(changed_files),
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    parent_task_id = runtime_context.parent_task_id or backlog_id
+    worker_session_id = "worker-session-active-lineage"
+    test_results = {"status": "passed", "passed": True, "command": "pytest -q"}
+    read_receipt_event_id = "4201"
+    read_receipt_hash = "sha256:active-lineage-read"
+
+    def attestation_line(*, label: str) -> dict[str, Any]:
+        attestation = {
+            "schema_version": "worker_transcript_self_attestation.v1",
+            "attestation_phase": "finish",
+            "status": "passed",
+            "ok": True,
+            "worker_self_attesting": True,
+            "self_attesting": True,
+            "finish_time_self_attesting": True,
+            "finish_time_blockers": [],
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "worker_transcript_ref": f"codex:{worker_session_id}:{label}",
+            "harness_type": "codex",
+            "blockers": [],
+        }
+        payload = {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "head_commit": head_commit,
+            "changed_files": changed_files,
+            "test_results": test_results,
+            "read_receipt_event_id": read_receipt_event_id,
+            "read_receipt_hash": read_receipt_hash,
+            "graph_trace_ids": ["gqt-contract-finish-active-lineage"],
+            "finish_time_worker_self_attestation": attestation,
+        }
+        return {
+            "stage_id": "worker_attestation",
+            "line_id": "worker_finish_time_attestation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "record_finish_time_worker_attestation",
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+            "commit_sha": head_commit,
+            "payload": payload,
+        }
+
+    context_line = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": parent_task_id,
+        "actor_role": "mf_sub",
+        "payload": {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": parent_task_id,
+        },
+    }
+    old_attestation = attestation_line(label="pre-qa")
+    failed_qa = {
+        **context_line,
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "failed",
+        "payload": {**context_line["payload"], "status": "failed", "verdict": "FAIL"},
+        "verification": {"result": "failed", "verdict": "FAIL"},
+    }
+    retry_worker_commit = {
+        **context_line,
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "evidence_kind": "worker_commit",
+        "commit_sha": head_commit,
+    }
+    active_attestation = attestation_line(label="post-qa")
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    record["completed_lines"] = [
+        old_attestation,
+        failed_qa,
+        retry_worker_commit,
+        active_attestation,
+    ]
+    record["runtime_guide"] = {
+        **dict(record.get("runtime_guide") or {}),
+        "completed_lines": list(record["completed_lines"]),
+    }
+    record["execution_state_revision"] = 4
+    runtime.store.update(contract_execution_id, record)
+
+    projected = server._runtime_context_contract_finish_attestation_projection(
+        conn,
+        context=runtime_context,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context.runtime_context_id,
+        parent_task_id=parent_task_id,
+        head_commit=head_commit,
+        changed_files=changed_files,
+        test_results=test_results,
+        supplied_worker_session_id=worker_session_id,
+        supplied_filer_principal=worker_session_id,
+        read_receipt_event_id=read_receipt_event_id,
+        read_receipt_hash=read_receipt_hash,
+        supplied_attestation=active_attestation["payload"][
+            "finish_time_worker_self_attestation"
+        ],
+    )
+    assert projected["contract_runtime_source_ref"].endswith(":completed_lines:3")
+    assert projected["active_failed_qa_line_index"] == 1
+    assert projected["active_worker_commit_line_index"] == 2
+
+    record_without_active = runtime.store.get(contract_execution_id)
+    record_without_active["completed_lines"] = [
+        old_attestation,
+        failed_qa,
+        retry_worker_commit,
+    ]
+    record_without_active["runtime_guide"] = {
+        **dict(record_without_active.get("runtime_guide") or {}),
+        "completed_lines": list(record_without_active["completed_lines"]),
+    }
+    record_without_active["execution_state_revision"] += 1
+    runtime.store.update(contract_execution_id, record_without_active)
+    with pytest.raises(GovernanceError) as missing_active:
+        server._runtime_context_contract_finish_attestation_projection(
+            conn,
+            context=runtime_context,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context.runtime_context_id,
+            parent_task_id=parent_task_id,
+            head_commit=head_commit,
+            changed_files=changed_files,
+            test_results=test_results,
+        )
+    assert missing_active.value.code == "contract_worker_finish_attestation_required"
+    assert missing_active.value.details["matching_completed_line_indexes"] == []
+
+    record_ambiguous = runtime.store.get(contract_execution_id)
+    record_ambiguous["completed_lines"] = [
+        old_attestation,
+        failed_qa,
+        retry_worker_commit,
+        active_attestation,
+        attestation_line(label="duplicate-post-qa"),
+    ]
+    record_ambiguous["runtime_guide"] = {
+        **dict(record_ambiguous.get("runtime_guide") or {}),
+        "completed_lines": list(record_ambiguous["completed_lines"]),
+    }
+    record_ambiguous["execution_state_revision"] += 1
+    runtime.store.update(contract_execution_id, record_ambiguous)
+    with pytest.raises(GovernanceError) as ambiguous_active:
+        server._runtime_context_contract_finish_attestation_projection(
+            conn,
+            context=runtime_context,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context.runtime_context_id,
+            parent_task_id=parent_task_id,
+            head_commit=head_commit,
+            changed_files=changed_files,
+            test_results=test_results,
+        )
+    assert ambiguous_active.value.code == "contract_worker_finish_attestation_ambiguous"
+    assert ambiguous_active.value.details["matching_completed_line_indexes"] == [3, 4]
+
+
 @pytest.mark.parametrize(
     ("pinned_revision", "handoff_required"),
     [("rev3", False), ("rev1", True)],

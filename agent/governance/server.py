@@ -21515,9 +21515,10 @@ def _runtime_context_contract_finish_attestation_projection(
             422,
             {"contract_execution_id": contract_execution_id},
         ) from exc
+    completed_lines = _contract_runtime_completed_lines(record)
     matches = [
         (index, line)
-        for index, line in _contract_runtime_completed_lines(record)
+        for index, line in completed_lines
         if str(line.get("line_id") or "").strip()
         == "worker_finish_time_attestation"
         and _contract_runtime_mapping_matches_context(
@@ -21527,6 +21528,32 @@ def _runtime_context_contract_finish_attestation_projection(
             parent_task_id=parent_task_id,
         )
     ]
+    failed_qa_index = _active_failed_qa_line_index(
+        [line for _, line in completed_lines]
+    )
+    active_worker_commit_index = -1
+    if failed_qa_index >= 0:
+        retry_worker_commit_indexes = [
+            index
+            for index, line in completed_lines
+            if index > failed_qa_index
+            and str(line.get("line_id") or "").strip() == "worker_commit"
+            and _contract_runtime_mapping_matches_context(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        ]
+        if retry_worker_commit_indexes:
+            active_worker_commit_index = max(retry_worker_commit_indexes)
+            matches = [
+                (index, line)
+                for index, line in matches
+                if index > active_worker_commit_index
+            ]
+        else:
+            matches = []
     if len(matches) != 1:
         raise GovernanceError(
             (
@@ -21539,6 +21566,8 @@ def _runtime_context_contract_finish_attestation_projection(
             {
                 "contract_execution_id": contract_execution_id,
                 "matching_completed_line_indexes": [index for index, _ in matches],
+                "active_failed_qa_line_index": failed_qa_index,
+                "active_worker_commit_line_index": active_worker_commit_index,
             },
         )
 
@@ -21615,6 +21644,8 @@ def _runtime_context_contract_finish_attestation_projection(
         "contract_runtime_source_ref": (
             f"contract_runtime:{contract_execution_id}:completed_lines:{index}"
         ),
+        "active_failed_qa_line_index": failed_qa_index,
+        "active_worker_commit_line_index": active_worker_commit_index,
         "worker_session_id": canonical_session,
         "filer_principal": canonical_filer,
         "read_receipt_event_id": canonical_read_id,
