@@ -51995,7 +51995,10 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
 
     assert authority["authority_verified"] is True
     assert authority["qa_contract_runtime_verified"] is True
-    assert authority["qa_event_id"] == 0
+    assert (
+        authority["qa_event_id"],
+        authority["qa_event_created_at"],
+    ) == (0, "")
     assert authority["qa_source_ref"] == (
         f"contract_runtime:{contract_execution_id}:completed_lines:10"
     )
