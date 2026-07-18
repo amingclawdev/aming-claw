@@ -6719,6 +6719,7 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
         "observer_session_id": observer_session_id,
         "route_token_ref": route_token_ref,
         "route_token_scope": expected_scope,
+        "route_token_allowed_actions": normalized_allowed,
     }
 
 
@@ -34145,6 +34146,17 @@ def _current_full_reconcile_runtime_context_scope(
         next(iter(runtime_context_claims)) if runtime_context_claims else ""
     )
     merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+    route_allowed_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in auth.get("route_token_allowed_actions") or []
+        if str(action or "").strip()
+    }
+    route_bound_direct_main = bool(
+        str(auth.get("role_source") or "").strip()
+        == "observer_session_route_token_ref"
+        and "observer_direct_mutation_exception" in route_allowed_actions
+        and "graph_current_full_reconcile" in route_allowed_actions
+    )
     if not task_id:
         if claimed_runtime_context_id:
             raise GovernanceError(
@@ -34206,6 +34218,28 @@ def _current_full_reconcile_runtime_context_scope(
                         str(trusted_merge.get("task_id") or "").strip(),
                     )
     if context is None:
+        route_bound_onboard_direct_main = bool(
+            contract_record
+            and str(contract_record.get("project_id") or "").strip()
+            == project_id
+            and str(contract_record.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(contract_record.get("contract_id") or "").strip()
+            == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+            and str(contract_record.get("contract_execution_id") or "").strip()
+            == task_id
+            and route_task_id == task_id
+            and route_bound_direct_main
+            and not claimed_runtime_context_id
+            and not merge_queue_id
+        )
+        if route_bound_onboard_direct_main:
+            # operator_supervised_direct_main intentionally has no branch
+            # runtime context. Its active observer session plus the exact
+            # full-round route scope is the canonical authority. Returning no
+            # runtime scope prevents direct-main provenance from masquerading
+            # as parallel_branch_runtime_context evidence.
+            return {}
         if (
             claimed_runtime_context_id
             or (backlog_id and merge_queue_id)
