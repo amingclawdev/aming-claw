@@ -54,6 +54,7 @@ from .contracts.runtime import (
     ContractRuntime,
     ContractRuntimeError,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
+    _active_failed_qa_line_index,
     _worker_commit_completed_implementation,
     _worker_implementation_lineage,
     is_legacy_primary_contract_route,
@@ -22399,10 +22400,32 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             )
         ):
             continue
-        if not (
+        contract_runtime_failed_qa = (
+            payload.get("contract_runtime_failed_qa_revision")
+            if isinstance(
+                payload.get("contract_runtime_failed_qa_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        timeline_reopen_authority = bool(
             _truthy_flag(payload.get("reopen_for_revision"))
             and _truthy_flag(payload.get("timeline_reopen_for_revision"))
-        ):
+        )
+        contract_runtime_reopen_authority = bool(
+            _truthy_flag(payload.get("reopen_for_revision"))
+            and str(contract_runtime_failed_qa.get("status") or "").strip()
+            == "revision_required"
+            and str(contract_runtime_failed_qa.get("source") or "").strip()
+            == "contract_runtime_completed_lines"
+            and str(
+                contract_runtime_failed_qa.get("runtime_context_id") or ""
+            ).strip()
+            == runtime_context_id
+            and str(contract_runtime_failed_qa.get("task_id") or "").strip()
+            == task_id
+        )
+        if not (timeline_reopen_authority or contract_runtime_reopen_authority):
             continue
         if str(payload.get("runtime_context_id") or "").strip() != runtime_context_id:
             continue
@@ -22437,6 +22460,11 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
             "source": "accepted_runtime_context_rejoin_event",
+            "reopen_authority_source": (
+                "contract_runtime_failed_qa_revision"
+                if contract_runtime_reopen_authority
+                else "failed_qa_timeline_event"
+            ),
             "revision_event_id": event_id,
             "revision_event_ref": f"timeline:{event_id}",
             "runtime_context_id": runtime_context_id,
@@ -23846,6 +23874,262 @@ def _runtime_context_contract_requires_worker_commit(
         ) from exc
 
 
+def _runtime_context_revise_failed_qa_implementation_lineage(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime: ContractRuntime,
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    revision_marker: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Version a bad retry implementation line from immutable worker git state."""
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    previous = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if previous is None:
+        return {}
+    completed_lines = list(record.get("completed_lines") or [])
+    failed_qa_index = _active_failed_qa_line_index(completed_lines)
+    previous_index = next(
+        (
+            index
+            for index in range(len(completed_lines) - 1, -1, -1)
+            if completed_lines[index] is previous
+            or completed_lines[index] == previous
+        ),
+        -1,
+    )
+    if failed_qa_index < 0 or previous_index <= failed_qa_index:
+        return {}
+    claimed_files = sorted(
+        set(_runtime_context_service_query_values(payload, "changed_files"))
+    )
+    claimed_trace_ids = sorted(
+        set(
+            _runtime_context_service_query_values(
+                payload,
+                "graph_trace_ids",
+                "graph_query_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+    )
+    previous_files = sorted(
+        set(_runtime_context_service_query_values(previous, "changed_files"))
+    )
+    # The implementation facade passes through the generic close gate before
+    # its canonical timeline hook. That same request may therefore observe the
+    # line it just wrote; identical file scope is idempotent, not a revision.
+    if claimed_files == previous_files:
+        return {}
+
+    resolved_revision_marker = dict(revision_marker)
+    if not str(resolved_revision_marker.get("revision_event_ref") or "").strip():
+        from . import task_timeline
+
+        resolved_revision_marker = _runtime_context_failed_qa_revision_rejoin_marker(
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=task_timeline.list_events(
+                conn,
+                project_id,
+                task_id=task_id,
+                backlog_id=str(getattr(context, "backlog_id", "") or ""),
+                limit=1000,
+            ),
+        )
+
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    runtime_base_commit = str(getattr(context, "base_commit", "") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", runtime_base_commit):
+        # Legacy/test contexts without immutable git boundaries retain the
+        # prior idempotent duplicate behavior; they cannot claim a canonical
+        # cumulative lineage revision.
+        return {}
+    if not worktree_path:
+        raise GovernanceError(
+            "contract_runtime_rework_lineage_worktree_required",
+            "failed-QA implementation revision requires the assigned worktree",
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "fail_closed": True,
+            },
+        )
+    from . import batch_jobs
+
+    actual_head = batch_jobs.git_commit(worktree_path)
+    dirty_files = _runtime_context_git_dirty_files(worktree_path)
+    if dirty_files:
+        raise GovernanceError(
+            "contract_runtime_rework_lineage_dirty_worktree",
+            "failed-QA implementation revision requires a clean assigned worktree",
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "dirty_files": dirty_files,
+                "next_legal_action": "commit_or_clean_worker_revision",
+            },
+        )
+    revision_diff = _runtime_context_worker_commit_revision_diff(
+        worktree_path,
+        actual_head,
+        base_commit=runtime_base_commit,
+    )
+    cumulative_files = sorted(set(revision_diff.get("changed_files") or []))
+    owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    out_of_fence = sorted(set(cumulative_files) - set(owned_files))
+    graph_evidence = (
+        payload.get("graph_trace_db_evidence")
+        if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+        else {}
+    )
+    verified_trace_ids = sorted(
+        set(graph_evidence.get("verified_trace_ids") or [])
+    )
+    errors: list[str] = []
+    if not claimed_files or claimed_files != cumulative_files:
+        errors.append(
+            "implementation revision changed_files must equal the cumulative runtime diff"
+        )
+    if out_of_fence:
+        errors.append(f"implementation revision contains out-of-fence files: {out_of_fence!r}")
+    if (
+        graph_evidence.get("db_verified") is not True
+        or not claimed_trace_ids
+        or claimed_trace_ids != verified_trace_ids
+    ):
+        errors.append("implementation revision requires exact DB-verified graph traces")
+    revision_event_ref = str(
+        resolved_revision_marker.get("revision_event_ref") or ""
+    ).strip()
+    if not revision_event_ref:
+        errors.append("implementation revision requires the accepted failed-QA rejoin marker")
+    if errors:
+        raise GovernanceError(
+            "contract_runtime_rework_lineage_revision_invalid",
+            "; ".join(errors),
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "claimed_changed_files": claimed_files,
+                "cumulative_changed_files": cumulative_files,
+                "owned_files": owned_files,
+                "fail_closed": True,
+                "next_legal_action": (
+                    "retry_implementation_evidence_with_cumulative_runtime_diff"
+                ),
+            },
+        )
+
+    canonical_payload = dict(payload)
+    canonical_payload["failed_qa_revision_rejoin_marker"] = dict(
+        resolved_revision_marker
+    )
+    canonical_payload["canonical_rework_lineage_revision_authority"] = {
+        "schema_version": (
+            "runtime_context.clean_cumulative_git_revision_authority.v1"
+        ),
+        "source": "runtime_context_clean_cumulative_git_revision",
+        "server_derived": True,
+        "actual_head_commit": actual_head,
+        "commit_parent_sha": revision_diff.get("parent_commit") or "",
+        "diff_base_commit": revision_diff.get("base_commit") or "",
+        "clean_worktree": True,
+        "cumulative_changed_files": cumulative_files,
+        "owned_files": owned_files,
+        "revision_event_ref": revision_event_ref,
+        "raw_worker_tokens_persisted": False,
+    }
+    write = {
+        "project_id": project_id,
+        "backlog_id": record.get("backlog_id"),
+        "contract_execution_id": record.get("contract_execution_id"),
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "commit_sha": actual_head,
+        "changed_files": cumulative_files,
+        "graph_trace_ids": claimed_trace_ids,
+        "payload": canonical_payload,
+    }
+    for key, value in canonical_payload.items():
+        if key not in write:
+            write[key] = value
+    result = runtime.revise_failed_qa_worker_implementation(
+        str(record.get("contract_execution_id") or ""),
+        write,
+        actor_role="mf_sub",
+    )
+    if not result.get("ok"):
+        raise GovernanceError(
+            "contract_runtime_rework_lineage_revision_rejected",
+            "ContractRuntime rejected the failed-QA implementation revision",
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "decision": result.get("decision") or {},
+                "fail_closed": True,
+            },
+        )
+    updated = result.get("record") if isinstance(result.get("record"), Mapping) else {}
+    latest = _worker_commit_completed_implementation(
+        updated,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    lineage = _worker_implementation_lineage(updated, latest or {})
+    current_state = _runtime_current_state_from_record(updated)
+    return {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": "revised",
+        "canonical": True,
+        "source_of_authority": "ContractRuntime.completed_lines",
+        "contract_execution_id": str(record.get("contract_execution_id") or ""),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": str((latest or {}).get("line_instance_id") or ""),
+        "commit_sha": actual_head,
+        "implementation_lineage_ref": lineage.get("implementation_lineage_ref") or "",
+        "supersedes_implementation_lineage_ref": result.get(
+            "supersedes_implementation_lineage_ref"
+        )
+        or "",
+        "execution_state_revision": current_state.get("execution_state_revision", 0),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "append_only_history_preserved": True,
+        "timeline_projection_authoritative": False,
+    }
+
+
 def _runtime_context_submit_canonical_contract_line(
     conn,
     *,
@@ -23950,6 +24234,7 @@ def _runtime_context_submit_canonical_contract_line(
             }
         runtime.current_guide(execution_id, actor_role="mf_sub")
         record = runtime.store.get(execution_id)
+        stored_record = record
         projected_record, candidate_projection = (
             _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
@@ -23999,6 +24284,61 @@ def _runtime_context_submit_canonical_contract_line(
         else {}
     )
     next_line_id = str(next_line.get("line_id") or "").strip()
+
+    canonical_payload = dict(payload)
+    canonical_payload.pop("failed_qa_revision_rejoin_marker", None)
+    revision_marker: dict[str, Any] = {}
+    if use_failed_qa_rejoin_projection:
+        revision_marker = next(
+            (
+                dict(item)
+                for item in (failed_qa_rejoin_contexts or [])
+                if isinstance(item, Mapping)
+                and str(item.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(item.get("revision_event_ref") or "").strip()
+            ),
+            {},
+        )
+        if revision_marker:
+            canonical_payload["failed_qa_revision_rejoin_marker"] = {
+                key: value
+                for key, value in revision_marker.items()
+                if key
+                in {
+                    "schema_version",
+                    "source",
+                    "revision_event_id",
+                    "revision_event_ref",
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "attempt",
+                    "retry_round",
+                    "route_token_ref",
+                    "route_identity_rebound",
+                    "evidence_backfill",
+                }
+            }
+
+    if (
+        line_id == "worker_implementation"
+        and next_line_id != "worker_implementation"
+    ):
+        revision = _runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime=runtime,
+            record=stored_record,
+            payload=canonical_payload,
+            revision_marker=canonical_payload.get(
+                "failed_qa_revision_rejoin_marker",
+                {},
+            ),
+        )
+        if revision:
+            return revision
 
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
@@ -24061,40 +24401,6 @@ def _runtime_context_submit_canonical_contract_line(
         line_id=line_id,
         evidence_kind=evidence_kind,
     )
-    canonical_payload = dict(payload)
-    canonical_payload.pop("failed_qa_revision_rejoin_marker", None)
-    if use_failed_qa_rejoin_projection:
-        revision_marker = next(
-            (
-                dict(item)
-                for item in (failed_qa_rejoin_contexts or [])
-                if isinstance(item, Mapping)
-                and str(item.get("runtime_context_id") or "").strip()
-                == runtime_context_id
-                and str(item.get("revision_event_ref") or "").strip()
-            ),
-            {},
-        )
-        if revision_marker:
-            canonical_payload["failed_qa_revision_rejoin_marker"] = {
-                key: value
-                for key, value in revision_marker.items()
-                if key
-                in {
-                    "schema_version",
-                    "source",
-                    "revision_event_id",
-                    "revision_event_ref",
-                    "runtime_context_id",
-                    "task_id",
-                    "parent_task_id",
-                    "attempt",
-                    "retry_round",
-                    "route_token_ref",
-                    "route_identity_rebound",
-                    "evidence_backfill",
-                }
-            }
     write["payload"] = canonical_payload
     protected_write_fields = {
         "actor_role",
@@ -66373,7 +66679,8 @@ def _contract_runtime_close_gate(
     projection: dict[str, Any] = {}
     try:
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
-        record = runtime.store.get(contract_execution_id)
+        stored_record = runtime.store.get(contract_execution_id)
+        record = stored_record
         record, projection = _contract_runtime_apply_mf_parallel_context_projection(
             conn,
             project_id=project_id,
@@ -66393,14 +66700,22 @@ def _contract_runtime_close_gate(
                 "error": str(exc),
             },
         ) from exc
+    authority_record = (
+        stored_record
+        if (
+            trusted_worker_commit_facade
+            and _contract_runtime_close_normalized(event_kind) == "worker_commit"
+        )
+        else record
+    )
     line = _contract_runtime_close_line_for_event(
-        record,
+        authority_record,
         event_kind=event_kind,
         body=body,
     )
     if not line:
         line = {"stage_id": "", "line_id": "", "evidence_kind": ""}
-    current_state = _runtime_current_state_from_record(record)
+    current_state = _runtime_current_state_from_record(authority_record)
     if not current_state.get("next_legal_action"):
         projection_gate = _contract_runtime_completed_line_projection_gate(
             record,
@@ -66412,7 +66727,7 @@ def _contract_runtime_close_gate(
         if projection_gate:
             return projection_gate
     write = _contract_runtime_write_from_record(
-        record,
+        authority_record,
         actor_role=actor_role,
         stage_id=line["stage_id"],
         line_id=line["line_id"],

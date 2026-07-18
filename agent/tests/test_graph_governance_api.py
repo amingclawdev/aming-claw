@@ -27544,6 +27544,294 @@ def test_runtime_context_session_token_rejoin_reopens_after_contract_runtime_fai
     ] == "observer_merge"
 
 
+def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commit(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-FAILED-QA-CUMULATIVE-IMPLEMENTATION-REVISION"
+    target_root = tmp_path / "failed-qa-cumulative-implementation-revision"
+    base_commit = _init_test_git_repo(target_root)
+    changed_files = [
+        "agent/governance/server.py",
+        "docs/onboarding.md",
+    ]
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="failed-qa-cumulative-parent",
+        worker_task_id="failed-qa-cumulative-worker",
+        fence_token="fence-failed-qa-cumulative-worker",
+        token="failed-qa-cumulative-worker-token",
+        worktree_path=str(target_root),
+        base_commit=base_commit,
+        owned_files=tuple(changed_files),
+    )
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token="fence-failed-qa-cumulative-worker",
+        graph_trace_id="gqt-failed-qa-cumulative-worker",
+        head_commit=base_commit,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-failed-qa-cumulative-worker",
+        head_commit=base_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+    )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(runtime_context, status=STATE_VALIDATED, attempt=1, retry_round=0),
+        now_iso="2026-07-18T04:00:00Z",
+    )
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "qa",
+        )
+    )
+    if current["next_legal_action"]["line_id"] == "qa_graph_context":
+        qa_trace_id = "gqt-failed-qa-cumulative-qa"
+        bounded_graph_evidence = _insert_exact_qa_graph_query_trace(
+            conn,
+            trace_id=qa_trace_id,
+            snapshot_id="scope-failed-qa-cumulative-qa",
+            candidate_commit_sha=base_commit,
+            backlog_id=backlog_id,
+            task_id=runtime_context.task_id,
+            target_project_root=str(target_root),
+            created_at="2026-07-18T04:01:00Z",
+        )
+        qa_graph = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "qa",
+                method="POST",
+                body={
+                    "stage_id": "qa_graph_context",
+                    "line_id": "qa_graph_context",
+                    "evidence_kind": "graph_trace",
+                    "graph_trace_ids": [qa_trace_id],
+                    "db_verified": True,
+                    "query_source": "qa",
+                    "query_purpose": "independent_verification",
+                    "payload": {
+                        "graph_trace_ids": [qa_trace_id],
+                        "graph_trace_evidence": bounded_graph_evidence,
+                    },
+                },
+            )
+        )
+        assert qa_graph["ok"] is True
+
+    failed_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "payload": {
+                    "status": "failed",
+                    "verdict": "FAIL",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "summary": "The retry needs both runtime and guide files.",
+                },
+                "verification": {
+                    "result": "failed",
+                    "verdict": "FAIL",
+                    "acceptance_failed": ["cumulative_implementation_lineage"],
+                },
+            },
+        )
+    )
+    assert failed_qa["ok"] is True
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": "failed QA requires a cumulative worker revision",
+                "now_iso": "2999-01-01T00:00:00Z",
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is True
+
+    # Seed the already-accepted bad retry line that this regression repairs.
+    # The production correction and subsequent worker_commit still run through
+    # their protected facades below.
+    runtime = server._contract_runtime(conn)
+    partial_record = runtime.store.get(successor["contract_execution_id"])
+    partial_payload, _unused_commit = _mf_parallel_worker_proof_payloads(
+        runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id="gqt-failed-qa-cumulative-worker",
+        head_commit=base_commit,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+    )
+    partial_payload["changed_files"] = ["agent/governance/server.py"]
+    partial_payload["graph_trace_db_evidence"] = {
+        "db_verified": True,
+        "verified_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+    }
+    partial_record["completed_lines"].append(
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            "line_instance_id": (
+                f"runtime_context:{runtime_context.runtime_context_id}"
+            ),
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "worker_id": runtime_context.worker_id,
+            "worker_slot_id": runtime_context.worker_slot_id,
+            "changed_files": ["agent/governance/server.py"],
+            "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+            "payload": partial_payload,
+        }
+    )
+    partial_record["execution_state_revision"] = int(
+        partial_record["execution_state_revision"]
+    ) + 1
+    runtime.store.update(successor["contract_execution_id"], partial_record)
+    runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
+
+    for path, content in (
+        ("agent/governance/server.py", "runtime revision\n"),
+        ("docs/onboarding.md", "guide revision\n"),
+    ):
+        destination = target_root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", *changed_files], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "failed QA cumulative revision"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    revised_head = batch_jobs.git_commit(target_root)
+
+    corrected = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": rejoin["fence_token"],
+                "session_token": rejoin["session_token"],
+                "target_project_root": str(target_root),
+                "changed_files": changed_files,
+                "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {"summary": "Cumulative retry lineage after clean commit."},
+            },
+        )
+    )
+    canonical = corrected["contract_runtime_canonical_line"]
+    assert canonical["status"] == "revised"
+    assert canonical["commit_sha"] == revised_head
+    assert canonical["append_only_history_preserved"] is True
+    assert canonical["supersedes_implementation_lineage_ref"]
+
+    revised_record = runtime.store.get(successor["contract_execution_id"])
+    failed_index = next(
+        index
+        for index, line in enumerate(revised_record["completed_lines"])
+        if line.get("line_id") == "qa_independent_verification"
+        and line.get("payload", {}).get("status") == "failed"
+    )
+    retry_implementations = [
+        line
+        for line in revised_record["completed_lines"][failed_index + 1 :]
+        if line.get("line_id") == "worker_implementation"
+    ]
+    assert len(retry_implementations) == 2
+    assert retry_implementations[0]["changed_files"] == [
+        "agent/governance/server.py"
+    ]
+    assert retry_implementations[-1]["changed_files"] == changed_files
+    revision_audit = retry_implementations[-1]["payload"][
+        "canonical_rework_lineage_revision"
+    ]
+    assert revision_audit["append_only_history_preserved"] is True
+    assert revision_audit["revision_event_ref"].startswith("timeline:")
+
+    latest_lineage = _worker_implementation_lineage(
+        revised_record,
+        retry_implementations[-1],
+    )
+    worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": successor["contract_execution_id"],
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "fence_token": rejoin["fence_token"],
+                "session_token": rejoin["session_token"],
+                "target_project_root": str(target_root),
+                "worker_commit_sha": revised_head,
+                "worker_session_id": runtime_context.worker_slot_id,
+                "filer_principal": runtime_context.worker_slot_id,
+                "implementation_lineage_ref": latest_lineage[
+                    "implementation_lineage_ref"
+                ],
+                "owned_files": changed_files,
+                "changed_files": changed_files,
+                "graph_trace_ids": latest_lineage["graph_trace_ids"],
+            },
+        )
+    )
+    assert worker_commit["ok"] is True
+    assert worker_commit["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert worker_commit["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+
+
 def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_backfill(
     conn,
     tmp_path,
@@ -49179,6 +49467,7 @@ def _record_mf_parallel_runtime_context_worker_evidence(
                 "parent_task_id": parent_task_id,
                 "worker_role": "mf_sub",
                 "worker_slot_id": runtime_context.worker_slot_id,
+                "worker_session_id": runtime_context.worker_slot_id,
                 "read_receipt_hash": "sha256:mf-parallel-runtime-projection-read",
                 "read_receipt_event_id": str(read_receipt["id"]),
                 "head_commit": head_commit,
@@ -49367,6 +49656,8 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     submit_dispatch: bool = True,
     pinned_revision: str = "",
     contract_execution_id: str = "",
+    base_commit: str = "",
+    owned_files: tuple[str, ...] = ("agent/governance/server.py",),
 ) -> tuple[dict[str, Any], BranchTaskRuntimeContext]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     started = server.handle_project_onboard_contract_start(
@@ -49434,9 +49725,9 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
                 "route_token_ref": f"rtok-{backlog_id.lower()}-root",
                 "worker_fence": {
                     "fence_token": fence_token,
-                    "owned_files": ["agent/governance/server.py"],
+                    "owned_files": list(owned_files),
                 },
-                "owned_files": ["agent/governance/server.py"],
+                "owned_files": list(owned_files),
             },
         )
     )
@@ -49461,10 +49752,10 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
         token=token,
         worktree_path=worktree_path,
         target_project_root=target_project_root,
-        base_commit=f"base-{worker_task_id}",
-        target_head_commit=f"head-{worker_task_id}",
+        base_commit=base_commit or f"base-{worker_task_id}",
+        target_head_commit=base_commit or f"head-{worker_task_id}",
         merge_queue_id=f"mq-{worker_task_id}",
-        owned_files=("agent/governance/server.py",),
+        owned_files=owned_files,
     )
     worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
     route_identity = {

@@ -3620,6 +3620,259 @@ class ContractRuntime:
             "record": result_record,
         }
 
+    def revise_failed_qa_worker_implementation(
+        self,
+        contract_execution_id: str,
+        write: Mapping[str, Any],
+        *,
+        actor_role: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a server-verified canonical implementation revision.
+
+        This is deliberately narrower than a generic duplicate-line or rewind
+        facility. It only versions the active ``worker_implementation`` after
+        failed independent QA, before the retry ``worker_commit``, for the same
+        authenticated worker/runtime identity. Historical implementation and
+        QA lines remain append-only; the latest matching implementation becomes
+        the worker-commit lineage authority.
+        """
+
+        effective_write = dict(write)
+        effective_actor_role = _effective_actor_role(
+            effective_write,
+            actor_role=actor_role,
+        )
+        if effective_actor_role:
+            effective_write["actor_role"] = effective_actor_role
+        _enrich_line_instance_fields(effective_write)
+
+        record = self.store.get(contract_execution_id)
+        lines = list(record.get("completed_lines") or [])
+        failed_qa_index = _active_failed_qa_line_index(lines)
+        payload = (
+            dict(effective_write.get("payload"))
+            if isinstance(effective_write.get("payload"), Mapping)
+            else {}
+        )
+        authority = (
+            dict(payload.get("canonical_rework_lineage_revision_authority"))
+            if isinstance(
+                payload.get("canonical_rework_lineage_revision_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        rejoin_marker = (
+            dict(payload.get("failed_qa_revision_rejoin_marker"))
+            if isinstance(payload.get("failed_qa_revision_rejoin_marker"), Mapping)
+            else {}
+        )
+        graph_evidence = (
+            dict(payload.get("graph_trace_db_evidence"))
+            if isinstance(payload.get("graph_trace_db_evidence"), Mapping)
+            else {}
+        )
+
+        guide = self._record_view(
+            record,
+            actor_role=effective_actor_role,
+            completed_lines=lines,
+        )["runtime_guide"]
+        next_action = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        errors: list[str] = []
+        if _record_contract_id(record) not in {"mf_parallel", "mf_parallel.v2"}:
+            errors.append("implementation revision requires mf_parallel.v2")
+        if effective_actor_role != "mf_sub":
+            errors.append("implementation revision requires actor_role=mf_sub")
+        if str(effective_write.get("line_id") or "").strip() != "worker_implementation":
+            errors.append("implementation revision requires worker_implementation")
+        if str(effective_write.get("evidence_kind") or "").strip() != "implementation":
+            errors.append("implementation revision requires implementation evidence")
+        if failed_qa_index < 0:
+            errors.append("implementation revision requires active failed independent QA")
+        if str(next_action.get("line_id") or "").strip() != "worker_commit":
+            errors.append("implementation revision is only legal before retry worker_commit")
+
+        runtime_context_id = _worker_commit_text(
+            effective_write,
+            "runtime_context_id",
+        )
+        task_id = _worker_commit_text(effective_write, "task_id")
+        prior_implementation: Mapping[str, Any] | None = None
+        prior_index = -1
+        for index in range(len(lines) - 1, failed_qa_index, -1):
+            candidate = lines[index]
+            if not isinstance(candidate, Mapping):
+                continue
+            if str(candidate.get("line_id") or "").strip() != "worker_implementation":
+                continue
+            if runtime_context_id and _worker_commit_text(
+                candidate,
+                "runtime_context_id",
+            ) != runtime_context_id:
+                continue
+            if task_id and _worker_commit_text(candidate, "task_id") != task_id:
+                continue
+            prior_implementation = candidate
+            prior_index = index
+            break
+        if prior_implementation is None:
+            errors.append("implementation revision requires a post-failed-QA implementation")
+
+        for candidate in lines[failed_qa_index + 1 :]:
+            if not isinstance(candidate, Mapping):
+                continue
+            if str(candidate.get("line_id") or "").strip() != "worker_commit":
+                continue
+            if runtime_context_id and _worker_commit_text(
+                candidate,
+                "runtime_context_id",
+            ) != runtime_context_id:
+                continue
+            if task_id and _worker_commit_text(candidate, "task_id") != task_id:
+                continue
+            errors.append("implementation revision is closed after retry worker_commit")
+            break
+
+        identity_fields = (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "target_project_root",
+            "session_token_ref",
+            "fence_token_hash",
+        )
+        if prior_implementation is not None:
+            for field in identity_fields:
+                prior_value = _worker_commit_text(prior_implementation, field)
+                revised_value = _worker_commit_text(effective_write, field)
+                if prior_value and revised_value != prior_value:
+                    errors.append(
+                        f"implementation revision {field} must match prior implementation"
+                    )
+
+        commit_sha = str(effective_write.get("commit_sha") or "").strip()
+        changed_files = sorted(
+            set(_worker_commit_strings(effective_write, "changed_files"))
+        )
+        graph_trace_ids = sorted(
+            set(
+                _worker_commit_strings(
+                    effective_write,
+                    "graph_trace_ids",
+                    "graph_query_trace_ids",
+                    "verified_trace_ids",
+                )
+            )
+        )
+        if not _WORKER_COMMIT_SHA_RE.fullmatch(commit_sha):
+            errors.append("implementation revision requires a full immutable commit_sha")
+        if not changed_files:
+            errors.append("implementation revision requires cumulative changed_files")
+        if not graph_trace_ids:
+            errors.append("implementation revision requires graph_trace_ids")
+        if authority.get("server_derived") is not True or str(
+            authority.get("source") or ""
+        ) != "runtime_context_clean_cumulative_git_revision":
+            errors.append("implementation revision requires server-derived git authority")
+        if authority.get("clean_worktree") is not True:
+            errors.append("implementation revision requires a clean worktree")
+        if str(authority.get("actual_head_commit") or "").strip() != commit_sha:
+            errors.append("implementation revision commit must match actual worker HEAD")
+        if sorted(set(authority.get("cumulative_changed_files") or [])) != changed_files:
+            errors.append("implementation revision files must match cumulative runtime diff")
+        owned_files = set(authority.get("owned_files") or [])
+        if not owned_files or set(changed_files) - owned_files:
+            errors.append("implementation revision files must remain inside the worker fence")
+        revision_event_ref = str(rejoin_marker.get("revision_event_ref") or "").strip()
+        if not revision_event_ref or str(
+            authority.get("revision_event_ref") or ""
+        ).strip() != revision_event_ref:
+            errors.append("implementation revision requires the accepted failed-QA rejoin boundary")
+        if graph_evidence.get("db_verified") is not True or sorted(
+            set(graph_evidence.get("verified_trace_ids") or [])
+        ) != graph_trace_ids:
+            errors.append("implementation revision requires exact DB-verified graph traces")
+
+        if errors:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=tuple(dict.fromkeys(errors)),
+                ).to_dict(),
+                "record": record,
+            }
+
+        prior_lineage = _worker_implementation_lineage(
+            record,
+            prior_implementation or {},
+        )
+        payload["canonical_rework_lineage_revision"] = {
+            "schema_version": (
+                "contract_runtime.worker_implementation_rework_revision.v1"
+            ),
+            "source": "server_verified_failed_qa_rework",
+            "failed_qa_completed_line_index": failed_qa_index,
+            "superseded_completed_line_index": prior_index,
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+            "revision_event_ref": revision_event_ref,
+            "commit_sha": commit_sha,
+            "append_only_history_preserved": True,
+        }
+        effective_write["payload"] = payload
+        written_line = _line_evidence_from_write(
+            effective_write,
+            effective_actor_role,
+        )
+        completed_lines = [*lines, written_line]
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        updated_record = dict(record)
+        updated_record["completed_lines"] = completed_lines
+        updated_record["execution_state_revision"] = expected_revision + 1
+        try:
+            self.store.update(
+                contract_execution_id,
+                updated_record,
+                expected_revision=expected_revision,
+            )
+        except ContractRuntimeError as exc:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=(str(exc),),
+                ).to_dict(),
+                "record": self.store.get(contract_execution_id),
+            }
+        next_guide = self.current_guide(
+            contract_execution_id,
+            actor_role=effective_actor_role,
+        )
+        persisted = self.store.get(contract_execution_id)
+        persisted["runtime_guide"] = next_guide
+        self.store.update(contract_execution_id, persisted)
+        return {
+            "schema_version": "contract_runtime_write_result.v1",
+            "ok": True,
+            "status": "revised",
+            "decision": WriteGateDecision(ok=True).to_dict(),
+            "record": self.store.get(contract_execution_id),
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+        }
+
     def bypass_current_line(
         self,
         contract_execution_id: str,
