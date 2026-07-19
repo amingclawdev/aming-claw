@@ -19284,7 +19284,409 @@ def test_parallel_branch_merge_execute_mutates_target_owner_not_candidate_worktr
         capture_output=True,
         text=True,
     ).stdout.strip() == live["merge_commit"]
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == live["merge_commit"]
+    assert subprocess.run(
+        ["git", "diff", "--cached", "--quiet", "HEAD", "--"],
+        cwd=repo,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "diff", "--quiet", "--"],
+        cwd=repo,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    assert live["target_owner_alignment"] == {
+        "schema_version": "merge_target_owner_alignment.v1",
+        "passed": True,
+        "status": "pass",
+        "mutation_root": str(repo.resolve()),
+        "target_ref": "refs/heads/main",
+        "head_commit": live["merge_commit"],
+        "target_commit": live["merge_commit"],
+        "merge_commit": live["merge_commit"],
+        "refs_aligned": True,
+        "index_clean": True,
+        "worktree_clean": True,
+        "dirty_files": [],
+        "errors": {
+            "head": "",
+            "target_ref": "",
+            "merge_commit": "",
+            "cached_diff": "",
+            "worktree_diff": "",
+        },
+    }
     assert (repo / "owned-main.txt").read_text(encoding="utf-8") == "candidate\n"
+
+
+def test_parallel_branch_merge_execute_aborts_owner_merge_when_commit_fails(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_worktree = tmp_path / "candidate-commit-failure"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "feature-commit-failure",
+            str(candidate_worktree),
+            main_head,
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (candidate_worktree / "commit-failure.txt").write_text(
+        "candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "commit-failure.txt"],
+        cwd=candidate_worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate commit failure"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    queue_id = "mergeq-api-commit-failure-cleanup"
+    task_id = "commit-failure-cleanup-task"
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {
+            "status": "pass",
+            "passed": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": "timeline:commit-failure-cleanup-qa",
+        },
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="mf-batch-commit-failure-cleanup",
+            task_id=task_id,
+            branch_ref="refs/heads/feature-commit-failure",
+            status="merge_ready",
+            fence_token="fence-commit-failure-cleanup",
+            target_project_root=str(candidate_worktree),
+            worktree_path=str(candidate_worktree),
+            base_commit=main_head,
+            head_commit=candidate_commit,
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-07-19T12:00:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-commit-failure-cleanup",
+                task_id=task_id,
+                branch_ref="refs/heads/feature-commit-failure",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-commit-failure-cleanup",
+                projection_id="semproj-commit-failure-cleanup",
+            )
+        ],
+        now_iso="2026-07-19T12:00:00Z",
+    )
+
+    def fail_after_merge(_message, *, branch, cwd, **_kwargs):
+        merge = subprocess.run(
+            ["git", "merge", branch, "--no-ff", "--no-commit"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        assert merge.returncode == 0, merge.stderr
+        return False, "", "Commit failed: injected test failure"
+
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        fail_after_merge,
+    )
+    result = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "target_ref": "refs/heads/main",
+                "task_id": task_id,
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": "fence-commit-failure-cleanup",
+                "route_waiver": _route_waiver(
+                    "merge_execute",
+                    task_id=task_id,
+                ),
+                "message": "merge candidate with injected commit failure",
+                "bug_id": "AC-MERGE-COMMIT-FAILURE-CLEANUP",
+                "now_iso": "2026-07-19T12:01:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["executed"] is True
+    assert result["error"] == "merge_failed"
+    assert result["failed_merge_cleanup"] == {
+        "schema_version": "failed_merge_commit_cleanup.v1",
+        "attempted": True,
+        "passed": True,
+        "status": "pass",
+        "merge_in_progress_before": True,
+        "merge_in_progress_after": False,
+        "abort_returncode": 0,
+        "abort_error": "",
+        "index_clean_after": True,
+        "worktree_clean_after": True,
+        "dirty_files_after": [],
+    }
+    assert result["recorded"]["queue_item"]["status"] == "merge_failed"
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_head
+    assert subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    assert not (repo / "commit-failure.txt").exists()
+
+
+def test_parallel_branch_merge_execute_rechecks_owner_dirty_before_writer(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    from agent.governance import parallel_branch_runtime as branch_runtime
+
+    repo = _git_repo(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature-prewriter-dirty"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "prewriter-dirty.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "prewriter-dirty.txt"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate prewriter dirty"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    queue_id = "mergeq-api-prewriter-dirty"
+    task_id = "prewriter-dirty-task"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            branch_ref="refs/heads/feature-prewriter-dirty",
+            status="merge_ready",
+            fence_token="fence-prewriter-dirty",
+            target_project_root=str(repo),
+            worktree_path=str(repo),
+            base_commit=main_head,
+            head_commit=candidate_commit,
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-07-19T12:02:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-prewriter-dirty",
+                task_id=task_id,
+                branch_ref="refs/heads/feature-prewriter-dirty",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-prewriter-dirty",
+                projection_id="semproj-prewriter-dirty",
+            )
+        ],
+        now_iso="2026-07-19T12:02:00Z",
+    )
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {
+            "status": "pass",
+            "passed": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": "timeline:prewriter-dirty-qa",
+        },
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    real_dirty_files = branch_runtime._git_worktree_dirty_files
+    dirty_calls = 0
+
+    def dirty_after_preflight(root, *, timeout_seconds):
+        nonlocal dirty_calls
+        dirty_calls += 1
+        if dirty_calls == 2:
+            return ["agent/governance/concurrent-repair.py"]
+        return real_dirty_files(root, timeout_seconds=timeout_seconds)
+
+    writer_calls = 0
+
+    def writer_must_not_run(*_args, **_kwargs):
+        nonlocal writer_calls
+        writer_calls += 1
+        return True, "unexpected", ""
+
+    monkeypatch.setattr(
+        branch_runtime,
+        "_git_worktree_dirty_files",
+        dirty_after_preflight,
+    )
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        writer_must_not_run,
+    )
+    result = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "refs/heads/main",
+                "task_id": task_id,
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": "fence-prewriter-dirty",
+                "route_waiver": _route_waiver(
+                    "merge_execute",
+                    task_id=task_id,
+                ),
+                "message": "merge must refuse after concurrent dirty signal",
+                "bug_id": "AC-MERGE-PREWRITER-DIRTY",
+                "now_iso": "2026-07-19T12:03:00Z",
+            },
+        )
+    )
+
+    assert dirty_calls == 2
+    assert writer_calls == 0
+    assert result["ok"] is False
+    assert result["executed"] is False
+    assert result["error"] == "dirty_worktree_before_merge"
+    assert result["dirty_files"] == ["agent/governance/concurrent-repair.py"]
+    assert result["recorded"] is None
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_head
+    assert subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_head
 
 
 def test_parallel_branch_canonical_live_merge_identity_resolves_short_and_full_sha(

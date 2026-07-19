@@ -16553,6 +16553,149 @@ def _git_target_ref_owning_worktree(
     return None, f"no linked worktree owns target branch {wanted}"
 
 
+def _git_target_owner_alignment_evidence(
+    mutation_root: Path,
+    *,
+    target_ref: str,
+    merge_commit: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Verify the checked-out target owner is fully aligned after a merge.
+
+    Ref equality alone is insufficient: a failed or externally raced merge can
+    leave the index or working tree different from the commit now named by the
+    target branch.  Keep this as a fail-closed postcondition before recording a
+    merge queue item as merged.
+    """
+
+    head_commit, head_error = _git_preview_commit(
+        mutation_root,
+        "HEAD",
+        timeout_seconds=timeout_seconds,
+    )
+    target_commit, target_error = _git_preview_commit(
+        mutation_root,
+        target_ref,
+        timeout_seconds=timeout_seconds,
+    )
+    canonical_merge_commit, merge_error = _git_preview_commit(
+        mutation_root,
+        merge_commit,
+        timeout_seconds=timeout_seconds,
+    )
+    cached = _git_preview_command(
+        mutation_root,
+        ["diff", "--cached", "--quiet", "HEAD", "--"],
+        timeout_seconds=timeout_seconds,
+    )
+    worktree = _git_preview_command(
+        mutation_root,
+        ["diff", "--quiet", "--"],
+        timeout_seconds=timeout_seconds,
+    )
+    dirty_files = _git_worktree_dirty_files(
+        mutation_root,
+        timeout_seconds=timeout_seconds,
+    )
+    index_clean = cached.returncode == 0
+    worktree_clean = worktree.returncode == 0 and not dirty_files
+    commits_resolved = not any((head_error, target_error, merge_error))
+    refs_aligned = bool(
+        commits_resolved
+        and head_commit
+        and head_commit == target_commit == canonical_merge_commit
+    )
+    passed = bool(refs_aligned and index_clean and worktree_clean)
+    return {
+        "schema_version": "merge_target_owner_alignment.v1",
+        "passed": passed,
+        "status": "pass" if passed else "fail",
+        "mutation_root": str(mutation_root),
+        "target_ref": target_ref,
+        "head_commit": head_commit,
+        "target_commit": target_commit,
+        "merge_commit": canonical_merge_commit,
+        "refs_aligned": refs_aligned,
+        "index_clean": index_clean,
+        "worktree_clean": worktree_clean,
+        "dirty_files": dirty_files,
+        "errors": {
+            "head": head_error,
+            "target_ref": target_error,
+            "merge_commit": merge_error,
+            "cached_diff": _bounded_command_text(cached.stderr or cached.stdout)
+            if cached.returncode not in {0, 1}
+            else "",
+            "worktree_diff": _bounded_command_text(worktree.stderr or worktree.stdout)
+            if worktree.returncode not in {0, 1}
+            else "",
+        },
+    }
+
+
+def _git_abort_failed_merge_commit(
+    mutation_root: Path,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Abort a merge left open when the final merge commit failed."""
+
+    merge_head = _git_preview_command(
+        mutation_root,
+        ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        timeout_seconds=timeout_seconds,
+    )
+    merge_in_progress = merge_head.returncode == 0
+    abort = None
+    if merge_in_progress:
+        abort = _git_preview_command(
+            mutation_root,
+            ["merge", "--abort"],
+            timeout_seconds=timeout_seconds,
+        )
+    dirty_files = _git_worktree_dirty_files(
+        mutation_root,
+        timeout_seconds=timeout_seconds,
+    )
+    cached = _git_preview_command(
+        mutation_root,
+        ["diff", "--cached", "--quiet", "HEAD", "--"],
+        timeout_seconds=timeout_seconds,
+    )
+    worktree = _git_preview_command(
+        mutation_root,
+        ["diff", "--quiet", "--"],
+        timeout_seconds=timeout_seconds,
+    )
+    merge_head_after = _git_preview_command(
+        mutation_root,
+        ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        timeout_seconds=timeout_seconds,
+    )
+    passed = bool(
+        not dirty_files
+        and cached.returncode == 0
+        and worktree.returncode == 0
+        and merge_head_after.returncode != 0
+        and (abort is None or abort.returncode == 0)
+    )
+    return {
+        "schema_version": "failed_merge_commit_cleanup.v1",
+        "attempted": merge_in_progress,
+        "passed": passed,
+        "status": "pass" if passed else "fail",
+        "merge_in_progress_before": merge_in_progress,
+        "merge_in_progress_after": merge_head_after.returncode == 0,
+        "abort_returncode": abort.returncode if abort is not None else None,
+        "abort_error": _bounded_command_text(abort.stderr or abort.stdout)
+        if abort is not None and abort.returncode != 0
+        else "",
+        "index_clean_after": cached.returncode == 0,
+        "worktree_clean_after": worktree.returncode == 0 and not dirty_files,
+        "dirty_files_after": dirty_files,
+    }
+
+
 def execute_merge_queue_item(
     conn: sqlite3.Connection,
     *,
@@ -16872,6 +17015,29 @@ def execute_merge_queue_item(
             "recorded": None,
         }
 
+    final_dirty_files = _git_worktree_dirty_files(
+        mutation_root,
+        timeout_seconds=timeout_seconds,
+    )
+    if final_dirty_files:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "dirty_worktree_before_merge",
+            "message": (
+                "target branch owner changed after merge authority preflight; "
+                "refuse before target ref mutation"
+            ),
+            "dirty_files": final_dirty_files,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
     from .chain_trailer import write_merge_with_trailer
 
     ok, merge_commit, error = write_merge_with_trailer(
@@ -16885,6 +17051,10 @@ def execute_merge_queue_item(
         merge_queue_id=item.merge_queue_id,
     )
     if not ok:
+        cleanup = _git_abort_failed_merge_commit(
+            mutation_root,
+            timeout_seconds=timeout_seconds,
+        )
         recorded = record_merge_queue_result(
             conn,
             project_id=project_id,
@@ -16910,9 +17080,37 @@ def execute_merge_queue_item(
             "candidate_preview_root": str(repo_root),
             "target_mutation_root": str(mutation_root),
             "target_mutation_root_source": mutation_root_source,
+            "failed_merge_cleanup": cleanup,
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": recorded,
+        }
+
+    alignment = _git_target_owner_alignment_evidence(
+        mutation_root,
+        target_ref=selected_target_ref,
+        merge_commit=merge_commit,
+        timeout_seconds=timeout_seconds,
+    )
+    if not alignment["passed"]:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": True,
+            "target_ref_mutated": True,
+            "error": "post_merge_target_owner_misaligned",
+            "message": (
+                "merge commit was created but target owner HEAD/ref/index/worktree "
+                "postcondition failed; merged DB state was not recorded"
+            ),
+            "merge_commit": merge_commit,
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "target_owner_alignment": alignment,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
         }
 
     recorded = record_merge_queue_result(
@@ -16940,6 +17138,7 @@ def execute_merge_queue_item(
         "candidate_preview_root": str(repo_root),
         "target_mutation_root": str(mutation_root),
         "target_mutation_root_source": mutation_root_source,
+        "target_owner_alignment": alignment,
         "preview": preview,
         "gate_plan": merge_gate_plan_to_dict(gate_plan),
         "recorded": recorded,
