@@ -78,6 +78,13 @@ def test_mf_timeline_precheck_schema_exposes_repair_view():
     assert "repair" in view["enum"]
 
 
+def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
+    description = _tool_properties("task_timeline_append")["status"]["description"]
+    assert "satisfy the close gate" in description
+    assert "audit-only evidence" in description
+    assert "never satisfy close" in description
+
+
 def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     properties = _tool_properties("parallel_branch_merge_queue_apply")
     assert "branch_ref" in properties
@@ -3412,7 +3419,7 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.2"
     assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
 
     compatibility = mcp_tool_schema_compatibility(
@@ -3422,8 +3429,8 @@ def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
-    assert compatibility["server_tool_schema_version"] == "2026-07-19.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.1"
+    assert compatibility["server_tool_schema_version"] == "2026-07-19.2"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.2"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 

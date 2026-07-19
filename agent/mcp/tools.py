@@ -1972,7 +1972,7 @@ TOOLS: list[dict] = [
                 "decision": {"type": "string"},
                 "schema_version": {"type": "integer"},
                 "actor": {"type": "string"},
-                "status": {"type": "string", "description": "Use accepted/ok/passed/succeeded for close-gate evidence."},
+                "status": {"type": "string", "description": "Passing statuses accepted/ok/pass/passed/succeeded/success satisfy the close gate; failed/fail/rejected/blocked persist authenticated audit-only evidence and never satisfy close."},
                 "payload": {"type": "object"},
                 "verification": {"type": "object"},
                 "artifact_refs": {"type": "object"},

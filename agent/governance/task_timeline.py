@@ -735,6 +735,9 @@ def source_backed_qa_session_authority(
         "source": "server_qa_session_verification",
         "source_of_authority": "qa_session_verification",
         "qa_session_proof": proof,
+        "authority_scope": _text(proof.get("authority_scope")),
+        "close_satisfying": proof.get("close_satisfying") is True,
+        "audit_only": proof.get("audit_only") is True,
     }
     envelope["authority_hash"] = _canonical_contract_hash(
         {key: value for key, value in envelope.items() if key != "authority_hash"}
@@ -840,6 +843,44 @@ def _source_backed_qa_session_authority_valid(
         return False
     if _text(proof.get("query_purpose")) != "independent_verification":
         return False
+    semantic_fields = {
+        "evidence_status",
+        "authority_scope",
+        "close_satisfying",
+        "audit_only",
+        "passing_status_required_for_close",
+    }
+    legacy_passing_authority = not any(
+        field in proof or field in authority for field in semantic_fields
+    )
+    if not legacy_passing_authority:
+        status = _text(proof.get("evidence_status")).lower()
+        passing_statuses = {
+            "accepted",
+            "ok",
+            "pass",
+            "passed",
+            "succeeded",
+            "success",
+        }
+        audit_only_statuses = {"failed", "fail", "rejected", "blocked"}
+        if status not in passing_statuses | audit_only_statuses:
+            return False
+        expected_close_satisfying = status in passing_statuses
+        expected_audit_only = status in audit_only_statuses
+        expected_scope = (
+            "close_satisfying" if expected_close_satisfying else "audit_only"
+        )
+        if (
+            _text(proof.get("authority_scope")) != expected_scope
+            or proof.get("close_satisfying") is not expected_close_satisfying
+            or proof.get("audit_only") is not expected_audit_only
+            or proof.get("passing_status_required_for_close") is not True
+            or _text(authority.get("authority_scope")) != expected_scope
+            or authority.get("close_satisfying") is not expected_close_satisfying
+            or authority.get("audit_only") is not expected_audit_only
+        ):
+            return False
     required_fields = (
         "project_id",
         "backlog_id",

@@ -26083,6 +26083,26 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     )
     timeline_ctx._session = dict(qa_ctx._session)
 
+    queried_again = server.handle_graph_governance_query(qa_ctx)
+    assert queried_again["trace_id"] != queried["trace_id"]
+    timeline_ctx.body["payload"]["graph_trace_ids"] = [
+        queried["trace_id"],
+        queried_again["trace_id"],
+    ]
+    real_reverify = server._qa_reverify_candidate_trace_context
+    reverify_calls = 0
+
+    def counting_reverify(*args, **kwargs):
+        nonlocal reverify_calls
+        reverify_calls += 1
+        return real_reverify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_qa_reverify_candidate_trace_context",
+        counting_reverify,
+    )
+
     result = server.handle_task_timeline_append(timeline_ctx)
 
     assert result["event_kind"] == "independent_verification"
@@ -26099,11 +26119,108 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert proof["base_commit_sha"] == commit_sha
     assert proof["candidate_commit_sha"] == commit_sha
     assert proof["changed_files"] == []
-    assert proof["graph_trace_ids"] == [queried["trace_id"]]
+    assert proof["graph_trace_ids"] == [
+        queried["trace_id"],
+        queried_again["trace_id"],
+    ]
+    assert proof["requested_graph_trace_count"] == 2
+    assert proof["unique_reverification_context_count"] == 1
+    assert proof["reverification_reuse_count"] == 1
+    assert proof["reverification_cache_scope"] == "request_local_success_only"
+    assert reverify_calls == 1
+    assert authority["authority_scope"] == "close_satisfying"
+    assert authority["close_satisfying"] is True
+    assert authority["audit_only"] is False
     assert proof["raw_qa_session_token_persisted"] is False
     assert result["contract_gate_decision"]["source_of_authority"] == (
         "qa_session_verification"
     )
+
+    legacy_authority = json.loads(json.dumps(authority))
+    for field in ("authority_scope", "close_satisfying", "audit_only"):
+        legacy_authority.pop(field, None)
+    for field in (
+        "evidence_status",
+        "authority_scope",
+        "close_satisfying",
+        "audit_only",
+        "passing_status_required_for_close",
+    ):
+        legacy_authority["qa_session_proof"].pop(field, None)
+    legacy_authority["authority_hash"] = task_timeline._canonical_contract_hash(
+        {
+            key: value
+            for key, value in legacy_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    assert task_timeline._source_backed_qa_session_authority_valid(
+        legacy_authority,
+        conn=conn,
+    ) is True
+
+    replay_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(timeline_ctx.body)),
+    )
+    replay_ctx._session = dict(qa_ctx._session)
+    replay = server.handle_task_timeline_append(replay_ctx)
+    assert replay["id"] == result["id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["idempotency_scope"] == "authenticated_qa_exact_authority"
+    assert reverify_calls == 2
+
+    failed_body = json.loads(json.dumps(timeline_ctx.body))
+    failed_body["status"] = "failed"
+    failed_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=failed_body,
+    )
+    failed_ctx._session = dict(qa_ctx._session)
+    failed = server.handle_task_timeline_append(failed_ctx)
+    failed_authority = failed["payload"]["source_backed_contract_gate_authority"]
+    assert failed_authority["authority_scope"] == "audit_only"
+    assert failed_authority["close_satisfying"] is False
+    assert failed_authority["audit_only"] is True
+    assert failed_authority["qa_session_proof"]["evidence_status"] == "failed"
+    assert task_timeline._source_backed_qa_session_authority_valid(
+        failed_authority,
+        conn=conn,
+    ) is True
+    assert task_timeline._independent_qa_gate(
+        [failed],
+        {"requirements": {"independent_qa": True}},
+    )["passed"] is False
+    assert "qa_session_token" not in failed["payload"]
+    assert "qa_session_token" not in failed["verification"]
+    assert failed_authority["qa_session_proof"][
+        "raw_qa_session_token_persisted"
+    ] is False
+
+    unknown_body = json.loads(json.dumps(timeline_ctx.body))
+    unknown_body["status"] = "unknown"
+    unknown_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=unknown_body,
+    )
+    unknown_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as unknown:
+        server.handle_task_timeline_append(unknown_ctx)
+    assert unknown.value.code == "qa_verification_status_invalid"
+
+    event_count = conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+             AND event_kind = 'independent_verification'""",
+        (PID, backlog_id, task_id),
+    ).fetchone()[0]
+    assert event_count == 2
 
 
 def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
@@ -26328,7 +26445,10 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
             "status": "passed",
             "commit_sha": candidate_commit,
             "payload": {
-                "graph_trace_ids": [queried["trace_id"]],
+                "graph_trace_ids": [
+                    queried["trace_id"],
+                    symbol_query["trace_id"],
+                ],
                 "candidate_review_context": identity["candidate_review_context"],
                 "test_results": {"status": "passed"},
                 "observer_impersonation": False,
@@ -26356,7 +26476,10 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
             "status": "passed",
             "commit_sha": candidate_commit,
             "payload": {
-                "graph_trace_ids": [queried["trace_id"]],
+                "graph_trace_ids": [
+                    queried["trace_id"],
+                    symbol_query["trace_id"],
+                ],
                 "candidate_review_context": identity["candidate_review_context"],
                 "test_results": {"status": "passed"},
                 "observer_impersonation": False,
@@ -26364,6 +26487,20 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
         },
     )
     timeline_ctx._session = dict(qa_ctx._session)
+
+    real_candidate_diff_context = server._qa_candidate_diff_context
+    candidate_diff_recomputations = 0
+
+    def counting_candidate_diff_context(*args, **kwargs):
+        nonlocal candidate_diff_recomputations
+        candidate_diff_recomputations += 1
+        return real_candidate_diff_context(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_qa_candidate_diff_context",
+        counting_candidate_diff_context,
+    )
 
     verification = server.handle_task_timeline_append(timeline_ctx)
 
@@ -26377,6 +26514,10 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
     assert proof["candidate_diff_hash"] == identity["candidate_diff_hash"]
     assert proof["candidate_overlay_hash"] == identity["candidate_overlay_hash"]
     assert proof["repository_identity_hash"] == identity["repository_identity_hash"]
+    assert proof["requested_graph_trace_count"] == 2
+    assert proof["unique_reverification_context_count"] == 1
+    assert proof["reverification_reuse_count"] == 1
+    assert candidate_diff_recomputations == 1
 
 
 def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
@@ -28944,6 +29085,32 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
     assert "copy_safe_provenance_shape" not in linked_reporting
 
     append_evidence = guide["append_evidence"]
+    assert append_evidence["status_policy"] == {
+        "close_satisfying": [
+            "accepted",
+            "ok",
+            "pass",
+            "passed",
+            "succeeded",
+            "success",
+        ],
+        "persisted_audit_only": ["blocked", "fail", "failed", "rejected"],
+        "missing_or_unknown": "rejected",
+        "passing_status_required_for_close": True,
+    }
+    assert append_evidence["failed_audit_body"]["status"] == "failed"
+    assert append_evidence["safe_retry"] == {
+        "scope": "authenticated_qa_exact_authority",
+        "same_authority_returns_existing_event": True,
+        "conflicting_status_actor_commit_or_authority_deduplicated": False,
+        "intended_for_ambiguous_timeout_retry": True,
+    }
+    assert append_evidence["reverification_policy"] == {
+        "cache_scope": "request_local_success_only",
+        "identical_review_context_reverified_once_per_request": True,
+        "every_trace_identity_and_scope_still_verified": True,
+        "failed_reverification_cached": False,
+    }
     assert append_evidence["route_token_ref_body"]["verification"][
         "verification_plan"
     ]["focused_commands"] == [expected_focused_command]

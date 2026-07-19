@@ -9209,6 +9209,49 @@ def _qa_reverify_candidate_trace_context(
     return review_context, mismatches
 
 
+def _qa_trace_reverification_cache_key(
+    row: Any,
+    *,
+    body: Mapping[str, Any] | None = None,
+) -> str:
+    """Bind request-local reverify reuse to the full persisted review identity."""
+
+    review_context, mismatches = _qa_graph_review_context_from_trace_row(row)
+    if mismatches:
+        return ""
+    try:
+        root_identity = json.loads(str(row["root_identity_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError, KeyError, IndexError):
+        return ""
+    if not isinstance(root_identity, Mapping):
+        return ""
+    supplied_body = body or {}
+    supplied_root = next(
+        (
+            str(supplied_body.get(key) or "").strip()
+            for key in (
+                "project_root",
+                "target_project_root",
+                "target_graph_root",
+                "worktree_path",
+                "workspace_path",
+                "repo_root",
+            )
+            if str(supplied_body.get(key) or "").strip()
+        ),
+        "",
+    )
+    if supplied_root:
+        supplied_root = str(Path(supplied_root).resolve())
+    return stable_sha256(
+        {
+            "review_context": review_context,
+            "root_identity": dict(root_identity),
+            "supplied_root": supplied_root,
+        }
+    )
+
+
 def _require_bounded_qa_session_authority(
     ctx: RequestContext,
     conn,
@@ -12810,6 +12853,8 @@ def _runtime_context_service_qa_graph_trace_refs(
     identity_mismatches: list[dict[str, Any]] = []
     bounded_review_contexts: list[dict[str, Any]] = []
     bounded_qa_authorities: list[dict[str, str]] = []
+    successful_reverification_contexts: dict[str, dict[str, Any]] = {}
+    reverification_reuse_count = 0
     strict_bounded_qa = bool(strict_bounded_qa or require_complete_authority)
     expected_candidate_commit_sha = str(
         expected_candidate_commit_sha or ""
@@ -12942,11 +12987,19 @@ def _runtime_context_service_qa_graph_trace_refs(
                         "actual": row_status,
                     }
                 )
-        review_context, context_errors = _qa_reverify_candidate_trace_context(
-            conn,
-            project_id=project_id,
-            row=row,
-        )
+        reverify_key = _qa_trace_reverification_cache_key(row)
+        if reverify_key and reverify_key in successful_reverification_contexts:
+            review_context = successful_reverification_contexts[reverify_key]
+            context_errors: list[dict[str, Any]] = []
+            reverification_reuse_count += 1
+        else:
+            review_context, context_errors = _qa_reverify_candidate_trace_context(
+                conn,
+                project_id=project_id,
+                row=row,
+            )
+            if reverify_key and not context_errors:
+                successful_reverification_contexts[reverify_key] = review_context
         if context_errors:
             identity_mismatches.extend(context_errors)
             continue
@@ -13032,6 +13085,12 @@ def _runtime_context_service_qa_graph_trace_refs(
         "query_source": "qa" if verified else "",
         "query_purpose": "independent_verification" if verified else "",
         "target_project_root": target_project_root,
+        "requested_graph_trace_count": len(requested_trace_ids),
+        "unique_reverification_context_count": len(
+            successful_reverification_contexts
+        ),
+        "reverification_reuse_count": reverification_reuse_count,
+        "reverification_cache_scope": "request_local_success_only",
         "source_details": {
             "graph_query_traces": bool(rows),
             "caller_requested_trace_ids": bool(requested_trace_ids),
@@ -15337,6 +15396,14 @@ def _runtime_context_qa_verification_guide(
             ],
         },
     }
+    failed_audit_body = {
+        **base_append_body,
+        "status": "failed",
+        "payload": {
+            **dict(base_append_body["payload"]),
+            "verification_outcome": "candidate_failed_independent_verification",
+        },
+    }
     qa_graph_context_shape = _qa_graph_context_evidence_shape(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -15598,6 +15665,25 @@ def _runtime_context_qa_verification_guide(
             "focused_pass_with_full_suite_caveat_body": (
                 focused_pass_with_full_suite_caveat_body
             ),
+            "failed_audit_body": failed_audit_body,
+            "status_policy": {
+                "close_satisfying": sorted(_QA_TIMELINE_CLOSE_STATUSES),
+                "persisted_audit_only": sorted(_QA_TIMELINE_AUDIT_STATUSES),
+                "missing_or_unknown": "rejected",
+                "passing_status_required_for_close": True,
+            },
+            "safe_retry": {
+                "scope": "authenticated_qa_exact_authority",
+                "same_authority_returns_existing_event": True,
+                "conflicting_status_actor_commit_or_authority_deduplicated": False,
+                "intended_for_ambiguous_timeout_retry": True,
+            },
+            "reverification_policy": {
+                "cache_scope": "request_local_success_only",
+                "identical_review_context_reverified_once_per_request": True,
+                "every_trace_identity_and_scope_still_verified": True,
+                "failed_reverification_cached": False,
+            },
             "forbidden_authors": [
                 "observer",
                 "hotfix_implementation_actor",
@@ -76270,6 +76356,14 @@ def _trusted_contract_runtime_actor_role_from_context(
     return session_role if session_role in {"observer", "qa", "mf_sub"} else ""
 
 
+_QA_TIMELINE_CLOSE_STATUSES = frozenset(
+    {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+)
+_QA_TIMELINE_AUDIT_STATUSES = frozenset(
+    {"failed", "fail", "rejected", "blocked"}
+)
+
+
 def _timeline_trusted_qa_verification_authority(
     ctx: RequestContext,
     conn,
@@ -76305,12 +76399,16 @@ def _timeline_trusted_qa_verification_authority(
             422,
             {"phase": phase},
         )
-    if status not in {"accepted", "ok", "pass", "passed", "succeeded", "success"}:
+    if status not in _QA_TIMELINE_CLOSE_STATUSES | _QA_TIMELINE_AUDIT_STATUSES:
         raise GovernanceError(
             "qa_verification_status_invalid",
-            "QA verification authority requires a passing status",
+            "QA verification evidence requires an explicit passing or audit-only status",
             422,
-            {"status": status},
+            {
+                "status": status,
+                "passing_statuses": sorted(_QA_TIMELINE_CLOSE_STATUSES),
+                "audit_only_statuses": sorted(_QA_TIMELINE_AUDIT_STATUSES),
+            },
         )
     if _qa_request_has_impersonation_claim(body):
         raise GovernanceError(
@@ -76379,6 +76477,8 @@ def _timeline_trusted_qa_verification_authority(
     task_id = str(body.get("task_id") or "").strip()
     snapshot_ids: set[str] = set()
     review_contexts: list[dict[str, Any]] = []
+    successful_reverification_contexts: dict[str, dict[str, Any]] = {}
+    reverification_reuse_count = 0
     for trace_id in trace_ids:
         row = rows_by_trace.get(trace_id)
         if row is None:
@@ -76403,14 +76503,20 @@ def _timeline_trusted_qa_verification_authority(
                 mismatches.append({"trace_id": trace_id, "field": field, "expected": expected, "actual": actual})
         row_snapshot_id = str(row["snapshot_id"] or "").strip()
         snapshot_ids.add(row_snapshot_id)
-        review_context, review_mismatches = (
-            _qa_reverify_candidate_trace_context(
+        reverify_key = _qa_trace_reverification_cache_key(row, body=body)
+        if reverify_key and reverify_key in successful_reverification_contexts:
+            review_context = successful_reverification_contexts[reverify_key]
+            review_mismatches: list[dict[str, Any]] = []
+            reverification_reuse_count += 1
+        else:
+            review_context, review_mismatches = _qa_reverify_candidate_trace_context(
                 conn,
                 project_id=project_id,
                 row=row,
                 body=body,
             )
-        )
+            if reverify_key and not review_mismatches:
+                successful_reverification_contexts[reverify_key] = review_context
         review_contexts.append(review_context)
         mismatches.extend(review_mismatches)
     if len(snapshot_ids) != 1:
@@ -76454,13 +76560,28 @@ def _timeline_trusted_qa_verification_authority(
             "db_verified_graph_trace": True,
             "snapshot_id": next(iter(snapshot_ids)),
             "snapshot_commit_sha": review_context["base_commit_sha"],
+            "evidence_status": status,
+            "authority_scope": (
+                "close_satisfying"
+                if status in _QA_TIMELINE_CLOSE_STATUSES
+                else "audit_only"
+            ),
+            "close_satisfying": status in _QA_TIMELINE_CLOSE_STATUSES,
+            "audit_only": status in _QA_TIMELINE_AUDIT_STATUSES,
+            "passing_status_required_for_close": True,
+            "requested_graph_trace_count": len(trace_ids),
+            "unique_reverification_context_count": len(
+                successful_reverification_contexts
+            ),
+            "reverification_reuse_count": reverification_reuse_count,
+            "reverification_cache_scope": "request_local_success_only",
             **review_context,
         }
     )
     return proof
 
 
-def _parentless_direct_main_qa_timeline_replay(
+def _qa_timeline_idempotent_replay(
     conn,
     *,
     project_id: str,
@@ -76468,24 +76589,10 @@ def _parentless_direct_main_qa_timeline_replay(
     event_kind: str,
     norm_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Reuse one authenticated QA proof for an explicit onboard-service parent."""
+    """Reuse an exact authenticated QA authority after an ambiguous append."""
 
-    requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
-    if not requested_execution_id.startswith("onboard-service-"):
-        return {}
-    try:
-        record = _contract_runtime(conn).store.get(requested_execution_id)
-    except ContractRuntimeError:
-        return {}
     backlog_id = str(body.get("backlog_id") or "").strip()
     task_id = str(body.get("task_id") or "").strip()
-    if (
-        not _onboard_service_record(record)
-        or task_id != requested_execution_id
-        or str(record.get("project_id") or "").strip() != project_id
-        or str(record.get("backlog_id") or "").strip() != backlog_id
-    ):
-        return {}
     authority = (
         norm_payload.get("source_backed_contract_gate_authority")
         if isinstance(
@@ -76503,6 +76610,27 @@ def _parentless_direct_main_qa_timeline_replay(
 
     from . import task_timeline
 
+    if not task_timeline._source_backed_qa_session_authority_valid(
+        authority,
+        conn=conn,
+    ):
+        return {}
+
+    requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
+    valid_execution_id = ""
+    if requested_execution_id.startswith("onboard-service-"):
+        try:
+            record = _contract_runtime(conn).store.get(requested_execution_id)
+        except ContractRuntimeError:
+            record = {}
+        if (
+            _onboard_service_record(record)
+            and task_id == requested_execution_id
+            and str(record.get("project_id") or "").strip() == project_id
+            and str(record.get("backlog_id") or "").strip() == backlog_id
+        ):
+            valid_execution_id = requested_execution_id
+
     for existing in reversed(
         task_timeline.list_events(
             conn,
@@ -76519,6 +76647,8 @@ def _parentless_direct_main_qa_timeline_replay(
             != str(body.get("actor") or "").strip()
             or str(existing.get("commit_sha") or "").strip()
             != str(body.get("commit_sha") or "").strip()
+            or str(existing.get("status") or "").strip().lower()
+            != str(body.get("status") or "").strip().lower()
         ):
             continue
         existing_payload = (
@@ -76539,14 +76669,17 @@ def _parentless_direct_main_qa_timeline_replay(
             != authority_hash
         ):
             continue
-        return {
+        replay = {
             **existing,
             "idempotent_replay": True,
             "timeline_append_required": False,
             "timeline_append_authoritative": False,
             "existing_timeline_event_authoritative": True,
-            "contract_execution_id": requested_execution_id,
+            "idempotency_scope": "authenticated_qa_exact_authority",
         }
+        if valid_execution_id:
+            replay["contract_execution_id"] = valid_execution_id
+        return replay
     return {}
 
 
@@ -77286,7 +77419,7 @@ def handle_task_timeline_append(ctx: RequestContext):
         else:
             norm_payload["meta_contract_gate"] = meta_contract_gate
         if trusted_qa_verification_authority:
-            qa_replay = _parentless_direct_main_qa_timeline_replay(
+            qa_replay = _qa_timeline_idempotent_replay(
                 conn,
                 project_id=project_id,
                 body=ctx.body or {},
