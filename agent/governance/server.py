@@ -3102,6 +3102,7 @@ _OBSERVER_ROUTE_PROTECTED_WRITE_ACTIONS = (
     "backlog_close",
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
+    "contract_runtime_recover",
     "task_timeline_append",
     "graph_current_full_reconcile",
 )
@@ -51542,6 +51543,55 @@ def _contract_runtime_stale_recovery_projection(
     }
 
 
+def _contract_runtime_stale_record_evidence_projection(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    execution_id = str(record.get("contract_execution_id") or "")
+    completed_lines = [
+        line
+        for line in (record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+    ]
+    evidence_refs = [
+        f"contract_runtime:{execution_id}:completed_lines:{index}"
+        for index, _line in enumerate(completed_lines)
+    ]
+    return {
+        "schema_version": "contract_runtime.stale_record_evidence.v1",
+        "contract_execution_id": execution_id,
+        "definition_hash": str(record.get("definition_hash") or ""),
+        "definition_source_sha256": str(
+            record.get("definition_source_sha256") or ""
+        ),
+        "completed_line_count": len(completed_lines),
+        "completed_line_refs": evidence_refs,
+        "completed_line_summary": [
+            {
+                "source_ref": evidence_refs[index],
+                "stage_id": str(line.get("stage_id") or ""),
+                "line_id": str(line.get("line_id") or ""),
+                "evidence_kind": str(line.get("evidence_kind") or ""),
+                "actor_role": str(line.get("actor_role") or ""),
+                "status": str(
+                    line.get("status")
+                    or (
+                        line.get("payload", {}).get("status")
+                        if isinstance(line.get("payload"), Mapping)
+                        else ""
+                    )
+                    or ""
+                ),
+                "commit_sha": str(line.get("commit_sha") or ""),
+            }
+            for index, line in enumerate(completed_lines)
+        ],
+        "record_preserved": True,
+        "historical_evidence_replayed": False,
+        "authoritative_pass_synthesized": False,
+        "source_of_authority": "contract_runtime_executions.completed_lines",
+    }
+
+
 def _contract_runtime_recovery_requested(value: Any) -> bool:
     normalized = str(value or "").strip().lower().replace("-", "_")
     return normalized in {
@@ -58667,6 +58717,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "contract_runtime_current",
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
+    "contract_runtime_recover",
     "runtime_context_read_receipt",
     "mf_parallel_enter",
     "mf_batch_parallel_enter",
@@ -58691,6 +58742,7 @@ _CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "graph_query",
     "contract_runtime_current",
     "contract_runtime_guide",
+    "contract_runtime_recover",
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
     "parallel_branch_allocate",
@@ -63316,6 +63368,7 @@ _DIRECT_FIX_CHILD_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "graph_query",
     "contract_runtime_current",
     "contract_runtime_guide",
+    "contract_runtime_recover",
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
     "parallel_branch_allocate",
@@ -84525,6 +84578,187 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
         request_id=ctx.request_id,
     )
     response["actor_role"] = actor_role
+    return response
+
+
+@route("POST", "/api/projects/{project_id}/contract-runtime/recover")
+def handle_project_contract_runtime_recover(ctx: RequestContext):
+    """Start an idempotent current-definition execution for one stale pin."""
+
+    project_id = ctx.get_project_id()
+    body = dict(ctx.body or {})
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    stale_execution_id = str(
+        body.get("stale_contract_execution_id") or ""
+    ).strip()
+    recovery_policy = str(body.get("recovery_policy") or "").strip()
+    if not backlog_id:
+        raise ValidationError("backlog_id is required")
+    if not stale_execution_id:
+        raise ValidationError("stale_contract_execution_id is required")
+    if not _contract_runtime_recovery_requested(recovery_policy):
+        raise ValidationError(
+            "recovery_policy must request start_new_execution",
+            {"recovery_policy": recovery_policy},
+        )
+
+    route_token_ref = _contract_runtime_ref_value(
+        ctx, "route_token_ref", "observer_route_token_ref"
+    )
+    with DBContext(project_id) as conn:
+        runtime = _contract_runtime(conn)
+        stale_record = runtime.store.get(stale_execution_id)
+        record_backlog_id = str(stale_record.get("backlog_id") or "").strip()
+        if record_backlog_id != backlog_id:
+            raise ValidationError(
+                "stale contract execution backlog does not match recovery scope",
+                {
+                    "stale_contract_execution_id": stale_execution_id,
+                    "backlog_id": backlog_id,
+                    "record_backlog_id": record_backlog_id,
+                },
+            )
+        actor_role = _contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_recover",
+            backlog_id=backlog_id,
+            contract_execution_id=stale_execution_id,
+            record=stale_record,
+        )
+        if _normalized_contract_runtime_action(actor_role) != "observer":
+            raise PermissionDeniedError(
+                actor_role or "anonymous",
+                "contract_runtime_recover",
+                {"required_role": "observer"},
+            )
+
+        try:
+            runtime.current_guide(stale_execution_id, actor_role=actor_role)
+        except StalePinnedContractExecutionError as stale:
+            recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
+        else:
+            raise ValidationError(
+                "contract runtime recovery requires a stale pinned execution",
+                {
+                    "contract_execution_id": stale_execution_id,
+                    "safe_to_continue_existing_execution": True,
+                },
+            )
+
+        historical_evidence = (
+            _contract_runtime_stale_record_evidence_projection(stale_record)
+        )
+        idempotent = False
+        try:
+            recovery_record = runtime.store.get(recovery_execution_id)
+        except ContractRuntimeError:
+            recovery_record = None
+        if recovery_record is not None:
+            recovery_metadata = (
+                recovery_record.get("metadata")
+                if isinstance(recovery_record.get("metadata"), Mapping)
+                else {}
+            )
+            if str(
+                recovery_metadata.get("stale_contract_execution_id") or ""
+            ) != stale_execution_id:
+                raise ValidationError(
+                    "recovery execution id is bound to different stale history",
+                    {
+                        "recovery_contract_execution_id": recovery_execution_id,
+                        "stale_contract_execution_id": stale_execution_id,
+                    },
+                )
+            runtime.current_guide(
+                recovery_execution_id,
+                actor_role=actor_role,
+            )
+            recovery_record = runtime.store.get(recovery_execution_id)
+            idempotent = True
+        else:
+            backlog_lineage = dict(
+                stale_record.get("backlog_lineage")
+                if isinstance(stale_record.get("backlog_lineage"), Mapping)
+                else {}
+            )
+            backlog_lineage.update(
+                {
+                    "stale_contract_execution_id": stale_execution_id,
+                    "recovery_contract_execution_id": recovery_execution_id,
+                    "recovery_policy": "start_new_execution",
+                }
+            )
+            recovery_record = runtime.start_execution(
+                str(stale_record.get("contract_id") or ""),
+                project_id=project_id,
+                backlog_id=backlog_id,
+                actor_role=actor_role,
+                contract_execution_id=recovery_execution_id,
+                version=str(stale_record.get("version") or "") or None,
+                revision=str(stale_record.get("revision") or "") or None,
+                route_token_ref=route_token_ref,
+                parent_contract_execution_id=str(
+                    stale_record.get("parent_contract_execution_id") or ""
+                ),
+                root_contract_execution_id=str(
+                    stale_record.get("root_contract_execution_id") or ""
+                ),
+                contract_chain_id=str(
+                    stale_record.get("contract_chain_id") or ""
+                ),
+                role_binding=(
+                    dict(stale_record.get("role_binding") or {})
+                    if isinstance(stale_record.get("role_binding"), Mapping)
+                    else {}
+                ),
+                backlog_lineage=backlog_lineage,
+                metadata={
+                    "facade": "contract_runtime_recovery",
+                    "generic_crud_exposed": False,
+                    "recovery_policy": "start_new_execution",
+                    "recovery_reason": "stale_pinned_execution",
+                    "stale_contract_execution_id": stale_execution_id,
+                    "stale_completed_line_count": historical_evidence[
+                        "completed_line_count"
+                    ],
+                    "stale_evidence_refs": historical_evidence[
+                        "completed_line_refs"
+                    ],
+                    "historical_evidence_replayed": False,
+                    "authoritative_pass_synthesized": False,
+                },
+            )
+        guide = runtime.current_guide(
+            recovery_execution_id,
+            actor_role=actor_role,
+        )
+        recovery_record = runtime.store.get(recovery_execution_id)
+        recovery_record["runtime_guide"] = guide
+        conn.commit()
+
+    response = _contract_runtime_response(
+        recovery_record,
+        actor_role=actor_role,
+        request_id=ctx.request_id,
+    )
+    response.update(
+        {
+            "schema_version": "contract_runtime.recovery_response.v1",
+            "status": "recovery_execution_started",
+            "recovery_policy": "start_new_execution",
+            "stale_contract_execution_id": stale_execution_id,
+            "recovery_contract_execution_id": recovery_execution_id,
+            "idempotent": idempotent,
+            "existing_record_preserved": True,
+            "historical_evidence": historical_evidence,
+            "historical_evidence_replayed": False,
+            "authoritative_pass_synthesized": False,
+            "agent_facing_decision_source": (
+                "contract_runtime_stale_pinned_recovery"
+            ),
+        }
+    )
     return response
 
 

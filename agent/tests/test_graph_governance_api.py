@@ -49246,6 +49246,109 @@ def test_contract_add_stale_pinned_execution_returns_recovery_next_action(conn):
     assert recovered["next_legal_action"]["id"] == "observer_request_contract_add"
 
 
+def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_replay(
+    conn, tmp_path
+):
+    backlog_id = "AC-MF-PARALLEL-STALE-PINNED-GENERIC-RECOVERY"
+    worktree = tmp_path / "mf-parallel-stale-generic-recovery-candidate"
+    worker_commit = _init_test_git_repo(worktree)
+    chain = _start_completed_source_backed_mf_parallel_close_authority_chain(
+        conn,
+        backlog_id=backlog_id,
+        close_commit="f" * 40,
+        worker_commit=worker_commit,
+        route_label="stale-generic-recovery",
+        worktree_path=str(worktree),
+    )
+    execution_id = chain["successor"]["contract_execution_id"]
+    runtime = server._contract_runtime(conn)
+    stale = runtime.store.get(execution_id)
+    original_completed_lines = list(stale["completed_lines"])
+    stale["definition_hash"] = "sha256:stale-mf-parallel-definition"
+    runtime.store.update(execution_id, stale)
+    conn.commit()
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    assert current["status"] == "blocked_stale_pinned_execution"
+    assert current["next_legal_action"]["endpoint"].endswith(
+        "/contract-runtime/recover"
+    )
+
+    request_body = {
+        "backlog_id": backlog_id,
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": execution_id,
+        "route_token_ref": "rtok-generic-recovery",
+    }
+    recovered = server.handle_project_contract_runtime_recover(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=request_body,
+        )
+    )
+
+    recovery_id = current["recovery"]["recovery_contract_execution_id"]
+    assert recovered["ok"] is True
+    assert recovered["contract_execution_id"] == recovery_id
+    assert recovered["recovery_contract_execution_id"] == recovery_id
+    assert recovered["stale_contract_execution_id"] == execution_id
+    assert recovered["existing_record_preserved"] is True
+    assert recovered["historical_evidence_replayed"] is False
+    assert recovered["authoritative_pass_synthesized"] is False
+    historical = recovered["historical_evidence"]
+    assert historical["record_preserved"] is True
+    assert historical["completed_line_count"] == len(original_completed_lines)
+    assert historical["completed_line_refs"][-1].endswith(
+        f":{len(original_completed_lines) - 1}"
+    )
+    assert any(
+        line["line_id"] == "qa_independent_verification"
+        for line in historical["completed_line_summary"]
+    )
+    assert runtime.store.get(execution_id)["definition_hash"] == (
+        "sha256:stale-mf-parallel-definition"
+    )
+    assert runtime.store.get(execution_id)["completed_lines"] == (
+        original_completed_lines
+    )
+    recovery_record = runtime.store.get(recovery_id)
+    assert recovery_record["completed_lines"] == []
+    assert recovery_record["metadata"]["historical_evidence_replayed"] is False
+
+    replay = server.handle_project_contract_runtime_recover(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=request_body,
+        )
+    )
+    assert replay["idempotent"] is True
+    assert replay["contract_execution_id"] == recovery_id
+    assert runtime.store.get(recovery_id)["completed_lines"] == []
+
+
+def test_contract_runtime_recovery_is_observer_admin_evidence_action():
+    lane = observer_route_context._route_lane_requirements_for_actions(
+        ["contract_runtime_recover"]
+    )
+
+    scope = lane["route_action_scope"]
+    assert scope["classification"] == "observer_admin_close_evidence_only"
+    assert scope["requires_mf_sub_implementation_lane"] is False
+    assert "contract_runtime_recover" in (
+        server._CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS
+    )
+
+
 def test_mf_parallel_enter_uses_completed_onboard_recovery_parent(conn):
     backlog_id = "AC-MF-PARALLEL-RECOVERY-PARENT"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)

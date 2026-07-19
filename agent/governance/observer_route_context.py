@@ -157,6 +157,7 @@ OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS: tuple[str, ...] = (
     "graph_current_full_reconcile",
     "contract_runtime_current",
     "contract_runtime_guide",
+    "contract_runtime_recover",
     "contract_runtime_submit_line",
     "contract_runtime_bypass_line",
     "observer_direct_mutation_exception",
