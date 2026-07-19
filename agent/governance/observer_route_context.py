@@ -1174,6 +1174,9 @@ def issue_observer_write_route_context(
 REF_REGISTRY_SCHEMA_VERSION = "route_token_ref_registry.v1"
 REF_RENEWAL_SCHEMA_VERSION = "route_token_ref_renewal.v1"
 REF_RENEWAL_PROOF_SCHEMA_VERSION = "route_token_ref_renewal_proof.v1"
+REF_SAME_SCOPE_REISSUE_PROOF_SCHEMA_VERSION = (
+    "route_token_ref_same_scope_reissue_proof.v1"
+)
 REF_EXPIRY_STATUS_SCHEMA_VERSION = "route_token_ref_expiry_status.v1"
 REF_RENEWAL_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_renewal_next_action.v1"
 REF_REISSUE_NEXT_ACTION_SCHEMA_VERSION = "route_token_ref_same_scope_issue_next_action.v1"
@@ -2549,6 +2552,146 @@ def _actions_subset_or_same(
     return requested_actions
 
 
+def attach_same_scope_reissue_proof(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    token: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a child route to an exact superseded same-scope parent.
+
+    A superseded ref cannot be renewed directly.  The public recovery guide
+    therefore issues a fresh child route from the stored parent identity and
+    then renews that child to prove an active observer session.  Initial-join
+    may trust that two-hop chain only when the server records here that the
+    reissue did not widen project/backlog/task, role, action, or file scope.
+
+    Ordinary parent/child route issuance is unchanged: when the parent ref is
+    active, expired, unknown, or absent this helper returns no proof.
+    """
+
+    parent_lineage = (
+        token.get("parent_route_lineage")
+        if isinstance(token.get("parent_route_lineage"), Mapping)
+        else {}
+    )
+    previous_ref = _string(parent_lineage.get("route_token_ref"))
+    if not previous_ref:
+        return {}
+
+    _ensure_ref_registry_schema(conn)
+    row = conn.execute(
+        "SELECT * FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (_string(project_id), previous_ref),
+    ).fetchone()
+    if row is None:
+        return {}
+    row_dict = dict(row)
+    if _string(row_dict.get("status")) != REF_STATUS_SUPERSEDED:
+        return {}
+
+    for field in _PARENT_ROUTE_REQUIRED_FIELDS:
+        supplied = _string(parent_lineage.get(field))
+        stored = _string(row_dict.get(field))
+        if not supplied or not stored or supplied != stored:
+            raise RouteTokenRefError(
+                f"same-scope route reissue parent identity mismatch for {field}",
+                code="route_token_ref_same_scope_reissue_parent_identity_mismatch",
+                details={
+                    "route_token_ref": previous_ref,
+                    "field": field,
+                    "supplied": supplied,
+                    "stored": stored,
+                },
+            )
+
+    stored_scope = _row_scope(row_dict)
+    child_scope = dict(token.get("scope") or {})
+    for field in ("project_id", "backlog_id", "task_id"):
+        expected = _scope_value(stored_scope, field)
+        actual = _scope_value(child_scope, field)
+        if not expected or actual != expected:
+            raise RouteTokenRefError(
+                f"same-scope route reissue {field} mismatch",
+                code=f"route_token_ref_same_scope_reissue_{field}_mismatch",
+                details={
+                    "route_token_ref": previous_ref,
+                    "field": field,
+                    "expected": expected,
+                    "actual": actual,
+                },
+            )
+
+    stored_role = _string(row_dict.get("caller_role"))
+    child_role = _string(token.get("caller_role"))
+    if not stored_role or child_role != stored_role:
+        raise RouteTokenRefError(
+            "same-scope route reissue caller_role mismatch",
+            code="route_token_ref_same_scope_reissue_caller_role_mismatch",
+            details={
+                "route_token_ref": previous_ref,
+                "expected": stored_role,
+                "actual": child_role,
+            },
+        )
+
+    allowed_actions = _actions_subset_or_same(
+        token.get("allowed_actions"),
+        _row_allowed_actions(row_dict),
+        route_token_ref=previous_ref,
+    )
+    target_files = _subset_or_same(
+        token.get("target_files") or [],
+        _row_target_files(row_dict),
+        field="target_files",
+        route_token_ref=previous_ref,
+    )
+    owned_files = _subset_or_same(
+        token.get("owned_files") or token.get("target_files") or [],
+        _row_owned_files(row_dict) or _row_target_files(row_dict),
+        field="owned_files",
+        route_token_ref=previous_ref,
+    )
+
+    child_ref = _string(route_token_ref)
+    if not child_ref or child_ref == previous_ref:
+        raise RouteTokenRefError(
+            "same-scope route reissue requires a fresh child ref",
+            code="route_token_ref_same_scope_reissue_not_fresh",
+            details={
+                "route_token_ref": previous_ref,
+                "child_route_token_ref": child_ref,
+            },
+        )
+
+    proof = {
+        "schema_version": REF_SAME_SCOPE_REISSUE_PROOF_SCHEMA_VERSION,
+        "status": "reissued_from_superseded",
+        "source": "issue_observer_write_route_context",
+        "previous_route_token_ref": previous_ref,
+        "route_token_ref": child_ref,
+        "scope": {
+            field: _scope_value(stored_scope, field)
+            for field in ("project_id", "backlog_id", "task_id")
+        },
+        "caller_role": child_role,
+        "allowed_actions": allowed_actions,
+        "target_files": target_files,
+        "owned_files": owned_files,
+        "scope_widened": False,
+        "registry_verified": True,
+        "raw_route_token_persisted": False,
+        "raw_session_token_persisted": False,
+    }
+    route_lineage = _public_mapping(token.get("route_lineage"))
+    route_lineage.setdefault("schema_version", ROUTE_LINEAGE_SCHEMA_VERSION)
+    route_lineage["same_scope_reissue_proof"] = proof
+    token["route_lineage"] = route_lineage
+    return proof
+
+
 def renew_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -2700,6 +2843,35 @@ def renew_route_token_ref(
             route_token_ref=old_ref,
         )
 
+        # Preserve a superseded-parent recovery proof across the second hop,
+        # but never copy it by assertion alone.  Recompute it from the old
+        # child row and the current registry state so a caller cannot inject a
+        # forged ``registry_verified`` marker into a later renewal.
+        stored_route_lineage = _json_loads_public_mapping(
+            row_dict.get(_REF_LINEAGE_COLUMNS["route_lineage"])
+        )
+        carried_same_scope_reissue_proof: dict[str, Any] = {}
+        if isinstance(
+            stored_route_lineage.get("same_scope_reissue_proof"), Mapping
+        ):
+            proof_token = {
+                "parent_route_lineage": _json_loads_public_mapping(
+                    row_dict.get(_REF_LINEAGE_COLUMNS["parent_route_lineage"])
+                ),
+                "scope": dict(scope),
+                "caller_role": stored_role,
+                "allowed_actions": _row_allowed_actions(row_dict),
+                "target_files": list(stored_target_files),
+                "owned_files": list(stored_owned_files),
+                "route_lineage": dict(stored_route_lineage),
+            }
+            carried_same_scope_reissue_proof = attach_same_scope_reissue_proof(
+                conn,
+                project_id=project_id,
+                route_token_ref=old_ref,
+                token=proof_token,
+            )
+
         parent_lineage = _json_loads_public_mapping(
             row_dict.get(_REF_LINEAGE_COLUMNS["parent_route_lineage"])
         )
@@ -2760,6 +2932,10 @@ def renew_route_token_ref(
         }
         route_lineage = _public_mapping(token.get("route_lineage"))
         route_lineage.setdefault("schema_version", ROUTE_LINEAGE_SCHEMA_VERSION)
+        if carried_same_scope_reissue_proof:
+            route_lineage["same_scope_reissue_proof"] = dict(
+                carried_same_scope_reissue_proof
+            )
         route_lineage["route_token_ref_renewed"] = True
         route_lineage["renewal_proof"] = {
             "schema_version": REF_RENEWAL_PROOF_SCHEMA_VERSION,

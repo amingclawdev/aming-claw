@@ -3728,6 +3728,35 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     except Exception as exc:  # pragma: no cover - defensive
         return 400, {"ok": False, "error": f"route token issuance failed: {exc}"}
 
+    # A superseded route ref cannot be renewed directly.  When the caller uses
+    # the server-provided same-scope issue recovery, bind the fresh child to the
+    # exact inactive parent and prove that no action/file/task scope widened.
+    # The proof is persisted with the child and survives the later active-
+    # session renewal consumed by runtime-context initial_join.
+    try:
+        conn = get_connection(project_id)
+        try:
+            observer_route_context.attach_same_scope_reissue_proof(
+                conn,
+                project_id=project_id,
+                route_token_ref=str(issued.get("route_token_ref") or ""),
+                token=issued["route_token"],
+            )
+        finally:
+            conn.close()
+    except observer_route_context.RouteTokenRefError as exc:
+        return 409, {
+            "ok": False,
+            "error": exc.code,
+            "message": str(exc),
+            "details": dict(exc.details or {}),
+            "next_legal_action": (
+                "retry_observer_route_context_issue_with_the_exact_"
+                "server_provided_same_scope_payload"
+            ),
+            "fail_closed": True,
+        }
+
     # Persist the ref→token-digest mapping so gate resolution can work without
     # the caller re-supplying the full token body.  Failure is non-fatal for the
     # HTTP response (the caller still receives the full token and can use the
@@ -21318,8 +21347,54 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         proof_errors.append("status_not_renewed")
     if renewal_proof.get("source") != "renew_route_token_ref":
         proof_errors.append("source_not_renew_route_token_ref")
-    if str(renewal_proof.get("previous_route_token_ref") or "").strip() != expected_ref:
-        proof_errors.append("previous_route_token_ref_mismatch")
+    renewed_from_ref = str(
+        renewal_proof.get("previous_route_token_ref") or ""
+    ).strip()
+    same_scope_reissue_proof = (
+        route_lineage.get("same_scope_reissue_proof")
+        if isinstance(route_lineage.get("same_scope_reissue_proof"), Mapping)
+        else {}
+    )
+    reissue_scope = (
+        same_scope_reissue_proof.get("scope")
+        if isinstance(same_scope_reissue_proof.get("scope"), Mapping)
+        else {}
+    )
+    reissue_errors: list[str] = []
+    if renewed_from_ref != expected_ref:
+        if (
+            same_scope_reissue_proof.get("schema_version")
+            != _orc.REF_SAME_SCOPE_REISSUE_PROOF_SCHEMA_VERSION
+        ):
+            reissue_errors.append("missing_or_invalid_schema_version")
+        if (
+            same_scope_reissue_proof.get("status")
+            != "reissued_from_superseded"
+        ):
+            reissue_errors.append("status_not_reissued_from_superseded")
+        if (
+            same_scope_reissue_proof.get("source")
+            != "issue_observer_write_route_context"
+        ):
+            reissue_errors.append("source_not_route_context_issue")
+        if not bool(same_scope_reissue_proof.get("registry_verified")):
+            reissue_errors.append("registry_not_verified")
+        if bool(same_scope_reissue_proof.get("scope_widened")):
+            reissue_errors.append("scope_widened")
+        if (
+            str(
+                same_scope_reissue_proof.get("previous_route_token_ref") or ""
+            ).strip()
+            != expected_ref
+        ):
+            reissue_errors.append("previous_route_token_ref_mismatch")
+        if (
+            str(same_scope_reissue_proof.get("route_token_ref") or "").strip()
+            != renewed_from_ref
+        ):
+            reissue_errors.append("reissued_route_token_ref_mismatch")
+        if reissue_errors:
+            proof_errors.append("same_scope_reissue_proof_invalid")
     if str(renewal_proof.get("route_token_ref") or "").strip() != route_token_ref:
         proof_errors.append("route_token_ref_mismatch")
     expected_backlog_id = str(getattr(context, "backlog_id", "") or "")
@@ -21341,6 +21416,10 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         actual_value = str(proof_scope.get(key) or "").strip()
         if expected_value and actual_value != expected_value:
             proof_errors.append(f"scope_{key}_mismatch")
+        if renewed_from_ref != expected_ref:
+            reissued_value = str(reissue_scope.get(key) or "").strip()
+            if expected_value and reissued_value != expected_value:
+                reissue_errors.append(f"scope_{key}_mismatch")
     actual_task_scope = str(proof_scope.get("task_id") or "").strip()
     if (
         actual_task_scope
@@ -21348,6 +21427,16 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         and actual_task_scope not in expected_task_scope_candidates
     ):
         proof_errors.append("scope_task_id_mismatch")
+    if renewed_from_ref != expected_ref:
+        reissued_task_scope = str(reissue_scope.get("task_id") or "").strip()
+        if (
+            reissued_task_scope
+            and expected_task_scope_candidates
+            and reissued_task_scope not in expected_task_scope_candidates
+        ):
+            reissue_errors.append("scope_task_id_mismatch")
+        if reissue_errors and "same_scope_reissue_proof_invalid" not in proof_errors:
+            proof_errors.append("same_scope_reissue_proof_invalid")
     if proof_errors:
         raise GovernanceError(
             "runtime_context_initial_join_route_token_ref_not_renewed_from_active_contract",
@@ -21359,6 +21448,10 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
                 "route_token_ref": route_token_ref,
                 "expected_route_token_ref": expected_ref,
                 "required_registry_proof": "route_lineage.renewal_proof",
+                "required_registry_proofs": [
+                    "route_lineage.renewal_proof",
+                    "route_lineage.same_scope_reissue_proof",
+                ],
                 "renewal_proof_errors": proof_errors,
                 "expected_scope": {
                     "project_id": project_id,
@@ -21369,8 +21462,11 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
                     ),
                 },
                 "proof_scope": dict(proof_scope),
+                "same_scope_reissue_proof_errors": list(reissue_errors),
+                "same_scope_reissue_scope": dict(reissue_scope),
                 "next_legal_action": (
-                    "renew_the_active_runtime_route_token_ref_at_one_of_the_accepted_task_scopes_and_retry_initial_join"
+                    "renew_the_active_runtime_route_ref_or_use_the_server_"
+                    "provided_superseded_ref_two_hop_recovery_then_retry_initial_join"
                 ),
                 "copy_safe_recovery": {
                     "schema_version": (
@@ -21384,6 +21480,27 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
                     "accepted_task_id_candidates": list(
                         expected_task_scope_candidates
                     ),
+                    "branches": [
+                        {
+                            "when": "expected_route_token_ref_is_active_or_expired",
+                            "steps": [
+                                "observer_route_context_renew_expected_ref",
+                                "retry_runtime_context_session_token_initial_join",
+                            ],
+                        },
+                        {
+                            "when": "expected_route_token_ref_is_superseded",
+                            "steps": [
+                                "observer_route_context_issue_exact_same_scope_child_from_expected_parent_identity",
+                                "observer_route_context_renew_child_ref_with_active_observer_session",
+                                "retry_runtime_context_session_token_initial_join",
+                            ],
+                            "required_registry_proofs": [
+                                "route_lineage.same_scope_reissue_proof",
+                                "route_lineage.renewal_proof",
+                            ],
+                        },
+                    ],
                     "raw_route_token_required": False,
                     "raw_route_token_exposed": False,
                 },
@@ -21442,6 +21559,18 @@ def _runtime_context_initial_join_resolved_ref_route_identity(
         "registry_verified": True,
         "raw_route_token_exposed": False,
     }
+    if renewed_from_ref and renewed_from_ref != expected_ref:
+        lineage_payload["renewed_route_token_ref"].update(
+            {
+                "recovery_mode": "superseded_ref_same_scope_two_hop",
+                "reissued_route_token_ref": renewed_from_ref,
+                "renewal_chain": [
+                    expected_ref,
+                    renewed_from_ref,
+                    route_token_ref,
+                ],
+            }
+        )
     lineage_payload["accepted_renewal_task_id_candidates"] = list(
         expected_task_scope_candidates
     )

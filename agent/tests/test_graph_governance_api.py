@@ -29602,6 +29602,232 @@ def test_runtime_context_session_token_initial_join_accepts_parent_scope_renewal
     )
 
 
+def test_runtime_context_initial_join_accepts_registry_verified_superseded_ref_two_hop(
+    conn,
+    tmp_path,
+):
+    target_root = tmp_path / "runtime-token-initial-join-superseded-two-hop"
+    target_root.mkdir()
+    worker_task_id = "worker-runtime-initial-join-superseded-two-hop"
+    parent_task_id = "parent-runtime-initial-join-superseded-two-hop"
+    backlog_id = "AC-RUNTIME-TOKEN-INITIAL-JOIN-SUPERSEDED-TWO-HOP"
+    request_now = datetime.now(timezone.utc)
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id=worker_task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            stage_task_id=worker_task_id,
+            worker_id=worker_task_id,
+            worker_slot_id="slot-runtime-initial-join-superseded-two-hop",
+            branch_ref=(
+                "refs/heads/codex/worker-runtime-initial-join-superseded-two-hop"
+            ),
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-runtime-initial-join-superseded-two-hop",
+        ),
+    )
+    original = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        now=request_now,
+        evidence_refs=["test:superseded-two-hop-original"],
+    )
+    original_ref = original["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=original_ref,
+        token=original["route_token"],
+    )
+    original_identity = {
+        field: original["route_token"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    original_identity["route_token_ref"] = original_ref
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-runtime-initial-join-superseded-two-hop",
+        route_identity=original_identity,
+        payload={"route_identity": original_identity},
+    )
+
+    # Supersede the runtime's expected ref.  That direct successor is
+    # deliberately not projected into the runtime contract, reproducing a
+    # resumed worker whose expected ref can no longer be renewed.
+    observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=original_ref,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        ttl_hours=48.0,
+        now=request_now,
+        evidence_refs=["test:supersede-runtime-expected-ref"],
+    )
+
+    widened_status, widened = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": parent_task_id,
+                "target_files": ["agent/governance/server.py"],
+                "allowed_actions": [
+                    "task_timeline_append",
+                    "backlog_close",
+                ],
+                "parent_route_identity": original_identity,
+            },
+        )
+    )
+    assert widened_status == 409
+    assert widened["error"] == (
+        "route_token_ref_allowed_actions_widening_refused"
+    )
+    assert widened["fail_closed"] is True
+
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": parent_task_id,
+                "target_files": ["agent/governance/server.py"],
+                "owned_files": ["agent/governance/server.py"],
+                "allowed_actions": ["task_timeline_append"],
+                "evidence_refs": ["test:same-scope-reissue"],
+                "parent_route_identity": original_identity,
+            },
+        )
+    )
+    assert issued["ok"] is True
+    child_ref = issued["route_token_ref"]
+    child = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_ref,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        now=request_now,
+    )
+    assert child is not None
+    reissue_proof = child["route_lineage"]["same_scope_reissue_proof"]
+    assert reissue_proof == {
+        "schema_version": "route_token_ref_same_scope_reissue_proof.v1",
+        "status": "reissued_from_superseded",
+        "source": "issue_observer_write_route_context",
+        "previous_route_token_ref": original_ref,
+        "route_token_ref": child_ref,
+        "scope": {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": parent_task_id,
+        },
+        "caller_role": "observer",
+        "allowed_actions": ["task_timeline_append"],
+        "target_files": ["agent/governance/server.py"],
+        "owned_files": ["agent/governance/server.py"],
+        "scope_widened": False,
+        "registry_verified": True,
+        "raw_route_token_persisted": False,
+        "raw_session_token_persisted": False,
+    }
+
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_ref,
+        backlog_id=backlog_id,
+        task_id=parent_task_id,
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        ttl_hours=48.0,
+        now=request_now,
+        evidence_refs=["test:renew-reissued-child-with-active-observer"],
+    )
+    renewed_ref = renewed["route_token_ref"]
+    renewed_identity = {
+        field: renewed["route_identity"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    renewed_identity["route_token_ref"] = renewed_ref
+
+    result = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": worker_task_id,
+                "parent_task_id": parent_task_id,
+                "target_project_root": str(target_root),
+                **renewed_identity,
+                "reason": (
+                    "host adapter uses registry-verified two-hop recovery for "
+                    "the superseded runtime route ref"
+                ),
+                "ttl_seconds": 1200,
+                "now_iso": request_now.isoformat().replace("+00:00", "Z"),
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_initial_join_issued"
+    renewed_summary = result["route_lineage"]["renewed_route_token_ref"]
+    assert renewed_summary["renewed_from"] == original_ref
+    assert renewed_summary["recovery_mode"] == (
+        "superseded_ref_same_scope_two_hop"
+    )
+    assert renewed_summary["reissued_route_token_ref"] == child_ref
+    assert renewed_summary["renewal_chain"] == [
+        original_ref,
+        child_ref,
+        renewed_ref,
+    ]
+    assert result["route_lineage"]["route_lineage"][
+        "same_scope_reissue_proof"
+    ] == reissue_proof
+    assert result["session_token"] not in json.dumps(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            event_kind="observer_command",
+        ),
+        sort_keys=True,
+    )
+
+
 def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_only_write(
     conn,
     tmp_path,
