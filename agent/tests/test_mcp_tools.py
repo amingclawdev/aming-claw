@@ -516,6 +516,7 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
             "observer_route_token_ref": "rtok-current-full",
             "project_root": "/tmp/ac-candidate",
             "ref_name": "refs/heads/codex/ac-candidate",
+            "run_id": "current-full-route-proof",
         },
     )
 
@@ -533,6 +534,7 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
                 "observer_route_token_ref": "rtok-current-full",
                 "project_root": "/tmp/ac-candidate",
                 "ref_name": "refs/heads/codex/ac-candidate",
+                "run_id": "current-full-route-proof",
             },
         )
     ]
@@ -617,6 +619,11 @@ def test_mcp_graph_current_full_reconcile_timeout_returns_poll_guidance(monkeypa
     assert result["progress"] == {"done": 3, "total": 10}
     assert result["next_legal_action"]["poll_tool"] == "graph_operations_queue"
     assert result["next_legal_action"]["retry_tool"] == "graph_current_full_reconcile"
+    assert result["next_legal_action"]["safe_retry"] is False
+    assert result["next_legal_action"]["same_run_id_required"] is True
+    assert result["next_legal_action"]["retry_disposition"] == (
+        "conditional_same_run_id_resume"
+    )
     assert recorder.calls[0][3] == 900
     assert recorder.calls[1] == (
         "GET",
@@ -625,6 +632,27 @@ def test_mcp_graph_current_full_reconcile_timeout_returns_poll_guidance(monkeypa
         None,
         10,
     )
+
+
+def test_mcp_current_full_timeout_generates_recoverable_run_id(monkeypatch):
+    monkeypatch.setattr(mcp_tools.secrets, "token_hex", lambda _size: "generatedrunid01")
+    recorder = _TimeoutAwareGovRecorder(timeout_current_full=True)
+    dispatcher = ToolDispatcher(
+        api_fn=recorder.api,
+        worker_pool=None,
+        service_mgr=None,
+        workspace=".",
+    )
+
+    result = dispatcher.dispatch(
+        "graph_current_full_reconcile",
+        {"project_id": "aming-claw", "target_commit_sha": "a" * 40},
+    )
+
+    generated = "current-full-mcp-generatedrunid01"
+    assert result["run_id"] == generated
+    assert result["run_id_available"] is True
+    assert recorder.calls[0][2]["run_id"] == generated
 
 
 def test_governance_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
@@ -663,6 +691,71 @@ def test_governance_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monk
             1200,
         )
     ]
+
+
+def test_governance_mcp_current_full_timeout_requires_poll_then_same_run_resume():
+    result = governance_mcp_server._current_full_reconcile_timeout_response(
+        "aming-claw",
+        {"run_id": "current-full-governance-timeout"},
+        timeout_seconds=900,
+        timeout_result={"error": "request_timeout"},
+        progress={"status": "running", "progress": {"done": 0, "total": 2}},
+    )
+
+    assert result["error"] == "reconcile_timeout"
+    assert result["run_id"] == "current-full-governance-timeout"
+    assert result["next_legal_action"]["safe_retry"] is False
+    assert result["next_legal_action"]["same_run_id_required"] is True
+    assert result["next_legal_action"]["action"] == (
+        "poll_graph_operations_queue_then_resume_same_run_id"
+    )
+
+
+def test_governance_mcp_current_full_generates_run_id_before_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        governance_mcp_server.secrets,
+        "token_hex",
+        lambda _size: "governanceid001",
+    )
+    calls = []
+
+    def fake_http(method, path, body=None, **kwargs):
+        calls.append((method, path, body, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+
+    governance_mcp_server._dispatch_tool(
+        "graph_current_full_reconcile",
+        {"project_id": "aming-claw", "target_commit_sha": "a" * 40},
+    )
+
+    assert calls[0][2]["run_id"] == "current-full-mcp-governanceid001"
+
+
+def test_current_full_progress_matches_exact_run_id_not_prefix():
+    queue = {
+        "operations": [
+            {
+                "operation_id": "current-full:run-10",
+                "run_id": "run-10",
+                "status": "failed",
+            },
+            {
+                "operation_id": "current-full:run-1",
+                "run_id": "run-1",
+                "status": "candidate_ready",
+            },
+        ]
+    }
+
+    for summarize in (
+        mcp_tools._summarize_reconcile_progress,
+        governance_mcp_server._summarize_reconcile_progress,
+    ):
+        result = summarize(queue, "run-1")
+        assert result["operation_id"] == "current-full:run-1"
+        assert result["status"] == "candidate_ready"
 
 
 def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
@@ -1482,6 +1575,7 @@ def test_mcp_graph_tools_route_to_governance_api():
             "contract_execution_id": "cex-current-full",
             "observer_session_id": "obs-current-full",
             "observer_route_token_ref": "rtok-current-full",
+            "run_id": "current-full-head",
         },
     )
     dispatcher.dispatch(
@@ -1536,6 +1630,7 @@ def test_mcp_graph_tools_route_to_governance_api():
             "contract_execution_id": "cex-current-full",
             "observer_session_id": "obs-current-full",
             "observer_route_token_ref": "rtok-current-full",
+            "run_id": "current-full-head",
         },
     )
     assert recorder.calls[2] == (

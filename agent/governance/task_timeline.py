@@ -1102,7 +1102,12 @@ def _legacy_meta_audit_authority_source(
     return ""
 
 
-def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any]:
+def _insert_event(
+    conn: sqlite3.Connection,
+    event: dict[str, Any],
+    *,
+    post_commit_hooks: bool = True,
+) -> dict[str, Any]:
     from .db import sqlite_write_lock
 
     created_at = event.get("created_at") or _utc_iso()
@@ -1247,7 +1252,8 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
         "commit_sha": _text(event.get("commit_sha")),
         "created_at": created_at,
     }
-    _run_service_router_hook(conn, inserted)
+    if post_commit_hooks:
+        _run_service_router_hook(conn, inserted)
     return inserted
 
 
@@ -1288,6 +1294,17 @@ def _publish_timeline_event(inserted_event: dict[str, Any]) -> None:
         log.debug("task timeline event publish failed", exc_info=True)
 
 
+def run_post_commit_hooks(
+    conn: sqlite3.Connection,
+    inserted_event: Mapping[str, Any],
+) -> None:
+    """Run timeline side effects only after the caller's transaction commits."""
+
+    event = dict(inserted_event)
+    _run_service_router_hook(conn, event)
+    _publish_timeline_event(event)
+
+
 def record_event(
     conn: sqlite3.Connection,
     *,
@@ -1312,6 +1329,7 @@ def record_event(
     artifact_refs: dict[str, Any] | None = None,
     trace_id: str = "",
     commit_sha: str = "",
+    post_commit_hooks: bool = True,
 ) -> dict[str, Any]:
     """Append a timeline event using the caller's transaction."""
 
@@ -1342,8 +1360,10 @@ def record_event(
             "trace_id": trace_id,
             "commit_sha": commit_sha,
         },
+        post_commit_hooks=post_commit_hooks,
     )
-    _publish_timeline_event(inserted)
+    if post_commit_hooks:
+        _publish_timeline_event(inserted)
     return inserted
 
 

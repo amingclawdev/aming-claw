@@ -31347,6 +31347,77 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "supported_actions": supported_actions,
             })
 
+        # Current-full rebuilds can outlive the initiating MCP connection.
+        # Surface their durable run-id state so callers poll instead of
+        # blindly replaying a long operation.
+        reconcile_metric_rows = store.list_reconcile_run_metrics(
+            conn,
+            project_id,
+            limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+            strategy="current_full_reconcile",
+        )
+        metric_status_rank = {
+            "complete": 5,
+            "failed": 4,
+            "candidate_ready": 3,
+            "finalizing": 2,
+            "running": 1,
+        }
+        current_full_by_run: dict[str, dict[str, Any]] = {}
+        for metric in reconcile_metric_rows:
+            run_id = str(metric.get("run_id") or "").strip()
+            if not run_id:
+                continue
+            existing_metric = current_full_by_run.get(run_id)
+            if existing_metric is None or metric_status_rank.get(
+                str(metric.get("status") or "").strip().lower(),
+                0,
+            ) > metric_status_rank.get(
+                str(existing_metric.get("status") or "").strip().lower(),
+                0,
+            ):
+                current_full_by_run[run_id] = metric
+        include_reconcile_terminal = _query_bool(
+            ctx.query,
+            "include_resolved",
+            False,
+        )
+        for run_id, metric in current_full_by_run.items():
+            status_value = str(metric.get("status") or "unknown").strip().lower()
+            if status_value == "complete" and not include_reconcile_terminal:
+                continue
+            evidence = _json_loads(metric.get("evidence_json"), {})
+            evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+            if status_value == "complete":
+                progress = {"done": 2, "total": 2}
+            elif status_value == "candidate_ready":
+                progress = {"done": 1, "total": 2}
+            else:
+                progress = {"done": 0, "total": 2}
+            operations.append(
+                {
+                    "operation_id": f"current-full:{run_id}",
+                    "operation_type": "current_full_reconcile",
+                    "target_scope": "snapshot",
+                    "target_id": str(metric.get("commit_sha") or ""),
+                    "target_label": run_id,
+                    "run_id": run_id,
+                    "status": status_value,
+                    "progress": progress,
+                    "created_at": str(metric.get("created_at") or ""),
+                    "updated_at": str(metric.get("created_at") or ""),
+                    "claimed_by": "",
+                    "worker_id": "governance_current_full_reconcile",
+                    "lease_expires_at": "",
+                    "last_error": str(evidence.get("error") or ""),
+                    "last_result": str(evidence.get("phase") or status_value),
+                    "snapshot_id": str(metric.get("snapshot_id") or ""),
+                    "elapsed_ms": int(metric.get("elapsed_ms") or 0),
+                    "evidence": evidence,
+                    "supported_actions": ["view_trace", "file_backlog"],
+                }
+            )
+
         if stale_operation:
             operations.append(stale_operation)
 
@@ -35234,6 +35305,7 @@ def _record_pending_scope_reconcile_contract_event(
     result: Mapping[str, Any],
     target_commit_sha: str,
     runtime_context_scope: Mapping[str, Any] | None = None,
+    post_commit_hooks: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(result, Mapping) or result.get("ok") is False:
         return {}
@@ -35410,6 +35482,7 @@ def _record_pending_scope_reconcile_contract_event(
             },
         },
         commit_sha=target_commit_sha,
+        post_commit_hooks=post_commit_hooks,
     )
 
 
@@ -35593,9 +35666,298 @@ def _current_full_reconcile_projection_id(
     return str(projection.get("projection_id") or "").strip()
 
 
+def _current_full_reconcile_idempotency_scope(
+    route_evidence: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return the stable route scope used to fence one reconcile run id.
+
+    Route refs and observer sessions may be renewed while a long rebuild is in
+    flight, so idempotency is bound to the canonical task/runtime scope rather
+    than to those ephemeral credentials.
+    """
+
+    route_scope = (
+        route_evidence.get("route_token_scope")
+        if isinstance(route_evidence.get("route_token_scope"), Mapping)
+        else {}
+    )
+    runtime_scope = (
+        route_evidence.get("runtime_context_scope")
+        if isinstance(route_evidence.get("runtime_context_scope"), Mapping)
+        else {}
+    )
+    return {
+        key: str(runtime_scope.get(key) or route_scope.get(key) or "").strip()
+        for key in (
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "parent_task_id",
+            "runtime_context_id",
+            "merge_queue_id",
+            "contract_execution_id",
+        )
+        if str(runtime_scope.get(key) or route_scope.get(key) or "").strip()
+    }
+
+
+def _current_full_reconcile_existing_run(
+    conn,
+    store,
+    *,
+    project_id: str,
+    run_id: str,
+    target_commit_sha: str,
+    route_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a durable same-run candidate or terminal result without rebuild."""
+
+    expected_scope = _current_full_reconcile_idempotency_scope(route_evidence)
+    metric_rows = conn.execute(
+        """
+        SELECT * FROM reconcile_run_metrics
+        WHERE project_id = ? AND run_id = ?
+        ORDER BY created_at DESC, snapshot_id DESC
+        """,
+        (project_id, run_id),
+    ).fetchall()
+    metrics = [dict(row) for row in metric_rows]
+    conflicting_commits = sorted(
+        {
+            str(row.get("commit_sha") or "").strip()
+            for row in metrics
+            if str(row.get("commit_sha") or "").strip()
+            and str(row.get("commit_sha") or "").strip() != target_commit_sha
+        }
+    )
+    if conflicting_commits:
+        return {
+            "status": "conflict",
+            "reason": "reconcile_run_id_target_commit_conflict",
+            "run_id": run_id,
+            "expected_target_commit_sha": conflicting_commits[0],
+            "actual_target_commit_sha": target_commit_sha,
+            "conflicting_target_commits": conflicting_commits,
+        }
+    snapshots = []
+    for row in conn.execute(
+        """
+        SELECT * FROM graph_snapshots
+        WHERE project_id = ? AND commit_sha = ?
+        ORDER BY created_at DESC, snapshot_id DESC
+        """,
+        (project_id, target_commit_sha),
+    ).fetchall():
+        snapshot = dict(row)
+        notes = _json_loads(snapshot.get("notes"), {})
+        if not isinstance(notes, Mapping) or str(notes.get("run_id") or "") != run_id:
+            continue
+        snapshot["notes_payload"] = dict(notes)
+        snapshots.append(snapshot)
+
+    if len(snapshots) > 1:
+        return {
+            "status": "conflict",
+            "reason": "reconcile_run_id_multiple_snapshots",
+            "run_id": run_id,
+            "snapshot_ids": [row.get("snapshot_id") for row in snapshots],
+        }
+
+    snapshot = snapshots[0] if snapshots else {}
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    metric = next(
+        (
+            row
+            for row in metrics
+            if not snapshot_id or str(row.get("snapshot_id") or "") == snapshot_id
+        ),
+        metrics[0] if metrics else {},
+    )
+    metric_evidence = _json_loads(metric.get("evidence_json"), {})
+    metric_evidence = (
+        dict(metric_evidence) if isinstance(metric_evidence, Mapping) else {}
+    )
+    stored_scope = metric_evidence.get("idempotency_scope")
+    stored_scope = dict(stored_scope) if isinstance(stored_scope, Mapping) else {}
+    if stored_scope and stored_scope != expected_scope:
+        return {
+            "status": "conflict",
+            "reason": "reconcile_run_id_scope_conflict",
+            "run_id": run_id,
+            "expected_scope": stored_scope,
+            "actual_scope": expected_scope,
+        }
+
+    active = store.get_active_graph_snapshot(conn, project_id) or {}
+    active_snapshot_id = str(active.get("snapshot_id") or "").strip()
+    metric_status = str(metric.get("status") or "").strip().lower()
+    notes = snapshot.get("notes_payload") if isinstance(snapshot, Mapping) else {}
+    marker = notes.get("current_full_reconcile") if isinstance(notes, Mapping) else {}
+    marker = dict(marker) if isinstance(marker, Mapping) else {}
+    provenance_id = str(
+        metric_evidence.get("provenance_id") or marker.get("provenance_id") or ""
+    ).strip()
+    provenance = {}
+    if provenance_id:
+        row = conn.execute(
+            """
+            SELECT * FROM graph_current_full_reconcile_provenance
+            WHERE provenance_id = ? AND project_id = ?
+              AND snapshot_id = ? AND target_commit_sha = ?
+            """,
+            (provenance_id, project_id, snapshot_id, target_commit_sha),
+        ).fetchone()
+        provenance = dict(row) if row else {}
+    try:
+        reconcile_event_id = int(
+            provenance.get("reconcile_event_id")
+            or metric_evidence.get("reconcile_event_id")
+            or 0
+        )
+    except (TypeError, ValueError):
+        reconcile_event_id = 0
+    timeline_event = {}
+    if reconcile_event_id:
+        row = conn.execute(
+            """
+            SELECT * FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            """,
+            (project_id, reconcile_event_id),
+        ).fetchone()
+        timeline_event = dict(row) if row else {}
+
+    if (
+        snapshot_id
+        and active_snapshot_id == snapshot_id
+        and metric_status == "complete"
+    ):
+        route_bound = bool(expected_scope.get("backlog_id") and expected_scope.get("task_id"))
+        if route_bound and not provenance:
+            return {
+                "status": "incomplete_active",
+                "reason": "reconcile_terminal_provenance_missing",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+            }
+        if route_bound and not timeline_event:
+            return {
+                "status": "incomplete_active",
+                "reason": "reconcile_terminal_timeline_missing",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "reconcile_event_id": reconcile_event_id,
+            }
+        if route_bound and (
+            str(timeline_event.get("event_type") or "") != "graph.reconcile"
+            or str(timeline_event.get("event_kind") or "") != "reconcile"
+            or str(timeline_event.get("phase") or "") != "reconcile"
+            or str(timeline_event.get("status") or "") != "passed"
+            or str(timeline_event.get("backlog_id") or "")
+            != expected_scope.get("backlog_id")
+            or str(timeline_event.get("task_id") or "")
+            != expected_scope.get("task_id")
+        ):
+            return {
+                "status": "incomplete_active",
+                "reason": "reconcile_terminal_timeline_scope_mismatch",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "reconcile_event_id": reconcile_event_id,
+            }
+        return {
+            "status": "complete",
+            "run_id": run_id,
+            "snapshot": snapshot,
+            "snapshot_id": snapshot_id,
+            "metric": metric,
+            "metric_evidence": metric_evidence,
+            "provenance": provenance,
+            "timeline_event": timeline_event,
+        }
+
+    if snapshot_id and active_snapshot_id == snapshot_id:
+        return {
+            "status": "incomplete_active",
+            "reason": "reconcile_active_without_atomic_terminal_evidence",
+            "run_id": run_id,
+            "snapshot_id": snapshot_id,
+            "metric_status": metric_status,
+        }
+    if snapshot_id:
+        return {
+            "status": "candidate_ready",
+            "run_id": run_id,
+            "snapshot": snapshot,
+            "snapshot_id": snapshot_id,
+            "metric": metric,
+        }
+    if metric_status in {"running", "finalizing"}:
+        return {
+            "status": "running",
+            "run_id": run_id,
+            "metric": metric,
+            "metric_evidence": metric_evidence,
+        }
+    return {"status": "missing", "run_id": run_id}
+
+
+def _current_full_reconcile_idempotent_response(
+    existing: Mapping[str, Any],
+    *,
+    project_id: str,
+    target_commit_sha: str,
+    head_commit: str,
+) -> dict[str, Any]:
+    snapshot_id = str(existing.get("snapshot_id") or "").strip()
+    provenance = (
+        existing.get("provenance")
+        if isinstance(existing.get("provenance"), Mapping)
+        else {}
+    )
+    timeline_event = (
+        existing.get("timeline_event")
+        if isinstance(existing.get("timeline_event"), Mapping)
+        else {}
+    )
+    reconcile_event_id = int(timeline_event.get("id") or 0)
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "status": "complete",
+        "run_id": str(existing.get("run_id") or ""),
+        "snapshot_id": snapshot_id,
+        "active_snapshot_id": snapshot_id,
+        "snapshot_status": "active",
+        "target_commit_sha": target_commit_sha,
+        "head_commit": head_commit,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "scope_reconcile_strategy": "current_full_reconcile",
+        "graph_delta_mode": "full_rebuild",
+        "scope_graph_delta_mode": "full_rebuild",
+        "activated": True,
+        "idempotent_replay": True,
+        "rebuild_skipped": True,
+        "timeline_event_recorded": (
+            {
+                "id": reconcile_event_id,
+                "ref": f"timeline:{reconcile_event_id}",
+                "event_kind": str(timeline_event.get("event_kind") or ""),
+                "phase": str(timeline_event.get("phase") or ""),
+                "status": str(timeline_event.get("status") or ""),
+                "requirement_id": "reconcile",
+            }
+            if reconcile_event_id
+            else {}
+        ),
+        "current_full_reconcile_provenance": provenance,
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/reconcile/current-full")
 def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
-    """Rebuild and activate a full graph snapshot for the current clean HEAD."""
+    """Build a candidate, then atomically activate it with route evidence."""
     project_id = ctx.get_project_id()
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
@@ -35637,16 +35999,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
             }
         activate_requested = bool(body.get("activate", True))
-        require_clean = (
-            True
-            if not activate_requested
-            else bool(body.get("require_clean", True))
-        )
-        dirty_paths = (
-            filter_dirty_files(_git_dirty_paths(root))
-            if require_clean
-            else []
-        )
+        require_clean = True if not activate_requested else bool(body.get("require_clean", True))
+        dirty_paths = filter_dirty_files(_git_dirty_paths(root)) if require_clean else []
         if dirty_paths:
             return 409, {
                 "ok": False,
@@ -35667,6 +36021,75 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             target_commit_sha=target_commit,
             candidate_only=not activate_requested,
         )
+        run_id = str(body.get("run_id") or "").strip() or (
+            f"current-full-{target_commit[:7]}"
+        )
+        route_evidence = _current_full_reconcile_route_evidence(
+            current_full_auth,
+            runtime_context_scope=runtime_context_scope,
+        )
+        idempotency_scope = _current_full_reconcile_idempotency_scope(route_evidence)
+        route_evidence = {
+            **route_evidence,
+            "reconcile_run_id": run_id,
+            "idempotency_scope": idempotency_scope,
+        }
+        existing = _current_full_reconcile_existing_run(
+            conn,
+            store,
+            project_id=project_id,
+            run_id=run_id,
+            target_commit_sha=target_commit,
+            route_evidence=route_evidence,
+        )
+        if existing.get("status") == "conflict":
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": existing.get("reason"),
+                "message": "current-full reconcile run_id is already bound to different durable state",
+                "run_id": run_id,
+                "fail_closed": True,
+                **{key: value for key, value in existing.items() if key not in {"status", "reason"}},
+            }
+        if existing.get("status") == "incomplete_active":
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": existing.get("reason"),
+                "message": (
+                    "an active snapshot exists without the atomic terminal evidence for this run; "
+                    "do not replay or synthesize evidence"
+                ),
+                "run_id": run_id,
+                "snapshot_id": existing.get("snapshot_id") or "",
+                "fail_closed": True,
+                "next_legal_action": "file_or_resume_audited_system_repair",
+            }
+        if existing.get("status") == "complete":
+            return 200, _current_full_reconcile_idempotent_response(
+                existing,
+                project_id=project_id,
+                target_commit_sha=target_commit,
+                head_commit=head_commit,
+            )
+        if existing.get("status") == "running":
+            return 202, {
+                "ok": True,
+                "project_id": project_id,
+                "status": "running",
+                "run_id": run_id,
+                "target_commit_sha": target_commit,
+                "rebuild_started": False,
+                "idempotent_replay": True,
+                "next_legal_action": {
+                    "action": "poll_graph_operations_queue",
+                    "tool": "graph_operations_queue",
+                    "run_id": run_id,
+                    "retry_allowed": False,
+                },
+            }
+
         semantic_use_ai = _semantic_use_ai_from_body(body)
         semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
         notes_extra = (
@@ -35675,141 +36098,448 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             else {}
         )
         notes_extra.pop("current_full_reconcile", None)
-        try:
-            result = run_state_only_full_reconcile(
+        resumed_candidate = existing.get("status") == "candidate_ready"
+        requested_snapshot_id = str(
+            body.get("snapshot_id") or store.snapshot_id_for("full", target_commit)
+        ).strip()
+        if resumed_candidate:
+            snapshot_id = str(existing.get("snapshot_id") or "")
+            result = {
+                "ok": True,
+                "project_id": project_id,
+                "run_id": run_id,
+                "commit_sha": target_commit,
+                "snapshot_id": snapshot_id,
+                "snapshot_status": "candidate",
+                "projection_id": _current_full_reconcile_projection_id(
+                    conn,
+                    project_id=project_id,
+                    snapshot_id=snapshot_id,
+                    result={},
+                ),
+                "resumed_candidate": True,
+                "rebuild_skipped": True,
+            }
+        else:
+            store.record_reconcile_run_metric(
                 conn,
                 project_id,
-                root,
-                run_id=str(body.get("run_id") or f"current-full-{target_commit[:7]}"),
+                run_id=run_id,
+                snapshot_id=requested_snapshot_id,
                 commit_sha=target_commit,
-                snapshot_id=body.get("snapshot_id"),
                 snapshot_kind="full",
-                created_by=str(body.get("actor") or "dashboard_user"),
-                activate=activate_requested,
-                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-                ref_name=str(body.get("ref_name") or "active"),
-                branch_ref=str(body.get("branch_ref") or ""),
-                notes_extra=notes_extra,
-                semantic_enrich=bool(body.get("semantic_enrich", True)),
-                semantic_use_ai=semantic_use_ai,
-                semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
-                semantic_feedback_round=body.get("semantic_feedback_round"),
-                semantic_max_excerpt_chars=(
-                    int(body["semantic_max_excerpt_chars"])
-                    if body.get("semantic_max_excerpt_chars") is not None
-                    else None
-                ),
-                semantic_ai_call=semantic_ai_call,
-                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
-                **_semantic_ai_batch_kwargs_from_body(body),
-                **_semantic_state_kwargs_from_body(body),
-                semantic_classify_feedback=bool(
-                    _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
-                ),
-                **_semantic_ai_config_kwargs_from_body(body),
-                **_semantic_selector_kwargs_from_body(body),
-                semantic_config_path=body.get("semantic_config_path"),
-                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
+                strategy="current_full_reconcile",
+                graph_delta_mode="full_rebuild",
+                status="running",
+                evidence={
+                    "phase": "materializing_candidate",
+                    "activate_requested": activate_requested,
+                    "idempotency_scope": idempotency_scope,
+                    "request_id": str(ctx.request_id),
+                },
+                created_at=request_started_at,
             )
-        except (KeyError, ValueError) as exc:
-            _raise_graph_api_validation(exc)
+            conn.commit()
+            try:
+                # Candidate persistence may outlive a client connection.  The
+                # active ref is intentionally deferred to the final evidence
+                # transaction below.
+                result = run_state_only_full_reconcile(
+                    conn,
+                    project_id,
+                    root,
+                    run_id=run_id,
+                    commit_sha=target_commit,
+                    snapshot_id=body.get("snapshot_id"),
+                    snapshot_kind="full",
+                    created_by=str(body.get("actor") or "dashboard_user"),
+                    activate=False,
+                    expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                    ref_name=str(body.get("ref_name") or "active"),
+                    branch_ref=str(body.get("branch_ref") or ""),
+                    notes_extra=notes_extra,
+                    semantic_enrich=bool(body.get("semantic_enrich", True)),
+                    semantic_use_ai=semantic_use_ai,
+                    semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
+                    semantic_feedback_round=body.get("semantic_feedback_round"),
+                    semantic_max_excerpt_chars=(
+                        int(body["semantic_max_excerpt_chars"])
+                        if body.get("semantic_max_excerpt_chars") is not None
+                        else None
+                    ),
+                    semantic_ai_call=semantic_ai_call,
+                    semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                    **_semantic_ai_batch_kwargs_from_body(body),
+                    **_semantic_state_kwargs_from_body(body),
+                    semantic_classify_feedback=bool(
+                        _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
+                    ),
+                    **_semantic_ai_config_kwargs_from_body(body),
+                    **_semantic_selector_kwargs_from_body(body),
+                    semantic_config_path=body.get("semantic_config_path"),
+                    semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
+                )
+            except Exception as exc:
+                conn.rollback()
+                store.record_reconcile_run_metric(
+                    conn,
+                    project_id,
+                    run_id=run_id,
+                    snapshot_id=requested_snapshot_id,
+                    commit_sha=target_commit,
+                    snapshot_kind="full",
+                    strategy="current_full_reconcile",
+                    graph_delta_mode="full_rebuild",
+                    status="failed",
+                    evidence={
+                        "phase": "candidate_materialization_failed",
+                        "error": str(exc),
+                        "idempotency_scope": idempotency_scope,
+                    },
+                    created_at=request_started_at,
+                )
+                conn.commit()
+                if isinstance(exc, (KeyError, ValueError)):
+                    _raise_graph_api_validation(exc)
+                raise
 
         elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
-        if isinstance(result, dict) and result.get("ok", True):
-            result = dict(result)
-            result["status"] = result.get("status") or result.get("snapshot_status") or "complete"
-            result["target_commit_sha"] = target_commit
-            result["head_commit"] = head_commit
-            result["current_full_reconcile"] = True
-            result["strategy"] = "current_full_reconcile"
-            result["scope_reconcile_strategy"] = "current_full_reconcile"
-            result["graph_delta_mode"] = "full_rebuild"
-            result["scope_graph_delta_mode"] = "full_rebuild"
-            result["fallback_reason"] = ""
-            result["fallback_required"] = False
-            result["operator_next_action"] = ""
-            result["elapsed_ms"] = int(result.get("elapsed_ms") or elapsed_ms)
-            identity = store.normalize_pending_scope_identity(
-                ref_name=str(body.get("ref_name") or "active"),
-                branch_ref=str(body.get("branch_ref") or ""),
-            )
-            result["operation_trace"] = _scope_reconcile_operation_trace(
-                operation_type="current_full_reconcile",
-                status=str(result.get("snapshot_status") or result.get("status") or "complete"),
-                target_commit_sha=target_commit,
-                snapshot_id=str(result.get("snapshot_id") or ""),
-                run_id=str(result.get("run_id") or body.get("run_id") or ""),
-                identity=identity,
-                result=result,
-                elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
-                started_at=request_started_at,
-                updated_at=_utc_now(),
-            )
-            if activate_requested:
-                activation_verification = _pending_scope_activation_verification(
-                    conn,
-                    store,
-                    project_id,
-                    root=root,
-                    target_commit_sha=target_commit,
-                    activate_requested=True,
-                    identity=identity,
-                )
-                result["activation_verification"] = activation_verification
-                result["activated"] = bool(activation_verification.get("verified"))
-                if activation_verification.get("verified"):
-                    result["snapshot_status"] = "active"
-                    result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
-                    result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
-            else:
-                result["activated"] = False
-                result.setdefault("candidate_only", True)
-                candidate_snapshot_id = _current_full_reconcile_snapshot_id(
-                    result
-                )
-                result["candidate_snapshot_id"] = candidate_snapshot_id
-                result["exact_candidate_snapshot"] = True
-                result["next_action"] = (
-                    _exact_candidate_snapshot_qa_retry_guidance(
-                        snapshot_id=candidate_snapshot_id,
-                        target_commit_sha=target_commit,
-                    )
-                )
-            from .parallel_branch_runtime import (
-                record_merge_queue_graph_epoch_after_reconcile,
-            )
-
-            graph_epoch_snapshot_id = _current_full_reconcile_snapshot_id(result)
-            graph_epoch_projection_id = _current_full_reconcile_projection_id(
+        if not isinstance(result, dict) or result.get("ok", True) is False:
+            failure_result = result if isinstance(result, Mapping) else {}
+            store.record_reconcile_run_metric(
                 conn,
-                project_id=project_id,
-                snapshot_id=graph_epoch_snapshot_id,
-                result=result,
+                project_id,
+                run_id=run_id,
+                snapshot_id=(
+                    _current_full_reconcile_snapshot_id(failure_result)
+                    or requested_snapshot_id
+                ),
+                commit_sha=target_commit,
+                snapshot_kind="full",
+                strategy="current_full_reconcile",
+                graph_delta_mode="full_rebuild",
+                status="failed",
+                elapsed_ms=elapsed_ms,
+                evidence={
+                    "phase": "candidate_materialization_rejected",
+                    "error": str(failure_result.get("error") or failure_result.get("reason") or "invalid reconcile result"),
+                    "idempotency_scope": idempotency_scope,
+                },
+                created_at=request_started_at,
             )
-            merge_queue_id = str(body.get("merge_queue_id") or "").strip()
-            queue_item_id = str(body.get("queue_item_id") or "").strip()
-            if activate_requested or (merge_queue_id and queue_item_id):
-                result["merge_queue_graph_epoch_auto_record"] = (
-                    record_merge_queue_graph_epoch_after_reconcile(
+            conn.commit()
+            return 201, result
+
+        result = dict(result)
+        result["status"] = result.get("status") or result.get("snapshot_status") or "complete"
+        result["target_commit_sha"] = target_commit
+        result["head_commit"] = head_commit
+        result["current_full_reconcile"] = True
+        result["strategy"] = "current_full_reconcile"
+        result["scope_reconcile_strategy"] = "current_full_reconcile"
+        result["graph_delta_mode"] = "full_rebuild"
+        result["scope_graph_delta_mode"] = "full_rebuild"
+        result["fallback_reason"] = ""
+        result["fallback_required"] = False
+        result["operator_next_action"] = ""
+        result["elapsed_ms"] = int(result.get("elapsed_ms") or elapsed_ms)
+        identity = store.normalize_pending_scope_identity(
+            ref_name=str(body.get("ref_name") or "active"),
+            branch_ref=str(body.get("branch_ref") or ""),
+        )
+        graph_epoch_snapshot_id = _current_full_reconcile_snapshot_id(result)
+        if not graph_epoch_snapshot_id:
+            raise GovernanceError(
+                "current_full_reconcile_candidate_snapshot_required",
+                "current-full reconcile did not produce a candidate snapshot id",
+                500,
+                {"run_id": run_id, "fail_closed": True},
+            )
+        result["operation_trace"] = _scope_reconcile_operation_trace(
+            operation_type="current_full_reconcile",
+            status=str(result.get("snapshot_status") or result.get("status") or "candidate"),
+            target_commit_sha=target_commit,
+            snapshot_id=graph_epoch_snapshot_id,
+            run_id=run_id,
+            identity=identity,
+            result=result,
+            elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+            started_at=request_started_at,
+            updated_at=_utc_now(),
+        )
+        store.record_reconcile_run_metric(
+            conn,
+            project_id,
+            run_id=run_id,
+            snapshot_id=graph_epoch_snapshot_id,
+            commit_sha=target_commit,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status="candidate_ready",
+            elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+            trace_summary_path=str((result.get("trace") or {}).get("summary_path") or "") if isinstance(result.get("trace"), Mapping) else "",
+            evidence={
+                "phase": "candidate_ready",
+                "activate_requested": activate_requested,
+                "idempotency_scope": idempotency_scope,
+                "request_id": str(ctx.request_id),
+            },
+            created_at=request_started_at,
+        )
+        conn.commit()
+
+        from .parallel_branch_runtime import record_merge_queue_graph_epoch_after_reconcile
+
+        merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+        queue_item_id = str(body.get("queue_item_id") or "").strip()
+        if not activate_requested:
+            result["activated"] = False
+            result.setdefault("candidate_only", True)
+            result["candidate_snapshot_id"] = graph_epoch_snapshot_id
+            result["exact_candidate_snapshot"] = True
+            result["next_action"] = _exact_candidate_snapshot_qa_retry_guidance(
+                snapshot_id=graph_epoch_snapshot_id,
+                target_commit_sha=target_commit,
+            )
+            if merge_queue_id and queue_item_id:
+                result["merge_queue_graph_epoch_auto_record"] = record_merge_queue_graph_epoch_after_reconcile(
+                    conn,
+                    project_id=project_id,
+                    target_head_commit=target_commit,
+                    snapshot_id=graph_epoch_snapshot_id,
+                    projection_id=_current_full_reconcile_projection_id(
                         conn,
                         project_id=project_id,
-                        target_head_commit=target_commit,
                         snapshot_id=graph_epoch_snapshot_id,
-                        projection_id=graph_epoch_projection_id,
-                        merge_queue_id=merge_queue_id,
-                        queue_item_id=queue_item_id,
-                        now_iso=_utc_now(),
-                    )
+                        result=result,
+                    ),
+                    merge_queue_id=merge_queue_id,
+                    queue_item_id=queue_item_id,
+                    now_iso=_utc_now(),
                 )
             else:
                 result["merge_queue_graph_epoch_auto_record"] = {
                     "status": "skipped",
                     "recorded": False,
-                    "reason": (
-                        "candidate_only_without_explicit_merge_queue_scope"
-                    ),
+                    "reason": "candidate_only_without_explicit_merge_queue_scope",
                 }
-            if activate_requested:
+            conn.commit()
+            return (200 if resumed_candidate else 201), result
+
+        from .db import sqlite_write_lock
+        from .state_reconcile import (
+            _full_reconcile_pending_scope_waiver_commits,
+            _sync_project_registry_active_snapshot,
+        )
+
+        route_bound = bool(
+            str(current_full_auth.get("role_source") or "")
+            == "observer_session_route_token_ref"
+        )
+        # Every helper used after activation must avoid executescript-based
+        # schema guards, because sqlite3.executescript implicitly commits the
+        # current transaction.  Prewarm all required schemas before the
+        # atomic block and use the schema_ready variants inside it.
+        from . import graph_events as _graph_events
+        from . import task_timeline as _task_timeline
+        from .parallel_branch_runtime import ensure_branch_runtime_schema
+
+        store.ensure_schema(conn)
+        _graph_events.ensure_schema(conn)
+        _task_timeline.ensure_schema(conn)
+        ensure_branch_runtime_schema(conn)
+        conn.commit()
+        pending_rows = store.list_pending_scope_reconcile(
+            conn,
+            project_id,
+            statuses=[
+                store.PENDING_STATUS_QUEUED,
+                store.PENDING_STATUS_RUNNING,
+                store.PENDING_STATUS_FAILED,
+            ],
+            ref_name=identity["ref_name"],
+            branch_ref=identity["branch_ref"],
+            worktree_id="",
+            worktree_path="",
+        )
+        pending_scope_commits = _full_reconcile_pending_scope_waiver_commits(
+            root,
+            pending_rows,
+            target_commit,
+        )
+        graph_epoch_projection_id = _current_full_reconcile_projection_id(
+            conn,
+            project_id=project_id,
+            snapshot_id=graph_epoch_snapshot_id,
+            result=result,
+        )
+        conn.commit()
+        try:
+            with sqlite_write_lock():
+                # Two same-run requests may both observe candidate_ready before
+                # either acquires the SQLite writer lock.  Recheck terminal
+                # state under the lock so only the winner can append reconcile
+                # evidence; the loser returns the already committed result.
+                locked_active = conn.execute(
+                    "SELECT snapshot_id FROM graph_snapshot_refs "
+                    "WHERE project_id = ? AND ref_name = ?",
+                    (project_id, identity["ref_name"]),
+                ).fetchone()
+                locked_metric = conn.execute(
+                    """
+                    SELECT status FROM reconcile_run_metrics
+                    WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+                    """,
+                    (project_id, run_id, graph_epoch_snapshot_id),
+                ).fetchone()
+                if (
+                    locked_active
+                    and str(locked_active["snapshot_id"] or "")
+                    == graph_epoch_snapshot_id
+                    and locked_metric
+                    and str(locked_metric["status"] or "").lower()
+                    == "complete"
+                ):
+                    conn.rollback()
+                    terminal = _current_full_reconcile_existing_run(
+                        conn,
+                        store,
+                        project_id=project_id,
+                        run_id=run_id,
+                        target_commit_sha=target_commit,
+                        route_evidence=route_evidence,
+                    )
+                    if terminal.get("status") != "complete":
+                        return 409, {
+                            "ok": False,
+                            "project_id": project_id,
+                            "error": terminal.get("reason")
+                            or "reconcile_terminal_evidence_incomplete",
+                            "message": (
+                                "the concurrent terminal reconcile is missing "
+                                "durable atomic evidence; do not synthesize PASS"
+                            ),
+                            "run_id": run_id,
+                            "snapshot_id": graph_epoch_snapshot_id,
+                            "fail_closed": True,
+                            "next_legal_action": (
+                                "file_or_resume_audited_system_repair"
+                            ),
+                        }
+                    return 200, _current_full_reconcile_idempotent_response(
+                        terminal,
+                        project_id=project_id,
+                        target_commit_sha=target_commit,
+                        head_commit=head_commit,
+                    )
+                activation = store.activate_graph_snapshot(
+                    conn,
+                    project_id,
+                    graph_epoch_snapshot_id,
+                    expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
+                    actor=str(body.get("actor") or "dashboard_user"),
+                    auto_rebuild_projection=False,
+                    schema_ready=True,
+                    post_commit_hooks=False,
+                )
+                pending_scope_waiver = {
+                    "project_id": project_id,
+                    "waived_count": 0,
+                    "commit_shas": [],
+                    "snapshot_id": graph_epoch_snapshot_id,
+                }
+                if pending_scope_commits:
+                    pending_scope_waiver = store.waive_pending_scope_reconcile(
+                        conn,
+                        project_id,
+                        commit_shas=pending_scope_commits,
+                        ref_name=identity["ref_name"],
+                        branch_ref=identity["branch_ref"],
+                        worktree_id="",
+                        worktree_path="",
+                        snapshot_id=graph_epoch_snapshot_id,
+                        actor=str(body.get("actor") or "dashboard_user"),
+                        reason="full reconcile activated current graph snapshot",
+                        evidence={
+                            "source": "current_full_atomic_activation",
+                            "run_id": run_id,
+                            "target_commit_sha": target_commit,
+                        },
+                        schema_ready=True,
+                    )
+                result["activation"] = activation
+                result["pending_scope_waiver"] = pending_scope_waiver
+                active_row = conn.execute(
+                    """
+                    SELECT s.*
+                    FROM graph_snapshot_refs r
+                    JOIN graph_snapshots s
+                      ON s.project_id = r.project_id
+                     AND s.snapshot_id = r.snapshot_id
+                    WHERE r.project_id = ? AND r.ref_name = ?
+                    """,
+                    (project_id, identity["ref_name"]),
+                ).fetchone()
+                active_snapshot = dict(active_row) if active_row else {}
+                active_graph_commit = str(active_snapshot.get("commit_sha") or "")
+                active_snapshot_id = str(active_snapshot.get("snapshot_id") or "")
+                pending_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM pending_scope_reconcile
+                        WHERE project_id = ? AND status IN (?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            store.PENDING_STATUS_QUEUED,
+                            store.PENDING_STATUS_RUNNING,
+                            store.PENDING_STATUS_FAILED,
+                        ),
+                    ).fetchone()[0]
+                )
+                matches_target = active_graph_commit == target_commit
+                matches_head = active_graph_commit == head_commit
+                activation_verification = {
+                    "schema_version": "scope_reconcile_activation_verification.v1",
+                    "source": "atomic_transaction",
+                    "requested": True,
+                    "verified": bool(
+                        matches_target and matches_head and pending_count == 0
+                    ),
+                    "active_snapshot_id": active_snapshot_id,
+                    "active_graph_commit": active_graph_commit,
+                    "target_commit_sha": target_commit,
+                    "head_commit": head_commit,
+                    "matches_target_commit": matches_target,
+                    "matches_head_commit": matches_head,
+                    "pending_scope_reconcile_count": pending_count,
+                    "pending_scope_reconcile_zero": pending_count == 0,
+                    "ref_name": str(identity.get("ref_name") or ""),
+                    "branch_ref": str(identity.get("branch_ref") or ""),
+                    "worktree_id": str(identity.get("worktree_id") or ""),
+                    "worktree_path": str(identity.get("worktree_path") or ""),
+                }
+                result["activation_verification"] = activation_verification
+                result["activated"] = bool(activation_verification.get("verified"))
+                if not result["activated"]:
+                    raise GovernanceError(
+                        "current_full_reconcile_atomic_activation_not_verified",
+                        "current-full activation verification failed before evidence commit",
+                        409,
+                        {
+                            "run_id": run_id,
+                            "snapshot_id": graph_epoch_snapshot_id,
+                            "activation_verification": activation_verification,
+                            "fail_closed": True,
+                        },
+                    )
+                result["snapshot_status"] = "active"
+                result["status"] = "complete"
+                result["active_snapshot_id"] = activation_verification.get("active_snapshot_id") or ""
+                result["active_graph_commit"] = activation_verification.get("active_graph_commit") or ""
                 timeline_event = _record_pending_scope_reconcile_contract_event(
                     conn,
                     project_id=project_id,
@@ -35817,48 +36547,166 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     result=result,
                     target_commit_sha=target_commit,
                     runtime_context_scope=runtime_context_scope,
+                    post_commit_hooks=False,
                 )
-            else:
-                timeline_event = {}
-            if timeline_event:
-                result["timeline_event_recorded"] = {
-                    "id": timeline_event.get("id"),
-                    "ref": f"timeline:{timeline_event.get('id')}",
-                    "event_kind": timeline_event.get("event_kind"),
-                    "phase": timeline_event.get("phase"),
-                    "status": timeline_event.get("status"),
-                    "requirement_id": "reconcile",
-                }
-            if (
-                activate_requested
-                and result.get("activated") is True
-                and timeline_event
-            ):
-                provenance = store.record_current_full_reconcile_provenance(
-                    conn,
-                    project_id=project_id,
-                    snapshot_id=graph_epoch_snapshot_id,
-                    target_commit_sha=target_commit,
-                    request_id=str(ctx.request_id),
-                    request_started_at=request_started_at,
-                    route_evidence=_current_full_reconcile_route_evidence(
-                        current_full_auth,
+                if route_bound and not timeline_event:
+                    raise GovernanceError(
+                        "current_full_reconcile_atomic_timeline_required",
+                        "route-bound current-full activation requires durable reconcile timeline evidence",
+                        409,
+                        {"run_id": run_id, "snapshot_id": graph_epoch_snapshot_id, "fail_closed": True},
+                    )
+                provenance = {}
+                if timeline_event:
+                    result["timeline_event_recorded"] = {
+                        "id": timeline_event.get("id"),
+                        "ref": f"timeline:{timeline_event.get('id')}",
+                        "event_kind": timeline_event.get("event_kind"),
+                        "phase": timeline_event.get("phase"),
+                        "status": timeline_event.get("status"),
+                        "requirement_id": "reconcile",
+                    }
+                    provenance = store.record_current_full_reconcile_provenance(
+                        conn,
+                        project_id=project_id,
+                        snapshot_id=graph_epoch_snapshot_id,
+                        target_commit_sha=target_commit,
+                        request_id=str(ctx.request_id),
+                        request_started_at=request_started_at,
+                        route_evidence=route_evidence,
                         runtime_context_scope=runtime_context_scope,
-                    ),
-                    runtime_context_scope=runtime_context_scope,
-                    reconcile_event_id=int(timeline_event.get("id") or 0),
-                    reconcile_event_created_at=str(
-                        timeline_event.get("created_at") or ""
-                    ),
-                    marker_created_at=_utc_now(),
+                        reconcile_event_id=int(timeline_event.get("id") or 0),
+                        reconcile_event_created_at=str(timeline_event.get("created_at") or ""),
+                        marker_created_at=_utc_now(),
+                        schema_ready=True,
+                    )
+                    result["current_full_reconcile_provenance"] = provenance
+                if route_bound and not provenance:
+                    raise GovernanceError(
+                        "current_full_reconcile_atomic_provenance_required",
+                        "route-bound current-full activation requires durable reconcile provenance",
+                        409,
+                        {"run_id": run_id, "snapshot_id": graph_epoch_snapshot_id, "fail_closed": True},
+                    )
+                store.record_reconcile_run_metric(
+                    conn,
+                    project_id,
+                    run_id=run_id,
+                    snapshot_id=graph_epoch_snapshot_id,
+                    commit_sha=target_commit,
+                    snapshot_kind="full",
+                    strategy="current_full_reconcile",
+                    graph_delta_mode="full_rebuild",
+                    status="complete",
+                    elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
+                    evidence={
+                        "phase": "atomic_finalize_complete",
+                        "activate_requested": True,
+                        "idempotency_scope": idempotency_scope,
+                        "request_id": str(ctx.request_id),
+                        "reconcile_event_id": int(timeline_event.get("id") or 0) if timeline_event else 0,
+                        "provenance_id": str(provenance.get("provenance_id") or ""),
+                    },
+                    created_at=request_started_at,
+                    schema_ready=True,
                 )
-                result["current_full_reconcile_provenance"] = provenance
-            if runtime_context_scope:
-                result["current_full_reconcile_runtime_context_scope"] = dict(
-                    runtime_context_scope
-                )
+                conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            store.record_reconcile_run_metric(
+                conn,
+                project_id,
+                run_id=run_id,
+                snapshot_id=graph_epoch_snapshot_id,
+                commit_sha=target_commit,
+                snapshot_kind="full",
+                strategy="current_full_reconcile",
+                graph_delta_mode="full_rebuild",
+                status="failed",
+                elapsed_ms=int((time.monotonic() - request_started_monotonic) * 1000),
+                evidence={
+                    "phase": "atomic_finalize_failed",
+                    "error": str(exc),
+                    "candidate_preserved": True,
+                    "idempotency_scope": idempotency_scope,
+                },
+                created_at=request_started_at,
+            )
+            conn.commit()
+            raise
+
+        if timeline_event:
+            _task_timeline.run_post_commit_hooks(conn, timeline_event)
+            conn.commit()
+
+        # Queue-epoch propagation and advisory activation hooks run only after
+        # the activation/evidence transaction is durable.  A failure here can
+        # be safely answered by the same-run terminal lookup without creating
+        # duplicate timeline or provenance rows.
+        result["merge_queue_graph_epoch_auto_record"] = record_merge_queue_graph_epoch_after_reconcile(
+            conn,
+            project_id=project_id,
+            target_head_commit=target_commit,
+            snapshot_id=graph_epoch_snapshot_id,
+            projection_id=graph_epoch_projection_id,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            now_iso=_utc_now(),
+        )
         conn.commit()
-        return 201, result
+        try:
+            from . import event_bus
+
+            event_bus.publish(
+                "snapshot.activated",
+                {
+                    "project_id": project_id,
+                    "snapshot_id": graph_epoch_snapshot_id,
+                    "previous_snapshot_id": str(activation.get("previous_snapshot_id") or ""),
+                    "commit_sha": target_commit,
+                    "ref_name": identity["ref_name"],
+                    "projection_status": activation.get("projection_status") or "skipped",
+                    "graph_ref_event_id": activation.get("graph_ref_event_id") or "",
+                    "source": "current_full_atomic_activation",
+                },
+            )
+            event_bus.publish(
+                "dashboard.changed",
+                {
+                    "project_id": project_id,
+                    "path": "/api/graph-governance/{project_id}/reconcile/current-full",
+                    "method": "POST",
+                    "source": "current_full_atomic_activation",
+                },
+            )
+            result["post_commit_activation_events"] = {"published": True}
+        except Exception as exc:
+            result["post_commit_activation_events"] = {
+                "published": False,
+                "error": str(exc),
+            }
+        try:
+            retention_gc = store.run_snapshot_retention_gc(
+                conn,
+                project_id,
+                dry_run=False,
+                actor=f"post_activate:{str(body.get('actor') or 'dashboard_user')}",
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            retention_gc = {"ok": False, "error": str(exc), "dry_run": False}
+        result["activation"]["retention_gc"] = retention_gc
+
+        result["project_registry_activation"] = _sync_project_registry_active_snapshot(
+            project_id,
+            graph_epoch_snapshot_id,
+            node_count=int((result.get("graph_stats") or {}).get("nodes") or 0) if isinstance(result.get("graph_stats"), Mapping) else None,
+            ref_name=identity["ref_name"],
+        )
+        if runtime_context_scope:
+            result["current_full_reconcile_runtime_context_scope"] = dict(runtime_context_scope)
+        return (200 if resumed_candidate else 201), result
     finally:
         conn.close()
 

@@ -1952,6 +1952,17 @@ def _stub_current_full_reconcile(monkeypatch, tmp_path):
 
     def fake_reconcile(_conn, project_id, root, **kwargs):
         calls.append({"project_id": project_id, "root": root, **kwargs})
+        if not store.get_graph_snapshot(_conn, project_id, "full-current"):
+            store.create_graph_snapshot(
+                _conn,
+                project_id,
+                snapshot_id="full-current",
+                commit_sha=head,
+                snapshot_kind="full",
+                graph_json=_graph(),
+                notes=json.dumps({"run_id": kwargs.get("run_id", "")}),
+            )
+            _conn.commit()
         return {
             "ok": True,
             "snapshot_id": "full-current",
@@ -1965,11 +1976,6 @@ def _stub_current_full_reconcile(monkeypatch, tmp_path):
         state_reconcile,
         "run_state_only_full_reconcile",
         fake_reconcile,
-    )
-    monkeypatch.setattr(
-        server,
-        "_record_pending_scope_reconcile_contract_event",
-        lambda *_args, **_kwargs: None,
     )
     return head, calls
 
@@ -2852,13 +2858,397 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     assert preflight_status == 201
     assert preflight["current_full_reconcile"] is True
     assert preflight["activated"] is False
-    assert deployed_status == 201
+    assert deployed_status == 200
     assert deployed["current_full_reconcile"] is True
-    assert [call["activate"] for call in calls] == [False, True]
+    assert [call["activate"] for call in calls] == [False]
+    assert deployed["resumed_candidate"] is True
+    assert deployed["rebuild_skipped"] is True
     assert all(
         "current_full_reconcile_runtime_context_scope" not in result
         for result in (preflight, deployed)
     )
+
+
+def _current_full_direct_main_route_fixture(
+    conn,
+    *,
+    backlog_id: str,
+    observer_session_id: str,
+    route_token_ref: str,
+) -> tuple[str, str]:
+    _insert_active_observer_session_ref(
+        conn,
+        session_id=observer_session_id,
+    )
+    record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    execution_id = record["contract_execution_id"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+    )
+    return execution_id, observer_session_id
+
+
+def test_current_full_reconcile_atomic_finalization_rolls_back_activation_and_timeline(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-atomic-old"
+    _activate_basic_graph(
+        conn,
+        old_snapshot_id,
+        commit_sha="b" * 40,
+    )
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-ATOMIC-ROLLBACK"
+    route_token_ref = "rtok-current-full-atomic-rollback"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-atomic-rollback",
+        route_token_ref=route_token_ref,
+    )
+    post_commit_hook_calls = []
+    monkeypatch.setattr(
+        task_timeline,
+        "_run_service_router_hook",
+        lambda *_args, **_kwargs: post_commit_hook_calls.append("service_router"),
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_publish_timeline_event",
+        lambda *_args, **_kwargs: post_commit_hook_calls.append("publish"),
+    )
+
+    monkeypatch.setattr(
+        store,
+        "record_current_full_reconcile_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated client-timeout finalization interruption")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated client-timeout finalization interruption",
+    ):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": True,
+                    "semantic_enrich": False,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    active = store.get_active_graph_snapshot(conn, PID) or {}
+    assert active["snapshot_id"] == old_snapshot_id
+    assert calls[0]["activate"] is False
+    assert not [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            task_id=execution_id,
+            backlog_id=backlog_id,
+        )
+        if event.get("event_kind") == "reconcile"
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND target_commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0] == 0
+    assert post_commit_hook_calls == []
+    metric = conn.execute(
+        "SELECT * FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+        (PID, f"current-full-{head[:7]}", "full-current"),
+    ).fetchone()
+    assert metric is not None
+    assert metric["status"] == "failed"
+
+
+def test_current_full_reconcile_same_run_id_returns_terminal_without_duplicate_evidence(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-IDEMPOTENT-TERMINAL"
+    route_token_ref = "rtok-current-full-idempotent-terminal"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-idempotent-terminal",
+        route_token_ref=route_token_ref,
+    )
+    post_commit_hook_calls = []
+    monkeypatch.setattr(
+        task_timeline,
+        "_run_service_router_hook",
+        lambda *_args, **_kwargs: post_commit_hook_calls.append("service_router"),
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_publish_timeline_event",
+        lambda *_args, **_kwargs: post_commit_hook_calls.append("publish"),
+    )
+    body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": "current-full-idempotent-terminal-run",
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    first_event_count = len(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                task_id=execution_id,
+                backlog_id=backlog_id,
+            )
+            if event.get("event_kind") == "reconcile"
+        ]
+    )
+    first_provenance_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND target_commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0]
+
+    second_status, second = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert first_status == 201
+    assert first["activated"] is True
+    assert second_status == 200
+    assert second["idempotent_replay"] is True
+    assert second["rebuild_skipped"] is True
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert len(calls) == 1
+    assert calls[0]["activate"] is False
+    assert first_event_count == 1
+    assert len(
+        [
+            event
+            for event in task_timeline.list_events(
+                conn,
+                PID,
+                task_id=execution_id,
+                backlog_id=backlog_id,
+            )
+            if event.get("event_kind") == "reconcile"
+        ]
+    ) == first_event_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_current_full_reconcile_provenance "
+        "WHERE project_id = ? AND target_commit_sha = ?",
+        (PID, head),
+    ).fetchone()[0] == first_provenance_count == 1
+    assert post_commit_hook_calls == ["service_router", "publish"]
+    assert second["timeline_event_recorded"]["status"] == (
+        first["timeline_event_recorded"]["status"]
+    )
+
+    conn.execute(
+        "UPDATE task_timeline_events SET status = 'failed' "
+        "WHERE project_id = ? AND id = ?",
+        (PID, int(first["timeline_event_recorded"]["id"])),
+    )
+    conn.commit()
+    mismatched_status, mismatched = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+    )
+    assert mismatched_status == 409
+    assert mismatched["error"] == "reconcile_terminal_timeline_scope_mismatch"
+    assert mismatched["fail_closed"] is True
+
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (PID, int(first["timeline_event_recorded"]["id"])),
+    )
+    conn.commit()
+    third_status, third = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    assert third_status == 409
+    assert third["error"] == "reconcile_terminal_timeline_missing"
+    assert third["fail_closed"] is True
+    assert len(calls) == 1
+
+
+def test_current_full_reconcile_candidate_exception_records_failed_run(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, _calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    run_id = "current-full-candidate-exception"
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated candidate builder crash")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated candidate builder crash"):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": True,
+                    "semantic_enrich": False,
+                    "run_id": run_id,
+                },
+            )
+        )
+
+    metric = conn.execute(
+        "SELECT * FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND run_id = ?",
+        (PID, run_id),
+    ).fetchone()
+    assert metric is not None
+    assert metric["status"] == "failed"
+    evidence = json.loads(metric["evidence_json"])
+    assert evidence["phase"] == "candidate_materialization_failed"
+    assert evidence["error"] == "simulated candidate builder crash"
+
+
+def test_current_full_reconcile_run_id_rejects_target_commit_drift(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    run_id = "current-full-target-drift"
+    old_commit = "b" * 40
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id="full-old-target",
+        commit_sha=old_commit,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="failed",
+        evidence={"phase": "candidate_materialization_failed"},
+    )
+    conn.commit()
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "semantic_enrich": False,
+                "run_id": run_id,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "reconcile_run_id_target_commit_conflict"
+    assert result["expected_target_commit_sha"] == old_commit
+    assert result["actual_target_commit_sha"] == head
+    assert calls == []
+
+
+def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
+    head = "d" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-status",
+        commit_sha=head,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="current-full-visible-running",
+        snapshot_id="full-current-visible-running",
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="running",
+        evidence={
+            "phase": "materializing_candidate",
+            "idempotency_scope": {
+                "project_id": PID,
+                "backlog_id": "AC-CURRENT-FULL-VISIBLE-RUNNING",
+                "task_id": "cex-current-full-visible-running",
+            },
+        },
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+
+    operation = next(
+        item
+        for item in result["operations"]
+        if item.get("run_id") == "current-full-visible-running"
+    )
+    assert operation["operation_id"] == (
+        "current-full:current-full-visible-running"
+    )
+    assert operation["operation_type"] == "current_full_reconcile"
+    assert operation["status"] == "running"
+    assert operation["progress"] == {"done": 0, "total": 2}
+    assert operation["last_result"] == "materializing_candidate"
 
 
 @pytest.mark.parametrize(

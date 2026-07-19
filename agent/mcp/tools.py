@@ -191,11 +191,12 @@ def _summarize_reconcile_progress(queue: Any, run_id: str) -> dict:
         for operation in operations:
             if not isinstance(operation, dict):
                 continue
-            haystack = " ".join(
-                str(operation.get(key) or "")
-                for key in ("operation_id", "target_id", "last_result", "run_id")
-            )
-            if run_id in haystack:
+            operation_run_id = str(operation.get("run_id") or "").strip()
+            operation_id = str(operation.get("operation_id") or "").strip()
+            if operation_run_id == run_id or operation_id in {
+                run_id,
+                f"current-full:{run_id}",
+            }:
                 matched_operation = operation
                 break
     if matched_operation is None and len(operations) == 1:
@@ -247,6 +248,15 @@ def _current_full_reconcile_run_id(body: dict) -> str:
     return ""
 
 
+def _ensure_current_full_reconcile_run_id(body: dict) -> dict:
+    normalized = dict(body)
+    run_id = str(normalized.get("run_id") or "").strip()
+    if not run_id:
+        run_id = f"current-full-mcp-{secrets.token_hex(8)}"
+    normalized["run_id"] = run_id
+    return normalized
+
+
 def _current_full_reconcile_timeout_response(
     project_id: str,
     body: dict,
@@ -273,15 +283,18 @@ def _current_full_reconcile_timeout_response(
             "graph_operations_queue or graph_status before deciding whether to retry."
         ),
         "next_legal_action": {
-            "action": "poll_graph_operations_queue_or_retry_safely",
+            "action": "poll_graph_operations_queue_then_resume_same_run_id",
             "poll_tool": "graph_operations_queue",
             "status_tool": "graph_status",
             "retry_tool": "graph_current_full_reconcile",
-            "safe_retry": True,
+            "safe_retry": False,
+            "retry_disposition": "conditional_same_run_id_resume",
+            "same_run_id_required": True,
             "retry_guidance": (
-                "Poll graph_operations_queue for the run/progress first. Retry only "
-                "after no running reconcile is reported, preferably with the same "
-                "run_id when one was supplied."
+                "Poll graph_operations_queue for this run_id first. Do not replay "
+                "while it is running. If the durable state is candidate_ready or "
+                "failed before activation, call graph_current_full_reconcile with "
+                "the exact same run_id so the server resumes instead of rebuilding."
             ),
         },
     }
@@ -4929,6 +4942,7 @@ class ToolDispatcher:
             )
             if alias_error:
                 return alias_error
+            body = _ensure_current_full_reconcile_run_id(body)
             result = self._governance_api_with_timeout(
                 "POST",
                 f"/api/graph-governance/{pid}/reconcile/current-full",

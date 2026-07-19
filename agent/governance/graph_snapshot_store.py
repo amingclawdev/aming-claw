@@ -412,10 +412,33 @@ def _latest_projection_id(
     *,
     ref_name: str = "",
     branch_ref: str = "",
+    schema_ready: bool = False,
 ) -> str:
     if not snapshot_id:
         return ""
     try:
+        if schema_ready:
+            filters: list[str] = []
+            params: list[Any] = [project_id, snapshot_id]
+            if ref_name:
+                if str(ref_name or "") == "active":
+                    filters.append("(ref_name = ? OR ref_name = '')")
+                    params.append("active")
+                else:
+                    filters.append("ref_name = ?")
+                    params.append(str(ref_name or ""))
+            filters.append("branch_ref = ?")
+            params.append(str(branch_ref or ""))
+            where_extra = " AND " + " AND ".join(filters) if filters else ""
+            row = conn.execute(
+                f"""
+                SELECT projection_id FROM graph_semantic_projections
+                WHERE project_id = ? AND snapshot_id = ?{where_extra}
+                ORDER BY event_watermark DESC, created_at DESC LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            return str(row["projection_id"] if row else "")
         from . import graph_events
 
         projection = graph_events.get_semantic_projection(
@@ -453,8 +476,10 @@ def record_graph_ref_event(
     evidence: dict[str, Any] | None = None,
     event_id: str = "",
     created_at: str = "",
+    schema_ready: bool = False,
 ) -> dict[str, Any]:
-    ensure_schema(conn)
+    if not schema_ready:
+        ensure_schema(conn)
     op = str(operation_type or "").strip()
     if op not in GRAPH_REF_OPERATION_TYPES:
         raise ValueError(f"invalid graph ref operation_type: {operation_type}")
@@ -1798,8 +1823,15 @@ def activate_graph_snapshot(
     evidence: dict[str, Any] | None = None,
     actor: str = "activate_hook",
     auto_rebuild_projection: bool = True,
+    schema_ready: bool = False,
+    post_commit_hooks: bool = True,
 ) -> dict[str, Any]:
-    ensure_schema(conn)
+    if not schema_ready:
+        ensure_schema(conn)
+    if schema_ready and auto_rebuild_projection:
+        raise ValueError(
+            "transaction-safe graph activation requires auto_rebuild_projection=false"
+        )
     ref_name = normalize_pending_scope_identity(ref_name=ref_name)["ref_name"]
     op = str(operation_type or "").strip()
     if op not in GRAPH_REF_OPERATION_TYPES:
@@ -1841,6 +1873,7 @@ def activate_graph_snapshot(
         old_id,
         ref_name=ref_name,
         branch_ref=activation_branch_ref,
+        schema_ready=schema_ready,
     )
 
     now = utc_now()
@@ -1930,6 +1963,7 @@ def activate_graph_snapshot(
         snapshot_id,
         ref_name=ref_name,
         branch_ref=activation_branch_ref,
+        schema_ready=schema_ready,
     )
     try:
         ref_event = record_graph_ref_event(
@@ -1956,6 +1990,7 @@ def activate_graph_snapshot(
                 "projection_status": projection_status,
                 **(evidence or {}),
             },
+            schema_ready=schema_ready,
         )
         result["graph_ref_event_id"] = ref_event["event_id"]
         result["old_projection_id"] = old_projection_id
@@ -1966,7 +2001,7 @@ def activate_graph_snapshot(
     # so _emit_dashboard_changed never fires for it. Publish here so the
     # dashboard's SSE subscribers refetch when a new snapshot becomes
     # active (reconcile / pending-scope materialize, etc.).
-    if target_ref_activation:
+    if target_ref_activation and post_commit_hooks:
         try:
             from . import event_bus
             event_bus.publish("snapshot.activated", {
@@ -1990,7 +2025,7 @@ def activate_graph_snapshot(
     # Post-activation GC: run retention GC automatically after a successful
     # target-ref activation. This is advisory-only; never blocks activation.
     gc_result: dict[str, Any] | None = None
-    if target_ref_activation:
+    if target_ref_activation and post_commit_hooks:
         try:
             gc_result = run_snapshot_retention_gc(
                 conn,
@@ -2172,10 +2207,12 @@ def record_current_full_reconcile_provenance(
     reconcile_event_created_at: str,
     runtime_context_scope: Mapping[str, Any] | None = None,
     marker_created_at: str | None = None,
+    schema_ready: bool = False,
 ) -> dict[str, Any]:
     """Seal one protected current-full completion to its durable reconcile event."""
 
-    ensure_schema(conn)
+    if not schema_ready:
+        ensure_schema(conn)
     project_id = str(project_id or "").strip()
     snapshot_id = str(snapshot_id or "").strip()
     target_commit_sha = str(target_commit_sha or "").strip().lower()
@@ -2205,7 +2242,14 @@ def record_current_full_reconcile_provenance(
             "current-full reconcile provenance requires: "
             + ", ".join(missing_fields)
         )
-    snapshot = get_graph_snapshot(conn, project_id, snapshot_id) or {}
+    if schema_ready:
+        snapshot_row = conn.execute(
+            "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+            (project_id, snapshot_id),
+        ).fetchone()
+        snapshot = dict(snapshot_row) if snapshot_row else {}
+    else:
+        snapshot = get_graph_snapshot(conn, project_id, snapshot_id) or {}
     if (
         str(snapshot.get("status") or "").strip() != SNAPSHOT_STATUS_ACTIVE
         or str(snapshot.get("commit_sha") or "").strip().lower()
@@ -4252,13 +4296,15 @@ def record_reconcile_run_metric(
     fallback_reason: str = "",
     evidence: dict[str, Any] | None = None,
     created_at: str = "",
+    schema_ready: bool = False,
 ) -> dict[str, Any]:
     """Persist one reconcile timing row.
 
     The primary key is run_id + snapshot_id so fallback metadata can be
     upserted after graph events are emitted.
     """
-    ensure_schema(conn)
+    if not schema_ready:
+        ensure_schema(conn)
     rid = str(run_id or snapshot_id or commit_sha or "").strip()
     sid = str(snapshot_id or "").strip()
     if not rid or not sid:
@@ -4936,9 +4982,11 @@ def waive_pending_scope_reconcile(
     actor: str = "observer",
     reason: str = "",
     evidence: dict[str, Any] | None = None,
+    schema_ready: bool = False,
 ) -> dict[str, Any]:
     """Mark retryable pending scope rows as waived with explicit evidence."""
-    ensure_schema(conn)
+    if not schema_ready:
+        ensure_schema(conn)
     selected = [
         str(commit or "").strip()
         for commit in (commit_shas or [])
