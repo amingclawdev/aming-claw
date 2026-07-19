@@ -26573,6 +26573,138 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
     assert proof["reverification_reuse_count"] == 1
     assert candidate_diff_recomputations == 1
 
+    post_candidate_path = fixture.root / "src" / "post_candidate.py"
+    post_candidate_path.write_text(
+        "def post_candidate_entry():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/post_candidate.py"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "advance canonical head after candidate qa"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    advanced_head = batch_jobs.git_commit(fixture.root)
+
+    historical_failed_body = json.loads(json.dumps(timeline_ctx.body))
+    historical_failed_body["status"] = "failed"
+    historical_failed_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=historical_failed_body,
+    )
+    historical_failed_ctx._session = dict(qa_ctx._session)
+    historical_failed = server.handle_task_timeline_append(
+        historical_failed_ctx
+    )
+    historical_authority = historical_failed["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    historical_proof = historical_authority["qa_session_proof"]
+    historical_reverification = historical_proof[
+        "historical_audit_reverification"
+    ]
+    assert historical_authority["authority_scope"] == "audit_only"
+    assert historical_authority["close_satisfying"] is False
+    assert historical_authority["audit_only"] is True
+    assert historical_reverification == {
+        "schema_version": "qa_review_graph.historical_audit_reverification.v1",
+        "verified": True,
+        "authority_scope": "audit_only",
+        "close_satisfying": False,
+        "evidence_status": "failed",
+        "source": "immutable_graph_trace+server_git_object_diff+git_ancestry",
+        "canonical_base_snapshot_id": snapshot_id,
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "current_active_snapshot_id": snapshot_id,
+        "current_active_snapshot_commit_sha": base_commit,
+        "current_canonical_head_commit_sha": advanced_head,
+        "candidate_is_ancestor_of_current_head": True,
+        "historical_close_authority_granted": False,
+    }
+    assert task_timeline._independent_qa_gate(
+        [historical_failed],
+        {"requirements": {"independent_qa": True}},
+    )["passed"] is False
+
+    historical_replay_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(historical_failed_body)),
+    )
+    historical_replay_ctx._session = dict(qa_ctx._session)
+    historical_replay = server.handle_task_timeline_append(
+        historical_replay_ctx
+    )
+    assert historical_replay["id"] == historical_failed["id"]
+    assert historical_replay["idempotent_replay"] is True
+
+    historical_pass_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(timeline_ctx.body)),
+    )
+    historical_pass_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as historical_pass:
+        server.handle_task_timeline_append(historical_pass_ctx)
+    assert historical_pass.value.code == "qa_graph_trace_mismatch"
+
+    empty_tree = subprocess.run(
+        ["git", "mktree"],
+        cwd=fixture.root,
+        input="",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    divergent_head = subprocess.run(
+        ["git", "commit-tree", empty_tree, "-m", "divergent head"],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", divergent_head],
+        cwd=fixture.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _activate_basic_graph(
+        conn,
+        "full-query-bounded-qa-divergent",
+        commit_sha=divergent_head,
+    )
+    divergent_failed_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(historical_failed_body)),
+    )
+    divergent_failed_ctx._session = dict(qa_ctx._session)
+    with pytest.raises(GovernanceError) as divergent_failed:
+        server.handle_task_timeline_append(divergent_failed_ctx)
+    assert divergent_failed.value.code == "qa_graph_trace_mismatch"
+    mismatch_details = divergent_failed.value.details["identity_mismatches"]
+    assert any(
+        item.get("actual") == "historical_candidate_not_ancestor_of_current_head"
+        for item in mismatch_details
+    )
+
 
 def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
     conn,
@@ -28917,6 +29049,18 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         ],
         "overlay_failure_policy": "fail_closed",
         "one_hop_dependency_failure_policy": "fail_closed",
+        "historical_overlay_retry_policy": (
+            "audit_only_after_server_git_object_reverification"
+        ),
+        "historical_overlay_retry_requirements": [
+            "authenticated_bounded_qa_session",
+            "persisted_immutable_graph_trace_identity",
+            "server_recomputed_base_to_candidate_diff",
+            "base_is_ancestor_of_candidate",
+            "candidate_is_ancestor_of_current_head",
+            "status_is_failed_fail_rejected_or_blocked",
+        ],
+        "historical_pass_without_merge_or_deployment_provenance": "rejected",
         "full_candidate_snapshot_required": False,
     }
     current_qa_graph_shape = current_qa_guide["qa_graph_context"][
@@ -29164,6 +29308,9 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         "identical_review_context_reverified_once_per_request": True,
         "every_trace_identity_and_scope_still_verified": True,
         "failed_reverification_cached": False,
+        "historical_descendant_overlay_audit_only": True,
+        "historical_descendant_overlay_close_satisfying": False,
+        "historical_pass_requires_stronger_provenance": True,
     }
     assert append_evidence["credential_scrub_policy"] == {
         "applied_before_authority_projection": True,

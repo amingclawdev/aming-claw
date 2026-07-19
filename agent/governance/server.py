@@ -7537,6 +7537,7 @@ def _qa_checkout_root_identity(
     candidate_commit_sha: str,
     require_canonical_base_head: bool = True,
     require_query_candidate_head: bool = False,
+    require_query_review_head: bool = True,
 ) -> dict[str, Any]:
     from .checkout_provenance import describe_checkout
 
@@ -7597,7 +7598,7 @@ def _qa_checkout_root_identity(
         if require_query_candidate_head
         else {base_commit_sha, candidate_commit_sha}
     )
-    if query_head not in accepted_query_heads:
+    if require_query_review_head and query_head not in accepted_query_heads:
         _qa_overlay_fail(
             "query_root_head_mismatch",
             (
@@ -7688,7 +7689,11 @@ def _qa_checkout_root_identity(
         "query_root_is_linked_worktree": bool(query_git.get("is_linked_worktree")),
         "canonical_project_root": str(Path(canonical_root).resolve()),
         "canonical_head_commit": canonical_head,
-        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_policy": (
+            "base_or_candidate"
+            if require_canonical_base_head
+            else "historical_audit_descendant"
+        ),
         "canonical_head_relation": (
             "candidate"
             if canonical_head == candidate_commit_sha
@@ -7775,6 +7780,7 @@ def _qa_candidate_diff_context(
     canonical_project_root: Path,
     base_commit_sha: str,
     candidate_commit_sha: str,
+    allow_historical_audit_descendant: bool = False,
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -7814,7 +7820,38 @@ def _qa_candidate_diff_context(
         canonical_root=canonical_root,
         base_commit_sha=base_commit_sha,
         candidate_commit_sha=candidate_commit_sha,
+        require_canonical_base_head=not allow_historical_audit_descendant,
+        require_query_review_head=not allow_historical_audit_descendant,
     )
+    if allow_historical_audit_descendant:
+        canonical_head_commit = str(
+            root_identity.get("canonical_head_commit") or ""
+        ).strip().lower()
+        candidate_to_head = _qa_git_bytes(
+            canonical_root,
+            [
+                "merge-base",
+                "--is-ancestor",
+                candidate_commit_sha,
+                canonical_head_commit,
+            ],
+        )
+        if candidate_to_head.returncode != 0:
+            _qa_overlay_fail(
+                "historical_candidate_not_ancestor_of_current_head",
+                (
+                    "historical audit-only overlay requires the reviewed "
+                    "candidate to be an ancestor of current canonical HEAD"
+                ),
+                candidate_commit_sha=candidate_commit_sha,
+                canonical_head_commit=canonical_head_commit,
+            )
+        root_identity["canonical_head_relation"] = (
+            "candidate"
+            if canonical_head_commit == candidate_commit_sha
+            else "descendant_of_candidate"
+        )
+        root_identity["historical_audit_only"] = True
     changed = _qa_git_bytes(
         canonical_root,
         [
@@ -9132,7 +9169,23 @@ def _qa_reverify_candidate_trace_context(
     active_commit_sha = str(active.get("commit_sha") or "").strip().lower()
     expected_snapshot_id = review_context["canonical_base_snapshot_id"]
     expected_base_commit = review_context["base_commit_sha"]
-    if active_snapshot_id != expected_snapshot_id:
+    evidence_status = str((body or {}).get("status") or "").strip().lower()
+    canonical_head = _qa_git_bytes(
+        Path(canonical_root),
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+    )
+    canonical_head_commit = (
+        canonical_head.stdout.decode("ascii", errors="ignore").strip().lower()
+        if canonical_head.returncode == 0
+        else ""
+    )
+    historical_audit_only = evidence_status in _QA_TIMELINE_AUDIT_STATUSES and (
+        active_snapshot_id != expected_snapshot_id
+        or active_commit_sha != expected_base_commit
+        or canonical_head_commit
+        not in {expected_base_commit, review_context["candidate_commit_sha"]}
+    )
+    if not historical_audit_only and active_snapshot_id != expected_snapshot_id:
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -9141,7 +9194,7 @@ def _qa_reverify_candidate_trace_context(
                 "actual": active_snapshot_id,
             }
         )
-    if active_commit_sha != expected_base_commit:
+    if not historical_audit_only and active_commit_sha != expected_base_commit:
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -9152,11 +9205,16 @@ def _qa_reverify_candidate_trace_context(
         )
     try:
         recomputed = _qa_candidate_diff_context(
-            Path(query_root_raw),
+            (
+                Path(canonical_root)
+                if historical_audit_only
+                else Path(query_root_raw)
+            ),
             project_id=project_id,
             canonical_project_root=canonical_root,
             base_commit_sha=expected_base_commit,
             candidate_commit_sha=review_context["candidate_commit_sha"],
+            allow_historical_audit_descendant=historical_audit_only,
         )
     except _QACandidateOverlayError as exc:
         mismatches.append(
@@ -9169,17 +9227,23 @@ def _qa_reverify_candidate_trace_context(
             }
         )
         return review_context, mismatches
-    for field in (
-        "graph_basis_decision_hash",
+    immutable_reverification_fields = [
         "changed_files",
         "candidate_diff_hash",
         "changed_files_source",
         "candidate_overlay_hash",
-        "root_identity_hash",
-        "query_root_identity_hash",
-        "canonical_project_identity_hash",
         "repository_identity_hash",
-    ):
+    ]
+    if not historical_audit_only:
+        immutable_reverification_fields.extend(
+            [
+                "graph_basis_decision_hash",
+                "root_identity_hash",
+                "query_root_identity_hash",
+                "canonical_project_identity_hash",
+            ]
+        )
+    for field in immutable_reverification_fields:
         expected = review_context[field]
         actual = recomputed[field]
         if actual != expected:
@@ -9206,6 +9270,26 @@ def _qa_reverify_candidate_trace_context(
                 "actual": stable_sha256(recomputed["candidate_overlay"]),
             }
         )
+    if historical_audit_only and not mismatches:
+        current_head_commit = str(
+            recomputed["root_identity"].get("canonical_head_commit") or ""
+        ).strip().lower()
+        review_context["historical_audit_reverification"] = {
+            "schema_version": "qa_review_graph.historical_audit_reverification.v1",
+            "verified": True,
+            "authority_scope": "audit_only",
+            "close_satisfying": False,
+            "evidence_status": evidence_status,
+            "source": "immutable_graph_trace+server_git_object_diff+git_ancestry",
+            "canonical_base_snapshot_id": expected_snapshot_id,
+            "base_commit_sha": expected_base_commit,
+            "candidate_commit_sha": review_context["candidate_commit_sha"],
+            "current_active_snapshot_id": active_snapshot_id,
+            "current_active_snapshot_commit_sha": active_commit_sha,
+            "current_canonical_head_commit_sha": current_head_commit,
+            "candidate_is_ancestor_of_current_head": True,
+            "historical_close_authority_granted": False,
+        }
     return review_context, mismatches
 
 
@@ -9248,6 +9332,9 @@ def _qa_trace_reverification_cache_key(
             "review_context": review_context,
             "root_identity": dict(root_identity),
             "supplied_root": supplied_root,
+            "evidence_status": str(
+                supplied_body.get("status") or ""
+            ).strip().lower(),
         }
     )
 
@@ -15608,6 +15695,20 @@ def _runtime_context_qa_verification_guide(
                 ],
                 "overlay_failure_policy": "fail_closed",
                 "one_hop_dependency_failure_policy": "fail_closed",
+                "historical_overlay_retry_policy": (
+                    "audit_only_after_server_git_object_reverification"
+                ),
+                "historical_overlay_retry_requirements": [
+                    "authenticated_bounded_qa_session",
+                    "persisted_immutable_graph_trace_identity",
+                    "server_recomputed_base_to_candidate_diff",
+                    "base_is_ancestor_of_candidate",
+                    "candidate_is_ancestor_of_current_head",
+                    "status_is_failed_fail_rejected_or_blocked",
+                ],
+                "historical_pass_without_merge_or_deployment_provenance": (
+                    "rejected"
+                ),
                 "full_candidate_snapshot_required": False,
             },
             "required_provenance": [
@@ -15683,6 +15784,9 @@ def _runtime_context_qa_verification_guide(
                 "identical_review_context_reverified_once_per_request": True,
                 "every_trace_identity_and_scope_still_verified": True,
                 "failed_reverification_cached": False,
+                "historical_descendant_overlay_audit_only": True,
+                "historical_descendant_overlay_close_satisfying": False,
+                "historical_pass_requires_stronger_provenance": True,
             },
             "credential_scrub_policy": {
                 "applied_before_authority_projection": True,

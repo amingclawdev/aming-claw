@@ -1972,7 +1972,7 @@ TOOLS: list[dict] = [
                 "decision": {"type": "string"},
                 "schema_version": {"type": "integer"},
                 "actor": {"type": "string"},
-                "status": {"type": "string", "description": "Passing statuses accepted/ok/pass/passed/succeeded/success satisfy the close gate; failed/fail/rejected/blocked persist authenticated audit-only evidence and never satisfy close."},
+                "status": {"type": "string", "description": "Passing statuses accepted/ok/pass/passed/succeeded/success satisfy the close gate; failed/fail/rejected/blocked persist authenticated audit-only evidence and never satisfy close. After canonical HEAD advances, only audit-only outcomes may reuse an immutable old-graph plus candidate-diff trace, and only after the server recomputes base..candidate Git objects and proves candidate ancestry; historical PASS remains rejected without stronger merge/deployment provenance."},
                 "payload": {"type": "object", "description": "Caller credential-shaped fields are recursively scrubbed before authority projection and persistence; use copy-safe refs or hashes."},
                 "verification": {"type": "object", "description": "Verification evidence only; nested raw authorization, session, governance, route, or fence credentials are removed."},
                 "artifact_refs": {"type": "object", "description": "Copy-safe artifact references and hashes only; nested raw credential fields are removed."},

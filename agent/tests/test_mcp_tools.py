@@ -84,6 +84,8 @@ def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     assert "satisfy the close gate" in description
     assert "audit-only evidence" in description
     assert "never satisfy close" in description
+    assert "recomputes base..candidate Git objects" in description
+    assert "historical PASS remains rejected" in description
     assert "recursively scrubbed" in properties["payload"]["description"]
     assert "raw authorization" in properties["verification"]["description"]
     assert "Copy-safe artifact references" in properties["artifact_refs"][
@@ -3425,7 +3427,7 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.2"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.3"
     assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
 
     compatibility = mcp_tool_schema_compatibility(
@@ -3435,8 +3437,8 @@ def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
-    assert compatibility["server_tool_schema_version"] == "2026-07-19.2"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.2"
+    assert compatibility["server_tool_schema_version"] == "2026-07-19.3"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.3"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 

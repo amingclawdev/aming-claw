@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 
-MCP_TOOL_SCHEMA_VERSION = "2026-07-19.2"
+MCP_TOOL_SCHEMA_VERSION = "2026-07-19.3"
 MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION = MCP_TOOL_SCHEMA_VERSION
 
 
