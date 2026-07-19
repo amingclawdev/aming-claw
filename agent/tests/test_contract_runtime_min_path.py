@@ -107,6 +107,14 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
         "canonical_base_plus_candidate_diff",
     ]
     assert policy["candidate_diff_derivation"] == "server_only"
+    assert policy["default_graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert policy["graph_basis_decision_required"] is True
+    assert policy["graph_basis_decision_source"] == (
+        "server_bounded_qa_graph_basis"
+    )
+    assert policy["canonical_head_policy"] == "base_or_candidate"
+    assert policy["overlay_failure_policy"] == "fail_closed"
+    assert policy["one_hop_dependency_failure_policy"] == "fail_closed"
     assert policy["full_candidate_snapshot_required"] is False
     assert policy["exact_candidate_query_root_clean_required"] is True
     assert policy["assigned_target_project_root_required"] is True
@@ -138,6 +146,8 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     required_fields = qa_checkpoint["packet"]["required_fields"]
     for field in (
         "graph_trace_evidence.graph_basis",
+        "graph_trace_evidence.graph_basis_decision",
+        "graph_trace_evidence.graph_basis_decision_hash",
         "graph_trace_evidence.canonical_base_snapshot_id",
         "graph_trace_evidence.base_commit_sha",
         "graph_trace_evidence.candidate_commit_sha",
@@ -154,6 +164,12 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     assert qa_checkpoint["packet"]["graph_basis_policy"][
         "candidate_diff_derivation"
     ] == "server_only"
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "default_graph_basis"
+    ] == "canonical_base_plus_candidate_diff"
+    assert qa_checkpoint["packet"]["graph_basis_policy"][
+        "graph_basis_decision_required"
+    ] is True
     assert qa_checkpoint["packet"]["graph_basis_policy"][
         "exact_candidate_query_root_clean_required"
     ] is True

@@ -616,6 +616,35 @@ def test_function_call_query_reports_truncation_instead_of_scanning_forever(conn
     assert truncated["result"]["truncation_reason"] == "max_scan"
 
 
+def test_bounded_qa_overlay_one_hop_dependency_failure_is_fail_closed(
+    conn, tmp_path, monkeypatch
+):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    monkeypatch.setattr(
+        graph_query_trace,
+        "_run_base_tool",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "truncated": True,
+            "truncation_reason": "timeout",
+        },
+    )
+
+    with pytest.raises(ValueError, match="one-hop dependency query failed closed"):
+        graph_query_trace.run_tool(
+            conn,
+            PID,
+            snapshot_id,
+            tool="function_callees",
+            args={"query": "serve"},
+            project_root=project_root,
+            candidate_overlay={
+                "graph_basis": "canonical_base_plus_candidate_diff",
+                "files": [],
+            },
+        )
+
+
 def test_graph_native_queries_search_edge_projection_and_neighbor_semantics(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     _seed_edge_projection(conn, snapshot_id)
@@ -849,9 +878,11 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
     assert identity["candidate_diff_hash"] == candidate_diff_hash
     assert identity["candidate_review_context"] == {
         key: identity[key]
-        for key in (
-            "graph_basis",
-            "canonical_base_snapshot_id",
+            for key in (
+                "graph_basis",
+                "graph_basis_decision",
+                "graph_basis_decision_hash",
+                "canonical_base_snapshot_id",
             "base_commit_sha",
             "candidate_commit_sha",
             "changed_files",

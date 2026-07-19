@@ -16,7 +16,7 @@ from agent.governance.contracts import (
     resolve_instruction_bundle,
     validate_contract_write,
 )
-from agent.governance.contracts.hash import file_sha256
+from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.registry import UnknownContractDefinitionError
 
 
@@ -462,8 +462,8 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     parallel_rev1 = registry.get("mf_parallel.v2", version="v2", revision="rev1")
     parallel_rev2 = registry.get("mf_parallel.v2", version="v2", revision="rev2")
 
-    assert registry.get("direct_fix", version="v1")["revision"] == "rev2"
-    assert registry.get("mf_parallel.v2", version="v2")["revision"] == "rev4"
+    assert registry.get("direct_fix", version="v1")["revision"] == "rev3"
+    assert registry.get("mf_parallel.v2", version="v2")["revision"] == "rev6"
     assert direct_rev1["definition_hash"] == (
         "sha256:aada5b4fd59b49bdfda85c17839194432e4b4d690d78bfe6a35cff138c96a383"
     )
@@ -971,3 +971,132 @@ def test_mf_parallel_rev5_instructions_cover_replay_friction() -> None:
     assert "durable status merge_ready" in instructions
     assert "git_mutation_executed=false" in instructions
     assert "distinct activation snapshot id" in instructions
+
+
+def test_latest_qa_basis_revisions_default_overlay_without_rewriting_pinned_policy() -> None:
+    registry = ContractDefinitionRegistry()
+    parallel_rev5 = registry.get("mf_parallel.v2", revision="rev5")
+    parallel_rev6 = registry.get("mf_parallel.v2", revision="rev6")
+    direct_rev2 = registry.get("direct_fix", revision="rev2")
+    direct_rev3 = registry.get("direct_fix", revision="rev3")
+
+    assert parallel_rev6["metadata"]["previous_revision"] == "mf_parallel.v2.rev5"
+    assert direct_rev3["metadata"]["previous_revision"] == "direct_fix.v1.rev2"
+    assert parallel_rev5["definition_hash"] != parallel_rev6["definition_hash"]
+    assert direct_rev2["definition_hash"] != direct_rev3["definition_hash"]
+    assert "materialize an exact candidate snapshot" in "\n".join(
+        parallel_rev5["instruction_layer"]["inline"]
+    )
+    assert "default to the active canonical parent graph" in "\n".join(
+        parallel_rev6["instruction_layer"]["inline"]
+    )
+
+    for definition in (parallel_rev6, direct_rev3):
+        policy = definition["system_layer"]["graph_binding_policy"][
+            "bounded_qa_review_policy"
+        ]
+        assert policy["default_graph_basis"] == (
+            "canonical_base_plus_candidate_diff"
+        )
+        assert policy["graph_basis_decision_required"] is True
+        assert policy["graph_basis_decision_source"] == (
+            "server_bounded_qa_graph_basis"
+        )
+        assert policy["canonical_head_policy"] == "base_or_candidate"
+        assert policy["overlay_failure_policy"] == "fail_closed"
+        assert policy["one_hop_dependency_failure_policy"] == "fail_closed"
+        assert policy["exact_candidate_upgrade_triggers"] == [
+            "graph_algorithm_or_graph_config_change",
+            "governance_semantic_or_structure_hint_change",
+            "broad_or_unbounded_candidate_change",
+            "deterministic_overlay_or_one_hop_dependency_failure",
+            "qa_explicit_exact_snapshot_request",
+        ]
+
+    state = build_execution_state(
+        direct_rev3,
+        project_id="aming-claw",
+        backlog_id="AC-QA-BASE-GRAPH-DIFF-PREMERGE-20260711",
+        contract_execution_id="cex-latest-qa-basis",
+        actor_role="qa",
+        instruction_bundle_hash="sha256:latest-qa-basis",
+    )
+    decision = {
+        "schema_version": "qa_review_graph.basis_decision.v1",
+        "decision_source": "server_bounded_qa_graph_basis",
+        "default_graph_basis": "canonical_base_plus_candidate_diff",
+        "selected_graph_basis": "canonical_base_plus_candidate_diff",
+        "selection_reason": "bounded_source_backed_overlay_safe",
+        "candidate_change_classification": "bounded_source_backed_overlay",
+        "exact_candidate_upgrade_trigger": "",
+        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_relation": "candidate",
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
+    }
+    authority = {
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "trace_ids": ["gqt-latest-qa-basis"],
+        "verified_trace_ids": ["gqt-latest-qa-basis"],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-BASE-GRAPH-DIFF-PREMERGE-20260711",
+        "task_id": "worker-latest-qa-basis",
+        "qa_session_id": "ses-latest-qa-basis",
+        "qa_principal": "qa-latest-qa-basis",
+        "target_project_root": "/tmp/latest-qa-basis",
+        "graph_basis": "canonical_base_plus_candidate_diff",
+        "graph_basis_decision": decision,
+        "graph_basis_decision_hash": stable_sha256(decision),
+        "canonical_base_snapshot_id": "full-latest-qa-basis",
+        "base_commit_sha": "a" * 40,
+        "candidate_commit_sha": "b" * 40,
+        "changed_files": ["agent/governance/server.py"],
+        "candidate_diff_hash": "sha256:" + "1" * 64,
+        "changed_files_source": "server_candidate_diff",
+        "candidate_overlay_hash": "sha256:" + "2" * 64,
+        "root_identity_hash": "sha256:" + "3" * 64,
+        "query_root_identity_hash": "sha256:" + "4" * 64,
+        "canonical_project_identity_hash": "sha256:" + "5" * 64,
+        "repository_identity_hash": "sha256:" + "6" * 64,
+    }
+    write = {
+        "project_id": state["project_id"],
+        "backlog_id": state["backlog_id"],
+        "contract_execution_id": state["contract_execution_id"],
+        "definition_hash": state["definition_hash"],
+        "instruction_bundle_hash": state["instruction_bundle_hash"],
+        "execution_state_revision": state["execution_state_revision"],
+        "stage_id": "qa_graph_context",
+        "line_id": "direct_fix_qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        "task_id": "worker-latest-qa-basis",
+        "graph_trace_ids": ["gqt-latest-qa-basis"],
+        "payload": {"graph_trace_evidence": authority},
+    }
+    assert validate_contract_write(
+        direct_rev3, state, write, require_next_action=False
+    ).ok is True
+
+    forged_decision = {**decision, "overlay_failure_policy": "allow_partial"}
+    forged = {
+        **write,
+        "payload": {
+            "graph_trace_evidence": {
+                **authority,
+                "graph_basis_decision": forged_decision,
+                "graph_basis_decision_hash": stable_sha256(forged_decision),
+            }
+        },
+    }
+    rejected = validate_contract_write(
+        direct_rev3, state, forged, require_next_action=False
+    )
+    assert rejected.ok is False
+    assert any("fail-closed overlay" in item for item in rejected.errors)

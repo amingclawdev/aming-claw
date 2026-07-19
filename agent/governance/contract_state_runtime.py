@@ -3005,6 +3005,15 @@ def _bounded_qa_graph_context_satisfies_requirement(
         evidence.get("changed_files_source") or ""
     ).strip()
     changed_files = evidence.get("changed_files")
+    graph_basis_decision = evidence.get("graph_basis_decision")
+    graph_basis_decision_mapping = (
+        graph_basis_decision
+        if isinstance(graph_basis_decision, Mapping)
+        else {}
+    )
+    graph_basis_decision_hash = str(
+        evidence.get("graph_basis_decision_hash") or ""
+    ).strip().lower()
 
     def full_commit(value: str) -> bool:
         return len(value) in {40, 64} and all(
@@ -3022,6 +3031,50 @@ def _bounded_qa_graph_context_satisfies_requirement(
             )
         )
 
+    decision_present = isinstance(graph_basis_decision, Mapping)
+    decision_valid = bool(
+        not decision_present
+        or (
+            str(
+                graph_basis_decision_mapping.get("schema_version") or ""
+            ).strip()
+            == "qa_review_graph.basis_decision.v1"
+            and str(
+                graph_basis_decision_mapping.get("decision_source") or ""
+            ).strip()
+            == "server_bounded_qa_graph_basis"
+            and str(
+                graph_basis_decision_mapping.get("default_graph_basis") or ""
+            ).strip()
+            == "canonical_base_plus_candidate_diff"
+            and str(
+                graph_basis_decision_mapping.get("selected_graph_basis") or ""
+            ).strip()
+            == graph_basis
+            and str(
+                graph_basis_decision_mapping.get("overlay_failure_policy") or ""
+            ).strip()
+            == "fail_closed"
+            and str(
+                graph_basis_decision_mapping.get(
+                    "one_hop_dependency_failure_policy"
+                )
+                or ""
+            ).strip()
+            == "fail_closed"
+            and graph_basis_decision_hash
+            == "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    graph_basis_decision,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+    )
+
     if not (
         graph_basis
         in {
@@ -3034,6 +3087,7 @@ def _bounded_qa_graph_context_satisfies_requirement(
         and isinstance(changed_files, list)
         and sha256(diff_hash)
         and changed_files_source.startswith("server_")
+        and decision_valid
     ):
         return False
     if graph_basis == "exact_candidate_snapshot":
@@ -3042,6 +3096,16 @@ def _bounded_qa_graph_context_satisfies_requirement(
             base_commit_sha == candidate_commit_sha
             and not changed_files
             and diff_hash == empty_diff_hash
+            and (
+                not decision_present
+                or str(
+                    graph_basis_decision_mapping.get(
+                        "exact_candidate_upgrade_trigger"
+                    )
+                    or ""
+                ).strip()
+                == "qa_explicit_exact_snapshot_request"
+            )
             and all(
                 sha256(evidence.get(field))
                 for field in (
@@ -3054,6 +3118,20 @@ def _bounded_qa_graph_context_satisfies_requirement(
         )
     return bool(
         base_commit_sha != candidate_commit_sha
+        and (
+            not decision_present
+            or str(
+                graph_basis_decision_mapping.get("selection_reason") or ""
+            ).strip()
+            == "bounded_source_backed_overlay_safe"
+        )
+        and (
+            not decision_present
+            or str(
+                graph_basis_decision_mapping.get("canonical_head_relation") or ""
+            ).strip()
+            in {"base", "candidate"}
+        )
         and all(
             sha256(evidence.get(field))
             for field in (

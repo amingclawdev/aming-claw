@@ -25060,13 +25060,6 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
         text=True,
     )
     candidate_commit = batch_jobs.git_commit(fixture.root)
-    subprocess.run(
-        ["git", "checkout", "main"],
-        cwd=fixture.root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -25125,6 +25118,18 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
 
     identity = queried["graph_query_identity"]
     assert identity["graph_basis"] == "canonical_base_plus_candidate_diff"
+    assert identity["graph_basis_decision"]["default_graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    assert identity["graph_basis_decision"]["selection_reason"] == (
+        "bounded_source_backed_overlay_safe"
+    )
+    assert identity["graph_basis_decision"]["canonical_head_relation"] == (
+        "candidate"
+    )
+    assert identity["graph_basis_decision_hash"] == server.stable_sha256(
+        identity["graph_basis_decision"]
+    )
     assert identity["snapshot_id"] == snapshot_id
     assert identity["canonical_base_snapshot_id"] == snapshot_id
     assert identity["base_commit_sha"] == base_commit
@@ -25145,6 +25150,8 @@ def test_bounded_qa_can_query_canonical_base_graph_with_candidate_diff(
         key: identity[key]
         for key in (
             "graph_basis",
+            "graph_basis_decision",
+            "graph_basis_decision_hash",
             "canonical_base_snapshot_id",
             "base_commit_sha",
             "candidate_commit_sha",
@@ -26147,6 +26154,7 @@ def test_qa_candidate_overlay_accepts_linked_candidate_worktree(tmp_path):
     assert identity["query_root_is_linked_worktree"] is True
     assert identity["query_root_head_commit"] == candidate_commit
     assert identity["canonical_head_commit"] == fixture.main_head
+    assert identity["canonical_head_relation"] == "base"
     assert identity["repository_identity_match"] is True
 
 
@@ -27535,6 +27543,8 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         "source=graph_query_traces",
         "db_verified=true",
         "graph_basis",
+        "graph_basis_decision",
+        "graph_basis_decision_hash",
         "canonical_base_snapshot_id",
         "base_commit_sha",
         "candidate_commit_sha",
@@ -27552,12 +27562,26 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
             "exact_candidate_snapshot",
             "canonical_base_plus_candidate_diff",
         ],
+        "default": "canonical_base_plus_candidate_diff",
+        "canonical_head_policy": "base_or_candidate",
         "canonical_base_snapshot_server_resolved": True,
         "changed_files_server_derived": True,
         "candidate_diff_hash_server_derived": True,
         "candidate_overlay_server_derived": True,
         "root_identity_server_derived": True,
         "unsafe_overlay_requires_exact_candidate_snapshot": True,
+        "exact_candidate_snapshot_upgrade_policy": (
+            "server_classified_or_qa_explicit"
+        ),
+        "exact_candidate_snapshot_upgrade_triggers": [
+            "graph_algorithm_or_graph_config_change",
+            "governance_semantic_or_structure_hint_change",
+            "broad_or_unbounded_candidate_change",
+            "deterministic_overlay_or_one_hop_dependency_failure",
+            "qa_explicit_exact_snapshot_request",
+        ],
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
         "full_candidate_snapshot_required": False,
     }
     current_qa_graph_shape = current_qa_guide["qa_graph_context"][

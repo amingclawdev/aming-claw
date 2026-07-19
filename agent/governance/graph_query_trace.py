@@ -290,6 +290,8 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "route_token_ref",
     "commit_sha",
     "graph_basis",
+    "graph_basis_decision",
+    "graph_basis_decision_hash",
     "canonical_base_snapshot_id",
     "base_commit_sha",
     "candidate_commit_sha",
@@ -307,6 +309,58 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "fence_token",
     "actor",
 )
+
+
+QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION = "qa_review_graph.basis_decision.v1"
+QA_GRAPH_BASIS_DECISION_SOURCE = "server_bounded_qa_graph_basis"
+QA_GRAPH_BASIS_DEFAULT = store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF
+
+
+def bounded_qa_graph_basis_decision(
+    graph_basis: str,
+    root_identity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Derive the executable QA basis decision from server-persisted facts."""
+
+    selected = str(graph_basis or "").strip()
+    root = root_identity if isinstance(root_identity, Mapping) else {}
+    canonical_head = str(root.get("canonical_head_commit") or "").strip().lower()
+    base_commit = str(root.get("base_commit_sha") or "").strip().lower()
+    candidate_commit = str(root.get("candidate_commit_sha") or "").strip().lower()
+    relation = str(root.get("canonical_head_relation") or "").strip()
+    if not relation:
+        if canonical_head and canonical_head == candidate_commit:
+            relation = "candidate"
+        elif canonical_head and canonical_head == base_commit:
+            relation = "base"
+        elif canonical_head:
+            relation = "other"
+
+    exact = selected == store.QA_GRAPH_BASIS_EXACT_CANDIDATE
+    return {
+        "schema_version": QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION,
+        "decision_source": QA_GRAPH_BASIS_DECISION_SOURCE,
+        "default_graph_basis": QA_GRAPH_BASIS_DEFAULT,
+        "selected_graph_basis": selected,
+        "selection_reason": (
+            "qa_explicit_exact_candidate_snapshot"
+            if exact
+            else "bounded_source_backed_overlay_safe"
+        ),
+        "candidate_change_classification": (
+            "exact_candidate_snapshot_server_verified"
+            if exact
+            else "bounded_source_backed_overlay"
+        ),
+        "exact_candidate_upgrade_trigger": (
+            "qa_explicit_exact_snapshot_request" if exact else ""
+        ),
+        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_relation": relation,
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
+    }
 _TRACE_IDENTITY_COLUMNS = {
     "runtime_context_id": "TEXT NOT NULL DEFAULT ''",
     "task_id": "TEXT NOT NULL DEFAULT ''",
@@ -415,8 +469,14 @@ def _normalize_candidate_review_context(
 ) -> dict[str, Any]:
     normalized_overlay = dict(candidate_overlay or {})
     normalized_root_identity = dict(root_identity or {})
+    basis_decision = bounded_qa_graph_basis_decision(
+        graph_basis,
+        normalized_root_identity,
+    )
     context = {
         "graph_basis": str(graph_basis or "").strip(),
+        "graph_basis_decision": basis_decision,
+        "graph_basis_decision_hash": stable_sha256(basis_decision),
         "canonical_base_snapshot_id": str(canonical_base_snapshot_id or "").strip(),
         "base_commit_sha": str(base_commit_sha or "").strip().lower(),
         "candidate_commit_sha": str(candidate_commit_sha or "").strip().lower(),
@@ -436,7 +496,14 @@ def _normalize_candidate_review_context(
     supplied = changed_files is not None or candidate_overlay is not None or root_identity is not None or any(
         value
         for key, value in context.items()
-        if key not in {"changed_files", "candidate_overlay", "root_identity"}
+        if key
+        not in {
+            "changed_files",
+            "candidate_overlay",
+            "root_identity",
+            "graph_basis_decision",
+            "graph_basis_decision_hash",
+        }
     )
     if not supplied:
         return context
@@ -587,6 +654,14 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
             source.get("repository_identity_hash") or ""
         ),
     }
+    basis_decision = bounded_qa_graph_basis_decision(
+        candidate_context["graph_basis"],
+        source.get("root_identity")
+        if isinstance(source.get("root_identity"), Mapping)
+        else {},
+    )
+    candidate_context["graph_basis_decision"] = basis_decision
+    candidate_context["graph_basis_decision_hash"] = stable_sha256(basis_decision)
     return {
         "schema_version": GRAPH_QUERY_IDENTITY_SCHEMA_VERSION,
         "identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
@@ -1018,6 +1093,13 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
         trace.pop("candidate_overlay_json", "{}"), {}
     )
     trace["root_identity"] = _decode(trace.pop("root_identity_json", "{}"), {})
+    trace["graph_basis_decision"] = bounded_qa_graph_basis_decision(
+        str(trace.get("graph_basis") or ""),
+        trace["root_identity"],
+    )
+    trace["graph_basis_decision_hash"] = stable_sha256(
+        trace["graph_basis_decision"]
+    )
     events = conn.execute(
         """
         SELECT seq, tool, args_hash, result_hash, result_count, duration_ms, created_at
@@ -2465,6 +2547,16 @@ def run_tool(
         )
     if not candidate_overlay:
         return base_result
+    if normalized_tool in {"function_callees", "function_callers"}:
+        truncation_reason = str(base_result.get("truncation_reason") or "")
+        if base_result.get("ok") is False or truncation_reason in {
+            "max_scan",
+            "timeout",
+        }:
+            raise ValueError(
+                "bounded QA candidate overlay one-hop dependency query failed "
+                "closed; use an exact candidate snapshot"
+            )
     result = dict(base_result)
     result["qa_review_graph"] = _candidate_overlay_projection(
         tool=normalized_tool,
@@ -2644,7 +2736,11 @@ def traced_query(
                         "actual": actual_value,
                     }
                 continue
-            if field in {"candidate_overlay", "root_identity"}:
+            if field in {
+                "candidate_overlay",
+                "root_identity",
+                "graph_basis_decision",
+            }:
                 expected_value = stable_sha256(expected or {})
                 actual_value = stable_sha256(actual or {})
                 if expected_value != actual_value:

@@ -97,7 +97,7 @@
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "direct_fix",
-    "contract_definition_revision": "rev1",
+    "contract_definition_revision": "rev3",
         "entrypoint": "direct_fix_enter",
         "blocked_parent_projection": true,
         "graph_query_checkpoints": [
@@ -154,6 +154,8 @@
                         "graph_trace_ids",
                         "graph_trace_evidence.db_verified",
                         "graph_trace_evidence.graph_basis",
+                        "graph_trace_evidence.graph_basis_decision",
+                        "graph_trace_evidence.graph_basis_decision_hash",
                         "graph_trace_evidence.canonical_base_snapshot_id",
                         "graph_trace_evidence.base_commit_sha",
                         "graph_trace_evidence.candidate_commit_sha",
@@ -174,6 +176,20 @@
                         "authority": "contract_definition.system_layer.graph_binding_policy.bounded_qa_review_policy",
                         "caller_authority_fields_trusted": false,
                         "candidate_diff_derivation": "server_only",
+                        "default_graph_basis": "canonical_base_plus_candidate_diff",
+                        "graph_basis_decision_required": true,
+                        "graph_basis_decision_source": "server_bounded_qa_graph_basis",
+                        "canonical_head_policy": "base_or_candidate",
+                        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+                        "exact_candidate_upgrade_triggers": [
+                            "graph_algorithm_or_graph_config_change",
+                            "governance_semantic_or_structure_hint_change",
+                            "broad_or_unbounded_candidate_change",
+                            "deterministic_overlay_or_one_hop_dependency_failure",
+                            "qa_explicit_exact_snapshot_request"
+                        ],
+                        "overlay_failure_policy": "fail_closed",
+                        "one_hop_dependency_failure_policy": "fail_closed",
                         "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
                         "exact_candidate_query_root_clean_required": true,
                         "exact_candidate_query_root_tree_identity_required": true,

@@ -114,18 +114,68 @@ def _bounded_qa_graph_evidence(*, base_diff: bool = False) -> dict:
         "repository_identity_hash": "sha256:" + "2" * 64,
     }
     if not base_diff:
+        decision = {
+            "schema_version": "qa_review_graph.basis_decision.v1",
+            "decision_source": "server_bounded_qa_graph_basis",
+            "default_graph_basis": "canonical_base_plus_candidate_diff",
+            "selected_graph_basis": "exact_candidate_snapshot",
+            "selection_reason": "qa_explicit_exact_candidate_snapshot",
+            "candidate_change_classification": (
+                "exact_candidate_snapshot_server_verified"
+            ),
+            "exact_candidate_upgrade_trigger": (
+                "qa_explicit_exact_snapshot_request"
+            ),
+            "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+            "canonical_head_policy": "base_or_candidate",
+            "canonical_head_relation": "base",
+            "overlay_failure_policy": "fail_closed",
+            "one_hop_dependency_failure_policy": "fail_closed",
+        }
         evidence.update(
             {
                 "graph_basis": "exact_candidate_snapshot",
+                "graph_basis_decision": decision,
+                "graph_basis_decision_hash": "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        decision,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
                 "candidate_commit_sha": "a" * 40,
                 "changed_files": [],
                 "candidate_diff_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
             }
         )
         return evidence
+    decision = {
+        "schema_version": "qa_review_graph.basis_decision.v1",
+        "decision_source": "server_bounded_qa_graph_basis",
+        "default_graph_basis": "canonical_base_plus_candidate_diff",
+        "selected_graph_basis": "canonical_base_plus_candidate_diff",
+        "selection_reason": "bounded_source_backed_overlay_safe",
+        "candidate_change_classification": "bounded_source_backed_overlay",
+        "exact_candidate_upgrade_trigger": "",
+        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_relation": "candidate",
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
+    }
     evidence.update(
         {
             "graph_basis": "canonical_base_plus_candidate_diff",
+            "graph_basis_decision": decision,
+            "graph_basis_decision_hash": "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    decision,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
             "candidate_commit_sha": "b" * 40,
             "changed_files": ["agent/governance/server.py"],
             "candidate_diff_hash": "sha256:" + "c" * 64,
@@ -2670,6 +2720,26 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
     assert _bounded_qa_graph_context_satisfies_requirement(
         {"payload": {"graph_trace_evidence": qa_evidence}}
     ) is True
+    unsafe_decision = dict(qa_evidence["graph_basis_decision"])
+    unsafe_decision["overlay_failure_policy"] = "allow_partial"
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {
+            "payload": {
+                "graph_trace_evidence": {
+                    **qa_evidence,
+                    "graph_basis_decision": unsafe_decision,
+                    "graph_basis_decision_hash": "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            unsafe_decision,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                }
+            }
+        }
+    ) is False
     split_qa = dict(qa_evidence)
     candidate_diff_hash = split_qa.pop("candidate_diff_hash")
     assert _bounded_qa_graph_context_satisfies_requirement(

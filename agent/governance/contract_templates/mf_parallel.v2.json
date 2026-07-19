@@ -57,7 +57,7 @@
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
-    "contract_definition_revision": "rev5"
+    "contract_definition_revision": "rev6"
   },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",
@@ -537,6 +537,8 @@
     ],
     "required_trace_identity_fields": [
       "graph_basis",
+      "graph_basis_decision",
+      "graph_basis_decision_hash",
       "canonical_base_snapshot_id",
       "base_commit_sha",
       "candidate_commit_sha",
@@ -550,6 +552,20 @@
       "repository_identity_hash"
     ],
     "candidate_diff_derivation": "server_only",
+    "default_graph_basis": "canonical_base_plus_candidate_diff",
+    "graph_basis_decision_required": true,
+    "graph_basis_decision_source": "server_bounded_qa_graph_basis",
+    "canonical_head_policy": "base_or_candidate",
+    "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+    "exact_candidate_upgrade_triggers": [
+      "graph_algorithm_or_graph_config_change",
+      "governance_semantic_or_structure_hint_change",
+      "broad_or_unbounded_candidate_change",
+      "deterministic_overlay_or_one_hop_dependency_failure",
+      "qa_explicit_exact_snapshot_request"
+    ],
+    "overlay_failure_policy": "fail_closed",
+    "one_hop_dependency_failure_policy": "fail_closed",
     "candidate_overlay_derivation": "server_git_objects_and_language_adapters",
     "exact_candidate_query_root_clean_required": true,
     "exact_candidate_query_root_tree_identity_required": true,

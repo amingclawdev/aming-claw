@@ -7549,11 +7549,16 @@ def _qa_checkout_root_identity(
             canonical_project_root=str(canonical_root),
         )
     canonical_head = str(canonical.get("commit_sha") or "").strip().lower()
-    if require_canonical_base_head and canonical_head != base_commit_sha:
+    accepted_canonical_heads = {base_commit_sha, candidate_commit_sha}
+    if require_canonical_base_head and canonical_head not in accepted_canonical_heads:
         _qa_overlay_fail(
             "canonical_base_not_current",
-            "active canonical base snapshot is not the current registered-project HEAD",
+            (
+                "registered-project HEAD must be the canonical base or the "
+                "immutable candidate under bounded review"
+            ),
             expected_base_commit_sha=base_commit_sha,
+            expected_candidate_commit_sha=candidate_commit_sha,
             canonical_head_commit=canonical_head,
         )
     query_head = str(query.get("commit_sha") or "").strip().lower()
@@ -7645,12 +7650,22 @@ def _qa_checkout_root_identity(
     )
     identity = {
         "schema_version": "qa_review_graph.root_identity.v1",
+        "base_commit_sha": base_commit_sha,
+        "candidate_commit_sha": candidate_commit_sha,
         "query_root": str(Path(query_root).resolve()),
         "query_root_head_commit": query_head,
         "query_root_identity_hash": query_root_identity_hash,
         "query_root_is_linked_worktree": bool(query_git.get("is_linked_worktree")),
         "canonical_project_root": str(Path(canonical_root).resolve()),
         "canonical_head_commit": canonical_head,
+        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_relation": (
+            "candidate"
+            if canonical_head == candidate_commit_sha
+            else "base"
+            if canonical_head == base_commit_sha
+            else "other"
+        ),
         "canonical_project_identity_hash": canonical_project_identity_hash,
         "repository_identity_hash": repository_identity_hash,
         "repository_identity_match": True,
@@ -7677,6 +7692,8 @@ def _qa_exact_candidate_context(
     canonical_project_root: Path,
     candidate_commit_sha: str,
 ) -> dict[str, Any]:
+    from . import graph_query_trace
+
     candidate_commit_sha = str(candidate_commit_sha or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit_sha):
         _qa_overlay_fail(
@@ -7693,7 +7710,13 @@ def _qa_exact_candidate_context(
         require_canonical_base_head=False,
         require_query_candidate_head=True,
     )
+    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        "exact_candidate_snapshot",
+        root_identity,
+    )
     return {
+        "graph_basis_decision": graph_basis_decision,
+        "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
         "root_identity": root_identity,
         "root_identity_hash": stable_sha256(root_identity),
         "query_root_identity_hash": root_identity["query_root_identity_hash"],
@@ -7712,6 +7735,8 @@ def _qa_candidate_diff_context(
     base_commit_sha: str,
     candidate_commit_sha: str,
 ) -> dict[str, Any]:
+    from . import graph_query_trace
+
     query_root = Path(project_root).resolve()
     canonical_root = Path(canonical_project_root).resolve()
     base_commit_sha = str(base_commit_sha or "").strip().lower()
@@ -7994,12 +8019,18 @@ def _qa_candidate_diff_context(
             if normalized and normalized not in changed_files:
                 changed_files.append(normalized)
     root_identity_hash = stable_sha256(root_identity)
+    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        "canonical_base_plus_candidate_diff",
+        root_identity,
+    )
     return {
         "changed_files": changed_files,
         "candidate_diff_hash": f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}",
         "changed_files_source": "server_git_diff_name_status_z_m",
         "candidate_overlay": overlay,
         "candidate_overlay_hash": stable_sha256(overlay),
+        "graph_basis_decision": graph_basis_decision,
+        "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
         "root_identity": root_identity,
         "root_identity_hash": root_identity_hash,
         "query_root_identity_hash": root_identity["query_root_identity_hash"],
@@ -8013,6 +8044,7 @@ def _qa_candidate_diff_context(
 
 _QA_REVIEW_CLAIM_ALIASES = {
     "graph_basis": ("graph_basis",),
+    "graph_basis_decision_hash": ("graph_basis_decision_hash",),
     "canonical_base_snapshot_id": (
         "canonical_base_snapshot_id",
         "base_snapshot_id",
@@ -8046,6 +8078,7 @@ _QA_REVIEW_AUTHORITY_NAMES = {
     for alias in aliases
 } | {
     "candidate_overlay",
+    "graph_basis_decision",
     "root_identity",
     "query_root_head_commit",
     "query_root_clean",
@@ -8147,8 +8180,16 @@ def _qa_graph_review_context_from_trace_row(
         root_identity_raw = json.loads(str(row["root_identity_json"] or "{}"))
     except (TypeError, ValueError, json.JSONDecodeError):
         root_identity_raw = None
+    from . import graph_query_trace
+
+    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        str(row["graph_basis"] or "").strip(),
+        root_identity_raw if isinstance(root_identity_raw, Mapping) else {},
+    )
     review_context = {
         "graph_basis": str(row["graph_basis"] or "").strip(),
+        "graph_basis_decision": graph_basis_decision,
+        "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
         "canonical_base_snapshot_id": str(
             row["canonical_base_snapshot_id"] or ""
         ).strip(),
@@ -8917,6 +8958,7 @@ def _qa_reverify_candidate_trace_context(
         ).strip().lower()
         if current_canonical_head == stored_canonical_head:
             for field in (
+                "graph_basis_decision_hash",
                 "root_identity_hash",
                 "canonical_project_identity_hash",
             ):
@@ -9001,6 +9043,7 @@ def _qa_reverify_candidate_trace_context(
         )
         return review_context, mismatches
     for field in (
+        "graph_basis_decision_hash",
         "changed_files",
         "candidate_diff_hash",
         "changed_files_source",
@@ -12904,6 +12947,8 @@ def _runtime_context_service_qa_graph_trace_refs(
             key: result[key]
             for key in (
                 "graph_basis",
+                "graph_basis_decision",
+                "graph_basis_decision_hash",
                 "canonical_base_snapshot_id",
                 "base_commit_sha",
                 "candidate_commit_sha",
@@ -14781,6 +14826,30 @@ def _qa_graph_context_evidence_shape(
             "<exact_candidate_snapshot-or-"
             "canonical_base_plus_candidate_diff>"
         ),
+        "graph_basis_decision": {
+            "schema_version": "qa_review_graph.basis_decision.v1",
+            "decision_source": "server_bounded_qa_graph_basis",
+            "default_graph_basis": "canonical_base_plus_candidate_diff",
+            "selected_graph_basis": (
+                "<exact_candidate_snapshot-or-"
+                "canonical_base_plus_candidate_diff>"
+            ),
+            "selection_reason": "<server-derived-selection-reason>",
+            "candidate_change_classification": (
+                "<server-derived-candidate-change-classification>"
+            ),
+            "exact_candidate_upgrade_trigger": (
+                "<empty-or-qa_explicit_exact_snapshot_request>"
+            ),
+            "exact_candidate_upgrade_policy": (
+                "server_classified_or_qa_explicit"
+            ),
+            "canonical_head_policy": "base_or_candidate",
+            "canonical_head_relation": "<base-or-candidate>",
+            "overlay_failure_policy": "fail_closed",
+            "one_hop_dependency_failure_policy": "fail_closed",
+        },
+        "graph_basis_decision_hash": "sha256:<server-derived-decision-hash>",
         "canonical_base_snapshot_id": "<server-resolved-base-snapshot-id>",
         "base_commit_sha": "<full-canonical-base-commit>",
         "candidate_commit_sha": "<full-candidate-commit>",
@@ -15289,12 +15358,26 @@ def _runtime_context_qa_verification_guide(
                     "exact_candidate_snapshot",
                     "canonical_base_plus_candidate_diff",
                 ],
+                "default": "canonical_base_plus_candidate_diff",
+                "canonical_head_policy": "base_or_candidate",
                 "canonical_base_snapshot_server_resolved": True,
                 "changed_files_server_derived": True,
                 "candidate_diff_hash_server_derived": True,
                 "candidate_overlay_server_derived": True,
                 "root_identity_server_derived": True,
                 "unsafe_overlay_requires_exact_candidate_snapshot": True,
+                "exact_candidate_snapshot_upgrade_policy": (
+                    "server_classified_or_qa_explicit"
+                ),
+                "exact_candidate_snapshot_upgrade_triggers": [
+                    "graph_algorithm_or_graph_config_change",
+                    "governance_semantic_or_structure_hint_change",
+                    "broad_or_unbounded_candidate_change",
+                    "deterministic_overlay_or_one_hop_dependency_failure",
+                    "qa_explicit_exact_snapshot_request",
+                ],
+                "overlay_failure_policy": "fail_closed",
+                "one_hop_dependency_failure_policy": "fail_closed",
                 "full_candidate_snapshot_required": False,
             },
             "required_provenance": [
@@ -15305,6 +15388,8 @@ def _runtime_context_qa_verification_guide(
                 "source=graph_query_traces",
                 "db_verified=true",
                 "graph_basis",
+                "graph_basis_decision",
+                "graph_basis_decision_hash",
                 "canonical_base_snapshot_id",
                 "base_commit_sha",
                 "candidate_commit_sha",
@@ -54294,6 +54379,8 @@ def _contract_runtime_projected_qa_graph_line(
         key: graph_refs.get(key)
         for key in (
             "graph_basis",
+            "graph_basis_decision",
+            "graph_basis_decision_hash",
             "canonical_base_snapshot_id",
             "base_commit_sha",
             "candidate_commit_sha",

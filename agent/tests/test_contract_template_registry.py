@@ -207,9 +207,28 @@ def test_qa_template_policies_are_non_authoritative_definition_mirrors():
     assert qa_policy["post_merge_graph_policy"]["authority"].endswith(
         "current_full_reconcile_evidence_policy"
     )
+    assert parallel["runtime_contract_hints"]["contract_definition_revision"] == (
+        "rev6"
+    )
+    assert qa_policy["default_graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    assert qa_policy["graph_basis_decision_required"] is True
+    assert qa_policy["overlay_failure_policy"] == "fail_closed"
     graph_basis_policy = qa_checkpoint["packet"]["graph_basis_policy"]
     assert graph_basis_policy["non_authoritative_template_mirror"] is True
     assert graph_basis_policy["authority"].endswith("bounded_qa_review_policy")
+    assert direct_fix["runtime_contract_hints"]["contract_definition_revision"] == (
+        "rev3"
+    )
+    assert graph_basis_policy["default_graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    assert graph_basis_policy["graph_basis_decision_required"] is True
+    assert graph_basis_policy["one_hop_dependency_failure_policy"] == "fail_closed"
+    assert graph_basis_policy["exact_candidate_upgrade_triggers"] == qa_policy[
+        "exact_candidate_upgrade_triggers"
+    ]
     qa_graph = {
         item["id"]: item for item in v2["evidence_requirements"]
     }["qa_graph_trace_evidence"]
