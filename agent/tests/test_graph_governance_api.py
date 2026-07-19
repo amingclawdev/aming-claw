@@ -1445,6 +1445,62 @@ def test_contract_runtime_worker_implementation_preserves_top_level_lineage_proo
         )
 
 
+def test_contract_runtime_line_write_body_preserves_safe_qa_evidence_only():
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-QA-LINE-WRITE-BRIDGE",
+        "contract_execution_id": "cex-qa-line-write-bridge",
+        "definition_hash": _fake_sha("qa-line-write-bridge-definition"),
+        "instruction_bundle_hash": _fake_sha("qa-line-write-bridge-instructions"),
+        "execution_state": {"execution_state_revision": 3},
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha("qa-line-write-bridge-guide"),
+            "next_legal_action": {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+            },
+        },
+    }
+    safe_evidence = {
+        "status": "passed",
+        "verdict": "pass",
+        "verification": {"result": "passed"},
+        "tests": [{"name": "focused", "status": "passed"}],
+        "test_results": {"passed": 15, "failed": 0},
+        "changed_files": ["agent/governance/server.py"],
+        "owned_changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-qa-line-write-bridge"],
+        "graph_query_trace_ids": ["gqt-qa-line-write-bridge"],
+        "db_verified": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+    }
+
+    write = server._contract_runtime_line_write_body(
+        record,
+        {
+            **safe_evidence,
+            "payload": {"decision": "PASS"},
+            "session_token": "raw-worker-token-must-not-persist",
+            "qa_session_token": "raw-qa-token-must-not-persist",
+            "route_token": {"token": "raw-route-token-must-not-persist"},
+            "governance_token": "raw-governance-token-must-not-persist",
+        },
+        actor_role="qa",
+    )
+
+    for field, expected in safe_evidence.items():
+        assert write[field] == expected
+    assert write["payload"] == {"decision": "PASS"}
+    assert {
+        "session_token",
+        "qa_session_token",
+        "route_token",
+        "governance_token",
+    }.isdisjoint(write)
+
+
 def _persist_append_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -50896,6 +50952,143 @@ def test_contract_runtime_generic_facade_preserves_role_and_order_gates(conn):
         "qa_independent_verification"
     )
     assert hotfix_record["completed_lines"][-1]["actor_role"] == "qa"
+
+
+def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields(conn):
+    backlog_id = "AC-CONTRACT-RUNTIME-QA-BRIDGE-PARITY"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+
+    def advance_hotfix(execution_id: str) -> None:
+        for stage_id, line_id, evidence_kind in (
+            ("pre_mutation", "hotfix_pre_reason", "hotfix_entered"),
+            ("mutation", "hotfix_post_action_summary", "hotfix_under_action"),
+        ):
+            result = server.handle_project_contract_runtime_line_write(
+                _ctx_with_role(
+                    {"project_id": PID, "contract_execution_id": execution_id},
+                    "observer",
+                    method="POST",
+                    body={
+                        "stage_id": stage_id,
+                        "line_id": line_id,
+                        "evidence_kind": evidence_kind,
+                    },
+                )
+            )
+            assert result["ok"] is True
+
+    hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-hotfix-rich-qa",
+    )
+    conn.commit()
+    advance_hotfix(hotfix["contract_execution_id"])
+    qa_evidence_body = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "verdict": "pass",
+        "verification": {"result": "passed", "diff_clean": True},
+        "tests": [{"name": "focused", "status": "passed"}],
+        "test_results": {"passed": 15, "failed": 0},
+        "changed_files": ["agent/governance/server.py"],
+        "owned_changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": ["gqt-generic-qa-evidence"],
+        "graph_query_trace_ids": ["gqt-generic-qa-evidence"],
+        "db_verified": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "payload": {"decision": "pass", "auth_source": "trusted_qa_role"},
+    }
+    qa_precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body=qa_evidence_body,
+        )
+    )
+    assert qa_precheck["ok"] is True
+    assert qa_precheck["would_mutate_completed_lines"] is False
+    assert len(runtime.store.get(hotfix["contract_execution_id"])["completed_lines"]) == 2
+
+    accepted_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body=qa_evidence_body,
+        )
+    )
+    assert accepted_qa["ok"] is True
+    persisted_qa = runtime.store.get(hotfix["contract_execution_id"])[
+        "completed_lines"
+    ][-1]
+    for field in (
+        "status",
+        "verdict",
+        "verification",
+        "tests",
+        "test_results",
+        "changed_files",
+        "owned_changed_files",
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "db_verified",
+        "query_source",
+        "query_purpose",
+    ):
+        assert persisted_qa[field] == qa_evidence_body[field]
+    assert accepted_qa["next_legal_action"]["line_id"] == "observer_close_ready"
+
+    failed_hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-hotfix-failed-qa",
+    )
+    conn.commit()
+    advance_hotfix(failed_hotfix["contract_execution_id"])
+    failed_qa = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": failed_hotfix["contract_execution_id"],
+            },
+            "qa",
+            method="POST",
+            body={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "verdict": "fail",
+                "verification": {"result": "failed"},
+                "payload": {"decision": "independent_verification_complete"},
+            },
+        )
+    )
+    assert failed_qa["ok"] is True
+    failed_line = runtime.store.get(failed_hotfix["contract_execution_id"])[
+        "completed_lines"
+    ][-1]
+    assert failed_line["status"] == "failed"
+    assert failed_line["verdict"] == "fail"
+    assert server._active_failed_qa_line_index(
+        runtime.store.get(failed_hotfix["contract_execution_id"])["completed_lines"]
+    ) == 2
+    assert failed_qa["next_legal_action"]["line_id"] != "observer_close_ready"
+    assert failed_qa["runtime_guide"]["failed_qa_rework"][
+        "semantic_next_action"
+    ] == (
+        "revise_after_failed_independent_qa"
+    )
 
 
 def test_contract_runtime_line_write_precheck_route_does_not_append(conn):

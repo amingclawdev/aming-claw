@@ -1867,6 +1867,21 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
         "authorization_source",
         "qa_session_token_ref",
         "qa_evidence_provenance",
+        "status",
+        "verdict",
+        "verification",
+        "tests",
+        "test_results",
+        "changed_files",
+        "owned_changed_files",
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "graph_query_trace_id",
+        "trace_ids",
+        "db_verified",
+        "query_source",
+        "query_purpose",
+        "graph_trace_evidence",
     }
     assert _tool_properties("contract_runtime_precheck_line") == submit_properties
     timeout_schema = submit_properties["timeout_seconds"]
@@ -2564,6 +2579,15 @@ def test_mcp_qa_session_opaque_ref_roundtrip_is_scope_bound_and_header_only():
                 "qa_session_token_ref": token_ref,
             },
         )
+    qa_line_evidence = {
+        "status": "passed",
+        "verdict": "pass",
+        "verification": {"result": "passed"},
+        "tests": [{"name": "focused", "status": "passed"}],
+        "test_results": {"passed": 15, "failed": 0},
+        "changed_files": ["agent/governance/server.py"],
+        "graph_query_trace_ids": ["gqt-qa-opaque"],
+    }
     for tool_name in (
         "contract_runtime_precheck_line",
         "contract_runtime_submit_line",
@@ -2579,6 +2603,7 @@ def test_mcp_qa_session_opaque_ref_roundtrip_is_scope_bound_and_header_only():
                 "stage_id": "qa",
                 "line_id": "qa_independent_verification",
                 "evidence_kind": "independent_verification",
+                **qa_line_evidence,
             },
         )
 
@@ -2594,6 +2619,8 @@ def test_mcp_qa_session_opaque_ref_roundtrip_is_scope_bound_and_header_only():
     for line_call in recorder.auth_calls[3:]:
         assert line_call[2]["qa_session_token_ref"] == token_ref
         assert line_call[2]["backlog_id"] == "AC-QA-OPAQUE"
+        for field, expected in qa_line_evidence.items():
+            assert line_call[2][field] == expected
         assert raw_token not in json.dumps(line_call[2], sort_keys=True)
 
 
@@ -3385,7 +3412,7 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-17.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-07-19.1"
     assert "qa_session_token_ref" in _tool_properties("task_timeline_append")
 
     compatibility = mcp_tool_schema_compatibility(
@@ -3395,8 +3422,8 @@ def test_managed_qa_timeline_ref_schema_bump_marks_pre_ref_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-07-16.1"
-    assert compatibility["server_tool_schema_version"] == "2026-07-17.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-17.1"
+    assert compatibility["server_tool_schema_version"] == "2026-07-19.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-07-19.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 

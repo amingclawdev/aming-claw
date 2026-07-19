@@ -4468,7 +4468,10 @@ def _effective_actor_role(write: Mapping[str, Any], *, actor_role: str | None) -
     return ""
 
 
-_LINE_EVIDENCE_OPTIONAL_FIELDS = (
+# Public, explicit safe vocabulary for ContractRuntime completed-line evidence.
+# HTTP/MCP facades may use this allowlist when rebuilding a line write, but raw
+# authentication tokens remain transport-only and are intentionally absent.
+LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "line_instance_id",
     "status",
     "verdict",
@@ -4481,6 +4484,8 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "worker_id",
     "payload",
     "verification",
+    "tests",
+    "test_results",
     "artifact_refs",
     "trace_id",
     "graph_trace_id",
@@ -4500,12 +4505,15 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "implementation_lineage_ref",
     "worker_implementation_lineage",
     "implementation_event_ref",
+    "worker_commit_sha",
     "worker_session_id",
     "filer_principal",
     "session_token_ref",
     "fence_token_hash",
     "owned_files",
     "changed_files",
+    "owned_changed_files",
+    "worker_changed_files",
     "commit_diff_files",
     "clean_worktree",
     "dirty_files",
@@ -4524,6 +4532,9 @@ _LINE_EVIDENCE_OPTIONAL_FIELDS = (
     "parent_materialization_authorized",
     "qa_evidence_provenance",
 )
+# Backward-compatible private alias for internal consumers that predate the
+# shared facade/runtime contract name.
+_LINE_EVIDENCE_OPTIONAL_FIELDS = LINE_EVIDENCE_OPTIONAL_FIELDS
 _QA_EVIDENCE_PROVENANCE_FIELDS = (
     "actor_session_principal",
     "evidence_owner_actor",

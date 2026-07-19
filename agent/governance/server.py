@@ -53,6 +53,7 @@ from .contracts.registry import ContractDefinitionRegistry
 from .contracts.runtime import (
     ContractRuntime,
     ContractRuntimeError,
+    LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     _active_failed_qa_line_index,
     _worker_commit_completed_implementation,
@@ -58387,6 +58388,23 @@ def _contract_runtime_effective_actor_role(
     return role
 
 
+_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS = (
+    "execution_state_revision",
+    "runtime_guide_hash",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "lane_id",
+    "worker_slot_id",
+    "worker_id",
+    "observer_command_id",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+)
+
+
 def _contract_runtime_line_write_body(
     record: Mapping[str, Any],
     body: Mapping[str, Any],
@@ -58410,39 +58428,11 @@ def _contract_runtime_line_write_body(
             or ""
         ),
     )
-    for key in (
-        "execution_state_revision",
-        "runtime_guide_hash",
-        "line_instance_id",
-        "runtime_context_id",
-        "task_id",
-        "parent_task_id",
-        "worker_role",
-        "lane_id",
-        "worker_slot_id",
-        "worker_id",
-        "observer_command_id",
-        "base_commit",
-        "target_head_commit",
-        "merge_queue_id",
-        "payload",
-        "artifact_refs",
-        "trace_id",
-        "commit_sha",
-        "actor_session_principal",
-        "evidence_owner_actor",
-        "evidence_owner_role",
-        "evidence_owner_session",
-        "evidence_owner_session_ref",
-        "submitter_session",
-        "submitter_principal",
-        "materialized_from",
-        "materialized_from_report",
-        "authorization_source",
-        "observer_impersonation",
-        "qa_session_token_ref",
-        "parent_materialization_authorized",
-        "qa_evidence_provenance",
+    # Keep the HTTP bridge and ContractRuntime persistence vocabulary aligned.
+    # This is an allowlist, not a generic body copy: raw route/session/QA tokens
+    # are transport credentials and must never become completed-line evidence.
+    for key in dict.fromkeys(
+        (*_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS, *LINE_EVIDENCE_OPTIONAL_FIELDS)
     ):
         if key in body:
             write[key] = body[key]
