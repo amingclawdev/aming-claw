@@ -49406,8 +49406,14 @@ def _contract_runtime_store(conn) -> SQLiteContractExecutionStore:
     return SQLiteContractExecutionStore(conn)
 
 
+_CONTRACT_DEFINITION_REGISTRY = ContractDefinitionRegistry()
+
+
 def _contract_runtime(conn) -> ContractRuntime:
-    return ContractRuntime(ContractDefinitionRegistry(), store=_contract_runtime_store(conn))
+    return ContractRuntime(
+        _CONTRACT_DEFINITION_REGISTRY,
+        store=_contract_runtime_store(conn),
+    )
 
 
 def _contract_runtime_stable_id(prefix: str, *parts: Any) -> str:
@@ -55555,7 +55561,7 @@ _CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS = {
 def _contract_runtime_definition_for_record(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return ContractDefinitionRegistry().get(
+    return _CONTRACT_DEFINITION_REGISTRY.get(
         str(record.get("contract_id") or ""),
         version=str(record.get("version") or ""),
         revision=str(record.get("revision") or ""),

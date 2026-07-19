@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 
 import pytest
+import agent.governance.contracts.registry as registry_module
 
 from agent.governance.contracts import (
     ContractDefinitionError,
@@ -108,6 +110,132 @@ def test_registry_loads_definition_with_hash_and_alias(tmp_path):
     assert by_alias["definition_hash"].startswith("sha256:")
     assert by_alias["rule_layer"]["stages"][1]["lines"][0]["allowed_writer_roles"] == ["qa"]
     assert is_new_execution_allowed(by_alias) is True
+
+
+def test_registry_snapshot_cache_reuses_normalized_definitions_and_defensive_copies(
+    tmp_path,
+    monkeypatch,
+):
+    _write_definition(tmp_path, _definition())
+    normalize_calls = 0
+    real_normalize = registry_module.normalize_definition
+
+    def counted_normalize(*args, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "normalize_definition", counted_normalize)
+    registry = ContractDefinitionRegistry(tmp_path)
+
+    first = registry.get("observer_hotfix")
+    first["rule_layer"]["stages"][0]["stage_id"] = "caller_mutation"
+    second = registry.get("observer_hotfix")
+
+    assert normalize_calls == 1
+    assert second["rule_layer"]["stages"][0]["stage_id"] == "pre_mutation"
+
+
+def test_registry_snapshot_cache_invalidates_on_source_and_head_change(
+    tmp_path,
+    monkeypatch,
+):
+    path = _write_definition(tmp_path, _definition())
+    head_revision = ["head-a"]
+    monkeypatch.setattr(
+        registry_module,
+        "_git_registry_snapshot",
+        lambda root: (None, head_revision[0]),
+    )
+    normalize_calls = 0
+    real_normalize = registry_module.normalize_definition
+
+    def counted_normalize(*args, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "normalize_definition", counted_normalize)
+    registry = ContractDefinitionRegistry(tmp_path)
+
+    assert registry.get("observer_hotfix")["status"] == "active"
+    assert registry.get("observer_hotfix")["status"] == "active"
+    assert normalize_calls == 1
+
+    path.write_text(json.dumps(_definition(status="draft")), encoding="utf-8")
+    assert registry.get("observer_hotfix")["status"] == "draft"
+    assert normalize_calls == 2
+
+    head_revision[0] = "head-b"
+    assert registry.get("observer_hotfix")["status"] == "draft"
+    assert normalize_calls == 3
+
+
+def test_registry_snapshot_cache_build_is_thread_safe(tmp_path, monkeypatch):
+    _write_definition(tmp_path, _definition())
+    normalize_calls = 0
+    real_normalize = registry_module.normalize_definition
+
+    def counted_normalize(*args, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "normalize_definition", counted_normalize)
+    registry = ContractDefinitionRegistry(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        definitions = list(
+            executor.map(lambda _: registry.get("observer_hotfix"), range(16))
+        )
+
+    assert normalize_calls == 1
+    assert {item["definition_hash"] for item in definitions} == {
+        definitions[0]["definition_hash"]
+    }
+
+
+def test_server_contract_runtime_and_pinned_definition_share_registry_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    from agent.governance import server as governance_server
+
+    _write_definition(tmp_path, _definition())
+    registry = ContractDefinitionRegistry(tmp_path)
+    normalize_calls = 0
+    real_normalize = registry_module.normalize_definition
+
+    def counted_normalize(*args, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "normalize_definition", counted_normalize)
+    monkeypatch.setattr(
+        governance_server,
+        "_CONTRACT_DEFINITION_REGISTRY",
+        registry,
+    )
+    monkeypatch.setattr(
+        governance_server,
+        "_contract_runtime_store",
+        lambda conn: object(),
+    )
+
+    first_runtime = governance_server._contract_runtime(object())
+    second_runtime = governance_server._contract_runtime(object())
+    first = governance_server._contract_runtime_definition_for_record(
+        {"contract_id": "observer_hotfix", "version": "v1", "revision": "rev1"}
+    )
+    second = governance_server._contract_runtime_definition_for_record(
+        {"contract_id": "observer_hotfix", "version": "v1", "revision": "rev1"}
+    )
+
+    assert first_runtime.registry is registry
+    assert second_runtime.registry is registry
+    assert first["definition_hash"] == second["definition_hash"]
+    assert normalize_calls == 1
 
 
 def test_registry_exposes_system_layer_legacy_default_read_model(tmp_path):
