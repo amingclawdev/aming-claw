@@ -15685,6 +15685,20 @@ def queue_merge_item_for_branch_context(
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
     postmerge_recovery = audited_postmerge_recovery_authority
+    resolved_queue_item_id = queue_item_id or f"{queue_id}:{task_id}"
+    existing_recovery_rows = conn.execute(
+        """
+        SELECT queue_item_id, recovery_mode, recovery_authority_hash
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+          AND (recovery_mode != '' OR recovery_authority_hash != '')
+        """,
+        (project_id, queue_id, task_id),
+    ).fetchall()
+    if existing_recovery_rows and postmerge_recovery is None:
+        raise ValueError(
+            "durable audited post-merge recovery queue cannot be rematerialized as ordinary"
+        )
     if postmerge_recovery is not None:
         if not isinstance(postmerge_recovery, AuditedPostmergeRecoveryAuthority):
             raise ValueError(
@@ -15726,6 +15740,20 @@ def queue_merge_item_for_branch_context(
             raise ValueError(
                 "audited post-merge recovery forbids fence/checkpoint reuse and only materializes queued_for_merge"
             )
+        for existing_recovery_row in existing_recovery_rows:
+            if not (
+                str(existing_recovery_row["queue_item_id"] or "")
+                == resolved_queue_item_id
+                and str(existing_recovery_row["recovery_mode"] or "")
+                == AUDITED_POSTMERGE_RECOVERY_MODE
+                and str(
+                    existing_recovery_row["recovery_authority_hash"] or ""
+                )
+                == str(postmerge_recovery.authority_hash or "")
+            ):
+                raise ValueError(
+                    "durable audited post-merge recovery queue identity changed"
+                )
     finish_checkpoint_route_gate = _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
         context,
         fence_token=fence_token,
@@ -15759,7 +15787,7 @@ def queue_merge_item_for_branch_context(
     item = MergeQueueItem(
         project_id=project_id,
         merge_queue_id=queue_id,
-        queue_item_id=queue_item_id or f"{queue_id}:{task_id}",
+        queue_item_id=resolved_queue_item_id,
         backlog_id=str(context.backlog_id or ""),
         recovery_mode=(
             AUDITED_POSTMERGE_RECOVERY_MODE

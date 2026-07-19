@@ -16391,6 +16391,13 @@ def test_postmerge_queue_recovery_rejects_caller_mapping_and_never_reuses_fence(
     )
     assert persisted_recovery.recovery_mode == "audited_postmerge_no_pass"
     assert persisted_recovery.recovery_authority_hash == authority.authority_hash
+    with pytest.raises(ValueError, match="cannot be rematerialized as ordinary"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PID,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+        )
     assert recovered["audited_postmerge_recovery_authority"]["no_pass_claim"] is True
     assert (
         recovered["audited_postmerge_recovery_authority"]
