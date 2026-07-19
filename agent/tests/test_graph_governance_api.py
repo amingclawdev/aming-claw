@@ -38836,6 +38836,125 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert closed["gate_summary"]["can_close"] is True
 
 
+def test_onboard_service_uses_current_route_ref_after_prior_ref_is_superseded(conn):
+    backlog_id = "AC-ONBOARD-SERVICE-CURRENT-ROUTE-REF-AFTER-RENEWAL"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    old_ref = "rtok-onboard-service-before-renewal"
+    current_ref = "rtok-onboard-service-after-renewal"
+    for route_token_ref in (old_ref, current_ref):
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=route_token_ref,
+            allowed_actions=list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+        )
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=old_ref,
+    )
+    assert observer_route_context.supersede_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=old_ref,
+    )
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": current_ref,
+            },
+        )
+    )
+
+    durable = server._contract_runtime_store(conn).get(execution_id)
+    assert durable["route_token_ref"] == current_ref
+    assert durable["runtime_guide"]["execution"]["route_token_ref"] == current_ref
+    assert durable["execution_state_revision"] == 2
+    direct_main_query = result["onboard_route_guide"]["role_entries"]["observer"][
+        "direct_main"
+    ]["graph_query_close_authority"]["copy_safe_graph_query"]
+    next_query = result["next_legal_action"]["graph_query_close_authority"][
+        "copy_safe_graph_query"
+    ]
+    assert direct_main_query["ready"] is True
+    assert next_query["ready"] is True
+    assert direct_main_query["arguments"]["route_token_ref"] == current_ref
+    assert next_query["arguments"]["route_token_ref"] == current_ref
+
+
+@pytest.mark.parametrize("include_request_ref", [False, True])
+def test_onboard_service_never_emits_superseded_route_ref_as_copy_safe(
+    conn,
+    include_request_ref,
+):
+    suffix = "REQUEST" if include_request_ref else "FALLBACK"
+    backlog_id = f"AC-ONBOARD-SERVICE-SUPERSEDED-ROUTE-REF-{suffix}"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    superseded_ref = "rtok-onboard-service-superseded-fallback"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=superseded_ref,
+        allowed_actions=list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+    )
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=superseded_ref,
+    )
+    assert observer_route_context.supersede_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=superseded_ref,
+    )
+
+    body = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+    }
+    if include_request_ref:
+        body["route_token_ref"] = superseded_ref
+    result = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+
+    durable = server._contract_runtime_store(conn).get(execution_id)
+    assert durable["route_token_ref"] == ""
+    assert durable["runtime_guide"]["execution"]["route_token_ref"] == ""
+    direct_main_query = result["onboard_route_guide"]["role_entries"]["observer"][
+        "direct_main"
+    ]["graph_query_close_authority"]["copy_safe_graph_query"]
+    next_query = result["next_legal_action"]["graph_query_close_authority"][
+        "copy_safe_graph_query"
+    ]
+    for copy_safe_query in (direct_main_query, next_query):
+        assert copy_safe_query["ready"] is False
+        assert copy_safe_query["arguments"]["route_token_ref"] == ""
+
+
 def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     conn,
     monkeypatch,

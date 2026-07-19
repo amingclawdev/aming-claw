@@ -58776,6 +58776,7 @@ def _onboard_service_refresh_execution_state(
             "execution_state_revision": revision,
             "execution_state": state,
             "runtime_guide": guide,
+            "route_token_ref": route_token_ref,
             "precheck_decision": {
                 "schema_version": "contract_gate_decision.v1",
                 "ok": True,
@@ -58793,6 +58794,32 @@ def _onboard_service_refresh_execution_state(
     return refreshed
 
 
+def _onboard_service_route_token_ref_state(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+) -> str:
+    route_token_ref = str(route_token_ref or "").strip()
+    if not route_token_ref:
+        return "empty"
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return "invalid"
+    return "active" if isinstance(resolved, Mapping) else "unknown"
+
+
 def _onboard_service_materialize_parent_record(
     conn,
     *,
@@ -58802,12 +58829,23 @@ def _onboard_service_materialize_parent_record(
     blocked_successor_entry: Mapping[str, Any] | None = None,
     blocked_reason: str = "",
 ) -> dict[str, Any]:
+    requested_route_token_ref = str(route_token_ref or "").strip()
+    execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    requested_ref_state = _onboard_service_route_token_ref_state(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        route_token_ref=requested_route_token_ref,
+    )
+    initial_route_token_ref = (
+        "" if requested_ref_state == "invalid" else requested_route_token_ref
+    )
     record = _onboard_service_parent_record(
         project_id=project_id,
         backlog_id=backlog_id,
-        route_token_ref=route_token_ref,
+        route_token_ref=initial_route_token_ref,
     )
-    execution_id = str(record.get("contract_execution_id") or "")
     store = _contract_runtime_store(conn)
     completed_lines = [_onboard_service_waiver_line()]
     if isinstance(blocked_successor_entry, Mapping):
@@ -58824,7 +58862,7 @@ def _onboard_service_materialize_parent_record(
             _onboard_service_refresh_execution_state(
                 record,
                 completed_lines=completed_lines,
-                route_token_ref=route_token_ref,
+                route_token_ref=initial_route_token_ref,
                 revision=1,
             )
         )
@@ -58845,14 +58883,51 @@ def _onboard_service_materialize_parent_record(
             updated,
         )
         return updated
-    if route_token_ref and not str(existing.get("route_token_ref") or ""):
-        existing["route_token_ref"] = route_token_ref
+    existing_route_token_ref = str(existing.get("route_token_ref") or "").strip()
+    existing_ref_state = _onboard_service_route_token_ref_state(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        route_token_ref=existing_route_token_ref,
+    )
+    effective_route_token_ref = (
+        "" if existing_ref_state == "invalid" else existing_route_token_ref
+    )
+    if requested_route_token_ref:
+        if requested_ref_state == "active":
+            effective_route_token_ref = requested_route_token_ref
+        elif requested_ref_state == "unknown" and (
+            not existing_route_token_ref
+            or (
+                requested_route_token_ref == existing_route_token_ref
+                and existing_ref_state == "unknown"
+            )
+        ):
+            # Preserve legacy, non-registry service callers only when no
+            # conflicting durable identity exists. Registered inactive refs
+            # always fail closed.
+            effective_route_token_ref = requested_route_token_ref
+    route_token_ref_changed = effective_route_token_ref != existing_route_token_ref
+    if route_token_ref_changed:
+        revision = int(existing.get("execution_state_revision") or 0) + 1
+        existing_completed_lines = existing.get("completed_lines")
+        existing = _onboard_service_refresh_execution_state(
+            existing,
+            completed_lines=(
+                [dict(line) for line in existing_completed_lines]
+                if isinstance(existing_completed_lines, list)
+                else completed_lines
+            ),
+            route_token_ref=effective_route_token_ref,
+            revision=revision,
+        )
     if blocked_successor_entry is not None:
         revision = int(existing.get("execution_state_revision") or 0) + 1
         existing = _onboard_service_refresh_execution_state(
             existing,
             completed_lines=completed_lines,
-            route_token_ref=route_token_ref or str(existing.get("route_token_ref") or ""),
+            route_token_ref=effective_route_token_ref,
             revision=revision,
         )
         existing = _contract_runtime_apply_blocked_projection(
@@ -58868,7 +58943,7 @@ def _onboard_service_materialize_parent_record(
             updated,
         )
         return updated
-    if route_token_ref:
+    if route_token_ref_changed:
         updated = store.update(execution_id, existing)
         updated["contract_chain_current"] = upsert_contract_chain_root_current_binding(
             conn,
@@ -62403,6 +62478,7 @@ def _onboard_route_guide_service_response(
         backlog_id=backlog_id,
         route_token_ref=route_token_ref,
     )
+    route_token_ref = str(record.get("route_token_ref") or "").strip()
     target_files = _onboard_contract_route_issue_target_files(
         conn,
         backlog_id=backlog_id,
