@@ -521,6 +521,32 @@ def write_merge_with_trailer(
     root = cwd or _repo_root()
 
     if branch:
+        merge_head_before = _git(
+            ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            cwd=root,
+        )
+        if merge_head_before.returncode == 0:
+            return (
+                False,
+                "",
+                "Merge refused: pre-existing MERGE_HEAD is not owned by this writer",
+            )
+        if merge_head_before.returncode != 1:
+            return (
+                False,
+                "",
+                "Merge refused: unable to prove pre-merge operation state",
+            )
+        head_before = _git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=root)
+        branch_head = _git(
+            ["rev-parse", "--verify", f"{branch}^{{commit}}"],
+            cwd=root,
+        )
+        if head_before.returncode != 0 or branch_head.returncode != 0:
+            resolution_error = branch_head.stderr or head_before.stderr
+            return False, "", f"Merge failed: {resolution_error.strip()[:300]}"
+        expected_head = head_before.stdout.splitlines()[0].strip()
+        expected_merge_head = branch_head.stdout.splitlines()[0].strip()
         # Perform merge
         merge_args = ["merge", branch, "--no-ff", "--no-commit"]
         if extra_args:
@@ -528,7 +554,23 @@ def write_merge_with_trailer(
         merge_proc = _git(merge_args, cwd=root, timeout=30)
         if merge_proc.returncode != 0:
             if abort_failed_merge:
-                _git(["merge", "--abort"], cwd=root)
+                merge_head_after = _git(
+                    ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                    cwd=root,
+                )
+                head_after = _git(
+                    ["rev-parse", "--verify", "HEAD^{commit}"],
+                    cwd=root,
+                )
+                owns_failed_merge = bool(
+                    merge_head_after.returncode == 0
+                    and head_after.returncode == 0
+                    and merge_head_after.stdout.splitlines()[0].strip()
+                    == expected_merge_head
+                    and head_after.stdout.splitlines()[0].strip() == expected_head
+                )
+                if owns_failed_merge:
+                    _git(["merge", "--abort"], cwd=root)
             return False, "", f"Merge failed: {merge_proc.stderr.strip()[:300]}"
 
     # Build trailer lines

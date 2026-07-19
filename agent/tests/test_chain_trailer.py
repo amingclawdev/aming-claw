@@ -520,7 +520,16 @@ class TestWriteMergeWithTrailer:
         assert success is False
         assert err
 
-    def test_governed_writer_can_preserve_unknown_preexisting_merge(self, git_repo):
+    @pytest.mark.parametrize(
+        "abort_failed_merge",
+        [None, False],
+        ids=["legacy-default", "governed-deferred-cleanup"],
+    )
+    def test_writer_preserves_unknown_preexisting_merge(
+        self,
+        git_repo,
+        abort_failed_merge,
+    ):
         from agent.governance.chain_trailer import write_merge_with_trailer
 
         base_branch = subprocess.run(
@@ -590,16 +599,19 @@ class TestWriteMergeWithTrailer:
             text=True,
         )
 
+        cleanup_option = (
+            {} if abort_failed_merge is None else {"abort_failed_merge": False}
+        )
         success, commit_hash, err = write_merge_with_trailer(
             message="governed merge must not abort user operation",
             branch="governed-candidate",
             cwd=git_repo,
-            abort_failed_merge=False,
+            **cleanup_option,
         )
 
         assert success is False
         assert commit_hash == ""
-        assert err.startswith("Merge failed:")
+        assert err.startswith("Merge refused:")
         assert subprocess.run(
             ["git", "rev-parse", "MERGE_HEAD"],
             cwd=git_repo,
@@ -614,6 +626,88 @@ class TestWriteMergeWithTrailer:
             capture_output=True,
             text=True,
         )
+
+    def test_default_writer_aborts_only_owned_failed_merge(self, git_repo):
+        from agent.governance.chain_trailer import write_merge_with_trailer
+
+        base_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "owned-conflict-candidate"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        with open(os.path.join(git_repo, "README.md"), "w") as f:
+            f.write("candidate\n")
+        subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "candidate conflict"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", base_branch],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        with open(os.path.join(git_repo, "README.md"), "w") as f:
+            f.write("target\n")
+        subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "target conflict"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        expected_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        success, commit_hash, err = write_merge_with_trailer(
+            message="owned failed merge",
+            branch="owned-conflict-candidate",
+            cwd=git_repo,
+        )
+
+        assert success is False
+        assert commit_hash == ""
+        assert err.startswith("Merge failed:")
+        assert subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == expected_head
+        assert subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+        ).returncode != 0
+        assert subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
 
     def test_returns_short_hash(self, git_repo):
         from agent.governance.chain_trailer import write_merge_with_trailer
