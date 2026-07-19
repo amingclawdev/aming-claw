@@ -36524,8 +36524,17 @@ def _current_full_reconcile_existing_run(
     run_id: str,
     target_commit_sha: str,
     route_evidence: Mapping[str, Any],
+    requested_snapshot_id: str = "",
 ) -> dict[str, Any]:
-    """Resolve a durable same-run candidate or terminal result without rebuild."""
+    """Resolve a durable candidate or terminal result without rebuilding it.
+
+    A candidate-only request and its later activation may intentionally use
+    different run ids (for example, after QA or a recovered client timeout).
+    When the caller supplies an exact ``snapshot_id``, that immutable snapshot
+    identity is therefore authoritative for candidate lookup.  Run id remains
+    the idempotency key for activation metrics/evidence, while commit and kind
+    checks prevent an explicit snapshot id from adopting unrelated graph data.
+    """
 
     expected_scope = _current_full_reconcile_idempotency_scope(route_evidence)
     metric_rows = conn.execute(
@@ -36554,21 +36563,61 @@ def _current_full_reconcile_existing_run(
             "actual_target_commit_sha": target_commit_sha,
             "conflicting_target_commits": conflicting_commits,
         }
+    exact_snapshot_id = str(requested_snapshot_id or "").strip()
     snapshots = []
-    for row in conn.execute(
-        """
-        SELECT * FROM graph_snapshots
-        WHERE project_id = ? AND commit_sha = ?
-        ORDER BY created_at DESC, snapshot_id DESC
-        """,
-        (project_id, target_commit_sha),
-    ).fetchall():
-        snapshot = dict(row)
-        notes = _json_loads(snapshot.get("notes"), {})
-        if not isinstance(notes, Mapping) or str(notes.get("run_id") or "") != run_id:
-            continue
-        snapshot["notes_payload"] = dict(notes)
-        snapshots.append(snapshot)
+    if exact_snapshot_id:
+        row = conn.execute(
+            """
+            SELECT * FROM graph_snapshots
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, exact_snapshot_id),
+        ).fetchone()
+        if row:
+            snapshot = dict(row)
+            snapshot_commit = str(snapshot.get("commit_sha") or "").strip()
+            if snapshot_commit != target_commit_sha:
+                return {
+                    "status": "conflict",
+                    "reason": "reconcile_snapshot_id_target_commit_conflict",
+                    "run_id": run_id,
+                    "snapshot_id": exact_snapshot_id,
+                    "expected_target_commit_sha": snapshot_commit,
+                    "actual_target_commit_sha": target_commit_sha,
+                }
+            snapshot_kind = str(snapshot.get("snapshot_kind") or "").strip()
+            if snapshot_kind != "full":
+                return {
+                    "status": "conflict",
+                    "reason": "reconcile_snapshot_id_kind_conflict",
+                    "run_id": run_id,
+                    "snapshot_id": exact_snapshot_id,
+                    "expected_snapshot_kind": "full",
+                    "actual_snapshot_kind": snapshot_kind,
+                }
+            notes = _json_loads(snapshot.get("notes"), {})
+            snapshot["notes_payload"] = (
+                dict(notes) if isinstance(notes, Mapping) else {}
+            )
+            snapshots.append(snapshot)
+    else:
+        for row in conn.execute(
+            """
+            SELECT * FROM graph_snapshots
+            WHERE project_id = ? AND commit_sha = ?
+            ORDER BY created_at DESC, snapshot_id DESC
+            """,
+            (project_id, target_commit_sha),
+        ).fetchall():
+            snapshot = dict(row)
+            notes = _json_loads(snapshot.get("notes"), {})
+            if (
+                not isinstance(notes, Mapping)
+                or str(notes.get("run_id") or "") != run_id
+            ):
+                continue
+            snapshot["notes_payload"] = dict(notes)
+            snapshots.append(snapshot)
 
     if len(snapshots) > 1:
         return {
@@ -36705,6 +36754,9 @@ def _current_full_reconcile_existing_run(
             "run_id": run_id,
             "snapshot": snapshot,
             "snapshot_id": snapshot_id,
+            "candidate_origin_run_id": str(
+                (snapshot.get("notes_payload") or {}).get("run_id") or ""
+            ).strip(),
             "metric": metric,
         }
     if metric_status in {"running", "finalizing"}:
@@ -36849,6 +36901,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             "reconcile_run_id": run_id,
             "idempotency_scope": idempotency_scope,
         }
+        explicit_snapshot_id = str(body.get("snapshot_id") or "").strip()
         existing = _current_full_reconcile_existing_run(
             conn,
             store,
@@ -36856,6 +36909,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             run_id=run_id,
             target_commit_sha=target_commit,
             route_evidence=route_evidence,
+            requested_snapshot_id=explicit_snapshot_id,
         )
         if existing.get("status") == "conflict":
             return 409, {
@@ -36915,7 +36969,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         notes_extra.pop("current_full_reconcile", None)
         resumed_candidate = existing.get("status") == "candidate_ready"
         requested_snapshot_id = str(
-            body.get("snapshot_id") or store.snapshot_id_for("full", target_commit)
+            explicit_snapshot_id or store.snapshot_id_for("full", target_commit)
         ).strip()
         if resumed_candidate:
             snapshot_id = str(existing.get("snapshot_id") or "")
@@ -36933,6 +36987,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     result={},
                 ),
                 "resumed_candidate": True,
+                "candidate_origin_run_id": str(
+                    existing.get("candidate_origin_run_id") or ""
+                ),
                 "rebuild_skipped": True,
             }
         else:
@@ -37224,6 +37281,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         run_id=run_id,
                         target_commit_sha=target_commit,
                         route_evidence=route_evidence,
+                        requested_snapshot_id=explicit_snapshot_id,
                     )
                     if terminal.get("status") != "complete":
                         return 409, {

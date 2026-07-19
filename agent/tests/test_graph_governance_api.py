@@ -3354,6 +3354,151 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     )
 
 
+def test_current_full_reconcile_explicit_candidate_resumes_across_run_ids(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-existing-candidate-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-EXPLICIT-CANDIDATE-RESUME"
+    route_token_ref = "rtok-current-full-explicit-candidate-resume"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-explicit-candidate-resume",
+        route_token_ref=route_token_ref,
+    )
+    candidate_run_id = "current-full-explicit-candidate-build"
+    activation_run_id = "current-full-explicit-candidate-activate"
+
+    candidate_status, candidate = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "run_id": candidate_run_id,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+    )
+    activation_body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": activation_run_id,
+        "snapshot_id": candidate["candidate_snapshot_id"],
+        "expected_old_snapshot_id": old_snapshot_id,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+    activation_status, activation = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx({"project_id": PID}, method="POST", body=activation_body)
+        )
+    )
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=activation_body)
+    )
+
+    assert candidate_status == 201
+    assert activation_status == 200
+    assert activation["activated"] is True
+    assert activation["resumed_candidate"] is True
+    assert activation["rebuild_skipped"] is True
+    assert activation["candidate_origin_run_id"] == candidate_run_id
+    assert replay_status == 200
+    assert replay["idempotent_replay"] is True
+    assert replay["rebuild_skipped"] is True
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == candidate_run_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshots "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, candidate["candidate_snapshot_id"]),
+    ).fetchone()[0] == 1
+
+
+def test_current_full_reconcile_explicit_candidate_preserves_stale_cas_refusal(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-explicit-cas-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-EXPLICIT-CANDIDATE-CAS"
+    route_token_ref = "rtok-current-full-explicit-candidate-cas"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-explicit-candidate-cas",
+        route_token_ref=route_token_ref,
+    )
+    candidate_status, candidate = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "run_id": "current-full-explicit-cas-build",
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+    )
+    newer_snapshot_id = "full-current-explicit-cas-newer"
+    _activate_basic_graph(conn, newer_snapshot_id, commit_sha="c" * 40)
+
+    with pytest.raises(store.GraphSnapshotConflictError):
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": True,
+                    "semantic_enrich": False,
+                    "run_id": "current-full-explicit-cas-activate",
+                    "snapshot_id": candidate["candidate_snapshot_id"],
+                    "expected_old_snapshot_id": old_snapshot_id,
+                    "backlog_id": backlog_id,
+                    "task_id": execution_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert candidate_status == 201
+    assert len(calls) == 1
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == (
+        newer_snapshot_id
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshots "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, candidate["candidate_snapshot_id"]),
+    ).fetchone()[0] == 1
+
+
 def _current_full_direct_main_route_fixture(
     conn,
     *,
