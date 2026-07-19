@@ -79,10 +79,16 @@ def test_mf_timeline_precheck_schema_exposes_repair_view():
 
 
 def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
-    description = _tool_properties("task_timeline_append")["status"]["description"]
+    properties = _tool_properties("task_timeline_append")
+    description = properties["status"]["description"]
     assert "satisfy the close gate" in description
     assert "audit-only evidence" in description
     assert "never satisfy close" in description
+    assert "recursively scrubbed" in properties["payload"]["description"]
+    assert "raw authorization" in properties["verification"]["description"]
+    assert "Copy-safe artifact references" in properties["artifact_refs"][
+        "description"
+    ]
 
 
 def test_parallel_branch_merge_queue_apply_forwards_branch_ref():

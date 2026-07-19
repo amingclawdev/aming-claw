@@ -1973,9 +1973,9 @@ TOOLS: list[dict] = [
                 "schema_version": {"type": "integer"},
                 "actor": {"type": "string"},
                 "status": {"type": "string", "description": "Passing statuses accepted/ok/pass/passed/succeeded/success satisfy the close gate; failed/fail/rejected/blocked persist authenticated audit-only evidence and never satisfy close."},
-                "payload": {"type": "object"},
-                "verification": {"type": "object"},
-                "artifact_refs": {"type": "object"},
+                "payload": {"type": "object", "description": "Caller credential-shaped fields are recursively scrubbed before authority projection and persistence; use copy-safe refs or hashes."},
+                "verification": {"type": "object", "description": "Verification evidence only; nested raw authorization, session, governance, route, or fence credentials are removed."},
+                "artifact_refs": {"type": "object", "description": "Copy-safe artifact references and hashes only; nested raw credential fields are removed."},
                 "trace_id": {"type": "string"},
                 "commit_sha": {"type": "string"},
                 "qa_session_token": {

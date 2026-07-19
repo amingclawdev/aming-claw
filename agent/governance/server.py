@@ -15684,6 +15684,20 @@ def _runtime_context_qa_verification_guide(
                 "every_trace_identity_and_scope_still_verified": True,
                 "failed_reverification_cached": False,
             },
+            "credential_scrub_policy": {
+                "applied_before_authority_projection": True,
+                "containers": ["payload", "verification", "artifact_refs"],
+                "key_matching": "case_and_separator_normalized_exact_denylist",
+                "recursive": True,
+                "raw_credential_field_classes": [
+                    "authorization",
+                    "api_key",
+                    "cookie",
+                    "password_or_secret",
+                    "qa_or_governance_or_worker_token",
+                ],
+                "copy_safe_refs_hashes_and_provenance_preserved": True,
+            },
             "forbidden_authors": [
                 "observer",
                 "hotfix_implementation_actor",
@@ -47834,6 +47848,52 @@ _SERVER_PROJECTED_TIMELINE_KEYS = frozenset(
         *_ROUTE_ACTION_SCOPE_LINEAGE_KEYS,
     }
 )
+_SERVER_PROJECTED_TIMELINE_KEY_COMPACT_DENYLIST = frozenset(
+    re.sub(r"[^a-z0-9]+", "", key.casefold())
+    for key in _SERVER_PROJECTED_TIMELINE_KEYS
+)
+
+
+_CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "auth",
+        "authorization",
+        "bearertoken",
+        "clientcredential",
+        "clientsecret",
+        "cookie",
+        "credential",
+        "credentials",
+        "fencetoken",
+        "governancetoken",
+        "idtoken",
+        "password",
+        "passphrase",
+        "proxyauthorization",
+        "qasessiontoken",
+        "refreshtoken",
+        "routetoken",
+        "secret",
+        "sessiontoken",
+        "setcookie",
+        "token",
+        "xapikey",
+        "xgovernancetoken",
+        "xgovtoken",
+    }
+)
+
+
+def _caller_timeline_key_is_credential(key: Any) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
+    return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
+
+
+def _caller_timeline_key_is_server_projected(key: Any) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
+    return compact in _SERVER_PROJECTED_TIMELINE_KEY_COMPACT_DENYLIST
 
 
 def _strip_caller_server_projected_timeline_value(value: Any) -> Any:
@@ -47841,7 +47901,8 @@ def _strip_caller_server_projected_timeline_value(value: Any) -> Any:
         return {
             key: _strip_caller_server_projected_timeline_value(child)
             for key, child in value.items()
-            if key not in _SERVER_PROJECTED_TIMELINE_KEYS
+            if not _caller_timeline_key_is_server_projected(key)
+            and not _caller_timeline_key_is_credential(key)
         }
     if isinstance(value, list):
         return [

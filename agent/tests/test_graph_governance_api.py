@@ -26078,6 +26078,27 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
                 "graph_trace_ids": [queried["trace_id"]],
                 "test_results": {"status": "passed"},
                 "observer_impersonation": False,
+                "qa_session_token": "fake-qa-token-sentinel",
+                "nested_credentials": {
+                    "SESSION-TOKEN": "fake-session-token-sentinel",
+                    "safe_session_token_ref": "qaref-copy-safe",
+                    "Source-Backed-Contract-Gate-Authority": {
+                        "source": "fake-mixed-case-authority"
+                    },
+                },
+            },
+            "verification": {
+                "governance_token": "fake-governance-token-sentinel",
+                "nested": [
+                    {
+                        "Authorization": "Bearer fake-authorization-sentinel",
+                    }
+                ],
+                "authorization_source": "bounded_qa_session",
+            },
+            "artifact_refs": {
+                "X.Gov.Token": "fake-x-gov-token-sentinel",
+                "route_token_hash": "sha256:copy-safe-route-token-hash",
             },
         },
     )
@@ -26132,6 +26153,39 @@ def test_bounded_qa_session_can_query_graph_and_append_native_verification(
     assert authority["close_satisfying"] is True
     assert authority["audit_only"] is False
     assert proof["raw_qa_session_token_persisted"] is False
+    serialized_result = json.dumps(result, sort_keys=True)
+    for sentinel in (
+        "fake-qa-token-sentinel",
+        "fake-session-token-sentinel",
+        "fake-governance-token-sentinel",
+        "fake-authorization-sentinel",
+        "fake-x-gov-token-sentinel",
+    ):
+        assert sentinel not in serialized_result
+    assert result["payload"]["nested_credentials"] == {
+        "safe_session_token_ref": "qaref-copy-safe"
+    }
+    assert "fake-mixed-case-authority" not in serialized_result
+    assert result["verification"]["authorization_source"] == (
+        "bounded_qa_session"
+    )
+    assert result["artifact_refs"]["route_token_hash"] == (
+        "sha256:copy-safe-route-token-hash"
+    )
+    persisted_containers = conn.execute(
+        """SELECT payload_json, verification_json, artifact_refs_json
+           FROM task_timeline_events WHERE id = ?""",
+        (result["id"],),
+    ).fetchone()
+    persisted_json = "|".join(str(value or "") for value in persisted_containers)
+    for sentinel in (
+        "fake-qa-token-sentinel",
+        "fake-session-token-sentinel",
+        "fake-governance-token-sentinel",
+        "fake-authorization-sentinel",
+        "fake-x-gov-token-sentinel",
+    ):
+        assert sentinel not in persisted_json
     assert result["contract_gate_decision"]["source_of_authority"] == (
         "qa_session_verification"
     )
@@ -29110,6 +29164,20 @@ def test_runtime_context_qa_guide_scopes_verification_and_full_suite_caveat() ->
         "identical_review_context_reverified_once_per_request": True,
         "every_trace_identity_and_scope_still_verified": True,
         "failed_reverification_cached": False,
+    }
+    assert append_evidence["credential_scrub_policy"] == {
+        "applied_before_authority_projection": True,
+        "containers": ["payload", "verification", "artifact_refs"],
+        "key_matching": "case_and_separator_normalized_exact_denylist",
+        "recursive": True,
+        "raw_credential_field_classes": [
+            "authorization",
+            "api_key",
+            "cookie",
+            "password_or_secret",
+            "qa_or_governance_or_worker_token",
+        ],
+        "copy_safe_refs_hashes_and_provenance_preserved": True,
     }
     assert append_evidence["route_token_ref_body"]["verification"][
         "verification_plan"
