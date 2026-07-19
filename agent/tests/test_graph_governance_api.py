@@ -3108,6 +3108,127 @@ def test_current_full_reconcile_same_run_id_returns_terminal_without_duplicate_e
     assert len(calls) == 1
 
 
+def test_current_full_reconcile_reuses_generated_snapshot_id_for_metric_lifecycle(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, _stub_calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-ONE-METRIC-IDENTITY"
+    route_token_ref = "rtok-current-full-one-metric-identity"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-one-metric-identity",
+        route_token_ref=route_token_ref,
+    )
+    reconcile_calls: list[dict] = []
+
+    def fake_reconcile(conn_arg, project_id, root, **kwargs):
+        snapshot_id = str(kwargs.get("snapshot_id") or "")
+        assert snapshot_id
+        reconcile_calls.append(
+            {
+                "project_id": project_id,
+                "root": root,
+                "snapshot_id": snapshot_id,
+                **kwargs,
+            }
+        )
+        if not store.get_graph_snapshot(conn_arg, project_id, snapshot_id):
+            store.create_graph_snapshot(
+                conn_arg,
+                project_id,
+                snapshot_id=snapshot_id,
+                commit_sha=head,
+                snapshot_kind="full",
+                graph_json=_graph(),
+                notes=json.dumps({"run_id": kwargs.get("run_id", "")}),
+            )
+            conn_arg.commit()
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "projection_id": "semproj-one-metric-identity",
+            "snapshot_status": "candidate",
+            "run_id": kwargs.get("run_id", ""),
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    metric_updates: list[tuple[str, str]] = []
+    original_record_metric = store.record_reconcile_run_metric
+
+    def record_metric(conn_arg, project_id, **kwargs):
+        metric_updates.append(
+            (str(kwargs.get("status") or ""), str(kwargs.get("snapshot_id") or ""))
+        )
+        return original_record_metric(conn_arg, project_id, **kwargs)
+
+    monkeypatch.setattr(store, "record_reconcile_run_metric", record_metric)
+    run_id = "current-full-one-metric-identity"
+    body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": run_id,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+    first_metric_updates = list(metric_updates)
+    replay_status, replay = server.handle_graph_governance_current_full_reconcile(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert first_status == 201
+    assert first["activated"] is True
+    assert replay_status == 200
+    assert replay["idempotent_replay"] is True
+    assert replay["rebuild_skipped"] is True
+    assert len(reconcile_calls) == 1
+    snapshot_id = first["snapshot_id"]
+    assert reconcile_calls[0]["snapshot_id"] == snapshot_id
+    assert first_metric_updates == [
+        ("running", snapshot_id),
+        ("candidate_ready", snapshot_id),
+        ("complete", snapshot_id),
+    ]
+    assert metric_updates == first_metric_updates
+
+    metric_rows = conn.execute(
+        "SELECT snapshot_id, status FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND run_id = ?",
+        (PID, run_id),
+    ).fetchall()
+    assert [dict(row) for row in metric_rows] == [
+        {"snapshot_id": snapshot_id, "status": "complete"}
+    ]
+    queue = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "true"},
+        )
+    )
+    matching_operations = [
+        item for item in queue["operations"] if item.get("run_id") == run_id
+    ]
+    assert len(matching_operations) == 1
+    assert matching_operations[0]["snapshot_id"] == snapshot_id
+    assert matching_operations[0]["status"] == "complete"
+    assert store.summarize_reconcile_run_metrics(conn, PID)["sample_count"] == 1
+
+
 def test_current_full_reconcile_candidate_exception_records_failed_run(
     conn,
     monkeypatch,

@@ -36233,7 +36233,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     root,
                     run_id=run_id,
                     commit_sha=target_commit,
-                    snapshot_id=body.get("snapshot_id"),
+                    snapshot_id=requested_snapshot_id,
                     snapshot_kind="full",
                     created_by=str(body.get("actor") or "dashboard_user"),
                     activate=False,
