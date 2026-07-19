@@ -651,7 +651,9 @@ def test_lease_acquire_failure_revokes_and_zeroizes_staged_envelope(tmp_path):
 
     assert all(not value for value in buffers)
     assert store.pending_count() == 0
-    assert registry.get_run(run.run_id).state == "registered"
+    # Registration and capacity reservation are one transaction.  A lease
+    # conflict must not leave an orphaned run that was never admitted.
+    assert registry.get_run(run.run_id) is None
 
 
 def test_spawn_failure_discards_consumed_envelope(tmp_path):

@@ -1698,6 +1698,17 @@ def _direct_fix_graph_trace_payload(
         candidate_commit = candidate_commit_sha or hashlib.sha1(
             trace_id.encode("utf-8")
         ).hexdigest()
+        graph_basis_decision = (
+            graph_query_trace.bounded_qa_graph_basis_decision(
+                "exact_candidate_snapshot",
+                {
+                    "canonical_head_commit": candidate_commit,
+                    "base_commit_sha": candidate_commit,
+                    "candidate_commit_sha": candidate_commit,
+                    "canonical_head_relation": "candidate",
+                },
+            )
+        )
         evidence.update(
             {
                 "source": "graph_query_traces",
@@ -1710,6 +1721,10 @@ def _direct_fix_graph_trace_payload(
                 "missing_trace_ids": [],
                 "identity_mismatches": [],
                 "graph_basis": "exact_candidate_snapshot",
+                "graph_basis_decision": graph_basis_decision,
+                "graph_basis_decision_hash": server.stable_sha256(
+                    graph_basis_decision
+                ),
                 "canonical_base_snapshot_id": f"full-{trace_id}",
                 "base_commit_sha": candidate_commit,
                 "candidate_commit_sha": candidate_commit,
@@ -2053,6 +2068,17 @@ def _insert_exact_qa_graph_query_trace(
         task_id=task_id,
         commit_sha=candidate_commit_sha,
     )
+    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        "exact_candidate_snapshot",
+        {
+            **root_context["root_identity"],
+            "canonical_head_commit": candidate_commit_sha,
+            "base_commit_sha": candidate_commit_sha,
+            "candidate_commit_sha": candidate_commit_sha,
+            "canonical_head_relation": "candidate",
+        },
+    )
+    graph_basis_decision_hash = server.stable_sha256(graph_basis_decision)
     graph_query_trace.start_trace(
         conn,
         PID,
@@ -2065,6 +2091,8 @@ def _insert_exact_qa_graph_query_trace(
         task_id=task_id,
         commit_sha=candidate_commit_sha,
         graph_basis="exact_candidate_snapshot",
+        graph_basis_decision=graph_basis_decision,
+        graph_basis_decision_hash=graph_basis_decision_hash,
         canonical_base_snapshot_id=snapshot_id,
         base_commit_sha=candidate_commit_sha,
         candidate_commit_sha=candidate_commit_sha,
@@ -2111,6 +2139,8 @@ def _insert_exact_qa_graph_query_trace(
         "qa_scope_binding_ref": qa_scope_binding_ref,
         "target_project_root": target_project_root,
         "graph_basis": "exact_candidate_snapshot",
+        "graph_basis_decision": graph_basis_decision,
+        "graph_basis_decision_hash": graph_basis_decision_hash,
         "canonical_base_snapshot_id": snapshot_id,
         "base_commit_sha": candidate_commit_sha,
         "candidate_commit_sha": candidate_commit_sha,
@@ -5122,6 +5152,13 @@ def _record_test_current_full_reconcile_authority(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
     }
+    runtime_scope = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+    }
     qa_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -5191,13 +5228,22 @@ def _record_test_current_full_reconcile_authority(
             "authentication_source": "test_protected_entrypoint",
             "raw_route_token_persisted": False,
             "protected_action": "graph_current_full_reconcile",
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
             "route_token_scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
                 "task_id": task_id,
                 "runtime_context_id": runtime_context_id,
             },
+            "runtime_context_scope": {
+                **runtime_scope,
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
         },
+        runtime_context_scope=runtime_scope,
         reconcile_event_id=int(reconcile_event["id"]),
         reconcile_event_created_at=str(reconcile_event["created_at"]),
     )
@@ -38356,6 +38402,27 @@ def _complete_source_backed_mf_parallel_successor(
         qa_graph_trace_id=qa_graph_trace_id,
         qa_commit_sha=worker_commit,
     )
+    queue_item_id = f"mqitem-{backlog_id.lower()}"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=runtime_context.merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=backlog_id,
+                task_id=runtime_context.task_id,
+                branch_ref=runtime_context.branch_ref,
+                queue_index=1,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=worker_commit,
+                merge_commit=close_commit,
+                target_head_before_merge="c" * 40,
+                target_head_after_merge=close_commit,
+            )
+        ],
+    )
     line_specs = [
         (
             "observer",
@@ -38608,11 +38675,78 @@ def _complete_source_backed_mf_parallel_successor(
                 **payload,
                 "graph_trace_evidence": qa_graph_evidence,
             }
+        if line_id == "qa_independent_verification":
+            # QA completion is authoritative only when the passing verdict is
+            # explicit at the top level; a nested payload verdict is advisory.
+            write["status"] = "passed"
         if line_id == "observer_reconcile":
+            timeline_events = task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=runtime_context.task_id,
+            )
+            merge_authority = server._contract_runtime_completed_merge_authority(
+                conn,
+                project_id=PID,
+                record=record,
+                context=runtime_context,
+                timeline_events=timeline_events,
+            )
+            assert merge_authority.get("authority_verified") is True
+            reconcile_projection = {
+                "reconcile_source_ref": reconcile_authority["reconcile_source_ref"],
+                "reconcile_event_id": reconcile_authority["reconcile_event_id"],
+                "reconcile_event_created_at": reconcile_authority[
+                    "reconcile_event_created_at"
+                ],
+                "reconcile_task_id": runtime_context.task_id,
+                "reconcile_runtime_context_id": runtime_context.runtime_context_id,
+                "allow_taskless_reconcile": True,
+            }
+            canonical_reconcile_authority = (
+                server._contract_runtime_current_full_reconcile_authority_from_merge(
+                    conn,
+                    project_id=PID,
+                    record=record,
+                    merge=merge_authority,
+                    reconcile=reconcile_projection,
+                )
+            )
+            assert canonical_reconcile_authority["db_verified"] is True
+            # The unit fixture's project id is intentionally not registered to
+            # its temporary repository. Model the live root checks that the
+            # protected reconcile endpoint performs for a registered project.
+            canonical_reconcile_authority.update(
+                {
+                    "target_project_root": runtime_context.target_project_root,
+                    "canonical_head_commit": close_commit,
+                    "canonical_head_equals_merged_commit": True,
+                    "reconciled_commit_is_ancestor_of_canonical_head": True,
+                    "canonical_head_verified": True,
+                    "active_snapshot_matches_canonical_head": True,
+                    "live_verified": True,
+                    "active_snapshot_verified": True,
+                    "graph_reconciled": True,
+                }
+            )
+            canonical_reconcile_authority.pop("authority_hash", None)
+            canonical_reconcile_authority["authority_hash"] = server.stable_sha256(
+                canonical_reconcile_authority
+            )
             write["payload"] = {
                 **payload,
-                "reconcile_authority": reconcile_authority,
+                "reconcile_authority": canonical_reconcile_authority,
             }
+        if line_id == "observer_merge":
+            write = server._contract_runtime_bind_server_line_authority(
+                _ctx({"project_id": PID}),
+                conn,
+                project_id=PID,
+                record=record,
+                write=write,
+                body=write,
+            )
         if payload.get("worker_id"):
             write["worker_id"] = payload["worker_id"]
         if payload.get("worker_slot_id"):
@@ -38633,6 +38767,25 @@ def _complete_source_backed_mf_parallel_successor(
             decision.get("next_move"),
         )
         record = result["record"]
+        if line_id == "qa_independent_verification":
+            qa_acceptance = server._contract_runtime_completed_line_acceptance(
+                conn,
+                project_id=PID,
+                record=record,
+                completed_line_index=len(record["completed_lines"]) - 1,
+                expected_line=record["completed_lines"][-1],
+            )
+            assert qa_acceptance.get("db_verified") is True
+            conn.execute(
+                "UPDATE backlog_contract_chain_bindings SET created_at = ? "
+                "WHERE project_id = ? AND source_ref = ?",
+                (
+                    "2026-07-11T00:59:00Z",
+                    PID,
+                    qa_acceptance["acceptance_ref"],
+                ),
+            )
+            conn.commit()
     assert record["runtime_guide"]["next_legal_action"] is None
     return record
 
@@ -44192,6 +44345,7 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
         evidence_kind: str,
         payload: dict | None = None,
         commit_sha: str = "",
+        status: str = "",
     ) -> dict:
         runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
@@ -44206,6 +44360,8 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
             write["payload"] = payload
         if commit_sha:
             write["commit_sha"] = commit_sha
+        if status:
+            write["status"] = status
         result = runtime.submit_line_write(
             contract_execution_id,
             write,
@@ -44300,6 +44456,7 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
             "verified_commit": close_commit,
         },
         commit_sha=close_commit,
+        status="passed",
     )
     write_runtime_line(
         direct_execution_id,
@@ -44445,6 +44602,7 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
         evidence_kind: str,
         payload: dict,
         commit_sha: str = "",
+        status: str = "",
     ) -> None:
         runtime.current_guide(direct_execution_id, actor_role=actor_role)
         record = runtime.store.get(direct_execution_id)
@@ -44458,6 +44616,8 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
         write["payload"] = payload
         if commit_sha:
             write["commit_sha"] = commit_sha
+        if status:
+            write["status"] = status
         result = runtime.submit_line_write(
             direct_execution_id,
             write,
@@ -44544,6 +44704,7 @@ def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
             "verified_commit": close_commit,
         },
         commit_sha=close_commit,
+        status="passed",
     )
     write_runtime_line(
         actor_role="observer",
@@ -49207,7 +49368,9 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(
     target_repo = tmp_path / "direct-fix-candidate-repo"
     candidate_commit = _init_test_git_repo(target_repo)
     target_root = str(target_repo)
-    worktree_path = str(tmp_path / "direct-fix-worker")
+    # QA must inspect the allocated candidate worktree, so dispatch the real
+    # candidate repository instead of a separate nonexistent placeholder.
+    worktree_path = target_root
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -49496,6 +49659,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(
                 "stage_id": "qa",
                 "line_id": "qa_independent_verification",
                 "evidence_kind": "independent_verification",
+                "status": "passed",
                 "verification": {
                     "verdict": "PASS",
                     "independent": True,
@@ -50172,6 +50336,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
         evidence_kind: str,
         payload: dict | None = None,
         commit_sha: str = "",
+        status: str = "",
     ) -> dict:
         runtime.current_guide(direct_execution_id, actor_role=actor_role)
         record = runtime.store.get(direct_execution_id)
@@ -50186,6 +50351,8 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
             write["payload"] = payload
         if commit_sha:
             write["commit_sha"] = commit_sha
+        if status:
+            write["status"] = status
         result = runtime.submit_line_write(
             direct_execution_id,
             write,
@@ -50262,6 +50429,7 @@ def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
             "status": "pass",
             "qa_summary": "generic QA lacks child/generation/source refs",
         },
+        status="passed",
     )
     _write_line(
         actor_role="observer",

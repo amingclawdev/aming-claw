@@ -4379,6 +4379,9 @@ def _ticket_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
         source.get("target_project_root")
         or source.get("project_root")
         or source.get("repo_root")
+        or source.get("worktree_path")
+        or source.get("worker_worktree_path")
+        or source.get("assigned_worktree")
     )
     worktree_path = _ticket_public_text(
         source.get("worktree_path")
