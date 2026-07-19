@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -1144,6 +1145,7 @@ class AuditedPostmergeRecoveryAuthority:
     merge_queue_id: str
     candidate_commit: str
     merged_commit: str
+    candidate_diff_sha256: str
     qa_receipt_ref: str
     manual_merge_event_ref: str
     diagnostic_backlog_id: str
@@ -1152,6 +1154,7 @@ class AuditedPostmergeRecoveryAuthority:
     no_pass_claim: bool = True
     authoritative_pass_synthesized: bool = False
     business_qa_bypassed: bool = False
+    rejected_preflights_created_snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -15667,6 +15670,11 @@ def queue_merge_item_for_branch_context(
             or postmerge_recovery.no_pass_claim is not True
             or postmerge_recovery.authoritative_pass_synthesized is not False
             or postmerge_recovery.business_qa_bypassed is not False
+            or postmerge_recovery.rejected_preflights_created_snapshot is not False
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(postmerge_recovery.candidate_diff_sha256 or ""),
+            )
             or not str(postmerge_recovery.authority_hash or "").startswith("sha256:")
         ):
             raise ValueError("audited post-merge recovery authority is invalid")
@@ -15713,6 +15721,7 @@ def queue_merge_item_for_branch_context(
         project_id=project_id,
         merge_queue_id=queue_id,
         queue_item_id=queue_item_id or f"{queue_id}:{task_id}",
+        backlog_id=str(context.backlog_id or ""),
         task_id=task_id,
         branch_ref=context.branch_ref,
         queue_index=queue_index,

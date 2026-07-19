@@ -18825,6 +18825,34 @@ def _runtime_context_worker_recovery_payloads(
                     "diagnostic_backlog_id": "<OPEN-system-diagnostic-id>",
                 },
             },
+            "apply_copy_safe_body": {
+                "project_id": project_id,
+                "backlog_id": normalized_backlog_id
+                or "<source backlog_id>",
+                "task_id": task_id,
+                "parent_task_id": (
+                    successor_contract_execution_id
+                    or contract_execution_id
+                    or parent_task_id
+                ),
+                "merge_queue_id": normalized_merge_queue_id
+                or "<runtime_context.current_values.merge_queue_id>",
+                "branch_ref": normalized_branch_ref or "<worker branch_ref>",
+                "target_ref": "refs/heads/main",
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "contract_actor": "observer",
+                "route_token_ref": (
+                    "<worker_task_id close_or_merge_after_evidence route_token_ref>"
+                ),
+                "evidence": {
+                    "qa_evidence": {
+                        "receipt_event_ref": "timeline:<exact-qa-receipt-id>",
+                        "independent_qa_session_id": "<exact-qa-session-id>",
+                        "no_authoritative_pass_claim": True,
+                    }
+                },
+            },
             "server_revalidates": [
                 "runtime/queue/contract identity",
                 "QA session scope and language-aware verification",
@@ -18832,7 +18860,17 @@ def _runtime_context_worker_recovery_payloads(
                 "candidate branch equals the audited business merge commit",
                 "business candidate is an ancestor of the clean canonical current main HEAD",
                 "diagnostic no-PASS policy, exact provenance refs, and recovery_head_commit",
+                "server-recomputed base..candidate diff hash",
+                "git status command success for canonical and candidate worktrees",
+                "Python test summary contains no failed/error suffix",
+                "apply queue/commit and no-PASS QA receipt/session evidence",
                 "zero prior live-merge/reconcile consumption",
+            ],
+            "server_writes_atomically_on_apply": [
+                "merged durable queue row with exact backlog_id",
+                "no-PASS recovery live-merge event",
+                "no-PASS current-full reconcile exception event",
+                "diagnostic provenance links for live merge and exception",
             ],
         },
         "apply_merge_queue_item": {
@@ -29611,6 +29649,12 @@ def _parallel_branch_postmerge_recovery_materialize_authority(
                 authority.get("no_pass_claim") is True,
                 authority.get("authoritative_pass_synthesized") is False,
                 authority.get("business_qa_bypassed") is False,
+                authority.get("rejected_preflights_created_snapshot") is False,
+                re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(authority.get("candidate_diff_sha256") or ""),
+                )
+                is not None,
                 authority_hash == stable_sha256(authority_payload),
             )
         ):
@@ -29695,6 +29739,46 @@ def _record_parallel_branch_merge_contract_timeline_events(
     )
     is_postmerge_recovery = bool(recovery_authority)
     if is_postmerge_recovery:
+        scope["parent_task_id"] = str(
+            recovery_authority.get("parent_task_id") or ""
+        ).strip()
+        common_payload["parent_task_id"] = scope["parent_task_id"]
+        qa_request_evidence = (
+            qa_evidence.get("request_evidence")
+            if isinstance(qa_evidence.get("request_evidence"), Mapping)
+            else {}
+        )
+        recovery_qa_request = (
+            qa_request_evidence.get("qa_evidence")
+            if isinstance(qa_request_evidence, Mapping)
+            and isinstance(qa_request_evidence.get("qa_evidence"), Mapping)
+            else {}
+        )
+        if not all(
+            (
+                str(queue_item.get("backlog_id") or "").strip()
+                == scope["backlog_id"],
+                str(queue_item.get("branch_head") or "").strip().lower()
+                == str(
+                    recovery_authority.get("candidate_commit") or ""
+                ).lower(),
+                merge_commit.lower()
+                == str(
+                    recovery_authority.get("merged_commit") or ""
+                ).lower(),
+                str(recovery_qa_request.get("receipt_event_ref") or "")
+                == str(recovery_authority.get("qa_receipt_ref") or ""),
+                str(
+                    recovery_qa_request.get("independent_qa_session_id") or ""
+                ).strip(),
+                recovery_qa_request.get("no_authoritative_pass_claim") is True,
+            )
+        ):
+            raise GovernanceError(
+                "audited_postmerge_recovery_apply_evidence_invalid",
+                "recovery apply must preserve exact queue, commit, and no-PASS QA evidence",
+                422,
+            )
         common_payload.update(
             {
                 "audited_postmerge_recovery_authority": recovery_authority,
@@ -29735,7 +29819,11 @@ def _record_parallel_branch_merge_contract_timeline_events(
             == str(common_payload["queue_item_id"] or "")
         ):
             return []
-    actor = str(body.get("contract_actor") or "codex-observer").strip()
+    actor = (
+        "observer"
+        if is_postmerge_recovery
+        else str(body.get("contract_actor") or "codex-observer").strip()
+    )
     requested_by_actor = str(body.get("actor") or "").strip()
     events: list[dict[str, Any]] = []
 
@@ -29752,43 +29840,42 @@ def _record_parallel_branch_merge_contract_timeline_events(
     )
     if is_postmerge_recovery:
         preview_evidence.update({"status": "waived", "no_pass_claim": True})
-    events.append(
-        task_timeline.record_event(
-            conn,
-            project_id=project_id,
-            backlog_id=scope["backlog_id"],
-            task_id=scope["task_id"],
-            event_type=(
-                "parallel.merge_preview_postmerge_recovery"
-                if is_postmerge_recovery
-                else "parallel.merge_preview"
-            ),
-            event_kind=("blocker" if is_postmerge_recovery else "merge_preview"),
-            phase="merge_preview",
-            actor=actor,
-            status=(
-                "proceeded_with_exception" if is_postmerge_recovery else "passed"
-            ),
-            decision=(
-                "audited_postmerge_merge_preview_projection_no_pass"
-                if is_postmerge_recovery
-                else ""
-            ),
-            payload={
-                **common_payload,
-                "requirement_id": "merge_preview",
-                "contract_evidence": [preview_evidence],
-                "merge_preview": dict(preview),
-                "gate_plan": dict(gate_plan),
-                "requested_by_actor": requested_by_actor,
-            },
-            commit_sha=str(
-                preview.get("target_commit")
-                or queue_item.get("target_head_before_merge")
-                or ""
-            ),
-        )
+    preview_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=scope["backlog_id"],
+        task_id=scope["task_id"],
+        event_type=(
+            "parallel.merge_preview_postmerge_recovery"
+            if is_postmerge_recovery
+            else "parallel.merge_preview"
+        ),
+        event_kind=("blocker" if is_postmerge_recovery else "merge_preview"),
+        phase="merge_preview",
+        actor=actor,
+        status=(
+            "proceeded_with_exception" if is_postmerge_recovery else "passed"
+        ),
+        decision=(
+            "audited_postmerge_merge_preview_projection_no_pass"
+            if is_postmerge_recovery
+            else ""
+        ),
+        payload={
+            **common_payload,
+            "requirement_id": "merge_preview",
+            "contract_evidence": [preview_evidence],
+            "merge_preview": dict(preview),
+            "gate_plan": dict(gate_plan),
+            "requested_by_actor": requested_by_actor,
+        },
+        commit_sha=str(
+            preview.get("target_commit")
+            or queue_item.get("target_head_before_merge")
+            or ""
+        ),
     )
+    events.append(preview_event)
 
     live_ref = f"merge_execute:{merge_commit}" if merge_commit else ""
     live_evidence = _parallel_branch_contract_evidence_item(
@@ -29807,38 +29894,147 @@ def _record_parallel_branch_merge_contract_timeline_events(
     )
     if is_postmerge_recovery:
         live_evidence.update({"status": "waived", "no_pass_claim": True})
-    events.append(
-        task_timeline.record_event(
+    live_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=scope["backlog_id"],
+        task_id=scope["task_id"],
+        event_type=(
+            "parallel.live_merge_postmerge_recovery"
+            if is_postmerge_recovery
+            else "parallel.live_merge"
+        ),
+        event_kind="live_merge",
+        phase="live_merge",
+        actor=actor,
+        status=(
+            "proceeded_with_exception" if is_postmerge_recovery else "passed"
+        ),
+        decision=(
+            "audited_postmerge_durable_merge_projection_no_pass"
+            if is_postmerge_recovery
+            else ""
+        ),
+        payload={
+            **common_payload,
+            "requirement_id": "live_merge",
+            "contract_evidence": [live_evidence],
+            "recorded_merge": dict(recorded),
+            "requested_by_actor": requested_by_actor,
+        },
+        commit_sha=merge_commit,
+    )
+    events.append(live_event)
+    if is_postmerge_recovery:
+        diagnostic_id = str(
+            recovery_authority.get("diagnostic_backlog_id") or ""
+        ).strip()
+        diagnostic_row = conn.execute(
+            "SELECT status, provenance_paths FROM backlog_bugs WHERE bug_id = ?",
+            (diagnostic_id,),
+        ).fetchone()
+        reconcile_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM graph_current_full_reconcile_provenance
+                WHERE project_id = ? AND lower(target_commit_sha) = ?
+                """,
+                (project_id, merge_commit.lower()),
+            ).fetchone()[0]
+        )
+        if not (
+            diagnostic_row is not None
+            and str(diagnostic_row["status"] or "") == "OPEN"
+            and reconcile_count == 0
+            and recovery_authority.get("rejected_preflights_created_snapshot")
+            is False
+        ):
+            raise GovernanceError(
+                "audited_postmerge_reconcile_exception_not_recordable",
+                "recovery diagnostic or zero-reconcile precondition changed before merge projection",
+                409,
+            )
+        exception_event = task_timeline.record_event(
             conn,
             project_id=project_id,
             backlog_id=scope["backlog_id"],
             task_id=scope["task_id"],
             event_type=(
-                "parallel.live_merge_postmerge_recovery"
-                if is_postmerge_recovery
-                else "parallel.live_merge"
+                "graph_reconcile.contract_merge_authority_projection_blocked"
             ),
-            event_kind="live_merge",
-            phase="live_merge",
-            actor=actor,
-            status=(
-                "proceeded_with_exception" if is_postmerge_recovery else "passed"
-            ),
-            decision=(
-                "audited_postmerge_durable_merge_projection_no_pass"
-                if is_postmerge_recovery
-                else ""
-            ),
-            payload={
-                **common_payload,
-                "requirement_id": "live_merge",
-                "contract_evidence": [live_evidence],
-                "recorded_merge": dict(recorded),
-                "requested_by_actor": requested_by_actor,
-            },
+            event_kind="blocker",
+            phase="post_merge_reconcile",
+            actor="observer",
+            status="proceeded_with_exception",
+            decision="audited_system_route_bypass_no_pass",
             commit_sha=merge_commit,
+            payload={
+                "actual_reconcile_count_before_bypass": 0,
+                "allowed_bypass_operation": (
+                    "one_current_full_reconcile_and_activation"
+                ),
+                "authoritative_pass_synthesized": False,
+                "business_qa_bypassed": False,
+                "classification": (
+                    "stale_contract_runtime_missing_durable_merge_projection"
+                ),
+                "diagnostic_backlog_id": diagnostic_id,
+                "diagnostic_status": "OPEN",
+                "durable_merge_event_ref": f"timeline:{live_event['id']}",
+                "durable_merge_queue_id": scope["merge_queue_id"],
+                "independent_qa_receipt_ref": str(
+                    recovery_authority.get("qa_receipt_ref") or ""
+                ),
+                "merged_commit": merge_commit,
+                "rejected_requests_created_snapshot": False,
+                "source_contract_execution_id": scope["parent_task_id"],
+                "system_reconcile_authority_bypassed": True,
+                "route_token_gate": route_gate_payload,
+                "source_backed_contract_gate_authority": (
+                    task_timeline.source_backed_route_gate_authority(
+                        route_gate_payload
+                    )
+                ),
+            },
+            verification={
+                "final_reconcile_still_required": True,
+                "main_tests_passed": True,
+                "no_pass_claim": True,
+                "ordered_merge_complete": True,
+                "preflight_only_no_snapshot": True,
+            },
         )
-    )
+        events.append(exception_event)
+        diagnostic_refs = _json_loads(
+            diagnostic_row["provenance_paths"], []
+        )
+        linked_refs = [
+            str(item or "").strip()
+            for item in diagnostic_refs
+            if str(item or "").strip()
+        ] if isinstance(diagnostic_refs, list) else []
+        for evidence_ref in (
+            f"backlog:{scope['backlog_id']}",
+            f"contract-runtime:{scope['parent_task_id']}",
+            str(recovery_authority.get("qa_receipt_ref") or ""),
+            f"timeline:{live_event['id']}",
+            f"timeline:{exception_event['id']}",
+            f"merge:{merge_commit}",
+        ):
+            if evidence_ref and evidence_ref not in linked_refs:
+                linked_refs.append(evidence_ref)
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+            SET provenance_paths = ?, updated_at = ?
+            WHERE bug_id = ? AND status = 'OPEN'
+            """,
+            (
+                json.dumps(linked_refs, ensure_ascii=False),
+                _utc_now(),
+                diagnostic_id,
+            ),
+        )
     return events
 
 
@@ -29973,7 +30169,10 @@ def _independent_qa_toolchain_evidence_passed(
             verification.get("python_focused_tests") or ""
         ).strip().lower()
         return bool(
-            re.match(r"^[1-9][0-9]*\s+passed\b", focused)
+            re.fullmatch(
+                r"[1-9][0-9]*\s+passed(?:\s+in\s+[0-9]+(?:\.[0-9]+)?s)?",
+                focused,
+            )
             and str(verification.get("py_compile") or "").strip().lower()
             == "passed"
             and str(
@@ -29988,6 +30187,49 @@ def _independent_qa_toolchain_evidence_passed(
             == "passed"
         )
     return False
+
+
+def _server_candidate_diff_sha256(
+    project_root: Path,
+    *,
+    base_commit: str,
+    candidate_commit: str,
+) -> str:
+    """Hash the exact server-side review diff; command failure is not clean."""
+
+    diff = _qa_git_bytes(
+        project_root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{base_commit}..{candidate_commit}",
+            "--",
+            ".",
+        ],
+    )
+    if diff.returncode != 0:
+        return ""
+    return f"sha256:{hashlib.sha256(diff.stdout).hexdigest()}"
+
+
+def _git_clean_worktree_verified(project_root: Path) -> bool:
+    """Return true only when git status itself succeeds and reports no paths."""
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=project_root,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and not result.stdout.strip()
 
 
 def _audited_postmerge_recovery_ref_id(value: Any) -> int:
@@ -30343,6 +30585,7 @@ def _audited_postmerge_recovery_authority(
         and str(trigger.get("merged_commit") or "").lower()
         == audited_candidate_commit
         and _safe_int(trigger.get("actual_reconcile_count")) == 0
+        and trigger.get("rejected_preflight_created_snapshot") is False
         and trigger.get("no_pass_claim") is True
         and isinstance(provenance, list)
         and qa_ref in provenance
@@ -30358,11 +30601,15 @@ def _audited_postmerge_recovery_authority(
     branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
     branch_commit = _git_output(canonical_root, ["rev-parse", branch_ref]).lower()
     target_commit = _git_output(canonical_root, ["rev-parse", "refs/heads/main"]).lower()
-    target_dirty = _git_dirty_paths(canonical_root, limit=1)
-    candidate_dirty = (
-        _git_dirty_paths(context_root, limit=1)
-        if context_root.is_dir()
-        else ["<missing-worker-worktree>"]
+    target_clean = _git_clean_worktree_verified(canonical_root)
+    candidate_clean = bool(
+        context_root.is_dir()
+        and _git_clean_worktree_verified(context_root)
+    )
+    server_diff_sha256 = _server_candidate_diff_sha256(
+        canonical_root,
+        base_commit=baseline_commit,
+        candidate_commit=candidate_commit,
     )
     recovery_head_commit = str(
         trigger.get("recovery_head_commit") or ""
@@ -30371,12 +30618,18 @@ def _audited_postmerge_recovery_authority(
         branch_commit == candidate_commit == audited_candidate_commit
         and target_commit == recovery_head_commit
         and _git_commit_is_ancestor(canonical_root, candidate_commit, target_commit)
-        and not target_dirty
-        and not candidate_dirty
+        and target_clean
+        and candidate_clean
     ):
         raise GovernanceError(
             "audited_postmerge_recovery_git_state_invalid",
             "candidate/current audited recovery head ancestry or clean-worktree identity changed after the audited merge",
+            409,
+        )
+    if not server_diff_sha256 or server_diff_sha256 != diff_sha256:
+        raise GovernanceError(
+            "audited_postmerge_recovery_diff_hash_invalid",
+            "independent QA diff hash does not match the server-recomputed candidate diff",
             409,
         )
     reconcile_count = int(
@@ -30431,12 +30684,14 @@ def _audited_postmerge_recovery_authority(
         "merge_queue_id": merge_queue_id,
         "candidate_commit": candidate_commit,
         "merged_commit": target_commit,
+        "candidate_diff_sha256": server_diff_sha256,
         "qa_receipt_ref": qa_ref,
         "manual_merge_event_ref": merge_ref,
         "diagnostic_backlog_id": diagnostic_id,
         "no_pass_claim": True,
         "authoritative_pass_synthesized": False,
         "business_qa_bypassed": False,
+        "rejected_preflights_created_snapshot": False,
     }
     return AuditedPostmergeRecoveryAuthority(
         **{
@@ -36932,8 +37187,16 @@ def _current_full_reconcile_audited_no_pass_authority(
             == candidate_commit
             and str(merge_recovery_authority.get("merged_commit") or "").lower()
             == target_commit
+            and str(
+                merge_recovery_authority.get("candidate_diff_sha256") or ""
+            )
+            == diff_sha256
             and str(merge_recovery_authority.get("qa_receipt_ref") or "")
             == f"timeline:{qa_event_id}"
+            and merge_recovery_authority.get(
+                "rejected_preflights_created_snapshot"
+            )
+            is False
         )
         merge_qa = merge_payload.get("qa_evidence")
         merge_request_evidence = (
@@ -37071,7 +37334,14 @@ def _current_full_reconcile_audited_no_pass_authority(
             qa_time is not None
             and merge_time is not None
             and exception_time is not None
-            and qa_time < merge_time < exception_time
+            and qa_time < merge_time
+            and (
+                merge_time < exception_time
+                or (
+                    merge_time == exception_time
+                    and merge_event_id < exception_id
+                )
+            )
         ):
             continue
 
