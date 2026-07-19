@@ -18792,8 +18792,8 @@ def _runtime_context_worker_recovery_payloads(
             "one_shot": True,
             "eligible_only_after": [
                 "exact candidate business-QA receipt persisted",
-                "audited fast-forward already landed at clean main HEAD",
-                "OPEN system-only diagnostic binds the same evidence",
+                "audited fast-forward business candidate is an ancestor of clean main HEAD",
+                "OPEN system-only diagnostic binds the same evidence and exact recovery HEAD",
                 "no current-full reconcile materialization exists for HEAD",
             ],
             "forbidden_fields": [
@@ -18829,9 +18829,9 @@ def _runtime_context_worker_recovery_payloads(
                 "runtime/queue/contract identity",
                 "QA session scope and language-aware verification",
                 "timeline source-backed route authority",
-                "candidate branch equals clean canonical main HEAD",
-                "Git ancestry and both worktrees clean",
-                "diagnostic no-PASS policy and exact provenance refs",
+                "candidate branch equals the audited business merge commit",
+                "business candidate is an ancestor of the clean canonical current main HEAD",
+                "diagnostic no-PASS policy, exact provenance refs, and recovery_head_commit",
                 "zero prior live-merge/reconcile consumption",
             ],
         },
@@ -30268,7 +30268,9 @@ def _audited_postmerge_recovery_authority(
         else ""
     )
     adversarial_match = re.fullmatch(r"([1-9][0-9]*)/\1", adversarial)
-    merged_commit = str(merge_row["commit_sha"] or "").strip().lower()
+    audited_candidate_commit = str(
+        merge_row["commit_sha"] or ""
+    ).strip().lower()
     merge_valid = bool(
         str(merge_row["backlog_id"] or "") == backlog_id
         and str(merge_row["task_id"] or "") == execution_id
@@ -30279,11 +30281,11 @@ def _audited_postmerge_recovery_authority(
         and str(merge_row["status"] or "") == "proceeded_with_exception"
         and str(merge_row["decision"] or "")
         == "audited_fast_forward_after_merge_queue_system_block_no_pass"
-        and merged_commit == candidate_commit
+        and audited_candidate_commit == candidate_commit
         and str(merge_payload.get("schema_version") or "")
         == "audited_fast_forward_merge.v1"
         and str(merge_payload.get("merged_commit") or "").lower()
-        == merged_commit
+        == audited_candidate_commit
         and str(merge_payload.get("merge_mode") or "") == "git_fast_forward_only"
         and merge_payload.get("exact_base_match") is True
         and merge_payload.get("main_was_clean") is True
@@ -30338,7 +30340,8 @@ def _audited_postmerge_recovery_authority(
         and str(policy.get("source_runtime_context_id") or "")
         == runtime_context_id
         and isinstance(trigger, Mapping)
-        and str(trigger.get("merged_commit") or "").lower() == merged_commit
+        and str(trigger.get("merged_commit") or "").lower()
+        == audited_candidate_commit
         and _safe_int(trigger.get("actual_reconcile_count")) == 0
         and trigger.get("no_pass_claim") is True
         and isinstance(provenance, list)
@@ -30361,15 +30364,19 @@ def _audited_postmerge_recovery_authority(
         if context_root.is_dir()
         else ["<missing-worker-worktree>"]
     )
+    recovery_head_commit = str(
+        trigger.get("recovery_head_commit") or ""
+    ).strip().lower()
     if not (
-        branch_commit == candidate_commit == merged_commit == target_commit
+        branch_commit == candidate_commit == audited_candidate_commit
+        and target_commit == recovery_head_commit
         and _git_commit_is_ancestor(canonical_root, candidate_commit, target_commit)
         and not target_dirty
         and not candidate_dirty
     ):
         raise GovernanceError(
             "audited_postmerge_recovery_git_state_invalid",
-            "candidate/main ancestry or clean-worktree identity changed after the audited merge",
+            "candidate/current audited recovery head ancestry or clean-worktree identity changed after the audited merge",
             409,
         )
     reconcile_count = int(
@@ -30423,7 +30430,7 @@ def _audited_postmerge_recovery_authority(
         "runtime_context_id": runtime_context_id,
         "merge_queue_id": merge_queue_id,
         "candidate_commit": candidate_commit,
-        "merged_commit": merged_commit,
+        "merged_commit": target_commit,
         "qa_receipt_ref": qa_ref,
         "manual_merge_event_ref": merge_ref,
         "diagnostic_backlog_id": diagnostic_id,

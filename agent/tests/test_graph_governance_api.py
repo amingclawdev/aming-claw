@@ -16445,6 +16445,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     baseline_snapshot_id = "full-postmerge-recovery-baseline"
     baseline_commit = "b" * 40
     candidate_commit = "a" * 40
+    recovery_head_commit = "c" * 40
     diff_sha256 = "sha256:" + "d" * 64
     qa_principal = "qa:postmerge-recovery-exact"
     worker_root = tmp_path / "worker"
@@ -16633,6 +16634,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             json.dumps(
                 {
                     "merged_commit": candidate_commit,
+                    "recovery_head_commit": recovery_head_commit,
                     "actual_reconcile_count": 0,
                     "no_pass_claim": True,
                 }
@@ -16652,7 +16654,11 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     monkeypatch.setattr(
         server,
         "_git_output",
-        lambda *_args, **_kwargs: candidate_commit,
+        lambda _root, argv: (
+            recovery_head_commit
+            if argv[-1] == "refs/heads/main"
+            else candidate_commit
+        ),
     )
     monkeypatch.setattr(server, "_git_dirty_paths", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
@@ -16691,8 +16697,45 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     )
     assert isinstance(authority, AuditedPostmergeRecoveryAuthority)
     assert authority.candidate_commit == candidate_commit
+    assert authority.merged_commit == recovery_head_commit
     assert authority.no_pass_claim is True
     assert authority.authoritative_pass_synthesized is False
+    forged_trigger = {
+        "merged_commit": candidate_commit,
+        "recovery_head_commit": "e" * 40,
+        "actual_reconcile_count": 0,
+        "no_pass_claim": True,
+    }
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (json.dumps(forged_trigger), diagnostic_id),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as forged_recovery_head:
+        server._audited_postmerge_recovery_authority(
+            conn,
+            project_id=PID,
+            body=body,
+            route_gate=recovery_gate,
+        )
+    assert forged_recovery_head.value.code == (
+        "audited_postmerge_recovery_git_state_invalid"
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "merged_commit": candidate_commit,
+                    "recovery_head_commit": recovery_head_commit,
+                    "actual_reconcile_count": 0,
+                    "no_pass_claim": True,
+                }
+            ),
+            diagnostic_id,
+        ),
+    )
+    conn.commit()
     queued = queue_merge_item_for_branch_context(
         conn,
         project_id=PID,
@@ -16734,9 +16777,9 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     merged_queue_item = {
         **queued["queue_item"],
         "status": "merged",
-        "merge_commit": candidate_commit,
-        "target_head_before_merge": candidate_commit,
-        "target_head_after_merge": candidate_commit,
+        "merge_commit": recovery_head_commit,
+        "target_head_before_merge": recovery_head_commit,
+        "target_head_after_merge": recovery_head_commit,
     }
     recovery_merge_events = (
         server._record_parallel_branch_merge_contract_timeline_events(
@@ -16760,14 +16803,14 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
                 "executed": False,
                 "already_integrated": True,
                 "target_ref_mutated": False,
-                "merge_commit": candidate_commit,
+                "merge_commit": recovery_head_commit,
                 "recorded": {
                     "queue_item": merged_queue_item,
                     "context": queued["context"],
                 },
                 "preview": {
                     "status": "pass",
-                    "target_commit": candidate_commit,
+                    "target_commit": recovery_head_commit,
                     "branch_commit": candidate_commit,
                 },
                 "gate_plan": {},
@@ -58748,6 +58791,14 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "worker-guide-scope-task"
     )
     assert "fence_token" in postmerge_recovery["forbidden_fields"]
+    assert any(
+        "recovery_head_commit" in item
+        for item in postmerge_recovery["server_revalidates"]
+    )
+    assert any(
+        "ancestor" in item and "current main HEAD" in item
+        for item in postmerge_recovery["server_revalidates"]
+    )
     assert set(implementation_body) & set(
         server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     ) == {"route_token_ref"}
