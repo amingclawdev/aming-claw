@@ -105,7 +105,7 @@ def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str)
     state = record["execution_state"]
     guide = record["runtime_guide"]
     next_action = guide.get("next_legal_action") or {}
-    return {
+    write = {
         "project_id": record["project_id"],
         "backlog_id": record["backlog_id"],
         "contract_execution_id": record["contract_execution_id"],
@@ -118,6 +118,9 @@ def _runtime_write_from(record, *, actor_role: str, stage_id: str, line_id: str)
         "actor_role": actor_role,
         "evidence_kind": next_action.get("evidence_kind") or "",
     }
+    if actor_role == "qa" and line_id == "qa_independent_verification":
+        write["status"] = "passed"
+    return write
 
 
 def _runtime_next_write(record, *, actor_role: str):

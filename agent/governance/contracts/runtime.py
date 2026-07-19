@@ -1737,6 +1737,12 @@ def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
 _CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
     {"fail", "failed", "failure", "rejected", "blocked"}
 )
+_QA_COMPLETION_PASSING_STATUSES = frozenset(
+    {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+)
+_QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION = (
+    "contract_runtime.qa_completion_status_gate.v1"
+)
 _CONTRACT_COMPLETION_STATUS_FIELDS = frozenset(
     {
         "status",
@@ -2555,6 +2561,28 @@ def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
         if _contains_contract_completion_blocker(line.get(field)):
             return False
     if str(line.get("line_id") or "").strip() == "qa_independent_verification":
+        provenance = (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        status_gate = (
+            provenance.get("completion_status_gate")
+            if isinstance(provenance.get("completion_status_gate"), Mapping)
+            else {}
+        )
+        if (
+            str(status_gate.get("schema_version") or "")
+            == _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION
+        ):
+            qa_status = str(line.get("status") or "").strip().lower()
+            if (
+                status_gate.get("top_level_status_present") is not True
+                or status_gate.get("top_level_status_passing") is not True
+                or str(status_gate.get("normalized_status") or "") != qa_status
+                or qa_status not in _QA_COMPLETION_PASSING_STATUSES
+            ):
+                return False
         payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
         if _contains_contract_completion_blocker(payload):
             return False
@@ -4194,6 +4222,7 @@ class ContractRuntime:
         if body_actor_role and effective_actor_role and body_actor_role != effective_actor_role:
             effective_write["body_actor_role"] = body_actor_role
         _enrich_line_instance_fields(effective_write)
+        _enrich_qa_evidence_provenance(effective_write, effective_actor_role)
         guide = self.current_guide(
             contract_execution_id,
             actor_role=effective_actor_role,
@@ -4639,6 +4668,16 @@ def _enrich_qa_evidence_provenance(
         "parent_materialization_authorized",
         write.get("parent_materialization_authorized"),
     )
+    qa_status = str(write.get("status") or "").strip().lower()
+    provenance["completion_status_gate"] = {
+        "schema_version": _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION,
+        "source": "contract_runtime_line_write_normalization",
+        "top_level_status_present": bool(qa_status),
+        "top_level_status_passing": qa_status in _QA_COMPLETION_PASSING_STATUSES,
+        "normalized_status": qa_status,
+        "nested_payload_decision_satisfies": False,
+        "server_derived": True,
+    }
     write["qa_evidence_provenance"] = provenance
 
 

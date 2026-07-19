@@ -51005,6 +51005,32 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
         "query_purpose": "independent_verification",
         "payload": {"decision": "pass", "auth_source": "trusted_qa_role"},
     }
+    hotfix_record_before_qa = runtime.store.get(hotfix["contract_execution_id"])
+    normalized_precheck = runtime.precheck_line_write(
+        hotfix["contract_execution_id"],
+        server._contract_runtime_line_write_body(
+            hotfix_record_before_qa,
+            qa_evidence_body,
+            actor_role="qa",
+        ),
+        actor_role="qa",
+    )
+    assert normalized_precheck["ok"] is True
+    for field in (
+        "status",
+        "verdict",
+        "verification",
+        "tests",
+        "test_results",
+        "changed_files",
+        "owned_changed_files",
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+    ):
+        assert normalized_precheck["write"][field] == qa_evidence_body[field]
+    assert normalized_precheck["write"]["qa_evidence_provenance"][
+        "completion_status_gate"
+    ]["top_level_status_passing"] is True
     qa_precheck = server.handle_project_contract_runtime_line_write_precheck(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": hotfix["contract_execution_id"]},
@@ -51044,6 +51070,18 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
         "query_purpose",
     ):
         assert persisted_qa[field] == qa_evidence_body[field]
+    passing_status_gate = persisted_qa["qa_evidence_provenance"][
+        "completion_status_gate"
+    ]
+    assert passing_status_gate == {
+        "schema_version": "contract_runtime.qa_completion_status_gate.v1",
+        "source": "contract_runtime_line_write_normalization",
+        "top_level_status_present": True,
+        "top_level_status_passing": True,
+        "normalized_status": "passed",
+        "nested_payload_decision_satisfies": False,
+        "server_derived": True,
+    }
     assert accepted_qa["next_legal_action"]["line_id"] == "observer_close_ready"
 
     failed_hotfix = runtime.start_execution(
@@ -51089,6 +51127,64 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
     ] == (
         "revise_after_failed_independent_qa"
     )
+
+    for label, qa_status in (
+        ("missing", None),
+        ("empty", ""),
+        ("unknown", "reviewed"),
+    ):
+        incomplete_hotfix = runtime.start_execution(
+            "observer_hotfix",
+            project_id=PID,
+            backlog_id=backlog_id,
+            actor_role="observer",
+            contract_execution_id=f"cex-generic-hotfix-{label}-qa-status",
+        )
+        conn.commit()
+        advance_hotfix(incomplete_hotfix["contract_execution_id"])
+        incomplete_body = {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "verdict": "pass",
+            "payload": {"decision": "PASS"},
+        }
+        if qa_status is not None:
+            incomplete_body["status"] = qa_status
+        incomplete_qa = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": incomplete_hotfix[
+                        "contract_execution_id"
+                    ],
+                },
+                "qa",
+                method="POST",
+                body=incomplete_body,
+            )
+        )
+        assert incomplete_qa["ok"] is True
+        incomplete_record = runtime.store.get(
+            incomplete_hotfix["contract_execution_id"]
+        )
+        incomplete_line = incomplete_record["completed_lines"][-1]
+        incomplete_status_gate = incomplete_line["qa_evidence_provenance"][
+            "completion_status_gate"
+        ]
+        assert incomplete_status_gate["server_derived"] is True
+        assert incomplete_status_gate["top_level_status_passing"] is False
+        assert incomplete_status_gate["normalized_status"] == (qa_status or "")
+        assert incomplete_status_gate["nested_payload_decision_satisfies"] is False
+        assert server._active_failed_qa_line_index(
+            incomplete_record["completed_lines"]
+        ) == 2
+        assert incomplete_qa["next_legal_action"]["line_id"] != (
+            "observer_close_ready"
+        )
+        assert incomplete_qa["runtime_guide"]["failed_qa_rework"][
+            "semantic_next_action"
+        ] == "revise_after_failed_independent_qa"
 
 
 def test_contract_runtime_line_write_precheck_route_does_not_append(conn):

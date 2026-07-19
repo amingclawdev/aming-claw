@@ -709,6 +709,7 @@ def _direct_fix_qa_write(record, *, generation: int, repair_ref: str):
         line_id="qa_independent_verification",
         evidence_kind="independent_verification",
     )
+    write["status"] = "passed"
     write["payload"] = {
         "status": "pass",
         "direct_fix_contract_execution_id": record["contract_execution_id"],
@@ -1692,6 +1693,7 @@ def test_direct_fix_qa_without_explicit_binding_counts_after_repair(tmp_path):
         line_id="qa_independent_verification",
         evidence_kind="independent_verification",
     )
+    generic_qa_write["status"] = "passed"
     generic_qa_write["payload"] = {
         "status": "pass",
         "qa_summary": "generic QA line without child/projection/source refs",
