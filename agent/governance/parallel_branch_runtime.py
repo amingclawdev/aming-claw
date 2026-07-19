@@ -13284,11 +13284,19 @@ def _startup_retry_payload_template(
             value = copyable_identity.get("session_token_surrogate")
         if field == "worker_role" and not value:
             value = "mf_sub"
+        if field == "fence_token" and value:
+            value = "<read from env:AMING_WORKER_FENCE_TOKEN>"
         if field in {"session_token"}:
             value = "<redacted-if-present>"
         if value:
             retry[field] = value
     for field in missing:
+        if field == "fence_token":
+            retry.setdefault(
+                "fence_token",
+                "<read from env:AMING_WORKER_FENCE_TOKEN>",
+            )
+            continue
         if field == "session_token_surrogate_or_host_startup_id":
             retry.setdefault(
                 "host_startup_id",

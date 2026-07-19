@@ -772,7 +772,13 @@ def test_worker_commit_bypass_continuation_preserves_current_candidate_without_p
     task_id = "worker-commit-bypass-task"
     backlog_id = "AC-WORKER-COMMIT-BYPASS-CONTINUATION"
     identity = {"runtime_context_id": runtime_context_id, "task_id": task_id}
-    context = SimpleNamespace(**identity, parent_task_id=backlog_id, worktree_path="/worker", base_commit=base_commit)
+    context = SimpleNamespace(
+        **identity,
+        parent_task_id=backlog_id,
+        worktree_path="/worker",
+        base_commit=base_commit,
+        owned_files=("owned.py",),
+    )
     dispatch = {
         "line_id": "observer_dispatch_bounded_workers",
         "payload": {"worker_role": "mf_sub", **identity},
@@ -841,6 +847,87 @@ def test_worker_commit_bypass_continuation_preserves_current_candidate_without_p
     assert server._contract_runtime_server_candidate_commit(None, project_id=PID, record=forged) == old_commit
 
 
+def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(monkeypatch):
+    candidate_commit, historical_commit, base_commit = "d" * 40, "a" * 40, "c" * 40
+    runtime_context_id = "mfrctx-worker-commit-stale"
+    task_id = "worker-commit-stale-task"
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id="AC-WORKER-COMMIT-STALE",
+        worktree_path="/worker",
+        base_commit=base_commit,
+        owned_files=("owned.py",),
+    )
+    record = {
+        "project_id": PID,
+        "contract_execution_id": "cex-worker-commit-stale",
+        "completed_lines": [
+            {
+                "line_id": "observer_dispatch_bounded_workers",
+                "payload": {"worker_role": "mf_sub", "runtime_context_id": runtime_context_id, "task_id": task_id},
+            },
+            {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+                "commit_sha": historical_commit,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "payload": {"changed_files": ["owned.py"]},
+            },
+            {
+                "stage_id": "qa_independent_verification",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+            },
+        ],
+    }
+    request = {
+        "line_id": "worker_commit",
+        "evidence_kind": "contract_line_bypass",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+        "changed_files": ["owned.py"],
+        "evidence_refs": [f"commit:{candidate_commit}"],
+    }
+    monkeypatch.setattr(server, "_contract_runtime_contexts_for_dispatch_line", lambda *_a, **_k: [context])
+    monkeypatch.setattr(server, "_runtime_context_git_dirty_files", lambda _path: [])
+    monkeypatch.setattr(server, "_runtime_context_git_head_commit", lambda _path: candidate_commit)
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_commit_revision_diff",
+        lambda *_a, **_k: {
+            "parent_commit": historical_commit,
+            "base_commit": base_commit,
+            "changed_files": ["owned.py"],
+        },
+    )
+
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None,
+        project_id=PID,
+        record=record,
+        request=request,
+    )
+
+    assert authority["server_derived"] is True
+    assert authority["historical_lineage_stale"] is True
+    assert authority["commit_sha"] == candidate_commit
+    assert authority["changed_files"] == ["owned.py"]
+    assert authority["no_pass_claim"] is True
+
+    context.owned_files = ("different.py",)
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None,
+        project_id=PID,
+        record=record,
+        request=request,
+    ) == {}
+
+
 def test_generic_timeline_path_cannot_author_contract_worker_commit():
     with pytest.raises(GovernanceError) as rejected:
         server._contract_runtime_close_gate(
@@ -854,8 +941,191 @@ def test_generic_timeline_path_cannot_author_contract_worker_commit():
             norm_payload={"worker_commit_sha": "a" * 40},
             trusted_actor_role="mf_sub",
         )
-
     assert rejected.value.code == "contract_worker_commit_facade_required"
+
+
+def test_failed_qa_route_rotation_uses_one_server_correction_identity(monkeypatch):
+    """Regression for req-9b081/5ecb/6ba2: current and source refs do not deadlock."""
+
+    runtime_context_id = "mfrctx-route-rotation"
+    task_id = "worker-route-rotation"
+    old_ref = "rtok-historical-source"
+    current_identity = {
+        "route_id": "route-current",
+        "route_context_hash": "sha256:route-current",
+        "prompt_contract_id": "rprompt-current",
+        "prompt_contract_hash": "sha256:prompt-current",
+        "route_token_ref": "rtok-current",
+        "visible_injection_manifest_hash": "sha256:visible-current",
+    }
+    source_line = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "actor_role": "mf_sub",
+        "line_instance_id": "line-historical-implementation",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "route_id": "route-historical",
+        "route_context_hash": "sha256:route-historical",
+        "prompt_contract_id": "rprompt-historical",
+        "prompt_contract_hash": "sha256:prompt-historical",
+        "route_token_ref": old_ref,
+        "visible_injection_manifest_hash": "sha256:visible-historical",
+    }
+    record = {
+        "contract_execution_id": "cex-route-rotation",
+        "route_token_ref": current_identity["route_token_ref"],
+        "completed_lines": [
+            source_line,
+            {
+                "stage_id": "qa_independent_verification",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+            },
+        ],
+        "execution_state": {"next_legal_action": {}},
+        "runtime_guide": {},
+    }
+    runtime = SimpleNamespace(store=SimpleNamespace(get=lambda _execution_id: record))
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_marker",
+        lambda **_kwargs: {"revision_event_ref": "timeline:rejoin-route-rotation"},
+    )
+    context = SimpleNamespace(task_id=task_id)
+
+    authority = server._runtime_context_historical_rework_route_correction_authority(
+        None,
+        body={"route_token_ref": current_identity["route_token_ref"]},
+        context=context,
+        runtime_context_id=runtime_context_id,
+        contract_execution_id="cex-route-rotation",
+        current_route_identity=current_identity,
+        parent_route_identity=current_identity,
+        timeline_events=[],
+    )
+
+    assert authority["server_derived"] is True
+    assert authority["canonical_route_identity"] == current_identity
+    assert authority["authorization_route_token_ref"] == "rtok-current"
+    assert authority["source_completed_route_token_ref"] == old_ref
+    assert authority["client_composes_multiple_route_identities"] is False
+
+    historical_request = {
+        field: source_line[field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+    }
+    historical_authority = (
+        server._runtime_context_historical_rework_route_correction_authority(
+            None,
+            body=historical_request,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            contract_execution_id="cex-route-rotation",
+            current_route_identity=current_identity,
+            parent_route_identity=current_identity,
+            timeline_events=[],
+        )
+    )
+    assert historical_authority["canonical_route_identity"] == current_identity
+
+    partial_two_identity_request = dict(historical_request)
+    partial_two_identity_request["route_token_ref"] = "rtok-current"
+    assert server._runtime_context_historical_rework_route_correction_authority(
+        None,
+        body=partial_two_identity_request,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        contract_execution_id="cex-route-rotation",
+        current_route_identity=current_identity,
+        parent_route_identity=current_identity,
+        timeline_events=[],
+    ) == {}
+
+    gate = server._contract_runtime_completed_line_projection_gate(
+        record,
+        body={"route_token_ref": "rtok-current"},
+        event_kind="implementation",
+        actor_role="mf_sub",
+        line={
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+        },
+        allow_in_progress_completed_line=True,
+        historical_route_correction=authority,
+    )
+    assert gate["accepted"] is True
+    assert gate["historical_rework_route_correction"]["server_derived"] is True
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_completed_line_projection_gate(
+            record,
+            body={"route_token_ref": "rtok-current"},
+            event_kind="implementation",
+            actor_role="mf_sub",
+            line={
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+            },
+            allow_in_progress_completed_line=True,
+        )
+    assert rejected.value.details["error"] == "completed_line_route_token_ref_mismatch"
+
+
+def test_line_bypass_does_not_preflight_the_same_guide_twice(conn, monkeypatch):
+    class FakeRuntime:
+        store = SimpleNamespace(
+            get=lambda _execution_id: {
+                "project_id": PID,
+                "backlog_id": "AC-BYPASS-SELF-DEADLOCK",
+                "contract_execution_id": "cex-bypass-self-deadlock",
+            }
+        )
+
+        def current_guide(self, *_args, **_kwargs):
+            raise AssertionError("handler must not bootstrap through a duplicate guide read")
+
+        def bypass_current_line(self, *_args, **_kwargs):
+            return {"ok": False, "decision": {"errors": ["expected-test-stop"]}}
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: FakeRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_effective_actor_role",
+        lambda *_args, **_kwargs: "observer",
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (kwargs["record"], {}),
+    )
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": "cex-bypass-self-deadlock",
+            },
+            method="POST",
+            body={
+                "line_id": "observer_merge",
+                "bypass_identity": "bypass-self-deadlock",
+            },
+        )
+    )
+    assert response["ok"] is False
+    assert response["decision"]["errors"] == ["expected-test-stop"]
 
 
 def test_contract_runtime_close_execution_id_resolves_pinned_non_cex_only(conn):
@@ -889,6 +1159,43 @@ def test_contract_runtime_close_execution_id_resolves_pinned_non_cex_only(conn):
         {"contract_execution_id": "unknown-non-cex-execution"},
         conn=conn,
     ) == ""
+
+
+def test_worker_initial_join_copy_safe_body_carries_contract_execution_identity():
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id="mfrctx-initial-join-contract",
+        task_id="worker-initial-join-contract",
+        parent_task_id="cex-root-contract",
+        worker_id="worker-initial-join-contract",
+        worker_slot_id="slot-initial-join-contract",
+        target_project_root="/canonical/repo",
+        contract_execution_id="cex-active-worker-contract",
+    )
+
+    initial = payloads["session_token_initial_join_submission"]["copy_safe_body"]
+    rejoin = payloads["session_token_rejoin_submission"]["copy_safe_body"]
+    assert initial["contract_execution_id"] == "cex-active-worker-contract"
+    assert rejoin["contract_execution_id"] == "cex-active-worker-contract"
+    assert initial["parent_task_id"] == "cex-root-contract"
+    assert initial["target_project_root"] == "/canonical/repo"
+
+
+def test_startup_refusal_retry_payload_never_echoes_raw_fence_token():
+    from agent.governance import parallel_branch_runtime
+
+    retry = parallel_branch_runtime._startup_retry_payload_template(
+        payload={
+            "runtime_context_id": "mfrctx-startup-refusal",
+            "task_id": "worker-startup-refusal",
+            "fence_token": "raw-fence-must-not-leak",
+        },
+        missing=[],
+        identity_fields={},
+    )
+
+    assert retry["fence_token"] == "<read from env:AMING_WORKER_FENCE_TOKEN>"
+    assert "raw-fence-must-not-leak" not in json.dumps(retry, sort_keys=True)
 
 
 def test_contract_runtime_worker_implementation_preserves_top_level_lineage_proof():
@@ -28885,6 +29192,11 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
             "parent_contract_execution_id": "cex-parent-empty-target-root",
             "successor_contract_execution_id": "cex-qa-empty-target-root",
             "target_files": ["agent/governance/server.py"],
+            "profile_requirements": {
+                "profile_id": "codex-mf-sub",
+                "harness": "codex",
+            },
+            "retry_policy": {"attempt": 1, "max_attempts": 2},
         },
         route_identity={
             "route_id": "route-empty-target-root",
@@ -28965,6 +29277,21 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     assert worker_guide["target_project_root"] == str(target_root)
     assert worker_guide["project_root"] == str(target_root)
     assert worker_guide["repo_root"] == str(target_root)
+    assert worker_guide["contract_execution_id"] == "cex-empty-target-root"
+    assert worker_guide["parent_task_id"] == "parent-empty-target-root"
+    assert worker_guide["branch_ref"] == (
+        "refs/heads/codex/worker-empty-target-root"
+    )
+    assert worker_guide["child_route_token_ref"] == "rtok-empty-target-root"
+    assert worker_guide["owned_files"] == ["agent/governance/server.py"]
+    assert worker_guide["profile_requirements"] == {
+        "profile_id": "codex-mf-sub",
+        "harness": "codex",
+    }
+    assert worker_guide["retry_policy"] == {"attempt": 1, "max_attempts": 2}
+    assert worker_guide["actionable_payloads"][
+        "session_token_initial_join_submission"
+    ]["copy_safe_body"]["contract_execution_id"] == "cex-empty-target-root"
     capacity_guidance = worker_guide["capacity_fallback_guidance"]
     assert guide["capacity_fallback_guidance"] == capacity_guidance
     assert worker_guide["actionable_payloads"][

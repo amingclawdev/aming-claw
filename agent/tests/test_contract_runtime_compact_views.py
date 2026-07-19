@@ -6,6 +6,28 @@ import os
 import pytest
 
 
+@pytest.mark.parametrize("failure", [TimeoutError("timeout"), ConnectionRefusedError("refused")])
+def test_optional_judgment_enrichment_is_strict_budget_cached_and_fail_open(
+    monkeypatch,
+    failure,
+):
+    from agent.governance.contracts import runtime
+
+    calls = []
+
+    def unavailable(**kwargs):
+        calls.append(kwargs)
+        raise failure
+
+    runtime._JUDGMENT_HINT_CACHE.clear()
+    monkeypatch.setattr(runtime, "_default_judgment_hints_fetcher", unavailable)
+
+    assert runtime._fetch_judgment_hints(project_id="proj", task_id="task") is None
+    assert runtime._fetch_judgment_hints(project_id="proj", task_id="task") is None
+    assert len(calls) == 1
+    assert calls[0]["timeout"] <= 0.2
+
+
 def _ctx(query=None):
     from agent.governance import server
 

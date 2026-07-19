@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -44,7 +45,9 @@ log = logging.getLogger(__name__)
 _JUDGMENT_HINTS_DISABLED_ENV = "AMING_JB_HINTS_DISABLED"
 _JUDGMENT_HINT_PORT_ENV = "JUDGMENT_BRAIN_HINT_PORT"
 _JUDGMENT_HINT_DEFAULT_PORT = "40123"
-_JUDGMENT_HINT_TIMEOUT_SECONDS = 1.0
+_JUDGMENT_HINT_TIMEOUT_SECONDS = 0.2
+_JUDGMENT_HINT_CACHE_TTL_SECONDS = 30.0
+_JUDGMENT_HINT_CACHE: dict[tuple[str, str], tuple[float, list[Any] | None]] = {}
 
 
 class ContractRuntimeError(ValueError):
@@ -3077,6 +3080,12 @@ def _fetch_judgment_hints(
     if not project_id or not task_id:
         log.info("judgment_hints_gap: missing project_id or task_id")
         return None
+    cache_key = (project_id, task_id)
+    use_cache = fetcher is None
+    if use_cache:
+        cached = _JUDGMENT_HINT_CACHE.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < _JUDGMENT_HINT_CACHE_TTL_SECONDS:
+            return deepcopy(cached[1])
     fetch = fetcher or _default_judgment_hints_fetcher
     try:
         result = fetch(
@@ -3095,10 +3104,16 @@ def _fetch_judgment_hints(
         json.JSONDecodeError,
     ) as exc:
         log.info("judgment_hints_gap: fetch failed open: %s", exc)
+        if use_cache:
+            _JUDGMENT_HINT_CACHE[cache_key] = (time.monotonic(), None)
         return None
     if not hints:
         log.info("judgment_hints_gap: empty or missing hints")
+        if use_cache:
+            _JUDGMENT_HINT_CACHE[cache_key] = (time.monotonic(), None)
         return None
+    if use_cache:
+        _JUDGMENT_HINT_CACHE[cache_key] = (time.monotonic(), deepcopy(hints))
     return hints
 
 

@@ -11354,6 +11354,9 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         or ctx.body.get("contract_execution_id")
                         or ""
                     ),
+                    contract_execution_id=str(
+                        ctx.body.get("contract_execution_id") or ""
+                    ),
                     worker_id=saved.worker_slot_id or saved.worker_id,
                     session_token_ref=runtime_context_session_token_ref(saved),
                     target_project_root=saved.target_project_root,
@@ -13069,6 +13072,43 @@ def _runtime_context_projection_response(
             },
         ],
     )
+    profile_requirements = next(
+        (
+            dict(source.get("profile_requirements") or {})
+            for source in (
+                latest_revision_payload.get("payload")
+                if isinstance(latest_revision_payload.get("payload"), Mapping)
+                else {},
+                latest_revision_payload,
+                full_worker_view_for_scope,
+                worker_view_for_summary,
+            )
+            if isinstance(source.get("profile_requirements"), Mapping)
+            and source.get("profile_requirements")
+        ),
+        {},
+    )
+    retry_policy = next(
+        (
+            dict(source.get("retry_policy") or {})
+            for source in (
+                latest_revision_payload.get("payload")
+                if isinstance(latest_revision_payload.get("payload"), Mapping)
+                else {},
+                latest_revision_payload,
+                full_worker_view_for_scope,
+                worker_view_for_summary,
+            )
+            if isinstance(source.get("retry_policy"), Mapping)
+            and source.get("retry_policy")
+        ),
+        {},
+    )
+    branch_ref = str(
+        getattr(context, "branch_ref", "")
+        or latest_revision_payload.get("branch_ref")
+        or ""
+    ).strip()
     if worker_scope_files and isinstance(worker_view_for_summary, dict):
         _runtime_context_patch_worker_scope(worker_view_for_summary, worker_scope_files)
         if "worker_view" in exposed_views:
@@ -13128,6 +13168,9 @@ def _runtime_context_projection_response(
         "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
         "owned_files": list(worker_scope_files),
         "target_files": list(worker_scope_files),
+        "branch_ref": branch_ref,
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
         "runtime_context_id": runtime_context_id,
         "task_id": getattr(context, "task_id", ""),
         "role_scope": role_scope,
@@ -15146,6 +15189,17 @@ def _runtime_context_worker_guide_response(
             task,
         ],
     )
+    profile_requirements = dict(
+        current_state_response.get("profile_requirements") or {}
+    )
+    retry_policy = dict(current_state_response.get("retry_policy") or {})
+    branch_ref = str(
+        current_state_response.get("branch_ref")
+        or graph_identity.get("branch_ref")
+        or task.get("branch_ref")
+        or branch_view.get("branch_ref")
+        or ""
+    ).strip()
     if worker_scope_files:
         for scope_container in (
             worker_view,
@@ -15290,7 +15344,13 @@ def _runtime_context_worker_guide_response(
                 "header": "X-Gov-Token",
                 "role_required": "mf_sub",
                 "required": False,
+                "credential_kind": "governance_session_only",
+                "worker_session_token_allowed_in_header": False,
             },
+            "http_auth_separation": (
+                "Worker session auth belongs in the documented query/body "
+                "session_token field; never place a worker token in X-Gov-Token."
+            ),
         }
 
     read_endpoints = {
@@ -16497,9 +16557,20 @@ def _runtime_context_worker_guide_response(
         "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
         "owned_files": list(worker_scope_files),
         "target_files": list(worker_scope_files),
+        "branch_ref": branch_ref,
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
         "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": str(
+            contract_execution_identity.get("contract_execution_id")
+            or contract_runtime_execution_resolution.get("contract_execution_id")
+            or contract_runtime_current_state.get("contract_execution_id")
+            or ""
+        ),
+        "child_route_token_ref": str(route_identity.get("route_token_ref") or ""),
         "session_token_ref": str(worker_view.get("session_token_ref") or ""),
         "session_token_ref_present": bool(worker_view.get("session_token_ref")),
         "raw_session_token_exposed": False,
@@ -16571,6 +16642,17 @@ def _runtime_context_worker_guide_response(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            "contract_execution_id": str(
+                contract_execution_identity.get("contract_execution_id")
+                or contract_runtime_execution_resolution.get(
+                    "contract_execution_id"
+                )
+                or contract_runtime_current_state.get("contract_execution_id")
+                or ""
+            ),
+            "child_route_token_ref": str(
+                route_identity.get("route_token_ref") or ""
+            ),
             "session_token_ref": str(worker_view.get("session_token_ref") or ""),
             "session_token_ref_present": bool(worker_view.get("session_token_ref")),
             "raw_session_token_exposed": False,
@@ -16583,6 +16665,9 @@ def _runtime_context_worker_guide_response(
             "worker_scope": _runtime_context_worker_scope_projection(worker_scope_files),
             "owned_files": list(worker_scope_files),
             "target_files": list(worker_scope_files),
+            "branch_ref": branch_ref,
+            "profile_requirements": profile_requirements,
+            "retry_policy": retry_policy,
             "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
             "next_legal_action": next_legal_action,
             "next_legal_action_decision_source": (
@@ -17334,6 +17419,11 @@ def _runtime_context_worker_recovery_payloads(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            **(
+                {"contract_execution_id": contract_execution_id}
+                if contract_execution_id
+                else {}
+            ),
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
@@ -17349,6 +17439,11 @@ def _runtime_context_worker_recovery_payloads(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            **(
+                {"contract_execution_id": contract_execution_id}
+                if contract_execution_id
+                else {}
+            ),
             "target_project_root": target_project_root,
             "worker_id": worker_id,
             "worker_slot_id": worker_slot_id,
@@ -19908,6 +20003,148 @@ def _runtime_context_implementation_event_route_identity(
     )
 
 
+def _runtime_context_historical_rework_route_correction_authority(
+    conn,
+    *,
+    body: Mapping[str, Any],
+    context: Any,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    current_route_identity: Mapping[str, Any],
+    parent_route_identity: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Derive one current identity for failed-QA evidence after route rotation.
+
+    The historical Contract line remains provenance, never a second client
+    authorization identity.  The later canonical rework path still validates
+    the clean cumulative git diff and the owned-file fence before mutation.
+    """
+
+    if not contract_execution_id or body.get("route_token"):
+        return {}
+    supplied_ref = str(body.get("route_token_ref") or "").strip()
+    if not supplied_ref:
+        return {}
+    try:
+        record = _contract_runtime(conn).store.get(contract_execution_id)
+    except ContractRuntimeError:
+        return {}
+    lines = [
+        line for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    failed_qa_index = _active_failed_qa_line_index(lines)
+    if failed_qa_index < 0:
+        return {}
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    source_line = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if not isinstance(source_line, Mapping):
+        return {}
+    source_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line is source_line or line == source_line
+        ),
+        -1,
+    )
+    if source_index < 0 or source_index >= failed_qa_index:
+        return {}
+    rejoin_marker = _runtime_context_failed_qa_revision_rejoin_marker(
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=timeline_events,
+    )
+    if not rejoin_marker:
+        return {}
+
+    current_identity = {
+        field: str(current_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(current_route_identity.get(field) or "").strip()
+    }
+    parent_identity = {
+        field: str(parent_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(parent_route_identity.get(field) or "").strip()
+    }
+    source_identity = {
+        field: _route_request_identity_value(source_line, field)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if _route_request_identity_value(source_line, field)
+    }
+    current_ref = str(current_identity.get("route_token_ref") or "").strip()
+    parent_ref = str(parent_identity.get("route_token_ref") or "").strip()
+    source_ref = str(source_identity.get("route_token_ref") or "").strip()
+    expected_identity = (
+        source_identity
+        if supplied_ref == source_ref
+        else parent_identity
+        if supplied_ref == parent_ref
+        else current_identity
+        if supplied_ref == current_ref
+        else {}
+    )
+    if not expected_identity or not current_ref or current_ref == source_ref:
+        return {}
+    supplied_identity = {
+        field: _route_request_identity_value(body, field)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if _route_request_identity_value(body, field)
+    }
+    mismatches = [
+        {
+            "field": field,
+            "expected": str(expected_identity.get(field) or "").strip(),
+            "actual": str(value or "").strip(),
+        }
+        for field, value in supplied_identity.items()
+        if str(value or "").strip()
+        and str(expected_identity.get(field) or "").strip()
+        and str(value or "").strip()
+        != str(expected_identity.get(field) or "").strip()
+    ]
+    if mismatches:
+        return {}
+
+    canonical_identity = dict(current_identity)
+    return {
+        "schema_version": "runtime_context.historical_rework_route_correction.v1",
+        "server_derived": True,
+        "status": "current_route_authorizes_historical_source_correction",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "canonical_route_identity": canonical_identity,
+        "authorization_route_token_ref": current_ref,
+        "source_completed_route_token_ref": source_ref,
+        "source_line_instance_id": str(source_line.get("line_instance_id") or ""),
+        "source_line_id": "worker_implementation",
+        "source_evidence_kind": "implementation",
+        "failed_qa_revision_event_ref": str(
+            rejoin_marker.get("revision_event_ref") or ""
+        ),
+        "client_composes_multiple_route_identities": False,
+        "clean_cumulative_git_validation_pending": True,
+        "raw_route_token_persisted": False,
+        "route_lineage": {
+            "schema_version": "runtime_context.implementation_route_lineage.v1",
+            "status": "historical_source_rebound_to_current_runtime_route",
+            "parent_route_lineage": _route_identity_public_summary(
+                parent_route_identity
+            ),
+            "child_route_lineage": _route_identity_public_summary(
+                canonical_identity
+            ),
+        },
+    }
+
+
 def _runtime_context_resolve_implementation_route_token_ref(
     body: Mapping[str, Any],
     *,
@@ -20841,6 +21078,7 @@ def _runtime_context_forward_request(
     body: Mapping[str, Any],
     trusted_route_gate: Mapping[str, Any] | None = None,
     trusted_runtime_context_worker_proof: bool = False,
+    trusted_historical_route_correction: Mapping[str, Any] | None = None,
 ) -> RequestContext:
     forward = RequestContext(
         ctx.handler,
@@ -20857,6 +21095,13 @@ def _runtime_context_forward_request(
         forward._trusted_route_token_gate = dict(trusted_route_gate)
     if trusted_runtime_context_worker_proof:
         forward._trusted_runtime_context_worker_proof = True
+    if (
+        isinstance(trusted_historical_route_correction, Mapping)
+        and trusted_historical_route_correction.get("server_derived") is True
+    ):
+        forward._trusted_historical_route_correction = dict(
+            trusted_historical_route_correction
+        )
     return forward
 
 
@@ -26298,20 +26543,47 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             backlog_id=getattr(context, "backlog_id", ""),
             limit=1000,
         )
+        historical_route_correction = (
+            _runtime_context_historical_rework_route_correction_authority(
+                conn,
+                body=body,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=str(
+                    contract_execution_identity.get("contract_execution_id") or ""
+                ),
+                current_route_identity=route_identity,
+                parent_route_identity=parent_route_identity,
+                timeline_events=timeline_events,
+            )
+        )
     finally:
         conn.close()
-    event_route_identity, route_lineage_payload = (
-        _runtime_context_implementation_event_route_identity(
-            body,
-            project_id=project_id,
-            runtime_context_id=runtime_context_id,
-            context=context,
-            parent_route_identity=parent_route_identity,
-            contract_execution_id=str(
-                contract_execution_identity.get("contract_execution_id") or ""
-            ),
+    if historical_route_correction:
+        event_route_identity = dict(
+            historical_route_correction.get("canonical_route_identity") or {}
         )
-    )
+        route_lineage_payload = {
+            "route_lineage": dict(
+                historical_route_correction.get("route_lineage") or {}
+            ),
+            "historical_rework_route_correction": dict(
+                historical_route_correction
+            ),
+        }
+    else:
+        event_route_identity, route_lineage_payload = (
+            _runtime_context_implementation_event_route_identity(
+                body,
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                context=context,
+                parent_route_identity=parent_route_identity,
+                contract_execution_id=str(
+                    contract_execution_identity.get("contract_execution_id") or ""
+                ),
+            )
+        )
 
     supplied_payload = (
         body.get("payload") if isinstance(body.get("payload"), Mapping) else {}
@@ -26353,6 +26625,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
                 "route_lineage",
                 "parent_route_lineage_repair",
                 "resolved_route_scope",
+                "historical_rework_route_correction",
             }
             and value
         ):
@@ -26557,6 +26830,7 @@ def handle_graph_governance_runtime_context_implementation_evidence(ctx: Request
             body=event_body,
             trusted_route_gate=trusted_route_gate,
             trusted_runtime_context_worker_proof=bool(worker_provenance),
+            trusted_historical_route_correction=historical_route_correction,
         )
     )
     response = _runtime_context_write_response(
@@ -55622,16 +55896,29 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         if line is request or line == request:
             stop = index
             break
-    implementation = next(
-        (
-            line
-            for line in reversed(completed[:stop])
-            if str(line.get("line_id") or "").strip() == "worker_implementation"
-            and str(line.get("evidence_kind") or "").strip() == "implementation"
-            and str(line.get("commit_sha") or "").strip().lower() == commit_sha
-        ),
-        {},
+    requested_runtime_context_id = _timeline_first_deep_text(
+        request, "runtime_context_id"
     )
+    requested_task_id = _timeline_first_deep_text(request, "task_id")
+    implementation = {}
+    for candidate in reversed(completed[:stop]):
+        if str(candidate.get("line_id") or "").strip() != "worker_implementation":
+            continue
+        if str(candidate.get("evidence_kind") or "").strip() != "implementation":
+            continue
+        candidate_runtime_context_id = _timeline_first_deep_text(
+            candidate, "runtime_context_id"
+        )
+        candidate_task_id = _timeline_first_deep_text(candidate, "task_id")
+        if (
+            requested_runtime_context_id
+            and candidate_runtime_context_id != requested_runtime_context_id
+        ):
+            continue
+        if requested_task_id and candidate_task_id != requested_task_id:
+            continue
+        implementation = candidate
+        break
     if not implementation:
         return {}
     runtime_context_id = _timeline_first_deep_text(
@@ -55679,13 +55966,39 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         )
         if str(item or "").strip()
     ]
-    if actual_head != commit_sha or set(implementation_files) != set(changed_files):
+    claimed_files = sorted(
+        set(_runtime_context_service_query_values(request, "changed_files"))
+    )
+    owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    out_of_scope = sorted(set(changed_files) - set(owned_files))
+    historical_lineage_stale = bool(
+        str(implementation.get("commit_sha") or "").strip().lower()
+        != actual_head
+        or set(implementation_files) != set(changed_files)
+    )
+    if actual_head != commit_sha:
+        return {}
+    if claimed_files and claimed_files != sorted(set(changed_files)):
+        return {}
+    if not changed_files or not owned_files or out_of_scope:
+        return {}
+    if historical_lineage_stale and _active_failed_qa_line_index(completed[:stop]) < 0:
         return {}
     return {
         "schema_version": "contract_runtime.worker_commit_bypass_continuation.v1",
         "server_derived": True,
         "db_verified": True,
-        "source": "canonical_worker_implementation+runtime_context_git",
+        "source": (
+            "runtime_context_clean_base_head_diff_after_historical_lineage_stale"
+            if historical_lineage_stale
+            else "canonical_worker_implementation+runtime_context_git"
+        ),
         "no_pass_claim": True,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
@@ -55696,6 +56009,13 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         "commit_diff_files": changed_files,
         "commit_parent_sha": str(revision_diff.get("parent_commit") or ""),
         "diff_base_commit": str(revision_diff.get("base_commit") or ""),
+        "owned_files": owned_files,
+        "out_of_scope_files": [],
+        "clean_worktree": True,
+        "historical_lineage_stale": historical_lineage_stale,
+        "canonical_historical_commit_sha": str(
+            implementation.get("commit_sha") or ""
+        ).strip().lower(),
     }
 
 
@@ -67601,6 +67921,7 @@ def _contract_runtime_completed_line_projection_gate(
     actor_role: str,
     line: Mapping[str, Any],
     allow_in_progress_completed_line: bool = False,
+    historical_route_correction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     guide = (
         record.get("runtime_guide")
@@ -67649,10 +67970,30 @@ def _contract_runtime_completed_line_projection_gate(
     record_route_token_ref = str(record.get("route_token_ref") or "").strip()
     completed_route_token_ref = str(matched_line.get("route_token_ref") or "").strip()
     source_route_token_ref = completed_route_token_ref or record_route_token_ref
+    correction = (
+        dict(historical_route_correction)
+        if isinstance(historical_route_correction, Mapping)
+        else {}
+    )
+    correction_accepts_route_rotation = bool(
+        correction.get("server_derived") is True
+        and str(correction.get("contract_execution_id") or "").strip()
+        == str(record.get("contract_execution_id") or "").strip()
+        and str(correction.get("source_line_id") or "").strip()
+        == requested["line_id"]
+        and str(correction.get("source_evidence_kind") or "").strip()
+        == requested["evidence_kind"]
+        and str(correction.get("authorization_route_token_ref") or "").strip()
+        == request_route_token_ref
+        and str(correction.get("source_completed_route_token_ref") or "").strip()
+        == source_route_token_ref
+        and str(correction.get("failed_qa_revision_event_ref") or "").strip()
+    )
     if (
         request_route_token_ref
         and source_route_token_ref
         and request_route_token_ref != source_route_token_ref
+        and not correction_accepts_route_rotation
     ):
         raise GovernanceError(
             "contract_runtime_close_evidence_rejected",
@@ -67736,6 +68077,11 @@ def _contract_runtime_completed_line_projection_gate(
             "commit_sha": completed_commit_sha,
         },
     }
+    if correction_accepts_route_rotation:
+        gate["historical_rework_route_correction"] = correction
+        gate["projection_source"] = (
+            "completed_contract_runtime_line+server_derived_current_route_correction"
+        )
     if current_state.get("next_legal_action"):
         gate.update(
             {
@@ -67756,6 +68102,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
     body: Mapping[str, Any],
     event_kind: str,
     trusted_actor_role: str = "",
+    historical_route_correction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
     if (
@@ -67818,6 +68165,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
                 actor_role=gate_actor_role,
                 line=completed_line,
                 allow_in_progress_completed_line=True,
+                historical_route_correction=historical_route_correction,
             )
             if gate:
                 gate["completed_line_already_recorded"] = True
@@ -67847,6 +68195,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         event_kind=event_kind,
         actor_role=actor_role,
         line=line,
+        historical_route_correction=historical_route_correction,
     )
 
 
@@ -73219,6 +73568,16 @@ def handle_task_timeline_append(ctx: RequestContext):
     )
     trusted_route_gate = getattr(ctx, "_trusted_route_token_gate", {})
     route_gate = dict(trusted_route_gate) if isinstance(trusted_route_gate, Mapping) else {}
+    trusted_historical_route_correction = getattr(
+        ctx,
+        "_trusted_historical_route_correction",
+        {},
+    )
+    trusted_historical_route_correction = (
+        dict(trusted_historical_route_correction)
+        if isinstance(trusted_historical_route_correction, Mapping)
+        else {}
+    )
     trusted_qa_verification_authority: dict[str, Any] = {}
 
     with DBContext(project_id) as conn:
@@ -73255,6 +73614,9 @@ def handle_task_timeline_append(ctx: RequestContext):
                     body=ctx.body or {},
                     event_kind=str(event.get("event_kind") or ""),
                     trusted_actor_role=trusted_contract_runtime_actor_role,
+                    historical_route_correction=(
+                        trusted_historical_route_correction
+                    ),
                 )
             )
             if not contract_runtime_completed_projection_gate:
@@ -74409,6 +74771,7 @@ def _bounded_worker_dispatch_recovery_payload(
     task_id: str = "",
     parent_task_id: str = "",
     observer_command_id: str = "",
+    contract_execution_id: str = "",
     worker_id: str = "",
     session_token_ref: str = "",
     target_project_root: str = "",
@@ -74444,6 +74807,9 @@ def _bounded_worker_dispatch_recovery_payload(
     )
     repair_payload = {
         "runtime_context_id": runtime_context_id or "<mfrctx-...>",
+        "contract_execution_id": (
+            contract_execution_id or "<active contract_execution_id>"
+        ),
         "task_id": task_id or "<worker-task-id>",
         "parent_task_id": parent_task_id or "<observer-or-root-task-id>",
         "observer_command_id": observer_command_id or "<observer-command-id>",
@@ -74900,6 +75266,8 @@ def _record_bounded_worker_dispatch_event(
         "target_head_commit": _first_field("target_head_commit"),
         "merge_queue_id": _first_field("merge_queue_id"),
         "owned_files": owned_files,
+        "profile_requirements": _first_mapping("profile_requirements"),
+        "retry_policy": _first_mapping("retry_policy"),
         "read_receipt_event_id": _first_field("read_receipt_event_id"),
         "startup_event_id": _first_field("startup_event_id"),
     }
@@ -75182,6 +75550,7 @@ def _record_bounded_worker_dispatch_event(
                 task_id=task_id,
                 parent_task_id=parent_task_id,
                 observer_command_id=observer_command_id,
+                contract_execution_id=contract_runtime_execution_id,
                 worker_id=worker_slot_id,
                 session_token_ref=_first_field(
                     "session_token_ref",
@@ -83624,7 +83993,10 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
             record=record,
         )
         try:
-            runtime.current_guide(execution_id, actor_role=actor_role)
+            # bypass_current_line owns the authoritative guide/precheck refresh.
+            # Do not run the same guide path twice before the bypass can inspect
+            # its current line; that creates a bootstrap deadlock when optional
+            # guide enrichment is unavailable.
             record = runtime.store.get(execution_id)
             record, projection = _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
