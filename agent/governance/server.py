@@ -35536,6 +35536,587 @@ def _contract_timeline_scope_from_graph_body(body: Mapping[str, Any]) -> dict[st
     }
 
 
+def _current_full_reconcile_audited_no_pass_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    target_commit_sha: str,
+) -> dict[str, Any]:
+    """Verify a one-shot system-only reconcile exception.
+
+    This is deliberately weaker than ContractRuntime QA/close authority and is
+    usable only by the current-full post-merge reconcile gate.  It preserves a
+    real independent business-QA receipt when historical graph trace
+    materialization was blocked, but it never upgrades that receipt to an
+    authoritative ContractRuntime PASS or ordinary close evidence.
+    """
+
+    from . import task_timeline
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    merge_queue_id = str(
+        getattr(context, "merge_queue_id", "") or ""
+    ).strip()
+    target_commit = str(target_commit_sha or "").strip().lower()
+    if not (
+        execution_id
+        and runtime_context_id
+        and task_id
+        and parent_task_id == execution_id
+        and backlog_id
+        and merge_queue_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_commit)
+    ):
+        return {}
+
+    def _row_text(row: Any, key: str) -> str:
+        try:
+            return str(row[key] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            return ""
+
+    def _row_int(row: Any, key: str) -> int:
+        try:
+            return int(row[key] or 0)
+        except (KeyError, TypeError, ValueError, IndexError):
+            return 0
+
+    def _value_int(value: Any, default: int = -1) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _json_mapping(raw: Any) -> dict[str, Any]:
+        parsed = _json_loads(raw, {})
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+    def _timeline_ref_id(value: Any) -> int:
+        match = re.fullmatch(r"timeline:(\d+)", str(value or "").strip())
+        return int(match.group(1)) if match else 0
+
+    def _route_gate_scope_matches(
+        payload: Mapping[str, Any],
+        *,
+        expected_task_id: str,
+        require_authority_envelope: bool,
+    ) -> bool:
+        authority = payload.get("source_backed_contract_gate_authority")
+        if require_authority_envelope:
+            if not isinstance(authority, Mapping) or not (
+                task_timeline._source_backed_route_gate_authority_valid(
+                    authority
+                )
+            ):
+                return False
+            gate = authority.get("route_token_gate")
+        else:
+            gate = payload.get("route_token_gate")
+        if not isinstance(gate, Mapping):
+            return False
+        gate_accepted = task_timeline._source_backed_route_gate_accepted(
+            gate
+        )
+        if not gate_accepted and not require_authority_envelope:
+            gate_status = str(
+                gate.get("status") or gate.get("decision") or ""
+            ).strip()
+            gate_accepted = bool(
+                gate.get("allowed") is True
+                and gate_status in {
+                    "accepted",
+                    "ok",
+                    "passed",
+                    "route_token_ref_resolved",
+                }
+                and str(gate.get("action") or "") == "merge_execute"
+                and str(gate.get("authorized_action") or "")
+                == _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION
+                and gate.get("child_task_scope_accepted") is True
+                and str(gate.get("accepted_task_scope") or "") == "child"
+                and str(gate.get("child_task_id") or "")
+                == expected_task_id
+                and str(gate.get("backlog_id") or "") == backlog_id
+                and gate.get("registry_verified") is True
+                and gate.get("resolved_from_ref") is True
+                and gate.get("server_issued_binding") is True
+                and str(gate.get("binding_source") or "")
+                == "observer_route_token_refs"
+            )
+        if not gate_accepted:
+            return False
+        scope = gate.get("scope")
+        if not isinstance(scope, Mapping):
+            return False
+        return all(
+            str(scope.get(field) or "").strip() == expected
+            for field, expected in (
+                ("project_id", project_id),
+                ("backlog_id", backlog_id),
+                ("task_id", expected_task_id),
+            )
+        )
+
+    try:
+        exception_rows = conn.execute(
+            """
+            SELECT id, backlog_id, task_id, event_type, event_kind, phase,
+                   actor, status, decision, correlation_id, commit_sha,
+                   created_at, payload_json, verification_json,
+                   artifact_refs_json
+            FROM task_timeline_events
+            WHERE project_id = ? AND backlog_id = ?
+              AND event_type = ? AND status = ? AND decision = ?
+            ORDER BY id ASC
+            LIMIT 100
+            """,
+            (
+                project_id,
+                backlog_id,
+                "graph_reconcile.contract_merge_authority_projection_blocked",
+                "proceeded_with_exception",
+                "audited_system_route_bypass_no_pass",
+            ),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    candidates: list[dict[str, Any]] = []
+    for exception_row in exception_rows:
+        exception_id = _row_int(exception_row, "id")
+        exception_payload = _json_mapping(exception_row["payload_json"])
+        exception_verification = _json_mapping(
+            exception_row["verification_json"]
+        )
+        if not (
+            exception_id > 0
+            and _row_text(exception_row, "task_id") == task_id
+            and _row_text(exception_row, "event_kind") == "blocker"
+            and _row_text(exception_row, "phase") == "post_merge_reconcile"
+            and _row_text(exception_row, "actor") == "observer"
+            and _row_text(exception_row, "commit_sha").lower()
+            == target_commit
+            and exception_payload.get("system_reconcile_authority_bypassed")
+            is True
+            and exception_payload.get("business_qa_bypassed") is False
+            and exception_payload.get("authoritative_pass_synthesized")
+            is False
+            and exception_payload.get("rejected_requests_created_snapshot")
+            is False
+            and _value_int(
+                exception_payload.get("actual_reconcile_count_before_bypass")
+            )
+            == 0
+            and str(exception_payload.get("classification") or "")
+            == "stale_contract_runtime_missing_durable_merge_projection"
+            and str(exception_payload.get("allowed_bypass_operation") or "")
+            == "one_current_full_reconcile_and_activation"
+            and str(exception_payload.get("source_contract_execution_id") or "")
+            == execution_id
+            and str(exception_payload.get("durable_merge_queue_id") or "")
+            == merge_queue_id
+            and str(exception_payload.get("merged_commit") or "").lower()
+            == target_commit
+            and exception_verification.get("no_pass_claim") is True
+            and exception_verification.get("ordered_merge_complete") is True
+            and exception_verification.get("main_tests_passed") is True
+            and exception_verification.get("preflight_only_no_snapshot")
+            is True
+            and exception_verification.get("final_reconcile_still_required")
+            is True
+            and _route_gate_scope_matches(
+                exception_payload,
+                expected_task_id=task_id,
+                require_authority_envelope=True,
+            )
+        ):
+            continue
+
+        qa_event_id = _timeline_ref_id(
+            exception_payload.get("independent_qa_receipt_ref")
+        )
+        merge_event_id = _timeline_ref_id(
+            exception_payload.get("durable_merge_event_ref")
+        )
+        diagnostic_id = str(
+            exception_payload.get("diagnostic_backlog_id") or ""
+        ).strip()
+        if not qa_event_id or not merge_event_id or not diagnostic_id:
+            continue
+        try:
+            referenced_rows = conn.execute(
+                """
+                SELECT id, backlog_id, task_id, event_type, event_kind, phase,
+                       actor, status, decision, correlation_id, commit_sha,
+                       created_at, payload_json, verification_json,
+                       artifact_refs_json
+                FROM task_timeline_events
+                WHERE project_id = ? AND id IN (?, ?)
+                """,
+                (project_id, qa_event_id, merge_event_id),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        rows_by_id = {
+            _row_int(row, "id"): row
+            for row in referenced_rows
+            if _row_int(row, "id") > 0
+        }
+        qa_row = rows_by_id.get(qa_event_id)
+        merge_row = rows_by_id.get(merge_event_id)
+        if qa_row is None or merge_row is None:
+            continue
+
+        qa_payload = _json_mapping(qa_row["payload_json"])
+        qa_verification = _json_mapping(qa_row["verification_json"])
+        candidate_commit = _row_text(qa_row, "commit_sha").lower()
+        qa_session_id = str(
+            qa_payload.get("independent_qa_session_id") or ""
+        ).strip()
+        qa_principal = str(
+            qa_payload.get("independent_qa_principal") or ""
+        ).strip()
+        diff_sha256 = str(qa_payload.get("diff_sha256") or "").strip()
+        baseline_snapshot_id = str(
+            qa_payload.get("canonical_base_snapshot_id") or ""
+        ).strip()
+        baseline_commit = str(
+            qa_payload.get("canonical_base_commit") or ""
+        ).strip().lower()
+        acceptance_count = _value_int(
+            qa_verification.get("acceptance_criteria_count")
+        )
+        if not (
+            _row_text(qa_row, "backlog_id") == backlog_id
+            and _row_text(qa_row, "task_id") == execution_id
+            and _row_text(qa_row, "event_type")
+            == "qa.independent_verification_completed_with_governance_exception"
+            and _row_text(qa_row, "event_kind") == "blocker"
+            and _row_text(qa_row, "phase") == "qa_verification"
+            and _row_text(qa_row, "status") == "proceeded_with_exception"
+            and _row_text(qa_row, "decision")
+            == "business_qa_pass_authoritative_trace_blocked_no_pass"
+            and _row_text(qa_row, "actor") == "observer"
+            and candidate_commit
+            and str(qa_payload.get("candidate_commit") or "").lower()
+            == candidate_commit
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", diff_sha256)
+            and baseline_snapshot_id
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", baseline_commit)
+            and qa_session_id
+            and _row_text(qa_row, "correlation_id") == qa_session_id
+            and qa_principal
+            and str(qa_payload.get("independent_qa_session_ref") or "").strip()
+            and str(qa_payload.get("business_verdict") or "").upper()
+            == "PASS"
+            and str(
+                qa_payload.get("governance_evidence_materialization") or ""
+            ).upper()
+            == "BLOCKED"
+            and qa_payload.get("contract_runtime_authoritative_pass") is False
+            and qa_payload.get("business_qa_bypassed") is False
+            and qa_payload.get("system_gate_bypass_requested") is True
+            and qa_payload.get("reconcile_before_qa") is False
+            and qa_payload.get("historical_graph_data_readable") is True
+            and not str(qa_payload.get("graph_trace_id") or "").strip()
+            and str(qa_payload.get("graph_trace_status") or "")
+            == "blocked_by_nonactive_snapshot_gate"
+            and acceptance_count > 0
+            and _value_int(
+                qa_verification.get("acceptance_criteria_passed")
+            )
+            == acceptance_count
+            and qa_verification.get("authoritative_pass_synthesized") is False
+            and qa_verification.get("no_pass_claim") is True
+            and qa_verification.get("candidate_head_exact") is True
+            and qa_verification.get("candidate_worktree_clean") is True
+            and qa_verification.get("merge_tree_clean") is True
+            and str(qa_verification.get("npm_test") or "") == "passed"
+            and str(qa_verification.get("node_check") or "") == "passed"
+            and str(qa_verification.get("git_diff_check") or "") == "passed"
+            and str(qa_verification.get("current_main_regression") or "")
+            == "passed"
+            and _route_gate_scope_matches(
+                qa_payload,
+                expected_task_id=execution_id,
+                require_authority_envelope=True,
+            )
+        ):
+            continue
+
+        try:
+            snapshot_row = conn.execute(
+                """
+                SELECT commit_sha
+                FROM graph_snapshots
+                WHERE project_id = ? AND snapshot_id = ?
+                """,
+                (project_id, baseline_snapshot_id),
+            ).fetchone()
+            qa_session_row = conn.execute(
+                """
+                SELECT principal_id, project_id, role, scope_json
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (qa_session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if (
+            snapshot_row is None
+            or _row_text(snapshot_row, "commit_sha").lower()
+            != baseline_commit
+            or qa_session_row is None
+            or _row_text(qa_session_row, "principal_id") != qa_principal
+            or _row_text(qa_session_row, "project_id") != project_id
+            or _row_text(qa_session_row, "role") != "qa"
+        ):
+            continue
+        qa_scope = _json_loads(qa_session_row["scope_json"], [])
+        if not isinstance(qa_scope, list):
+            continue
+        scope_refs = _qa_session_scope_refs({"scope": qa_scope})
+        required_scope_refs = {
+            f"backlog:{backlog_id}",
+            f"task:{execution_id}",
+            f"commit:{candidate_commit}",
+            _qa_scope_binding_ref(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                commit_sha=candidate_commit,
+            ),
+        }
+        if not required_scope_refs.issubset(scope_refs):
+            continue
+
+        merge_payload = _json_mapping(merge_row["payload_json"])
+        merge_qa = merge_payload.get("qa_evidence")
+        merge_request_evidence = (
+            merge_qa.get("request_evidence")
+            if isinstance(merge_qa, Mapping)
+            else {}
+        )
+        merge_qa_request = (
+            merge_request_evidence.get("qa_evidence")
+            if isinstance(merge_request_evidence, Mapping)
+            else {}
+        )
+        queue_item_id = str(
+            merge_payload.get("queue_item_id") or ""
+        ).strip()
+        if not (
+            _row_text(merge_row, "backlog_id") == backlog_id
+            and _row_text(merge_row, "task_id") == task_id
+            and _row_text(merge_row, "event_type") == "parallel.live_merge"
+            and _row_text(merge_row, "event_kind") == "live_merge"
+            and _row_text(merge_row, "phase") == "live_merge"
+            and _row_text(merge_row, "status") == "passed"
+            and _row_text(merge_row, "actor") == "observer"
+            and _row_text(merge_row, "commit_sha").lower() == target_commit
+            and str(merge_payload.get("parent_task_id") or "")
+            == execution_id
+            and str(merge_payload.get("child_task_id") or "") == task_id
+            and str(merge_payload.get("merge_queue_id") or "")
+            == merge_queue_id
+            and queue_item_id
+            and str(merge_payload.get("merge_commit") or "").lower()
+            == target_commit
+            and str(merge_payload.get("target_head_after_merge") or "").lower()
+            == target_commit
+            and isinstance(merge_qa_request, Mapping)
+            and str(merge_qa_request.get("receipt_event_ref") or "")
+            == f"timeline:{qa_event_id}"
+            and str(merge_qa_request.get("independent_qa_session_id") or "")
+            == qa_session_id
+            and merge_qa_request.get("no_authoritative_pass_claim") is True
+            and _route_gate_scope_matches(
+                merge_payload,
+                expected_task_id=task_id,
+                require_authority_envelope=False,
+            )
+        ):
+            continue
+
+        from .parallel_branch_runtime import get_merge_queue_item
+
+        queue_item = get_merge_queue_item(
+            conn,
+            project_id,
+            merge_queue_id,
+            queue_item_id,
+        )
+        if queue_item is None or not all(
+            (
+                str(queue_item.backlog_id or "").strip() == backlog_id,
+                str(queue_item.task_id or "").strip() == task_id,
+                str(queue_item.status or "").strip() == "merged",
+                str(queue_item.branch_head or "").strip().lower()
+                == candidate_commit,
+                str(queue_item.merge_commit or "").strip().lower()
+                == target_commit,
+                str(queue_item.target_head_after_merge or "").strip().lower()
+                == target_commit,
+            )
+        ):
+            continue
+
+        try:
+            diagnostic_row = conn.execute(
+                """
+                SELECT status, bypass_policy_json, provenance_paths
+                FROM backlog_bugs
+                WHERE bug_id = ?
+                """,
+                (diagnostic_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if diagnostic_row is None or _row_text(
+            diagnostic_row, "status"
+        ) != "OPEN":
+            continue
+        diagnostic_policy = _json_mapping(
+            diagnostic_row["bypass_policy_json"]
+        )
+        diagnostic_refs = _json_loads(
+            diagnostic_row["provenance_paths"], []
+        )
+        diagnostic_ref_set = {
+            str(item or "").strip()
+            for item in diagnostic_refs
+            if str(item or "").strip()
+        } if isinstance(diagnostic_refs, list) else set()
+        required_diagnostic_refs = {
+            f"backlog:{backlog_id}",
+            f"contract-runtime:{execution_id}",
+            f"timeline:{qa_event_id}",
+            f"timeline:{merge_event_id}",
+            f"merge:{target_commit}",
+        }
+        if not (
+            str(exception_payload.get("diagnostic_status") or "") == "OPEN"
+            and diagnostic_policy.get("keep_open") is True
+            and diagnostic_policy.get("system_gate_bypass_only") is True
+            and diagnostic_policy.get("business_qa_bypassed") is False
+            and diagnostic_policy.get("authoritative_pass_synthesized")
+            is False
+            and str(diagnostic_policy.get("classification") or "")
+            == "system_governance_projection_block"
+            and str(diagnostic_policy.get("source_backlog_id") or "")
+            == backlog_id
+            and str(
+                diagnostic_policy.get("source_contract_execution_id") or ""
+            )
+            == execution_id
+            and str(diagnostic_policy.get("allowed_operation") or "")
+            == "one_post_merge_current_full_reconcile_and_activation"
+            and required_diagnostic_refs.issubset(diagnostic_ref_set)
+        ):
+            continue
+
+        qa_time = _contract_runtime_close_authority_time_order_value(
+            _row_text(qa_row, "created_at")
+        )
+        merge_time = _contract_runtime_close_authority_time_order_value(
+            _row_text(merge_row, "created_at")
+        )
+        exception_time = _contract_runtime_close_authority_time_order_value(
+            _row_text(exception_row, "created_at")
+        )
+        if not (
+            qa_time is not None
+            and merge_time is not None
+            and exception_time is not None
+            and qa_time < merge_time < exception_time
+        ):
+            continue
+
+        # The exception authorizes one actual reconcile. Once a successful
+        # reconcile is recorded on its diagnostic row, the authority is spent.
+        try:
+            consumed = conn.execute(
+                """
+                SELECT 1
+                FROM task_timeline_events
+                WHERE project_id = ? AND backlog_id IN (?, ?)
+                  AND event_type = 'graph.reconcile'
+                  AND status IN ('accepted', 'ok', 'passed', 'succeeded')
+                  AND lower(commit_sha) = ? AND created_at > ?
+                LIMIT 1
+                """,
+                (
+                    project_id,
+                    diagnostic_id,
+                    backlog_id,
+                    target_commit,
+                    _row_text(exception_row, "created_at"),
+                ),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if consumed is not None:
+            continue
+
+        candidates.append(
+            {
+                "schema_version": (
+                    "graph_current_full_reconcile.audited_no_pass_authority.v1"
+                ),
+                "source": "audited_no_pass_reconcile_exception",
+                "authority_mode": "audited_no_pass_reconcile_exception",
+                "server_derived": True,
+                "db_verified": True,
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "merge_queue_id": merge_queue_id,
+                "queue_item_id": queue_item_id,
+                "candidate_commit_sha": candidate_commit,
+                "merged_commit_sha": target_commit,
+                "canonical_base_snapshot_id": baseline_snapshot_id,
+                "canonical_base_commit": baseline_commit,
+                "candidate_diff_sha256": diff_sha256,
+                "qa_source_ref": f"timeline:{qa_event_id}",
+                "qa_event_id": qa_event_id,
+                "qa_event_created_at": _row_text(qa_row, "created_at"),
+                "qa_session_id": qa_session_id,
+                "qa_principal_id": qa_principal,
+                "merge_source_ref": f"timeline:{merge_event_id}",
+                "merge_event_id": merge_event_id,
+                "merge_event_created_at": _row_text(
+                    merge_row, "created_at"
+                ),
+                "exception_source_ref": f"timeline:{exception_id}",
+                "exception_event_id": exception_id,
+                "exception_event_created_at": _row_text(
+                    exception_row, "created_at"
+                ),
+                "diagnostic_backlog_id": diagnostic_id,
+                "qa_contract_runtime_verified": False,
+                "ordinary_close_authority": False,
+                "business_qa_bypassed": False,
+                "system_gate_bypass_only": True,
+                "authoritative_pass_synthesized": False,
+                "no_pass_claim": True,
+                "one_shot": True,
+            }
+        )
+
+    unique = {stable_sha256(item): item for item in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else {}
+
+
 def _current_full_reconcile_contract_merge_authority(
     conn,
     *,
@@ -35650,7 +36231,7 @@ def _current_full_reconcile_contract_merge_authority(
                 ("merge_queue_id", merge_queue_id),
             )
         )
-        if not (
+        strict_authority = bool(
             authority.get("timeline_verified") is True
             and authority.get("authority_verified") is True
             and authority.get("qa_contract_runtime_verified") is True
@@ -35664,7 +36245,19 @@ def _current_full_reconcile_contract_merge_authority(
             and qa_time is not None
             and merge_time is not None
             and qa_time < merge_time
-        ):
+        )
+        if not strict_authority:
+            audited_exception = (
+                _current_full_reconcile_audited_no_pass_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    context=context,
+                    target_commit_sha=target_commit,
+                )
+            )
+            if audited_exception:
+                candidates.append(audited_exception)
             continue
         candidates.append(
             {

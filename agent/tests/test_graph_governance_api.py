@@ -56527,6 +56527,415 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     ) == {}
 
 
+def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
+    conn,
+):
+    project_id = PID
+    backlog_id = "AC-AUDITED-NO-PASS-RECONCILE"
+    diagnostic_id = "AC-AUDITED-NO-PASS-RECONCILE-DIAGNOSTIC"
+    contract_execution_id = "cex-audited-no-pass-reconcile"
+    task_id = "worker-audited-no-pass-reconcile"
+    runtime_context_id = "mfrctx-audited-no-pass-reconcile"
+    merge_queue_id = "mq-audited-no-pass-reconcile"
+    queue_item_id = "mqitem-audited-no-pass-reconcile"
+    baseline_snapshot_id = "full-audited-no-pass-baseline"
+    baseline_commit = "c" * 40
+    candidate_commit = "a" * 40
+    merged_commit = "b" * 40
+    diff_sha256 = "sha256:" + "d" * 64
+    qa_principal = "qa:audited-no-pass-reconcile"
+
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    context = BranchTaskRuntimeContext(
+        project_id=project_id,
+        task_id=task_id,
+        branch_ref="refs/heads/codex/audited-no-pass-reconcile",
+        status=STATE_VALIDATED,
+        runtime_context_id=runtime_context_id,
+        backlog_id=backlog_id,
+        parent_task_id=contract_execution_id,
+        target_project_id="audited-no-pass-target",
+        target_project_root="/tmp/audited-no-pass-target",
+        merge_queue_id=merge_queue_id,
+    )
+    upsert_branch_context(conn, context)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queue_item_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                branch_ref=context.branch_ref,
+                queue_index=1,
+                status="merged",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                merge_commit=merged_commit,
+                target_head_before_merge="e" * 40,
+                target_head_after_merge=merged_commit,
+            )
+        ],
+    )
+    record = server._contract_runtime_store(conn).create(
+        {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "contract_id": "mf_parallel.v2",
+            "version": "v2",
+            "revision": "rev5",
+            "execution_state_revision": 10,
+            "contract_chain_id": "cchain-audited-no-pass-reconcile",
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "actor_role": "observer",
+                    "evidence_kind": "dispatch_bounded_worker",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": contract_execution_id,
+                    "worker_role": "mf_sub",
+                    "payload": {
+                        "runtime_context_id": runtime_context_id,
+                        "worker_task_id": task_id,
+                        "parent_task_id": contract_execution_id,
+                        "worker_role": "mf_sub",
+                    },
+                }
+            ],
+        }
+    )
+    _activate_basic_graph(
+        conn,
+        baseline_snapshot_id,
+        project_id=project_id,
+        commit_sha=baseline_commit,
+    )
+
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        commit_sha=candidate_commit,
+    )
+    qa_session = server.role_service.register(
+        conn,
+        qa_principal,
+        project_id,
+        "qa",
+        scope=[
+            f"backlog:{backlog_id}",
+            f"task:{contract_execution_id}",
+            f"commit:{candidate_commit}",
+            qa_scope_binding_ref,
+        ],
+    )
+
+    def route_gate(route_task_id: str) -> dict:
+        return {
+            "action": "task_timeline_append",
+            "allowed": True,
+            "status": "accepted",
+            "server_projected": True,
+            "projection_source": "server_route_token_mutation_gate",
+            "resolved_from_ref": True,
+            "registry_verified": True,
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": route_task_id,
+            },
+        }
+
+    qa_gate = route_gate(contract_execution_id)
+    qa_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        event_type=(
+            "qa.independent_verification_completed_with_governance_exception"
+        ),
+        event_kind="blocker",
+        phase="qa_verification",
+        actor="observer",
+        status="proceeded_with_exception",
+        decision="business_qa_pass_authoritative_trace_blocked_no_pass",
+        correlation_id=qa_session["session_id"],
+        commit_sha=candidate_commit,
+        payload={
+            "business_qa_bypassed": False,
+            "business_verdict": "PASS",
+            "candidate_commit": candidate_commit,
+            "canonical_base_commit": baseline_commit,
+            "canonical_base_snapshot_id": baseline_snapshot_id,
+            "classification": "system_graph_query_historical_snapshot_trace_gap",
+            "contract_runtime_authoritative_pass": False,
+            "diff_sha256": diff_sha256,
+            "governance_evidence_materialization": "BLOCKED",
+            "graph_trace_id": "",
+            "graph_trace_status": "blocked_by_nonactive_snapshot_gate",
+            "historical_graph_data_readable": True,
+            "independent_qa_principal": qa_principal,
+            "independent_qa_session_id": qa_session["session_id"],
+            "independent_qa_session_ref": "qa-session-ref-test",
+            "reconcile_before_qa": False,
+            "system_gate_bypass_requested": True,
+            "route_token_gate": qa_gate,
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_route_gate_authority(qa_gate)
+            ),
+        },
+        verification={
+            "acceptance_criteria_count": 5,
+            "acceptance_criteria_passed": 5,
+            "authoritative_pass_synthesized": False,
+            "candidate_head_exact": True,
+            "candidate_worktree_clean": True,
+            "current_main_regression": "passed",
+            "git_diff_check": "passed",
+            "merge_tree_clean": True,
+            "no_pass_claim": True,
+            "node_check": "passed",
+            "npm_test": "passed",
+        },
+    )
+    merge_gate = route_gate(task_id)
+    merge_gate.pop("server_projected")
+    merge_gate.pop("projection_source")
+    merge_gate.update(
+        {
+            "action": "merge_execute",
+            "authorized_action": "close_or_merge_after_evidence",
+            "accepted_task_scope": "child",
+            "child_task_id": task_id,
+            "child_task_scope_accepted": True,
+            "backlog_id": backlog_id,
+            "binding_source": "observer_route_token_refs",
+            "server_issued_binding": True,
+        }
+    )
+    merge_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="parallel.live_merge",
+        event_kind="live_merge",
+        phase="live_merge",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+        payload={
+            "child_task_id": task_id,
+            "parent_task_id": contract_execution_id,
+            "merge_queue_id": merge_queue_id,
+            "queue_item_id": queue_item_id,
+            "merge_commit": merged_commit,
+            "target_head_after_merge": merged_commit,
+            "qa_evidence": {
+                "request_evidence": {
+                    "qa_evidence": {
+                        "receipt_event_ref": f"timeline:{qa_event['id']}",
+                        "independent_qa_session_id": qa_session["session_id"],
+                        "no_authoritative_pass_claim": True,
+                    }
+                }
+            },
+            "route_token_gate": merge_gate,
+        },
+    )
+    conn.execute(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, mf_type, bypass_policy_json,
+            provenance_paths, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'chain_rescue', ?, ?, ?, ?)""",
+        (
+            diagnostic_id,
+            "Audited no-PASS reconcile authority diagnostic",
+            json.dumps(
+                {
+                    "allowed_operation": (
+                        "one_post_merge_current_full_reconcile_and_activation"
+                    ),
+                    "authoritative_pass_synthesized": False,
+                    "business_qa_bypassed": False,
+                    "classification": "system_governance_projection_block",
+                    "keep_open": True,
+                    "source_backlog_id": backlog_id,
+                    "source_contract_execution_id": contract_execution_id,
+                    "system_gate_bypass_only": True,
+                }
+            ),
+            json.dumps(
+                [
+                    f"backlog:{backlog_id}",
+                    f"contract-runtime:{contract_execution_id}",
+                    f"timeline:{qa_event['id']}",
+                    f"timeline:{merge_event['id']}",
+                    f"merge:{merged_commit}",
+                ]
+            ),
+            "2026-07-16T23:27:44Z",
+            "2026-07-16T23:27:44Z",
+        ),
+    )
+    bypass_gate = route_gate(task_id)
+    exception_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type=(
+            "graph_reconcile.contract_merge_authority_projection_blocked"
+        ),
+        event_kind="blocker",
+        phase="post_merge_reconcile",
+        actor="observer",
+        status="proceeded_with_exception",
+        decision="audited_system_route_bypass_no_pass",
+        commit_sha=merged_commit,
+        payload={
+            "actual_reconcile_count_before_bypass": 0,
+            "allowed_bypass_operation": (
+                "one_current_full_reconcile_and_activation"
+            ),
+            "authoritative_pass_synthesized": False,
+            "business_qa_bypassed": False,
+            "classification": (
+                "stale_contract_runtime_missing_durable_merge_projection"
+            ),
+            "diagnostic_backlog_id": diagnostic_id,
+            "diagnostic_status": "OPEN",
+            "durable_merge_event_ref": f"timeline:{merge_event['id']}",
+            "durable_merge_queue_id": merge_queue_id,
+            "independent_qa_receipt_ref": f"timeline:{qa_event['id']}",
+            "merged_commit": merged_commit,
+            "rejected_requests_created_snapshot": False,
+            "source_contract_execution_id": contract_execution_id,
+            "system_reconcile_authority_bypassed": True,
+            "route_token_gate": bypass_gate,
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_route_gate_authority(bypass_gate)
+            ),
+        },
+        verification={
+            "final_reconcile_still_required": True,
+            "main_tests_passed": True,
+            "no_pass_claim": True,
+            "ordered_merge_complete": True,
+            "preflight_only_no_snapshot": True,
+        },
+    )
+    for event, created_at in (
+        (qa_event, "2026-07-16T23:27:42Z"),
+        (merge_event, "2026-07-16T23:27:43Z"),
+        (exception_event, "2026-07-16T23:27:45Z"),
+    ):
+        conn.execute(
+            "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+            (created_at, int(event["id"])),
+        )
+    conn.commit()
+
+    runtime_scope = server._current_full_reconcile_runtime_context_scope(
+        conn,
+        project_id=project_id,
+        body={"backlog_id": backlog_id, "task_id": task_id},
+        auth={
+            "role_source": "observer_session_route_token_ref",
+            "route_token_scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "route_token_allowed_actions": [
+                "graph_current_full_reconcile"
+            ],
+        },
+        target_commit_sha=merged_commit,
+    )
+    authority = runtime_scope["contract_merge_authority"]
+    assert authority["schema_version"] == (
+        "graph_current_full_reconcile.audited_no_pass_authority.v1"
+    )
+    assert authority["authority_mode"] == (
+        "audited_no_pass_reconcile_exception"
+    )
+    assert authority["contract_execution_id"] == contract_execution_id
+    assert authority["queue_item_id"] == queue_item_id
+    assert authority["candidate_commit_sha"] == candidate_commit
+    assert authority["merged_commit_sha"] == merged_commit
+    assert authority["qa_contract_runtime_verified"] is False
+    assert authority["ordinary_close_authority"] is False
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["business_qa_bypassed"] is False
+    assert authority["no_pass_claim"] is True
+    assert authority["one_shot"] is True
+
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (diagnostic_id,),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as closed_diagnostic:
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={"backlog_id": backlog_id, "task_id": task_id},
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha=merged_commit,
+        )
+    assert closed_diagnostic.value.code == (
+        "current_full_reconcile_contract_merge_authority_required"
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN' WHERE bug_id = ?",
+        (diagnostic_id,),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=diagnostic_id,
+        task_id=diagnostic_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        commit_sha=merged_commit,
+    )
+    conn.execute(
+        """UPDATE task_timeline_events
+           SET created_at = '2026-07-16T23:28:00Z'
+           WHERE project_id = ? AND backlog_id = ?
+             AND event_type = 'graph.reconcile'""",
+        (project_id, diagnostic_id),
+    )
+    conn.commit()
+    assert server._current_full_reconcile_audited_no_pass_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        context=context,
+        target_commit_sha=merged_commit,
+    ) == {}
+
+
 def test_parallel_merge_repo_root_comes_from_runtime_context(conn, tmp_path):
     task_id = "merge-root-task"
     merge_queue_id = "mq-merge-root"
