@@ -71,6 +71,7 @@ from agent.governance.parallel_branch_runtime import (
     build_runtime_context_action_plan_view,
     build_runtime_context_lane_plan_view,
     get_branch_context,
+    get_merge_queue_item,
     get_latest_branch_contract_revision,
     list_merge_queue_items,
     mf_subagent_session_token_hash,
@@ -81,6 +82,7 @@ from agent.governance.parallel_branch_runtime import (
     runtime_context_session_token_ref,
     upsert_batch_merge_runtime,
     upsert_branch_context,
+    upsert_merge_queue_item,
     upsert_merge_queue_items,
     validate_mf_subagent_graph_query_identity,
 )
@@ -16368,6 +16370,27 @@ def test_postmerge_queue_recovery_rejects_caller_mapping_and_never_reuses_fence(
 
     assert recovered["queue_item"]["status"] == "queued_for_merge"
     assert recovered["queue_item"]["backlog_id"] == backlog_id
+    assert recovered["queue_item"]["recovery_mode"] == (
+        "audited_postmerge_no_pass"
+    )
+    assert recovered["queue_item"]["recovery_authority_hash"] == (
+        authority.authority_hash
+    )
+    persisted_recovery = upsert_merge_queue_item(
+        conn,
+        replace(
+            get_merge_queue_item(
+                conn,
+                PID,
+                merge_queue_id,
+                recovered["queue_item"]["queue_item_id"],
+            ),
+            recovery_mode="",
+            recovery_authority_hash="",
+        ),
+    )
+    assert persisted_recovery.recovery_mode == "audited_postmerge_no_pass"
+    assert persisted_recovery.recovery_authority_hash == authority.authority_hash
     assert recovered["audited_postmerge_recovery_authority"]["no_pass_claim"] is True
     assert (
         recovered["audited_postmerge_recovery_authority"]
@@ -16858,6 +16881,9 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     assert recovery_event["task_id"] == execution_id
     assert recovery_event["actor"] == "observer"
     assert recovery_event["payload"]["parent_task_id"] == execution_id
+    assert "checkpoint_id" not in recovery_event["payload"]["context"]
+    assert "checkpoint_id" not in recovery_event["payload"]
+    assert "checkpoint_id" not in recovery_event["artifact_refs"]
     assert recovery_event["payload"]["no_pass_claim"] is True
     assert (
         recovery_event["payload"]["authoritative_pass_synthesized"] is False
@@ -16953,7 +16979,11 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             lambda *_args, **_kwargs: {},
         )
 
+        execute_calls = 0
+
         def _fake_execute_merge_queue_item(fake_conn, **_kwargs):
+            nonlocal execute_calls
+            execute_calls += 1
             recorded = record_merge_queue_result(
                 fake_conn,
                 project_id=PID,
@@ -16989,6 +17019,54 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             "execute_merge_queue_item",
             _fake_execute_merge_queue_item,
         )
+        original_recovery_payload = dict(recovery_event["payload"])
+        valid_apply_evidence = {
+            "qa_evidence": {
+                "receipt_event_ref": qa_ref,
+                "independent_qa_session_id": qa_session["session_id"],
+                "no_authoritative_pass_claim": True,
+            }
+        }
+        for forged_field, forged_value in (
+            ("child_task_id", "forged-child-task"),
+            ("merge_queue_id", "forged-merge-queue"),
+            ("queue_item_id", "forged-queue-item"),
+        ):
+            forged_payload = dict(original_recovery_payload)
+            forged_payload[forged_field] = forged_value
+            conn.execute(
+                "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                (json.dumps(forged_payload), recovery_event["id"]),
+            )
+            conn.commit()
+            with pytest.raises(GovernanceError) as forged_payload_identity:
+                server.handle_graph_governance_parallel_branch_merge_execute(
+                    _ctx(
+                        {"project_id": PID},
+                        method="POST",
+                        body={
+                            **body,
+                            "parent_task_id": execution_id,
+                            "branch_ref": (
+                                "refs/heads/codex/postmerge-recovery-exact"
+                            ),
+                            "target_ref": "refs/heads/main",
+                            "dry_run": False,
+                            "allow_target_ref_mutation": True,
+                            "contract_actor": "observer",
+                            "evidence": valid_apply_evidence,
+                        },
+                    )
+                )
+            assert forged_payload_identity.value.code == (
+                "audited_postmerge_recovery_materialize_identity_invalid"
+            )
+            assert execute_calls == 0
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(original_recovery_payload), recovery_event["id"]),
+        )
+        conn.commit()
         with pytest.raises(GovernanceError) as handler_missing_qa:
             server.handle_graph_governance_parallel_branch_merge_execute(
                 _ctx(
@@ -17011,6 +17089,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
         assert handler_missing_qa.value.code == (
             "audited_postmerge_recovery_apply_evidence_invalid"
         )
+        assert execute_calls == 0
         assert conn.execute(
             """
             SELECT status FROM parallel_branch_merge_queue_items
@@ -17061,6 +17140,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
         assert handler_post_write_rejected.value.code == (
             "test_recovery_timeline_write_rejected"
         )
+        assert execute_calls == 1
         assert conn.execute(
             """
             SELECT status FROM parallel_branch_merge_queue_items
@@ -59186,6 +59266,10 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
     assert "fence_token" not in postmerge_recovery["apply_copy_safe_body"]
     assert any(
         "before merge execution" in item
+        for item in postmerge_recovery["server_revalidates"]
+    )
+    assert any(
+        "durable queue recovery mode" in item
         for item in postmerge_recovery["server_revalidates"]
     )
     assert postmerge_recovery["server_writes_atomically_on_apply"] == [

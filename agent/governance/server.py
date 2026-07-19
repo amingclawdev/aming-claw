@@ -18865,6 +18865,7 @@ def _runtime_context_worker_recovery_payloads(
                 "Python test summary contains no failed/error suffix",
                 "apply queue/commit and no-PASS QA receipt/session evidence",
                 "materialize actor/parent/task identity from server authority",
+                "durable queue recovery mode and authority hash before timeline payload",
                 "recovery apply evidence before merge execution or durable queue mutation",
                 "zero prior live-merge/reconcile consumption",
             ],
@@ -29704,7 +29705,7 @@ def _parallel_branch_postmerge_recovery_apply_precheck(
         queue_rows = conn.execute(
             """
             SELECT backlog_id, task_id, merge_queue_id, queue_item_id,
-                   branch_head
+                   branch_head, recovery_mode, recovery_authority_hash
             FROM parallel_branch_merge_queue_items
             WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
             """,
@@ -29714,7 +29715,7 @@ def _parallel_branch_postmerge_recovery_apply_precheck(
         queue_rows = conn.execute(
             """
             SELECT backlog_id, task_id, merge_queue_id, queue_item_id,
-                   branch_head
+                   branch_head, recovery_mode, recovery_authority_hash
             FROM parallel_branch_merge_queue_items
             WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
             """,
@@ -29725,48 +29726,41 @@ def _parallel_branch_postmerge_recovery_apply_precheck(
 
     queue_row = queue_rows[0]
     exact_backlog_id = str(
-        backlog_id or _row_get(queue_row, "backlog_id", "") or ""
+        _row_get(queue_row, "backlog_id", "") or ""
     ).strip()
     exact_task_id = str(_row_get(queue_row, "task_id", "") or "").strip()
     exact_item_id = str(
         _row_get(queue_row, "queue_item_id", "") or ""
     ).strip()
-    if not exact_backlog_id or exact_task_id != worker_task_id:
-        return {}
+    from .parallel_branch_runtime import AUDITED_POSTMERGE_RECOVERY_MODE
 
-    materialize_rows = conn.execute(
-        """
-        SELECT payload_json
-        FROM task_timeline_events
-        WHERE project_id = ? AND backlog_id = ?
-          AND event_type = ? AND status = 'proceeded_with_exception'
-          AND decision = ?
-        ORDER BY id DESC
-        LIMIT 20
-        """,
-        (
-            project_id,
-            exact_backlog_id,
-            "parallel.merge_queue_item_materialize_postmerge_recovery",
-            "audited_postmerge_durable_queue_recovery_no_pass",
-        ),
-    ).fetchall()
-    linked_recovery_exists = False
-    for materialize_row in materialize_rows:
-        payload = _json_loads(
-            _row_get(materialize_row, "payload_json", "{}"), {}
-        )
-        if isinstance(payload, Mapping) and all(
-            (
-                str(payload.get("child_task_id") or "") == exact_task_id,
-                str(payload.get("merge_queue_id") or "") == queue_id,
-                str(payload.get("queue_item_id") or "") == exact_item_id,
-            )
-        ):
-            linked_recovery_exists = True
-            break
-    if not linked_recovery_exists:
+    recovery_mode = str(
+        _row_get(queue_row, "recovery_mode", "") or ""
+    ).strip()
+    durable_authority_hash = str(
+        _row_get(queue_row, "recovery_authority_hash", "") or ""
+    ).strip()
+    if not recovery_mode and not durable_authority_hash:
         return {}
+    if not (
+        recovery_mode == AUDITED_POSTMERGE_RECOVERY_MODE
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", durable_authority_hash)
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_durable_marker_invalid",
+            "durable recovery mode or authority hash is invalid",
+            409,
+        )
+    if not (
+        exact_backlog_id
+        and exact_task_id == worker_task_id
+        and (not backlog_id or str(backlog_id).strip() == exact_backlog_id)
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_queue_identity_invalid",
+            "durable recovery queue backlog or task identity does not match the apply request",
+            409,
+        )
 
     authority = _parallel_branch_postmerge_recovery_materialize_authority(
         conn,
@@ -29776,7 +29770,9 @@ def _parallel_branch_postmerge_recovery_apply_precheck(
         merge_queue_id=queue_id,
         queue_item_id=exact_item_id,
     )
-    if not authority:
+    if not authority or str(authority.get("authority_hash") or "") != (
+        durable_authority_hash
+    ):
         raise GovernanceError(
             "audited_postmerge_recovery_materialize_identity_invalid",
             "stored recovery materialize actor, parent, task, or authority identity is invalid",
@@ -30260,6 +30256,12 @@ def _record_parallel_branch_merge_queue_materialize_event(
             recovery_authority.get("merge_queue_id") or ""
         ).strip()
         actor = "observer"
+        checkpoint_id = ""
+        context = {
+            key: value
+            for key, value in context.items()
+            if key != "checkpoint_id"
+        }
     evidence_ref = f"merge_queue_item:{queue_item_id}" if queue_item_id else ""
     event = task_timeline.record_event(
         conn,
@@ -30303,7 +30305,11 @@ def _record_parallel_branch_merge_queue_materialize_event(
             "child_task_id": child_task_id,
             "parent_task_id": parent_task_id,
             "backlog_id": backlog_id,
-            "checkpoint_id": checkpoint_id,
+            **(
+                {}
+                if is_postmerge_recovery
+                else {"checkpoint_id": checkpoint_id}
+            ),
             "route_token_gate": dict(route_gate or {}),
             "queue_item": dict(queue_item),
             "context": dict(context),
@@ -30321,7 +30327,11 @@ def _record_parallel_branch_merge_queue_materialize_event(
             "child_task_id": child_task_id,
             "merge_queue_id": merge_queue_id,
             "queue_item_id": queue_item_id,
-            "checkpoint_id": checkpoint_id,
+            **(
+                {}
+                if is_postmerge_recovery
+                else {"checkpoint_id": checkpoint_id}
+            ),
         },
         commit_sha=str(queue_item.get("branch_head") or context.get("head_commit") or ""),
     )

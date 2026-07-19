@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS parallel_branch_merge_queue_items (
     merge_queue_id    TEXT NOT NULL,
     queue_item_id     TEXT NOT NULL,
     backlog_id        TEXT NOT NULL DEFAULT '',
+    recovery_mode     TEXT NOT NULL DEFAULT '',
+    recovery_authority_hash TEXT NOT NULL DEFAULT '',
     task_id           TEXT NOT NULL,
     branch_ref        TEXT NOT NULL DEFAULT '',
     queue_index       INTEGER NOT NULL DEFAULT 0,
@@ -230,6 +232,7 @@ STATE_ABANDONED = "abandoned"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
 STATE_ALLOCATED = "allocated"
 STATE_WORKTREE_READY = "worktree_ready"
+AUDITED_POSTMERGE_RECOVERY_MODE = "audited_postmerge_no_pass"
 MATERIALIZED_RUNTIME_CONTEXT_STATES = {
     STATE_WORKTREE_READY,
     STATE_RUNNING,
@@ -1167,6 +1170,8 @@ class MergeQueueItem:
     queue_index: int
     status: str
     backlog_id: str = ""
+    recovery_mode: str = ""
+    recovery_authority_hash: str = ""
     depends_on: tuple[str, ...] = ()
     hard_depends_on: tuple[str, ...] = ()
     serializes_after: tuple[str, ...] = ()
@@ -1965,6 +1970,16 @@ def _ensure_branch_merge_queue_columns(conn: sqlite3.Connection) -> None:
             "backlog_id",
             "ALTER TABLE parallel_branch_merge_queue_items "
             "ADD COLUMN backlog_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "recovery_mode",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN recovery_mode TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "recovery_authority_hash",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN recovery_authority_hash TEXT NOT NULL DEFAULT ''",
         ),
         (
             "merge_commit",
@@ -10941,6 +10956,8 @@ def _merge_queue_item_from_row(row: sqlite3.Row) -> MergeQueueItem:
         merge_queue_id=row["merge_queue_id"],
         queue_item_id=row["queue_item_id"],
         backlog_id=row["backlog_id"] or "",
+        recovery_mode=row["recovery_mode"] or "",
+        recovery_authority_hash=row["recovery_authority_hash"] or "",
         task_id=row["task_id"],
         branch_ref=row["branch_ref"] or "",
         queue_index=int(row["queue_index"] or 0),
@@ -10979,7 +10996,8 @@ def upsert_merge_queue_item(
     conn.execute(
         """
         INSERT INTO parallel_branch_merge_queue_items (
-            project_id, merge_queue_id, queue_item_id, backlog_id, task_id, branch_ref,
+            project_id, merge_queue_id, queue_item_id, backlog_id,
+            recovery_mode, recovery_authority_hash, task_id, branch_ref,
             queue_index, status, depends_on_json, hard_depends_on_json,
             serializes_after_json, conflicts_with_json,
             same_node_or_file_conflicts_json, requires_graph_epoch_json,
@@ -10988,10 +11006,20 @@ def upsert_merge_queue_item(
             snapshot_id, projection_id, merge_commit, target_head_before_merge,
             target_head_after_merge, completed_at, failure_reason, created_at, updated_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, merge_queue_id, queue_item_id) DO UPDATE SET
             backlog_id = excluded.backlog_id,
+            recovery_mode = CASE
+                WHEN parallel_branch_merge_queue_items.recovery_mode != ''
+                    THEN parallel_branch_merge_queue_items.recovery_mode
+                ELSE excluded.recovery_mode
+            END,
+            recovery_authority_hash = CASE
+                WHEN parallel_branch_merge_queue_items.recovery_authority_hash != ''
+                    THEN parallel_branch_merge_queue_items.recovery_authority_hash
+                ELSE excluded.recovery_authority_hash
+            END,
             task_id = excluded.task_id,
             branch_ref = excluded.branch_ref,
             queue_index = excluded.queue_index,
@@ -11023,6 +11051,8 @@ def upsert_merge_queue_item(
             item.merge_queue_id,
             item.queue_item_id,
             item.backlog_id,
+            item.recovery_mode,
+            item.recovery_authority_hash,
             item.task_id,
             item.branch_ref,
             item.queue_index,
@@ -15731,6 +15761,16 @@ def queue_merge_item_for_branch_context(
         merge_queue_id=queue_id,
         queue_item_id=queue_item_id or f"{queue_id}:{task_id}",
         backlog_id=str(context.backlog_id or ""),
+        recovery_mode=(
+            AUDITED_POSTMERGE_RECOVERY_MODE
+            if postmerge_recovery is not None
+            else ""
+        ),
+        recovery_authority_hash=(
+            str(postmerge_recovery.authority_hash or "")
+            if postmerge_recovery is not None
+            else ""
+        ),
         task_id=task_id,
         branch_ref=context.branch_ref,
         queue_index=queue_index,
