@@ -18860,6 +18860,18 @@ def _runtime_context_worker_recovery_payloads(
                 "candidate branch equals the audited business merge commit",
                 "business candidate is an ancestor of the clean canonical current main HEAD",
                 "diagnostic no-PASS policy, exact provenance refs, and recovery_head_commit",
+                (
+                    "current HEAD equals the recovery anchor or is an ancestry-"
+                    "proven system-repair descendant"
+                ),
+                (
+                    "every recovery-anchor..HEAD commit carries the diagnostic "
+                    "Chain-Bug-Id and repair ContractRuntime Chain-Source-Task"
+                ),
+                (
+                    "every repair-descendant changed file stays inside the "
+                    "diagnostic target/test scope"
+                ),
                 "server-recomputed base..candidate diff hash",
                 "git status command success for canonical and candidate worktrees",
                 "Python test summary contains no failed/error suffix",
@@ -37055,7 +37067,7 @@ def _current_full_reconcile_audited_no_pass_authority(
         gate_accepted = task_timeline._source_backed_route_gate_accepted(
             gate
         )
-        if not gate_accepted and not require_authority_envelope:
+        if not gate_accepted:
             gate_status = str(
                 gate.get("status") or gate.get("decision") or ""
             ).strip()
@@ -37126,14 +37138,21 @@ def _current_full_reconcile_audited_no_pass_authority(
         exception_verification = _json_mapping(
             exception_row["verification_json"]
         )
+        exception_merge_commit = str(
+            exception_payload.get("merged_commit") or ""
+        ).strip().lower()
         if not (
             exception_id > 0
             and _row_text(exception_row, "task_id") == task_id
             and _row_text(exception_row, "event_kind") == "blocker"
             and _row_text(exception_row, "phase") == "post_merge_reconcile"
             and _row_text(exception_row, "actor") == "observer"
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                exception_merge_commit,
+            )
             and _row_text(exception_row, "commit_sha").lower()
-            == target_commit
+            == exception_merge_commit
             and exception_payload.get("system_reconcile_authority_bypassed")
             is True
             and exception_payload.get("business_qa_bypassed") is False
@@ -37153,8 +37172,6 @@ def _current_full_reconcile_audited_no_pass_authority(
             == execution_id
             and str(exception_payload.get("durable_merge_queue_id") or "")
             == merge_queue_id
-            and str(exception_payload.get("merged_commit") or "").lower()
-            == target_commit
             and exception_verification.get("no_pass_claim") is True
             and exception_verification.get("ordered_merge_complete") is True
             and exception_verification.get("main_tests_passed") is True
@@ -37332,6 +37349,9 @@ def _current_full_reconcile_audited_no_pass_authority(
         merge_event_type = _row_text(merge_row, "event_type")
         merge_status = _row_text(merge_row, "status")
         merge_decision = _row_text(merge_row, "decision")
+        merge_evidence_commit = _row_text(
+            merge_row, "commit_sha"
+        ).lower()
         merge_recovery_authority = merge_payload.get(
             "audited_postmerge_recovery_authority"
         )
@@ -37380,7 +37400,7 @@ def _current_full_reconcile_audited_no_pass_authority(
             and str(merge_recovery_authority.get("candidate_commit") or "").lower()
             == candidate_commit
             and str(merge_recovery_authority.get("merged_commit") or "").lower()
-            == target_commit
+            == merge_evidence_commit
             and str(
                 merge_recovery_authority.get("candidate_diff_sha256") or ""
             )
@@ -37413,7 +37433,7 @@ def _current_full_reconcile_audited_no_pass_authority(
             and _row_text(merge_row, "event_kind") == "live_merge"
             and _row_text(merge_row, "phase") == "live_merge"
             and _row_text(merge_row, "actor") == "observer"
-            and _row_text(merge_row, "commit_sha").lower() == target_commit
+            and merge_evidence_commit == exception_merge_commit
             and str(merge_payload.get("parent_task_id") or "")
             == execution_id
             and str(merge_payload.get("child_task_id") or "") == task_id
@@ -37421,9 +37441,9 @@ def _current_full_reconcile_audited_no_pass_authority(
             == merge_queue_id
             and queue_item_id
             and str(merge_payload.get("merge_commit") or "").lower()
-            == target_commit
+            == merge_evidence_commit
             and str(merge_payload.get("target_head_after_merge") or "").lower()
-            == target_commit
+            == merge_evidence_commit
             and isinstance(merge_qa_request, Mapping)
             and str(merge_qa_request.get("receipt_event_ref") or "")
             == f"timeline:{qa_event_id}"
@@ -37467,9 +37487,9 @@ def _current_full_reconcile_audited_no_pass_authority(
                 str(queue_item.branch_head or "").strip().lower()
                 == candidate_commit,
                 str(queue_item.merge_commit or "").strip().lower()
-                == target_commit,
+                == merge_evidence_commit,
                 str(queue_item.target_head_after_merge or "").strip().lower()
-                == target_commit,
+                == merge_evidence_commit,
                 recovery_marker_valid,
             )
         ):
@@ -37478,7 +37498,8 @@ def _current_full_reconcile_audited_no_pass_authority(
         try:
             diagnostic_row = conn.execute(
                 """
-                SELECT status, bypass_policy_json, provenance_paths
+                SELECT status, bypass_policy_json, chain_trigger_json,
+                       provenance_paths, target_files, test_files
                 FROM backlog_bugs
                 WHERE bug_id = ?
                 """,
@@ -37493,6 +37514,9 @@ def _current_full_reconcile_audited_no_pass_authority(
         diagnostic_policy = _json_mapping(
             diagnostic_row["bypass_policy_json"]
         )
+        diagnostic_trigger = _json_mapping(
+            diagnostic_row["chain_trigger_json"]
+        )
         diagnostic_refs = _json_loads(
             diagnostic_row["provenance_paths"], []
         )
@@ -37506,8 +37530,113 @@ def _current_full_reconcile_audited_no_pass_authority(
             f"contract-runtime:{execution_id}",
             f"timeline:{qa_event_id}",
             f"timeline:{merge_event_id}",
-            f"merge:{target_commit}",
+            f"merge:{merge_evidence_commit}",
         }
+        recovery_anchor_commit = str(
+            diagnostic_trigger.get("recovery_head_commit") or ""
+        ).strip().lower()
+        recovery_repair_execution_id = str(
+            diagnostic_trigger.get("repair_contract_execution_id") or ""
+        ).strip()
+        recovery_target_valid = bool(
+            recovery_live_merge
+            and recovery_anchor_commit == merge_evidence_commit
+            and diagnostic_trigger.get("no_pass_claim") is True
+            and _value_int(
+                diagnostic_trigger.get("actual_reconcile_count")
+            )
+            == 0
+            and diagnostic_trigger.get(
+                "rejected_preflight_created_snapshot"
+            )
+            is False
+            and (
+                target_commit == recovery_anchor_commit
+                or recovery_repair_execution_id
+            )
+        )
+        repair_descendant_commits: list[str] = []
+        if recovery_target_valid and target_commit != recovery_anchor_commit:
+            root = _graph_governance_project_root(project_id, {})
+            allowed_repair_files: set[str] = set()
+            for raw_scope in (
+                diagnostic_row["target_files"],
+                diagnostic_row["test_files"],
+            ):
+                parsed_scope = _json_loads(raw_scope, [])
+                if isinstance(parsed_scope, list):
+                    allowed_repair_files.update(
+                        str(item or "").strip()
+                        for item in parsed_scope
+                        if str(item or "").strip()
+                    )
+            repair_descendant_commits = [
+                commit.strip().lower()
+                for commit in _git_output(
+                    root,
+                    [
+                        "rev-list",
+                        "--reverse",
+                        f"{recovery_anchor_commit}..{target_commit}",
+                    ],
+                ).splitlines()
+                if commit.strip()
+            ]
+            recovery_target_valid = bool(
+                allowed_repair_files
+                and _git_clean_worktree_verified(root)
+                and _git_output(
+                    root, ["rev-parse", "refs/heads/main"]
+                ).lower()
+                == target_commit
+                and _git_commit_is_ancestor(
+                    root,
+                    recovery_anchor_commit,
+                    target_commit,
+                )
+                and repair_descendant_commits
+                and repair_descendant_commits[-1] == target_commit
+            )
+            for repair_commit in repair_descendant_commits:
+                commit_body = _git_output(
+                    root,
+                    ["show", "-s", "--format=%B", repair_commit],
+                )
+                changed_files = {
+                    path.strip()
+                    for path in _git_output(
+                        root,
+                        [
+                            "diff-tree",
+                            "--no-commit-id",
+                            "--name-only",
+                            "-r",
+                            repair_commit,
+                        ],
+                    ).splitlines()
+                    if path.strip()
+                }
+                bug_trailers = re.findall(
+                    r"(?m)^Chain-Bug-Id:\s*(\S+)\s*$",
+                    commit_body,
+                )
+                source_trailers = re.findall(
+                    r"(?m)^Chain-Source-Task:\s*(\S+)\s*$",
+                    commit_body,
+                )
+                if not (
+                    recovery_target_valid
+                    and bug_trailers == [diagnostic_id]
+                    and source_trailers == [
+                        recovery_repair_execution_id
+                    ]
+                    and changed_files
+                    and changed_files.issubset(allowed_repair_files)
+                ):
+                    recovery_target_valid = False
+                    break
+        if ordinary_live_merge:
+            recovery_target_valid = merge_evidence_commit == target_commit
         if not (
             str(exception_payload.get("diagnostic_status") or "") == "OPEN"
             and diagnostic_policy.get("keep_open") is True
@@ -37526,6 +37655,7 @@ def _current_full_reconcile_audited_no_pass_authority(
             and str(diagnostic_policy.get("allowed_operation") or "")
             == "one_post_merge_current_full_reconcile_and_activation"
             and required_diagnostic_refs.issubset(diagnostic_ref_set)
+            and recovery_target_valid
         ):
             continue
 
@@ -37598,6 +37728,19 @@ def _current_full_reconcile_audited_no_pass_authority(
                 "queue_item_id": queue_item_id,
                 "candidate_commit_sha": candidate_commit,
                 "merged_commit_sha": target_commit,
+                "recovery_anchor_commit_sha": (
+                    recovery_anchor_commit if recovery_live_merge else ""
+                ),
+                "repair_descendant_commit_shas": (
+                    list(repair_descendant_commits)
+                    if recovery_live_merge
+                    else []
+                ),
+                "repair_descendant_verified": bool(
+                    recovery_live_merge
+                    and target_commit != recovery_anchor_commit
+                    and recovery_target_valid
+                ),
                 "canonical_base_snapshot_id": baseline_snapshot_id,
                 "canonical_base_commit": baseline_commit,
                 "candidate_diff_sha256": diff_sha256,

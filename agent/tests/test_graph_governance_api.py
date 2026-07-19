@@ -57642,6 +57642,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
 
 def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     conn,
+    monkeypatch,
 ):
     project_id = PID
     backlog_id = "AC-AUDITED-NO-PASS-RECONCILE"
@@ -57651,6 +57652,7 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     runtime_context_id = "mfrctx-audited-no-pass-reconcile"
     historical_task_id = "worker-audited-no-pass-original"
     historical_runtime_context_id = "mfrctx-audited-no-pass-original"
+    repair_contract_execution_id = "cex-audited-no-pass-repair"
     merge_queue_id = "mq-audited-no-pass-reconcile"
     queue_item_id = "mqitem-audited-no-pass-reconcile"
     baseline_snapshot_id = "full-audited-no-pass-baseline"
@@ -57876,8 +57878,9 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     conn.execute(
         """INSERT INTO backlog_bugs
            (bug_id, title, status, mf_type, bypass_policy_json,
-            provenance_paths, created_at, updated_at)
-           VALUES (?, ?, 'OPEN', 'chain_rescue', ?, ?, ?, ?)""",
+            chain_trigger_json, provenance_paths, target_files, test_files,
+            created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'chain_rescue', ?, ?, ?, ?, ?, ?, ?)""",
         (
             diagnostic_id,
             "Audited no-PASS reconcile authority diagnostic",
@@ -57896,6 +57899,17 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
                 }
             ),
             json.dumps(
+                {
+                    "actual_reconcile_count": 0,
+                    "no_pass_claim": True,
+                    "recovery_head_commit": merged_commit,
+                    "rejected_preflight_created_snapshot": False,
+                    "repair_contract_execution_id": (
+                        repair_contract_execution_id
+                    ),
+                }
+            ),
+            json.dumps(
                 [
                     f"backlog:{backlog_id}",
                     f"contract-runtime:{contract_execution_id}",
@@ -57904,11 +57918,13 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
                     f"merge:{merged_commit}",
                 ]
             ),
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
             "2026-07-16T23:27:44Z",
             "2026-07-16T23:27:44Z",
         ),
     )
-    bypass_gate = route_gate(task_id)
+    bypass_gate = dict(merge_gate)
     exception_event = task_timeline.record_event(
         conn,
         project_id=project_id,
@@ -58140,6 +58156,123 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
         ),
     )
     conn.commit()
+    repair_commit = "f" * 40
+    repair_git = {
+        "body": (
+            "system repair\n\n"
+            f"Chain-Source-Task: {repair_contract_execution_id}\n"
+            f"Chain-Bug-Id: {diagnostic_id}\n"
+        ),
+        "files": (
+            "agent/governance/server.py\n"
+            "agent/tests/test_graph_governance_api.py"
+        ),
+    }
+
+    def repair_git_output(_root, args):
+        if args == ["rev-parse", "refs/heads/main"]:
+            return repair_commit
+        if args[:2] == ["rev-list", "--reverse"]:
+            return repair_commit
+        if args[:3] == ["show", "-s", "--format=%B"]:
+            return repair_git["body"]
+        if args and args[0] == "diff-tree":
+            return repair_git["files"]
+        return ""
+
+    monkeypatch.setattr(server, "_git_output", repair_git_output)
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda _root, ancestor, descendant: (
+            ancestor == merged_commit and descendant == repair_commit
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_clean_worktree_verified",
+        lambda _root: True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: Path("/tmp/audited-repair-root"),
+    )
+    repaired_runtime_scope = (
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={"backlog_id": backlog_id, "task_id": task_id},
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha=repair_commit,
+        )
+    )
+    repaired_authority = repaired_runtime_scope["contract_merge_authority"]
+    assert repaired_authority["merged_commit_sha"] == repair_commit
+    assert repaired_authority["recovery_anchor_commit_sha"] == merged_commit
+    assert repaired_authority["repair_descendant_commit_shas"] == [
+        repair_commit
+    ]
+    assert repaired_authority["repair_descendant_verified"] is True
+    repair_git["files"] = "README.md"
+    with pytest.raises(GovernanceError) as out_of_scope_repair:
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={"backlog_id": backlog_id, "task_id": task_id},
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha=repair_commit,
+        )
+    assert out_of_scope_repair.value.code == (
+        "current_full_reconcile_contract_merge_authority_required"
+    )
+    repair_git["files"] = "agent/governance/server.py"
+    repair_git["body"] = (
+        "system repair\n\n"
+        "Chain-Source-Task: forged-cex\n"
+        f"Chain-Bug-Id: {diagnostic_id}\n"
+    )
+    with pytest.raises(GovernanceError) as wrong_repair_source:
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={"backlog_id": backlog_id, "task_id": task_id},
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha=repair_commit,
+        )
+    assert wrong_repair_source.value.code == (
+        "current_full_reconcile_contract_merge_authority_required"
+    )
     forged_recovery_payload = json.loads(json.dumps(recovery_merge_payload))
     forged_recovery_payload["audited_postmerge_recovery_authority"][
         "candidate_commit"
