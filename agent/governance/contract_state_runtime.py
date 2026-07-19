@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .contracts.write_gate import bounded_qa_graph_decision_errors
+
 try:
     from agent.plugin_installer import CODEX_PLUGIN_PAYLOAD, REQUIRED_PLUGIN_FILES
 except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
@@ -2974,7 +2976,10 @@ def _payload_declares_requirement(value: Any, requirement_id: str, *, depth: int
 
 def _bounded_qa_graph_context_satisfies_requirement(
     event: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any] | None = None,
 ) -> bool:
+    policy = policy if isinstance(policy, Mapping) else {}
     payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
     evidence = payload.get("graph_trace_evidence")
     if not isinstance(evidence, Mapping):
@@ -3005,15 +3010,6 @@ def _bounded_qa_graph_context_satisfies_requirement(
         evidence.get("changed_files_source") or ""
     ).strip()
     changed_files = evidence.get("changed_files")
-    graph_basis_decision = evidence.get("graph_basis_decision")
-    graph_basis_decision_mapping = (
-        graph_basis_decision
-        if isinstance(graph_basis_decision, Mapping)
-        else {}
-    )
-    graph_basis_decision_hash = str(
-        evidence.get("graph_basis_decision_hash") or ""
-    ).strip().lower()
 
     def full_commit(value: str) -> bool:
         return len(value) in {40, 64} and all(
@@ -3031,56 +3027,23 @@ def _bounded_qa_graph_context_satisfies_requirement(
             )
         )
 
-    decision_present = isinstance(graph_basis_decision, Mapping)
-    decision_valid = bool(
-        not decision_present
+    accepted_graph_basis = {
+        str(item)
+        for item in policy.get("accepted_graph_basis")
         or (
-            str(
-                graph_basis_decision_mapping.get("schema_version") or ""
-            ).strip()
-            == "qa_review_graph.basis_decision.v1"
-            and str(
-                graph_basis_decision_mapping.get("decision_source") or ""
-            ).strip()
-            == "server_bounded_qa_graph_basis"
-            and str(
-                graph_basis_decision_mapping.get("default_graph_basis") or ""
-            ).strip()
-            == "canonical_base_plus_candidate_diff"
-            and str(
-                graph_basis_decision_mapping.get("selected_graph_basis") or ""
-            ).strip()
-            == graph_basis
-            and str(
-                graph_basis_decision_mapping.get("overlay_failure_policy") or ""
-            ).strip()
-            == "fail_closed"
-            and str(
-                graph_basis_decision_mapping.get(
-                    "one_hop_dependency_failure_policy"
-                )
-                or ""
-            ).strip()
-            == "fail_closed"
-            and graph_basis_decision_hash
-            == "sha256:"
-            + hashlib.sha256(
-                json.dumps(
-                    graph_basis_decision,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            ).hexdigest()
+            "exact_candidate_snapshot",
+            "canonical_base_plus_candidate_diff",
         )
+    }
+    decision_valid = not bounded_qa_graph_decision_errors(
+        policy,
+        evidence,
+        graph_basis=graph_basis,
     )
 
     if not (
         graph_basis
-        in {
-            "exact_candidate_snapshot",
-            "canonical_base_plus_candidate_diff",
-        }
+        in accepted_graph_basis
         and base_snapshot_id
         and full_commit(base_commit_sha)
         and full_commit(candidate_commit_sha)
@@ -3096,19 +3059,10 @@ def _bounded_qa_graph_context_satisfies_requirement(
             base_commit_sha == candidate_commit_sha
             and not changed_files
             and diff_hash == empty_diff_hash
-            and (
-                not decision_present
-                or str(
-                    graph_basis_decision_mapping.get(
-                        "exact_candidate_upgrade_trigger"
-                    )
-                    or ""
-                ).strip()
-                == "qa_explicit_exact_snapshot_request"
-            )
             and all(
                 sha256(evidence.get(field))
-                for field in (
+                for field in policy.get("exact_candidate_required_hash_fields")
+                or (
                     "root_identity_hash",
                     "query_root_identity_hash",
                     "canonical_project_identity_hash",
@@ -3118,23 +3072,10 @@ def _bounded_qa_graph_context_satisfies_requirement(
         )
     return bool(
         base_commit_sha != candidate_commit_sha
-        and (
-            not decision_present
-            or str(
-                graph_basis_decision_mapping.get("selection_reason") or ""
-            ).strip()
-            == "bounded_source_backed_overlay_safe"
-        )
-        and (
-            not decision_present
-            or str(
-                graph_basis_decision_mapping.get("canonical_head_relation") or ""
-            ).strip()
-            in {"base", "candidate"}
-        )
         and all(
             sha256(evidence.get(field))
-            for field in (
+            for field in policy.get("base_diff_required_hash_fields")
+            or (
                 "candidate_overlay_hash",
                 "root_identity_hash",
                 "query_root_identity_hash",
@@ -3466,6 +3407,13 @@ def _requirement_uses_strict_evidence_policy(
     requirement: Mapping[str, Any],
     policy_name: str,
 ) -> bool:
+    return _requirement_strict_evidence_policy(requirement, policy_name) is not None
+
+
+def _requirement_strict_evidence_policy(
+    requirement: Mapping[str, Any],
+    policy_name: str,
+) -> dict[str, Any] | None:
     for key in (
         "compiled_evidence_policies",
         "server_derived_evidence_policies",
@@ -3475,12 +3423,12 @@ def _requirement_uses_strict_evidence_policy(
         if isinstance(value, Mapping):
             marker = value.get(policy_name)
             if marker is True:
-                return True
+                return {"enabled": True}
             if isinstance(marker, Mapping) and marker.get("enabled") is True:
-                return True
+                return dict(marker)
         elif policy_name in _string_list(value):
-            return True
-    return False
+            return {"enabled": True}
+    return None
 
 
 def _candidate_commit_satisfies_requirement(
@@ -3821,12 +3769,15 @@ def _event_satisfies_requirement(
         and not _candidate_commit_satisfies_requirement(event, requirement)
     ):
         return False, None
-    if (
-        _requirement_uses_strict_evidence_policy(
-            requirement,
-            "bounded_qa_review_policy",
+    bounded_qa_policy = _requirement_strict_evidence_policy(
+        requirement,
+        "bounded_qa_review_policy",
+    )
+    if bounded_qa_policy is not None and not (
+        _bounded_qa_graph_context_satisfies_requirement(
+            event,
+            policy=bounded_qa_policy,
         )
-        and not _bounded_qa_graph_context_satisfies_requirement(event)
     ):
         return False, None
     if (

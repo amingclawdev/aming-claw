@@ -1005,6 +1005,13 @@ def test_latest_qa_basis_revisions_default_overlay_without_rewriting_pinned_poli
         assert policy["canonical_head_policy"] == "base_or_candidate"
         assert policy["overlay_failure_policy"] == "fail_closed"
         assert policy["one_hop_dependency_failure_policy"] == "fail_closed"
+        assert policy["exact_candidate_escalation_stage"] == (
+            "server_persisted_overlay_failure_classification"
+        )
+        assert policy["exact_candidate_acceptance_stage"] == (
+            "graph_query_trace_persisted_basis_decision"
+        )
+        assert policy["server_trigger_escalation_ref_required"] is True
         assert policy["exact_candidate_upgrade_triggers"] == [
             "graph_algorithm_or_graph_config_change",
             "governance_semantic_or_structure_hint_change",
@@ -1100,3 +1107,104 @@ def test_latest_qa_basis_revisions_default_overlay_without_rewriting_pinned_poli
     )
     assert rejected.ok is False
     assert any("fail-closed overlay" in item for item in rejected.errors)
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "graph_algorithm_or_graph_config_change",
+        "governance_semantic_or_structure_hint_change",
+        "broad_or_unbounded_candidate_change",
+        "deterministic_overlay_or_one_hop_dependency_failure",
+        "qa_explicit_exact_snapshot_request",
+    ],
+)
+def test_latest_qa_gate_accepts_each_pinned_exact_upgrade_trigger(trigger: str) -> None:
+    definition = ContractDefinitionRegistry().get(
+        "direct_fix",
+        revision="rev3",
+    )
+    state = build_execution_state(
+        definition,
+        project_id="aming-claw",
+        backlog_id="AC-QA-EXACT-TRIGGER-MATRIX",
+        contract_execution_id=f"cex-exact-trigger-{trigger}",
+        actor_role="qa",
+        instruction_bundle_hash="sha256:exact-trigger-matrix",
+    )
+    decision = {
+        "schema_version": "qa_review_graph.basis_decision.v1",
+        "decision_source": "server_bounded_qa_graph_basis",
+        "default_graph_basis": "canonical_base_plus_candidate_diff",
+        "selected_graph_basis": "exact_candidate_snapshot",
+        "selection_reason": (
+            "qa_explicit_exact_candidate_snapshot"
+            if trigger == "qa_explicit_exact_snapshot_request"
+            else "server_classified_exact_candidate_snapshot"
+        ),
+        "candidate_change_classification": f"server_or_qa:{trigger}",
+        "exact_candidate_upgrade_trigger": trigger,
+        "exact_candidate_upgrade_ref": (
+            "" if trigger == "qa_explicit_exact_snapshot_request" else f"qage-{trigger}"
+        ),
+        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+        "canonical_head_policy": "base_or_candidate",
+        "canonical_head_relation": "candidate",
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
+    }
+    commit = "b" * 40
+    authority = {
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "trace_ids": ["gqt-exact-trigger"],
+        "verified_trace_ids": ["gqt-exact-trigger"],
+        "missing_trace_ids": [],
+        "identity_mismatches": [],
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-QA-EXACT-TRIGGER-MATRIX",
+        "task_id": "worker-exact-trigger",
+        "qa_session_id": "ses-exact-trigger",
+        "qa_principal": "qa-exact-trigger",
+        "target_project_root": "/tmp/exact-trigger",
+        "graph_basis": "exact_candidate_snapshot",
+        "graph_basis_decision": decision,
+        "graph_basis_decision_hash": stable_sha256(decision),
+        "canonical_base_snapshot_id": "full-exact-trigger",
+        "base_commit_sha": commit,
+        "candidate_commit_sha": commit,
+        "changed_files": [],
+        "candidate_diff_hash": (
+            "sha256:e3b0c44298fc1c149afbf4c8996fb924"
+            "27ae41e4649b934ca495991b7852b855"
+        ),
+        "changed_files_source": "server_exact_candidate_snapshot",
+        "root_identity_hash": "sha256:" + "3" * 64,
+        "query_root_identity_hash": "sha256:" + "4" * 64,
+        "canonical_project_identity_hash": "sha256:" + "5" * 64,
+        "repository_identity_hash": "sha256:" + "6" * 64,
+    }
+    write = {
+        "project_id": state["project_id"],
+        "backlog_id": state["backlog_id"],
+        "contract_execution_id": state["contract_execution_id"],
+        "definition_hash": state["definition_hash"],
+        "instruction_bundle_hash": state["instruction_bundle_hash"],
+        "execution_state_revision": state["execution_state_revision"],
+        "stage_id": "qa_graph_context",
+        "line_id": "direct_fix_qa_graph_context",
+        "actor_role": "qa",
+        "evidence_kind": "graph_trace",
+        "task_id": "worker-exact-trigger",
+        "graph_trace_ids": ["gqt-exact-trigger"],
+        "payload": {"graph_trace_evidence": authority},
+    }
+
+    assert validate_contract_write(
+        definition,
+        state,
+        write,
+        require_next_action=False,
+    ).ok is True

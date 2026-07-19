@@ -25359,6 +25359,50 @@ def test_strict_qa_trace_refs_require_matching_pinned_candidate_and_root(
     assert matching["db_verified"] is True
     assert matching["candidate_commit_sha"] == candidate_commit
 
+    escalation = graph_query_trace.record_qa_graph_basis_escalation(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        qa_session_id="ses-qa",
+        candidate_commit_sha=candidate_commit,
+        machine_reason="graph_config_change_requires_exact_candidate_snapshot",
+    )
+    root_identity = json.loads(
+        conn.execute(
+            "SELECT root_identity_json FROM graph_query_traces "
+            "WHERE project_id = ? AND trace_id = ?",
+            (PID, trace_id),
+        ).fetchone()["root_identity_json"]
+    )
+    server_decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        "exact_candidate_snapshot",
+        root_identity,
+        exact_candidate_upgrade_trigger=escalation[
+            "exact_candidate_upgrade_trigger"
+        ],
+        candidate_change_classification=escalation[
+            "candidate_change_classification"
+        ],
+        exact_candidate_upgrade_ref=escalation["escalation_id"],
+    )
+    conn.execute(
+        "UPDATE graph_query_traces SET graph_basis_decision_json = ?, "
+        "graph_basis_decision_hash = ? WHERE project_id = ? AND trace_id = ?",
+        (
+            json.dumps(server_decision),
+            server.stable_sha256(server_decision),
+            PID,
+            trace_id,
+        ),
+    )
+    conn.commit()
+    server_escalated = refs(candidate_commit)
+    assert server_escalated["db_verified"] is True
+    assert server_escalated["candidate_review_context"][
+        "graph_basis_decision"
+    ]["exact_candidate_upgrade_ref"] == escalation["escalation_id"]
+
     wrong_session = refs(candidate_commit, expected_session_id="ses-other")
     assert wrong_session["db_verified"] is False
     assert any(
@@ -27573,6 +27617,16 @@ def test_runtime_context_current_state_and_guide_expose_session_token_lease(
         "exact_candidate_snapshot_upgrade_policy": (
             "server_classified_or_qa_explicit"
         ),
+        "exact_candidate_escalation_stage": (
+            "server_persisted_overlay_failure_classification"
+        ),
+        "exact_candidate_acceptance_stage": (
+            "graph_query_trace_persisted_basis_decision"
+        ),
+        "exact_candidate_escalation_authority_source": (
+            "qa_graph_basis_escalations"
+        ),
+        "server_trigger_escalation_ref_required": True,
         "exact_candidate_snapshot_upgrade_triggers": [
             "graph_algorithm_or_graph_config_change",
             "governance_semantic_or_structure_hint_change",

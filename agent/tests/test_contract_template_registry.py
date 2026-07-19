@@ -226,6 +226,12 @@ def test_qa_template_policies_are_non_authoritative_definition_mirrors():
     )
     assert graph_basis_policy["graph_basis_decision_required"] is True
     assert graph_basis_policy["one_hop_dependency_failure_policy"] == "fail_closed"
+    assert graph_basis_policy["exact_candidate_escalation_stage"] == qa_policy[
+        "exact_candidate_escalation_stage"
+    ]
+    assert graph_basis_policy["exact_candidate_acceptance_stage"] == qa_policy[
+        "exact_candidate_acceptance_stage"
+    ]
     assert graph_basis_policy["exact_candidate_upgrade_triggers"] == qa_policy[
         "exact_candidate_upgrade_triggers"
     ]

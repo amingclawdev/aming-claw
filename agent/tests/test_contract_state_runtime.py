@@ -1124,6 +1124,23 @@ def _strict_mf_parallel_contract() -> dict:
                 "bounded_qa_review_policy": {
                     "enabled": True,
                     "line_ids": ["qa_graph_context"],
+                    "accepted_graph_basis": [
+                        "exact_candidate_snapshot",
+                        "canonical_base_plus_candidate_diff",
+                    ],
+                    "default_graph_basis": "canonical_base_plus_candidate_diff",
+                    "graph_basis_decision_required": True,
+                    "graph_basis_decision_source": (
+                        "server_bounded_qa_graph_basis"
+                    ),
+                    "exact_candidate_upgrade_triggers": [
+                        "graph_algorithm_or_graph_config_change",
+                        "governance_semantic_or_structure_hint_change",
+                        "broad_or_unbounded_candidate_change",
+                        "deterministic_overlay_or_one_hop_dependency_failure",
+                        "qa_explicit_exact_snapshot_request",
+                    ],
+                    "server_trigger_escalation_ref_required": True,
                 },
                 "current_full_reconcile_evidence_policy": {
                     "enabled": True,
@@ -2696,6 +2713,23 @@ def test_bounded_qa_graph_context_requires_complete_candidate_review_tuple():
     )
     assert incomplete["next_legal_action"]["id"] == "qa_graph_context"
 
+    decisionless_evidence = _bounded_qa_graph_evidence(base_diff=True)
+    decisionless_evidence.pop("graph_basis_decision")
+    decisionless_evidence.pop("graph_basis_decision_hash")
+    decisionless = build_contract_state_projection(
+        [
+            *prefix,
+            _event(
+                11,
+                "qa_graph_trace",
+                payload={"graph_trace_evidence": decisionless_evidence},
+            ),
+        ],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": "AC-CONTRACT-RUNTIME"},
+    )
+    assert decisionless["next_legal_action"]["id"] == "qa_graph_context"
+
     complete = build_contract_state_projection(
         [
             *prefix,
@@ -2753,6 +2787,119 @@ def test_qa_and_reconcile_authority_fields_cannot_be_combined_across_mappings():
         }
     ) is False
 
+
+def test_bounded_qa_decision_matrix_uses_pinned_policy_and_preserves_old_pins():
+    triggers = [
+        "graph_algorithm_or_graph_config_change",
+        "governance_semantic_or_structure_hint_change",
+        "broad_or_unbounded_candidate_change",
+        "deterministic_overlay_or_one_hop_dependency_failure",
+        "qa_explicit_exact_snapshot_request",
+    ]
+    policy = {
+        "enabled": True,
+        "accepted_graph_basis": [
+            "exact_candidate_snapshot",
+            "canonical_base_plus_candidate_diff",
+        ],
+        "default_graph_basis": "canonical_base_plus_candidate_diff",
+        "graph_basis_decision_required": True,
+        "graph_basis_decision_source": "server_bounded_qa_graph_basis",
+        "exact_candidate_upgrade_triggers": triggers,
+        "server_trigger_escalation_ref_required": True,
+        "exact_candidate_required_hash_fields": [
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        ],
+        "base_diff_required_hash_fields": [
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        ],
+    }
+
+    for trigger in triggers:
+        evidence = _bounded_qa_graph_evidence()
+        decision = dict(evidence["graph_basis_decision"])
+        decision["exact_candidate_upgrade_trigger"] = trigger
+        decision["selection_reason"] = (
+            "qa_explicit_exact_candidate_snapshot"
+            if trigger == "qa_explicit_exact_snapshot_request"
+            else "server_classified_exact_candidate_snapshot"
+        )
+        decision["exact_candidate_upgrade_ref"] = (
+            "" if trigger == "qa_explicit_exact_snapshot_request" else f"qage-{trigger}"
+        )
+        evidence["graph_basis_decision"] = decision
+        evidence["graph_basis_decision_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                decision,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        assert _bounded_qa_graph_context_satisfies_requirement(
+            {"payload": {"graph_trace_evidence": evidence}},
+            policy=policy,
+        ) is True
+
+    base_diff = _bounded_qa_graph_evidence(base_diff=True)
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": base_diff}},
+        policy=policy,
+    ) is True
+
+    missing = dict(base_diff)
+    missing.pop("graph_basis_decision")
+    missing.pop("graph_basis_decision_hash")
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": missing}},
+        policy=policy,
+    ) is False
+
+    tampered = dict(base_diff)
+    tampered["graph_basis_decision"] = {
+        **base_diff["graph_basis_decision"],
+        "canonical_head_relation": "other",
+    }
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": tampered}},
+        policy=policy,
+    ) is False
+
+    invalid = _bounded_qa_graph_evidence()
+    invalid_decision = {
+        **invalid["graph_basis_decision"],
+        "exact_candidate_upgrade_trigger": "caller_invented_trigger",
+        "exact_candidate_upgrade_ref": "qage-invalid",
+    }
+    invalid["graph_basis_decision"] = invalid_decision
+    invalid["graph_basis_decision_hash"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            invalid_decision,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": invalid}},
+        policy=policy,
+    ) is False
+
+    old_pin = dict(base_diff)
+    old_pin.pop("graph_basis_decision")
+    old_pin.pop("graph_basis_decision_hash")
+    assert _bounded_qa_graph_context_satisfies_requirement(
+        {"payload": {"graph_trace_evidence": old_pin}},
+        policy={"enabled": True},
+    ) is True
+
+
+def test_reconcile_authority_fields_cannot_be_combined_across_mappings():
     commit_sha = "c" * 40
     marker = {
         "schema_version": "current_full_reconcile.provenance.v2",

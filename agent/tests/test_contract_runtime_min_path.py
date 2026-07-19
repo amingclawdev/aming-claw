@@ -115,6 +115,12 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
     assert policy["canonical_head_policy"] == "base_or_candidate"
     assert policy["overlay_failure_policy"] == "fail_closed"
     assert policy["one_hop_dependency_failure_policy"] == "fail_closed"
+    assert policy["exact_candidate_escalation_stage"] == (
+        "server_persisted_overlay_failure_classification"
+    )
+    assert policy["exact_candidate_acceptance_stage"] == (
+        "graph_query_trace_persisted_basis_decision"
+    )
     assert policy["full_candidate_snapshot_required"] is False
     assert policy["exact_candidate_query_root_clean_required"] is True
     assert policy["assigned_target_project_root_required"] is True

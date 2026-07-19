@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   route_token_ref TEXT NOT NULL DEFAULT '',
   commit_sha TEXT NOT NULL DEFAULT '',
   graph_basis TEXT NOT NULL DEFAULT '',
+  graph_basis_decision_json TEXT NOT NULL DEFAULT '{}',
+  graph_basis_decision_hash TEXT NOT NULL DEFAULT '',
   canonical_base_snapshot_id TEXT NOT NULL DEFAULT '',
   base_commit_sha TEXT NOT NULL DEFAULT '',
   candidate_commit_sha TEXT NOT NULL DEFAULT '',
@@ -82,6 +84,24 @@ CREATE TABLE IF NOT EXISTS graph_query_events (
   created_at TEXT NOT NULL,
   PRIMARY KEY(trace_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS qa_graph_basis_escalations (
+  escalation_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  backlog_id TEXT NOT NULL DEFAULT '',
+  task_id TEXT NOT NULL DEFAULT '',
+  qa_session_id TEXT NOT NULL DEFAULT '',
+  candidate_commit_sha TEXT NOT NULL,
+  exact_candidate_upgrade_trigger TEXT NOT NULL,
+  candidate_change_classification TEXT NOT NULL,
+  machine_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qa_graph_basis_escalation_lookup
+  ON qa_graph_basis_escalations(
+    project_id, backlog_id, task_id, qa_session_id, candidate_commit_sha, created_at
+  );
 """
 
 
@@ -314,11 +334,150 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
 QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION = "qa_review_graph.basis_decision.v1"
 QA_GRAPH_BASIS_DECISION_SOURCE = "server_bounded_qa_graph_basis"
 QA_GRAPH_BASIS_DEFAULT = store.QA_GRAPH_BASIS_CANONICAL_BASE_DIFF
+QA_EXACT_UPGRADE_TRIGGERS = (
+    "graph_algorithm_or_graph_config_change",
+    "governance_semantic_or_structure_hint_change",
+    "broad_or_unbounded_candidate_change",
+    "deterministic_overlay_or_one_hop_dependency_failure",
+    "qa_explicit_exact_snapshot_request",
+)
+
+
+def classify_qa_exact_upgrade_trigger(machine_reason: str) -> str:
+    """Classify a fail-closed overlay reason into the public exact trigger set."""
+
+    reason = str(machine_reason or "").strip().lower()
+    if reason.startswith(("graph_algorithm_", "graph_config_")):
+        return "graph_algorithm_or_graph_config_change"
+    if reason.startswith(("governance_hint_", "graph_structure_hint_")):
+        return "governance_semantic_or_structure_hint_change"
+    if any(
+        marker in reason
+        for marker in (
+            "changed_file_limit",
+            "total_source_limit",
+            "symbol_limit",
+            "parse_limit",
+            "oversized_source",
+            "binary_source",
+            "non_utf8_source",
+        )
+    ):
+        return "broad_or_unbounded_candidate_change"
+    return "deterministic_overlay_or_one_hop_dependency_failure"
+
+
+def record_qa_graph_basis_escalation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    backlog_id: str,
+    task_id: str,
+    qa_session_id: str,
+    candidate_commit_sha: str,
+    machine_reason: str,
+    exact_candidate_upgrade_trigger: str = "",
+) -> dict[str, Any]:
+    """Persist server-classified overlay failure authority for later exact QA."""
+
+    ensure_schema(conn)
+    trigger = str(exact_candidate_upgrade_trigger or "").strip() or (
+        classify_qa_exact_upgrade_trigger(machine_reason)
+    )
+    if trigger not in QA_EXACT_UPGRADE_TRIGGERS[:-1]:
+        raise ValueError("server escalation requires a supported non-QA exact trigger")
+    escalation_id = f"qage-{uuid.uuid4().hex[:16]}"
+    classification = f"server_classified:{trigger}"
+    created_at = utc_now()
+    conn.execute(
+        """
+        INSERT INTO qa_graph_basis_escalations (
+          escalation_id, project_id, backlog_id, task_id, qa_session_id,
+          candidate_commit_sha, exact_candidate_upgrade_trigger,
+          candidate_change_classification, machine_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            escalation_id,
+            str(project_id or "").strip(),
+            str(backlog_id or "").strip(),
+            str(task_id or "").strip(),
+            str(qa_session_id or "").strip(),
+            str(candidate_commit_sha or "").strip().lower(),
+            trigger,
+            classification,
+            str(machine_reason or "").strip(),
+            created_at,
+        ),
+    )
+    return {
+        "schema_version": "qa_review_graph.basis_escalation.v1",
+        "escalation_id": escalation_id,
+        "decision_source": QA_GRAPH_BASIS_DECISION_SOURCE,
+        "exact_candidate_upgrade_trigger": trigger,
+        "candidate_change_classification": classification,
+        "machine_reason": str(machine_reason or "").strip(),
+        "created_at": created_at,
+    }
+
+
+def latest_qa_graph_basis_escalation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    backlog_id: str,
+    task_id: str,
+    qa_session_id: str,
+    candidate_commit_sha: str,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM qa_graph_basis_escalations
+        WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+          AND qa_session_id = ? AND candidate_commit_sha = ?
+        ORDER BY created_at DESC, escalation_id DESC
+        LIMIT 1
+        """,
+        (
+            str(project_id or "").strip(),
+            str(backlog_id or "").strip(),
+            str(task_id or "").strip(),
+            str(qa_session_id or "").strip(),
+            str(candidate_commit_sha or "").strip().lower(),
+        ),
+    ).fetchone()
+    if not row:
+        return {}
+    result = dict(row)
+    result["schema_version"] = "qa_review_graph.basis_escalation.v1"
+    result["decision_source"] = QA_GRAPH_BASIS_DECISION_SOURCE
+    return result
+
+
+def get_qa_graph_basis_escalation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    escalation_id: str,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM qa_graph_basis_escalations
+        WHERE project_id = ? AND escalation_id = ?
+        """,
+        (str(project_id or "").strip(), str(escalation_id or "").strip()),
+    ).fetchone()
+    return dict(row) if row else {}
 
 
 def bounded_qa_graph_basis_decision(
     graph_basis: str,
     root_identity: Mapping[str, Any] | None,
+    *,
+    exact_candidate_upgrade_trigger: str = "",
+    candidate_change_classification: str = "",
+    exact_candidate_upgrade_ref: str = "",
 ) -> dict[str, Any]:
     """Derive the executable QA basis decision from server-persisted facts."""
 
@@ -337,23 +496,33 @@ def bounded_qa_graph_basis_decision(
             relation = "other"
 
     exact = selected == store.QA_GRAPH_BASIS_EXACT_CANDIDATE
+    trigger = str(exact_candidate_upgrade_trigger or "").strip()
+    if exact and not trigger:
+        trigger = "qa_explicit_exact_snapshot_request"
+    if exact and trigger not in QA_EXACT_UPGRADE_TRIGGERS:
+        raise ValueError(f"unsupported exact candidate upgrade trigger: {trigger}")
+    server_classified = exact and trigger != "qa_explicit_exact_snapshot_request"
     return {
         "schema_version": QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION,
         "decision_source": QA_GRAPH_BASIS_DECISION_SOURCE,
         "default_graph_basis": QA_GRAPH_BASIS_DEFAULT,
         "selected_graph_basis": selected,
         "selection_reason": (
-            "qa_explicit_exact_candidate_snapshot"
+            "server_classified_exact_candidate_snapshot"
+            if server_classified
+            else "qa_explicit_exact_candidate_snapshot"
             if exact
             else "bounded_source_backed_overlay_safe"
         ),
         "candidate_change_classification": (
-            "exact_candidate_snapshot_server_verified"
+            str(candidate_change_classification or "").strip()
+            or "exact_candidate_snapshot_server_verified"
             if exact
             else "bounded_source_backed_overlay"
         ),
-        "exact_candidate_upgrade_trigger": (
-            "qa_explicit_exact_snapshot_request" if exact else ""
+        "exact_candidate_upgrade_trigger": trigger if exact else "",
+        "exact_candidate_upgrade_ref": (
+            str(exact_candidate_upgrade_ref or "").strip() if exact else ""
         ),
         "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
         "canonical_head_policy": "base_or_candidate",
@@ -373,6 +542,8 @@ _TRACE_IDENTITY_COLUMNS = {
     "route_token_ref": "TEXT NOT NULL DEFAULT ''",
     "commit_sha": "TEXT NOT NULL DEFAULT ''",
     "graph_basis": "TEXT NOT NULL DEFAULT ''",
+    "graph_basis_decision_json": "TEXT NOT NULL DEFAULT '{}'",
+    "graph_basis_decision_hash": "TEXT NOT NULL DEFAULT ''",
     "canonical_base_snapshot_id": "TEXT NOT NULL DEFAULT ''",
     "base_commit_sha": "TEXT NOT NULL DEFAULT ''",
     "candidate_commit_sha": "TEXT NOT NULL DEFAULT ''",
@@ -459,6 +630,8 @@ def _normalize_candidate_review_context(
     changed_files: Any,
     candidate_diff_hash: str,
     changed_files_source: str,
+    graph_basis_decision: Mapping[str, Any] | None = None,
+    graph_basis_decision_hash: str = "",
     candidate_overlay: Mapping[str, Any] | None = None,
     candidate_overlay_hash: str = "",
     root_identity: Mapping[str, Any] | None = None,
@@ -469,14 +642,31 @@ def _normalize_candidate_review_context(
 ) -> dict[str, Any]:
     normalized_overlay = dict(candidate_overlay or {})
     normalized_root_identity = dict(root_identity or {})
-    basis_decision = bounded_qa_graph_basis_decision(
-        graph_basis,
-        normalized_root_identity,
+    normalized_graph_basis = str(graph_basis or "").strip()
+    basis_decision = (
+        dict(graph_basis_decision)
+        if isinstance(graph_basis_decision, Mapping) and graph_basis_decision
+        else bounded_qa_graph_basis_decision(
+            normalized_graph_basis,
+            normalized_root_identity,
+        )
+        if normalized_graph_basis
+        else {}
     )
+    basis_decision_hash = str(graph_basis_decision_hash or "").strip().lower()
+    expected_basis_decision_hash = stable_sha256(basis_decision) if basis_decision else ""
+    if basis_decision_hash and basis_decision_hash != expected_basis_decision_hash:
+        raise ValueError(
+            "graph_basis_decision_hash must hash the exact persisted decision"
+        )
+    if basis_decision and str(
+        basis_decision.get("selected_graph_basis") or ""
+    ).strip() != normalized_graph_basis:
+        raise ValueError("graph_basis_decision must select graph_basis")
     context = {
-        "graph_basis": str(graph_basis or "").strip(),
+        "graph_basis": normalized_graph_basis,
         "graph_basis_decision": basis_decision,
-        "graph_basis_decision_hash": stable_sha256(basis_decision),
+        "graph_basis_decision_hash": expected_basis_decision_hash,
         "canonical_base_snapshot_id": str(canonical_base_snapshot_id or "").strip(),
         "base_commit_sha": str(base_commit_sha or "").strip().lower(),
         "candidate_commit_sha": str(candidate_commit_sha or "").strip().lower(),
@@ -654,14 +844,25 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
             source.get("repository_identity_hash") or ""
         ),
     }
-    basis_decision = bounded_qa_graph_basis_decision(
-        candidate_context["graph_basis"],
-        source.get("root_identity")
-        if isinstance(source.get("root_identity"), Mapping)
-        else {},
+    graph_basis = candidate_context["graph_basis"]
+    basis_decision = (
+        dict(source.get("graph_basis_decision"))
+        if isinstance(source.get("graph_basis_decision"), Mapping)
+        and source.get("graph_basis_decision")
+        else bounded_qa_graph_basis_decision(
+            graph_basis,
+            source.get("root_identity")
+            if isinstance(source.get("root_identity"), Mapping)
+            else {},
+        )
+        if graph_basis
+        else {}
     )
     candidate_context["graph_basis_decision"] = basis_decision
-    candidate_context["graph_basis_decision_hash"] = stable_sha256(basis_decision)
+    candidate_context["graph_basis_decision_hash"] = str(
+        source.get("graph_basis_decision_hash")
+        or (stable_sha256(basis_decision) if basis_decision else "")
+    )
     return {
         "schema_version": GRAPH_QUERY_IDENTITY_SCHEMA_VERSION,
         "identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
@@ -902,6 +1103,8 @@ def start_trace(
     route_token_ref: str = "",
     commit_sha: str = "",
     graph_basis: str = "",
+    graph_basis_decision: Mapping[str, Any] | None = None,
+    graph_basis_decision_hash: str = "",
     canonical_base_snapshot_id: str = "",
     base_commit_sha: str = "",
     candidate_commit_sha: str = "",
@@ -937,6 +1140,8 @@ def start_trace(
         snapshot_id=snapshot_id,
         commit_sha=commit_sha,
         graph_basis=graph_basis,
+        graph_basis_decision=graph_basis_decision,
+        graph_basis_decision_hash=graph_basis_decision_hash,
         canonical_base_snapshot_id=canonical_base_snapshot_id,
         base_commit_sha=base_commit_sha,
         candidate_commit_sha=candidate_commit_sha,
@@ -957,7 +1162,8 @@ def start_trace(
         "task_id", "backlog_id", "route_id", "route_context_hash",
         "prompt_contract_id", "prompt_contract_hash",
         "visible_injection_manifest_hash", "route_token_ref", "commit_sha",
-        "graph_basis", "canonical_base_snapshot_id", "base_commit_sha",
+        "graph_basis", "graph_basis_decision_json", "graph_basis_decision_hash",
+        "canonical_base_snapshot_id", "base_commit_sha",
         "candidate_commit_sha", "changed_files_json", "candidate_diff_hash",
         "changed_files_source", "candidate_overlay_json",
         "candidate_overlay_hash", "root_identity_json", "root_identity_hash",
@@ -986,6 +1192,8 @@ def start_trace(
             str(route_token_ref or ""),
             str(commit_sha or ""),
             candidate_context["graph_basis"],
+            _json(candidate_context["graph_basis_decision"]),
+            candidate_context["graph_basis_decision_hash"],
             candidate_context["canonical_base_snapshot_id"],
             candidate_context["base_commit_sha"],
             candidate_context["candidate_commit_sha"],
@@ -1093,12 +1301,30 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
         trace.pop("candidate_overlay_json", "{}"), {}
     )
     trace["root_identity"] = _decode(trace.pop("root_identity_json", "{}"), {})
-    trace["graph_basis_decision"] = bounded_qa_graph_basis_decision(
-        str(trace.get("graph_basis") or ""),
-        trace["root_identity"],
+    persisted_decision = _decode(
+        trace.pop("graph_basis_decision_json", "{}"),
+        {},
     )
-    trace["graph_basis_decision_hash"] = stable_sha256(
-        trace["graph_basis_decision"]
+    trace["graph_basis_decision"] = (
+        persisted_decision
+        if isinstance(persisted_decision, Mapping) and persisted_decision
+        else bounded_qa_graph_basis_decision(
+            str(trace.get("graph_basis") or ""),
+            trace["root_identity"],
+        )
+        if str(trace.get("graph_basis") or "").strip()
+        else {}
+    )
+    persisted_decision_hash = str(
+        trace.get("graph_basis_decision_hash") or ""
+    ).strip().lower()
+    trace["graph_basis_decision_hash"] = (
+        persisted_decision_hash
+        or (
+            stable_sha256(trace["graph_basis_decision"])
+            if trace["graph_basis_decision"]
+            else ""
+        )
     )
     events = conn.execute(
         """
@@ -2591,6 +2817,8 @@ def traced_query(
     route_token_ref: str = "",
     commit_sha: str = "",
     graph_basis: str = "",
+    graph_basis_decision: Mapping[str, Any] | None = None,
+    graph_basis_decision_hash: str = "",
     canonical_base_snapshot_id: str = "",
     base_commit_sha: str = "",
     candidate_commit_sha: str = "",
@@ -2635,6 +2863,8 @@ def traced_query(
             route_token_ref=route_token_ref,
             commit_sha=commit_sha,
             graph_basis=graph_basis,
+            graph_basis_decision=graph_basis_decision,
+            graph_basis_decision_hash=graph_basis_decision_hash,
             canonical_base_snapshot_id=canonical_base_snapshot_id,
             base_commit_sha=base_commit_sha,
             candidate_commit_sha=candidate_commit_sha,
@@ -2684,6 +2914,8 @@ def traced_query(
                     snapshot_id=snapshot_id,
                     commit_sha=commit_sha,
                     graph_basis=graph_basis,
+                    graph_basis_decision=graph_basis_decision,
+                    graph_basis_decision_hash=graph_basis_decision_hash,
                     canonical_base_snapshot_id=canonical_base_snapshot_id,
                     base_commit_sha=base_commit_sha,
                     candidate_commit_sha=candidate_commit_sha,
@@ -2886,10 +3118,16 @@ __all__ = [
     "GRAPH_QUERY_IDENTITY_SCHEMA_VERSION",
     "QUERY_PURPOSES",
     "QUERY_SOURCES",
+    "QA_EXACT_UPGRADE_TRIGGERS",
+    "bounded_qa_graph_basis_decision",
+    "classify_qa_exact_upgrade_trigger",
     "ensure_schema",
     "finish_trace",
     "get_trace",
+    "get_qa_graph_basis_escalation",
     "graph_query_identity",
+    "latest_qa_graph_basis_escalation",
+    "record_qa_graph_basis_escalation",
     "run_tool",
     "start_trace",
     "traced_query",

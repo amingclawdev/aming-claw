@@ -87,6 +87,7 @@ _GRAPH_TRACE_ID_KEYS = {
 _BOUNDED_QA_POLICY_NAME = "bounded_qa_review_policy"
 _CANDIDATE_COMMIT_POLICY_NAME = "candidate_commit_evidence_policy"
 _CURRENT_FULL_RECONCILE_POLICY_NAME = "current_full_reconcile_evidence_policy"
+_QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION = "qa_review_graph.basis_decision.v1"
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,99 @@ class WriteGateDecision:
             "ok": self.ok,
             "errors": list(self.errors),
         }
+
+
+def bounded_qa_graph_decision_errors(
+    policy: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    graph_basis: str,
+    line_id: str = "qa_graph_context",
+) -> list[str]:
+    """Validate one persisted bounded-QA basis decision against pinned policy."""
+
+    errors: list[str] = []
+    decision = evidence.get("graph_basis_decision")
+    decision_hash = str(
+        evidence.get("graph_basis_decision_hash") or ""
+    ).strip().lower()
+    decision_required = policy.get("graph_basis_decision_required") is True
+    if not isinstance(decision, Mapping):
+        if decision_required:
+            errors.append(f"{line_id} requires server-derived graph_basis_decision")
+        return errors
+
+    expected_decision_source = str(
+        policy.get("graph_basis_decision_source")
+        or "server_bounded_qa_graph_basis"
+    ).strip()
+    expected_default = str(
+        policy.get("default_graph_basis")
+        or "canonical_base_plus_candidate_diff"
+    ).strip()
+    if str(decision.get("schema_version") or "").strip() != (
+        _QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION
+    ):
+        errors.append(f"{line_id} requires a supported graph_basis_decision schema")
+    if str(decision.get("decision_source") or "").strip() != expected_decision_source:
+        errors.append(
+            f"{line_id} requires graph_basis_decision.decision_source="
+            f"{expected_decision_source}"
+        )
+    if str(decision.get("default_graph_basis") or "").strip() != expected_default:
+        errors.append(f"{line_id} requires default graph basis {expected_default}")
+    if str(decision.get("selected_graph_basis") or "").strip() != graph_basis:
+        errors.append(f"{line_id} graph_basis_decision must select graph_basis")
+    if str(decision.get("overlay_failure_policy") or "").strip() != "fail_closed":
+        errors.append(f"{line_id} requires fail-closed overlay failures")
+    if (
+        str(decision.get("one_hop_dependency_failure_policy") or "").strip()
+        != "fail_closed"
+    ):
+        errors.append(f"{line_id} requires fail-closed one-hop dependency failures")
+    if stable_sha256(decision) != decision_hash:
+        errors.append(
+            f"{line_id} graph_basis_decision_hash must hash the exact decision"
+        )
+
+    if graph_basis == "exact_candidate_snapshot":
+        allowed_triggers = {
+            str(item)
+            for item in policy.get("exact_candidate_upgrade_triggers") or ()
+            if str(item)
+        }
+        trigger = str(
+            decision.get("exact_candidate_upgrade_trigger") or ""
+        ).strip()
+        if allowed_triggers and trigger not in allowed_triggers:
+            errors.append(
+                f"{line_id} exact candidate basis requires an allowed upgrade trigger"
+            )
+        if (
+            trigger != "qa_explicit_exact_snapshot_request"
+            and policy.get("server_trigger_escalation_ref_required") is True
+            and not str(
+                decision.get("exact_candidate_upgrade_ref") or ""
+            ).strip()
+        ):
+            errors.append(
+                f"{line_id} server-classified exact basis requires escalation ref"
+            )
+    elif graph_basis == "canonical_base_plus_candidate_diff":
+        if str(decision.get("selection_reason") or "").strip() != (
+            "bounded_source_backed_overlay_safe"
+        ):
+            errors.append(
+                f"{line_id} base-diff basis requires the safe default decision"
+            )
+        if str(decision.get("canonical_head_relation") or "").strip() not in {
+            "base",
+            "candidate",
+        }:
+            errors.append(
+                f"{line_id} base-diff basis requires canonical HEAD at base or candidate"
+            )
+    return errors
 
 
 def validate_contract_write(
@@ -369,48 +463,14 @@ def _validate_bounded_qa_graph_context(
     ).strip().lower()
     changed_files_source = str(evidence.get("changed_files_source") or "").strip()
 
-    decision = evidence.get("graph_basis_decision")
-    decision_hash = str(
-        evidence.get("graph_basis_decision_hash") or ""
-    ).strip().lower()
-    decision_required = policy.get("graph_basis_decision_required") is True
-    if decision_required and not isinstance(decision, Mapping):
-        errors.append(f"{line_id} requires server-derived graph_basis_decision")
-    elif decision_required and isinstance(decision, Mapping):
-        expected_decision_source = str(
-            policy.get("graph_basis_decision_source")
-            or "server_bounded_qa_graph_basis"
-        ).strip()
-        expected_default = str(
-            policy.get("default_graph_basis")
-            or "canonical_base_plus_candidate_diff"
-        ).strip()
-        if str(decision.get("decision_source") or "").strip() != expected_decision_source:
-            errors.append(
-                f"{line_id} requires graph_basis_decision.decision_source="
-                f"{expected_decision_source}"
-            )
-        if str(decision.get("default_graph_basis") or "").strip() != expected_default:
-            errors.append(
-                f"{line_id} requires default graph basis {expected_default}"
-            )
-        if str(decision.get("selected_graph_basis") or "").strip() != graph_basis:
-            errors.append(
-                f"{line_id} graph_basis_decision must select graph_basis"
-            )
-        if str(decision.get("overlay_failure_policy") or "").strip() != "fail_closed":
-            errors.append(f"{line_id} requires fail-closed overlay failures")
-        if (
-            str(decision.get("one_hop_dependency_failure_policy") or "").strip()
-            != "fail_closed"
-        ):
-            errors.append(
-                f"{line_id} requires fail-closed one-hop dependency failures"
-            )
-        if stable_sha256(decision) != decision_hash:
-            errors.append(
-                f"{line_id} graph_basis_decision_hash must hash the exact decision"
-            )
+    errors.extend(
+        bounded_qa_graph_decision_errors(
+            policy,
+            evidence,
+            graph_basis=graph_basis,
+            line_id=line_id,
+        )
+    )
 
     accepted_graph_basis = set(
         str(item) for item in policy.get("accepted_graph_basis") or []
@@ -448,18 +508,6 @@ def _validate_bounded_qa_graph_context(
             value = str(evidence.get(field) or "").strip().lower()
             if not _is_sha256(value):
                 errors.append(f"{line_id} requires {field}")
-        if decision_required and isinstance(decision, Mapping):
-            allowed_triggers = set(
-                str(item)
-                for item in policy.get("exact_candidate_upgrade_triggers") or ()
-            )
-            trigger = str(
-                decision.get("exact_candidate_upgrade_trigger") or ""
-            ).strip()
-            if allowed_triggers and trigger not in allowed_triggers:
-                errors.append(
-                    f"{line_id} exact candidate basis requires an allowed upgrade trigger"
-                )
         return
 
     if graph_basis == "canonical_base_plus_candidate_diff":
@@ -471,20 +519,6 @@ def _validate_bounded_qa_graph_context(
             value = str(evidence.get(field) or "").strip().lower()
             if not _is_sha256(value):
                 errors.append(f"{line_id} requires {field}")
-        if decision_required and isinstance(decision, Mapping):
-            if str(decision.get("selection_reason") or "").strip() != (
-                "bounded_source_backed_overlay_safe"
-            ):
-                errors.append(
-                    f"{line_id} base-diff basis requires the safe default decision"
-                )
-            if str(decision.get("canonical_head_relation") or "").strip() not in {
-                "base",
-                "candidate",
-            }:
-                errors.append(
-                    f"{line_id} base-diff basis requires canonical HEAD at base or candidate"
-                )
 
 
 def _validate_current_full_reconcile_evidence(

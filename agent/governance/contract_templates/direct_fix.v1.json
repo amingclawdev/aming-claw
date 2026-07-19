@@ -181,6 +181,10 @@
                         "graph_basis_decision_source": "server_bounded_qa_graph_basis",
                         "canonical_head_policy": "base_or_candidate",
                         "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+                        "exact_candidate_escalation_stage": "server_persisted_overlay_failure_classification",
+                        "exact_candidate_acceptance_stage": "graph_query_trace_persisted_basis_decision",
+                        "exact_candidate_escalation_authority_source": "qa_graph_basis_escalations",
+                        "server_trigger_escalation_ref_required": true,
                         "exact_candidate_upgrade_triggers": [
                             "graph_algorithm_or_graph_config_change",
                             "governance_semantic_or_structure_hint_change",

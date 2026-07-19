@@ -275,6 +275,8 @@ def test_trace_records_queries_and_budget_usage(conn, tmp_path):
     assert stored["events"][0]["tool"] == "get_node"
     assert stored["status"] == "running"
     assert stored["artifact_path"]
+    assert stored["graph_basis_decision"] == {}
+    assert stored["graph_basis_decision_hash"] == ""
 
 
 def test_query_tools_reuse_graph_files_and_search_docs(conn, tmp_path):
@@ -982,6 +984,134 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
             tool="query_schema",
             project_root=project_root,
         )
+
+
+@pytest.mark.parametrize(
+    ("machine_reason", "expected_trigger"),
+    [
+        (
+            "graph_config_change_requires_exact_candidate_snapshot",
+            "graph_algorithm_or_graph_config_change",
+        ),
+        (
+            "governance_hint_change_requires_exact_candidate_snapshot",
+            "governance_semantic_or_structure_hint_change",
+        ),
+        (
+            "changed_file_limit_requires_exact_candidate_snapshot",
+            "broad_or_unbounded_candidate_change",
+        ),
+        (
+            "one_hop_dependency_query_failed_closed",
+            "deterministic_overlay_or_one_hop_dependency_failure",
+        ),
+    ],
+)
+def test_server_exact_escalation_is_persisted_and_classified(
+    conn, machine_reason, expected_trigger
+):
+    escalation = graph_query_trace.record_qa_graph_basis_escalation(
+        conn,
+        PID,
+        backlog_id="AC-QA-ESCALATION",
+        task_id="qa-escalation-task",
+        qa_session_id="ses-qa-escalation",
+        candidate_commit_sha="b" * 40,
+        machine_reason=machine_reason,
+    )
+    loaded = graph_query_trace.latest_qa_graph_basis_escalation(
+        conn,
+        PID,
+        backlog_id="AC-QA-ESCALATION",
+        task_id="qa-escalation-task",
+        qa_session_id="ses-qa-escalation",
+        candidate_commit_sha="b" * 40,
+    )
+
+    assert escalation["exact_candidate_upgrade_trigger"] == expected_trigger
+    assert loaded["escalation_id"] == escalation["escalation_id"]
+    assert loaded["exact_candidate_upgrade_trigger"] == expected_trigger
+
+
+def test_exact_trace_reads_persisted_server_decision_without_rewriting(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    candidate_commit = "b" * 40
+    query_root_identity_hash = "sha256:" + "1" * 64
+    canonical_project_identity_hash = "sha256:" + "2" * 64
+    repository_identity_hash = "sha256:" + "3" * 64
+    root_identity = {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "canonical_head_commit": candidate_commit,
+        "canonical_head_relation": "candidate",
+        "query_root": str(project_root),
+        "query_root_head_commit": candidate_commit,
+        "query_root_identity_hash": query_root_identity_hash,
+        "query_root_clean": True,
+        "query_root_status_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        "query_root_tree_sha": "4" * 40,
+        "query_root_untracked_files_checked": True,
+        "canonical_project_root": str(project_root),
+        "canonical_project_identity_hash": canonical_project_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+        "repository_identity_match": True,
+    }
+    decision = graph_query_trace.bounded_qa_graph_basis_decision(
+        "exact_candidate_snapshot",
+        root_identity,
+        exact_candidate_upgrade_trigger=(
+            "graph_algorithm_or_graph_config_change"
+        ),
+        candidate_change_classification=(
+            "server_classified:graph_algorithm_or_graph_config_change"
+        ),
+        exact_candidate_upgrade_ref="qage-persisted-decision",
+    )
+    trace = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        actor="qa:persisted-decision",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id="qa-persisted-decision",
+        backlog_id="AC-QA-PERSISTED-DECISION",
+        commit_sha=candidate_commit,
+        graph_basis="exact_candidate_snapshot",
+        graph_basis_decision=decision,
+        graph_basis_decision_hash=stable_sha256(decision),
+        canonical_base_snapshot_id=snapshot_id,
+        base_commit_sha=candidate_commit,
+        candidate_commit_sha=candidate_commit,
+        changed_files=[],
+        candidate_diff_hash="sha256:" + hashlib.sha256(b"").hexdigest(),
+        changed_files_source="server_exact_candidate_snapshot",
+        root_identity=root_identity,
+        root_identity_hash=stable_sha256(root_identity),
+        query_root_identity_hash=query_root_identity_hash,
+        canonical_project_identity_hash=canonical_project_identity_hash,
+        repository_identity_hash=repository_identity_hash,
+        qa_session_id="ses-persisted-decision",
+        qa_scope_binding_ref="qa_scope:sha256:persisted-decision",
+    )["trace"]
+
+    assert trace["graph_basis_decision"] == decision
+    assert trace["graph_basis_decision_hash"] == stable_sha256(decision)
+    row = conn.execute(
+        "SELECT graph_basis_decision_json FROM graph_query_traces WHERE trace_id = ?",
+        (trace["trace_id"],),
+    ).fetchone()
+    assert json.loads(row["graph_basis_decision_json"]) == decision
+
+    tampered = {**decision, "exact_candidate_upgrade_trigger": "caller_tamper"}
+    conn.execute(
+        "UPDATE graph_query_traces SET graph_basis_decision_json = ? WHERE trace_id = ?",
+        (json.dumps(tampered), trace["trace_id"]),
+    )
+    reread = graph_query_trace.get_trace(conn, PID, trace["trace_id"])["trace"]
+    assert reread["graph_basis_decision"] == tampered
+    assert reread["graph_basis_decision_hash"] == stable_sha256(decision)
 
 
 def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_path):

@@ -7691,6 +7691,7 @@ def _qa_exact_candidate_context(
     project_id: str,
     canonical_project_root: Path,
     candidate_commit_sha: str,
+    escalation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from . import graph_query_trace
 
@@ -7710,9 +7711,19 @@ def _qa_exact_candidate_context(
         require_canonical_base_head=False,
         require_query_candidate_head=True,
     )
+    escalation = escalation if isinstance(escalation, Mapping) else {}
     graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
         "exact_candidate_snapshot",
         root_identity,
+        exact_candidate_upgrade_trigger=str(
+            escalation.get("exact_candidate_upgrade_trigger") or ""
+        ),
+        candidate_change_classification=str(
+            escalation.get("candidate_change_classification") or ""
+        ),
+        exact_candidate_upgrade_ref=str(
+            escalation.get("escalation_id") or ""
+        ),
     )
     return {
         "graph_basis_decision": graph_basis_decision,
@@ -8182,14 +8193,33 @@ def _qa_graph_review_context_from_trace_row(
         root_identity_raw = None
     from . import graph_query_trace
 
-    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
-        str(row["graph_basis"] or "").strip(),
-        root_identity_raw if isinstance(root_identity_raw, Mapping) else {},
+    try:
+        persisted_decision = json.loads(
+            str(row["graph_basis_decision_json"] or "{}")
+        )
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        persisted_decision = None
+    graph_basis_decision = (
+        dict(persisted_decision)
+        if isinstance(persisted_decision, Mapping) and persisted_decision
+        else graph_query_trace.bounded_qa_graph_basis_decision(
+            str(row["graph_basis"] or "").strip(),
+            root_identity_raw if isinstance(root_identity_raw, Mapping) else {},
+        )
+    )
+    try:
+        persisted_decision_hash = str(
+            row["graph_basis_decision_hash"] or ""
+        ).strip().lower()
+    except (IndexError, KeyError, TypeError):
+        persisted_decision_hash = ""
+    graph_basis_decision_hash = (
+        persisted_decision_hash or stable_sha256(graph_basis_decision)
     )
     review_context = {
         "graph_basis": str(row["graph_basis"] or "").strip(),
         "graph_basis_decision": graph_basis_decision,
-        "graph_basis_decision_hash": stable_sha256(graph_basis_decision),
+        "graph_basis_decision_hash": graph_basis_decision_hash,
         "canonical_base_snapshot_id": str(
             row["canonical_base_snapshot_id"] or ""
         ).strip(),
@@ -8239,6 +8269,15 @@ def _qa_graph_review_context_from_trace_row(
         for field, expected in expected_context.items()
         if str(review_context.get(field) or "") != expected
     ]
+    if graph_basis_decision_hash != stable_sha256(graph_basis_decision):
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": "graph_basis_decision_hash",
+                "expected": stable_sha256(graph_basis_decision),
+                "actual": graph_basis_decision_hash,
+            }
+        )
     graph_basis = review_context["graph_basis"]
     if graph_basis not in {
         "exact_candidate_snapshot",
@@ -8854,7 +8893,7 @@ def _qa_reverify_candidate_trace_context(
         return review_context, mismatches
 
     trace_id = str(row["trace_id"] or "").strip()
-    from . import graph_snapshot_store
+    from . import graph_query_trace, graph_snapshot_store
     try:
         root_identity = json.loads(str(row["root_identity_json"] or "{}"))
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -8900,12 +8939,70 @@ def _qa_reverify_candidate_trace_context(
         )
         return review_context, mismatches
     if review_context.get("graph_basis") == "exact_candidate_snapshot":
+        persisted_decision = review_context.get("graph_basis_decision")
+        persisted_decision = (
+            persisted_decision
+            if isinstance(persisted_decision, Mapping)
+            else {}
+        )
+        persisted_trigger = str(
+            persisted_decision.get("exact_candidate_upgrade_trigger") or ""
+        ).strip()
+        if persisted_trigger != "qa_explicit_exact_snapshot_request":
+            escalation_ref = str(
+                persisted_decision.get("exact_candidate_upgrade_ref") or ""
+            ).strip()
+            escalation = graph_query_trace.get_qa_graph_basis_escalation(
+                conn,
+                project_id,
+                escalation_ref,
+            )
+            escalation_expected = {
+                "backlog_id": str(row["backlog_id"] or "").strip(),
+                "task_id": str(row["task_id"] or "").strip(),
+                "qa_session_id": str(row["qa_session_id"] or "").strip(),
+                "candidate_commit_sha": review_context["candidate_commit_sha"],
+                "exact_candidate_upgrade_trigger": persisted_trigger,
+            }
+            escalation_mismatches = {
+                field: {
+                    "expected": expected,
+                    "actual": str(escalation.get(field) or "").strip(),
+                }
+                for field, expected in escalation_expected.items()
+                if str(escalation.get(field) or "").strip() != expected
+            }
+            if not escalation_ref or not escalation or escalation_mismatches:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "exact_candidate_upgrade_ref",
+                        "expected": "matching persisted server escalation",
+                        "actual": escalation_ref or "missing",
+                        "identity_mismatches": escalation_mismatches,
+                    }
+                )
+                return review_context, mismatches
         try:
             recomputed = _qa_exact_candidate_context(
                 Path(query_root_raw),
                 project_id=project_id,
                 canonical_project_root=Path(canonical_root),
                 candidate_commit_sha=review_context["candidate_commit_sha"],
+                escalation={
+                    "escalation_id": str(
+                        persisted_decision.get("exact_candidate_upgrade_ref")
+                        or ""
+                    ),
+                    "exact_candidate_upgrade_trigger": str(
+                        persisted_decision.get("exact_candidate_upgrade_trigger")
+                        or ""
+                    ),
+                    "candidate_change_classification": str(
+                        persisted_decision.get("candidate_change_classification")
+                        or ""
+                    ),
+                },
             )
         except _QACandidateOverlayError as exc:
             mismatches.append(
@@ -9403,7 +9500,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             commit_sha=str(body.get("commit_sha") or body.get("head_commit") or ""),
             action=action,
         )
-        from . import graph_snapshot_store
+        from . import graph_query_trace, graph_snapshot_store
 
         snapshot_id = _resolve_graph_snapshot_id(
             conn,
@@ -9450,6 +9547,16 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                     )
                 )
             else:
+                escalation = graph_query_trace.latest_qa_graph_basis_escalation(
+                    conn,
+                    ctx.get_project_id(),
+                    backlog_id=str(proof.get("backlog_id") or ""),
+                    task_id=str(proof.get("task_id") or ""),
+                    qa_session_id=str(proof.get("qa_session_id") or ""),
+                    candidate_commit_sha=str(
+                        review_context.get("candidate_commit_sha") or ""
+                    ),
+                )
                 review_context.update(
                     {
                         "changed_files": [],
@@ -9467,10 +9574,21 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                             candidate_commit_sha=str(
                                 review_context.get("candidate_commit_sha") or ""
                             ),
+                            escalation=escalation,
                         ),
                     }
                 )
         except _QACandidateOverlayError as exc:
+            escalation = graph_query_trace.record_qa_graph_basis_escalation(
+                conn,
+                ctx.get_project_id(),
+                backlog_id=str(proof.get("backlog_id") or ""),
+                task_id=str(proof.get("task_id") or ""),
+                qa_session_id=str(proof.get("qa_session_id") or ""),
+                candidate_commit_sha=str(proof.get("commit_sha") or ""),
+                machine_reason=exc.reason,
+            )
+            conn.commit()
             raise GovernanceError(
                 "qa_candidate_overlay_requires_exact_snapshot",
                 (
@@ -9484,6 +9602,7 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                     "required_commit_sha": proof.get("commit_sha", ""),
                     "machine_reason": exc.reason,
                     "exact_candidate_snapshot_required": True,
+                    "exact_candidate_upgrade": escalation,
                     **exc.details,
                 },
             ) from exc
@@ -12632,7 +12751,8 @@ def _runtime_context_service_qa_graph_trace_refs(
                    t.actor, t.snapshot_id, t.commit_sha, t.qa_session_id,
                    t.backlog_id, t.task_id, t.parent_task_id,
                    t.runtime_context_id, t.status,
-                   t.graph_basis, t.canonical_base_snapshot_id,
+                   t.graph_basis, t.graph_basis_decision_json,
+                   t.graph_basis_decision_hash, t.canonical_base_snapshot_id,
                    t.base_commit_sha, t.candidate_commit_sha,
                    t.changed_files_json, t.candidate_diff_hash,
                    t.changed_files_source,
@@ -14839,7 +14959,10 @@ def _qa_graph_context_evidence_shape(
                 "<server-derived-candidate-change-classification>"
             ),
             "exact_candidate_upgrade_trigger": (
-                "<empty-or-qa_explicit_exact_snapshot_request>"
+                "<empty-or-one-supported-upgrade-trigger>"
+            ),
+            "exact_candidate_upgrade_ref": (
+                "<empty-for-qa-explicit-or-server-escalation-id>"
             ),
             "exact_candidate_upgrade_policy": (
                 "server_classified_or_qa_explicit"
@@ -15369,6 +15492,16 @@ def _runtime_context_qa_verification_guide(
                 "exact_candidate_snapshot_upgrade_policy": (
                     "server_classified_or_qa_explicit"
                 ),
+                "exact_candidate_escalation_stage": (
+                    "server_persisted_overlay_failure_classification"
+                ),
+                "exact_candidate_acceptance_stage": (
+                    "graph_query_trace_persisted_basis_decision"
+                ),
+                "exact_candidate_escalation_authority_source": (
+                    "qa_graph_basis_escalations"
+                ),
+                "server_trigger_escalation_ref_required": True,
                 "exact_candidate_snapshot_upgrade_triggers": [
                     "graph_algorithm_or_graph_config_change",
                     "governance_semantic_or_structure_hint_change",
@@ -34842,6 +34975,16 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                     route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    graph_basis_decision=(
+                        qa_proof.get("graph_basis_decision")
+                        if isinstance(
+                            qa_proof.get("graph_basis_decision"), Mapping
+                        )
+                        else None
+                    ),
+                    graph_basis_decision_hash=str(
+                        qa_proof.get("graph_basis_decision_hash") or ""
+                    ),
                     canonical_base_snapshot_id=str(
                         qa_proof.get("canonical_base_snapshot_id") or ""
                     ),
@@ -34989,6 +35132,16 @@ def handle_graph_governance_query(ctx: RequestContext):
                     route_token_ref=str(observer_proof.get("route_token_ref") or ""),
                     commit_sha=str(qa_proof.get("commit_sha") or ""),
                     graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    graph_basis_decision=(
+                        qa_proof.get("graph_basis_decision")
+                        if isinstance(
+                            qa_proof.get("graph_basis_decision"), Mapping
+                        )
+                        else None
+                    ),
+                    graph_basis_decision_hash=str(
+                        qa_proof.get("graph_basis_decision_hash") or ""
+                    ),
                     canonical_base_snapshot_id=str(
                         qa_proof.get("canonical_base_snapshot_id") or ""
                     ),
@@ -35046,6 +35199,34 @@ def handle_graph_governance_query(ctx: RequestContext):
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )
+                result_error = str(
+                    (result.get("result") or {}).get("error")
+                    if isinstance(result.get("result"), Mapping)
+                    else ""
+                )
+                if (
+                    qa_proof.get("graph_basis")
+                    == "canonical_base_plus_candidate_diff"
+                    and not result.get("ok")
+                    and "one-hop dependency query failed closed" in result_error
+                ):
+                    result["exact_candidate_upgrade"] = (
+                        graph_query_trace.record_qa_graph_basis_escalation(
+                            conn,
+                            project_id,
+                            backlog_id=str(qa_proof.get("backlog_id") or ""),
+                            task_id=str(qa_proof.get("task_id") or ""),
+                            qa_session_id=str(
+                                qa_proof.get("qa_session_id") or ""
+                            ),
+                            candidate_commit_sha=str(
+                                qa_proof.get("candidate_commit_sha") or ""
+                            ),
+                            machine_reason=(
+                                "one_hop_dependency_query_failed_closed"
+                            ),
+                        )
+                    )
                 if qa_proof.get("graph_basis") == "exact_candidate_snapshot":
                     if root is None:
                         raise GovernanceError(
@@ -35067,6 +35248,30 @@ def handle_graph_governance_query(ctx: RequestContext):
                         candidate_commit_sha=str(
                             qa_proof.get("candidate_commit_sha") or ""
                         ),
+                        escalation={
+                            "escalation_id": str(
+                                (
+                                    qa_proof.get("graph_basis_decision") or {}
+                                ).get("exact_candidate_upgrade_ref")
+                                or ""
+                            ),
+                            "exact_candidate_upgrade_trigger": str(
+                                (
+                                    qa_proof.get("graph_basis_decision") or {}
+                                ).get("exact_candidate_upgrade_trigger")
+                                or ""
+                            ),
+                            "candidate_change_classification": str(
+                                (
+                                    qa_proof.get("graph_basis_decision") or {}
+                                ).get("candidate_change_classification")
+                                or ""
+                            ),
+                        }
+                        if isinstance(
+                            qa_proof.get("graph_basis_decision"), Mapping
+                        )
+                        else {},
                     )
                     exact_mismatches = [
                         field
@@ -74616,7 +74821,8 @@ def _timeline_trusted_qa_verification_authority(
         f"""
         SELECT t.trace_id, t.snapshot_id, t.query_source, t.query_purpose,
                t.actor, t.task_id, t.backlog_id, t.commit_sha,
-               t.graph_basis, t.canonical_base_snapshot_id,
+               t.graph_basis, t.graph_basis_decision_json,
+               t.graph_basis_decision_hash, t.canonical_base_snapshot_id,
                t.base_commit_sha, t.candidate_commit_sha,
                t.changed_files_json, t.candidate_diff_hash,
                t.changed_files_source,
