@@ -758,6 +758,52 @@ def test_current_full_progress_matches_exact_run_id_not_prefix():
         assert result["status"] == "candidate_ready"
 
 
+def test_current_full_progress_does_not_fall_back_to_sole_unrelated_operation():
+    queue = {
+        "operations": [
+            {
+                "operation_id": "current-full:unrelated",
+                "run_id": "unrelated",
+                "status": "complete",
+                "progress": {"done": 2, "total": 2},
+            }
+        ],
+        "count": 1,
+    }
+
+    for summarize in (
+        mcp_tools._summarize_reconcile_progress,
+        governance_mcp_server._summarize_reconcile_progress,
+    ):
+        result = summarize(queue, "wanted-run")
+        assert result["available"] is False
+        assert result["status"] == "unknown"
+        assert result["operation_count"] == 1
+        assert "operation_id" not in result
+
+
+def test_current_full_progress_retains_sole_operation_fallback_without_run_id():
+    queue = {
+        "operations": [
+            {
+                "operation_id": "current-full:legacy-run",
+                "run_id": "legacy-run",
+                "status": "running",
+                "progress": {"done": 0, "total": 2},
+            }
+        ]
+    }
+
+    for summarize in (
+        mcp_tools._summarize_reconcile_progress,
+        governance_mcp_server._summarize_reconcile_progress,
+    ):
+        result = summarize(queue, "")
+        assert result["available"] is True
+        assert result["operation_id"] == "current-full:legacy-run"
+        assert result["status"] == "running"
+
+
 def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
     hotfix = next(tool for tool in TOOLS if tool.get("name") == "observer_hotfix_enter")
     props = hotfix["inputSchema"]["properties"]

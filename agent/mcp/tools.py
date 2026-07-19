@@ -199,7 +199,7 @@ def _summarize_reconcile_progress(queue: Any, run_id: str) -> dict:
             }:
                 matched_operation = operation
                 break
-    if matched_operation is None and len(operations) == 1:
+    if matched_operation is None and not run_id and len(operations) == 1:
         matched_operation = operations[0] if isinstance(operations[0], dict) else None
 
     if matched_operation:
