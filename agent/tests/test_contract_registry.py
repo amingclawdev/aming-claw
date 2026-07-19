@@ -195,6 +195,109 @@ def test_registry_snapshot_cache_build_is_thread_safe(tmp_path, monkeypatch):
     }
 
 
+@pytest.mark.parametrize("control_character", ["\n", "\r", "\x1f", "\x7f"])
+def test_registry_rejects_protocol_control_characters_in_file_name(
+    tmp_path,
+    control_character,
+):
+    registry = ContractDefinitionRegistry(tmp_path)
+
+    with pytest.raises(ContractLifecycleError, match="control characters"):
+        registry.create_definition(
+            _definition(),
+            file_name=f"probe{control_character}HEAD:.mcp.json",
+        )
+
+
+def test_git_head_blobs_rejects_protocol_injection_before_subprocess(
+    tmp_path,
+    monkeypatch,
+):
+    injected = tmp_path / "probe\nHEAD:.mcp.json"
+    injected.write_text("{}", encoding="utf-8")
+
+    def unexpected_subprocess(*args, **kwargs):
+        raise AssertionError("unsafe batch input reached subprocess")
+
+    monkeypatch.setattr(registry_module.subprocess, "run", unexpected_subprocess)
+
+    assert registry_module._git_head_blobs(tmp_path, [injected]) is None
+
+
+def test_registry_retries_unchanged_snapshot_after_transient_batch_failure(
+    tmp_path,
+    monkeypatch,
+):
+    path = _write_definition(tmp_path, _definition())
+    batch_calls = 0
+
+    monkeypatch.setattr(
+        registry_module,
+        "_git_registry_snapshot",
+        lambda root: (tmp_path, "head-a"),
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "_git_head_blob",
+        lambda git_root, relative_path: path.read_bytes(),
+    )
+
+    def transient_then_success(git_root, paths):
+        nonlocal batch_calls
+        batch_calls += 1
+        if batch_calls == 1:
+            return None
+        return {path.name: path.read_bytes()}
+
+    monkeypatch.setattr(
+        registry_module,
+        "_git_head_blobs",
+        transient_then_success,
+    )
+    registry = ContractDefinitionRegistry(tmp_path)
+
+    first = registry.get("observer_hotfix")
+    second = registry.get("observer_hotfix")
+    third = registry.get("observer_hotfix")
+
+    assert first["definition_load_record"]["source_control_integrity"]["status"] == (
+        "current"
+    )
+    assert second["definition_load_record"]["source_control_integrity"]["status"] == (
+        "current"
+    )
+    assert third["definition_hash"] == second["definition_hash"]
+    assert batch_calls == 2
+
+
+def test_git_head_blobs_rejects_misaligned_or_trailing_batch_output(
+    tmp_path,
+    monkeypatch,
+):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text("{}", encoding="utf-8")
+    second.write_text("{}", encoding="utf-8")
+
+    class Result:
+        returncode = 0
+        stdout = (
+            b"a" * 40
+            + b" blob 2\n{}\n"
+            + b"b" * 40
+            + b" blob 2\n{}\n"
+            + b"unexpected trailing response\n"
+        )
+
+    monkeypatch.setattr(
+        registry_module.subprocess,
+        "run",
+        lambda *args, **kwargs: Result(),
+    )
+
+    assert registry_module._git_head_blobs(tmp_path, [first, second]) is None
+
+
 def test_server_contract_runtime_and_pinned_definition_share_registry_snapshot(
     tmp_path,
     monkeypatch,

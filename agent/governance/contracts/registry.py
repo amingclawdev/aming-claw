@@ -105,7 +105,10 @@ class ContractDefinitionRegistry:
                     definitions,
                     key=_definition_key,
                 )
-                self._snapshot_key = snapshot_key
+                if head_blobs is not None:
+                    self._snapshot_key = snapshot_key
+                else:
+                    self._snapshot_key = None
 
             definitions = deepcopy(self._snapshot_definitions)
         if not include_deprecated:
@@ -247,6 +250,10 @@ class ContractDefinitionRegistry:
         name = file_name or _file_name(definition)
         if "/" in name or "\\" in name or name.startswith("."):
             raise ContractLifecycleError("contract definition file_name must be local")
+        if _has_protocol_control_characters(name):
+            raise ContractLifecycleError(
+                "contract definition file_name must not contain control characters"
+            )
         return self.root / name
 
 
@@ -448,7 +455,7 @@ def _source_control_integrity(
         "blocks_runtime": False,
         "next_operator_action": "none",
     }
-    if head_blob is _UNSET:
+    if head_blob is _UNSET and git_root is None:
         git_root = _git_root_for(path)
     if git_root is None:
         integrity.update(
@@ -587,7 +594,7 @@ def _git_registry_snapshot(root: Path) -> tuple[Path | None, str]:
 def _git_head_blobs(
     git_root: Path | None,
     paths: Sequence[Path],
-) -> dict[str, bytes | None]:
+) -> dict[str, bytes | None] | None:
     """Load all registry files from HEAD with one git subprocess."""
 
     if git_root is None:
@@ -600,6 +607,8 @@ def _git_head_blobs(
             continue
     if not relative_paths:
         return {}
+    if any(_has_protocol_control_characters(path) for path in relative_paths):
+        return None
     specs = [f"HEAD:{relative_path}" for relative_path in relative_paths]
     try:
         result = subprocess.run(
@@ -611,9 +620,9 @@ def _git_head_blobs(
             timeout=2,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {relative_path: None for relative_path in relative_paths}
+        return None
     if result.returncode != 0:
-        return {relative_path: None for relative_path in relative_paths}
+        return None
 
     blobs: dict[str, bytes | None] = {}
     output = bytes(result.stdout)
@@ -621,8 +630,7 @@ def _git_head_blobs(
     for relative_path in relative_paths:
         newline = output.find(b"\n", offset)
         if newline < 0:
-            blobs[relative_path] = None
-            continue
+            return None
         header = output[offset:newline]
         offset = newline + 1
         if header.endswith(b" missing"):
@@ -632,12 +640,18 @@ def _git_head_blobs(
         try:
             size = int(parts[-1])
         except (ValueError, IndexError):
-            blobs[relative_path] = None
-            continue
-        blobs[relative_path] = output[offset:offset + size]
-        offset += size
-        if output[offset:offset + 1] == b"\n":
-            offset += 1
+            return None
+        blob_end = offset + size
+        if (
+            size < 0
+            or blob_end >= len(output)
+            or output[blob_end:blob_end + 1] != b"\n"
+        ):
+            return None
+        blobs[relative_path] = output[offset:blob_end]
+        offset = blob_end + 1
+    if offset != len(output):
+        return None
     return blobs
 
 
@@ -645,15 +659,21 @@ def _head_blob_for_path(
     path: Path,
     *,
     git_root: Path | None,
-    head_blobs: Mapping[str, bytes | None],
-) -> bytes | None:
+    head_blobs: Mapping[str, bytes | None] | None,
+) -> bytes | None | object:
     if git_root is None:
         return None
+    if head_blobs is None:
+        return _UNSET
     try:
         relative_path = path.resolve().relative_to(git_root).as_posix()
     except ValueError:
         return None
     return head_blobs.get(relative_path)
+
+
+def _has_protocol_control_characters(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
 def _git_head_blob(git_root: Path, relative_path: str) -> bytes | None:
