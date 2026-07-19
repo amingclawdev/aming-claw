@@ -28,6 +28,7 @@ from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import observer_route_context
 from agent.governance import observer_session
+from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
@@ -16841,7 +16842,11 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     recovery_event = server._record_parallel_branch_merge_queue_materialize_event(
         conn,
         project_id=PID,
-        body=body,
+        body={
+            **body,
+            "parent_task_id": "forged-request-parent",
+            "contract_actor": "forged-request-actor",
+        },
         queued=queued,
         route_gate=recovery_gate,
     )
@@ -16850,10 +16855,49 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     assert recovery_event["decision"] == (
         "audited_postmerge_durable_queue_recovery_no_pass"
     )
+    assert recovery_event["task_id"] == execution_id
+    assert recovery_event["actor"] == "observer"
+    assert recovery_event["payload"]["parent_task_id"] == execution_id
     assert recovery_event["payload"]["no_pass_claim"] is True
     assert (
         recovery_event["payload"]["authoritative_pass_synthesized"] is False
     )
+    conn.execute(
+        "UPDATE task_timeline_events SET task_id = ?, actor = ? WHERE id = ?",
+        ("forged-stored-parent", "forged-stored-actor", recovery_event["id"]),
+    )
+    conn.commit()
+    assert server._parallel_branch_postmerge_recovery_materialize_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+        queue_item_id=queued["queue_item"]["queue_item_id"],
+    ) == {}
+    with pytest.raises(GovernanceError) as forged_materialize_identity:
+        server._parallel_branch_postmerge_recovery_apply_precheck(
+            conn,
+            project_id=PID,
+            body={
+                **body,
+                "evidence": {
+                    "qa_evidence": {
+                        "receipt_event_ref": qa_ref,
+                        "independent_qa_session_id": qa_session["session_id"],
+                        "no_authoritative_pass_claim": True,
+                    }
+                },
+            },
+        )
+    assert forged_materialize_identity.value.code == (
+        "audited_postmerge_recovery_materialize_identity_invalid"
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET task_id = ?, actor = ? WHERE id = ?",
+        (execution_id, "observer", recovery_event["id"]),
+    )
+    conn.commit()
     live_route_gate = {
         **recovery_gate,
         "action": "merge_execute",
@@ -16871,6 +16915,166 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             "task_id": task_id,
         },
     }
+    class _RollbackOnCloseConnection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def close(self):
+            self.wrapped.rollback()
+
+    with monkeypatch.context() as handler_patch:
+        handler_conn = _RollbackOnCloseConnection(conn)
+        handler_patch.setattr(
+            server,
+            "get_connection",
+            lambda _project_id: handler_conn,
+        )
+        handler_patch.setattr(
+            server,
+            "_require_graph_governance_operator",
+            lambda *_args, **_kwargs: None,
+        )
+        handler_patch.setattr(
+            server,
+            "_require_parallel_branch_merge_route_gate",
+            lambda *_args, **_kwargs: live_route_gate,
+        )
+        handler_patch.setattr(
+            server,
+            "_parallel_branch_merge_repo_root_authority",
+            lambda *_args, **_kwargs: (str(canonical_root), "test"),
+        )
+        handler_patch.setattr(
+            server,
+            "_record_route_token_gate_event",
+            lambda *_args, **_kwargs: {},
+        )
+
+        def _fake_execute_merge_queue_item(fake_conn, **_kwargs):
+            recorded = record_merge_queue_result(
+                fake_conn,
+                project_id=PID,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=queued["queue_item"]["queue_item_id"],
+                task_id=task_id,
+                target_ref="refs/heads/main",
+                status="merged",
+                merge_commit=recovery_head_commit,
+                target_head_before_merge=recovery_head_commit,
+                target_head_after_merge=recovery_head_commit,
+                allow_route_gated_reclaimed_fence_without_token=True,
+            )
+            return {
+                "ok": True,
+                "dry_run": False,
+                "executed": False,
+                "already_integrated": True,
+                "target_ref_mutated": False,
+                "merge_commit": recovery_head_commit,
+                "target_head_after_merge": recovery_head_commit,
+                "recorded": recorded,
+                "preview": {
+                    "status": "pass",
+                    "target_commit": recovery_head_commit,
+                    "branch_commit": candidate_commit,
+                },
+                "gate_plan": {},
+            }
+
+        handler_patch.setattr(
+            parallel_branch_runtime,
+            "execute_merge_queue_item",
+            _fake_execute_merge_queue_item,
+        )
+        with pytest.raises(GovernanceError) as handler_missing_qa:
+            server.handle_graph_governance_parallel_branch_merge_execute(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body={
+                        **body,
+                        "parent_task_id": execution_id,
+                        "branch_ref": (
+                            "refs/heads/codex/postmerge-recovery-exact"
+                        ),
+                        "target_ref": "refs/heads/main",
+                        "dry_run": False,
+                        "allow_target_ref_mutation": True,
+                        "contract_actor": "observer",
+                        "evidence": {},
+                    },
+                )
+            )
+        assert handler_missing_qa.value.code == (
+            "audited_postmerge_recovery_apply_evidence_invalid"
+        )
+        assert conn.execute(
+            """
+            SELECT status FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (PID, merge_queue_id, queued["queue_item"]["queue_item_id"]),
+        ).fetchone()["status"] == "queued_for_merge"
+
+        def _reject_timeline_after_queue_write(*_args, **_kwargs):
+            raise GovernanceError(
+                "test_recovery_timeline_write_rejected",
+                "force rollback after durable queue mutation",
+                409,
+            )
+
+        handler_patch.setattr(
+            server,
+            "_record_parallel_branch_merge_contract_timeline_events",
+            _reject_timeline_after_queue_write,
+        )
+        with pytest.raises(GovernanceError) as handler_post_write_rejected:
+            server.handle_graph_governance_parallel_branch_merge_execute(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body={
+                        **body,
+                        "parent_task_id": execution_id,
+                        "branch_ref": (
+                            "refs/heads/codex/postmerge-recovery-exact"
+                        ),
+                        "target_ref": "refs/heads/main",
+                        "dry_run": False,
+                        "allow_target_ref_mutation": True,
+                        "contract_actor": "observer",
+                        "evidence": {
+                            "qa_evidence": {
+                                "receipt_event_ref": qa_ref,
+                                "independent_qa_session_id": (
+                                    qa_session["session_id"]
+                                ),
+                                "no_authoritative_pass_claim": True,
+                            }
+                        },
+                    },
+                )
+            )
+        assert handler_post_write_rejected.value.code == (
+            "test_recovery_timeline_write_rejected"
+        )
+        assert conn.execute(
+            """
+            SELECT status FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (PID, merge_queue_id, queued["queue_item"]["queue_item_id"]),
+        ).fetchone()["status"] == "queued_for_merge"
+    assert conn.execute(
+        """
+        SELECT status FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (PID, merge_queue_id, queued["queue_item"]["queue_item_id"]),
+    ).fetchone()["status"] == "queued_for_merge"
     recorded_merge = record_merge_queue_result(
         conn,
         project_id=PID,
@@ -58980,6 +59184,10 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         is True
     )
     assert "fence_token" not in postmerge_recovery["apply_copy_safe_body"]
+    assert any(
+        "before merge execution" in item
+        for item in postmerge_recovery["server_revalidates"]
+    )
     assert postmerge_recovery["server_writes_atomically_on_apply"] == [
         "merged durable queue row with exact backlog_id",
         "no-PASS recovery live-merge event",
@@ -58993,6 +59201,10 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
     )
     assert any(
         "ancestor" in item and "current main HEAD" in item
+        for item in postmerge_recovery["server_revalidates"]
+    )
+    assert any(
+        "materialize actor/parent/task identity" in item
         for item in postmerge_recovery["server_revalidates"]
     )
     assert set(implementation_body) & set(

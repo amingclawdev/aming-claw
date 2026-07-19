@@ -18864,6 +18864,8 @@ def _runtime_context_worker_recovery_payloads(
                 "git status command success for canonical and candidate worktrees",
                 "Python test summary contains no failed/error suffix",
                 "apply queue/commit and no-PASS QA receipt/session evidence",
+                "materialize actor/parent/task identity from server authority",
+                "recovery apply evidence before merge execution or durable queue mutation",
                 "zero prior live-merge/reconcile consumption",
             ],
             "server_writes_atomically_on_apply": [
@@ -29606,7 +29608,7 @@ def _parallel_branch_postmerge_recovery_materialize_authority(
 ) -> dict[str, Any]:
     rows = conn.execute(
         """
-        SELECT payload_json
+        SELECT id, task_id, actor, event_kind, phase, commit_sha, payload_json
         FROM task_timeline_events
         WHERE project_id = ? AND backlog_id = ?
           AND event_type = ? AND status = 'proceeded_with_exception'
@@ -29634,6 +29636,16 @@ def _parallel_branch_postmerge_recovery_materialize_authority(
         authority_hash = str(authority_payload.pop("authority_hash", "") or "")
         if all(
             (
+                str(_row_get(row, "task_id", "") or "")
+                == str(authority.get("parent_task_id") or ""),
+                str(_row_get(row, "actor", "") or "") == "observer",
+                str(_row_get(row, "event_kind", "") or "") == "blocker",
+                str(_row_get(row, "phase", "") or "") == "merge_queue",
+                str(_row_get(row, "commit_sha", "") or "").lower()
+                == str(authority.get("candidate_commit") or "").lower(),
+                str(payload.get("parent_task_id") or "")
+                == str(authority.get("parent_task_id") or ""),
+                str(payload.get("backlog_id") or "") == backlog_id,
                 str(payload.get("child_task_id") or "") == task_id,
                 str(payload.get("merge_queue_id") or "") == merge_queue_id,
                 str(payload.get("queue_item_id") or "") == queue_item_id,
@@ -29660,6 +29672,161 @@ def _parallel_branch_postmerge_recovery_materialize_authority(
         ):
             return dict(authority)
     return {}
+
+
+def _parallel_branch_postmerge_recovery_apply_precheck(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    backlog_id: str = "",
+    task_id: str = "",
+    merge_queue_id: str = "",
+    queue_item_id: str = "",
+) -> dict[str, Any]:
+    """Reject forged or incomplete recovery apply requests before execution.
+
+    Recovery materialization is intentionally a no-PASS exception.  Once a
+    queue item is linked to that exception, an invalid stored identity must not
+    make the item fall back to the ordinary merge path, and caller-supplied QA
+    evidence must be checked before any Git or durable queue mutation occurs.
+    """
+
+    queue_id = str(
+        merge_queue_id or body.get("merge_queue_id") or ""
+    ).strip()
+    item_id = str(queue_item_id or body.get("queue_item_id") or "").strip()
+    worker_task_id = str(task_id or body.get("task_id") or "").strip()
+    if not queue_id or not worker_task_id:
+        return {}
+
+    if item_id:
+        queue_rows = conn.execute(
+            """
+            SELECT backlog_id, task_id, merge_queue_id, queue_item_id,
+                   branch_head
+            FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (project_id, queue_id, item_id),
+        ).fetchall()
+    else:
+        queue_rows = conn.execute(
+            """
+            SELECT backlog_id, task_id, merge_queue_id, queue_item_id,
+                   branch_head
+            FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+            """,
+            (project_id, queue_id, worker_task_id),
+        ).fetchall()
+    if len(queue_rows) != 1:
+        return {}
+
+    queue_row = queue_rows[0]
+    exact_backlog_id = str(
+        backlog_id or _row_get(queue_row, "backlog_id", "") or ""
+    ).strip()
+    exact_task_id = str(_row_get(queue_row, "task_id", "") or "").strip()
+    exact_item_id = str(
+        _row_get(queue_row, "queue_item_id", "") or ""
+    ).strip()
+    if not exact_backlog_id or exact_task_id != worker_task_id:
+        return {}
+
+    materialize_rows = conn.execute(
+        """
+        SELECT payload_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+          AND event_type = ? AND status = 'proceeded_with_exception'
+          AND decision = ?
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        (
+            project_id,
+            exact_backlog_id,
+            "parallel.merge_queue_item_materialize_postmerge_recovery",
+            "audited_postmerge_durable_queue_recovery_no_pass",
+        ),
+    ).fetchall()
+    linked_recovery_exists = False
+    for materialize_row in materialize_rows:
+        payload = _json_loads(
+            _row_get(materialize_row, "payload_json", "{}"), {}
+        )
+        if isinstance(payload, Mapping) and all(
+            (
+                str(payload.get("child_task_id") or "") == exact_task_id,
+                str(payload.get("merge_queue_id") or "") == queue_id,
+                str(payload.get("queue_item_id") or "") == exact_item_id,
+            )
+        ):
+            linked_recovery_exists = True
+            break
+    if not linked_recovery_exists:
+        return {}
+
+    authority = _parallel_branch_postmerge_recovery_materialize_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=exact_backlog_id,
+        task_id=exact_task_id,
+        merge_queue_id=queue_id,
+        queue_item_id=exact_item_id,
+    )
+    if not authority:
+        raise GovernanceError(
+            "audited_postmerge_recovery_materialize_identity_invalid",
+            "stored recovery materialize actor, parent, task, or authority identity is invalid",
+            409,
+        )
+
+    request_evidence = (
+        body.get("evidence")
+        if isinstance(body.get("evidence"), Mapping)
+        else {}
+    )
+    qa_request = (
+        request_evidence.get("qa_evidence")
+        if isinstance(request_evidence.get("qa_evidence"), Mapping)
+        else {}
+    )
+    qa_event_id = _audited_postmerge_recovery_ref_id(
+        authority.get("qa_receipt_ref")
+    )
+    qa_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (project_id, qa_event_id),
+    ).fetchone()
+    qa_payload = _json_loads(
+        _row_get(qa_row, "payload_json", "{}") if qa_row is not None else "{}",
+        {},
+    )
+    expected_qa_session_id = str(
+        qa_payload.get("independent_qa_session_id") or ""
+    ).strip() if isinstance(qa_payload, Mapping) else ""
+    if not all(
+        (
+            str(_row_get(queue_row, "backlog_id", "") or "").strip()
+            == exact_backlog_id,
+            str(_row_get(queue_row, "branch_head", "") or "").strip().lower()
+            == str(authority.get("candidate_commit") or "").lower(),
+            str(qa_request.get("receipt_event_ref") or "")
+            == str(authority.get("qa_receipt_ref") or ""),
+            expected_qa_session_id,
+            str(qa_request.get("independent_qa_session_id") or "").strip()
+            == expected_qa_session_id,
+            qa_request.get("no_authoritative_pass_claim") is True,
+        )
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_apply_evidence_invalid",
+            "recovery apply must preserve exact queue, candidate, QA receipt/session, and no-PASS evidence",
+            422,
+        )
+    return authority
 
 
 def _record_parallel_branch_merge_contract_timeline_events(
@@ -29726,9 +29893,10 @@ def _record_parallel_branch_merge_contract_timeline_events(
         "route_token_gate": route_gate_payload,
     }
     recovery_authority = (
-        _parallel_branch_postmerge_recovery_materialize_authority(
+        _parallel_branch_postmerge_recovery_apply_precheck(
             conn,
             project_id=project_id,
+            body=body,
             backlog_id=scope["backlog_id"],
             task_id=scope["task_id"],
             merge_queue_id=scope["merge_queue_id"],
@@ -30082,6 +30250,16 @@ def _record_parallel_branch_merge_queue_materialize_event(
     ).strip()
     recovery_authority = queued.get("audited_postmerge_recovery_authority")
     is_postmerge_recovery = isinstance(recovery_authority, Mapping)
+    if is_postmerge_recovery:
+        child_task_id = str(recovery_authority.get("task_id") or "").strip()
+        backlog_id = str(recovery_authority.get("backlog_id") or "").strip()
+        parent_task_id = str(
+            recovery_authority.get("parent_task_id") or ""
+        ).strip()
+        merge_queue_id = str(
+            recovery_authority.get("merge_queue_id") or ""
+        ).strip()
+        actor = "observer"
     evidence_ref = f"merge_queue_item:{queue_item_id}" if queue_item_id else ""
     event = task_timeline.record_event(
         conn,
@@ -31267,6 +31445,12 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 route_gate,
             )
         )
+        if not dry_run:
+            _parallel_branch_postmerge_recovery_apply_precheck(
+                conn,
+                project_id=project_id,
+                body=ctx.body,
+            )
         repo_root, repo_root_source = _parallel_branch_merge_repo_root_authority(
             conn,
             project_id=project_id,

@@ -1879,7 +1879,16 @@ def preserve_materialized_context_for_allocation(
 
 
 def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL)
+    # ``sqlite3.Connection.executescript`` commits a pending transaction before
+    # running the script.  Runtime helpers call this guard repeatedly inside
+    # merge handlers, so executescript could make a queue mutation durable
+    # before the no-PASS recovery evidence/timeline transaction completed.
+    # The schema contains only ordinary CREATE TABLE/INDEX statements; execute
+    # them individually so the caller retains transaction authority.
+    for statement in PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL.split(";"):
+        ddl = statement.strip()
+        if ddl:
+            conn.execute(ddl)
     _ensure_branch_runtime_context_columns(conn)
     _ensure_branch_merge_queue_columns(conn)
     conn.execute(
