@@ -2068,17 +2068,19 @@ def _insert_exact_qa_graph_query_trace(
         task_id=task_id,
         commit_sha=candidate_commit_sha,
     )
-    graph_basis_decision = graph_query_trace.bounded_qa_graph_basis_decision(
-        "exact_candidate_snapshot",
-        {
-            **root_context["root_identity"],
-            "canonical_head_commit": candidate_commit_sha,
-            "base_commit_sha": candidate_commit_sha,
-            "candidate_commit_sha": candidate_commit_sha,
-            "canonical_head_relation": "candidate",
-        },
+    server_decision = root_context.get("graph_basis_decision")
+    graph_basis_decision = (
+        dict(server_decision)
+        if isinstance(server_decision, dict) and server_decision
+        else graph_query_trace.bounded_qa_graph_basis_decision(
+            "exact_candidate_snapshot",
+            root_context["root_identity"],
+        )
     )
-    graph_basis_decision_hash = server.stable_sha256(graph_basis_decision)
+    graph_basis_decision_hash = str(
+        root_context.get("graph_basis_decision_hash") or ""
+    ).strip() or server.stable_sha256(graph_basis_decision)
+    assert graph_basis_decision_hash == server.stable_sha256(graph_basis_decision)
     graph_query_trace.start_trace(
         conn,
         PID,
