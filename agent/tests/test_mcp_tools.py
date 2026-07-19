@@ -782,6 +782,21 @@ def test_current_full_progress_does_not_fall_back_to_sole_unrelated_operation():
         assert "operation_id" not in result
 
 
+def test_current_full_progress_with_empty_queue_is_unknown():
+    queue = {"operations": [], "count": 0}
+
+    for summarize in (
+        mcp_tools._summarize_reconcile_progress,
+        governance_mcp_server._summarize_reconcile_progress,
+    ):
+        result = summarize(queue, "wanted-run")
+        assert result["available"] is False
+        assert result["status"] == "unknown"
+        assert result["progress"] == {}
+        assert result["operation_count"] == 0
+        assert "operation_id" not in result
+
+
 def test_current_full_progress_retains_sole_operation_fallback_without_run_id():
     queue = {
         "operations": [
