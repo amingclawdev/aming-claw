@@ -142,6 +142,53 @@ def test_parallel_branch_merge_queue_materialize_forwards_checkpoint():
     )
 
 
+def test_parallel_branch_merge_queue_materialize_forwards_audited_postmerge_recovery_refs():
+    properties = _tool_properties("parallel_branch_merge_queue_materialize")
+    recovery_schema = properties["audited_postmerge_recovery"]
+    assert recovery_schema["additionalProperties"] is False
+    assert set(recovery_schema["required"]) == {
+        "source_contract_execution_id",
+        "runtime_context_id",
+        "independent_qa_receipt_ref",
+        "manual_merge_event_ref",
+        "diagnostic_backlog_id",
+    }
+
+    recovery = {
+        "source_contract_execution_id": "cex-source",
+        "runtime_context_id": "mfrctx-source",
+        "independent_qa_receipt_ref": "timeline:101",
+        "manual_merge_event_ref": "timeline:102",
+        "diagnostic_backlog_id": "AC-SYSTEM-RECOVERY",
+    }
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+    dispatcher.dispatch(
+        "parallel_branch_merge_queue_materialize",
+        {
+            "project_id": "aming-claw",
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "backlog_id": "AC-SOURCE",
+            "route_token_ref": "rtok-1",
+            "audited_postmerge_recovery": recovery,
+        },
+    )
+
+    assert recorder.calls[-1] == (
+        "POST",
+        "/api/graph-governance/aming-claw/parallel-branches/merge-queue/materialize",
+        {
+            "merge_queue_id": "mq-1",
+            "task_id": "task-1",
+            "backlog_id": "AC-SOURCE",
+            "route_token_ref": "rtok-1",
+            "audited_postmerge_recovery": recovery,
+            "bug_id": "AC-SOURCE",
+        },
+    )
+
+
 class _Recorder:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []

@@ -1127,6 +1127,34 @@ class RecoveryPlan:
 
 
 @dataclass(frozen=True)
+class AuditedPostmergeRecoveryAuthority:
+    """Server-derived authority for reconstructing an already-landed queue row.
+
+    This is intentionally an in-process value object, rather than a caller
+    supplied mapping or boolean.  The HTTP/MCP boundary may supply immutable
+    evidence references, but only the governance server can validate those
+    references and construct this authority.
+    """
+
+    project_id: str
+    backlog_id: str
+    task_id: str
+    parent_task_id: str
+    runtime_context_id: str
+    merge_queue_id: str
+    candidate_commit: str
+    merged_commit: str
+    qa_receipt_ref: str
+    manual_merge_event_ref: str
+    diagnostic_backlog_id: str
+    authority_hash: str
+    schema_version: str = "parallel_branch.audited_postmerge_recovery_authority.v1"
+    no_pass_claim: bool = True
+    authoritative_pass_synthesized: bool = False
+    business_qa_bypassed: bool = False
+
+
+@dataclass(frozen=True)
 class MergeQueueItem:
     project_id: str
     merge_queue_id: str
@@ -15602,6 +15630,7 @@ def queue_merge_item_for_branch_context(
     checkpoint_id: str = "",
     require_finish_gate: bool = False,
     allow_finish_checkpoint_without_fence: bool = False,
+    audited_postmerge_recovery_authority: AuditedPostmergeRecoveryAuthority | None = None,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Persist a fenced merge queue request for one branch runtime context."""
@@ -15613,6 +15642,43 @@ def queue_merge_item_for_branch_context(
     context = get_branch_context(conn, project_id, task_id)
     if context is None:
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    postmerge_recovery = audited_postmerge_recovery_authority
+    if postmerge_recovery is not None:
+        if not isinstance(postmerge_recovery, AuditedPostmergeRecoveryAuthority):
+            raise ValueError(
+                "audited post-merge recovery requires server-derived authority"
+            )
+        expected_recovery_scope = (
+            ("project_id", project_id),
+            ("backlog_id", str(context.backlog_id or "")),
+            ("task_id", task_id),
+            ("parent_task_id", str(context.parent_task_id or "")),
+            ("runtime_context_id", str(context.runtime_context_id or "")),
+            ("merge_queue_id", queue_id),
+        )
+        for field_name, expected_value in expected_recovery_scope:
+            if str(getattr(postmerge_recovery, field_name, "") or "") != expected_value:
+                raise ValueError(
+                    f"audited post-merge recovery {field_name} does not match runtime context"
+                )
+        if (
+            postmerge_recovery.schema_version
+            != "parallel_branch.audited_postmerge_recovery_authority.v1"
+            or postmerge_recovery.no_pass_claim is not True
+            or postmerge_recovery.authoritative_pass_synthesized is not False
+            or postmerge_recovery.business_qa_bypassed is not False
+            or not str(postmerge_recovery.authority_hash or "").startswith("sha256:")
+        ):
+            raise ValueError("audited post-merge recovery authority is invalid")
+        if (
+            str(fence_token or "").strip()
+            or str(checkpoint_id or "").strip()
+            or require_finish_gate
+            or requested_status != STATE_QUEUED_FOR_MERGE
+        ):
+            raise ValueError(
+                "audited post-merge recovery forbids fence/checkpoint reuse and only materializes queued_for_merge"
+            )
     finish_checkpoint_route_gate = _finish_checkpoint_route_gate_allows_merge_queue_without_fence(
         context,
         fence_token=fence_token,
@@ -15620,7 +15686,11 @@ def queue_merge_item_for_branch_context(
         require_finish_gate=require_finish_gate,
         allow_finish_checkpoint_without_fence=allow_finish_checkpoint_without_fence,
     )
-    if (context.fence_token or fence_token) and not finish_checkpoint_route_gate:
+    if (
+        (context.fence_token or fence_token)
+        and not finish_checkpoint_route_gate
+        and postmerge_recovery is None
+    ):
         _require_current_fence(context, fence_token)
     if require_finish_gate:
         expected_checkpoint = str(checkpoint_id or "").strip()
@@ -15678,10 +15748,13 @@ def queue_merge_item_for_branch_context(
         target_head_commit=saved_item.current_target_head or context.target_head_commit,
     )
     saved_context = upsert_branch_context(conn, updated_context, now_iso=now_iso)
-    return {
+    result = {
         "context": public_branch_context_to_dict(saved_context),
         "queue_item": merge_queue_item_to_dict(saved_item),
     }
+    if postmerge_recovery is not None:
+        result["audited_postmerge_recovery_authority"] = asdict(postmerge_recovery)
+    return result
 
 
 def branch_context_from_chain_stage(

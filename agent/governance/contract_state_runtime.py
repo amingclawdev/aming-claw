@@ -1008,6 +1008,17 @@ _MF_PARALLEL_DEFAULT_REQUIREMENTS = [
         "owner_role": "observer",
         "allowed_writer_roles": ["observer"],
         "requires": ["qa_independent_verification"],
+        "audited_postmerge_recovery_policy": {
+            "ordinary_requirement_satisfied": False,
+            "event_type": (
+                "parallel.merge_queue_item_materialize_postmerge_recovery"
+            ),
+            "required_status": "proceeded_with_exception",
+            "required_no_pass_claim": True,
+            "business_qa_bypass_allowed": False,
+            "authoritative_pass_synthesized": False,
+            "next_required_events": ["parallel.live_merge", "graph.reconcile"],
+        },
         "order": 760,
     },
     {
@@ -3726,6 +3737,14 @@ def _event_satisfies_requirement(
 ) -> tuple[bool, dict[str, Any] | None]:
     requirement_id = str(requirement.get("id") or "").strip()
     if not requirement_id:
+        return False, None
+    recovery_policy = requirement.get("audited_postmerge_recovery_policy")
+    if isinstance(recovery_policy, Mapping) and str(
+        event.get("event_type") or ""
+    ).strip() == str(recovery_policy.get("event_type") or "").strip():
+        # The recovery event preserves process continuity after a system gate
+        # failure.  It is deliberately no-PASS and cannot satisfy the ordinary
+        # ContractRuntime merge-queue requirement or close authority.
         return False, None
     status = str(event.get("status") or "").strip().lower()
     accepted_statuses = set(_string_list(requirement.get("accepted_statuses")))

@@ -18780,6 +18780,61 @@ def _runtime_context_worker_recovery_payloads(
             "body": dict(merge_materialize_body),
             "copy_safe_body": dict(merge_materialize_body),
         },
+        "audited_postmerge_recovery": {
+            "schema_version": (
+                "runtime_context.audited_postmerge_recovery_guidance.v1"
+            ),
+            "ordinary_happy_path": False,
+            "system_gate_exception_only": True,
+            "business_qa_bypass_allowed": False,
+            "authoritative_pass_synthesized": False,
+            "no_pass_claim": True,
+            "one_shot": True,
+            "eligible_only_after": [
+                "exact candidate business-QA receipt persisted",
+                "audited fast-forward already landed at clean main HEAD",
+                "OPEN system-only diagnostic binds the same evidence",
+                "no current-full reconcile materialization exists for HEAD",
+            ],
+            "forbidden_fields": [
+                "fence_token",
+                "checkpoint_id",
+                "require_finish_gate=true",
+            ],
+            "tool": "parallel_branch_merge_queue_materialize",
+            "copy_safe_body": {
+                "project_id": project_id,
+                "backlog_id": normalized_backlog_id
+                or "<source backlog_id>",
+                "task_id": task_id,
+                "runtime_context_id": runtime_context_id,
+                "merge_queue_id": normalized_merge_queue_id
+                or "<runtime_context.current_values.merge_queue_id>",
+                "route_token_ref": (
+                    "<worker_task_id close_or_merge_after_evidence route_token_ref>"
+                ),
+                "audited_postmerge_recovery": {
+                    "source_contract_execution_id": (
+                        successor_contract_execution_id
+                        or contract_execution_id
+                        or parent_task_id
+                    ),
+                    "runtime_context_id": runtime_context_id,
+                    "independent_qa_receipt_ref": "timeline:<exact-qa-receipt-id>",
+                    "manual_merge_event_ref": "timeline:<audited-fast-forward-id>",
+                    "diagnostic_backlog_id": "<OPEN-system-diagnostic-id>",
+                },
+            },
+            "server_revalidates": [
+                "runtime/queue/contract identity",
+                "QA session scope and language-aware verification",
+                "timeline source-backed route authority",
+                "candidate branch equals clean canonical main HEAD",
+                "Git ancestry and both worktrees clean",
+                "diagnostic no-PASS policy and exact provenance refs",
+                "zero prior live-merge/reconcile consumption",
+            ],
+        },
         "apply_merge_queue_item": {
             "mcp_tool": "parallel_branch_merge_queue_apply",
             "method": "POST",
@@ -29502,6 +29557,67 @@ def _parallel_branch_canonical_live_merge_identity(
     }
 
 
+def _parallel_branch_postmerge_recovery_materialize_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT payload_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND backlog_id = ?
+          AND event_type = ? AND status = 'proceeded_with_exception'
+          AND decision = ?
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        (
+            project_id,
+            backlog_id,
+            "parallel.merge_queue_item_materialize_postmerge_recovery",
+            "audited_postmerge_durable_queue_recovery_no_pass",
+        ),
+    ).fetchall()
+    for row in rows:
+        payload = _json_loads(_row_get(row, "payload_json", "{}"), {})
+        authority = (
+            payload.get("audited_postmerge_recovery_authority")
+            if isinstance(payload, Mapping)
+            else {}
+        )
+        if not isinstance(authority, Mapping):
+            continue
+        authority_payload = dict(authority)
+        authority_hash = str(authority_payload.pop("authority_hash", "") or "")
+        if all(
+            (
+                str(payload.get("child_task_id") or "") == task_id,
+                str(payload.get("merge_queue_id") or "") == merge_queue_id,
+                str(payload.get("queue_item_id") or "") == queue_item_id,
+                payload.get("no_pass_claim") is True,
+                payload.get("authoritative_pass_synthesized") is False,
+                payload.get("business_qa_bypassed") is False,
+                str(authority.get("schema_version") or "")
+                == "parallel_branch.audited_postmerge_recovery_authority.v1",
+                str(authority.get("project_id") or "") == project_id,
+                str(authority.get("backlog_id") or "") == backlog_id,
+                str(authority.get("task_id") or "") == task_id,
+                str(authority.get("merge_queue_id") or "") == merge_queue_id,
+                authority.get("no_pass_claim") is True,
+                authority.get("authoritative_pass_synthesized") is False,
+                authority.get("business_qa_bypassed") is False,
+                authority_hash == stable_sha256(authority_payload),
+            )
+        ):
+            return dict(authority)
+    return {}
+
+
 def _record_parallel_branch_merge_contract_timeline_events(
     conn,
     *,
@@ -29565,6 +29681,28 @@ def _record_parallel_branch_merge_contract_timeline_events(
         "qa_evidence": qa_evidence,
         "route_token_gate": route_gate_payload,
     }
+    recovery_authority = (
+        _parallel_branch_postmerge_recovery_materialize_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=scope["backlog_id"],
+            task_id=scope["task_id"],
+            merge_queue_id=scope["merge_queue_id"],
+            queue_item_id=scope["queue_item_id"],
+        )
+        if result.get("already_integrated")
+        else {}
+    )
+    is_postmerge_recovery = bool(recovery_authority)
+    if is_postmerge_recovery:
+        common_payload.update(
+            {
+                "audited_postmerge_recovery_authority": recovery_authority,
+                "authoritative_pass_synthesized": False,
+                "business_qa_bypassed": False,
+                "no_pass_claim": True,
+            }
+        )
     existing_live_rows = conn.execute(
         """
         SELECT id, payload_json
@@ -29612,17 +29750,30 @@ def _record_parallel_branch_merge_contract_timeline_events(
             "preview_tree": preview.get("preview_tree"),
         },
     )
+    if is_postmerge_recovery:
+        preview_evidence.update({"status": "waived", "no_pass_claim": True})
     events.append(
         task_timeline.record_event(
             conn,
             project_id=project_id,
             backlog_id=scope["backlog_id"],
             task_id=scope["task_id"],
-            event_type="parallel.merge_preview",
-            event_kind="merge_preview",
+            event_type=(
+                "parallel.merge_preview_postmerge_recovery"
+                if is_postmerge_recovery
+                else "parallel.merge_preview"
+            ),
+            event_kind=("blocker" if is_postmerge_recovery else "merge_preview"),
             phase="merge_preview",
             actor=actor,
-            status="passed",
+            status=(
+                "proceeded_with_exception" if is_postmerge_recovery else "passed"
+            ),
+            decision=(
+                "audited_postmerge_merge_preview_projection_no_pass"
+                if is_postmerge_recovery
+                else ""
+            ),
             payload={
                 **common_payload,
                 "requirement_id": "merge_preview",
@@ -29654,17 +29805,30 @@ def _record_parallel_branch_merge_contract_timeline_events(
             "qa_evidence": qa_evidence,
         },
     )
+    if is_postmerge_recovery:
+        live_evidence.update({"status": "waived", "no_pass_claim": True})
     events.append(
         task_timeline.record_event(
             conn,
             project_id=project_id,
             backlog_id=scope["backlog_id"],
             task_id=scope["task_id"],
-            event_type="parallel.live_merge",
+            event_type=(
+                "parallel.live_merge_postmerge_recovery"
+                if is_postmerge_recovery
+                else "parallel.live_merge"
+            ),
             event_kind="live_merge",
             phase="live_merge",
             actor=actor,
-            status="passed",
+            status=(
+                "proceeded_with_exception" if is_postmerge_recovery else "passed"
+            ),
+            decision=(
+                "audited_postmerge_durable_merge_projection_no_pass"
+                if is_postmerge_recovery
+                else ""
+            ),
             payload={
                 **common_payload,
                 "requirement_id": "live_merge",
@@ -29720,26 +29884,44 @@ def _record_parallel_branch_merge_queue_materialize_event(
     checkpoint_id = str(
         body.get("checkpoint_id") or context.get("checkpoint_id") or ""
     ).strip()
+    recovery_authority = queued.get("audited_postmerge_recovery_authority")
+    is_postmerge_recovery = isinstance(recovery_authority, Mapping)
     evidence_ref = f"merge_queue_item:{queue_item_id}" if queue_item_id else ""
     event = task_timeline.record_event(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
         task_id=parent_task_id,
-        event_type="parallel.merge_queue_item_materialize",
-        event_kind="merge_queue_item_materialize",
+        event_type=(
+            "parallel.merge_queue_item_materialize_postmerge_recovery"
+            if is_postmerge_recovery
+            else "parallel.merge_queue_item_materialize"
+        ),
+        event_kind=(
+            "blocker" if is_postmerge_recovery else "merge_queue_item_materialize"
+        ),
         phase="merge_queue",
         actor=actor,
-        status="accepted",
+        status=("proceeded_with_exception" if is_postmerge_recovery else "accepted"),
+        decision=(
+            "audited_postmerge_durable_queue_recovery_no_pass"
+            if is_postmerge_recovery
+            else ""
+        ),
         payload={
-            "schema_version": "mf_parallel_merge_queue_item_materialize.v1",
+            "schema_version": (
+                "mf_parallel_merge_queue_item_postmerge_recovery.v1"
+                if is_postmerge_recovery
+                else "mf_parallel_merge_queue_item_materialize.v1"
+            ),
             "requirement_id": "observer_merge_queue_item_materialize",
             "requirement_ids": ["observer_merge_queue_item_materialize"],
             "contract_evidence": [
                 {
                     "requirement_id": "observer_merge_queue_item_materialize",
-                    "status": "passed",
+                    "status": "waived" if is_postmerge_recovery else "passed",
                     "evidence_refs": [evidence_ref] if evidence_ref else [],
+                    "no_pass_claim": bool(is_postmerge_recovery),
                 }
             ],
             "merge_queue_id": merge_queue_id,
@@ -29752,6 +29934,12 @@ def _record_parallel_branch_merge_queue_materialize_event(
             "queue_item": dict(queue_item),
             "context": dict(context),
             "source_of_authority": "parallel_branch_merge_queue_materialize",
+            "audited_postmerge_recovery_authority": (
+                dict(recovery_authority) if is_postmerge_recovery else {}
+            ),
+            "authoritative_pass_synthesized": False,
+            "business_qa_bypassed": False,
+            "no_pass_claim": bool(is_postmerge_recovery),
         },
         artifact_refs={
             "backlog_id": backlog_id,
@@ -29764,6 +29952,493 @@ def _record_parallel_branch_merge_queue_materialize_event(
         commit_sha=str(queue_item.get("branch_head") or context.get("head_commit") or ""),
     )
     return event
+
+
+def _independent_qa_toolchain_evidence_passed(
+    verification: Mapping[str, Any],
+) -> bool:
+    """Accept explicit, language-aware QA evidence without guessing a toolchain."""
+
+    toolchain = str(verification.get("test_toolchain") or "").strip().lower()
+    if not toolchain:
+        # Backward-compatible legacy JavaScript receipts remain valid, but a
+        # Python receipt can no longer be forced to invent npm/node evidence.
+        return bool(
+            str(verification.get("npm_test") or "").strip().lower() == "passed"
+            and str(verification.get("node_check") or "").strip().lower()
+            == "passed"
+        )
+    if toolchain == "python":
+        focused = str(
+            verification.get("python_focused_tests") or ""
+        ).strip().lower()
+        return bool(
+            re.match(r"^[1-9][0-9]*\s+passed\b", focused)
+            and str(verification.get("py_compile") or "").strip().lower()
+            == "passed"
+            and str(
+                verification.get("structured_static_checks") or ""
+            ).strip().lower()
+            == "passed"
+        )
+    if toolchain in {"javascript", "typescript", "node"}:
+        return bool(
+            str(verification.get("npm_test") or "").strip().lower() == "passed"
+            and str(verification.get("node_check") or "").strip().lower()
+            == "passed"
+        )
+    return False
+
+
+def _audited_postmerge_recovery_ref_id(value: Any) -> int:
+    match = re.fullmatch(r"timeline:(\d+)", str(value or "").strip())
+    return int(match.group(1)) if match else 0
+
+
+def _audited_postmerge_recovery_authority(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    route_gate: Mapping[str, Any],
+):
+    """Derive a no-PASS authority for an already integrated candidate.
+
+    The request contains only immutable evidence references.  Git state,
+    timeline receipts, QA session scope, diagnostic policy, runtime identity,
+    and reconcile consumption are all re-read by the server before the typed
+    in-process authority is constructed.
+    """
+
+    requested = body.get("audited_postmerge_recovery")
+    if requested is None:
+        return None
+    if not isinstance(requested, Mapping):
+        raise GovernanceError(
+            "audited_postmerge_recovery_invalid",
+            "audited_postmerge_recovery must be an evidence-reference object",
+            422,
+        )
+
+    from . import task_timeline
+    from .parallel_branch_runtime import (
+        AuditedPostmergeRecoveryAuthority,
+        get_branch_context,
+    )
+
+    def _safe_int(value: Any, default: int = -1) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    merge_queue_id = str(body.get("merge_queue_id") or "").strip()
+    runtime_context_id = str(
+        requested.get("runtime_context_id") or body.get("runtime_context_id") or ""
+    ).strip()
+    execution_id = str(
+        requested.get("source_contract_execution_id") or ""
+    ).strip()
+    qa_ref = str(requested.get("independent_qa_receipt_ref") or "").strip()
+    merge_ref = str(requested.get("manual_merge_event_ref") or "").strip()
+    diagnostic_id = str(requested.get("diagnostic_backlog_id") or "").strip()
+    qa_event_id = _audited_postmerge_recovery_ref_id(qa_ref)
+    merge_event_id = _audited_postmerge_recovery_ref_id(merge_ref)
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        raise GovernanceError(
+            "audited_postmerge_recovery_runtime_context_not_found",
+            "audited post-merge recovery requires the persisted worker runtime context",
+            422,
+        )
+    context_root = Path(str(getattr(context, "target_project_root", "") or ""))
+    parent_task_id = str(getattr(context, "parent_task_id", "") or "").strip()
+    if not all(
+        (
+            backlog_id,
+            task_id,
+            merge_queue_id,
+            runtime_context_id,
+            execution_id,
+            qa_event_id,
+            merge_event_id,
+            diagnostic_id,
+        )
+    ) or not (
+        str(getattr(context, "backlog_id", "") or "") == backlog_id
+        and str(getattr(context, "runtime_context_id", "") or "")
+        == runtime_context_id
+        and str(getattr(context, "merge_queue_id", "") or "")
+        == merge_queue_id
+        and parent_task_id == execution_id
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_scope_mismatch",
+            "recovery evidence does not match the persisted runtime/queue/contract scope",
+            422,
+        )
+    if any(
+        (
+            str(body.get("fence_token") or "").strip(),
+            str(body.get("checkpoint_id") or "").strip(),
+            _query_bool(body, "require_finish_gate", False),
+        )
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_raw_worker_authority_forbidden",
+            "post-merge recovery must not reuse a worker fence or finish checkpoint",
+            422,
+        )
+    if not (
+        route_gate.get("allowed") is True
+        and str(route_gate.get("status") or "") == "accepted"
+        and str(route_gate.get("action") or "") == "merge_queue"
+        and str(
+            route_gate.get("authorized_action")
+            or route_gate.get("allowed_action")
+            or ""
+        )
+        == _PARALLEL_BRANCH_PARENT_ROUTE_MERGE_ACTION
+        and str(route_gate.get("child_task_id") or task_id) == task_id
+        and str(route_gate.get("backlog_id") or backlog_id) == backlog_id
+        and route_gate.get("registry_verified") is True
+        and route_gate.get("resolved_from_ref") is True
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_route_authority_required",
+            "a server-resolved close_or_merge_after_evidence route for the worker task is required",
+            422,
+        )
+
+    rows = conn.execute(
+        """
+        SELECT id, backlog_id, task_id, event_type, event_kind, phase, actor,
+               status, decision, correlation_id, commit_sha, created_at,
+               payload_json, verification_json
+        FROM task_timeline_events
+        WHERE project_id = ? AND id IN (?, ?)
+        """,
+        (project_id, qa_event_id, merge_event_id),
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    qa_row = rows_by_id.get(qa_event_id)
+    merge_row = rows_by_id.get(merge_event_id)
+    if qa_row is None or merge_row is None:
+        raise GovernanceError(
+            "audited_postmerge_recovery_evidence_not_found",
+            "referenced QA or manual-merge timeline evidence was not found",
+            422,
+        )
+    qa_payload = _json_loads(qa_row["payload_json"], {})
+    qa_verification = _json_loads(qa_row["verification_json"], {})
+    merge_payload = _json_loads(merge_row["payload_json"], {})
+    merge_verification = _json_loads(merge_row["verification_json"], {})
+    if not isinstance(qa_payload, Mapping) or not isinstance(
+        qa_verification, Mapping
+    ) or not isinstance(merge_payload, Mapping) or not isinstance(
+        merge_verification, Mapping
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_evidence_invalid",
+            "referenced evidence payloads must be structured objects",
+            422,
+        )
+    candidate_commit = str(qa_row["commit_sha"] or "").strip().lower()
+    diff_sha256 = str(qa_payload.get("diff_sha256") or "").strip()
+    qa_session_id = str(
+        qa_payload.get("independent_qa_session_id") or ""
+    ).strip()
+    qa_principal = str(
+        qa_payload.get("independent_qa_principal") or ""
+    ).strip()
+    baseline_snapshot_id = str(
+        qa_payload.get("canonical_base_snapshot_id") or ""
+    ).strip()
+    baseline_commit = str(
+        qa_payload.get("canonical_base_commit") or ""
+    ).strip().lower()
+    acceptance_count = _safe_int(
+        qa_verification.get("acceptance_criteria_count"), 0
+    )
+    qa_authority = qa_payload.get("source_backed_contract_gate_authority")
+    qa_valid = bool(
+        str(qa_row["backlog_id"] or "") == backlog_id
+        and str(qa_row["task_id"] or "") == execution_id
+        and str(qa_row["event_type"] or "")
+        == "qa.independent_verification_completed_with_governance_exception"
+        and str(qa_row["event_kind"] or "") == "blocker"
+        and str(qa_row["phase"] or "") == "qa_verification"
+        and str(qa_row["actor"] or "") == "observer"
+        and str(qa_row["status"] or "") == "proceeded_with_exception"
+        and str(qa_row["decision"] or "")
+        == "business_qa_pass_authoritative_trace_blocked_no_pass"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
+        and str(qa_payload.get("candidate_commit") or "").lower()
+        == candidate_commit
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", diff_sha256)
+        and baseline_snapshot_id
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", baseline_commit)
+        and qa_session_id
+        and str(qa_row["correlation_id"] or "") == qa_session_id
+        and qa_principal
+        and str(qa_payload.get("independent_qa_session_ref") or "").strip()
+        and str(qa_payload.get("business_verdict") or "").upper() == "PASS"
+        and str(qa_payload.get("governance_evidence_materialization") or "").upper()
+        == "BLOCKED"
+        and qa_payload.get("contract_runtime_authoritative_pass") is False
+        and qa_payload.get("business_qa_bypassed") is False
+        and qa_payload.get("system_gate_bypass_requested") is True
+        and qa_payload.get("reconcile_before_qa") is False
+        and qa_payload.get("historical_graph_data_readable") is True
+        and not str(qa_payload.get("graph_trace_id") or "").strip()
+        and str(qa_payload.get("graph_trace_status") or "")
+        == "blocked_by_nonactive_snapshot_gate"
+        and acceptance_count > 0
+        and _safe_int(qa_verification.get("acceptance_criteria_passed"), 0)
+        == acceptance_count
+        and qa_verification.get("authoritative_pass_synthesized") is False
+        and qa_verification.get("no_pass_claim") is True
+        and qa_verification.get("candidate_head_exact") is True
+        and qa_verification.get("candidate_worktree_clean") is True
+        and qa_verification.get("merge_tree_clean") is True
+        and str(qa_verification.get("git_diff_check") or "") == "passed"
+        and str(qa_verification.get("current_main_regression") or "") == "passed"
+        and _independent_qa_toolchain_evidence_passed(qa_verification)
+        and isinstance(qa_authority, Mapping)
+        and task_timeline._source_backed_route_gate_authority_valid(qa_authority)
+    )
+    if not qa_valid:
+        raise GovernanceError(
+            "audited_postmerge_recovery_qa_receipt_invalid",
+            "independent QA receipt is not an exact no-PASS business-QA receipt",
+            422,
+        )
+
+    qa_session = conn.execute(
+        """
+        SELECT principal_id, project_id, role, scope_json
+        FROM sessions WHERE session_id = ?
+        """,
+        (qa_session_id,),
+    ).fetchone()
+    baseline_snapshot = conn.execute(
+        """
+        SELECT commit_sha FROM graph_snapshots
+        WHERE project_id = ? AND snapshot_id = ?
+        """,
+        (project_id, baseline_snapshot_id),
+    ).fetchone()
+    qa_scope = _json_loads(qa_session["scope_json"], []) if qa_session else []
+    scope_refs = _qa_session_scope_refs({"scope": qa_scope}) if isinstance(
+        qa_scope, list
+    ) else set()
+    required_scope = {
+        f"backlog:{backlog_id}",
+        f"task:{execution_id}",
+        f"commit:{candidate_commit}",
+        _qa_scope_binding_ref(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            commit_sha=candidate_commit,
+        ),
+    }
+    if not qa_session or baseline_snapshot is None or not (
+        str(qa_session["principal_id"] or "") == qa_principal
+        and str(qa_session["project_id"] or "") == project_id
+        and str(qa_session["role"] or "") == "qa"
+        and required_scope.issubset(scope_refs)
+        and str(baseline_snapshot["commit_sha"] or "").lower()
+        == baseline_commit
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_qa_scope_invalid",
+            "independent QA session scope does not bind the exact candidate",
+            422,
+        )
+
+    merge_authority = merge_payload.get("source_backed_contract_gate_authority")
+    merge_business_qa = merge_payload.get("independent_business_qa")
+    merge_contract_runtime = merge_payload.get("contract_runtime")
+    adversarial = (
+        str(merge_business_qa.get("adversarial_assertions") or "").strip()
+        if isinstance(merge_business_qa, Mapping)
+        else ""
+    )
+    adversarial_match = re.fullmatch(r"([1-9][0-9]*)/\1", adversarial)
+    merged_commit = str(merge_row["commit_sha"] or "").strip().lower()
+    merge_valid = bool(
+        str(merge_row["backlog_id"] or "") == backlog_id
+        and str(merge_row["task_id"] or "") == execution_id
+        and str(merge_row["event_type"] or "") == "audited_fast_forward_merge"
+        and str(merge_row["event_kind"] or "") == "merge"
+        and str(merge_row["phase"] or "") == "integration"
+        and str(merge_row["actor"] or "") == "observer"
+        and str(merge_row["status"] or "") == "proceeded_with_exception"
+        and str(merge_row["decision"] or "")
+        == "audited_fast_forward_after_merge_queue_system_block_no_pass"
+        and merged_commit == candidate_commit
+        and str(merge_payload.get("schema_version") or "")
+        == "audited_fast_forward_merge.v1"
+        and str(merge_payload.get("merged_commit") or "").lower()
+        == merged_commit
+        and str(merge_payload.get("merge_mode") or "") == "git_fast_forward_only"
+        and merge_payload.get("exact_base_match") is True
+        and merge_payload.get("main_was_clean") is True
+        and merge_payload.get("no_pass_claim") is True
+        and isinstance(merge_business_qa, Mapping)
+        and str(merge_business_qa.get("status") or "") == "passed"
+        and str(merge_business_qa.get("candidate_diff_hash") or "")
+        == diff_sha256
+        and _safe_int(merge_business_qa.get("tests_passed"), 0) > 0
+        and adversarial_match is not None
+        and isinstance(merge_contract_runtime, Mapping)
+        and merge_contract_runtime.get("no_pass_claim") is True
+        and str(merge_contract_runtime.get("status") or "").startswith(
+            "blocked_"
+        )
+        and merge_verification.get("base_ancestor") is True
+        and merge_verification.get("candidate_clean") is True
+        and str(merge_verification.get("git_operation") or "") == "ff-only"
+        and isinstance(merge_authority, Mapping)
+        and task_timeline._source_backed_route_gate_authority_valid(
+            merge_authority
+        )
+    )
+    if not merge_valid:
+        raise GovernanceError(
+            "audited_postmerge_recovery_manual_merge_invalid",
+            "manual merge evidence is not the exact audited fast-forward no-PASS event",
+            422,
+        )
+
+    diagnostic = conn.execute(
+        """
+        SELECT status, bypass_policy_json, chain_trigger_json, provenance_paths
+        FROM backlog_bugs WHERE bug_id = ?
+        """,
+        (diagnostic_id,),
+    ).fetchone()
+    policy = _json_loads(diagnostic["bypass_policy_json"], {}) if diagnostic else {}
+    trigger = _json_loads(diagnostic["chain_trigger_json"], {}) if diagnostic else {}
+    provenance = _json_loads(diagnostic["provenance_paths"], []) if diagnostic else []
+    if not diagnostic or not (
+        str(diagnostic["status"] or "") == "OPEN"
+        and isinstance(policy, Mapping)
+        and policy.get("system_gate_bypass_only") is True
+        and policy.get("no_pass_claim") is True
+        and policy.get("authoritative_pass_synthesized") is False
+        and policy.get("business_qa_bypassed") is False
+        and policy.get("keep_open") is True
+        and str(policy.get("source_backlog_id") or "") == backlog_id
+        and str(policy.get("source_contract_execution_id") or "")
+        == execution_id
+        and str(policy.get("source_runtime_context_id") or "")
+        == runtime_context_id
+        and isinstance(trigger, Mapping)
+        and str(trigger.get("merged_commit") or "").lower() == merged_commit
+        and _safe_int(trigger.get("actual_reconcile_count")) == 0
+        and trigger.get("no_pass_claim") is True
+        and isinstance(provenance, list)
+        and qa_ref in provenance
+        and merge_ref in provenance
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_diagnostic_invalid",
+            "OPEN system-only diagnostic does not bind the exact QA and merge evidence",
+            422,
+        )
+
+    canonical_root = _graph_governance_project_root(project_id, {})
+    branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
+    branch_commit = _git_output(canonical_root, ["rev-parse", branch_ref]).lower()
+    target_commit = _git_output(canonical_root, ["rev-parse", "refs/heads/main"]).lower()
+    target_dirty = _git_dirty_paths(canonical_root, limit=1)
+    candidate_dirty = (
+        _git_dirty_paths(context_root, limit=1)
+        if context_root.is_dir()
+        else ["<missing-worker-worktree>"]
+    )
+    if not (
+        branch_commit == candidate_commit == merged_commit == target_commit
+        and _git_commit_is_ancestor(canonical_root, candidate_commit, target_commit)
+        and not target_dirty
+        and not candidate_dirty
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_git_state_invalid",
+            "candidate/main ancestry or clean-worktree identity changed after the audited merge",
+            409,
+        )
+    reconcile_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM graph_current_full_reconcile_provenance
+            WHERE project_id = ? AND lower(target_commit_sha) = ?
+            """,
+            (project_id, target_commit),
+        ).fetchone()[0]
+    )
+    existing_live_merge = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM task_timeline_events
+            WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+              AND event_type = 'parallel.live_merge' AND lower(commit_sha) = ?
+            """,
+            (project_id, backlog_id, task_id, target_commit),
+        ).fetchone()[0]
+    )
+    existing_recovery_materialize = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM task_timeline_events
+            WHERE project_id = ? AND backlog_id = ?
+              AND event_type = ? AND status = 'proceeded_with_exception'
+              AND decision = ?
+            """,
+            (
+                project_id,
+                backlog_id,
+                "parallel.merge_queue_item_materialize_postmerge_recovery",
+                "audited_postmerge_durable_queue_recovery_no_pass",
+            ),
+        ).fetchone()[0]
+    )
+    if reconcile_count or existing_live_merge or existing_recovery_materialize:
+        raise GovernanceError(
+            "audited_postmerge_recovery_already_consumed",
+            "post-merge recovery is one-shot and already has materialize, live-merge, or reconcile evidence",
+            409,
+        )
+
+    authority_payload = {
+        "schema_version": "parallel_branch.audited_postmerge_recovery_authority.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "candidate_commit": candidate_commit,
+        "merged_commit": merged_commit,
+        "qa_receipt_ref": qa_ref,
+        "manual_merge_event_ref": merge_ref,
+        "diagnostic_backlog_id": diagnostic_id,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "business_qa_bypassed": False,
+    }
+    return AuditedPostmergeRecoveryAuthority(
+        **{
+            key: value
+            for key, value in authority_payload.items()
+            if key != "schema_version"
+        },
+        authority_hash=stable_sha256(authority_payload),
+    )
 
 
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue/materialize")
@@ -29796,6 +30471,14 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
             task_id=task_id,
         )
         with sqlite_write_lock():
+            postmerge_recovery_authority = (
+                _audited_postmerge_recovery_authority(
+                    conn,
+                    project_id=project_id,
+                    body=ctx.body,
+                    route_gate=route_gate,
+                )
+            )
             queued = queue_merge_item_for_branch_context(
                 conn,
                 project_id=project_id,
@@ -29828,6 +30511,9 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     or str(ctx.body.get("worker_role") or "") == "mf_sub"
                 ),
                 allow_finish_checkpoint_without_fence=bool(route_gate),
+                audited_postmerge_recovery_authority=(
+                    postmerge_recovery_authority
+                ),
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(
@@ -36127,8 +36813,7 @@ def _current_full_reconcile_audited_no_pass_authority(
             and qa_verification.get("candidate_head_exact") is True
             and qa_verification.get("candidate_worktree_clean") is True
             and qa_verification.get("merge_tree_clean") is True
-            and str(qa_verification.get("npm_test") or "") == "passed"
-            and str(qa_verification.get("node_check") or "") == "passed"
+            and _independent_qa_toolchain_evidence_passed(qa_verification)
             and str(qa_verification.get("git_diff_check") or "") == "passed"
             and str(qa_verification.get("current_main_regression") or "")
             == "passed"
@@ -36188,6 +36873,61 @@ def _current_full_reconcile_audited_no_pass_authority(
             continue
 
         merge_payload = _json_mapping(merge_row["payload_json"])
+        merge_event_type = _row_text(merge_row, "event_type")
+        merge_status = _row_text(merge_row, "status")
+        merge_decision = _row_text(merge_row, "decision")
+        merge_recovery_authority = merge_payload.get(
+            "audited_postmerge_recovery_authority"
+        )
+        recovery_authority_payload = (
+            dict(merge_recovery_authority)
+            if isinstance(merge_recovery_authority, Mapping)
+            else {}
+        )
+        recovery_authority_hash = str(
+            recovery_authority_payload.pop("authority_hash", "") or ""
+        )
+        ordinary_live_merge = bool(
+            merge_event_type == "parallel.live_merge"
+            and merge_status == "passed"
+        )
+        recovery_live_merge = bool(
+            merge_event_type == "parallel.live_merge_postmerge_recovery"
+            and merge_status == "proceeded_with_exception"
+            and merge_decision
+            == "audited_postmerge_durable_merge_projection_no_pass"
+            and merge_payload.get("no_pass_claim") is True
+            and merge_payload.get("authoritative_pass_synthesized") is False
+            and merge_payload.get("business_qa_bypassed") is False
+            and isinstance(merge_recovery_authority, Mapping)
+            and str(merge_recovery_authority.get("schema_version") or "")
+            == "parallel_branch.audited_postmerge_recovery_authority.v1"
+            and merge_recovery_authority.get("no_pass_claim") is True
+            and merge_recovery_authority.get(
+                "authoritative_pass_synthesized"
+            )
+            is False
+            and merge_recovery_authority.get("business_qa_bypassed") is False
+            and recovery_authority_hash
+            == stable_sha256(recovery_authority_payload)
+            and str(merge_recovery_authority.get("project_id") or "")
+            == project_id
+            and str(merge_recovery_authority.get("backlog_id") or "")
+            == backlog_id
+            and str(merge_recovery_authority.get("task_id") or "") == task_id
+            and str(merge_recovery_authority.get("parent_task_id") or "")
+            == execution_id
+            and str(merge_recovery_authority.get("runtime_context_id") or "")
+            == runtime_context_id
+            and str(merge_recovery_authority.get("merge_queue_id") or "")
+            == merge_queue_id
+            and str(merge_recovery_authority.get("candidate_commit") or "").lower()
+            == candidate_commit
+            and str(merge_recovery_authority.get("merged_commit") or "").lower()
+            == target_commit
+            and str(merge_recovery_authority.get("qa_receipt_ref") or "")
+            == f"timeline:{qa_event_id}"
+        )
         merge_qa = merge_payload.get("qa_evidence")
         merge_request_evidence = (
             merge_qa.get("request_evidence")
@@ -36205,10 +36945,9 @@ def _current_full_reconcile_audited_no_pass_authority(
         if not (
             _row_text(merge_row, "backlog_id") == backlog_id
             and _row_text(merge_row, "task_id") == task_id
-            and _row_text(merge_row, "event_type") == "parallel.live_merge"
+            and (ordinary_live_merge or recovery_live_merge)
             and _row_text(merge_row, "event_kind") == "live_merge"
             and _row_text(merge_row, "phase") == "live_merge"
-            and _row_text(merge_row, "status") == "passed"
             and _row_text(merge_row, "actor") == "observer"
             and _row_text(merge_row, "commit_sha").lower() == target_commit
             and str(merge_payload.get("parent_task_id") or "")
@@ -36958,6 +37697,32 @@ def _current_full_reconcile_runtime_context_scope(
                 "merge_queue_id": canonical_scope["merge_queue_id"],
                 "target_commit_sha": str(target_commit_sha or "").strip(),
                 "fail_closed": True,
+                "copy_safe_recovery": {
+                    "schema_version": (
+                        "current_full_reconcile.postmerge_authority_recovery.v1"
+                    ),
+                    "ordinary_happy_path": False,
+                    "system_gate_exception_only": True,
+                    "authoritative_pass_synthesized": False,
+                    "business_qa_bypassed": False,
+                    "no_pass_claim": True,
+                    "one_shot": True,
+                    "next_action": (
+                        "parallel_branch_merge_queue_materialize_with_"
+                        "audited_postmerge_recovery_evidence_refs"
+                    ),
+                    "mcp_tool": "parallel_branch_merge_queue_materialize",
+                    "forbidden_fields": [
+                        "fence_token",
+                        "checkpoint_id",
+                        "require_finish_gate=true",
+                    ],
+                    "required_evidence_refs": [
+                        "independent_qa_receipt_ref",
+                        "manual_merge_event_ref",
+                        "diagnostic_backlog_id",
+                    ],
+                },
             },
         )
     if contract_merge_authority:

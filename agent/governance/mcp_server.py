@@ -1037,6 +1037,29 @@ def _parallel_branch_merge_queue_materialize_schema_properties() -> dict[str, An
             "type": "boolean",
             "description": "Defaults to true when checkpoint_id is provided.",
         },
+        "audited_postmerge_recovery": {
+            "type": "object",
+            "description": (
+                "Immutable evidence refs for server-derived, system-only recovery "
+                "of a durable queue row after an audited fast-forward already "
+                "landed. This never accepts a raw fence or synthesizes PASS."
+            ),
+            "properties": {
+                "source_contract_execution_id": {"type": "string"},
+                "runtime_context_id": {"type": "string"},
+                "independent_qa_receipt_ref": {"type": "string"},
+                "manual_merge_event_ref": {"type": "string"},
+                "diagnostic_backlog_id": {"type": "string"},
+            },
+            "required": [
+                "source_contract_execution_id",
+                "runtime_context_id",
+                "independent_qa_receipt_ref",
+                "manual_merge_event_ref",
+                "diagnostic_backlog_id",
+            ],
+            "additionalProperties": False,
+        },
         "worker_role": {"type": "string"},
         "status": {
             "type": "string",
@@ -1181,6 +1204,7 @@ def _parallel_branch_merge_queue_materialize_body(args: dict) -> dict:
         "route_action_precheck_event_ref",
         "close_ready_event_ref",
         "require_finish_gate",
+        "audited_postmerge_recovery",
         "worker_role",
         "status",
         "fence_token",
