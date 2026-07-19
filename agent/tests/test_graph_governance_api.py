@@ -38877,9 +38877,37 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
-    template = guide["onboard_route_guide"]["role_entries"]["observer"][
+    direct_main = guide["onboard_route_guide"]["role_entries"]["observer"][
         "direct_main"
-    ]["close_satisfying_evidence_template"]
+    ]
+    template = direct_main["close_satisfying_evidence_template"]
+    graph_query_authority = direct_main["graph_query_close_authority"]
+    graph_query_arguments = graph_query_authority["copy_safe_graph_query"][
+        "arguments"
+    ]
+    assert graph_query_authority["accepted_query_sources"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES
+    )
+    assert graph_query_authority["accepted_query_purposes"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES
+    )
+    assert graph_query_arguments == {
+        "project_id": PID,
+        "tool": "find_node_by_path",
+        "args": {"path": "agent/governance/server.py"},
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "route_token_ref": f"{route_token_ref}-parent",
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+    }
+    assert graph_query_authority["exploration_only"]["query_purposes"] == [
+        "inspect_node"
+    ]
+    assert graph_query_authority["exploration_only"]["close_authoritative"] is False
+    assert graph_query_authority["ordering"][
+        "late_or_post_hoc_traces_accepted"
+    ] is False
     assert [step["id"] for step in template["ordered_close_path"]] == [
         "pre_mutation_exception",
         "commit_bound_implementation",
@@ -38958,6 +38986,8 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     _insert_observer_graph_query_trace(
         conn,
         trace_id=graph_trace_id,
+        query_source=graph_query_arguments["query_source"],
+        query_purpose=graph_query_arguments["query_purpose"],
         task_id=parent_execution_id,
     )
     append_base = {
@@ -39782,6 +39812,7 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
         graph_trace_ids: list[str],
         *,
         insert_trace_task_id: str | None = None,
+        insert_trace_query_purpose: str | None = None,
     ) -> dict:
         backlog_id = f"AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-GRAPH-{suffix}"
         close_commit = hashlib.sha1(suffix.encode("utf-8")).hexdigest()
@@ -39836,12 +39867,22 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
                 "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
             },
         )
-        if insert_trace_task_id is not None:
+        if (
+            insert_trace_task_id is not None
+            or insert_trace_query_purpose is not None
+        ):
             for trace_id in graph_trace_ids:
                 _insert_observer_graph_query_trace(
                     conn,
                     trace_id=trace_id,
-                    task_id=insert_trace_task_id,
+                    query_purpose=(
+                        insert_trace_query_purpose or "global_architecture_review"
+                    ),
+                    task_id=(
+                        parent_execution_id
+                        if insert_trace_query_purpose is not None
+                        else str(insert_trace_task_id or "")
+                    ),
                 )
         append_base = {
             "backlog_id": backlog_id,
@@ -40043,6 +40084,27 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
             "field": "task_id",
             "expected": wrong_task_precheck["parent_execution_id"],
             "actual": "other-contract",
+        }
+    ]
+
+    inspect_trace_id = "gqt-20260719-1a5ec701"
+    inspect_precheck = build_precheck(
+        "INSPECT",
+        [inspect_trace_id],
+        insert_trace_query_purpose="inspect_node",
+    )
+    graph_gate = assert_close_blocked_by_graph_gate(
+        inspect_precheck,
+        "graph_trace_ids_db_verified",
+    )
+    assert graph_gate["db_evidence"]["identity_mismatches"] == [
+        {
+            "trace_id": inspect_trace_id,
+            "field": "query_purpose",
+            "expected": "|".join(
+                sorted(server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES)
+            ),
+            "actual": "inspect_node",
         }
     ]
 
@@ -42498,6 +42560,40 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert direct_main["requires_operator_approval"] is True
     assert "operator_approval_ref" in direct_main["required_identity"]
     assert "dirty_scope_exact_match" in direct_main["required_evidence"]
+    graph_query_authority = direct_main["graph_query_close_authority"]
+    assert graph_query_authority["accepted_query_sources"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES
+    )
+    assert graph_query_authority["accepted_query_purposes"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES
+    )
+    assert graph_query_authority["recommended_query_source"] == "observer"
+    assert graph_query_authority["recommended_query_purpose"] == "gate_validation"
+    copy_safe_query = graph_query_authority["copy_safe_graph_query"]
+    assert copy_safe_query["ready"] is True
+    assert copy_safe_query["raw_route_token_required"] is False
+    assert copy_safe_query["arguments"] == {
+        "project_id": PID,
+        "tool": "find_node_by_path",
+        "args": {"path": "agent/governance/server.py"},
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "route_token_ref": "rtok-onboard-root",
+        "backlog_id": backlog_id,
+        "task_id": expected_execution_id,
+    }
+    assert graph_query_authority["exploration_only"] == {
+        "query_purposes": ["inspect_node"],
+        "graph_query_valid": True,
+        "close_authoritative": False,
+        "reason": (
+            "inspect_node remains valid for exploration but is not accepted "
+            "by the parentless direct-main close gate"
+        ),
+    }
+    assert graph_query_authority["ordering"][
+        "late_or_post_hoc_traces_accepted"
+    ] is False
     full_round_issue = direct_main["full_round_route_issue"]
     assert full_round_issue["issue_on_first_route"] is True
     assert full_round_issue["single_scoped_issue_covers_full_round"] is True
@@ -43848,6 +43944,29 @@ def test_onboard_route_guide_direct_main_complete_projection_points_to_exception
     assert next_action["contract_complete_runtime_no_remaining_line"] is True
     assert "graph_query first" in next_action["next_step"]
     assert "enter the selected successor interface" not in next_action["next_step"]
+    graph_query_authority = next_action["graph_query_close_authority"]
+    assert graph_query_authority["recommended_query_source"] == "observer"
+    assert graph_query_authority["recommended_query_purpose"] == "gate_validation"
+    assert graph_query_authority["accepted_query_sources"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES
+    )
+    assert graph_query_authority["accepted_query_purposes"] == sorted(
+        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES
+    )
+    assert graph_query_authority["copy_safe_graph_query"]["arguments"] == {
+        "project_id": PID,
+        "tool": "find_node_by_path",
+        "args": {"path": "agent/governance/server.py"},
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "route_token_ref": "rtok-direct-main-complete",
+        "backlog_id": backlog_id,
+        "task_id": result["runtime_resume"]["current_contract_execution_id"],
+    }
+    assert graph_query_authority["exploration_only"]["close_authoritative"] is False
+    assert graph_query_authority["ordering"][
+        "late_or_post_hoc_traces_accepted"
+    ] is False
     issue_payload = result["agent_onboard_guidance"]["route_token_issue"][
         "observer_route_context_issue_payload"
     ]

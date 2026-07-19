@@ -59678,6 +59678,88 @@ def _onboard_selected_qa_contract_runtime_guidance(
     }
 
 
+def _onboard_parentless_direct_main_graph_query_guidance(
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    target_files: Sequence[str] = (),
+) -> dict[str, Any]:
+    approved_target_files = _runtime_context_service_dedupe(
+        [str(path or "").strip() for path in target_files]
+    )
+    query_path = approved_target_files[0] if approved_target_files else ""
+    arguments = {
+        "project_id": str(project_id or "").strip(),
+        "tool": "find_node_by_path",
+        "args": {"path": query_path},
+        "query_source": "observer",
+        "query_purpose": "gate_validation",
+        "route_token_ref": str(route_token_ref or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+    }
+    return {
+        "schema_version": (
+            "onboard_route_guide.parentless_direct_main."
+            "graph_query_close_authority.v1"
+        ),
+        "authority": "parentless_direct_main_close_gate",
+        "server_gate": (
+            "parentless_direct_main_pre_implementation_graph_trace_gate"
+        ),
+        "accepted_query_sources": sorted(
+            _PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES
+        ),
+        "accepted_query_purposes": sorted(
+            _PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES
+        ),
+        "recommended_query_source": "observer",
+        "recommended_query_purpose": "gate_validation",
+        "copy_safe_graph_query": {
+            "mcp_tool": "graph_query",
+            "ready": all(
+                [
+                    arguments["project_id"],
+                    arguments["route_token_ref"],
+                    arguments["backlog_id"],
+                    arguments["task_id"],
+                    arguments["args"]["path"],
+                ]
+            ),
+            "arguments": arguments,
+            "raw_route_token_required": False,
+        },
+        "db_identity_binding": {
+            "project_id": arguments["project_id"],
+            "backlog_id": arguments["backlog_id"],
+            "task_id": arguments["task_id"],
+            "task_id_db_column": "graph_query_traces.task_id",
+            "route_bound_observer_behavior": (
+                "server derives canonical backlog_id/task_id from route_token_ref "
+                "and rejects mismatched client claims"
+            ),
+        },
+        "exploration_only": {
+            "query_purposes": ["inspect_node"],
+            "graph_query_valid": True,
+            "close_authoritative": False,
+            "reason": (
+                "inspect_node remains valid for exploration but is not accepted "
+                "by the parentless direct-main close gate"
+            ),
+        },
+        "ordering": {
+            "required": "graph_query_before_pre_mutation_event_and_implementation",
+            "record_trace_ids_in": (
+                "observer_direct_mutation_exception.artifact_refs.graph_trace_ids"
+            ),
+            "late_or_post_hoc_traces_accepted": False,
+        },
+    }
+
+
 def _onboard_contract_route_guide(
     record: Mapping[str, Any],
     *,
@@ -60055,6 +60137,15 @@ def _onboard_contract_route_guide(
     direct_main_allowed_files = _onboard_contract_route_issue_target_files_from_record(
         record
     )
+    direct_main_graph_query_guidance = (
+        _onboard_parentless_direct_main_graph_query_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            target_files=direct_main_allowed_files,
+        )
+    )
     direct_main_entry = {
         "schema_version": "onboard_contract.operator_supervised_direct_main.v1",
         "id": "operator_supervised_direct_main",
@@ -60099,6 +60190,7 @@ def _onboard_contract_route_guide(
             "before mutation, then follow ordered_close_path using only "
             "approved row-scoped files"
         ),
+        "graph_query_close_authority": direct_main_graph_query_guidance,
         "full_round_route_issue": {
             "schema_version": (
                 "onboard_contract.operator_supervised_direct_main."
@@ -60140,7 +60232,12 @@ def _onboard_contract_route_guide(
             "graph_first_gate": {
                 "required": True,
                 "mcp_tool": "graph_query",
-                "query_source": "observer",
+                "query_source": direct_main_graph_query_guidance[
+                    "recommended_query_source"
+                ],
+                "allowed_query_sources": direct_main_graph_query_guidance[
+                    "accepted_query_sources"
+                ],
                 "required_query_identity": {
                     "task_id": contract_execution_id,
                     "task_id_source": "root_contract_execution_id",
@@ -60154,10 +60251,8 @@ def _onboard_contract_route_guide(
                         "route_token_ref",
                     ],
                 },
-                "allowed_query_purposes": [
-                    "global_architecture_review",
-                    "gate_validation",
-                    "prompt_context_build",
+                "allowed_query_purposes": direct_main_graph_query_guidance[
+                    "accepted_query_purposes"
                 ],
                 "required_before": [
                     "pre_mutation_event",
@@ -61521,6 +61616,10 @@ def _onboard_route_guide_completed_next_action(
     work_type: str = "",
     runtime_resume: Mapping[str, Any] | None = None,
     backlog_row_status: str = "",
+    project_id: str = "",
+    backlog_id: str = "",
+    route_token_ref: str = "",
+    target_files: Sequence[str] = (),
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -61555,6 +61654,19 @@ def _onboard_route_guide_completed_next_action(
             ),
         }
     if selected_work_type == "operator_supervised_direct_main":
+        graph_query_close_authority = (
+            _onboard_parentless_direct_main_graph_query_guidance(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=str(
+                    resume.get("current_contract_execution_id")
+                    or resume.get("root_contract_execution_id")
+                    or ""
+                ),
+                route_token_ref=route_token_ref,
+                target_files=target_files,
+            )
+        )
         return {
             **base,
             "id": "operator_supervised_direct_main_graph_first",
@@ -61562,6 +61674,7 @@ def _onboard_route_guide_completed_next_action(
             "interface": "observer_direct_mutation_exception",
             "requires_operator_approval": True,
             "requires_graph_first": True,
+            "graph_query_close_authority": graph_query_close_authority,
             "next_step": (
                 "run graph_query first, record observer_direct_mutation_exception "
                 "with DB-verified graph trace ids, then edit only approved files"
@@ -62472,6 +62585,10 @@ def _onboard_route_guide_service_response(
                 work_type=work_type,
                 runtime_resume=runtime_resume,
                 backlog_row_status=backlog_row_status,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+                target_files=target_files,
             )
     qa_runtime_record: Mapping[str, Any] | None = None
     if (
