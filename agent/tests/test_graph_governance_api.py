@@ -38981,6 +38981,190 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert closed["gate_summary"]["can_close"] is True
 
 
+def test_parentless_direct_main_qa_timeline_accepts_explicit_service_parent_once(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-PARENTLESS-QA-EXPLICIT-SERVICE-PARENT"
+    project_root = tmp_path / "parentless-qa-explicit-service-parent"
+    commit_sha = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-parentless-qa-explicit-parent",
+            },
+        )
+    )
+    parent_execution_id = guide["contract_chain_current"][
+        "current_contract_execution_id"
+    ]
+    assert parent_execution_id.startswith("onboard-service-")
+
+    _activate_basic_graph(
+        conn,
+        "full-parentless-qa-explicit-parent",
+        commit_sha=commit_sha,
+    )
+    principal_id = "qa:parentless-explicit"
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        commit_sha=commit_sha,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{parent_execution_id}",
+        f"commit:{commit_sha}",
+        qa_scope_binding_ref,
+    ]
+    qa_session = server.role_service.register(
+        conn,
+        principal_id,
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": parent_execution_id,
+            "commit_sha": commit_sha,
+        },
+    )
+    qa_graph_ctx._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": principal_id,
+            "scope": qa_scope,
+        }
+    )
+    qa_graph = server.handle_graph_governance_query(qa_graph_ctx)
+    append_body = {
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+        "contract_execution_id": parent_execution_id,
+        "event_type": "qa.independent_verification",
+        "event_kind": "independent_verification",
+        "phase": "qa",
+        "status": "passed",
+        "actor": principal_id,
+        "commit_sha": commit_sha,
+        "verification": {
+            "tests_run": ["pytest -q focused-parentless-qa"],
+            "diff_check": {"unexpected_files": []},
+            "live_regression": {"status": "passed"},
+        },
+        "payload": {
+            "graph_trace_ids": [qa_graph["trace_id"]],
+            "observer_impersonation": False,
+        },
+    }
+
+    def append(body):
+        ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body=json.loads(json.dumps(body)),
+        )
+        ctx._session = dict(qa_graph_ctx._session)
+        return server.handle_task_timeline_append(ctx)
+
+    accepted = append(append_body)
+    assert accepted["event_kind"] == "independent_verification"
+    authority = accepted["payload"]["source_backed_contract_gate_authority"]
+    assert authority["source_of_authority"] == "qa_session_verification"
+    assert authority["authority_hash"].startswith("sha256:")
+
+    replay = append(append_body)
+    assert replay["id"] == accepted["id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["timeline_append_required"] is False
+    assert replay["existing_timeline_event_authoritative"] is True
+    event_count = conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+             AND event_kind = 'independent_verification'""",
+        (PID, backlog_id, parent_execution_id),
+    ).fetchone()[0]
+    assert event_count == 1
+
+    forged = json.loads(json.dumps(append_body))
+    forged["actor"] = "qa:forged"
+    with pytest.raises(GovernanceError) as rejected:
+        append(forged)
+    assert rejected.value.code == "qa_session_principal_mismatch"
+    assert conn.execute(
+        """SELECT COUNT(*) FROM task_timeline_events
+           WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+             AND event_kind = 'independent_verification'""",
+        (PID, backlog_id, parent_execution_id),
+    ).fetchone()[0] == 1
+
+
+def test_contract_runtime_close_unknown_definition_fails_as_controlled_rejection(conn):
+    execution_id = "cex-unknown-definition-close-gate"
+    server._contract_runtime(conn).store.create(
+        {
+            "project_id": PID,
+            "backlog_id": "AC-UNKNOWN-DEFINITION-CLOSE-GATE",
+            "contract_id": "unknown_contract_definition",
+            "version": "v1",
+            "revision": "rev1",
+            "contract_execution_id": execution_id,
+            "root_contract_execution_id": execution_id,
+            "parent_contract_execution_id": "",
+            "contract_chain_id": "cchain-unknown-definition-close-gate",
+            "execution_state_revision": 1,
+            "definition_hash": _fake_sha("unknown-contract-definition"),
+            "instruction_bundle_hash": _fake_sha("unknown-contract-instructions"),
+        }
+    )
+    conn.commit()
+    body = {"contract_execution_id": execution_id}
+
+    assert server._contract_runtime_completed_line_projection_preflight_gate(
+        conn,
+        body=body,
+        event_kind="independent_verification",
+        trusted_actor_role="qa",
+    ) == {}
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_close_gate(
+            conn,
+            project_id=PID,
+            body=body,
+            event_kind="independent_verification",
+            norm_payload={},
+            trusted_actor_role="qa",
+        )
+    assert rejected.value.code == "contract_runtime_close_evidence_rejected"
+    assert rejected.value.status == 422
+    assert "unknown contract definition" in rejected.value.message
+
+
 def test_onboard_service_uses_current_route_ref_after_prior_ref_is_superseded(conn):
     backlog_id = "AC-ONBOARD-SERVICE-CURRENT-ROUTE-REF-AFTER-RENEWAL"
     _insert_simple_mf_close_backlog(conn, backlog_id)

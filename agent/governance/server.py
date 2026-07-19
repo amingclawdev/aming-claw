@@ -66,6 +66,7 @@ from .contracts.runtime import (
     upsert_contract_chain_successor_binding,
 )
 from .contracts.hash import stable_sha256
+from .contracts.schema import ContractDefinitionError
 from .contracts.write_gate import contract_line_evidence_policy
 from agent.mcp.schema_contract import (
     MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
@@ -68162,6 +68163,8 @@ def _contract_runtime_close_execution_id(
                 record = runtime.store.get(token)
             except ContractRuntimeError:
                 continue
+            if _onboard_service_record(record):
+                continue
             if (
                 str(record.get("contract_execution_id") or "").strip() == token
                 and str(record.get("definition_hash") or "").strip()
@@ -68875,7 +68878,7 @@ def _contract_runtime_completed_line_projection_preflight_gate(
         if actor_role:
             runtime.current_guide(contract_execution_id, actor_role=actor_role)
         record = runtime.store.get(contract_execution_id)
-    except ContractRuntimeError:
+    except (ContractRuntimeError, ContractDefinitionError):
         return {}
     if actor_role:
         record, _ = _contract_runtime_apply_mf_parallel_context_projection(
@@ -69012,7 +69015,7 @@ def _contract_runtime_close_gate(
             record=record,
             actor_role=actor_role,
         )
-    except ContractRuntimeError as exc:
+    except (ContractRuntimeError, ContractDefinitionError) as exc:
         raise GovernanceError(
             "contract_runtime_close_evidence_rejected",
             str(exc),
@@ -73964,6 +73967,96 @@ def _timeline_trusted_qa_verification_authority(
     return proof
 
 
+def _parentless_direct_main_qa_timeline_replay(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event_kind: str,
+    norm_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reuse one authenticated QA proof for an explicit onboard-service parent."""
+
+    requested_execution_id = _contract_runtime_close_requested_execution_ref(body)
+    if not requested_execution_id.startswith("onboard-service-"):
+        return {}
+    try:
+        record = _contract_runtime(conn).store.get(requested_execution_id)
+    except ContractRuntimeError:
+        return {}
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if (
+        not _onboard_service_record(record)
+        or task_id != requested_execution_id
+        or str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+    ):
+        return {}
+    authority = (
+        norm_payload.get("source_backed_contract_gate_authority")
+        if isinstance(
+            norm_payload.get("source_backed_contract_gate_authority"), Mapping
+        )
+        else {}
+    )
+    authority_hash = str(authority.get("authority_hash") or "").strip()
+    if (
+        str(authority.get("source_of_authority") or "").strip()
+        != "qa_session_verification"
+        or not authority_hash
+    ):
+        return {}
+
+    from . import task_timeline
+
+    for existing in reversed(
+        task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind=event_kind,
+            limit=1000,
+        )
+    ):
+        if (
+            str(existing.get("event_kind") or "").strip() != event_kind
+            or str(existing.get("actor") or "").strip()
+            != str(body.get("actor") or "").strip()
+            or str(existing.get("commit_sha") or "").strip()
+            != str(body.get("commit_sha") or "").strip()
+        ):
+            continue
+        existing_payload = (
+            existing.get("payload")
+            if isinstance(existing.get("payload"), Mapping)
+            else {}
+        )
+        existing_authority = (
+            existing_payload.get("source_backed_contract_gate_authority")
+            if isinstance(
+                existing_payload.get("source_backed_contract_gate_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            str(existing_authority.get("authority_hash") or "").strip()
+            != authority_hash
+        ):
+            continue
+        return {
+            **existing,
+            "idempotent_replay": True,
+            "timeline_append_required": False,
+            "timeline_append_authoritative": False,
+            "existing_timeline_event_authoritative": True,
+            "contract_execution_id": requested_execution_id,
+        }
+    return {}
+
+
 def _timeline_trusted_runtime_context_worker_proof(
     ctx: RequestContext,
     conn,
@@ -74699,6 +74792,26 @@ def handle_task_timeline_append(ctx: RequestContext):
             norm_payload["meta_contract_gate_decision_source"] = False
         else:
             norm_payload["meta_contract_gate"] = meta_contract_gate
+        if trusted_qa_verification_authority:
+            qa_replay = _parentless_direct_main_qa_timeline_replay(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                norm_payload=norm_payload,
+            )
+            if qa_replay:
+                qa_replay_payload = (
+                    qa_replay.get("payload")
+                    if isinstance(qa_replay.get("payload"), Mapping)
+                    else {}
+                )
+                qa_replay["contract_gate_decision"] = qa_replay_payload.get(
+                    "contract_gate_decision"
+                )
+                qa_replay["agent_facing_decision_source"] = "contract_gate_kernel"
+                qa_replay["meta_contract_gate_decision_source"] = False
+                return qa_replay
         if route_gate:
             _record_route_token_gate_event(
                 conn,
