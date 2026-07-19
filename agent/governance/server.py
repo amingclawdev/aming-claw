@@ -17130,6 +17130,20 @@ def _runtime_context_worker_recovery_payloads(
             or "<current worker route_token_ref>"
         )
     }
+    implementation_diff_submission_guidance = {
+        "schema_version": (
+            "runtime_context.implementation_diff_submission_guidance.v1"
+        ),
+        "expected_diff_base_commit": (
+            str(base_commit or "").strip()
+            or "<runtime_context base_commit>"
+        ),
+        "expected_diff_base_source": "runtime_context.base_commit",
+        "changed_files_semantics": "cumulative_runtime_diff",
+        "required_submission": "changed_files=cumulative_runtime_diff",
+        "git_diff_expression": "runtime_context.base_commit..clean_worker_HEAD",
+        "delta_rework_changed_files_allowed": False,
+    }
     canonical_implementation_lineage = dict(
         worker_implementation_lineage
         if isinstance(worker_implementation_lineage, Mapping)
@@ -17789,6 +17803,9 @@ def _runtime_context_worker_recovery_payloads(
         "worker_slot_id": worker_slot_id,
         "target_project_root": target_project_root,
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "implementation_diff_submission_guidance": dict(
+            implementation_diff_submission_guidance
+        ),
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
         "raw_session_token_persisted": False,
@@ -17808,7 +17825,10 @@ def _runtime_context_worker_recovery_payloads(
         "fence_token": fence_token_placeholder,
         "session_token_env": session_token_env,
         "fence_token_env": fence_token_env,
-        "changed_files": ["<worker-owned changed file>"],
+        "changed_files": ["<cumulative runtime diff file from base_commit..HEAD>"],
+        "implementation_diff_submission_guidance": dict(
+            implementation_diff_submission_guidance
+        ),
         "tests": [{"command": "<worker test command>", "status": "passed"}],
         "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
@@ -18309,6 +18329,9 @@ def _runtime_context_worker_recovery_payloads(
             "copy_safe_body": dict(implementation_evidence_body),
             "retry_payload": dict(implementation_evidence_body),
             "payload": implementation_evidence_payload,
+            "implementation_diff_submission_guidance": dict(
+                implementation_diff_submission_guidance
+            ),
             "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
             "write_authorization_policy": write_authorization_policy,
             "route_token_policy": {
@@ -23982,7 +24005,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     payload: Mapping[str, Any],
     revision_marker: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Version a bad retry implementation line from immutable worker git state."""
+    """Validate or version failed-QA implementation from immutable git state."""
 
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
@@ -23993,8 +24016,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         runtime_context_id=runtime_context_id,
         task_id=task_id,
     )
-    if previous is None:
-        return {}
     completed_lines = list(record.get("completed_lines") or [])
     failed_qa_index = _active_failed_qa_line_index(completed_lines)
     previous_index = next(
@@ -24006,8 +24027,11 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         ),
         -1,
     )
-    if failed_qa_index < 0 or previous_index <= failed_qa_index:
+    if failed_qa_index < 0:
         return {}
+    post_failed_qa_implementation_exists = bool(
+        previous is not None and previous_index > failed_qa_index
+    )
     claimed_files = sorted(
         set(_runtime_context_service_query_values(payload, "changed_files"))
     )
@@ -24021,13 +24045,60 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             )
         )
     )
-    previous_files = sorted(
-        set(_runtime_context_service_query_values(previous, "changed_files"))
+    previous_files = (
+        sorted(
+            set(
+                _runtime_context_service_query_values(
+                    previous,
+                    "changed_files",
+                )
+            )
+        )
+        if previous is not None
+        else []
+    )
+    previous_payload = (
+        previous.get("payload")
+        if previous is not None
+        and isinstance(previous.get("payload"), Mapping)
+        else {}
+    )
+    previous_authority = (
+        previous_payload.get("canonical_rework_lineage_revision_authority")
+        if isinstance(
+            previous_payload.get("canonical_rework_lineage_revision_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    previous_has_canonical_cumulative_authority = bool(
+        previous_authority.get("server_derived") is True
+        and str(previous_authority.get("source") or "").strip()
+        == "runtime_context_clean_cumulative_git_revision"
+        and previous_authority.get("clean_worktree") is True
+        and sorted(
+            set(previous_authority.get("cumulative_changed_files") or [])
+        )
+        == previous_files
+        and re.fullmatch(
+            r"[0-9a-f]{40,64}",
+            str(previous_authority.get("actual_head_commit") or "").strip(),
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40,64}",
+            str(previous_authority.get("diff_base_commit") or "").strip(),
+        )
     )
     # The implementation facade passes through the generic close gate before
-    # its canonical timeline hook. That same request may therefore observe the
-    # line it just wrote; identical file scope is idempotent, not a revision.
-    if claimed_files == previous_files:
+    # its canonical timeline hook, so this request may observe the line it just
+    # wrote. Equality alone cannot prove idempotence: a delta-only retry has the
+    # same claimed files as that newly-written line. Only a prior line already
+    # carrying server-derived cumulative git authority is safely idempotent.
+    if (
+        post_failed_qa_implementation_exists
+        and claimed_files == previous_files
+        and previous_has_canonical_cumulative_authority
+    ):
         return {}
 
     resolved_revision_marker = dict(revision_marker)
@@ -24159,6 +24230,17 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         "revision_event_ref": revision_event_ref,
         "raw_worker_tokens_persisted": False,
     }
+    if not post_failed_qa_implementation_exists:
+        return {
+            "schema_version": (
+                "runtime_context.failed_qa_implementation_prevalidation.v1"
+            ),
+            "accepted": True,
+            "status": "validated_submission",
+            "canonical_payload": canonical_payload,
+            "diff_base_commit": revision_diff.get("base_commit") or "",
+            "cumulative_changed_files": cumulative_files,
+        }
     write = {
         "project_id": project_id,
         "backlog_id": record.get("backlog_id"),
@@ -24419,10 +24501,7 @@ def _runtime_context_submit_canonical_contract_line(
                 }
             }
 
-    if (
-        line_id == "worker_implementation"
-        and next_line_id != "worker_implementation"
-    ):
+    if line_id == "worker_implementation":
         revision = _runtime_context_revise_failed_qa_implementation_lineage(
             conn,
             project_id=project_id,
@@ -24435,7 +24514,11 @@ def _runtime_context_submit_canonical_contract_line(
                 {},
             ),
         )
-        if revision:
+        if revision.get("status") == "validated_submission":
+            canonical_payload = dict(
+                revision.get("canonical_payload") or canonical_payload
+            )
+        elif revision and next_line_id != "worker_implementation":
             return revision
 
     for completed in record.get("completed_lines") or []:
@@ -66989,7 +67072,43 @@ def _contract_runtime_close_gate(
         line_id=line["line_id"],
         evidence_kind=line["evidence_kind"],
     )
-    write["payload"] = dict(norm_payload)
+    canonical_norm_payload = dict(norm_payload)
+    if (
+        actor_role == "mf_sub"
+        and str(line.get("line_id") or "").strip()
+        == "worker_implementation"
+    ):
+        from .parallel_branch_runtime import (
+            get_branch_context_by_runtime_context_id,
+        )
+
+        runtime_context_id = _timeline_first_deep_text(
+            {"body": body, "payload": canonical_norm_payload},
+            "runtime_context_id",
+        )
+        runtime_context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        if runtime_context is not None:
+            prevalidation = (
+                _runtime_context_revise_failed_qa_implementation_lineage(
+                    conn,
+                    project_id=project_id,
+                    context=runtime_context,
+                    runtime=runtime,
+                    record=stored_record,
+                    payload=canonical_norm_payload,
+                    revision_marker={},
+                )
+            )
+            if prevalidation.get("status") == "validated_submission":
+                canonical_norm_payload = dict(
+                    prevalidation.get("canonical_payload")
+                    or canonical_norm_payload
+                )
+    write["payload"] = canonical_norm_payload
     for key in ("artifact_refs", "verification", "trace_id", "commit_sha"):
         if key in body:
             write[key] = body[key]

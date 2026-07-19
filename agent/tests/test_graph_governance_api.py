@@ -27621,6 +27621,23 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         "agent/governance/server.py",
         "docs/onboarding.md",
     ]
+    rework_changed_files = ["docs/onboarding.md"]
+    initial_candidate = target_root / "agent/governance/server.py"
+    initial_candidate.parent.mkdir(parents=True, exist_ok=True)
+    initial_candidate.write_text("initial candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial failed QA candidate"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    initial_head = batch_jobs.git_commit(target_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -27643,7 +27660,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         backlog_id=backlog_id,
         fence_token="fence-failed-qa-cumulative-worker",
         graph_trace_id="gqt-failed-qa-cumulative-worker",
-        head_commit=base_commit,
+        head_commit=initial_head,
     )
     _record_mf_parallel_contract_runtime_worker_prefix(
         conn,
@@ -27651,7 +27668,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         runtime_context=runtime_context,
         parent_task_id=backlog_id,
         graph_trace_id="gqt-failed-qa-cumulative-worker",
-        head_commit=base_commit,
+        head_commit=initial_head,
         implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
     runtime_context = upsert_branch_context(
@@ -27675,7 +27692,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
             conn,
             trace_id=qa_trace_id,
             snapshot_id="scope-failed-qa-cumulative-qa",
-            candidate_commit_sha=base_commit,
+            candidate_commit_sha=initial_head,
             backlog_id=backlog_id,
             task_id=runtime_context.task_id,
             target_project_root=str(target_root),
@@ -27759,19 +27776,98 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     assert prior_session_token_ref
     assert rejoin["session_token_ref"] != prior_session_token_ref
 
+    runtime = server._contract_runtime(conn)
+    retry_guide = runtime.current_guide(
+        successor["contract_execution_id"], actor_role="mf_sub"
+    )
+    retry_guidance = retry_guide["failed_qa_rework"]
+    assert retry_guidance["expected_diff_base_source"] == (
+        "runtime_context.base_commit"
+    )
+    assert retry_guidance["required_submission"] == (
+        "changed_files=cumulative_runtime_diff"
+    )
+    assert retry_guidance["delta_rework_changed_files_allowed"] is False
+
+    rework_file = target_root / rework_changed_files[0]
+    rework_file.parent.mkdir(parents=True, exist_ok=True)
+    rework_file.write_text("guide revision\n", encoding="utf-8")
+    subprocess.run(["git", "add", *rework_changed_files], cwd=target_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "failed QA child revision"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    revised_head = batch_jobs.git_commit(target_root)
+
+    # Reject a delta-only retry before the generic facade can persist a line
+    # whose file list merely echoes the worker's incomplete claim.
+    before_delta_record = runtime.store.get(successor["contract_execution_id"])
+    before_delta_revision = before_delta_record["execution_state_revision"]
+    before_delta_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    with pytest.raises(GovernanceError) as delta_error:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": rejoin["fence_token"],
+                    "session_token": rejoin["session_token"],
+                    "target_project_root": str(target_root),
+                    "changed_files": rework_changed_files,
+                    "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                },
+            )
+        )
+    assert delta_error.value.code == (
+        "contract_runtime_rework_lineage_revision_invalid"
+    )
+    assert delta_error.value.details["claimed_changed_files"] == (
+        rework_changed_files
+    )
+    assert delta_error.value.details["cumulative_changed_files"] == changed_files
+    assert delta_error.value.details["next_legal_action"] == (
+        "retry_implementation_evidence_with_cumulative_runtime_diff"
+    )
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "execution_state_revision"
+    ] == before_delta_revision
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            task_id=runtime_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    ) == len(before_delta_events)
+
     # Seed the already-accepted bad retry line that this regression repairs.
     # The production correction and subsequent worker_commit still run through
     # their protected facades below.
-    runtime = server._contract_runtime(conn)
     partial_record = runtime.store.get(successor["contract_execution_id"])
     partial_payload, _unused_commit = _mf_parallel_worker_proof_payloads(
         runtime_context,
         parent_task_id=backlog_id,
         graph_trace_id="gqt-failed-qa-cumulative-worker",
-        head_commit=base_commit,
+        head_commit=initial_head,
         implementation_event_ref=f"timeline:{worker_events['implementation']}",
     )
-    partial_payload["changed_files"] = ["agent/governance/server.py"]
+    partial_payload["changed_files"] = rework_changed_files
     partial_payload["session_token_ref"] = prior_session_token_ref
     partial_payload["graph_trace_db_evidence"] = {
         "db_verified": True,
@@ -27792,7 +27888,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
             "worker_id": runtime_context.worker_id,
             "worker_slot_id": runtime_context.worker_slot_id,
             "session_token_ref": prior_session_token_ref,
-            "changed_files": ["agent/governance/server.py"],
+            "changed_files": rework_changed_files,
             "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
             "payload": partial_payload,
         }
@@ -27802,23 +27898,6 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     ) + 1
     runtime.store.update(successor["contract_execution_id"], partial_record)
     runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
-
-    for path, content in (
-        ("agent/governance/server.py", "runtime revision\n"),
-        ("docs/onboarding.md", "guide revision\n"),
-    ):
-        destination = target_root / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
-    subprocess.run(["git", "add", *changed_files], cwd=target_root, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "failed QA cumulative revision"],
-        cwd=target_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    revised_head = batch_jobs.git_commit(target_root)
 
     saved_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert saved_context is not None
@@ -27948,9 +28027,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         if line.get("line_id") == "worker_implementation"
     ]
     assert len(retry_implementations) == 2
-    assert retry_implementations[0]["changed_files"] == [
-        "agent/governance/server.py"
-    ]
+    assert retry_implementations[0]["changed_files"] == rework_changed_files
     assert retry_implementations[-1]["changed_files"] == changed_files
     revision_audit = retry_implementations[-1]["payload"][
         "canonical_rework_lineage_revision"
@@ -27966,6 +28043,42 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     assert retry_implementations[-1]["session_token_ref"] == (
         rejoin["session_token_ref"]
     )
+    canonical_authority = retry_implementations[-1]["payload"][
+        "canonical_rework_lineage_revision_authority"
+    ]
+    assert canonical_authority["server_derived"] is True
+    assert canonical_authority["diff_base_commit"] == base_commit
+    assert canonical_authority["cumulative_changed_files"] == changed_files
+
+    revision_before_idempotent_retry = revised_record["execution_state_revision"]
+    idempotent_retry = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": rejoin["fence_token"],
+                    "session_token": rejoin["session_token"],
+                    "target_project_root": str(target_root),
+                    "changed_files": changed_files,
+                    "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "payload": {"summary": "Idempotent cumulative retry."},
+                },
+            )
+        )
+    )
+    assert idempotent_retry["contract_runtime_canonical_line"]["status"] == (
+        "already_completed"
+    )
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "execution_state_revision"
+    ] == revision_before_idempotent_retry
 
     latest_lineage = _worker_implementation_lineage(
         revised_record,
@@ -54845,6 +54958,7 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         target_project_root="/tmp/worker-guide-scope",
         backlog_id="AC-GUIDE-SCOPE",
         merge_queue_id="mq-guide-scope",
+        base_commit="a" * 40,
         route_identity={
             "route_id": "route-guide-scope",
             "route_context_hash": "sha256:guide-scope",
@@ -54867,6 +54981,9 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
     implementation_body = payloads[
         "implementation_evidence_facade_payload_skeleton"
     ]["copy_safe_body"]
+    implementation_diff_guidance = payloads[
+        "implementation_evidence_facade_payload_skeleton"
+    ]["implementation_diff_submission_guidance"]
     worker_commit_skeleton = payloads["worker_commit_facade_payload_skeleton"]
     worker_commit_body = worker_commit_skeleton["copy_safe_body"]
 
@@ -54888,6 +55005,17 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
     assert set(implementation_body) & set(
         server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     ) == {"route_token_ref"}
+    assert implementation_diff_guidance["expected_diff_base_commit"] == "a" * 40
+    assert implementation_diff_guidance["required_submission"] == (
+        "changed_files=cumulative_runtime_diff"
+    )
+    assert implementation_diff_guidance["delta_rework_changed_files_allowed"] is False
+    assert implementation_body["implementation_diff_submission_guidance"] == (
+        implementation_diff_guidance
+    )
+    assert implementation_body["changed_files"] == [
+        "<cumulative runtime diff file from base_commit..HEAD>"
+    ]
     assert worker_commit_body["implementation_lineage_ref"] == (
         implementation_lineage["implementation_lineage_ref"]
     )
