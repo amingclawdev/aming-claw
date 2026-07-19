@@ -9408,6 +9408,142 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertIn("independent_qa_gate", direct_group["replaced_gate_ids"])
         self.assertIn("cross_ref_gate", direct_group["replaced_gate_ids"])
 
+    def test_observer_direct_exception_projects_server_accepted_historical_shape(self):
+        from agent.governance import task_timeline
+
+        project_id = "aming-claw"
+        backlog_id = "AC-SYSTEM-DIRECT-MAIN-PROJECTION"
+        task_id = "onboard-service-historical"
+        route_id = "route-20260719-historical"
+        route_gate = {
+            "action": "task_timeline_append",
+            "allowed": True,
+            "status": "accepted",
+            "server_projected": True,
+            "projection_source": "server_route_token_mutation_gate",
+            "resolved_from_ref": True,
+            "server_issued_binding": True,
+            "binding_source": "observer_route_token_refs",
+            "route_id": route_id,
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+            "scope": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        }
+        event = {
+            "id": 15328,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_type": "observer_direct_mutation_exception",
+            "event_kind": "route_context",
+            "phase": "pre_implementation",
+            "decision": "operator_supervised_direct_main_approved",
+            "status": "accepted",
+            "actor": "observer:/root",
+            "payload": {
+                "source_backed_contract_gate_authority": (
+                    task_timeline.source_backed_route_gate_authority(route_gate)
+                )
+            },
+            "verification": {
+                "observer_direct_mutation": True,
+                "tiny_deterministic_scope": True,
+                "operator_approval": {
+                    "approved": True,
+                    "approval_ref": "user-serial-block-repair",
+                    "close_satisfying_shape": True,
+                },
+                "dirty_scope": {"expected": [], "actual": [], "exact_match": True},
+                "db_verified_pre_implementation_graph_trace": True,
+            },
+            "artifact_refs": {
+                "allowed_files": ["agent/governance/task_timeline.py"],
+                "graph_trace_ids": ["gqt-20260719-historical"],
+            },
+        }
+        contract = {
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+            "close_context": {
+                "target_files": ["agent/governance/task_timeline.py"],
+            },
+        }
+
+        projected = task_timeline.mf_close_gate_verification(
+            [event],
+            contract=contract,
+        )["observer_direct_close_exception_gate"]
+
+        self.assertEqual(projected["accepted_exception"]["event"]["id"], 15328)
+        self.assertNotIn(
+            "accepted_observer_direct_implementation_exception",
+            projected["missing_requirement_ids"],
+        )
+        accepted = projected["accepted_exception"]
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(
+            accepted["reason_source"],
+            "server_accepted_operator_supervised_direct_main_decision",
+        )
+        self.assertTrue(accepted["server_gate_shape"]["accepted"])
+
+        forged = copy.deepcopy(event)
+        forged["payload"] = {
+            "route_context_hash": ROUTE_IDENTITY["route_context_hash"],
+        }
+        rejected = task_timeline._observer_direct_exception_event(
+            forged,
+            {
+                "route_ids": [route_id],
+                "route_context_hashes": [ROUTE_IDENTITY["route_context_hash"]],
+            },
+        )
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("reason", rejected["missing_fields"])
+        self.assertFalse(rejected["server_gate_shape"]["accepted"])
+
+        wrong_scope = copy.deepcopy(event)
+        wrong_scope_gate = dict(route_gate)
+        wrong_scope_gate["scope"] = {
+            **route_gate["scope"],
+            "backlog_id": "AC-DIFFERENT-BACKLOG",
+        }
+        wrong_scope["payload"] = {
+            "source_backed_contract_gate_authority": (
+                task_timeline.source_backed_route_gate_authority(wrong_scope_gate)
+            )
+        }
+        rejected_wrong_scope = task_timeline._observer_direct_exception_event(
+            wrong_scope,
+            {
+                "route_ids": [route_id],
+                "route_context_hashes": [ROUTE_IDENTITY["route_context_hash"]],
+            },
+        )
+        self.assertFalse(rejected_wrong_scope["accepted"])
+        self.assertFalse(
+            rejected_wrong_scope["server_gate_shape"]["checks"]["scope_identity"]
+        )
+
+        self_attested = copy.deepcopy(event)
+        self_attested["verification"]["self_attesting"] = True
+        rejected_self_attested = task_timeline._observer_direct_exception_event(
+            self_attested,
+            {
+                "route_ids": [route_id],
+                "route_context_hashes": [ROUTE_IDENTITY["route_context_hash"]],
+            },
+        )
+        self.assertFalse(rejected_self_attested["accepted"])
+        self.assertIn("reason", rejected_self_attested["missing_fields"])
+        self.assertFalse(
+            rejected_self_attested["server_gate_shape"]["checks"][
+                "not_self_attesting"
+            ]
+        )
+
     def test_observer_direct_exception_accepts_qa_commands_run_test_evidence(self):
         from agent.governance import task_timeline
 

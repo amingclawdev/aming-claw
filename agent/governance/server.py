@@ -59107,6 +59107,34 @@ def _onboard_contract_route_guide(
             "path": "/api/task/{project_id}/timeline",
             "event_type": "mf.observer_direct_implementation_exception",
             "event_kind": "observer_direct_implementation_exception",
+            "canonical_timeline_event": {
+                "schema_version": "observer_direct_mutation_exception.canonical_event.v1",
+                "top_level": {
+                    "event_type": "mf.observer_direct_implementation_exception",
+                    "event_kind": "observer_direct_implementation_exception",
+                    "phase": "pre_mutation",
+                    "status": "accepted",
+                    "decision": "operator_supervised_direct_main_approved",
+                },
+                "payload_fields": [
+                    "reason",
+                    "observer_direct_mutation=true",
+                    "tiny_deterministic_scope=true",
+                ],
+                "verification_fields": [
+                    "operator_approval.approved=true",
+                    "operator_approval.approval_ref",
+                    "dirty_scope.exact_match=true",
+                    "db_verified_pre_implementation_graph_trace=true",
+                ],
+                "artifact_ref_fields": [
+                    "allowed_files",
+                    "graph_trace_ids",
+                    "operator_approval_ref",
+                ],
+                "ordering": "append_before_any_mutation",
+                "authority": "server_route_token_gate",
+            },
         },
         "graph_query": {
             "kind": "mcp_or_http",
@@ -59227,6 +59255,11 @@ def _onboard_contract_route_guide(
             "timeline_evidence_recorded_before_mutation",
             "focused_tests_or_no_test_decision",
         ],
+        "canonical_timeline_event": dict(
+            interface_index["observer_direct_mutation_exception"][
+                "canonical_timeline_event"
+            ]
+        ),
         "blocked_without": [
             "operator_approval_ref",
             "operator_approval.close_satisfying_shape",

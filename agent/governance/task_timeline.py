@@ -8356,6 +8356,83 @@ def _has_operator_approval(event: dict[str, Any]) -> bool:
     return bool(_operator_approval_shape(event).get("accepted"))
 
 
+def _observer_direct_server_gate_shape(event: dict[str, Any]) -> dict[str, Any]:
+    """Recognize the server-signed direct-main shape without trusting self-attestation."""
+
+    authority: dict[str, Any] = {}
+    for source in (
+        _mapping(event.get("payload")),
+        _mapping(event.get("verification")),
+        _mapping(event.get("artifact_refs")),
+    ):
+        candidate = _first_deep_mapping(
+            source,
+            "source_backed_contract_gate_authority",
+        )
+        if _source_backed_route_gate_authority_valid(candidate):
+            authority = candidate
+            break
+
+    route_gate = _mapping(authority.get("route_token_gate"))
+    event_type = _normalize_token(event.get("event_type"))
+    phase = _normalize_token(event.get("phase"))
+    decision = _normalize_token(event.get("decision"))
+    direct_mutation_declared = any(
+        _truthy(value)
+        for value in _event_field_values(event, {"observer_direct_mutation"})
+    )
+    self_attesting = _contract_runtime_meta_contains_truthy_key(
+        event,
+        {"self_attesting", "worker_self_attesting"},
+    )
+    scope = _mapping(route_gate.get("scope"))
+    scope_fields = ("project_id", "backlog_id", "task_id")
+    scope_mismatches = [
+        field
+        for field in scope_fields
+        if str(scope.get(field) or "").strip()
+        and str(scope.get(field) or "").strip()
+        != str(event.get(field) or "").strip()
+    ]
+    scope_identity_exact = all(
+        str(scope.get(field) or "").strip()
+        and str(scope.get(field) or "").strip()
+        == str(event.get(field) or "").strip()
+        for field in scope_fields
+    )
+    checks = {
+        "source_backed_authority": bool(authority),
+        "route_gate_accepted": _source_backed_route_gate_accepted(route_gate),
+        "route_gate_action": str(route_gate.get("action") or "").strip()
+        == "task_timeline_append",
+        "event_type": event_type
+        in {
+            "observer_direct_mutation_exception",
+            "mf_observer_direct_implementation_exception",
+        },
+        "pre_mutation_phase": phase in {"pre_implementation", "pre_mutation"},
+        "operator_supervised_decision": (
+            decision == "operator_supervised_direct_main_approved"
+        ),
+        "observer_direct_mutation": direct_mutation_declared,
+        "scope_identity": scope_identity_exact and not scope_mismatches,
+        "not_self_attesting": not self_attesting,
+    }
+    accepted = all(checks.values())
+    return {
+        "schema_version": "observer_direct_server_gate_shape.v1",
+        "accepted": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "checks": checks,
+        "scope_mismatches": scope_mismatches,
+        "reason_source": (
+            "server_accepted_operator_supervised_direct_main_decision"
+            if accepted
+            else ""
+        ),
+    }
+
+
 def _observer_direct_exception_event(
     event: dict[str, Any],
     route_identity: dict[str, list[str]],
@@ -8395,6 +8472,8 @@ def _observer_direct_exception_event(
             or expected_route_hashes.intersection(route_hashes)
         )
     reason = _first_event_string(event, {"reason", "exception_reason", "waiver_reason"})
+    server_gate_shape = _observer_direct_server_gate_shape(event)
+    has_reason = bool(reason) or bool(server_gate_shape.get("accepted"))
     has_dirty_scope = _has_dirty_scope_evidence(event)
     operator_approval_shape = _operator_approval_shape(event)
     has_operator_approval = bool(operator_approval_shape.get("accepted"))
@@ -8404,7 +8483,7 @@ def _observer_direct_exception_event(
         missing_fields.append("route_id_or_route_context_hash")
     elif not route_matches:
         missing_fields.append("matching_route_id_or_route_context_hash")
-    if not reason:
+    if not has_reason:
         missing_fields.append("reason")
     if not has_dirty_scope:
         missing_fields.append("dirty_scope_or_dirty_scope_check")
@@ -8420,13 +8499,19 @@ def _observer_direct_exception_event(
             field
             for field, present in (
                 ("route_id_or_route_context_hash", has_route and route_matches),
-                ("reason", bool(reason)),
+                ("reason", has_reason),
                 ("dirty_scope_or_dirty_scope_check", has_dirty_scope),
                 ("operator_approval.close_satisfying_shape", has_operator_approval),
             )
             if present
         ],
         "operator_approval_shape": operator_approval_shape,
+        "reason_source": (
+            "explicit_reason"
+            if reason
+            else str(server_gate_shape.get("reason_source") or "")
+        ),
+        "server_gate_shape": server_gate_shape,
     }
 
 

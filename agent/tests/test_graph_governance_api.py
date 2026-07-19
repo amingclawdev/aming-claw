@@ -42094,6 +42094,24 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert direct_exception_interface["event_kind"] == (
         "observer_direct_implementation_exception"
     )
+    canonical_direct_event = direct_exception_interface["canonical_timeline_event"]
+    assert canonical_direct_event["top_level"] == {
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+    }
+    assert canonical_direct_event["payload_fields"] == [
+        "reason",
+        "observer_direct_mutation=true",
+        "tiny_deterministic_scope=true",
+    ]
+    assert "operator_approval.approved=true" in canonical_direct_event[
+        "verification_fields"
+    ]
+    assert "graph_trace_ids" in canonical_direct_event["artifact_ref_fields"]
+    assert direct_main["canonical_timeline_event"] == canonical_direct_event
     assert route_guide["backlog_chain_binding"]["create_successor"][
         "direct_fix"
     ]["guide"]["completion_sequence"][-1] == (
