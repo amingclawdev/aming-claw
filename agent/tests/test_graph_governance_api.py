@@ -3354,6 +3354,68 @@ def test_current_full_reconcile_accepts_route_bound_onboard_direct_main_without_
     )
 
 
+def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authority(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-custom-ref-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-CUSTOM-RUN-REF"
+    route_token_ref = "rtok-current-full-custom-run-ref"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-custom-run-ref",
+        route_token_ref=route_token_ref,
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": True,
+                "semantic_enrich": False,
+                "run_id": "postmerge-direct-main-custom-ref-r1",
+                "ref_name": "postmerge-direct-main-custom-ref-r1",
+                "branch_ref": "main",
+                "expected_old_snapshot_id": old_snapshot_id,
+                "backlog_id": backlog_id,
+                "task_id": execution_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["activated"] is True
+    assert result["active_snapshot_id"] == "full-current"
+    assert result["activation"]["previous_snapshot_id"] == old_snapshot_id
+    assert result["current_full_target_identity"] == {
+        "schema_version": "graph_current_full_reconcile.target_identity.v1",
+        "authority_source": "graph_status.active_snapshot_id",
+        "ref_name": "active",
+        "branch_ref": "",
+        "requested_ref_name": "postmerge-direct-main-custom-ref-r1",
+        "requested_branch_ref": "main",
+        "canonicalized": True,
+    }
+    assert calls[0]["ref_name"] == "active"
+    assert calls[0]["branch_ref"] == ""
+    assert store.graph_governance_status(conn, PID)["active_snapshot_id"] == (
+        "full-current"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_snapshot_refs "
+        "WHERE project_id = ? AND ref_name = ?",
+        (PID, "postmerge-direct-main-custom-ref-r1"),
+    ).fetchone()[0] == 0
+
+
 def test_current_full_reconcile_explicit_candidate_resumes_across_run_ids(
     conn,
     monkeypatch,
@@ -3467,30 +3529,47 @@ def test_current_full_reconcile_explicit_candidate_preserves_stale_cas_refusal(
     newer_snapshot_id = "full-current-explicit-cas-newer"
     _activate_basic_graph(conn, newer_snapshot_id, commit_sha="c" * 40)
 
+    activation_body = {
+        "target_commit_sha": head,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": "current-full-explicit-cas-activate",
+        "snapshot_id": candidate["candidate_snapshot_id"],
+        "expected_old_snapshot_id": old_snapshot_id,
+        "ref_name": "postmerge-direct-main-cas-retry",
+        "branch_ref": "main",
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
     with pytest.raises(store.GraphSnapshotConflictError):
         server.handle_graph_governance_current_full_reconcile(
-            _ctx(
-                {"project_id": PID},
-                method="POST",
-                body={
-                    "target_commit_sha": head,
-                    "activate": True,
-                    "semantic_enrich": False,
-                    "run_id": "current-full-explicit-cas-activate",
-                    "snapshot_id": candidate["candidate_snapshot_id"],
-                    "expected_old_snapshot_id": old_snapshot_id,
-                    "backlog_id": backlog_id,
-                    "task_id": execution_id,
-                    "observer_session_id": observer_session_id,
-                    "observer_route_token_ref": route_token_ref,
-                },
-            )
+            _ctx({"project_id": PID}, method="POST", body=activation_body)
         )
+
+    retry_status, retry = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                key: value
+                for key, value in activation_body.items()
+                if key != "expected_old_snapshot_id"
+            },
+        )
+    )
 
     assert candidate_status == 201
     assert len(calls) == 1
+    assert retry_status == 200
+    assert retry["activated"] is True
+    assert retry["resumed_candidate"] is True
+    assert retry["rebuild_skipped"] is True
+    assert retry["activation"]["previous_snapshot_id"] == newer_snapshot_id
+    assert retry["current_full_target_identity"]["ref_name"] == "active"
     assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == (
-        newer_snapshot_id
+        candidate["candidate_snapshot_id"]
     )
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_snapshots "

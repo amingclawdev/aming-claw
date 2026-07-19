@@ -36867,6 +36867,18 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
             }
         activate_requested = bool(body.get("activate", True))
+        requested_identity = store.normalize_pending_scope_identity(
+            ref_name=str(body.get("ref_name") or ""),
+            branch_ref=str(body.get("branch_ref") or ""),
+        )
+        # ``current-full`` is the canonical active-graph path surfaced by
+        # graph_status.  A client-supplied run/branch label is trace metadata,
+        # not a second graph-ref authority.  Routing the CAS through that label
+        # makes graph_status report one active snapshot while activation reads
+        # an unrelated (often empty) ref.  Materialize both candidate-only and
+        # activating requests as active-target candidates so an exact candidate
+        # remains resumable after QA or a failed CAS.
+        identity = store.normalize_pending_scope_identity(ref_name="active")
         require_clean = True if not activate_requested else bool(body.get("require_clean", True))
         dirty_paths = filter_dirty_files(_git_dirty_paths(root)) if require_clean else []
         if dirty_paths:
@@ -37028,8 +37040,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     created_by=str(body.get("actor") or "dashboard_user"),
                     activate=False,
                     expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-                    ref_name=str(body.get("ref_name") or "active"),
-                    branch_ref=str(body.get("branch_ref") or ""),
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
                     notes_extra=notes_extra,
                     semantic_enrich=bool(body.get("semantic_enrich", True)),
                     semantic_use_ai=semantic_use_ai,
@@ -37116,10 +37128,18 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         result["fallback_required"] = False
         result["operator_next_action"] = ""
         result["elapsed_ms"] = int(result.get("elapsed_ms") or elapsed_ms)
-        identity = store.normalize_pending_scope_identity(
-            ref_name=str(body.get("ref_name") or "active"),
-            branch_ref=str(body.get("branch_ref") or ""),
-        )
+        result["current_full_target_identity"] = {
+            "schema_version": "graph_current_full_reconcile.target_identity.v1",
+            "authority_source": "graph_status.active_snapshot_id",
+            "ref_name": identity["ref_name"],
+            "branch_ref": identity["branch_ref"],
+            "requested_ref_name": str(body.get("ref_name") or ""),
+            "requested_branch_ref": str(body.get("branch_ref") or ""),
+            "canonicalized": bool(
+                requested_identity["ref_name"] != identity["ref_name"]
+                or requested_identity["branch_ref"] != identity["branch_ref"]
+            ),
+        }
         graph_epoch_snapshot_id = _current_full_reconcile_snapshot_id(result)
         if not graph_epoch_snapshot_id:
             raise GovernanceError(
