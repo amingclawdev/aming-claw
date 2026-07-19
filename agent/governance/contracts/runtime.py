@@ -1953,6 +1953,10 @@ def _attach_failed_qa_rework_guidance(
         "failed_qa_status": str(failed_line.get("status") or ""),
         "next_required_line_id": str(next_action.get("line_id") or ""),
         "next_required_owner_role": str(next_action.get("owner_role") or ""),
+        "expected_diff_base_source": "runtime_context.base_commit",
+        "changed_files_semantics": "cumulative_runtime_diff",
+        "required_submission": "changed_files=cumulative_runtime_diff",
+        "delta_rework_changed_files_allowed": False,
         "reason": (
             "Independent QA recorded a failing verdict; merge/materialize stay "
             "blocked until a worker revision and a later passing independent QA line."
