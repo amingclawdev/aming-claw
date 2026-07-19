@@ -37446,6 +37446,19 @@ def _current_full_reconcile_audited_no_pass_authority(
             merge_queue_id,
             queue_item_id,
         )
+        recovery_marker_valid = True
+        if recovery_live_merge:
+            from .parallel_branch_runtime import (
+                AUDITED_POSTMERGE_RECOVERY_MODE,
+            )
+
+            recovery_marker_valid = bool(
+                queue_item is not None
+                and str(queue_item.recovery_mode or "").strip()
+                == AUDITED_POSTMERGE_RECOVERY_MODE
+                and str(queue_item.recovery_authority_hash or "").strip()
+                == recovery_authority_hash
+            )
         if queue_item is None or not all(
             (
                 str(queue_item.backlog_id or "").strip() == backlog_id,
@@ -37457,6 +37470,7 @@ def _current_full_reconcile_audited_no_pass_authority(
                 == target_commit,
                 str(queue_item.target_head_after_merge or "").strip().lower()
                 == target_commit,
+                recovery_marker_valid,
             )
         ):
             continue
@@ -37605,6 +37619,9 @@ def _current_full_reconcile_audited_no_pass_authority(
                 "diagnostic_backlog_id": diagnostic_id,
                 "qa_contract_runtime_verified": False,
                 "ordinary_close_authority": False,
+                "durable_recovery_marker_verified": bool(
+                    recovery_live_merge and recovery_marker_valid
+                ),
                 "business_qa_bypassed": False,
                 "system_gate_bypass_only": True,
                 "authoritative_pass_synthesized": False,
@@ -37706,6 +37723,25 @@ def _current_full_reconcile_contract_merge_authority(
             if dispatched:
                 break
         if not dispatched:
+            # A server-validated post-merge recovery can bind a newer exact
+            # runtime child than the historical ContractRuntime dispatch line.
+            # Its no-PASS authority independently revalidates the execution
+            # parent, runtime, queue, QA receipt, route, diagnostic, chronology,
+            # and target commit, so do not discard it at the ordinary dispatch
+            # projection gate.
+            audited_exception = (
+                _current_full_reconcile_audited_no_pass_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    context=context,
+                    target_commit_sha=target_commit,
+                )
+            )
+            if audited_exception and audited_exception.get(
+                "durable_recovery_marker_verified"
+            ) is True:
+                candidates.append(audited_exception)
             continue
 
         authority = _contract_runtime_trusted_merge_projection(

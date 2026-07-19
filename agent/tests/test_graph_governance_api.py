@@ -57649,6 +57649,8 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     contract_execution_id = "cex-audited-no-pass-reconcile"
     task_id = "worker-audited-no-pass-reconcile"
     runtime_context_id = "mfrctx-audited-no-pass-reconcile"
+    historical_task_id = "worker-audited-no-pass-original"
+    historical_runtime_context_id = "mfrctx-audited-no-pass-original"
     merge_queue_id = "mq-audited-no-pass-reconcile"
     queue_item_id = "mqitem-audited-no-pass-reconcile"
     baseline_snapshot_id = "full-audited-no-pass-baseline"
@@ -57721,6 +57723,15 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
                 }
             ],
         }
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-audited-no-pass-recovery-runtime",
+        contract_version="mf_parallel.v2",
+        payload={"recovery_runtime_child": True},
+        actor="observer",
+        now_iso="2026-07-16T23:27:41Z",
     )
     _activate_basic_graph(
         conn,
@@ -58038,6 +58049,33 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
             merge_event["id"],
         ),
     )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET recovery_mode = ?, recovery_authority_hash = ?
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (
+            "audited_postmerge_no_pass",
+            recovery_authority["authority_hash"],
+            project_id,
+            merge_queue_id,
+            queue_item_id,
+        ),
+    )
+    historical_record = json.loads(json.dumps(record))
+    historical_dispatch = historical_record["completed_lines"][0]
+    historical_dispatch["runtime_context_id"] = historical_runtime_context_id
+    historical_dispatch["task_id"] = historical_task_id
+    historical_dispatch["payload"][
+        "runtime_context_id"
+    ] = historical_runtime_context_id
+    historical_dispatch["payload"]["worker_task_id"] = historical_task_id
+    server._contract_runtime_store(conn).update(
+        contract_execution_id,
+        historical_record,
+        expected_revision=int(record["execution_state_revision"]),
+    )
     conn.commit()
     recovery_runtime_scope = server._current_full_reconcile_runtime_context_scope(
         conn,
@@ -58058,6 +58096,50 @@ def test_current_full_reconcile_accepts_one_shot_audited_no_pass_exception(
     assert recovery_runtime_scope["contract_merge_authority"][
         "ordinary_close_authority"
     ] is False
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET recovery_authority_hash = ''
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (project_id, merge_queue_id, queue_item_id),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as missing_durable_recovery_marker:
+        server._current_full_reconcile_runtime_context_scope(
+            conn,
+            project_id=project_id,
+            body={"backlog_id": backlog_id, "task_id": task_id},
+            auth={
+                "role_source": "observer_session_route_token_ref",
+                "route_token_scope": {
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+                "route_token_allowed_actions": [
+                    "graph_current_full_reconcile"
+                ],
+            },
+            target_commit_sha=merged_commit,
+        )
+    assert missing_durable_recovery_marker.value.code == (
+        "current_full_reconcile_contract_merge_authority_required"
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+        SET recovery_authority_hash = ?
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (
+            recovery_authority["authority_hash"],
+            project_id,
+            merge_queue_id,
+            queue_item_id,
+        ),
+    )
+    conn.commit()
     forged_recovery_payload = json.loads(json.dumps(recovery_merge_payload))
     forged_recovery_payload["audited_postmerge_recovery_authority"][
         "candidate_commit"
