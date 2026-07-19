@@ -2185,14 +2185,24 @@ def resolve_route_token_ref(
             )
     if task_id:
         stored_task = _string(row_dict.get("task_id"))
-        if stored_task and stored_task != _string(task_id):
+        if not stored_task:
+            raise RouteTokenRefError(
+                "route_token_ref binding cannot be corroborated: task_id "
+                f"{task_id!r} was supplied but the registered entry has no stored task_id"
+            )
+        if stored_task != _string(task_id):
             raise RouteTokenRefError(
                 f"route_token_ref identity mismatch: task_id {task_id!r} does not "
                 f"match registered {stored_task!r}"
             )
     if backlog_id:
         stored_bl = _string(row_dict.get("backlog_id"))
-        if stored_bl and stored_bl != _string(backlog_id):
+        if not stored_bl:
+            raise RouteTokenRefError(
+                "route_token_ref binding cannot be corroborated: backlog_id "
+                f"{backlog_id!r} was supplied but the registered entry has no stored backlog_id"
+            )
+        if stored_bl != _string(backlog_id):
             raise RouteTokenRefError(
                 f"route_token_ref identity mismatch: backlog_id {backlog_id!r} does not "
                 f"match registered {stored_bl!r}"

@@ -3033,6 +3033,10 @@ _OBSERVER_ROUTE_CONTEXT_ACTION_ALIASES = {
     "observer_hotfix_enter": ("hotfix_enter",),
     "parallel_branch_merge_queue_materialize": ("merge_queue",),
     "parallel_branch_merge_queue_apply": ("merge_execute",),
+    # The observer guide historically advertised the generic ``reconcile``
+    # action.  Expand it only to the canonical current-full reconcile action;
+    # do not treat it as a wildcard for other graph mutations.
+    "reconcile": ("graph_current_full_reconcile",),
 }
 
 
@@ -6561,6 +6565,9 @@ def _current_full_route_action_allowed(
     accepted = {
         "graph_current_full_reconcile",
         "graph_governance_reconcile_current_full",
+        # Compatibility for already-issued guide tokens. New tokens issued by
+        # this server also carry graph_current_full_reconcile explicitly.
+        "reconcile",
     }
     return bool(allowed & accepted), sorted(allowed)
 
@@ -6743,6 +6750,7 @@ def _require_current_full_reconcile_auth(ctx: RequestContext, conn, action: str)
             accepted_actions=[
                 "graph_current_full_reconcile",
                 "graph-governance.reconcile.current-full",
+                "reconcile",
             ],
         )
 
@@ -77310,7 +77318,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                             ctx,
                             action="task_timeline_append",
                             backlog_id=ctx.body.get("backlog_id", ""),
-                            task_id="",
+                            task_id=ctx.body.get("task_id", ""),
                         )
         if not route_gate and not contract_runtime_completed_projection_gate and (
             ctx.body.get("route_token_ref") or ctx.body.get("route_token")

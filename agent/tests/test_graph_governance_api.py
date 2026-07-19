@@ -3311,6 +3311,92 @@ def test_current_full_reconcile_accepts_observer_route_token_proof(
     assert calls[0]["activate"] is False
 
 
+def test_current_full_reconcile_accepts_legacy_reconcile_action_only(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-LEGACY-RECONCILE-ACTION"
+    task_id = "cex-current-full-legacy-reconcile-action"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-legacy-reconcile-action",
+    )
+    route_token_ref = "rtok-current-full-legacy-reconcile-action"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["reconcile"],
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "semantic_enrich": False,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["candidate_only"] is True
+    assert calls[0]["activate"] is False
+
+
+def test_current_full_reconcile_rejects_unrelated_action_before_build(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-UNRELATED-ACTION"
+    task_id = "cex-current-full-unrelated-action"
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-current-full-unrelated-action",
+    )
+    route_token_ref = "rtok-current-full-unrelated-action"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["backlog_close"],
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            )
+        )
+
+    assert exc.value.code == "observer_route_token_proof_required"
+    assert exc.value.details["proof_error"] == "route_token_ref_action_not_allowed"
+    assert calls == []
+    assert store.get_graph_snapshot(conn, PID, "full-current") is None
+
+
 def test_current_full_candidate_cannot_waive_clean_worktree(
     conn,
     monkeypatch,
@@ -54392,6 +54478,71 @@ def test_observer_route_context_issue_allowed_actions_expands_hotfix_facade_alia
     )
 
     assert allowed == ["observer_hotfix_enter", "hotfix_enter"]
+
+
+def test_observer_route_context_issue_expands_reconcile_to_current_full_only():
+    allowed = server._observer_route_context_issue_allowed_actions(
+        ["reconcile"]
+    )
+
+    assert allowed == ["reconcile", "graph_current_full_reconcile"]
+
+
+@pytest.mark.parametrize("empty_dimension", ["backlog_id", "task_id"])
+def test_task_timeline_ref_rejects_empty_persisted_scope_dimension(
+    conn,
+    empty_dimension,
+):
+    backlog_id = f"AC-REF-EMPTY-{empty_dimension.upper()}"
+    task_id = f"task-ref-empty-{empty_dimension}"
+    route_token_ref = f"rtok-ref-empty-{empty_dimension}"
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_id=f"route-ref-empty-{empty_dimension}",
+        route_context_hash=_fake_sha(f"context-ref-empty-{empty_dimension}"),
+        prompt_contract_id=f"prompt-ref-empty-{empty_dimension}",
+        prompt_contract_hash=_fake_sha(f"prompt-ref-empty-{empty_dimension}"),
+        visible_injection_manifest_hash=_fake_sha(
+            f"manifest-ref-empty-{empty_dimension}"
+        ),
+        route_token_ref=route_token_ref,
+    )
+    conn.execute(
+        f"UPDATE observer_route_token_refs SET {empty_dimension} = '' "
+        "WHERE project_id = ? AND route_token_ref = ?",
+        (PID, route_token_ref),
+    )
+    conn.commit()
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": "observer.scope_binding_probe",
+                    "event_kind": "verification",
+                    "phase": "preflight",
+                    "status": "accepted",
+                    "actor": "observer",
+                    "route_token_ref": route_token_ref,
+                    "payload": {"summary": "must fail before append"},
+                },
+            )
+        )
+
+    assert exc.value.code == "route_token_required"
+    assert "cannot be corroborated" in str(exc.value)
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) == []
 
 
 def _insert_mf_parallel_source_backed_runtime_context(
