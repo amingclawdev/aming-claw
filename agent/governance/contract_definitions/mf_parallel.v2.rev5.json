@@ -24,7 +24,11 @@
             "mf_sub workers own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence in their assigned worktree/fence.",
       "QA owns QA graph context and independent verification evidence; observer must not write or reconstruct QA evidence.",
       "Prefer explicit parallel child contracts with owned_files fences before dispatching workers.",
+      "Before implementation, compare active persisted owned_files with worker-authored files. If authored scope is wider, stop and use one explicit parallel_branch_allocate authority revision with complete owned_files, base_commit, and target_head_commit. Inherited target-head files are not worker-authored files and must not be added to changed_files.",
+      "Before QA, when the clean candidate is the canonical HEAD but the active graph is stale, materialize an exact candidate snapshot with graph_current_full_reconcile activate=false using a worker-runtime-task-scoped route. Give that exact snapshot id to the same QA session; a child CEX route is not a substitute for the worker task route.",
+      "Merge materialize uses durable status merge_ready. If live apply proves the candidate is already contained, the server still emits the canonical observer merge timeline event with git_mutation_executed=false; callers must never reconstruct that event manually.",
       "For observer_reconcile, first run graph_current_full_reconcile with a reconcile-only route whose canonical task_id comes from the dispatched runtime_context.task_id; then submit the ContractRuntime observer_reconcile line with the child contract execution route. These route scopes are not interchangeable.",
+      "Post-merge graph_current_full_reconcile activate=true requires durable merge authority and a distinct activation snapshot id (or no caller-supplied snapshot id). Never reuse the pre-QA candidate snapshot id with create semantics, and never treat an observer_merge bypass as activation authority.",
       "Copy only observer_session_id, route_token_ref, backlog_id, contract_execution_id, runtime_context_id, task_id, and target_project_root between the observer guide and current-full reconcile. Never copy a raw route token, and accept reconcile evidence only from the live authoritative snapshot returned by graph_snapshot_store.current_full_reconcile_state."
     ],
     "refs": []
@@ -33,10 +37,10 @@
     "backlog_id": "AC-SYSTEM-CONTRACT-RUNTIME-RECONCILE-LEGACY-QA-TIMELINE-POLICY-CONFLICT-R1-20260717",
     "legacy_template_id": "mf_parallel.v1",
     "previous_revision": "mf_parallel.v2.rev4",
-    "revision_reason": "Accept exactly one server-verified QA authority source during current-full reconcile: a legacy QA timeline event or canonical ContractRuntime QA acceptance.",
+    "revision_reason": "Preserve server-verified QA authority and add copy-safe scope/target revision, candidate-only pre-QA graph, no-op merge event, and distinct post-merge activation guidance found during live replay.",
     "runtime_dogfood": true,
     "updated_by_contract": "mf_parallel.v2",
-    "updated_by_contract_execution": "reconcile-qa-authority-policy-r8-20260718"
+    "updated_by_contract_execution": "cex-mf-parallel-9aafe3ece1f3b07678be"
   },
   "revision": "rev5",
   "role": "observer",

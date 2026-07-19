@@ -5917,6 +5917,19 @@ def build_runtime_context_current_view(
     current_values["close_precheck"] = public_contract_revision_payload(
         revision_payload.get("close_precheck")
     )
+    authority_revision = public_contract_revision_payload(
+        revision_payload.get("authority_revision")
+    )
+    current_values["authority_revision"] = authority_revision
+    current_values["active_persisted_owned_files"] = list(
+        authority_revision.get("active_owned_files") or owned_file_values
+    )
+    current_values["worker_authored_files"] = list(
+        authority_revision.get("worker_authored_files") or []
+    )
+    current_values["inherited_target_head_files"] = list(
+        authority_revision.get("inherited_target_head_files") or []
+    )
     contract_failed_qa_revision = public_contract_revision_payload(
         contract_runtime_failed_qa_revision or {}
     )
@@ -5988,6 +6001,14 @@ def build_runtime_context_current_view(
         "work": {
             "target_files": target_file_values,
             "owned_files": owned_file_values,
+            "active_persisted_owned_files": current_values[
+                "active_persisted_owned_files"
+            ],
+            "worker_authored_files": current_values["worker_authored_files"],
+            "inherited_target_head_files": current_values[
+                "inherited_target_head_files"
+            ],
+            "authority_revision": authority_revision,
             "acceptance_criteria": acceptance_values,
             "required_evidence": required_evidence_values,
         },
@@ -9806,6 +9827,9 @@ def build_runtime_context_worker_view(
         }
         | {"raw_private_context_exposed": False},
         "work": dict(_runtime_context_mapping(current_view.get("work"))),
+        "authority_revision": dict(
+            _runtime_context_mapping(values.get("authority_revision"))
+        ),
         "graph_query_identity": values.get("graph_query_identity", {}),
         "session_token_lease": dict(
             _runtime_context_mapping(values.get("session_token_lease"))
@@ -10735,6 +10759,15 @@ def append_branch_contract_revision(
         context.project_id,
         runtime_context_id,
     )
+    current_authority_revision = public_contract_revision_payload(
+        public_payload.get("authority_revision")
+    )
+    if not current_authority_revision and previous_revision is not None:
+        inherited_authority_revision = public_contract_revision_payload(
+            previous_revision.payload.get("authority_revision")
+        )
+        if inherited_authority_revision:
+            public_payload["authority_revision"] = inherited_authority_revision
     previous_revision_hash = _previous_revision_hash(previous_revision)
     read_receipt_hash = (
         _first_public_string(public_payload, "read_receipt_hash", "worker_read_receipt_hash")

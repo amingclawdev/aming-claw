@@ -955,3 +955,19 @@ def test_runtime_guide_and_write_gate_reject_wrong_role_or_stale_hash(tmp_path):
     )
     assert decision.ok is False
     assert "cannot write line" in decision.errors[0]
+
+
+def test_mf_parallel_rev5_instructions_cover_replay_friction() -> None:
+    definition = ContractDefinitionRegistry().get(
+        "mf_parallel.v2",
+        revision="rev5",
+    )
+    instructions = "\n".join(
+        definition["instruction_layer"]["inline"]
+    )
+
+    assert "active persisted owned_files" in instructions
+    assert "activate=false" in instructions
+    assert "durable status merge_ready" in instructions
+    assert "git_mutation_executed=false" in instructions
+    assert "distinct activation snapshot id" in instructions

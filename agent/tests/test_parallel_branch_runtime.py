@@ -1923,6 +1923,101 @@ def test_runtime_context_worker_guide_carries_branch_runtime_owned_files() -> No
     assert read_action["worker_constraints"]["scope"]["owned_files"] == list(owned_files)
 
 
+def test_runtime_context_views_project_scope_target_authority_sets() -> None:
+    context = _contract_revision_test_context("T-authority-revision-view")
+    authority_revision = {
+        "schema_version": "runtime_context.scope_target_authority_revision.v1",
+        "active_owned_files": ["worker.py"],
+        "worker_authored_files": ["worker.py"],
+        "inherited_target_head_files": ["inherited.py"],
+        "old_base_commit": "a" * 40,
+        "new_base_commit": "b" * 40,
+    }
+    current = build_runtime_context_current_view(
+        context,
+        contract_revision={
+            "payload": {
+                "owned_files": ["worker.py"],
+                "target_files": ["worker.py"],
+                "authority_revision": authority_revision,
+            }
+        },
+    )
+    worker = build_runtime_context_worker_view(current)
+
+    assert current["work"]["active_persisted_owned_files"] == ["worker.py"]
+    assert current["work"]["worker_authored_files"] == ["worker.py"]
+    assert current["work"]["inherited_target_head_files"] == ["inherited.py"]
+    assert worker["authority_revision"]["new_base_commit"] == "b" * 40
+    assert worker["work"]["inherited_target_head_files"] == ["inherited.py"]
+
+
+def test_ordinary_contract_revision_retains_scope_target_authority_sets() -> None:
+    conn = _runtime_conn()
+    context = _contract_revision_test_context("T-authority-revision-renewal")
+    route_identity = {
+        "route_id": "route-authority-renewal",
+        "route_context_hash": "sha256:route-authority-renewal",
+        "prompt_contract_id": "rprompt-authority-renewal",
+        "prompt_contract_hash": "sha256:prompt-authority-renewal",
+        "route_token_ref": "rtok-authority-renewal",
+    }
+    authority_revision = {
+        "schema_version": "runtime_context.scope_target_authority_revision.v1",
+        "active_owned_files": ["worker.py"],
+        "worker_authored_files": ["worker.py"],
+        "inherited_target_head_files": ["inherited.py"],
+        "old_base_commit": "a" * 40,
+        "new_base_commit": "b" * 40,
+    }
+    explicit = append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "owned_files": ["worker.py"],
+            "target_files": ["worker.py"],
+            "authority_revision": authority_revision,
+        },
+        route_identity=route_identity,
+        now_iso=NOW,
+    )
+
+    renewal = append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "owned_files": ["worker.py"],
+            "target_files": ["worker.py"],
+            "source": "ordinary_same_scope_allocation_renewal",
+        },
+        route_identity=route_identity,
+        now_iso="2026-05-16T12:01:00Z",
+    )
+
+    assert renewal.payload["authority_revision"] == explicit.payload[
+        "authority_revision"
+    ]
+    latest = get_latest_branch_contract_revision(
+        conn,
+        PROJECT_ID,
+        branch_runtime_context_id(PROJECT_ID, context.task_id),
+    )
+    assert latest is not None
+    assert latest.revision_id == renewal.revision_id
+    projection = build_runtime_context_projection(
+        context,
+        contract_revision=latest,
+        generated_at="2026-05-16T12:01:00Z",
+    ).to_dict()
+    current = projection["views"]["current"]
+    worker = projection["views"]["worker_view"]
+    assert current["work"]["active_persisted_owned_files"] == ["worker.py"]
+    assert current["work"]["worker_authored_files"] == ["worker.py"]
+    assert current["work"]["inherited_target_head_files"] == ["inherited.py"]
+    assert worker["authority_revision"] == authority_revision
+    assert worker["work"]["worker_authored_files"] == ["worker.py"]
+
+
 def test_branch_runtime_persists_owned_files_for_later_worker_guide() -> None:
     conn = _runtime_conn()
     context = _runtime_projection_context(

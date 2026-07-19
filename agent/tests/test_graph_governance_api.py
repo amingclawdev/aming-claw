@@ -456,6 +456,184 @@ def test_worker_commit_revision_diff_uses_runtime_base_across_rework_commits(
     }
 
 
+def test_materialized_authority_revision_separates_inherited_and_authored_files(
+    conn,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="materialized-authority-revision",
+    )
+    project_root = fixture.root
+    worktree = tmp_path / "materialized-authority-worker"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "codex/materialized-authority-worker",
+            str(worktree),
+            fixture.main_head,
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    (project_root / "inherited.py").write_text(
+        "inherited target change\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "inherited.py"], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance target"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_head = batch_jobs.git_commit(project_root)
+    subprocess.run(
+        ["git", "merge", "--ff-only", target_head],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (worktree / "worker.py").write_text(
+        "worker authored change\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "worker.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "worker change"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    worker_head = batch_jobs.git_commit(worktree)
+
+    existing = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="materialized-authority-worker",
+        runtime_context_id="mfrctx-materialized-authority-worker",
+        backlog_id="AC-MATERIALIZED-AUTHORITY-REVISION",
+        target_project_root=str(project_root),
+        target_files=("worker.py",),
+        owned_files=("worker.py",),
+        ref_name="main",
+        branch_ref="refs/heads/codex/materialized-authority-worker",
+        worktree_path=str(worktree),
+        base_commit=fixture.main_head,
+        head_commit=fixture.main_head,
+        target_head_commit=fixture.main_head,
+        status=STATE_WORKTREE_READY,
+    )
+    planned = replace(
+        existing,
+        base_commit=target_head,
+        head_commit=worker_head,
+        target_head_commit=target_head,
+    )
+
+    revised, authority = (
+        server._parallel_branch_allocate_materialized_authority_revision(
+            conn,
+            project_id=PID,
+            existing=existing,
+            planned=planned,
+            body={
+                "owned_files": ["worker.py"],
+                "base_commit": target_head,
+                "target_head_commit": target_head,
+            },
+            workspace_root=str(project_root),
+        )
+    )
+
+    assert revised.base_commit == target_head
+    assert revised.target_head_commit == target_head
+    assert revised.head_commit == worker_head
+    assert authority["active_owned_files"] == ["worker.py"]
+    assert authority["inherited_target_head_files"] == ["inherited.py"]
+    assert authority["worker_authored_files"] == ["worker.py"]
+
+
+def test_materialized_scope_revision_blocks_silent_expansion_after_implementation(
+    conn,
+):
+    runtime_context_id = "mfrctx-scope-revision-after-implementation"
+    task_id = "scope-revision-after-implementation"
+    existing = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id,
+        runtime_context_id=runtime_context_id,
+        backlog_id="AC-SCOPE-REVISION-AFTER-IMPLEMENTATION",
+        target_project_root="/repo",
+        target_files=("worker.py",),
+        owned_files=("worker.py",),
+        ref_name="main",
+        branch_ref="refs/heads/codex/scope-revision-after-implementation",
+        worktree_path="/repo/.worktrees/worker",
+        base_commit="a" * 40,
+        head_commit="a" * 40,
+        target_head_commit="a" * 40,
+        status=STATE_WORKTREE_READY,
+    )
+    planned = replace(
+        existing,
+        target_files=("worker.py", "backlog-test.py"),
+        owned_files=("worker.py", "backlog-test.py"),
+    )
+
+    with pytest.raises(GovernanceError) as incomplete_exc:
+        server._parallel_branch_allocate_materialized_authority_revision(
+            conn,
+            project_id=PID,
+            existing=existing,
+            planned=planned,
+            body={
+                "owned_files": ["worker.py"],
+                "base_commit": "a" * 40,
+                "target_head_commit": "a" * 40,
+            },
+            workspace_root="/repo",
+        )
+    assert incomplete_exc.value.code == "runtime_context_authority_revision_required"
+
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=existing.backlog_id,
+        task_id=task_id,
+        event_type="mf_subagent.implementation",
+        event_kind="implementation",
+        phase="implementation",
+        actor="mf_sub",
+        status="accepted",
+        payload={"runtime_context_id": runtime_context_id},
+    )
+    with pytest.raises(GovernanceError) as late_exc:
+        server._parallel_branch_allocate_materialized_authority_revision(
+            conn,
+            project_id=PID,
+            existing=existing,
+            planned=planned,
+            body={
+                "owned_files": ["worker.py", "backlog-test.py"],
+                "base_commit": "a" * 40,
+                "target_head_commit": "a" * 40,
+            },
+            workspace_root="/repo",
+        )
+    assert late_exc.value.code == (
+        "runtime_context_scope_revision_after_implementation"
+    )
+
+
 def test_worker_commit_startup_principal_ignores_contract_guide_placeholder():
     worker_session_id = "worker-session-from-startup-gate"
     startup_event = {
@@ -57086,6 +57264,100 @@ def test_live_merge_recorder_uses_child_task_scope_and_retains_parent_lineage(co
     ) == {}
 
 
+def test_live_merge_recorder_emits_authority_for_already_integrated_candidate(conn):
+    backlog_id = "AC-LIVE-MERGE-ALREADY-INTEGRATED"
+    child_task_id = "worker-live-merge-already-integrated"
+    runtime_context_id = "mfrctx-live-merge-already-integrated"
+    merge_commit = "d" * 40
+
+    recorded = server._record_parallel_branch_merge_contract_timeline_events(
+        conn,
+        project_id=PID,
+        body={
+            "backlog_id": backlog_id,
+            "task_id": child_task_id,
+            "contract_actor": "codex-observer",
+        },
+        result={
+            "ok": True,
+            "executed": False,
+            "dry_run": False,
+            "already_integrated": True,
+            "target_ref_mutated": False,
+            "merge_commit": merge_commit,
+            "preview": {
+                "status": "pass",
+                "target_commit": merge_commit,
+                "branch_commit": merge_commit,
+            },
+            "gate_plan": {"merge_gate_passed": True},
+            "recorded": {
+                "context": {
+                    "task_id": child_task_id,
+                    "root_task_id": "cex-live-merge-already-integrated",
+                    "backlog_id": backlog_id,
+                    "runtime_context_id": runtime_context_id,
+                    "merge_queue_id": "mq-live-merge-already-integrated",
+                },
+                "queue_item": {
+                    "task_id": child_task_id,
+                    "queue_item_id": "mqi-live-merge-already-integrated",
+                    "merge_queue_id": "mq-live-merge-already-integrated",
+                    "status": "merged",
+                    "target_head_before_merge": merge_commit,
+                    "target_head_after_merge": merge_commit,
+                },
+            },
+        },
+    )
+
+    assert [event["event_kind"] for event in recorded] == [
+        "merge_preview",
+        "live_merge",
+    ]
+    for event in recorded:
+        assert event["payload"]["git_mutation_executed"] is False
+        assert event["payload"]["already_integrated"] is True
+        assert event["payload"]["target_ref_mutated"] is False
+    live_merge = recorded[-1]
+    assert live_merge["status"] == "passed"
+    assert live_merge["commit_sha"] == merge_commit
+    evidence = live_merge["payload"]["contract_evidence"][0]
+    assert evidence["git_mutation_executed"] is False
+    assert evidence["already_integrated"] is True
+    assert server._record_parallel_branch_merge_contract_timeline_events(
+        conn,
+        project_id=PID,
+        body={
+            "backlog_id": backlog_id,
+            "task_id": child_task_id,
+            "contract_actor": "codex-observer",
+        },
+        result={
+            "ok": True,
+            "executed": False,
+            "dry_run": False,
+            "already_integrated": True,
+            "merge_commit": merge_commit,
+            "recorded": {
+                "context": {
+                    "task_id": child_task_id,
+                    "backlog_id": backlog_id,
+                    "runtime_context_id": runtime_context_id,
+                    "merge_queue_id": "mq-live-merge-already-integrated",
+                },
+                "queue_item": {
+                    "task_id": child_task_id,
+                    "queue_item_id": "mqi-live-merge-already-integrated",
+                    "merge_queue_id": "mq-live-merge-already-integrated",
+                    "status": "merged",
+                    "target_head_after_merge": merge_commit,
+                },
+            },
+        },
+    ) == []
+
+
 def test_live_merge_batch_root_wrapper_projects_exact_child_task():
     batch_task_id = "mf-batch-live-merge-root"
     child_contract_id = "cex-live-merge-child-contract"
@@ -58075,6 +58347,71 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         is True
     )
     assert later_authority["active_snapshot_matches_canonical_head"] is True
+
+
+def test_dispatch_identity_mismatch_counts_completed_expected_context_lines(
+    conn,
+    monkeypatch,
+):
+    expected_runtime_context_id = "mfrctx-expected-completed"
+    expected_task_id = "expected-completed-worker"
+    replacement = SimpleNamespace(
+        runtime_context_id="mfrctx-unrelated-history",
+        task_id="unrelated-history-worker",
+        parent_task_id="cex-dispatch-counts-completed",
+        root_task_id="cex-dispatch-counts-completed",
+        backlog_id="AC-DISPATCH-COUNTS-COMPLETED",
+    )
+    monkeypatch.setattr(
+        "agent.governance.parallel_branch_runtime.list_branch_contexts",
+        lambda _conn, _project_id: [replacement],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_projection_for_context",
+        lambda *args, **kwargs: {
+            "projected_lines": [
+                {
+                    "line_id": "worker_read_runtime_guide",
+                    "actor_role": "mf_sub",
+                    "runtime_context_id": replacement.runtime_context_id,
+                    "task_id": replacement.task_id,
+                }
+            ],
+            "projected_line_refs": [],
+            "source_refs": ["timeline:unrelated-history"],
+        },
+    )
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": "cex-dispatch-counts-completed",
+        "backlog_id": "AC-DISPATCH-COUNTS-COMPLETED",
+        "completed_lines": [
+            {
+                "line_id": "worker_read_runtime_guide",
+                "actor_role": "mf_sub",
+                "runtime_context_id": expected_runtime_context_id,
+                "task_id": expected_task_id,
+            }
+        ],
+    }
+    expected_summaries = [
+        {
+            "runtime_context_id": expected_runtime_context_id,
+            "task_id": expected_task_id,
+            "parent_task_id": "cex-dispatch-counts-completed",
+            "worker_projected_line_count": 0,
+            "worker_projected_line_ids": [],
+        }
+    ]
+
+    assert server._contract_runtime_mf_parallel_dispatch_identity_mismatch(
+        conn,
+        project_id=PID,
+        record=record,
+        expected_context_summaries=expected_summaries,
+        existing_keys=set(),
+    ) == {}
 
 
 def test_contract_runtime_current_blocks_stale_dispatch_runtime_context_mismatch(conn):

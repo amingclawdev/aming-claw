@@ -10533,13 +10533,291 @@ def _parallel_branch_allocate_identity_repair_payload(
     }
 
 
+def _parallel_branch_allocate_materialized_authority_revision(
+    conn,
+    *,
+    project_id: str,
+    existing: Any,
+    planned: Any,
+    body: Mapping[str, Any],
+    workspace_root: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Validate an explicit scope/target refresh for a materialized worker lane.
+
+    Re-running allocation is allowed to renew the same identity, but it must not
+    silently turn backlog expansion or a moved target head into worker commit
+    authority.  A changed materialized scope therefore requires the caller to
+    copy the complete effective fence plus immutable base/target commits.  A
+    moved target is accepted only after it is an ancestor of the clean worker
+    HEAD, so inherited target files can be separated from worker-authored files.
+    """
+
+    from . import batch_jobs
+    from .parallel_branch_runtime import preserve_materialized_context_for_allocation
+
+    existing_owned = sorted(set(getattr(existing, "owned_files", ()) or ()))
+    planned_owned = sorted(set(getattr(planned, "owned_files", ()) or ()))
+    scope_changed = planned_owned != existing_owned
+    requested_base = str(body.get("base_commit") or "").strip()
+    requested_target = str(body.get("target_head_commit") or "").strip()
+    explicit_boundary_changed = bool(
+        (requested_base and requested_base != str(existing.base_commit or ""))
+        or (
+            requested_target
+            and requested_target != str(existing.target_head_commit or "")
+        )
+    )
+    explicit_owned = sorted(
+        set(
+            _runtime_context_service_query_values(body, "owned_files")
+            or _runtime_context_service_query_values(body, "target_files")
+        )
+    )
+    if not scope_changed and (not explicit_boundary_changed or not explicit_owned):
+        return preserve_materialized_context_for_allocation(existing, planned), {}
+
+    if (
+        explicit_owned != planned_owned
+        or not requested_base
+        or not requested_target
+    ):
+        raise GovernanceError(
+            "runtime_context_authority_revision_required",
+            (
+                "materialized runtime scope/target changes require one explicit "
+                "authority revision with the complete effective fence and immutable "
+                "base/target commits"
+            ),
+            422,
+            {
+                "runtime_context_id": str(existing.runtime_context_id or ""),
+                "active_owned_files": existing_owned,
+                "effective_requested_owned_files": planned_owned,
+                "explicit_requested_owned_files": explicit_owned,
+                "required_fields": [
+                    "owned_files",
+                    "base_commit",
+                    "target_head_commit",
+                ],
+                "next_legal_action": "retry_explicit_runtime_authority_revision",
+                "no_implementation_may_begin_before_revision": True,
+            },
+        )
+
+    runtime_context_id = str(existing.runtime_context_id or "").strip()
+    task_id = str(existing.task_id or "").strip()
+    if scope_changed:
+        implementation_events = [
+            event
+            for event in _runtime_context_service_timeline_events(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=str(existing.backlog_id or ""),
+            )
+            if str(event.get("event_kind") or event.get("event_type") or "")
+            .strip()
+            .lower()
+            in {
+                "implementation",
+                "mf_subagent.implementation",
+                "worker_implementation",
+                "mf_subagent.worker_commit",
+                "worker_commit",
+            }
+            and (
+                not _timeline_first_deep_text(event, "runtime_context_id")
+                or _timeline_first_deep_text(event, "runtime_context_id")
+                == runtime_context_id
+            )
+        ]
+        if implementation_events:
+            raise GovernanceError(
+                "runtime_context_scope_revision_after_implementation",
+                (
+                    "the materialized file fence cannot expand after implementation "
+                    "evidence; start a fresh/rework runtime context instead"
+                ),
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "active_owned_files": existing_owned,
+                    "requested_owned_files": planned_owned,
+                    "implementation_event_refs": [
+                        f"timeline:{event.get('id')}"
+                        for event in implementation_events
+                        if event.get("id")
+                    ],
+                    "next_legal_action": "start_fresh_or_rework_runtime_context",
+                },
+            )
+
+    worktree_path = str(existing.worktree_path or "").strip()
+    if not worktree_path:
+        raise GovernanceError(
+            "runtime_context_authority_revision_worktree_required",
+            "materialized authority revision requires the assigned worker worktree",
+            422,
+            {"runtime_context_id": runtime_context_id},
+        )
+    dirty_files = _runtime_context_git_dirty_files(worktree_path)
+    if dirty_files:
+        raise GovernanceError(
+            "runtime_context_authority_revision_dirty_worktree",
+            "materialized authority revision requires a clean worker worktree",
+            422,
+            {"runtime_context_id": runtime_context_id, "dirty_files": dirty_files},
+        )
+
+    canonical_root = str(
+        existing.target_project_root
+        or planned.target_project_root
+        or workspace_root
+    ).strip()
+    target_ref = str(existing.ref_name or planned.ref_name or "main").strip()
+    if not target_ref.startswith("refs/"):
+        target_ref = f"refs/heads/{target_ref}"
+    try:
+        actual_head = batch_jobs.git_commit(worktree_path)
+        canonical_target = batch_jobs.git_commit(canonical_root, ref=target_ref)
+        old_base = batch_jobs.git_commit(worktree_path, ref=str(existing.base_commit))
+        new_base = batch_jobs.git_commit(worktree_path, ref=requested_base)
+        new_target = batch_jobs.git_commit(canonical_root, ref=requested_target)
+    except Exception as exc:
+        raise GovernanceError(
+            "runtime_context_authority_revision_boundary_unresolved",
+            "runtime authority revision could not resolve immutable Git boundaries",
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "requested_base_commit": requested_base,
+                "requested_target_head_commit": requested_target,
+                "target_ref": target_ref,
+            },
+        ) from exc
+
+    if new_target != canonical_target:
+        raise GovernanceError(
+            "runtime_context_target_head_refresh_stale",
+            "target_head_commit must equal the current canonical target ref",
+            409,
+            {
+                "runtime_context_id": runtime_context_id,
+                "requested_target_head_commit": new_target,
+                "canonical_target_head_commit": canonical_target,
+                "target_ref": target_ref,
+                "next_legal_action": "refresh_target_head_and_retry",
+            },
+        )
+    target_moved = canonical_target != str(existing.target_head_commit or "")
+    required_base = canonical_target if target_moved else old_base
+    if new_base != required_base:
+        raise GovernanceError(
+            "runtime_context_target_head_refresh_base_mismatch",
+            (
+                "a moved target head must become the new worker diff base before "
+                "worker-authored files can be validated"
+            ),
+            409,
+            {
+                "runtime_context_id": runtime_context_id,
+                "old_base_commit": old_base,
+                "requested_base_commit": new_base,
+                "required_base_commit": required_base,
+                "canonical_target_head_commit": canonical_target,
+                "target_head_moved": target_moved,
+                "next_legal_action": "rebase_or_fast_forward_then_retry_authority_revision",
+            },
+        )
+    if not _git_commit_is_ancestor(Path(worktree_path), old_base, new_base):
+        raise GovernanceError(
+            "runtime_context_authority_revision_old_base_not_ancestor",
+            "old runtime base must be an ancestor of the refreshed base",
+            409,
+            {"old_base_commit": old_base, "new_base_commit": new_base},
+        )
+    if not _git_commit_is_ancestor(Path(worktree_path), new_base, actual_head):
+        raise GovernanceError(
+            "runtime_context_target_head_rebase_required",
+            "canonical target head must be an ancestor of the clean worker HEAD",
+            409,
+            {
+                "runtime_context_id": runtime_context_id,
+                "canonical_target_head_commit": canonical_target,
+                "worker_head_commit": actual_head,
+                "next_legal_action": "rebase_worker_on_canonical_target",
+            },
+        )
+
+    inherited_target_files = batch_jobs.git_changed_files(
+        worktree_path,
+        base_ref=old_base,
+        head_ref=new_base,
+    )
+    worker_authored_files = batch_jobs.git_changed_files(
+        worktree_path,
+        base_ref=new_base,
+        head_ref=actual_head,
+    )
+    out_of_fence = sorted(set(worker_authored_files) - set(planned_owned))
+    if out_of_fence:
+        raise GovernanceError(
+            "runtime_context_authority_revision_worker_files_out_of_fence",
+            "refreshed worker-authored files exceed the requested active fence",
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "worker_authored_files": worker_authored_files,
+                "active_owned_files": planned_owned,
+                "out_of_fence_files": out_of_fence,
+            },
+        )
+
+    revised = replace(
+        existing,
+        target_files=planned.target_files or existing.target_files,
+        owned_files=planned.owned_files or existing.owned_files,
+        base_commit=new_base,
+        head_commit=actual_head,
+        target_head_commit=canonical_target,
+    )
+    authority_revision = {
+        "schema_version": "runtime_context.scope_target_authority_revision.v1",
+        "source": "parallel_branch_allocate_explicit_authority_revision",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "old_base_commit": old_base,
+        "new_base_commit": new_base,
+        "old_target_head_commit": str(existing.target_head_commit or ""),
+        "new_target_head_commit": canonical_target,
+        "worker_head_commit": actual_head,
+        "target_head_moved": target_moved,
+        "scope_changed": scope_changed,
+        "active_owned_files": planned_owned,
+        "worker_authored_files": sorted(set(worker_authored_files)),
+        "inherited_target_head_files": sorted(set(inherited_target_files)),
+        "validation": {
+            "worktree_clean": True,
+            "old_base_ancestor_of_new_base": True,
+            "new_base_ancestor_of_worker_head": True,
+            "worker_authored_files_inside_active_fence": True,
+        },
+        "raw_token_persisted": False,
+    }
+    return revised, authority_revision
+
+
 def _parallel_branch_allocate_contract_revision_payload(
     body: Mapping[str, Any],
     saved_context: Mapping[str, Any],
     route_identity: Mapping[str, Any],
     owned_files: Sequence[str],
     test_files: Sequence[str] = (),
+    authority_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from .parallel_branch_runtime import public_contract_revision_payload
+
     observer_command_id = str(body.get("observer_command_id") or "").strip()
     contract_execution_id = _runtime_context_public_text(
         body.get("contract_execution_id"),
@@ -10565,7 +10843,7 @@ def _parallel_branch_allocate_contract_revision_payload(
             body.get("chain_id"),
         ),
     }
-    return {
+    payload = {
         "schema_version": "parallel_branch_allocate_contract_revision.v1",
         "source": "parallel_branch_allocate",
         "source_of_truth": "Contract/Revision/Event",
@@ -10616,6 +10894,11 @@ def _parallel_branch_allocate_contract_revision_payload(
         ),
         "raw_launch_text_persisted": False,
     }
+    if authority_revision:
+        payload["authority_revision"] = public_contract_revision_payload(
+            authority_revision
+        )
+    return payload
 
 
 def _parallel_branch_allocate_route_gate(
@@ -11159,6 +11442,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     )
 
     conn = get_connection(project_id)
+    authority_revision: dict[str, Any] = {}
+    runtime_contract_revision: dict[str, Any] = {}
+    route_identity_for_revision: dict[str, Any] = {}
+    owned_files_for_revision: list[str] = []
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
         effective_body = _parallel_branch_allocate_effective_route_body(
@@ -11186,12 +11473,88 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                             planned=context,
                             mismatches=mismatches,
                         )
-                context = preserve_materialized_context_for_allocation(existing, context)
+                if is_materialized_branch_context(existing):
+                    context, authority_revision = (
+                        _parallel_branch_allocate_materialized_authority_revision(
+                            conn,
+                            project_id=project_id,
+                            existing=existing,
+                            planned=context,
+                            body=ctx.body or {},
+                            workspace_root=workspace_root,
+                        )
+                    )
+                else:
+                    context = preserve_materialized_context_for_allocation(
+                        existing,
+                        context,
+                    )
+                if authority_revision:
+                    (
+                        route_identity_for_revision,
+                        owned_files_for_revision,
+                    ) = _parallel_branch_allocate_should_persist_contract_revision(
+                        effective_body,
+                        owned_files=context.owned_files or request_owned_files,
+                    )
+                    if not route_identity_for_revision or not owned_files_for_revision:
+                        raise GovernanceError(
+                            "runtime_context_authority_revision_route_required",
+                            (
+                                "explicit runtime authority revision requires one "
+                                "registered copy-safe allocation route identity"
+                            ),
+                            422,
+                            {
+                                "runtime_context_id": str(
+                                    context.runtime_context_id or ""
+                                ),
+                                "required_route_fields": [
+                                    "route_id",
+                                    "route_context_hash",
+                                    "prompt_contract_id",
+                                    "prompt_contract_hash",
+                                    "route_token_ref",
+                                ],
+                                "raw_route_token_required": False,
+                            },
+                        )
             saved = upsert_branch_context(
                 conn,
                 context,
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
+            if authority_revision:
+                saved_context = branch_context_to_dict(saved)
+                route_gate = _parallel_branch_allocate_route_gate(
+                    effective_body,
+                    route_identity_for_revision,
+                )
+                revision = append_branch_contract_revision(
+                    conn,
+                    saved,
+                    contract_version=str(
+                        ctx.body.get("contract_version") or MF_PARALLEL_CONTRACT_ID
+                    ),
+                    payload=_parallel_branch_allocate_contract_revision_payload(
+                        effective_body,
+                        saved_context,
+                        route_identity_for_revision,
+                        owned_files_for_revision,
+                        test_files=backlog_test_files,
+                        authority_revision=authority_revision,
+                    ),
+                    route_gate=route_gate,
+                    route_identity=route_identity_for_revision,
+                    route_evidence_type=(
+                        "parallel_branch_allocate_authority_revision"
+                    ),
+                    actor="parallel_branch_allocate",
+                    now_iso=str(ctx.body.get("now_iso") or ""),
+                )
+                runtime_contract_revision = branch_contract_revision_to_dict(
+                    revision
+                )
             conn.commit()
 
         worktree_result: dict[str, Any] | None = None
@@ -11233,14 +11596,18 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 )
                 conn.commit()
 
-        runtime_contract_revision: dict[str, Any] = {}
-        route_identity_for_revision, owned_files_for_revision = (
-            _parallel_branch_allocate_should_persist_contract_revision(
-                effective_body,
-                owned_files=saved.owned_files or request_owned_files,
+        if not runtime_contract_revision:
+            route_identity_for_revision, owned_files_for_revision = (
+                _parallel_branch_allocate_should_persist_contract_revision(
+                    effective_body,
+                    owned_files=saved.owned_files or request_owned_files,
+                )
             )
-        )
-        if route_identity_for_revision and owned_files_for_revision:
+        if (
+            not runtime_contract_revision
+            and route_identity_for_revision
+            and owned_files_for_revision
+        ):
             saved_context = branch_context_to_dict(saved)
             route_gate = _parallel_branch_allocate_route_gate(
                 effective_body,
@@ -11259,6 +11626,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                         route_identity_for_revision,
                         owned_files_for_revision,
                         test_files=backlog_test_files,
+                        authority_revision=authority_revision,
                     ),
                     route_gate=route_gate,
                     route_identity=route_identity_for_revision,
@@ -11298,6 +11666,8 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision
+        if authority_revision:
+            response["authority_revision"] = authority_revision
         try:
             dispatch_body = {
                 **effective_body,
@@ -13391,6 +13761,13 @@ def _runtime_context_projection_response(
         contract_runtime_dispatch_identity=(
             contract_runtime_projection.get("contract_runtime_dispatch_identity")
             if isinstance(contract_runtime_projection, Mapping)
+            else {}
+        ),
+        authority_revision=(
+            (latest_revision_payload.get("payload") or {}).get(
+                "authority_revision"
+            )
+            if isinstance(latest_revision_payload.get("payload"), Mapping)
             else {}
         ),
     )
@@ -16499,6 +16876,15 @@ def _runtime_context_worker_guide_response(
             else {}
         ),
         contract_runtime_dispatch_identity=contract_runtime_dispatch_identity,
+        authority_revision=(
+            worker_view.get("authority_revision")
+            if isinstance(worker_view.get("authority_revision"), Mapping)
+            else (
+                (worker_view.get("work") or {}).get("authority_revision")
+                if isinstance(worker_view.get("work"), Mapping)
+                else {}
+            )
+        ),
     )
     if not contract_worker_commit_required:
         actionable_payloads.pop("worker_commit_facade_payload_skeleton", None)
@@ -17201,6 +17587,7 @@ def _runtime_context_worker_recovery_payloads(
     graph_trace_id: str = "",
     worker_implementation_lineage: Mapping[str, Any] | None = None,
     contract_runtime_dispatch_identity: Mapping[str, Any] | None = None,
+    authority_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_route_identity = {
         field: str((route_identity or {}).get(field) or "").strip()
@@ -17228,6 +17615,21 @@ def _runtime_context_worker_recovery_payloads(
         "required_submission": "changed_files=cumulative_runtime_diff",
         "git_diff_expression": "runtime_context.base_commit..clean_worker_HEAD",
         "delta_rework_changed_files_allowed": False,
+        "active_persisted_owned_files": list(
+            (authority_revision or {}).get("active_owned_files") or []
+        ),
+        "worker_authored_files": list(
+            (authority_revision or {}).get("worker_authored_files") or []
+        ),
+        "inherited_target_head_files": list(
+            (authority_revision or {}).get("inherited_target_head_files") or []
+        ),
+        "inherited_target_files_are_worker_authored": False,
+        "scope_revision_rule": (
+            "If authored files exceed active_persisted_owned_files, stop before "
+            "implementation and request one explicit allocation authority revision; "
+            "never retry owned_files permutations after implementation."
+        ),
     }
     canonical_implementation_lineage = dict(
         worker_implementation_lineage
@@ -17991,8 +18393,18 @@ def _runtime_context_worker_recovery_payloads(
             }
         ),
         "worker_commit_sha": "<exact full clean git HEAD after implementation commit>",
-        "owned_files": ["<all runtime-context owned files>"],
-        "changed_files": ["<exact base..worker_commit_sha changed file>"],
+        "owned_files": (
+            list((authority_revision or {}).get("active_owned_files") or [])
+            or ["<all runtime-context owned files>"]
+        ),
+        "changed_files": (
+            list((authority_revision or {}).get("worker_authored_files") or [])
+            or ["<exact refreshed-base..worker_commit_sha authored file>"]
+        ),
+        "inherited_target_head_files": list(
+            (authority_revision or {}).get("inherited_target_head_files") or []
+        ),
+        "authority_revision": dict(authority_revision or {}),
         "graph_trace_ids": ["<same DB-verified implementation graph trace id>"],
         **safe_route_identity,
     }
@@ -18007,7 +18419,7 @@ def _runtime_context_worker_recovery_payloads(
         "checkpoint_id": "<finish-gate checkpoint_id>",
         "require_finish_gate": True,
         "worker_role": "mf_sub",
-        "status": "review_ready",
+        "status": "merge_ready",
         "fence_token": fence_token_placeholder,
         "route_token_ref": (
             "<worker_task_id close_or_merge_after_evidence route_token_ref>"
@@ -28358,7 +28770,7 @@ def _parallel_branch_merge_route_scope_mismatch_details(
                 "checkpoint_id": str(body.get("checkpoint_id") or ""),
                 "require_finish_gate": _query_bool(body, "require_finish_gate", True),
                 "worker_role": "mf_sub",
-                "status": str(body.get("status") or "review_ready"),
+                "status": str(body.get("status") or "merge_ready"),
             }
         )
     return {
@@ -28878,12 +29290,24 @@ def _record_parallel_branch_merge_contract_timeline_events(
     result: Mapping[str, Any],
     route_gate: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if not (result.get("ok") and result.get("executed") and not result.get("dry_run")):
+    recorded = result.get("recorded") if isinstance(result.get("recorded"), Mapping) else {}
+    queue_item = (
+        recorded.get("queue_item") if isinstance(recorded.get("queue_item"), Mapping) else {}
+    )
+    queue_status = str(queue_item.get("status") or "").strip().lower()
+    if not (
+        result.get("ok")
+        and not result.get("dry_run")
+        and queue_status == "merged"
+        and (
+            result.get("executed")
+            or result.get("already_integrated")
+        )
+    ):
         return []
 
     from . import task_timeline
 
-    recorded = result.get("recorded") if isinstance(result.get("recorded"), Mapping) else {}
     scope = _parallel_branch_parent_scope_from_recorded_merge(
         recorded,
         body=body,
@@ -28894,9 +29318,6 @@ def _record_parallel_branch_merge_contract_timeline_events(
 
     preview = result.get("preview") if isinstance(result.get("preview"), Mapping) else {}
     gate_plan = result.get("gate_plan") if isinstance(result.get("gate_plan"), Mapping) else {}
-    queue_item = (
-        recorded.get("queue_item") if isinstance(recorded.get("queue_item"), Mapping) else {}
-    )
     branch_ref = str(queue_item.get("branch_ref") or body.get("branch_ref") or "").strip()
     merge_commit = str(
         result.get("merge_commit")
@@ -28918,9 +29339,44 @@ def _record_parallel_branch_merge_contract_timeline_events(
         "merge_commit": merge_commit,
         "target_head_before_merge": str(queue_item.get("target_head_before_merge") or "").strip(),
         "target_head_after_merge": str(queue_item.get("target_head_after_merge") or "").strip(),
+        "git_mutation_executed": bool(result.get("executed")),
+        "already_integrated": bool(result.get("already_integrated")),
+        "target_ref_mutated": bool(result.get("target_ref_mutated")),
         "qa_evidence": qa_evidence,
         "route_token_gate": route_gate_payload,
     }
+    existing_live_rows = conn.execute(
+        """
+        SELECT id, payload_json
+          FROM task_timeline_events
+         WHERE project_id = ?
+           AND backlog_id = ?
+           AND task_id = ?
+           AND event_kind = 'live_merge'
+           AND commit_sha = ?
+         ORDER BY id DESC
+        """,
+        (
+            project_id,
+            scope["backlog_id"],
+            scope["task_id"],
+            merge_commit,
+        ),
+    ).fetchall()
+    for existing_row in existing_live_rows:
+        try:
+            existing_payload = json.loads(
+                _row_get(existing_row, "payload_json", "{}") or "{}"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_payload = {}
+        if (
+            str(existing_payload.get("merge_queue_id") or "")
+            == str(common_payload["merge_queue_id"] or "")
+            and str(existing_payload.get("queue_item_id") or "")
+            == str(common_payload["queue_item_id"] or "")
+        ):
+            return []
     actor = str(body.get("contract_actor") or "codex-observer").strip()
     requested_by_actor = str(body.get("actor") or "").strip()
     events: list[dict[str, Any]] = []
@@ -28973,6 +29429,8 @@ def _record_parallel_branch_merge_contract_timeline_events(
             "backlog_id": scope["backlog_id"],
             "target_head_after_merge": queue_item.get("target_head_after_merge"),
             "queue_status": queue_item.get("status"),
+            "git_mutation_executed": bool(result.get("executed")),
+            "already_integrated": bool(result.get("already_integrated")),
             "qa_evidence": qa_evidence,
         },
     )
@@ -52405,10 +52863,51 @@ def _contract_runtime_mf_parallel_dispatch_identity_mismatch(
         for summary in expected_context_summaries
         if str(summary.get("task_id") or "").strip()
     }
+    worker_line_ids = {
+        line_id
+        for _source_key, line_id, _evidence_kind, _source_kind in (
+            _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES
+        )
+    }
+    enriched_expected_contexts: list[dict[str, Any]] = []
+    for summary in expected_context_summaries:
+        enriched = dict(summary)
+        runtime_context_id = str(summary.get("runtime_context_id") or "").strip()
+        task_id = str(summary.get("task_id") or "").strip()
+        completed_worker_line_ids: list[str] = []
+        for line in record.get("completed_lines") or []:
+            if not isinstance(line, Mapping):
+                continue
+            line_id = str(line.get("line_id") or "").strip()
+            if line_id not in worker_line_ids:
+                continue
+            context_keys = _contract_runtime_line_context_keys(line)
+            if runtime_context_id and (
+                "runtime_context_id",
+                runtime_context_id,
+            ) in context_keys:
+                completed_worker_line_ids.append(line_id)
+                continue
+            if task_id and ("task_id", task_id) in context_keys:
+                completed_worker_line_ids.append(line_id)
+        completed_worker_line_ids = list(dict.fromkeys(completed_worker_line_ids))
+        projected_worker_line_ids = [
+            str(value or "").strip()
+            for value in summary.get("worker_projected_line_ids") or []
+            if str(value or "").strip()
+        ]
+        effective_worker_line_ids = list(
+            dict.fromkeys(completed_worker_line_ids + projected_worker_line_ids)
+        )
+        enriched["completed_worker_line_count"] = len(completed_worker_line_ids)
+        enriched["completed_worker_line_ids"] = completed_worker_line_ids
+        enriched["effective_worker_line_count"] = len(effective_worker_line_ids)
+        enriched["effective_worker_line_ids"] = effective_worker_line_ids
+        enriched_expected_contexts.append(enriched)
     best_expected_worker_line_count = max(
         [
-            int(summary.get("worker_projected_line_count") or 0)
-            for summary in expected_context_summaries
+            int(summary.get("effective_worker_line_count") or 0)
+            for summary in enriched_expected_contexts
         ]
         or [0]
     )
@@ -52477,7 +52976,7 @@ def _contract_runtime_mf_parallel_dispatch_identity_mismatch(
         "contract_execution_id": contract_execution_id,
         "backlog_id": backlog_id,
         "expected_dispatch_contexts": [
-            dict(summary) for summary in expected_context_summaries
+            dict(summary) for summary in enriched_expected_contexts
         ],
         "evidence_contexts": [dict(item) for item in evidence_contexts[:3]],
         "guidance": {
