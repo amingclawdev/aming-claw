@@ -19330,6 +19330,148 @@ def test_parallel_branch_merge_execute_mutates_target_owner_not_candidate_worktr
     assert (repo / "owned-main.txt").read_text(encoding="utf-8") == "candidate\n"
 
 
+def _prepare_merge_ownership_guard_case(conn, tmp_path, *, suffix: str):
+    repo = _git_repo(tmp_path)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_branch = f"feature-ownership-{suffix}"
+    candidate_worktree = tmp_path / f"candidate-ownership-{suffix}"
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            candidate_branch,
+            str(candidate_worktree),
+            main_head,
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_path = f"candidate-{suffix}.txt"
+    (candidate_worktree / candidate_path).write_text(
+        "candidate\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", candidate_path],
+        cwd=candidate_worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", f"candidate ownership {suffix}"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=candidate_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    queue_id = f"mergeq-api-ownership-{suffix}"
+    task_id = f"ownership-{suffix}-task"
+    fence_token = f"fence-ownership-{suffix}"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=f"mf-batch-ownership-{suffix}",
+            task_id=task_id,
+            branch_ref=f"refs/heads/{candidate_branch}",
+            status="merge_ready",
+            fence_token=fence_token,
+            target_project_root=str(candidate_worktree),
+            worktree_path=str(candidate_worktree),
+            base_commit=main_head,
+            head_commit=candidate_commit,
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-07-19T12:10:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=f"item-ownership-{suffix}",
+                task_id=task_id,
+                branch_ref=f"refs/heads/{candidate_branch}",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head=candidate_commit,
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id=f"scope-ownership-{suffix}",
+                projection_id=f"semproj-ownership-{suffix}",
+            )
+        ],
+        now_iso="2026-07-19T12:10:00Z",
+    )
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {
+            "status": "pass",
+            "passed": True,
+            "candidate_commit_sha": candidate_commit,
+            "qa_event_ref": f"timeline:ownership-{suffix}-qa",
+        },
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    return SimpleNamespace(
+        repo=repo,
+        main_head=main_head,
+        candidate_branch=candidate_branch,
+        candidate_commit=candidate_commit,
+        queue_id=queue_id,
+        task_id=task_id,
+        fence_token=fence_token,
+        evidence=evidence,
+    )
+
+
+def _execute_merge_ownership_guard_case(case):
+    return server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": case.queue_id,
+                "target_ref": "refs/heads/main",
+                "task_id": case.task_id,
+                "evidence": case.evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": case.fence_token,
+                "route_waiver": _route_waiver(
+                    "merge_execute",
+                    task_id=case.task_id,
+                ),
+                "message": f"merge ownership guard {case.task_id}",
+                "bug_id": "AC-MERGE-OWNERSHIP-GUARD",
+                "now_iso": "2026-07-19T12:11:00Z",
+            },
+        )
+    )
+
+
 def test_parallel_branch_merge_execute_aborts_owner_merge_when_commit_fails(
     conn,
     tmp_path,
@@ -19484,6 +19626,14 @@ def test_parallel_branch_merge_execute_aborts_owner_merge_when_commit_fails(
         "status": "pass",
         "merge_in_progress_before": True,
         "merge_in_progress_after": False,
+        "ownership_verified": True,
+        "expected_head": main_head,
+        "expected_merge_head": candidate_commit,
+        "actual_head_before": main_head,
+        "actual_target_before": main_head,
+        "actual_merge_head_before": candidate_commit,
+        "actual_head_after": main_head,
+        "actual_target_after": main_head,
         "abort_returncode": 0,
         "abort_error": "",
         "index_clean_after": True,
@@ -19512,6 +19662,298 @@ def test_parallel_branch_merge_execute_aborts_owner_merge_when_commit_fails(
         text=True,
     ).stdout == ""
     assert not (repo / "commit-failure.txt").exists()
+
+
+def test_parallel_branch_merge_execute_preserves_preexisting_clean_merge(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _prepare_merge_ownership_guard_case(
+        conn,
+        tmp_path,
+        suffix="preexisting-merge",
+    )
+    user_branch = "user-no-content-merge"
+    subprocess.run(
+        ["git", "checkout", "-b", user_branch],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "user no-content merge"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    user_merge_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", user_branch],
+        cwd=case.repo,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 0, merge.stderr
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+    writer_calls = 0
+
+    def writer_must_not_run(*_args, **_kwargs):
+        nonlocal writer_calls
+        writer_calls += 1
+        return True, "unexpected", ""
+
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        writer_must_not_run,
+    )
+    result = _execute_merge_ownership_guard_case(case)
+
+    assert writer_calls == 0
+    assert result["ok"] is False
+    assert result["executed"] is False
+    assert result["error"] == "merge_in_progress_before_writer"
+    assert result["recorded"] is None
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == case.main_head
+    assert subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == case.main_head
+    assert subprocess.run(
+        ["git", "rev-parse", "MERGE_HEAD"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == user_merge_head
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        case.queue_id,
+        target_ref="refs/heads/main",
+    )[0].status == "merge_ready"
+    subprocess.run(
+        ["git", "merge", "--abort"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_parallel_branch_merge_execute_preserves_mismatched_writer_merge_and_state(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _prepare_merge_ownership_guard_case(
+        conn,
+        tmp_path,
+        suffix="mismatched-writer-merge",
+    )
+    intruder_branch = "concurrent-no-content-merge"
+    subprocess.run(
+        ["git", "checkout", "-b", intruder_branch],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "concurrent merge"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    intruder_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    def fail_with_mismatched_merge(_message, *, cwd, **_kwargs):
+        merge = subprocess.run(
+            ["git", "merge", "--no-ff", "--no-commit", intruder_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        assert merge.returncode == 0, merge.stderr
+        return False, "", "Merge failed: injected ownership race"
+
+    monkeypatch.setattr(
+        "agent.governance.chain_trailer.write_merge_with_trailer",
+        fail_with_mismatched_merge,
+    )
+    result = _execute_merge_ownership_guard_case(case)
+
+    assert result["ok"] is False
+    assert result["executed"] is True
+    assert result["error"] == "merge_failed_cleanup_unverified"
+    assert result["recorded"] is None
+    assert result["failed_merge_cleanup"]["passed"] is False
+    assert result["failed_merge_cleanup"]["attempted"] is False
+    assert result["failed_merge_cleanup"]["ownership_verified"] is False
+    assert (
+        result["failed_merge_cleanup"]["actual_merge_head_before"]
+        == intruder_commit
+    )
+    assert subprocess.run(
+        ["git", "rev-parse", "MERGE_HEAD"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == intruder_commit
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        case.queue_id,
+        target_ref="refs/heads/main",
+    )[0].status == "merge_ready"
+    subprocess.run(
+        ["git", "merge", "--abort"],
+        cwd=case.repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_failed_merge_cleanup_rejects_post_abort_target_ref_drift(
+    tmp_path,
+    monkeypatch,
+):
+    from agent.governance import parallel_branch_runtime as branch_runtime
+
+    repo = _git_repo(tmp_path)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-b", "feature-cleanup-ref-drift"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "cleanup-ref-drift.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "cleanup-ref-drift.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "cleanup ref drift candidate"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", candidate_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    real_preview_commit = branch_runtime._git_preview_commit
+    target_reads = 0
+
+    def report_target_drift(root, ref, *, timeout_seconds):
+        nonlocal target_reads
+        commit, error = real_preview_commit(
+            root,
+            ref,
+            timeout_seconds=timeout_seconds,
+        )
+        if ref == "refs/heads/main":
+            target_reads += 1
+            if target_reads == 2:
+                return candidate_commit, ""
+        return commit, error
+
+    monkeypatch.setattr(
+        branch_runtime,
+        "_git_preview_commit",
+        report_target_drift,
+    )
+    cleanup = branch_runtime._git_abort_failed_merge_commit(
+        repo,
+        target_ref="refs/heads/main",
+        expected_head=main_head,
+        expected_merge_head=candidate_commit,
+        timeout_seconds=10,
+    )
+
+    assert cleanup["ownership_verified"] is True
+    assert cleanup["abort_returncode"] == 0
+    assert cleanup["actual_head_after"] == main_head
+    assert cleanup["actual_target_after"] == candidate_commit
+    assert cleanup["passed"] is False
+    assert cleanup["status"] == "fail"
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
 
 
 def test_parallel_branch_merge_execute_rechecks_owner_dirty_before_writer(

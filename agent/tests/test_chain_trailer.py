@@ -520,6 +520,101 @@ class TestWriteMergeWithTrailer:
         assert success is False
         assert err
 
+    def test_governed_writer_can_preserve_unknown_preexisting_merge(self, git_repo):
+        from agent.governance.chain_trailer import write_merge_with_trailer
+
+        base_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "governed-candidate"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        with open(os.path.join(git_repo, "candidate.txt"), "w") as f:
+            f.write("candidate\n")
+        subprocess.run(["git", "add", "candidate.txt"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "governed candidate"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", base_branch],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "user-no-content-merge"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "user merge"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        user_merge_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", base_branch],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "merge", "--no-ff", "--no-commit", "user-no-content-merge"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        success, commit_hash, err = write_merge_with_trailer(
+            message="governed merge must not abort user operation",
+            branch="governed-candidate",
+            cwd=git_repo,
+            abort_failed_merge=False,
+        )
+
+        assert success is False
+        assert commit_hash == ""
+        assert err.startswith("Merge failed:")
+        assert subprocess.run(
+            ["git", "rev-parse", "MERGE_HEAD"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == user_merge_head
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def test_returns_short_hash(self, git_repo):
         from agent.governance.chain_trailer import write_merge_with_trailer
         with open(os.path.join(git_repo, "hash_test.txt"), "w") as f:

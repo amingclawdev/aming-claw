@@ -16636,9 +16636,12 @@ def _git_target_owner_alignment_evidence(
 def _git_abort_failed_merge_commit(
     mutation_root: Path,
     *,
+    target_ref: str,
+    expected_head: str,
+    expected_merge_head: str,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """Abort a merge left open when the final merge commit failed."""
+    """Abort only the exact merge opened by this immutable merge preview."""
 
     merge_head = _git_preview_command(
         mutation_root,
@@ -16646,8 +16649,34 @@ def _git_abort_failed_merge_commit(
         timeout_seconds=timeout_seconds,
     )
     merge_in_progress = merge_head.returncode == 0
+    merge_head_probe_ok = merge_head.returncode in {0, 1}
+    merge_head_commit = (
+        merge_head.stdout.splitlines()[0].strip()
+        if merge_in_progress and merge_head.stdout.splitlines()
+        else ""
+    )
+    head_before, head_error = _git_preview_commit(
+        mutation_root,
+        "HEAD",
+        timeout_seconds=timeout_seconds,
+    )
+    target_before, target_error = _git_preview_commit(
+        mutation_root,
+        target_ref,
+        timeout_seconds=timeout_seconds,
+    )
+    ownership_verified = bool(
+        merge_head_probe_ok
+        and not head_error
+        and not target_error
+        and head_before == target_before == expected_head
+        and (
+            not merge_in_progress
+            or merge_head_commit == expected_merge_head
+        )
+    )
     abort = None
-    if merge_in_progress:
+    if merge_in_progress and ownership_verified:
         abort = _git_preview_command(
             mutation_root,
             ["merge", "--abort"],
@@ -16672,20 +16701,42 @@ def _git_abort_failed_merge_commit(
         ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
         timeout_seconds=timeout_seconds,
     )
+    head_after, head_after_error = _git_preview_commit(
+        mutation_root,
+        "HEAD",
+        timeout_seconds=timeout_seconds,
+    )
+    target_after, target_after_error = _git_preview_commit(
+        mutation_root,
+        target_ref,
+        timeout_seconds=timeout_seconds,
+    )
     passed = bool(
-        not dirty_files
+        ownership_verified
+        and not dirty_files
         and cached.returncode == 0
         and worktree.returncode == 0
-        and merge_head_after.returncode != 0
+        and merge_head_after.returncode == 1
+        and not head_after_error
+        and not target_after_error
+        and head_after == target_after == expected_head
         and (abort is None or abort.returncode == 0)
     )
     return {
         "schema_version": "failed_merge_commit_cleanup.v1",
-        "attempted": merge_in_progress,
+        "attempted": abort is not None,
         "passed": passed,
         "status": "pass" if passed else "fail",
         "merge_in_progress_before": merge_in_progress,
         "merge_in_progress_after": merge_head_after.returncode == 0,
+        "ownership_verified": ownership_verified,
+        "expected_head": expected_head,
+        "expected_merge_head": expected_merge_head,
+        "actual_head_before": head_before,
+        "actual_target_before": target_before,
+        "actual_merge_head_before": merge_head_commit,
+        "actual_head_after": head_after,
+        "actual_target_after": target_after,
         "abort_returncode": abort.returncode if abort is not None else None,
         "abort_error": _bounded_command_text(abort.stderr or abort.stdout)
         if abort is not None and abort.returncode != 0
@@ -17038,6 +17089,50 @@ def execute_merge_queue_item(
             "recorded": None,
         }
 
+    merge_head_before_writer = _git_preview_command(
+        mutation_root,
+        ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        timeout_seconds=timeout_seconds,
+    )
+    if merge_head_before_writer.returncode not in {0, 1}:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "git_operation_state_unresolved_before_writer",
+            "message": (
+                "could not prove whether the target branch owner already has "
+                "MERGE_HEAD; refuse before governed writer mutation"
+            ),
+            "stderr": _bounded_command_text(
+                merge_head_before_writer.stderr or merge_head_before_writer.stdout
+            ),
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+    if merge_head_before_writer.returncode == 0:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "merge_in_progress_before_writer",
+            "message": (
+                "target branch owner already has MERGE_HEAD before the governed "
+                "writer; refuse without aborting or mutating the existing merge"
+            ),
+            "merge_head": _bounded_command_text(merge_head_before_writer.stdout),
+            "candidate_preview_root": str(repo_root),
+            "target_mutation_root": str(mutation_root),
+            "target_mutation_root_source": mutation_root_source,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
     from .chain_trailer import write_merge_with_trailer
 
     ok, merge_commit, error = write_merge_with_trailer(
@@ -17049,12 +17144,40 @@ def execute_merge_queue_item(
         parent_chain_sha=before_commit,
         bug_id=bug_id or item.backlog_id or item.task_id,
         merge_queue_id=item.merge_queue_id,
+        abort_failed_merge=False,
     )
     if not ok:
         cleanup = _git_abort_failed_merge_commit(
             mutation_root,
+            target_ref=selected_target_ref,
+            expected_head=before_commit,
+            expected_merge_head=branch_commit,
             timeout_seconds=timeout_seconds,
         )
+        if not cleanup["passed"]:
+            actual_target_after = str(cleanup.get("actual_target_after") or "")
+            return {
+                "ok": False,
+                "dry_run": False,
+                "executed": True,
+                "target_ref_mutated": (
+                    not actual_target_after
+                    or actual_target_after != before_commit
+                ),
+                "error": "merge_failed_cleanup_unverified",
+                "message": (
+                    "merge writer failed and exact cleanup could not be verified; "
+                    "leave queue state non-terminal and require operator recovery"
+                ),
+                "writer_error": error,
+                "candidate_preview_root": str(repo_root),
+                "target_mutation_root": str(mutation_root),
+                "target_mutation_root_source": mutation_root_source,
+                "failed_merge_cleanup": cleanup,
+                "preview": preview,
+                "gate_plan": merge_gate_plan_to_dict(gate_plan),
+                "recorded": None,
+            }
         recorded = record_merge_queue_result(
             conn,
             project_id=project_id,

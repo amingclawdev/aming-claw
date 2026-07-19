@@ -491,6 +491,7 @@ def write_merge_with_trailer(
     parent_chain_sha: str | None = None,
     bug_id: str | None = None,
     merge_queue_id: str | None = None,
+    abort_failed_merge: bool = True,
 ) -> tuple[bool, str, str]:
     """Create a merge/commit with 4-field Chain trailer lines.
 
@@ -510,6 +511,9 @@ def write_merge_with_trailer(
         parent_chain_sha: Chain-Parent value (parent chain commit SHA)
         bug_id: Chain-Bug-Id value (backlog bug ID)
         merge_queue_id: Optional Chain-Merge-Queue-Id value
+        abort_failed_merge: Preserve legacy standalone behavior when true. A
+            governed caller can set false and perform ownership-aware cleanup
+            after verifying the exact HEAD and MERGE_HEAD it owns.
 
     Returns:
         (success, commit_hash, error_message)
@@ -523,8 +527,8 @@ def write_merge_with_trailer(
             merge_args.extend(extra_args)
         merge_proc = _git(merge_args, cwd=root, timeout=30)
         if merge_proc.returncode != 0:
-            # Abort the failed merge
-            _git(["merge", "--abort"], cwd=root)
+            if abort_failed_merge:
+                _git(["merge", "--abort"], cwd=root)
             return False, "", f"Merge failed: {merge_proc.stderr.strip()[:300]}"
 
     # Build trailer lines
