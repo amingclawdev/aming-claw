@@ -2175,6 +2175,7 @@ def _insert_observer_graph_query_trace(
 def _insert_exact_qa_graph_query_trace(
     conn,
     *,
+    project_id: str = PID,
     trace_id: str,
     snapshot_id: str,
     candidate_commit_sha: str,
@@ -2187,13 +2188,18 @@ def _insert_exact_qa_graph_query_trace(
     query_purpose: str = "independent_verification",
     created_at: str = "2026-07-04T10:00:00Z",
 ) -> dict[str, Any]:
-    _activate_basic_graph(conn, snapshot_id, commit_sha=candidate_commit_sha)
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        project_id=project_id,
+        commit_sha=candidate_commit_sha,
+    )
     query_root = Path(target_project_root).resolve()
     canonical_root = Path(canonical_project_root or query_root).resolve()
     if (query_root / ".git").exists():
         root_context = server._qa_exact_candidate_context(
             query_root,
-            project_id=PID,
+            project_id=project_id,
             canonical_project_root=canonical_root,
             candidate_commit_sha=candidate_commit_sha,
         )
@@ -2226,7 +2232,7 @@ def _insert_exact_qa_graph_query_trace(
         }
     empty_diff_hash = "sha256:" + hashlib.sha256(b"").hexdigest()
     qa_scope_binding_ref = server._qa_scope_binding_ref(
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         commit_sha=candidate_commit_sha,
@@ -2246,7 +2252,7 @@ def _insert_exact_qa_graph_query_trace(
     assert graph_basis_decision_hash == server.stable_sha256(graph_basis_decision)
     graph_query_trace.start_trace(
         conn,
-        PID,
+        project_id,
         snapshot_id,
         trace_id=trace_id,
         actor=actor,
@@ -2274,12 +2280,12 @@ def _insert_exact_qa_graph_query_trace(
         qa_session_id=qa_session_id,
         qa_scope_binding_ref=qa_scope_binding_ref,
     )
-    graph_query_trace.finish_trace(conn, PID, trace_id)
+    graph_query_trace.finish_trace(conn, project_id, trace_id)
     if created_at:
         conn.execute(
             "UPDATE graph_query_traces SET created_at = ?, updated_at = ? "
             "WHERE project_id = ? AND trace_id = ?",
-            (created_at, created_at, PID, trace_id),
+            (created_at, created_at, project_id, trace_id),
         )
     conn.commit()
     return {
@@ -2294,7 +2300,7 @@ def _insert_exact_qa_graph_query_trace(
         "requested_trace_ids": [trace_id],
         "missing_trace_ids": [],
         "identity_mismatches": [],
-        "project_id": PID,
+        "project_id": project_id,
         "backlog_id": backlog_id,
         "task_id": task_id,
         "query_source": "qa",
@@ -60493,6 +60499,7 @@ def test_contract_runtime_only_startup_principal_projects_native_finish_attestat
 def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
     conn,
     tmp_path,
+    monkeypatch,
 ):
     project_id = "aming-claw"
     contract_execution_id = "cex-contract-runtime-merge-authority"
@@ -60500,12 +60507,17 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     runtime_context_id = "mfrctx-contract-runtime-merge-authority"
     merge_queue_id = "mq-contract-runtime-merge-authority"
     queue_item_id = "mqitem-contract-runtime-merge-authority"
-    qa_commit = "a" * 40
-    merged_commit = server._git_head_commit(
-        Path(__file__).resolve().parents[2]
-    )
+    canonical_repo_root = Path(__file__).resolve().parents[2]
+    merged_commit = server._git_head_commit(canonical_repo_root)
     target_root = tmp_path / "target-project"
-    target_root.mkdir()
+    qa_commit = _init_test_git_repo(target_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, raw=None, **_kwargs: (
+            Path(raw).resolve() if raw else target_root.resolve()
+        ),
+    )
     context = BranchTaskRuntimeContext(
         project_id=project_id,
         task_id=task_id,
@@ -60514,8 +60526,9 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         runtime_context_id=runtime_context_id,
         backlog_id="AC-CONTRACT-RUNTIME-MERGE-AUTHORITY",
         parent_task_id="AC-CONTRACT-RUNTIME-MERGE-AUTHORITY",
-        target_project_root=str(target_root),
+        target_project_root=str(target_root.resolve()),
         target_project_id="target-project",
+        worktree_path=str(target_root.resolve()),
         merge_queue_id=merge_queue_id,
     )
     upsert_branch_context(conn, context)
@@ -61003,24 +61016,32 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     # base reproduction, zero candidate-new failures, and server-derived
     # durable merge authority.  It must never become a release PASS claim.
     no_pass_record = runtime.store.get(contract_execution_id)
-    qa_graph_line = no_pass_record["completed_lines"][9]
-    qa_graph_line.update(
+    qa_graph_trace_id = "gqt-contract-runtime-no-pass-merge-authority"
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        project_id=project_id,
+        trace_id=qa_graph_trace_id,
+        snapshot_id="scope-contract-runtime-no-pass-merge-authority",
+        candidate_commit_sha=qa_commit,
+        backlog_id=context.backlog_id,
+        task_id=task_id,
+        target_project_root=str(target_root.resolve()),
+    )
+    qa_graph_write = json.loads(
+        json.dumps(no_pass_record["completed_lines"][9])
+    )
+    qa_graph_write.update(
         {
             "commit_sha": qa_commit,
+            "status": "accepted",
             "observer_impersonation": False,
-            "authorization_source": "qa_session_token_ref",
-            "qa_evidence_provenance": {
-                "schema_version": "qa_evidence_provenance.v1",
-                "authorization_source": "qa_session_token_ref",
-                "evidence_owner_role": "qa",
-                "observer_impersonation": False,
-                "parent_materialization_authorized": False,
-            },
+            "graph_trace_ids": [qa_graph_trace_id],
+            "graph_query_trace_ids": [qa_graph_trace_id],
         }
     )
-    qa_graph_line["payload"].update(
+    qa_graph_write["payload"].update(
         {
-            "schema_version": "qa_graph_context.v1",
+            "schema_version": "mf_parallel.qa_graph_context.v1",
             "acceptance_scope": (
                 "candidate_regression_and_acceptance_criteria"
             ),
@@ -61028,8 +61049,32 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
             "exact_candidate": True,
             "no_pass_claim": True,
             "overall_release_pass_claimed": False,
+            "graph_trace_ids": [qa_graph_trace_id],
+            "graph_query_trace_ids": [qa_graph_trace_id],
         }
     )
+    qa_graph_line = server._contract_runtime_bind_server_line_authority(
+        _ctx_with_role({"project_id": project_id}, "qa"),
+        conn,
+        project_id=project_id,
+        record=no_pass_record,
+        write=qa_graph_write,
+        body=qa_graph_write,
+    )
+    assert qa_graph_line["payload"]["schema_version"] == (
+        "mf_parallel.qa_graph_context.v1"
+    )
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        qa_graph_line
+    ) is True, json.dumps(qa_graph_line, sort_keys=True)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: canonical_repo_root,
+    )
+    store.activate_graph_snapshot(conn, project_id, snapshot_id)
+    conn.commit()
+    no_pass_record["completed_lines"][9] = qa_graph_line
     qa_line = no_pass_record["completed_lines"][10]
     qa_candidate_result = {
         "candidate_new_failures": 0,
@@ -61135,6 +61180,54 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "reproduced": 17,
         "total": 17,
     }
+    trusted_no_pass_projection = (
+        server._contract_runtime_trusted_merge_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+    )
+    assert trusted_no_pass_projection["timeline_verified"] is True
+    assert trusted_no_pass_projection["authority_verified"] is True
+    assert trusted_no_pass_projection["no_pass_claim"] is True
+    assert trusted_no_pass_projection["queue_item_id"] == queue_item_id
+    legacy_qa_graph = json.loads(
+        json.dumps(record["completed_lines"][9])
+    )
+    legacy_qa_graph["payload"]["schema_version"] = "qa_graph_context.v1"
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        legacy_qa_graph
+    ) is True
+    unknown_qa_graph = json.loads(json.dumps(legacy_qa_graph))
+    unknown_qa_graph["payload"]["schema_version"] = (
+        "caller.qa_graph_context.v0"
+    )
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        unknown_qa_graph
+    ) is False
+    for rejected_status in ("failed", "waived", "bypassed"):
+        rejected_qa_graph = json.loads(
+            json.dumps(record["completed_lines"][9])
+        )
+        rejected_qa_graph["status"] = rejected_status
+        assert server._contract_runtime_candidate_scoped_no_pass_line(
+            rejected_qa_graph
+        ) is False
+    missing_schema_qa_graph = json.loads(json.dumps(legacy_qa_graph))
+    missing_schema_qa_graph["payload"].pop("schema_version")
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        missing_schema_qa_graph
+    ) is False
+    missing_authority_qa_graph = json.loads(json.dumps(legacy_qa_graph))
+    missing_authority_qa_graph["payload"].pop("graph_trace_evidence")
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        missing_authority_qa_graph
+    ) is False
+    forged_qa_graph = json.loads(json.dumps(legacy_qa_graph))
+    forged_qa_graph["authorization_source"] = "caller_forged"
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        forged_qa_graph
+    ) is False
     assert server._contract_runtime_value_reports_failed_qa(
         record["completed_lines"][10]
     ) is True
@@ -65313,7 +65406,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             }
         },
         "payload": {
-            "schema_version": "qa_graph_context.v1",
+            "schema_version": "mf_parallel.qa_graph_context.v1",
             "acceptance_scope": "candidate_regression_and_acceptance_criteria",
             "candidate_new_graph_failures": 0,
             "exact_candidate": True,
@@ -65381,6 +65474,9 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         successor["contract_execution_id"]
     )["completed_lines"][-1]
     stored_authority = stored_qa_line["payload"]["graph_trace_evidence"]
+    assert stored_qa_line["payload"]["schema_version"] == (
+        "mf_parallel.qa_graph_context.v1"
+    )
     assert stored_qa_line["authorization_source"] == "qa_session_token_ref"
     assert stored_qa_line["evidence_owner_actor"] == "qa-principal"
     assert stored_qa_line["evidence_owner_role"] == "qa"

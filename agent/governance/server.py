@@ -62562,6 +62562,7 @@ def _contract_runtime_candidate_scoped_no_pass_line(
         payload.get("no_pass_claim") is not True
         or payload.get("overall_release_pass_claimed") is not False
         or line.get("observer_impersonation") is True
+        or not _contract_runtime_line_status_passes(line)
         or str(line.get("status") or "").strip().lower() in {"waived", "bypassed"}
         or str(payload.get("disposition") or "").strip()
         == "proceeded_with_exception"
@@ -62605,7 +62606,11 @@ def _contract_runtime_candidate_scoped_no_pass_line(
             and str(line.get("evidence_kind") or "").strip() == "graph_trace"
             and str(line.get("authorization_source") or "")
             == "qa_session_token_ref"
-            and str(payload.get("schema_version") or "") == "qa_graph_context.v1"
+            and str(payload.get("schema_version") or "")
+            in {
+                "mf_parallel.qa_graph_context.v1",
+                "qa_graph_context.v1",
+            }
             and str(payload.get("acceptance_scope") or "") == candidate_scope
             and payload.get("candidate_new_graph_failures") == 0
             and payload.get("exact_candidate") is True
