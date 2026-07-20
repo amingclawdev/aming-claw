@@ -14,7 +14,11 @@ _agent_dir = os.path.join(os.path.dirname(__file__), "..")
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from governance.backlog_triage import triage_backlog_insert
+from governance.backlog_triage import (
+    release_operator_head_queue_order,
+    select_release_operator_head_queue,
+    triage_backlog_insert,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +284,77 @@ def test_force_admit_not_affected_by_triage():
     )
     # Low-similarity title + one rare file — may merge or admit; must not crash
     assert decision["action"] in ("admit", "merge_into", "supersede", "reject_dup")
+
+
+def test_release_operator_head_queue_selection_is_deterministic_and_bounded():
+    rows = [
+        {"backlog_id": "AC-HEAD", "position": 1, "eligible": True},
+        {
+            "backlog_id": "AC-ACTIVE",
+            "position": 2,
+            "eligible": True,
+            "active_execution": True,
+        },
+        {
+            "backlog_id": "AC-PINNED-ACTIVE",
+            "position": 3,
+            "eligible": True,
+            "active_execution": True,
+            "pinned": True,
+        },
+    ]
+
+    first = select_release_operator_head_queue(rows)
+    fresh_session = select_release_operator_head_queue(list(reversed(rows)))
+
+    assert first == fresh_session
+    assert first["selected_backlog_id"] == "AC-PINNED-ACTIVE"
+    assert first["selection_source"] == "pinned_active_position"
+    assert first["pinned_active_position"] is True
+
+    active_precedence = select_release_operator_head_queue(rows[:2])
+    assert active_precedence["selected_backlog_id"] == "AC-ACTIVE"
+    assert active_precedence["selection_source"] == (
+        "higher_precedence_active_execution"
+    )
+
+    ordinary_head = select_release_operator_head_queue(
+        [{"backlog_id": "AC-HEAD", "position": 1, "eligible": True}]
+    )
+    assert ordinary_head["selected_backlog_id"] == "AC-HEAD"
+    assert ordinary_head["selection_source"] == "ordered_queue_head"
+
+
+def test_release_operator_head_queue_ordinary_skip_is_one_shot_and_keeps_order():
+    rows = [
+        {"backlog_id": "AC-HEAD", "position": 1, "eligible": True},
+        {"backlog_id": "AC-NEXT", "position": 2, "eligible": True},
+    ]
+
+    skipped = select_release_operator_head_queue(
+        rows,
+        temporarily_skipped_backlog_ids={"AC-HEAD"},
+    )
+    restored = select_release_operator_head_queue(rows)
+
+    assert skipped["selected_backlog_id"] == "AC-NEXT"
+    assert restored["selected_backlog_id"] == "AC-HEAD"
+    assert [row["position"] for row in rows] == [1, 2]
+
+
+def test_release_operator_head_queue_reorder_requires_exact_unique_membership():
+    assert release_operator_head_queue_order(
+        ["AC-B", "AC-A"],
+        existing_backlog_ids=["AC-A", "AC-B"],
+    ) == ["AC-B", "AC-A"]
+
+    for invalid in (["AC-A"], ["AC-A", "AC-A"]):
+        try:
+            release_operator_head_queue_order(
+                invalid,
+                existing_backlog_ids=["AC-A", "AC-B"],
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid reorder must fail closed")

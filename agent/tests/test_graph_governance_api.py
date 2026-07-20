@@ -46242,6 +46242,224 @@ def test_onboard_contract_facade_guidance_requests_route_ref_when_missing(conn):
     ] == "backlog_get"
 
 
+def _insert_release_queue_backlog(conn, backlog_id: str) -> None:
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN' WHERE bug_id = ?",
+        (backlog_id,),
+    )
+    conn.commit()
+
+
+def test_release_operator_head_queue_insert_reorder_and_skip_are_durable_and_audited(
+    conn,
+    monkeypatch,
+):
+    first_id = "AC-RELEASE-HEAD-FIRST"
+    second_id = "AC-RELEASE-HEAD-SECOND"
+    _insert_release_queue_backlog(conn, first_id)
+    _insert_release_queue_backlog(conn, second_id)
+    auth_actions: list[str] = []
+
+    def fake_operator(_ctx, _conn, action):
+        auth_actions.append(action)
+        return {"role": "observer", "principal_id": "release-operator"}
+
+    monkeypatch.setattr(server, "_require_graph_governance_operator", fake_operator)
+
+    for backlog_id in (first_id, second_id):
+        result = server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={"action": "insert", "backlog_id": backlog_id},
+            )
+        )
+        assert result["ok"] is True
+
+    reordered = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"action": "reorder", "backlog_ids": [second_id, first_id]},
+        )
+    )
+    assert [
+        item["backlog_id"]
+        for item in reordered["release_operator_head_queue"]["items"]
+    ] == [second_id, first_id]
+
+    for count in (1, 2):
+        skipped = server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "action": "skip",
+                    "backlog_id": second_id,
+                    "reason": f"ordinary release skip {count}",
+                },
+            )
+        )
+        item = skipped["release_operator_head_queue"]["items"][0]
+        assert item["position"] == 1
+        assert item["skip_count"] == count
+        assert skipped["ordinary_skip"]["position_preserved"] is True
+        assert skipped["ordinary_skip"]["next_selection"][
+            "selected_backlog_id"
+        ] == first_id
+
+    fresh = server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": PID})
+    )["release_operator_head_queue"]
+    second_fresh = server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": PID})
+    )["release_operator_head_queue"]
+    assert fresh == second_fresh
+    assert fresh["head"]["backlog_id"] == second_id
+    assert [event["action"] for event in fresh["audit_events"][:3]] == [
+        "skip",
+        "skip",
+        "reorder",
+    ]
+    assert auth_actions == [
+        "backlog.release-operator-head-queue.mutate",
+    ] * 5
+
+
+def test_release_operator_head_queue_mutation_is_operator_only(conn):
+    backlog_id = "AC-RELEASE-QUEUE-QA-DENIED"
+    _insert_release_queue_backlog(conn, backlog_id)
+
+    with pytest.raises(PermissionDeniedError):
+        server.handle_project_release_operator_head_queue(
+            _ctx_with_role(
+                {"project_id": PID},
+                "qa",
+                method="POST",
+                body={"action": "insert", "backlog_id": backlog_id},
+            )
+        )
+
+
+def test_release_operator_head_queue_pinned_active_precedence_is_non_skippable(
+    conn,
+    monkeypatch,
+):
+    head_id = "AC-RELEASE-ORDINARY-HEAD"
+    pinned_id = "AC-RELEASE-PINNED-ACTIVE"
+    _insert_release_queue_backlog(conn, head_id)
+    _insert_release_queue_backlog(conn, pinned_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "release-operator"},
+    )
+
+    server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"action": "insert", "backlog_id": head_id},
+        )
+    )
+    server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"action": "insert", "backlog_id": pinned_id, "pinned": True},
+        )
+    )
+    server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"backlog_id": pinned_id, "role": "observer"},
+        )
+    )
+    conn.execute(
+        """
+        UPDATE backlog_contract_chain_current
+        SET current_contract_execution_id = ?,
+            current_contract_id = 'mf_parallel.v2',
+            active_child_contract_execution_id = ?,
+            readiness_state = 'contract_active',
+            next_legal_action_json = ?
+        WHERE project_id = ? AND backlog_id = ?
+        """,
+        (
+            "cex-release-pinned-active",
+            "cex-release-pinned-active",
+            '{"line_id":"worker_implementation","action":"record_implementation"}',
+            PID,
+            pinned_id,
+        ),
+    )
+    conn.commit()
+
+    code, refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "skip",
+                "backlog_id": pinned_id,
+                "reason": "must not bypass active release execution",
+            },
+        )
+    )
+    assert code == 409
+    assert refusal["error"] == "pinned_active_position_non_skippable"
+    assert refusal["position_preserved"] is True
+
+    selected = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"role": "observer"},
+        )
+    )
+    assert selected["backlog_id"] == pinned_id
+    assert selected["selected_backlog_source"] == "pinned_active_position"
+    assert selected["release_operator_head_queue_selection"][
+        "selected_active_execution"
+    ] is True
+
+
+def test_onboard_route_guide_without_backlog_selects_durable_queue_head(conn, monkeypatch):
+    first_id = "AC-RELEASE-FRESH-HEAD"
+    second_id = "AC-RELEASE-FRESH-NEXT"
+    _insert_release_queue_backlog(conn, first_id)
+    _insert_release_queue_backlog(conn, second_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "release-operator"},
+    )
+    for backlog_id in (first_id, second_id):
+        server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={"action": "insert", "backlog_id": backlog_id},
+            )
+        )
+
+    selected = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"role": "observer"},
+        )
+    )
+
+    assert selected["backlog_id"] == first_id
+    assert selected["selected_backlog_source"] == "ordered_queue_head"
+    assert selected["release_operator_head_queue_selection"][
+        "ordinary_head_selected"
+    ] is True
+
+
 def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_route(conn):
     backlog_id = "AC-ONBOARD-ROUTE-GUIDE-SERVICE-WAIVER"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -46290,6 +46508,15 @@ def test_onboard_route_guide_service_waives_legacy_contract_and_exposes_batch_ro
     assert guide["interface_index"]["mf_batch_parallel_enter"]["path"] == (
         "/api/projects/{project_id}/mf-batch-parallel/enter"
     )
+    assert guide["interface_index"]["release_operator_head_queue"] == {
+        "kind": "http",
+        "read_method": "GET",
+        "mutation_method": "POST",
+        "path": "/api/projects/{project_id}/release-operator-head-queue",
+        "mutation_roles": ["observer", "coordinator"],
+        "bounded_capacity": 32,
+        "actions": ["insert", "reorder", "skip"],
+    }
     graph_first = guide["graph_first_policy"]
     assert graph_first["source_symbol_discovery"]["tool_agnostic"] is True
     assert graph_first["default_sequence"][:3] == [
