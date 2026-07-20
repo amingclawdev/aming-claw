@@ -26660,7 +26660,11 @@ def _runtime_context_contract_failed_qa_has_canonical_provenance(
 ) -> bool:
     """Return whether a ContractRuntime failed-QA line has bounded QA authority."""
 
-    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
     provenance = (
         line.get("qa_evidence_provenance")
         if isinstance(line.get("qa_evidence_provenance"), Mapping)
@@ -62752,6 +62756,45 @@ def _contract_runtime_line_reports_disqualifying_failed_qa(
     return _contract_runtime_value_reports_failed_qa(line)
 
 
+def _contract_runtime_server_derived_observer_merge_no_pass_line(
+    line: Mapping[str, Any],
+) -> bool:
+    """Allow no-PASS on merge only with the server's durable authority.
+
+    Candidate-scoped QA evidence owns the baseline ledger.  The later
+    ``observer_merge`` line must not duplicate that QA shape; its authority is
+    instead the exact server-derived durable merge tuple, which the completed
+    merge resolver subsequently joins to identity, queue, commit, and timeline
+    state.
+    """
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    durable = (
+        payload.get("durable_merge_authority")
+        if isinstance(payload.get("durable_merge_authority"), Mapping)
+        else {}
+    )
+    commit_sha = str(line.get("commit_sha") or "").strip().lower()
+    return bool(
+        str(line.get("line_id") or "").strip() == "observer_merge"
+        and str(line.get("actor_role") or "").strip() == "observer"
+        and str(line.get("evidence_kind") or "").strip() == "merge"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+        and payload.get("no_pass_claim") is True
+        and payload.get("overall_release_pass_claimed") is False
+        and line.get("observer_impersonation") is not True
+        and _contract_runtime_line_status_passes(line)
+        and str(line.get("status") or "").strip().lower()
+        not in {"waived", "bypassed"}
+        and str(payload.get("disposition") or "").strip()
+        != "proceeded_with_exception"
+        and str(durable.get("schema_version") or "")
+        == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+        and durable.get("server_derived") is True
+        and durable.get("db_verified") is True
+    )
+
+
 def _contract_runtime_completed_merge_authority(
     conn,
     *,
@@ -62791,7 +62834,13 @@ def _contract_runtime_completed_merge_authority(
             and str(line.get("status") or "").strip().lower() not in {"waived", "bypassed"}
             and (
                 payload.get("no_pass_claim") is not True
-                or _contract_runtime_candidate_scoped_no_pass_line(line)
+                or (
+                    _contract_runtime_server_derived_observer_merge_no_pass_line(
+                        line
+                    )
+                    if line_id == "observer_merge"
+                    else _contract_runtime_candidate_scoped_no_pass_line(line)
+                )
             )
             and str(payload.get("disposition") or "").strip()
             != "proceeded_with_exception"
