@@ -5138,3 +5138,41 @@ def test_strict_worker_identity_next_action_hint_exposes_expected_fields():
     }
     for field in hint["required_payload_fields"]:
         assert hint["payload"][field] == hint["expected_identity"][field]
+
+
+def test_active_integration_epoch_projects_non_skippable_resume_before_contract_work():
+    projection = contract_state_runtime.integration_epoch_resume_projection(
+        {
+            "status": "merge_in_doubt",
+            "batch_id": "batch-restart",
+            "epoch_id": "integration-epoch-restart",
+            "target_ref": "refs/heads/main",
+            "merge_queue_id": "mq-restart",
+            "active_queue_item_id": "item-row2",
+            "active_task_id": "task-row2",
+            "active_backlog_id": "AC-BATCH-ROW2",
+            "active_checkpoint_id": "checkpoint-row2",
+        }
+    )
+
+    action = projection["next_legal_action"]
+    assert action["id"] == "resume_batch_merge"
+    assert action["precedence"] == "active_integration_epoch"
+    assert action["queue_item_id"] == "item-row2"
+    assert action["checkpoint_id"] == "checkpoint-row2"
+    assert action["position_skippable"] is False
+    assert action["target_ref_frozen"] is True
+
+    child_close = contract_state_runtime.integration_epoch_resume_projection(
+        {
+            "status": "reconciled",
+            "pending_child_backlog_ids": ["AC-BATCH-ROW1"],
+        }
+    )
+    assert child_close["next_legal_action"]["id"] == (
+        "close_reconciled_child_rows"
+    )
+    atomic_close = contract_state_runtime.integration_epoch_resume_projection(
+        {"status": "reconciled", "pending_child_backlog_ids": []}
+    )
+    assert atomic_close["next_legal_action"]["id"] == "close_batch_atomically"

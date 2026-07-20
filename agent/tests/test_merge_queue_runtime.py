@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 
 import pytest
 
+from agent.governance import parallel_branch_runtime as pbr
+from agent.governance import task_timeline
 from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_project
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
@@ -28,19 +31,31 @@ from agent.governance.parallel_branch_runtime import (
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
     STATE_WAITING_DEPENDENCY,
     MergeQueueItem,
+    IntegrationEpoch,
+    IntegrationEpochFrozenError,
+    INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+    INTEGRATION_EPOCH_RECONCILED,
+    advance_integration_epoch_after_merge,
+    arm_integration_epoch_merge_in_doubt,
+    close_integration_epoch,
     _merge_queue_item_matches_reconciled_head,
     decide_merge_gate,
     decide_merge_queue,
     decide_persisted_merge_gate,
     decide_persisted_merge_queue,
     execute_merge_queue_item,
+    get_active_integration_epoch,
     get_branch_context,
     git_merge_preview_evidence,
+    integration_epoch_resume_payload,
     list_merge_queue_items,
     merge_gate_plan_to_dict,
+    open_or_validate_integration_epoch,
     record_merge_queue_graph_epoch_after_reconcile,
     record_merge_queue_result,
     upsert_branch_context,
+    upsert_integration_epoch,
+    validate_integration_epoch_backlog_close,
     upsert_merge_queue_items,
 )
 
@@ -57,6 +72,39 @@ def _runtime_conn(path: str = ":memory:") -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _seed_batch_coordination_lineage(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    merge_queue_id: str,
+    backlog_id: str = "AC-BATCH-PARENT",
+) -> None:
+    task_timeline.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO task_timeline_events (
+            project_id, backlog_id, task_id, event_type,
+            event_kind, payload_json, created_at
+        ) VALUES (?, ?, ?, 'mf_batch_parallel.entered',
+                  'mf_batch_parallel_entered', ?, ?)
+        """,
+        (
+            PROJECT_ID,
+            backlog_id,
+            batch_id,
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "merge_queue_id": merge_queue_id,
+                    "backlog_id": backlog_id,
+                },
+                sort_keys=True,
+            ),
+            "2026-07-20T12:00:00Z",
+        ),
+    )
 
 
 def _passing_merge_evidence() -> dict[str, dict[str, str]]:
@@ -1328,3 +1376,478 @@ def test_merge_queue_item_matches_reconciled_head_prefix_rules() -> None:
         )
         is True
     )
+
+
+def test_reconcile_without_queue_scope_refuses_ambiguous_matching_epochs_without_mutation() -> None:
+    conn = _runtime_conn()
+    for suffix, target_ref, queue_id in (
+        ("one", "refs/heads/main", "mq-ambiguous-one"),
+        ("two", "refs/heads/release", "mq-ambiguous-two"),
+    ):
+        upsert_integration_epoch(
+            conn,
+            IntegrationEpoch(
+                project_id=PROJECT_ID,
+                batch_id=f"batch-ambiguous-{suffix}",
+                epoch_id=f"epoch-ambiguous-{suffix}",
+                coordination_backlog_id=f"AC-BATCH-{suffix.upper()}",
+                target_ref=target_ref,
+                base_head="base-head",
+                current_head="shared-final-head",
+                merge_queue_id=queue_id,
+                status=pbr.INTEGRATION_EPOCH_RECONCILE_PENDING,
+                reconcile_state="pending",
+            ),
+            now_iso="2026-07-20T12:00:00Z",
+        )
+
+    result = pbr.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="shared-final-head",
+        snapshot_id="full-shared-final-head",
+        projection_id="",
+        now_iso="2026-07-20T12:01:00Z",
+    )
+
+    assert result is None
+    for batch_id in ("batch-ambiguous-one", "batch-ambiguous-two"):
+        epoch = pbr.get_integration_epoch(conn, PROJECT_ID, batch_id)
+        assert epoch is not None
+        assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+        assert epoch.reconcile_state == "pending"
+        assert epoch.snapshot_id == ""
+        assert epoch.updated_at == "2026-07-20T12:00:00Z"
+
+
+def test_open_integration_epoch_refuses_non_contiguous_merged_prefix_without_mutation() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-prefix-gap"
+    queue_id = "mq-prefix-gap"
+    row2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-row2",
+        task_id="task-row2",
+        backlog_id="AC-PREFIX-ROW2",
+        branch_ref="refs/heads/codex/prefix-row2",
+        queue_index=2,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            replace(
+                row2,
+                queue_item_id="item-row1",
+                task_id="task-row1",
+                backlog_id="AC-PREFIX-ROW1",
+                queue_index=1,
+                status=STATE_MERGED,
+            ),
+            row2,
+            replace(
+                row2,
+                queue_item_id="item-row3",
+                task_id="task-row3",
+                backlog_id="AC-PREFIX-ROW3",
+                queue_index=3,
+                status=STATE_MERGED,
+            ),
+        ],
+    )
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
+
+    with pytest.raises(IntegrationEpochFrozenError) as exc:
+        open_or_validate_integration_epoch(
+            conn,
+            item=row2,
+            batch_id=batch_id,
+            target_head="base-head",
+        )
+
+    assert "merged row after the first unmerged row" in str(exc.value)
+    assert exc.value.epoch.failure_reason == "non_contiguous_merged_prefix"
+    assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
+def test_open_integration_epoch_requires_coordination_backlog_lineage_before_mutation() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-missing-coordination"
+    queue_id = "mq-missing-coordination"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-only",
+        task_id="task-only",
+        backlog_id="AC-MISSING-COORDINATION-CHILD",
+        branch_ref="refs/heads/codex/missing-coordination",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(conn, [item])
+
+    with pytest.raises(IntegrationEpochFrozenError) as exc:
+        open_or_validate_integration_epoch(
+            conn,
+            item=item,
+            batch_id=batch_id,
+            target_head="base-head",
+        )
+
+    assert "recover or replay" in str(exc.value)
+    assert "mf_batch_parallel.entered" in str(exc.value)
+    assert exc.value.epoch.failure_reason == (
+        "coordination_backlog_lineage_unresolved"
+    )
+    assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
+def test_integration_epoch_restart_recovers_already_integrated_item_and_freezes_unrelated_merge(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runtime_db = tmp_path / "integration-epoch.sqlite"
+    conn = _runtime_conn(str(runtime_db))
+    batch_id = "batch-restart"
+    queue_id = "mq-batch-restart"
+    row1 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-row1",
+        task_id="task-row1",
+        backlog_id="AC-BATCH-ROW1",
+        branch_ref="refs/heads/codex/row1",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+        current_target_head="base-head",
+        validated_target_head="base-head",
+        merge_preview_id="preview-row1",
+    )
+    row2 = replace(
+        row1,
+        queue_item_id="item-row2",
+        task_id="task-row2",
+        backlog_id="AC-BATCH-ROW2",
+        branch_ref="refs/heads/codex/row2",
+        queue_index=2,
+        merge_preview_id="preview-row2",
+    )
+    for task_id, backlog_id, checkpoint_id in (
+        ("task-row1", "AC-BATCH-ROW1", "checkpoint-row1"),
+        ("task-row2", "AC-BATCH-ROW2", "checkpoint-row2"),
+    ):
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PROJECT_ID,
+                batch_id=batch_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                branch_ref=f"refs/heads/codex/{task_id}",
+                status=STATE_MERGE_READY,
+                checkpoint_id=checkpoint_id,
+                merge_queue_id=queue_id,
+            ),
+        )
+    upsert_merge_queue_items(conn, [row1, row2])
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
+    epoch = open_or_validate_integration_epoch(
+        conn,
+        item=row1,
+        batch_id=batch_id,
+        target_head="base-head",
+        checkpoint_id="checkpoint-row1",
+    )
+    armed = arm_integration_epoch_merge_in_doubt(
+        conn,
+        epoch,
+        item=row1,
+        target_head_before="base-head",
+        branch_head="row1-head",
+    )
+    assert armed.status == INTEGRATION_EPOCH_MERGE_IN_DOUBT
+    conn.close()
+
+    restarted = _runtime_conn(str(runtime_db))
+    monkeypatch.setattr(
+        pbr,
+        "git_merge_preview_evidence",
+        lambda **_kwargs: {
+            "status": "pass",
+            "passed": True,
+            "target_commit": "merged-row1-head",
+            "branch_commit": "row1-head",
+        },
+    )
+    monkeypatch.setattr(
+        pbr,
+        "_git_preview_branch_is_ancestor",
+        lambda *_args, **_kwargs: True,
+    )
+    recovered = execute_merge_queue_item(
+        restarted,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        repo_root_path=tmp_path,
+        queue_item_id="item-row1",
+        target_ref=TARGET_REF,
+        dry_run=False,
+        allow_target_ref_mutation=False,
+    )
+    assert recovered["ok"] is True
+    assert recovered["already_integrated"] is True
+    assert recovered["target_ref_mutated"] is False
+    resumed_epoch = get_active_integration_epoch(
+        restarted, PROJECT_ID, target_ref=TARGET_REF
+    )
+    assert resumed_epoch is not None
+    assert resumed_epoch.merged_prefix == ("item-row1",)
+    assert resumed_epoch.active_queue_item_id == "item-row2"
+    assert resumed_epoch.active_checkpoint_id == "checkpoint-row2"
+    assert resumed_epoch.merge_cursor == 1
+
+    upsert_branch_context(
+        restarted,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id="unrelated-batch",
+            task_id="unrelated-task",
+            backlog_id="AC-UNRELATED",
+            branch_ref="refs/heads/codex/unrelated",
+            status=STATE_MERGE_READY,
+            merge_queue_id="mq-unrelated",
+        ),
+    )
+    upsert_merge_queue_items(
+        restarted,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mq-unrelated",
+                queue_item_id="item-unrelated",
+                task_id="unrelated-task",
+                backlog_id="AC-UNRELATED",
+                branch_ref="refs/heads/codex/unrelated",
+                queue_index=1,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+            )
+        ],
+    )
+    refused = execute_merge_queue_item(
+        restarted,
+        project_id=PROJECT_ID,
+        merge_queue_id="mq-unrelated",
+        repo_root_path=tmp_path,
+        queue_item_id="item-unrelated",
+        target_ref=TARGET_REF,
+        dry_run=False,
+        allow_target_ref_mutation=True,
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "integration_epoch_target_ref_frozen"
+    assert refused["next_legal_action"]["id"] == "resume_batch_merge"
+
+
+def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_skipped() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-projection-skipped"
+    queue_id = "mq-projection-skipped"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-only",
+        task_id="task-only",
+        backlog_id="AC-BATCH-ONLY",
+        branch_ref="refs/heads/codex/only",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+        current_target_head="base-head",
+        validated_target_head="base-head",
+        merge_preview_id="preview-only",
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id=item.task_id,
+            backlog_id=item.backlog_id,
+            branch_ref=item.branch_ref,
+            status=STATE_MERGE_READY,
+            checkpoint_id="checkpoint-only",
+            merge_queue_id=queue_id,
+        ),
+    )
+    upsert_merge_queue_items(conn, [item])
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
+    open_or_validate_integration_epoch(
+        conn,
+        item=item,
+        batch_id=batch_id,
+        target_head="base-head",
+        checkpoint_id="checkpoint-only",
+    )
+    record_merge_queue_result(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id=item.queue_item_id,
+        status=STATE_MERGED,
+        merge_commit="final-head",
+        target_head_before_merge="base-head",
+        target_head_after_merge="final-head",
+    )
+    epoch = advance_integration_epoch_after_merge(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        queue_item_id=item.queue_item_id,
+        merge_commit="final-head",
+    )
+    assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+
+    candidate_only = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="final-head",
+        snapshot_id="full-final-head",
+        projection_id="",
+        merge_queue_id=queue_id,
+        activation_completed=False,
+    )
+    assert candidate_only["integration_epoch_reconcile_recording"] == (
+        "deferred_until_snapshot_activation"
+    )
+    assert candidate_only["integration_epoch"]["status"] == (
+        pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+    )
+    pending = get_active_integration_epoch(conn, PROJECT_ID, merge_queue_id=queue_id)
+    assert pending is not None
+    assert integration_epoch_resume_payload(conn, pending)["id"] == (
+        "final_batch_reconcile"
+    )
+
+    recorded = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="final-head",
+        snapshot_id="full-final-head",
+        projection_id="",
+        merge_queue_id=queue_id,
+    )
+    assert recorded["semantic_projection_optional"] is True
+    assert recorded["projection_status"] == "skipped"
+    assert recorded["integration_epoch"]["status"] == INTEGRATION_EPOCH_RECONCILED
+    reconciled = get_active_integration_epoch(
+        conn, PROJECT_ID, merge_queue_id=queue_id
+    )
+    assert reconciled is not None
+    assert reconciled.snapshot_id == "full-final-head"
+    assert reconciled.projection_id == ""
+    assert integration_epoch_resume_payload(conn, reconciled)["id"] == (
+        "close_reconciled_child_rows"
+    )
+    conn.execute(
+        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO backlog_bugs (bug_id, status) VALUES (?, ?)",
+        ("AC-BATCH-ONLY", "FIXED"),
+    )
+    assert integration_epoch_resume_payload(conn, reconciled)["id"] == (
+        "close_batch_atomically"
+    )
+
+
+def test_child_close_waits_for_final_barrier_and_never_releases_epoch() -> None:
+    conn = _runtime_conn()
+    open_epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id="batch-close-barrier",
+            epoch_id="integration-epoch-close-barrier",
+            coordination_backlog_id="AC-BATCH-PARENT",
+            target_ref=TARGET_REF,
+            base_head="base-head",
+            current_head="partial-head",
+            merge_queue_id="mq-close-barrier",
+            remaining_queue_item_ids=("item-row2",),
+            status=pbr.INTEGRATION_EPOCH_OPEN,
+            active_queue_item_id="item-row2",
+            active_task_id="task-row2",
+            active_backlog_id="AC-BATCH-ROW2",
+        ),
+    )
+    with pytest.raises(IntegrationEpochFrozenError):
+        validate_integration_epoch_backlog_close(
+            open_epoch,
+            backlog_scope="child",
+            target_head_commit="partial-head",
+        )
+
+    reconciled = upsert_integration_epoch(
+        conn,
+        replace(
+            open_epoch,
+            status=INTEGRATION_EPOCH_RECONCILED,
+            current_head="final-head",
+            remaining_queue_item_ids=(),
+            active_queue_item_id="",
+            active_task_id="",
+            active_backlog_id="",
+            reconcile_state="reconciled",
+            snapshot_id="full-final-head",
+        ),
+    )
+    child_gate = validate_integration_epoch_backlog_close(
+        reconciled,
+        backlog_scope="child",
+        target_head_commit="final-head",
+    )
+    assert child_gate["passed"] is True
+    assert child_gate["preserve_epoch_freeze"] is True
+    assert child_gate["release_epoch"] is False
+    assert get_active_integration_epoch(
+        conn, PROJECT_ID, target_ref=TARGET_REF
+    ) is not None
+
+    parent_gate = validate_integration_epoch_backlog_close(
+        reconciled,
+        backlog_scope="coordination",
+        target_head_commit="final-head",
+    )
+    assert parent_gate["release_epoch"] is True
+    # A failed parent close after validation is still read-only and cannot
+    # release the epoch; only the atomic close write below does so.
+    assert get_active_integration_epoch(
+        conn, PROJECT_ID, target_ref=TARGET_REF
+    ) is not None
+    closed = close_integration_epoch(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=reconciled.batch_id,
+        target_head_commit="final-head",
+    )
+    assert closed.status == pbr.INTEGRATION_EPOCH_CLOSED
+    assert get_active_integration_epoch(
+        conn, PROJECT_ID, target_ref=TARGET_REF
+    ) is None

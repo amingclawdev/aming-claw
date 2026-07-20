@@ -25,6 +25,15 @@ except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
+INTEGRATION_EPOCH_RESUME_SCHEMA_VERSION = (
+    "contract_state.integration_epoch_resume_projection.v1"
+)
+_ACTIVE_INTEGRATION_EPOCH_STATES = {
+    "open",
+    "merge_in_doubt",
+    "reconcile_pending",
+    "reconciled",
+}
 CLI_AGENT_EXECUTION_TICKET_SCHEMA_VERSION = "cli_agent_execution_ticket.v1"
 CLI_AGENT_SUCCESSOR_TICKET_SCHEMA_VERSION = "cli_agent_successor_ticket.v1"
 CLI_AGENT_OBSERVER_ADMISSION_SCHEMA_VERSION = "cli_agent_observer.contract_runtime_admission.v1"
@@ -297,6 +306,50 @@ CLI_AGENT_QA_ONBOARD_GUIDANCE_MACHINE_CONTRACT = {
     },
     "raw_qa_session_token_public": False,
 }
+
+
+def integration_epoch_resume_projection(
+    epoch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the non-skippable batch recovery action above normal contract work.
+
+    This helper is intentionally read-only. The durable epoch remains owned by
+    ``parallel_branch_runtime``; contract state only exposes its precedence.
+    """
+
+    status = str(epoch.get("status") or "").strip()
+    if status not in _ACTIVE_INTEGRATION_EPOCH_STATES:
+        return {}
+    if status in {"open", "merge_in_doubt"}:
+        action_id = "resume_batch_merge"
+    elif status == "reconcile_pending":
+        action_id = "final_batch_reconcile"
+    else:
+        pending_children = epoch.get("pending_child_backlog_ids")
+        action_id = (
+            "close_reconciled_child_rows"
+            if isinstance(pending_children, (list, tuple)) and pending_children
+            else "close_batch_atomically"
+        )
+    return {
+        "schema_version": INTEGRATION_EPOCH_RESUME_SCHEMA_VERSION,
+        "next_legal_action": {
+            "id": action_id,
+            "line_id": action_id,
+            "source": "durable_integration_epoch",
+            "precedence": "active_integration_epoch",
+            "batch_id": str(epoch.get("batch_id") or ""),
+            "epoch_id": str(epoch.get("epoch_id") or ""),
+            "target_ref": str(epoch.get("target_ref") or ""),
+            "merge_queue_id": str(epoch.get("merge_queue_id") or ""),
+            "queue_item_id": str(epoch.get("active_queue_item_id") or ""),
+            "task_id": str(epoch.get("active_task_id") or ""),
+            "backlog_id": str(epoch.get("active_backlog_id") or ""),
+            "checkpoint_id": str(epoch.get("active_checkpoint_id") or ""),
+            "position_skippable": False,
+            "target_ref_frozen": True,
+        },
+    }
 CLI_AGENT_MANAGED_PROFILE_TOOLING_SCHEMA_VERSION = (
     "cli_agent.managed_profile_tooling_contract.v1"
 )

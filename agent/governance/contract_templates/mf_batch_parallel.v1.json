@@ -2,7 +2,7 @@
   "schema_version": "mf_contract_template.v1",
   "template_id": "mf_batch_parallel.v1",
   "version": "v1",
-  "description": "Parent route template for observer-led parallel work across multiple backlog rows. The parent batch owns fan-out planning only; each row enters its own mf_parallel successor with row-scoped route tokens, worker evidence, QA evidence, merge, reconcile, and close gates.",
+  "description": "Parent route template for observer-led parallel work across multiple backlog rows. Each row owns worker, independent QA, and protected close evidence; the parent owns one durable, restart-safe integration epoch that serializes merge and final reconcile, then atomically closes the coordination row with the epoch after every child has formally closed.",
   "task_types": [
     "mf_batch_parallel",
     "manual_fix",
@@ -14,7 +14,11 @@
     "row_fanout_planning",
     "row_successor_dispatch",
     "row_successor_tracking",
-    "batch_reconcile_summary"
+    "batch_integration_epoch",
+    "ordered_batch_merge",
+    "final_batch_reconcile",
+    "protected_child_closures",
+    "atomic_coordination_epoch_close"
   ],
   "required_instance_fields": [
     "batch_id",
@@ -31,7 +35,10 @@
     "batch_contract_draft",
     "fanout_ready",
     "row_successors_in_progress",
-    "waiting_row_closures",
+    "integration_epoch_open",
+    "merge_in_doubt",
+    "final_reconcile_pending",
+    "atomic_close_ready",
     "needs_revision",
     "batch_summary_ready",
     "accepted",
@@ -45,10 +52,13 @@
     "preflight_gate_required_before_fanout_ready": true,
     "preflight_planner_only": true,
     "durable_merge_queue_write_during_preflight": false,
+    "first_live_merge_opens_durable_integration_epoch": true,
+    "target_ref_frozen_until_atomic_close": true,
+    "onboard_active_epoch_precedes_ordinary_backlog_head": true,
     "single_row_successor_contract": "mf_parallel.v2",
     "row_scoped_successor_tokens": true,
     "shared_backlog_close_token_allowed": false,
-    "description": "The batch parent never shares one backlog token across rows. It creates a per-row successor plan; each row remains responsible for its own worker, QA, merge, reconcile, and close evidence."
+    "description": "The batch parent never shares one worker token across rows. Rows retain worker, independent QA, and protected close authority. After the first live merge, only the parent-owned canonical epoch cursor may mutate the target ref. Child closes never release the freeze; the coordination close releases it only after all protected child closes and one final reconcile."
   },
   "preflight_gate": {
     "schema_version": "mf_batch_parallel.preflight_gate_contract.v1",
@@ -97,8 +107,54 @@
     },
     "close_policy": {
       "per_row_close_required": true,
-      "batch_close_is_summary_only": true,
-      "batch_parent_must_not_close_child_rows": true
+      "child_close_while_epoch_active": "allowed_only_through_own_protected_close",
+      "child_close_releases_epoch": false,
+      "batch_close_is_summary_only": false,
+      "batch_parent_atomic_close_required": true,
+      "coordination_close_requires_children_fixed": true,
+      "atomic_close_scope": [
+        "coordination_backlog_id",
+        "integration_epoch"
+      ]
+    }
+  },
+  "integration_epoch_contract": {
+    "schema_version": "mf_batch_parallel.integration_epoch_contract.v1",
+    "open_trigger": "first_live_merge",
+    "durable_fields": [
+      "project_id",
+      "coordination_backlog_id",
+      "target_ref",
+      "batch_id",
+      "base_head",
+      "current_head",
+      "merge_queue_id",
+      "merge_cursor",
+      "merged_prefix",
+      "remaining_queue_item_ids",
+      "reconcile_state"
+    ],
+    "freeze_policy": {
+      "unrelated_same_target_dispatch": "refuse",
+      "unrelated_same_target_merge": "refuse",
+      "existing_materialized_worker_analysis": "allow",
+      "partial_head_as_new_dispatch_base": "refuse",
+      "position_skip": "refuse"
+    },
+    "restart_policy": {
+      "next_legal_action": "resume_batch_merge",
+      "source": "durable_integration_epoch",
+      "merge_in_doubt_resolution": "actual_target_ref_and_ancestry",
+      "blind_replay": false
+    },
+    "final_barrier": {
+      "all_queue_items_merged": true,
+      "one_current_full_reconcile": true,
+      "semantic_projection_optional_when_activation_skips_projection": true,
+      "reconcile_failure_keeps_epoch_open": true,
+      "child_protected_close_requires_reconciled_epoch": true,
+      "all_child_rows_formally_closed_before_coordination_close": true,
+      "release_only_in_atomic_coordination_epoch_close": true
     }
   },
   "observer_contract": {
@@ -109,7 +165,11 @@
       "detect_conflicts_between_rows",
       "create_per_row_mf_parallel_successor_plan",
       "track_row_successor_state",
-      "summarize_batch_completion"
+      "summarize_batch_completion",
+      "resume_canonical_batch_merge_after_restart",
+      "run_one_final_current_full_reconcile",
+      "verify_protected_child_closures",
+      "close_coordination_and_epoch_atomically"
     ],
     "default_forbidden_actions": [
       "shared_row_token",
