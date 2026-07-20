@@ -59470,6 +59470,19 @@ def _contract_runtime_bind_qa_graph_authority(
             },
         )
     session = ctx.require_auth(conn)
+    if _normalized_contract_runtime_action(session.get("role")) != "qa":
+        raise PermissionDeniedError(
+            str(session.get("role") or "unknown"),
+            "contract_runtime_qa_graph_authority",
+            {
+                "required_role": "qa",
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "authority_source": "authenticated_qa_session",
+            },
+        )
     expected_candidate_commit = _contract_runtime_server_candidate_commit(
         conn,
         project_id=project_id,
@@ -59554,6 +59567,80 @@ def _contract_runtime_bind_qa_graph_authority(
     effective["payload"] = payload
     effective["graph_trace_ids"] = list(requested_trace_ids)
     effective["graph_query_trace_ids"] = list(requested_trace_ids)
+    # The graph authority above is bound to the authenticated QA principal and
+    # session as well as the persisted graph-query rows.  Rebuild provenance
+    # from that trusted context instead of retaining caller-shaped ownership or
+    # authorization claims.  The opaque QA-session ref is transport state in
+    # the managed MCP process; it is not itself accepted as caller evidence.
+    qa_provenance_security_fields = {
+        "authorization_source",
+        "completion_status_gate",
+        "evidence_owner_actor",
+        "evidence_owner_role",
+        "evidence_owner_session",
+        "evidence_owner_session_ref",
+        "materialized_from",
+        "materialized_from_report",
+        "observer_impersonation",
+        "parent_materialization_authorized",
+        "qa_session_token_ref",
+        "submitter_principal",
+        "submitter_session",
+    }
+    caller_provenance = (
+        effective.get("qa_evidence_provenance")
+        if isinstance(effective.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    canonical_provenance = _contract_runtime_strip_authority_claims(
+        caller_provenance,
+        field_names=qa_provenance_security_fields,
+    )
+    canonical_provenance = (
+        dict(canonical_provenance)
+        if isinstance(canonical_provenance, Mapping)
+        else {}
+    )
+    qa_principal = str(session.get("principal_id") or "qa").strip() or "qa"
+    qa_session_id = str(session.get("session_id") or "").strip()
+    canonical_provenance.update(
+        {
+            "schema_version": "qa_evidence_provenance.v1",
+            "source": "contract_runtime_qa_graph_authority_binding",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": {
+                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+                "server_derived": True,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+                "graph_trace_session_matched": True,
+            },
+        }
+    )
+    for field in qa_provenance_security_fields:
+        effective.pop(field, None)
+    effective.update(
+        {
+            "actor_session_principal": qa_principal,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_role": "qa",
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "qa_evidence_provenance": canonical_provenance,
+        }
+    )
     for field in ("runtime_context_id", "task_id", "parent_task_id"):
         value = str(evidence.get(field) or identity.get(field) or "").strip()
         if value:

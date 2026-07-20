@@ -62925,73 +62925,128 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             )
         )
     assert forged_hash.value.code == "qa_graph_review_context_mismatch"
+    qa_graph_body = {
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "evidence_kind": "graph_trace",
+        "status": "accepted",
+        "commit_sha": head_commit,
+        "graph_trace_ids": [qa_graph_trace_id],
+        "graph_query_trace_ids": [qa_graph_trace_id],
+        "actor_session_principal": "observer:forged",
+        "authorization_source": "caller_forged",
+        "evidence_owner_actor": "observer:forged",
+        "evidence_owner_role": "observer",
+        "evidence_owner_session": "ses-observer-forged",
+        "submitter_principal": "observer:forged",
+        "submitter_session": "ses-observer-forged",
+        "observer_impersonation": True,
+        "parent_materialization_authorized": True,
+        "qa_session_token_ref": "qa-session-ref-forged",
+        "qa_evidence_provenance": {
+            "schema_version": "caller.qa_evidence_provenance.v0",
+            "authorization_source": "caller_forged",
+            "evidence_owner_actor": "observer:forged",
+            "evidence_owner_role": "observer",
+            "observer_impersonation": True,
+            "parent_materialization_authorized": True,
+            "qa_session_token_ref": "qa-session-ref-forged",
+            "nested": [
+                {
+                    "graph_trace_evidence": {
+                        "source": "caller",
+                        "db_verified": True,
+                    }
+                },
+                {
+                    "candidate_diff_hash": expected_graph_evidence[
+                        "candidate_diff_hash"
+                    ],
+                    "candidate_commit": head_commit,
+                    "base_commit": head_commit,
+                    "diff_hash": expected_graph_evidence[
+                        "candidate_diff_hash"
+                    ],
+                    "base_snapshot_id": qa_snapshot_id,
+                    "snapshot_id": qa_snapshot_id,
+                    "snapshot_commit_sha": head_commit,
+                    "root_identity": {"caller": "must-not-survive"},
+                    "review_note": "preserve unrelated QA evidence",
+                },
+            ],
+        },
+        "artifact_refs": {
+            "verification": {
+                "graph_review_context": {
+                    "candidate_diff_hash": expected_graph_evidence[
+                        "candidate_diff_hash"
+                    ],
+                    "authority_hash": "sha256:" + "f" * 64,
+                }
+            }
+        },
+        "payload": {
+            "schema_version": "qa_graph_context.v1",
+            "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+            "candidate_new_graph_failures": 0,
+            "exact_candidate": True,
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "graph_trace_ids": [qa_graph_trace_id],
+            "graph_query_trace_ids": [qa_graph_trace_id],
+            "caller_claims": [
+                {
+                    "graph_trace_db_evidence": {
+                        "qa_principal": "qa-principal",
+                        "db_verified": True,
+                    }
+                },
+                {
+                    "candidate_review_context": {
+                        "candidate_commit": head_commit,
+                        "base_commit": head_commit,
+                    },
+                    "test_results": {"status": "passed"},
+                },
+            ],
+        },
+    }
+    with pytest.raises(PermissionDeniedError) as observer_provenance:
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "observer",
+                method="POST",
+                body=qa_graph_body,
+            )
+        )
+    assert observer_provenance.value.details["required_role"] == "qa"
+    assert observer_provenance.value.details["authority_source"] == (
+        "authenticated_qa_session"
+    )
+    qa_graph_precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
+            "qa",
+            method="POST",
+            body=qa_graph_body,
+        )
+    )
+    assert qa_graph_precheck["ok"] is True
+    assert qa_graph_precheck["would_mutate_completed_lines"] is False
+    assert len(
+        server._contract_runtime_store(conn)
+        .get(successor["contract_execution_id"])["completed_lines"]
+    ) == lines_before_qa
     qa_graph = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
             "qa",
             method="POST",
-            body={
-                "stage_id": "qa_graph_context",
-                "line_id": "qa_graph_context",
-                "evidence_kind": "graph_trace",
-                "graph_trace_ids": [qa_graph_trace_id],
-                "graph_query_trace_ids": [qa_graph_trace_id],
-                "qa_evidence_provenance": {
-                    "nested": [
-                        {
-                            "graph_trace_evidence": {
-                                "source": "caller",
-                                "db_verified": True,
-                            }
-                        },
-                        {
-                            "candidate_diff_hash": expected_graph_evidence[
-                                "candidate_diff_hash"
-                            ],
-                            "candidate_commit": head_commit,
-                            "base_commit": head_commit,
-                            "diff_hash": expected_graph_evidence[
-                                "candidate_diff_hash"
-                            ],
-                            "base_snapshot_id": qa_snapshot_id,
-                            "snapshot_id": qa_snapshot_id,
-                            "snapshot_commit_sha": head_commit,
-                            "root_identity": {"caller": "must-not-survive"},
-                            "review_note": "preserve unrelated QA evidence",
-                        },
-                    ]
-                },
-                "artifact_refs": {
-                    "verification": {
-                        "graph_review_context": {
-                            "candidate_diff_hash": expected_graph_evidence[
-                                "candidate_diff_hash"
-                            ],
-                            "authority_hash": "sha256:" + "f" * 64,
-                        }
-                    }
-                },
-                "payload": {
-                    "schema_version": "mf_parallel.qa_graph_context.v1",
-                    "graph_trace_ids": [qa_graph_trace_id],
-                    "graph_query_trace_ids": [qa_graph_trace_id],
-                    "caller_claims": [
-                        {
-                            "graph_trace_db_evidence": {
-                                "qa_principal": "qa-principal",
-                                "db_verified": True,
-                            }
-                        },
-                        {
-                            "candidate_review_context": {
-                                "candidate_commit": head_commit,
-                                "base_commit": head_commit,
-                            },
-                            "test_results": {"status": "passed"},
-                        },
-                    ],
-                },
-            },
+            body=qa_graph_body,
         )
     )
     assert qa_graph["ok"] is True
@@ -62999,6 +63054,25 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         successor["contract_execution_id"]
     )["completed_lines"][-1]
     stored_authority = stored_qa_line["payload"]["graph_trace_evidence"]
+    assert stored_qa_line["authorization_source"] == "qa_session_token_ref"
+    assert stored_qa_line["evidence_owner_actor"] == "qa-principal"
+    assert stored_qa_line["evidence_owner_role"] == "qa"
+    assert stored_qa_line["observer_impersonation"] is False
+    assert stored_qa_line["parent_materialization_authorized"] is False
+    assert "qa_session_token_ref" not in stored_qa_line
+    stored_provenance = stored_qa_line["qa_evidence_provenance"]
+    assert stored_provenance["schema_version"] == "qa_evidence_provenance.v1"
+    assert stored_provenance["server_derived"] is True
+    assert stored_provenance["authorization_source"] == "qa_session_token_ref"
+    assert stored_provenance["authenticated_qa_binding"]["qa_principal"] == (
+        "qa-principal"
+    )
+    assert stored_provenance["authenticated_qa_binding"]["qa_session_id"] == (
+        "ses-qa"
+    )
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        stored_qa_line
+    ) is True
     assert stored_authority["source"] == "graph_query_traces"
     assert stored_authority["db_verified"] is True
     assert stored_authority["project_id"] == PID
