@@ -950,6 +950,168 @@ def test_runtime_context_finish_resolves_recorded_commit_and_rejects_later_drift
     assert drift.value.code == "contract_worker_commit_drift"
 
 
+def test_same_lane_worker_commit_recovery_requires_bounded_descendant_and_reopens_order(
+    tmp_path,
+):
+    worktree = tmp_path / "same-lane-worker-commit-recovery"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Commit Test"],
+        cwd=worktree,
+        check=True,
+    )
+    owned = worktree / "owned.py"
+    owned.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    owned.write_text("implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "implementation"],
+        cwd=worktree,
+        check=True,
+    )
+    worker_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    implementation = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": "runtime_context:mfrctx-repair",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "runtime_context_id": "mfrctx-repair",
+        "task_id": "task-repair",
+        "changed_files": ["owned.py"],
+        "graph_trace_ids": ["gqt-repair"],
+    }
+    record = {
+        "contract_execution_id": "cex-repair",
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_finish_time_attestation",
+            }
+        },
+        "completed_lines": [implementation],
+    }
+    lineage = _worker_implementation_lineage(record, implementation)
+    record["completed_lines"].append(
+        {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "line_instance_id": "runtime_context:mfrctx-repair",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+            "runtime_context_id": "mfrctx-repair",
+            "task_id": "task-repair",
+            "commit_sha": worker_commit,
+            "payload": {
+                "runtime_context_id": "mfrctx-repair",
+                "task_id": "task-repair",
+                "worker_commit_sha": worker_commit,
+                "changed_files": ["owned.py"],
+                "commit_diff_files": ["owned.py"],
+                "diff_base_commit": base_commit,
+                "owned_files": ["owned.py"],
+                "implementation_lineage_ref": lineage[
+                    "implementation_lineage_ref"
+                ],
+                "graph_trace_ids": ["gqt-repair"],
+            },
+        }
+    )
+    owned.write_text("bounded repair\n", encoding="utf-8")
+    subprocess.run(["git", "add", "owned.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "bounded repair"],
+        cwd=worktree,
+        check=True,
+    )
+    repair_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-repair",
+        task_id="task-repair",
+        worktree_path=str(worktree),
+        base_commit=base_commit,
+        owned_files=("owned.py",),
+        target_files=("owned.py",),
+    )
+
+    recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        record,
+        context,
+    )
+    assert recovery["status"] == "eligible"
+    assert recovery["recorded_commit_sha"] == worker_commit
+    assert recovery["actual_worktree_head_commit"] == repair_commit
+    assert recovery["changed_files"] == ["owned.py"]
+    assert recovery["append_only_history_preserved"] is True
+
+    reopened = server._runtime_context_row_scoped_finish_head_projection(
+        row_scoped_implementation_head_commit=worker_commit,
+        current_branch_head_commit=repair_commit,
+        contract_worker_commit_required=True,
+        canonical_worker_commit_head=worker_commit,
+        same_lane_worker_commit_recovery=recovery,
+    )
+    assert reopened["status"] == "worker_commit_repair_ready"
+    assert reopened["next_legal_action"] == "record_worker_commit"
+
+    exact_head = server._runtime_context_row_scoped_finish_head_projection(
+        row_scoped_implementation_head_commit=worker_commit,
+        current_branch_head_commit=repair_commit,
+        contract_worker_commit_required=True,
+        canonical_worker_commit_head=repair_commit,
+    )
+    assert exact_head["status"] == "worker_commit_recorded"
+    assert exact_head["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+
+    owned.write_text("dirty widened state\n", encoding="utf-8")
+    blocked = server._runtime_context_same_lane_worker_commit_recovery(
+        record,
+        context,
+    )
+    assert blocked["status"] == "blocked"
+    assert "assigned worktree is dirty" in blocked["errors"]
+    stopped = server._runtime_context_row_scoped_finish_head_projection(
+        row_scoped_implementation_head_commit=worker_commit,
+        current_branch_head_commit=repair_commit,
+        contract_worker_commit_required=True,
+        canonical_worker_commit_head=worker_commit,
+        same_lane_worker_commit_recovery=blocked,
+    )
+    assert stopped["status"] == "worker_commit_drift_blocked"
+    assert stopped["next_legal_action"] == (
+        "stop_and_report_worker_commit_drift"
+    )
+
+
 def test_worker_commit_bypass_continuation_preserves_current_candidate_without_pass(monkeypatch):
     candidate_commit, old_commit, base_commit = "b" * 40, "a" * 40, "c" * 40
     runtime_context_id = "mfrctx-worker-commit-bypass"
@@ -58576,6 +58738,248 @@ def test_runtime_context_worker_guide_projects_canonical_worker_commit_after_imp
     assert '"session_token":' not in serialized_safe_copy
     assert '"fence_token":' not in serialized_safe_copy
     assert '"route_token":' not in serialized_safe_copy
+
+
+def test_same_lane_worker_commit_revision_is_append_only_and_advances_to_attestation(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-SAME-LANE-WORKER-COMMIT-REVISION"
+    worker_task_id = "same-lane-worker-commit-revision-worker"
+    worktree = tmp_path / worker_task_id
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "worker@example.test"],
+        cwd=worktree,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Worker Commit Test"],
+        cwd=worktree,
+        check=True,
+    )
+    owned = worktree / "agent" / "governance" / "server.py"
+    owned.parent.mkdir(parents=True)
+    owned.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "agent/governance/server.py"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True)
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    owned.write_text("implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "agent/governance/server.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "implementation"],
+        cwd=worktree,
+        check=True,
+    )
+    worker_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="same-lane-worker-commit-revision-parent",
+        worker_task_id=worker_task_id,
+        fence_token="fence-same-lane-worker-commit-revision",
+        token="token-same-lane-worker-commit-revision",
+        worktree_path=str(worktree),
+        target_project_root=str(worktree),
+        base_commit=base_commit,
+    )
+    graph_trace_id = "gqt-same-lane-worker-commit-revision"
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=worker_commit,
+        implementation_event_ref="timeline:same-lane-implementation",
+        include_worker_commit=False,
+    )
+    runtime = server._contract_runtime(conn)
+    runtime.current_guide(successor["contract_execution_id"], actor_role="mf_sub")
+    record = runtime.store.get(successor["contract_execution_id"])
+    implementation = server._runtime_context_actual_worker_implementation_line(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )[2]
+    _implementation_payload, initial_commit_payload = (
+        _mf_parallel_worker_proof_payloads(
+            runtime_context,
+            parent_task_id=backlog_id,
+            graph_trace_id=graph_trace_id,
+            head_commit=worker_commit,
+            implementation_event_ref="timeline:same-lane-implementation",
+        )
+    )
+    initial_commit_payload.update(
+        {
+            "implementation_lineage_ref": implementation[
+                "implementation_lineage_ref"
+            ],
+            "worker_implementation_lineage": implementation,
+            "commit_parent_sha": base_commit,
+            "diff_base_commit": base_commit,
+        }
+    )
+    initial_write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    initial_write.update(initial_commit_payload)
+    initial_write["payload"] = initial_commit_payload
+    assert runtime.submit_line_write(
+        successor["contract_execution_id"],
+        initial_write,
+        actor_role="mf_sub",
+    )["ok"] is True
+    conn.commit()
+    before = runtime.store.get(successor["contract_execution_id"])
+    before_worker_commits = [
+        dict(line)
+        for line in before["completed_lines"]
+        if line.get("line_id") == "worker_commit"
+    ]
+    assert len(before_worker_commits) == 1
+
+    owned.write_text("bounded repair\n", encoding="utf-8")
+    subprocess.run(["git", "add", "agent/governance/server.py"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "bounded repair"],
+        cwd=worktree,
+        check=True,
+    )
+    repair_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    recovery = server._runtime_context_same_lane_worker_commit_recovery(
+        before,
+        runtime_context,
+    )
+    assert recovery["status"] == "eligible"
+    projected, projection = server._contract_runtime_apply_mf_parallel_context_projection(
+        conn,
+        project_id=PID,
+        record=before,
+        actor_role="mf_sub",
+    )
+    projected_write = server._contract_runtime_write_from_record(
+        projected,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    precheck = server._contract_runtime_same_lane_worker_commit_precheck(
+        stored_record=before,
+        projected_record=projected,
+        projection=projection,
+        write=projected_write,
+        actor_role="mf_sub",
+    )
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "completed_lines"
+    ] == before["completed_lines"]
+    route_precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                **projected_write,
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "worker_id": runtime_context.worker_id,
+                "worker_slot_id": runtime_context.worker_slot_id,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "session_token": "token-same-lane-worker-commit-revision",
+                "fence_token": "fence-same-lane-worker-commit-revision",
+                "target_project_root": runtime_context.target_project_root,
+            },
+        )
+    )
+    assert route_precheck["ok"] is True
+    assert route_precheck["would_mutate_completed_lines"] is False
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "completed_lines"
+    ] == before["completed_lines"]
+
+    repair_diff = server._runtime_context_worker_commit_revision_diff(
+        str(worktree),
+        repair_commit,
+        base_commit=base_commit,
+    )
+    replacement_payload = {
+        **initial_commit_payload,
+        "worker_commit_sha": repair_commit,
+        "commit_sha": repair_commit,
+        "head_commit": repair_commit,
+        "immutable_head_commit": repair_commit,
+        "validated_head_commit": repair_commit,
+        "commit_parent_sha": repair_diff["parent_commit"],
+        "diff_base_commit": repair_diff["base_commit"],
+    }
+    gate = server._runtime_context_append_same_lane_worker_commit_revision(
+        runtime=runtime,
+        record=before,
+        context=runtime_context,
+        payload=replacement_payload,
+    )
+    assert gate["accepted"] is True
+    assert gate["append_only_history_preserved"] is True
+    after = runtime.store.get(successor["contract_execution_id"])
+    after_worker_commits = [
+        line
+        for line in after["completed_lines"]
+        if line.get("line_id") == "worker_commit"
+    ]
+    assert len(after_worker_commits) == 2
+    assert after_worker_commits[0] == before_worker_commits[0]
+    assert after_worker_commits[-1]["commit_sha"] == repair_commit
+    assert after_worker_commits[-1]["payload"][
+        "canonical_same_lane_repair_head_revision"
+    ]["append_only_history_preserved"] is True
+    assert after["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_finish_time_attestation"
+    )
+    canonical_line, _canonical_payload = (
+        server._runtime_context_actual_worker_commit_line(
+            conn,
+            contract_execution_id=successor["contract_execution_id"],
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=runtime_context.task_id,
+        )
+    )
+    assert canonical_line["commit_sha"] == repair_commit
 
 
 def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
