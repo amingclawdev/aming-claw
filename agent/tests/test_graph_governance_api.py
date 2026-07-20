@@ -58365,8 +58365,11 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         },
     )
     for event, created_at in (
-        (merge_event, "2026-07-16T23:27:43Z"),
-        (reconcile_event, "2026-07-16T23:29:00Z"),
+        # Timeline timestamps have one-second resolution.  Position authority
+        # comes from the QA revision and strict merge/reconcile event ids, so
+        # a legal chain may persist all three positions in the same second.
+        (merge_event, "2026-07-16T23:27:42Z"),
+        (reconcile_event, "2026-07-16T23:27:42Z"),
     ):
         conn.execute(
             "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
@@ -58563,7 +58566,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         snapshot_id=snapshot_id,
         target_commit_sha=merged_commit,
         request_id="req-contract-runtime-merge-authority",
-        request_started_at="2026-07-16T23:28:59Z",
+        request_started_at="2026-07-16T23:27:42Z",
         route_evidence={
             "schema_version": "graph_current_full_reconcile.route_evidence.v1",
             "authenticated_role": "observer",
@@ -58587,8 +58590,8 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         },
         runtime_context_scope=runtime_scope,
         reconcile_event_id=int(reconcile_event["id"]),
-        reconcile_event_created_at="2026-07-16T23:29:00Z",
-        marker_created_at="2026-07-16T23:29:01Z",
+        reconcile_event_created_at="2026-07-16T23:27:42Z",
+        marker_created_at="2026-07-16T23:27:42Z",
     )
 
     authority = server._contract_runtime_completed_merge_authority(
@@ -58785,11 +58788,17 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert qa_to_merge["server_authority_checks"][
         "qa_acceptance_trusted"
     ] is True
+    assert qa_to_merge["before_source_event_time"] == (
+        qa_to_merge["after_source_event_time"]
+    )
     merge_to_reconcile = ordering_by_requirement[
         "contract_runtime.reconcile_after_merge"
     ]
     assert merge_to_reconcile["ordering_source"] == (
         "server_derived_durable_merge_to_reconcile"
+    )
+    assert merge_to_reconcile["before_source_event_time"] == (
+        merge_to_reconcile["after_source_event_time"]
     )
     assert merge_to_reconcile["passed"] is True
 

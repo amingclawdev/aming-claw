@@ -73310,11 +73310,13 @@ def _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
     merge_line: Mapping[str, Any],
     reconcile_line: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Verify strict ordering from server-bound merge/reconcile authority only.
+    """Verify immutable ordering from server-bound merge/reconcile authority only.
 
     QA acceptance is a ContractRuntime store fact and therefore has no
     redundant timeline event.  Merge and reconcile remain ordered by the
     immutable server-derived timeline ids/timestamps bound onto their lines.
+    IDs and ContractRuntime revisions remain strictly increasing; the
+    second-resolution timestamps are only required to be non-decreasing.
     Caller-shaped source_event_* fields are deliberately ignored here.
     """
 
@@ -73467,14 +73469,14 @@ def _contract_runtime_mf_parallel_server_temporal_ordering_diagnostic(
         qa_acceptance_trusted
         and merge_event_order is not None
         and qa_acceptance_order is not None
-        and merge_event_order > qa_acceptance_order
+        and merge_event_order >= qa_acceptance_order
     )
     merge_before_reconcile = bool(
         merge_event_id > 0
         and reconcile_event_id > merge_event_id
         and reconcile_event_order is not None
         and merge_event_order is not None
-        and reconcile_event_order > merge_event_order
+        and reconcile_event_order >= merge_event_order
         and reconcile_source_ref == f"timeline:{reconcile_event_id}"
     )
     common_authority_passed = bool(
