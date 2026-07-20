@@ -38265,7 +38265,7 @@ def _current_full_reconcile_contract_merge_authority(
             and int(authority.get("merge_event_id") or 0) > 0
             and qa_time is not None
             and merge_time is not None
-            and qa_time < merge_time
+            and qa_time <= merge_time
         )
         if not strict_authority:
             audited_exception = (
@@ -55967,7 +55967,7 @@ def _contract_runtime_projection_merge_authority(
         and merge_event_id > qa_event_id
         and qa_time is not None
         and merge_time is not None
-        and qa_time < merge_time
+        and qa_time <= merge_time
         and merge_event_id > 0
         and merge_event_created_at
     )
@@ -56184,13 +56184,13 @@ def _contract_runtime_projection_post_worker_lines(
             merge_event_id > qa_event_id > 0
             and qa_time is not None
             and merge_time is not None
-            and qa_time < merge_time
+            and qa_time <= merge_time
         )
         reconcile_order_valid = bool(
             reconcile_event_id > merge_event_id > 0
             and merge_time is not None
             and reconcile_time is not None
-            and merge_time < reconcile_time
+            and merge_time <= reconcile_time
         )
         if not qa_authoritative or not merge_order_valid:
             merge_event = {}
@@ -71716,6 +71716,7 @@ def _contract_runtime_close_gate(
     body: Mapping[str, Any],
     event_kind: str,
     norm_payload: Mapping[str, Any],
+    normalized_status: str = "",
     trusted_actor_role: str = "",
     trusted_worker_commit_facade: bool = False,
 ) -> dict[str, Any]:
@@ -71849,6 +71850,8 @@ def _contract_runtime_close_gate(
                     or canonical_norm_payload
                 )
     write["payload"] = canonical_norm_payload
+    if normalized_status:
+        write["status"] = normalized_status
     for key in ("artifact_refs", "verification", "trace_id", "commit_sha"):
         if key in body:
             write[key] = body[key]
@@ -77520,6 +77523,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     body=ctx.body or {},
                     event_kind=norm_event_kind,
                     norm_payload=validation_payload,
+                    normalized_status=norm_status,
                     trusted_actor_role=trusted_contract_runtime_actor_role,
                 )
             if meta_contract_error_message:

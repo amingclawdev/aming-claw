@@ -2723,22 +2723,21 @@ def current_full_reconcile_state(
         and merge_time is not None
         and reconcile_time is not None
         and marker_time is not None
-        and (
-            reconcile_time > merge_time
-            if qa_order_required
-            else reconcile_time >= merge_time
-        )
+        # Timeline ids/revisions carry strict position. Timestamps are emitted
+        # at one-second resolution, so they may be equal without being out of
+        # order; only a backwards timestamp is invalid.
+        and reconcile_time >= merge_time
         and marker_time >= reconcile_time
         and (
             not qa_order_required
             or (
                 canonical_qa_acceptance
-                and qa_acceptance_time < merge_time
+                and qa_acceptance_time <= merge_time
             )
             or (
                 timeline_qa_acceptance
                 and merge_event_id > qa_event_id
-                and qa_time < merge_time
+                and qa_time <= merge_time
             )
         )
     )

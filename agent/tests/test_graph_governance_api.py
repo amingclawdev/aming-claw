@@ -2726,6 +2726,24 @@ def test_current_full_state_orders_canonical_qa_acceptance_without_qa_event(conn
     assert state["durable_order_verified"] is True
     assert state["db_verified"] is True
 
+    same_second = store.current_full_reconcile_state(
+        conn,
+        PID,
+        commit_sha,
+        qa_source_ref=(
+            "contract_runtime:cex-canonical-qa:completed_lines:10"
+        ),
+        qa_acceptance_created_at="2026-07-16T23:29:00Z",
+        qa_acceptance_revision=12,
+        qa_contract_runtime_verified=True,
+        merge_event_id=50,
+        merge_event_created_at="2026-07-16T23:29:00Z",
+        reconcile_event_id=52,
+        reconcile_event_created_at="2026-07-16T23:29:00Z",
+    )
+    assert same_second["durable_order_verified"] is True
+    assert same_second["db_verified"] is True
+
     forged = store.current_full_reconcile_state(
         conn,
         PID,
@@ -62759,6 +62777,16 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         if line["line_id"] == "qa_independent_verification"
     ][0]
     assert qa_line["actor_role"] == "qa"
+    assert qa_line["status"] == "passed"
+    assert qa_line["qa_evidence_provenance"]["completion_status_gate"] == {
+        "schema_version": "contract_runtime.qa_completion_status_gate.v1",
+        "source": "contract_runtime_line_write_normalization",
+        "top_level_status_present": True,
+        "top_level_status_passing": True,
+        "normalized_status": "passed",
+        "nested_payload_decision_satisfies": False,
+        "server_derived": True,
+    }
 
     duplicate_result = server.handle_task_timeline_append(
         _ctx(
@@ -62961,6 +62989,34 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
             "authentication_source": "test_protected_entrypoint",
             "raw_route_token_persisted": False,
             "protected_action": "graph_current_full_reconcile",
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": successor["contract_execution_id"],
+            },
+            "task_id": runtime_context.task_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "contract_execution_id": successor["contract_execution_id"],
+            "runtime_context_scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": runtime_context.parent_task_id,
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "merge_queue_id": runtime_context.merge_queue_id,
+                "contract_execution_id": successor["contract_execution_id"],
+                "source": "parallel_branch_runtime_context",
+                "server_derived": True,
+            },
+        },
+        runtime_context_scope={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": runtime_context.parent_task_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "merge_queue_id": runtime_context.merge_queue_id,
+            "contract_execution_id": successor["contract_execution_id"],
         },
         reconcile_event_id=int(reconcile_event["id"]),
         reconcile_event_created_at=str(reconcile_event["created_at"]),
