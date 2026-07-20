@@ -32571,14 +32571,24 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     prior_worker_commit = stored["completed_lines"][prior_worker_commit_index]
     assert prior_worker_commit["line_id"] == "worker_commit"
     assert prior_worker_commit["commit_sha"] == initial_head
-    prior_worker_commit["implementation_lineage_ref"] = prior_lineage[
-        "implementation_lineage_ref"
-    ]
+    prior_worker_commit.pop("implementation_lineage_ref", None)
     prior_worker_commit_payload = prior_worker_commit.get("payload")
     assert isinstance(prior_worker_commit_payload, dict)
     prior_worker_commit_payload["implementation_lineage_ref"] = prior_lineage[
         "implementation_lineage_ref"
     ]
+    prior_worker_commit_payload["worker_implementation_lineage"] = {
+        "implementation_lineage_ref": prior_lineage[
+            "implementation_lineage_ref"
+        ]
+    }
+    assert not prior_worker_commit.get("implementation_lineage_ref")
+    assert prior_worker_commit_payload["implementation_lineage_ref"] == (
+        prior_lineage["implementation_lineage_ref"]
+    )
+    assert prior_worker_commit_payload["worker_implementation_lineage"][
+        "implementation_lineage_ref"
+    ] == prior_lineage["implementation_lineage_ref"]
     passed_common = {
         "runtime_context_id": runtime_context.runtime_context_id,
         "task_id": runtime_context.task_id,
@@ -33336,11 +33346,15 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     fallback_negative_cases = {}
     for case_name in (
         "missing_worker_commit",
+        "lineage_missing",
         "lineage_mismatch",
+        "lineage_conflicting_canonical_first_value",
         "runtime_mismatch",
         "task_mismatch",
         "multiple_different_commits",
         "non_full_commit",
+        "nested_commit_only",
+        "top_level_commit_missing",
     ):
         case_record = json.loads(
             json.dumps(runtime.store.get(successor["contract_execution_id"]))
@@ -33375,9 +33389,33 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             case_implementation["payload"]["commit_sha"] = initial_head
             case_implementation["payload"]["head_commit"] = initial_head
             case_record["completed_lines"].pop(case_worker_commit_index)
+        elif case_name == "lineage_missing":
+            case_worker_commit.pop("implementation_lineage_ref", None)
+            case_worker_commit["payload"].pop(
+                "implementation_lineage_ref",
+                None,
+            )
+            case_worker_commit["payload"].pop(
+                "worker_implementation_lineage",
+                None,
+            )
         elif case_name == "lineage_mismatch":
-            case_worker_commit["implementation_lineage_ref"] = (
-                "contract-runtime:worker-implementation:" + _fake_sha(case_name)
+            wrong_lineage_ref = (
+                "contract-runtime:worker-implementation:"
+                + _fake_sha(case_name)
+            )
+            case_worker_commit["payload"][
+                "implementation_lineage_ref"
+            ] = wrong_lineage_ref
+            case_worker_commit["payload"][
+                "worker_implementation_lineage"
+            ]["implementation_lineage_ref"] = wrong_lineage_ref
+        elif case_name == "lineage_conflicting_canonical_first_value":
+            case_worker_commit["payload"][
+                "implementation_lineage_ref"
+            ] = (
+                "contract-runtime:worker-implementation:"
+                + _fake_sha(case_name)
             )
         elif case_name == "runtime_mismatch":
             case_worker_commit["runtime_context_id"] = "mfrctx-other-runtime"
@@ -33391,6 +33429,12 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             case_record["completed_lines"].append(conflicting_worker_commit)
         elif case_name == "non_full_commit":
             case_worker_commit["commit_sha"] = initial_head[:12]
+        elif case_name == "nested_commit_only":
+            case_worker_commit.pop("commit_sha", None)
+            case_worker_commit["payload"]["commit_sha"] = initial_head
+        elif case_name == "top_level_commit_missing":
+            case_worker_commit.pop("commit_sha", None)
+            case_worker_commit["payload"].pop("commit_sha", None)
         fallback_negative_cases[case_name] = case_record
 
     for case_name, case_record in fallback_negative_cases.items():

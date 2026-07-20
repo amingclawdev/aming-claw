@@ -58,6 +58,7 @@ from .contracts.runtime import (
     _active_failed_qa_line_index,
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
+    _worker_commit_text,
     _worker_implementation_lineage,
     is_legacy_primary_contract_route,
     read_backlog_contract_chain_current,
@@ -26042,7 +26043,7 @@ def _runtime_context_superseded_implementation_commit_authority(
                 "fallback worker_commit task_id does not match the active runtime"
             )
         if (
-            str(line.get("implementation_lineage_ref") or "").strip()
+            _worker_commit_text(line, "implementation_lineage_ref")
             != expected_lineage_ref
         ):
             errors.append(
