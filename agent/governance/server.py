@@ -56,6 +56,7 @@ from .contracts.runtime import (
     LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     _active_failed_qa_line_index,
+    _line_evidence_from_write,
     _worker_commit_completed_implementation,
     _worker_implementation_lineage,
     is_legacy_primary_contract_route,
@@ -23748,6 +23749,161 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
     return False
 
 
+def _runtime_context_authenticated_failed_qa_timeline_boundary(
+    *,
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+    before_event_id: int = 0,
+) -> dict[str, Any]:
+    """Return the latest active server-authenticated QA timeline verdict."""
+
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    blocking_statuses = {"blocked", "error", "fail", "failed", "invalid", "rejected"}
+    passing_statuses = {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+    latest: dict[str, Any] = {}
+    for event in sorted(
+        (item for item in timeline_events if isinstance(item, Mapping)),
+        key=lambda item: int(item.get("id") or 0),
+    ):
+        event_id = int(event.get("id") or 0)
+        if event_id <= 0 or (before_event_id > 0 and event_id >= before_event_id):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        verification = (
+            event.get("verification")
+            if isinstance(event.get("verification"), Mapping)
+            else {}
+        )
+        event_task_id = str(
+            event.get("task_id")
+            or payload.get("task_id")
+            or verification.get("task_id")
+            or ""
+        ).strip()
+        event_backlog_id = str(
+            event.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        event_runtime_context_id = str(
+            payload.get("runtime_context_id")
+            or verification.get("runtime_context_id")
+            or ""
+        ).strip()
+        if task_id and event_task_id != task_id:
+            continue
+        if backlog_id and event_backlog_id != backlog_id:
+            continue
+        if runtime_context_id and event_runtime_context_id != runtime_context_id:
+            continue
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        event_type = str(event.get("event_type") or "").strip().lower()
+        qa_marker = " ".join(
+            str(value or "").strip().lower()
+            for value in (
+                event_kind,
+                event_type,
+                payload.get("reviewer_role"),
+                payload.get("requirement_id"),
+                verification.get("requirement_id"),
+            )
+            if str(value or "").strip()
+        )
+        if not (
+            event_kind in {"independent_verification", "qa_verification"}
+            or "independent_verification" in qa_marker
+            or "independent_qa" in qa_marker
+        ):
+            continue
+
+        gate = (
+            payload.get("contract_gate_decision")
+            if isinstance(payload.get("contract_gate_decision"), Mapping)
+            else {}
+        )
+        source_authority = (
+            payload.get("source_backed_contract_gate_authority")
+            if isinstance(
+                payload.get("source_backed_contract_gate_authority"), Mapping
+            )
+            else {}
+        )
+        qa_proof = (
+            source_authority.get("qa_session_proof")
+            if isinstance(source_authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        status = str(
+            event.get("status")
+            or verification.get("result")
+            or payload.get("status")
+            or ""
+        ).strip().lower()
+        actor = str(event.get("actor") or "").strip()
+        event_commit = str(
+            event.get("commit_sha")
+            or payload.get("commit_sha")
+            or qa_proof.get("commit_sha")
+            or ""
+        ).strip()
+        authenticated = bool(
+            gate.get("ok") is True
+            and gate.get("primary_decision_source") is True
+            and str(gate.get("source_of_authority") or "").strip()
+            == "qa_session_verification"
+            and str(gate.get("required_role") or "").strip() == "qa"
+            and not list(gate.get("missing_proof_fields") or [])
+            and str(source_authority.get("source") or "").strip()
+            == "server_qa_session_verification"
+            and str(source_authority.get("source_of_authority") or "").strip()
+            == "qa_session_verification"
+            and qa_proof.get("verified") is True
+            and str(qa_proof.get("source") or "").strip()
+            == "authenticated_qa_session"
+            and str(qa_proof.get("role") or "").strip() == "qa"
+            and bool(str(qa_proof.get("qa_session_id") or "").strip())
+            and bool(str(qa_proof.get("qa_scope_binding_ref") or "").strip())
+            and str(qa_proof.get("project_id") or "").strip()
+            == str(event.get("project_id") or "").strip()
+            and str(qa_proof.get("task_id") or "").strip() == task_id
+            and str(qa_proof.get("backlog_id") or "").strip() == backlog_id
+            and str(qa_proof.get("event_kind") or "").strip()
+            in {"independent_verification", "qa_verification"}
+            and str(qa_proof.get("evidence_status") or "").strip().lower()
+            == status
+            and str(qa_proof.get("principal_id") or "").strip() == actor
+            and re.fullmatch(r"[0-9a-f]{40,64}", event_commit)
+            and str(qa_proof.get("commit_sha") or "").strip() == event_commit
+            and bool(str(source_authority.get("authority_hash") or "").strip())
+            and payload.get("observer_impersonation") is False
+        )
+        if not authenticated or status not in blocking_statuses | passing_statuses:
+            continue
+        latest = {
+            "schema_version": "runtime_context.authenticated_failed_qa_timeline_boundary.v1",
+            "source": "server_qa_session_verification",
+            "source_of_authority": "qa_session_verification",
+            "event_id": event_id,
+            "source_ref": f"timeline:{event_id}",
+            "status": status,
+            "commit_sha": event_commit,
+            "actor": actor,
+            "qa_session_id": str(qa_proof.get("qa_session_id") or "").strip(),
+            "qa_scope_binding_ref": str(
+                qa_proof.get("qa_scope_binding_ref") or ""
+            ).strip(),
+            "authority_hash": str(
+                source_authority.get("authority_hash") or ""
+            ).strip(),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "backlog_id": backlog_id,
+        }
+    if str(latest.get("status") or "") not in blocking_statuses:
+        return {}
+    return latest
+
+
 def _runtime_context_failed_qa_revision_rejoin_marker(
     *,
     context: Any,
@@ -23873,6 +24029,14 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         event_id = int(event.get("id") or 0)
         if event_id <= 0:
             continue
+        timeline_failed_qa_boundary = (
+            _runtime_context_authenticated_failed_qa_timeline_boundary(
+                context=context,
+                runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events,
+                before_event_id=event_id,
+            )
+        )
         route_identity = (
             payload.get("route_identity")
             if isinstance(payload.get("route_identity"), Mapping)
@@ -23895,6 +24059,10 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         failed_qa_source_ref = str(
             contract_runtime_failed_qa.get("failed_qa_source_ref") or ""
         ).strip()
+        if not failed_qa_source_ref:
+            failed_qa_source_ref = str(
+                timeline_failed_qa_boundary.get("source_ref") or ""
+            ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
             "source": "accepted_runtime_context_rejoin_event",
@@ -23907,6 +24075,21 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             "revision_event_ref": f"timeline:{event_id}",
             "contract_execution_id": marker_contract_execution_id,
             "failed_qa_source_ref": failed_qa_source_ref,
+            "failed_qa_source": (
+                "contract_runtime_completed_lines"
+                if contract_runtime_reopen_authority
+                else (
+                    "server_qa_session_verification"
+                    if timeline_failed_qa_boundary
+                    else ""
+                )
+            ),
+            "failed_qa_event_id": int(
+                timeline_failed_qa_boundary.get("event_id") or 0
+            ),
+            "failed_qa_authority_hash": str(
+                timeline_failed_qa_boundary.get("authority_hash") or ""
+            ),
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -25355,6 +25538,93 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     )
     completed_lines = list(record.get("completed_lines") or [])
     failed_qa_index = _active_failed_qa_line_index(completed_lines)
+    from . import task_timeline
+
+    timeline_events = task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        limit=1000,
+    )
+    active_timeline_failed_qa = (
+        _runtime_context_authenticated_failed_qa_timeline_boundary(
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
+    )
+    authoritative_revision_marker = (
+        _runtime_context_failed_qa_revision_rejoin_marker(
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
+    )
+    supplied_revision_marker = dict(revision_marker)
+    marker_claim_mismatch = False
+    if supplied_revision_marker:
+        if not authoritative_revision_marker:
+            marker_claim_mismatch = True
+        else:
+            for field in (
+                "source",
+                "reopen_authority_source",
+                "revision_event_ref",
+                "contract_execution_id",
+                "failed_qa_source_ref",
+                "failed_qa_source",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "attempt",
+                "retry_round",
+            ):
+                supplied_value = supplied_revision_marker.get(field)
+                if supplied_value in (None, ""):
+                    continue
+                if supplied_value != authoritative_revision_marker.get(field):
+                    marker_claim_mismatch = True
+                    break
+            supplied_rotation = (
+                supplied_revision_marker.get("session_token_ref_rotation")
+                if isinstance(
+                    supplied_revision_marker.get("session_token_ref_rotation"),
+                    Mapping,
+                )
+                else {}
+            )
+            authoritative_rotation = (
+                authoritative_revision_marker.get("session_token_ref_rotation")
+                if isinstance(
+                    authoritative_revision_marker.get(
+                        "session_token_ref_rotation"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            for field in (
+                "source",
+                "server_derived",
+                "revision_event_ref",
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "target_project_root",
+                "fence_token_hash",
+                "active_session_token_ref",
+            ):
+                supplied_value = supplied_rotation.get(field)
+                if supplied_value in (None, ""):
+                    continue
+                if supplied_value != authoritative_rotation.get(field):
+                    marker_claim_mismatch = True
+                    break
+    resolved_revision_marker = dict(authoritative_revision_marker)
     previous_index = next(
         (
             index
@@ -25364,8 +25634,11 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         ),
         -1,
     )
-    if failed_qa_index < 0:
+    if failed_qa_index < 0 and not active_timeline_failed_qa:
         return {}
+    timeline_backed_failed_qa_revision = bool(
+        failed_qa_index < 0 and active_timeline_failed_qa
+    )
     post_failed_qa_implementation_exists = bool(
         previous is not None and previous_index > failed_qa_index
     )
@@ -25426,22 +25699,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             str(previous_authority.get("diff_base_commit") or "").strip(),
         )
     )
-    resolved_revision_marker = dict(revision_marker)
-    if not str(resolved_revision_marker.get("revision_event_ref") or "").strip():
-        from . import task_timeline
-
-        resolved_revision_marker = _runtime_context_failed_qa_revision_rejoin_marker(
-            context=context,
-            runtime_context_id=runtime_context_id,
-            timeline_events=task_timeline.list_events(
-                conn,
-                project_id,
-                task_id=task_id,
-                backlog_id=str(getattr(context, "backlog_id", "") or ""),
-                limit=1000,
-            ),
-        )
-
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
     runtime_base_commit = str(getattr(context, "base_commit", "") or "").strip()
     if not re.fullmatch(r"[0-9a-f]{40,64}", runtime_base_commit):
@@ -25518,10 +25775,18 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     contract_execution_id = str(
         record.get("contract_execution_id") or ""
     ).strip()
-    expected_failed_qa_source_ref = (
-        f"contract_runtime:{contract_execution_id}:completed_lines:{failed_qa_index}"
-        if contract_execution_id
-        else ""
+    expected_failed_qa_source_ref = str(
+        (
+            f"contract_runtime:{contract_execution_id}:completed_lines:{failed_qa_index}"
+            if failed_qa_index >= 0 and contract_execution_id
+            else active_timeline_failed_qa.get("source_ref")
+        )
+        or ""
+    ).strip()
+    expected_failed_qa_source = (
+        "contract_runtime_completed_lines"
+        if failed_qa_index >= 0
+        else "server_qa_session_verification"
     )
     marker_failed_qa_source_ref = str(
         resolved_revision_marker.get("failed_qa_source_ref") or ""
@@ -25531,7 +25796,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "implementation revision requires the accepted failed-QA rejoin marker"
         )
     if (
-        str(resolved_revision_marker.get("source") or "").strip()
+        marker_claim_mismatch
+        or not authoritative_revision_marker
+        or str(resolved_revision_marker.get("source") or "").strip()
         != "accepted_runtime_context_rejoin_event"
         or str(
             resolved_revision_marker.get("contract_execution_id") or ""
@@ -25539,11 +25806,162 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         != contract_execution_id
         or not expected_failed_qa_source_ref
         or marker_failed_qa_source_ref != expected_failed_qa_source_ref
+        or str(resolved_revision_marker.get("failed_qa_source") or "").strip()
+        != expected_failed_qa_source
+        or (
+            timeline_backed_failed_qa_revision
+            and (
+                str(
+                    resolved_revision_marker.get("reopen_authority_source")
+                    or ""
+                ).strip()
+                != "failed_qa_timeline_event"
+                or int(resolved_revision_marker.get("failed_qa_event_id") or 0)
+                != int(active_timeline_failed_qa.get("event_id") or 0)
+                or int(resolved_revision_marker.get("revision_event_id") or 0)
+                <= int(active_timeline_failed_qa.get("event_id") or 0)
+            )
+        )
     ):
         errors.append(
             "implementation revision requires a server-derived rejoin for the "
             "active failed-QA boundary"
         )
+    marker_rotation = (
+        resolved_revision_marker.get("session_token_ref_rotation")
+        if isinstance(
+            resolved_revision_marker.get("session_token_ref_rotation"), Mapping
+        )
+        else {}
+    )
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    expected_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "fence_token_hash": runtime_context_secret_hash(
+            str(getattr(context, "fence_token", "") or "")
+        ),
+        "session_token_ref": runtime_context_session_token_ref(context),
+    }
+    if (
+        marker_rotation.get("server_derived") is not True
+        or str(marker_rotation.get("source") or "").strip()
+        != "accepted_runtime_context_rejoin_event"
+        or str(marker_rotation.get("revision_event_ref") or "").strip()
+        != revision_event_ref
+        or str(marker_rotation.get("contract_execution_id") or "").strip()
+        != contract_execution_id
+        or str(marker_rotation.get("active_session_token_ref") or "").strip()
+        != expected_identity["session_token_ref"]
+        or any(
+            str(marker_rotation.get(field) or "").strip() != value
+            for field, value in expected_identity.items()
+            if field != "session_token_ref" and value
+        )
+    ):
+        errors.append(
+            "implementation revision requires exact active session, worker, and fence authority"
+        )
+    submitted_session_token_ref = str(
+        payload.get("session_token_ref") or ""
+    ).strip()
+    submitted_fence_token_hash = str(
+        payload.get("fence_token_hash") or ""
+    ).strip()
+    if (
+        submitted_session_token_ref != expected_identity["session_token_ref"]
+        or submitted_fence_token_hash != expected_identity["fence_token_hash"]
+    ):
+        errors.append(
+            "implementation revision session_token_ref and fence_token_hash must match the active worker envelope"
+        )
+    for field in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "target_project_root",
+    ):
+        submitted_value = str(payload.get(field) or "").strip()
+        if submitted_value and submitted_value != expected_identity[field]:
+            errors.append(
+                f"implementation revision {field} must match the active worker identity"
+            )
+    claimed_heads = {
+        str(payload.get(field) or "").strip()
+        for field in (
+            "commit_sha",
+            "head_commit",
+            "immutable_head_commit",
+            "validated_head_commit",
+            "worker_commit_sha",
+        )
+        if str(payload.get(field) or "").strip()
+    }
+    if claimed_heads and claimed_heads != {actual_head}:
+        errors.append(
+            "implementation revision claimed HEAD must match the clean assigned worktree HEAD"
+        )
+    if timeline_backed_failed_qa_revision:
+        guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
+        next_line = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        if str(next_line.get("line_id") or "").strip() != "observer_merge":
+            errors.append(
+                "timeline-backed implementation revision requires stored ContractRuntime at observer_merge"
+            )
+        if previous is None:
+            errors.append(
+                "timeline-backed implementation revision requires a prior canonical worker implementation"
+            )
+        failed_event_id = int(active_timeline_failed_qa.get("event_id") or 0)
+        for event in timeline_events:
+            if not isinstance(event, Mapping) or int(event.get("id") or 0) <= failed_event_id:
+                continue
+            event_payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), Mapping)
+                else {}
+            )
+            if str(event.get("event_kind") or "").strip() != "worker_commit":
+                continue
+            if str(event.get("task_id") or "").strip() != task_id:
+                continue
+            event_runtime_context_id = str(
+                event_payload.get("runtime_context_id") or ""
+            ).strip()
+            if event_runtime_context_id and event_runtime_context_id != runtime_context_id:
+                continue
+            if str(event.get("status") or "").strip().lower() in {
+                "accepted",
+                "ok",
+                "pass",
+                "passed",
+                "succeeded",
+                "success",
+            }:
+                errors.append(
+                    "timeline-backed implementation revision is closed after a later worker_commit"
+                )
+                break
     if errors:
         raise GovernanceError(
             "contract_runtime_rework_lineage_revision_invalid",
@@ -25605,6 +26023,289 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         "failed_qa_source_ref": expected_failed_qa_source_ref,
         "raw_worker_tokens_persisted": False,
     }
+    if timeline_backed_failed_qa_revision and not supplied_revision_marker:
+        return {
+            "schema_version": (
+                "runtime_context.failed_qa_implementation_prevalidation.v1"
+            ),
+            "accepted": True,
+            "status": "validated_timeline_boundary_submission",
+            "canonical_payload": canonical_payload,
+            "diff_base_commit": revision_diff.get("base_commit") or "",
+            "cumulative_changed_files": cumulative_files,
+        }
+    if timeline_backed_failed_qa_revision:
+        failed_qa_event_id = int(active_timeline_failed_qa.get("event_id") or 0)
+        failed_qa_event = next(
+            (
+                dict(event)
+                for event in timeline_events
+                if isinstance(event, Mapping)
+                and int(event.get("id") or 0) == failed_qa_event_id
+            ),
+            {},
+        )
+        failed_qa_event_payload = (
+            failed_qa_event.get("payload")
+            if isinstance(failed_qa_event.get("payload"), Mapping)
+            else {}
+        )
+        source_authority = (
+            failed_qa_event_payload.get("source_backed_contract_gate_authority")
+            if isinstance(
+                failed_qa_event_payload.get(
+                    "source_backed_contract_gate_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        qa_session_proof = (
+            source_authority.get("qa_session_proof")
+            if isinstance(source_authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        qa_principal = str(
+            active_timeline_failed_qa.get("actor") or ""
+        ).strip()
+        qa_session_id = str(
+            active_timeline_failed_qa.get("qa_session_id") or ""
+        ).strip()
+        qa_provenance = {
+            "schema_version": "qa_evidence_provenance.v1",
+            "source": "authenticated_failed_qa_timeline_revision_boundary",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "completion_status_gate": {
+                "status": "failed",
+                "close_satisfying": False,
+                "overall_release_pass_claimed": False,
+                "candidate_new_failures": failed_qa_event_payload.get(
+                    "candidate_new_failures"
+                ),
+            },
+            "authenticated_qa_binding": {
+                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+                "server_derived": True,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+                "independent_verification_session_matched": True,
+                "timeline_event_ref": expected_failed_qa_source_ref,
+                "qa_scope_binding_ref": str(
+                    qa_session_proof.get("qa_scope_binding_ref") or ""
+                ),
+                "authority_hash": str(
+                    source_authority.get("authority_hash") or ""
+                ),
+            },
+        }
+        boundary_line = _contract_runtime_projected_post_worker_line(
+            record=record,
+            context=context,
+            event=failed_qa_event,
+            stage_id="qa",
+            line_id="qa_independent_verification",
+            evidence_kind="independent_verification",
+            actor_role="qa",
+            source_key="failed_qa_revision_boundary",
+        )
+        boundary_line.pop("_source_ref", None)
+        boundary_payload = (
+            dict(boundary_line.get("payload"))
+            if isinstance(boundary_line.get("payload"), Mapping)
+            else {}
+        )
+        boundary_payload.update(
+            {
+                "schema_version": (
+                    "contract_runtime.authenticated_failed_qa_revision_boundary.v1"
+                ),
+                "source": "server_authenticated_qa_timeline_materialization",
+                "source_ref": expected_failed_qa_source_ref,
+                "source_of_authority": "qa_session_verification",
+                "source_backed": True,
+                "projection_persists_completed_line": True,
+                "observer_authored_qa_backfill": False,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": expected_identity["parent_task_id"],
+                "status": "failed",
+                "verdict": "FAIL",
+                "qa_evidence_provenance": qa_provenance,
+            }
+        )
+        boundary_line.update(
+            {
+                "status": "failed",
+                "commit_sha": str(
+                    active_timeline_failed_qa.get("commit_sha") or ""
+                ),
+                "actor_session_principal": qa_principal,
+                "authorization_source": "qa_session_token_ref",
+                "evidence_owner_actor": qa_principal,
+                "evidence_owner_role": "qa",
+                "evidence_owner_session": qa_session_id,
+                "submitter_principal": qa_principal,
+                "submitter_session": qa_session_id,
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "qa_evidence_provenance": qa_provenance,
+                "payload": boundary_payload,
+            }
+        )
+
+        prior_lineage = _worker_implementation_lineage(record, previous or {})
+        previous_session_token_ref = _timeline_first_deep_text(
+            {"line": previous or {}},
+            "session_token_ref",
+        )
+        revised_session_token_ref = str(
+            canonical_payload.get("session_token_ref") or ""
+        ).strip()
+        canonical_payload["canonical_rework_lineage_revision"] = {
+            "schema_version": (
+                "contract_runtime.worker_implementation_rework_revision.v1"
+            ),
+            "source": "server_verified_failed_qa_rework",
+            "failed_qa_completed_line_index": len(completed_lines),
+            "superseded_completed_line_index": previous_index,
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+            "revision_event_ref": revision_event_ref,
+            "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "commit_sha": actual_head,
+            "append_only_history_preserved": True,
+            "session_token_ref_rotation": {
+                "applied": bool(
+                    previous_session_token_ref
+                    and revised_session_token_ref != previous_session_token_ref
+                ),
+                "source": "accepted_runtime_context_rejoin_event",
+                "revision_event_ref": revision_event_ref,
+                "raw_session_tokens_persisted": False,
+            },
+        }
+        implementation_write = {
+            "project_id": project_id,
+            "backlog_id": record.get("backlog_id"),
+            "contract_execution_id": contract_execution_id,
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "actor_role": "mf_sub",
+            "evidence_kind": "implementation",
+            "commit_sha": actual_head,
+            "changed_files": cumulative_files,
+            "graph_trace_ids": claimed_trace_ids,
+            "payload": canonical_payload,
+        }
+        for key, value in canonical_payload.items():
+            if key not in implementation_write:
+                implementation_write[key] = value
+        implementation_line = _line_evidence_from_write(
+            implementation_write,
+            "mf_sub",
+        )
+        revised_lines = [*completed_lines, boundary_line, implementation_line]
+        projected = runtime.projected_record(
+            contract_execution_id,
+            actor_role="mf_sub",
+            completed_lines=revised_lines,
+            projection={
+                "schema_version": (
+                    "contract_runtime.authenticated_failed_qa_revision_projection.v1"
+                ),
+                "source": "server_authenticated_qa_timeline_materialization",
+                "failed_qa_source_ref": expected_failed_qa_source_ref,
+                "revision_event_ref": revision_event_ref,
+            },
+        )
+        projected_next = (
+            projected.get("runtime_guide", {}).get("next_legal_action", {})
+            if isinstance(projected.get("runtime_guide"), Mapping)
+            else {}
+        )
+        if str(projected_next.get("line_id") or "").strip() != "worker_commit":
+            raise GovernanceError(
+                "contract_runtime_rework_lineage_projection_invalid",
+                "authenticated timeline failed-QA revision must open worker_commit",
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "failed_qa_source_ref": expected_failed_qa_source_ref,
+                    "next_legal_action": dict(projected_next),
+                    "fail_closed": True,
+                },
+            )
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        updated_record = dict(record)
+        updated_record["completed_lines"] = revised_lines
+        updated_record["execution_state_revision"] = expected_revision + 1
+        try:
+            runtime.store.update(
+                contract_execution_id,
+                updated_record,
+                expected_revision=expected_revision,
+            )
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "contract_runtime_rework_lineage_revision_conflict",
+                str(exc),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "fail_closed": True,
+                },
+            ) from exc
+        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
+        persisted = runtime.store.get(contract_execution_id)
+        latest = _worker_commit_completed_implementation(
+            persisted,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        lineage = _worker_implementation_lineage(persisted, latest or {})
+        current_state = _runtime_current_state_from_record(persisted)
+        return {
+            "schema_version": "runtime_context.canonical_contract_line.v1",
+            "accepted": True,
+            "status": "revised",
+            "canonical": True,
+            "source_of_authority": "ContractRuntime.completed_lines",
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "line_instance_id": str((latest or {}).get("line_instance_id") or ""),
+            "commit_sha": actual_head,
+            "implementation_lineage_ref": lineage.get(
+                "implementation_lineage_ref"
+            )
+            or "",
+            "supersedes_implementation_lineage_ref": prior_lineage[
+                "implementation_lineage_ref"
+            ],
+            "execution_state_revision": current_state.get(
+                "execution_state_revision", 0
+            ),
+            "execution_state_hash": current_state.get("execution_state_hash", ""),
+            "next_legal_action": current_state.get("next_legal_action") or {},
+            "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "append_only_history_preserved": True,
+            "timeline_projection_authoritative": False,
+        }
     if not post_failed_qa_implementation_exists:
         if previous is not None:
             prior_lineage = _worker_implementation_lineage(record, previous)
@@ -25905,6 +26606,9 @@ def _runtime_context_submit_canonical_contract_line(
                     "revision_event_ref",
                     "contract_execution_id",
                     "failed_qa_source_ref",
+                    "failed_qa_source",
+                    "failed_qa_event_id",
+                    "failed_qa_authority_hash",
                     "runtime_context_id",
                     "task_id",
                     "parent_task_id",
@@ -25933,7 +26637,10 @@ def _runtime_context_submit_canonical_contract_line(
             canonical_payload = dict(
                 revision.get("canonical_payload") or canonical_payload
             )
-        elif revision and next_line_id != "worker_implementation":
+        elif revision and (
+            revision.get("status") == "revised"
+            or next_line_id != "worker_implementation"
+        ):
             return revision
 
     for completed in record.get("completed_lines") or []:
@@ -55273,6 +55980,9 @@ def _contract_runtime_mf_parallel_context_projection(
                     "revision_event_ref",
                     "contract_execution_id",
                     "failed_qa_source_ref",
+                    "failed_qa_source",
+                    "failed_qa_event_id",
+                    "failed_qa_authority_hash",
                     "attempt",
                     "retry_round",
                     "route_token_ref",
@@ -72549,6 +73259,32 @@ def _contract_runtime_close_gate(
                     revision_marker={},
                 )
             )
+            if prevalidation.get("status") == (
+                "validated_timeline_boundary_submission"
+            ):
+                return {
+                    "schema_version": (
+                        _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+                    ),
+                    "accepted": True,
+                    "status": "validated_submission",
+                    "primary_decision_source": True,
+                    "agent_facing_decision_source": (
+                        "contract_runtime_first_missing_line"
+                    ),
+                    "meta_contract_gate_decision_source": False,
+                    "contract_execution_id": contract_execution_id,
+                    "actor_role": actor_role,
+                    "requested_event_kind": event_kind,
+                    "stage_id": line.get("stage_id", ""),
+                    "line_id": line.get("line_id", ""),
+                    "evidence_kind": line.get("evidence_kind", ""),
+                    "decision": {"ok": True, "errors": []},
+                    "next_legal_action": dict(
+                        current_state.get("next_legal_action") or {}
+                    ),
+                    "canonical_submit_required": True,
+                }
             if prevalidation.get("status") == "validated_submission":
                 canonical_norm_payload = dict(
                     prevalidation.get("canonical_payload")

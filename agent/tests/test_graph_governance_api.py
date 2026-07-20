@@ -32475,6 +32475,402 @@ def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_
     )
 
 
+def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-TIMELINE-ONLY-FAILED-QA-STORED-OBSERVER-MERGE"
+    target_root = tmp_path / "timeline-only-failed-qa-observer-merge"
+    base_commit = _init_test_git_repo(target_root)
+    candidate = target_root / "agent/governance/server.py"
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text("initial candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial timeline-only QA candidate"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    initial_head = batch_jobs.git_commit(target_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: target_root,
+    )
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="timeline-only-failed-qa-parent",
+        worker_task_id="timeline-only-failed-qa-worker",
+        fence_token="fence-timeline-only-failed-qa",
+        token="timeline-only-failed-qa-token",
+        worktree_path=str(target_root),
+        base_commit=base_commit,
+        owned_files=("agent/governance/server.py",),
+    )
+    graph_trace_id = "gqt-timeline-only-failed-qa-worker"
+    worker_events = _record_mf_parallel_runtime_context_worker_evidence(
+        conn,
+        runtime_context,
+        backlog_id=backlog_id,
+        fence_token="fence-timeline-only-failed-qa",
+        graph_trace_id=graph_trace_id,
+        head_commit=initial_head,
+    )
+    _record_mf_parallel_contract_runtime_worker_prefix(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+        runtime_context=runtime_context,
+        parent_task_id=backlog_id,
+        graph_trace_id=graph_trace_id,
+        head_commit=initial_head,
+        implementation_event_ref=f"timeline:{worker_events['implementation']}",
+    )
+
+    runtime = server._contract_runtime(conn)
+    stored = runtime.store.get(successor["contract_execution_id"])
+    passed_common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
+        "commit_sha": initial_head,
+        "status": "passed",
+    }
+    stored["completed_lines"].extend(
+        [
+            {
+                **passed_common,
+                "stage_id": "worker_attestation",
+                "line_id": "worker_finish_time_attestation",
+                "actor_role": "mf_sub",
+                "evidence_kind": "record_finish_time_worker_attestation",
+                "payload": dict(passed_common),
+            },
+            {
+                **passed_common,
+                "stage_id": "worker_finish",
+                "line_id": "worker_finish_gate",
+                "actor_role": "mf_sub",
+                "evidence_kind": "mf_subagent_finish_gate",
+                "payload": dict(passed_common),
+            },
+            {
+                **passed_common,
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "actor_role": "qa",
+                "evidence_kind": "graph_trace",
+                "payload": dict(passed_common),
+            },
+            {
+                **passed_common,
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "authorization_source": "qa_session_token_ref",
+                "evidence_owner_role": "qa",
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "qa_evidence_provenance": {
+                    "schema_version": "qa_evidence_provenance.v1",
+                    "authorization_source": "qa_session_token_ref",
+                    "evidence_owner_role": "qa",
+                    "observer_impersonation": False,
+                    "parent_materialization_authorized": False,
+                },
+                "payload": dict(passed_common),
+            },
+        ]
+    )
+    stored["execution_state_revision"] = int(stored["execution_state_revision"]) + 1
+    runtime.store.update(successor["contract_execution_id"], stored)
+    stored_guide = runtime.current_guide(
+        successor["contract_execution_id"],
+        actor_role="mf_sub",
+    )
+    assert stored_guide["next_legal_action"]["line_id"] == "observer_merge"
+
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(runtime_context, status=STATE_VALIDATED, attempt=1, retry_round=0),
+        now_iso="2026-07-19T11:00:00Z",
+    )
+    qa_principal = "qa:timeline-only-failed-qa"
+    qa_session_id = "ses-timeline-only-failed-qa"
+    qa_scope_binding_ref = "qa_scope:timeline-only-failed-qa"
+    authority_hash = _fake_sha("timeline-only-failed-qa-authority")
+    failed_qa = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        event_type="independent_verification.completed",
+        event_kind="independent_verification",
+        phase="verification",
+        status="failed",
+        actor=qa_principal,
+        commit_sha=initial_head,
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
+            "parent_task_id": backlog_id,
+            "reviewer_role": "independent_qa",
+            "requirement_id": "independent_verification_lane",
+            "candidate_new_failures": 0,
+            "observer_impersonation": False,
+            "contract_gate_decision": {
+                "ok": True,
+                "primary_decision_source": True,
+                "source_of_authority": "qa_session_verification",
+                "required_role": "qa",
+                "missing_proof_fields": [],
+            },
+            "source_backed_contract_gate_authority": {
+                "schema_version": "source_backed_contract_gate_authority.v1",
+                "source": "server_qa_session_verification",
+                "source_of_authority": "qa_session_verification",
+                "authority_hash": authority_hash,
+                "qa_session_proof": {
+                    "schema_version": "qa_session_scope_proof.v1",
+                    "source": "authenticated_qa_session",
+                    "verified": True,
+                    "role": "qa",
+                    "principal_id": qa_principal,
+                    "qa_session_id": qa_session_id,
+                    "qa_scope_binding_ref": qa_scope_binding_ref,
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": runtime_context.task_id,
+                    "event_kind": "independent_verification",
+                    "evidence_status": "failed",
+                    "commit_sha": initial_head,
+                },
+            },
+        },
+        verification={
+            "result": "failed",
+            "verdict": "FAIL",
+            "requirement_id": "independent_verification_lane",
+        },
+    )
+    conn.commit()
+
+    before_rejoin_record = runtime.store.get(successor["contract_execution_id"])
+    initial_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "target_project_root": str(target_root),
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "fence_token_hash": runtime_context_secret_hash(
+            runtime_context.fence_token
+        ),
+        "changed_files": ["agent/governance/server.py"],
+        "graph_trace_ids": [graph_trace_id],
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": [graph_trace_id],
+        },
+    }
+    with pytest.raises(GovernanceError) as missing_rejoin:
+        server._runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            runtime=runtime,
+            record=before_rejoin_record,
+            payload=initial_payload,
+            revision_marker={},
+        )
+    assert missing_rejoin.value.code == (
+        "contract_runtime_rework_lineage_revision_invalid"
+    )
+    assert "active failed-QA boundary" in str(missing_rejoin.value)
+
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": f"Revise authenticated timeline failure timeline:{failed_qa['id']}",
+                "now_iso": "2999-01-03T00:00:00Z",
+            },
+        )
+    )
+    assert rejoin["reopen_for_revision"] is True
+
+    candidate.write_text("timeline-only failed QA revision\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "timeline-only failed QA revision"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    revised_head = batch_jobs.git_commit(target_root)
+    saved_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert saved_context is not None
+    revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        context=saved_context,
+        runtime_context_id=saved_context.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=saved_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    assert revision_marker["failed_qa_source_ref"] == f"timeline:{failed_qa['id']}"
+    assert revision_marker["failed_qa_source"] == "server_qa_session_verification"
+
+    revision_payload = {
+        **initial_payload,
+        "session_token_ref": rejoin["session_token_ref"],
+        "fence_token_hash": runtime_context_secret_hash(rejoin["fence_token"]),
+        "head_commit": revised_head,
+    }
+    revision_before_negative_cases = runtime.store.get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"]
+    negative_cases = {
+        "wrong_source": ({**revision_marker, "failed_qa_source": "caller_claim"}, revision_payload),
+        "stale_session": (
+            {
+                **revision_marker,
+                "session_token_ref_rotation": {
+                    **revision_marker["session_token_ref_rotation"],
+                    "active_session_token_ref": initial_payload["session_token_ref"],
+                },
+            },
+            revision_payload,
+        ),
+        "wrong_fence": (
+            {
+                **revision_marker,
+                "session_token_ref_rotation": {
+                    **revision_marker["session_token_ref_rotation"],
+                    "fence_token_hash": _fake_sha("wrong-timeline-only-fence"),
+                },
+            },
+            revision_payload,
+        ),
+        "wrong_head": (
+            revision_marker,
+            {**revision_payload, "head_commit": initial_head},
+        ),
+    }
+    for case_name, (case_marker, case_payload) in negative_cases.items():
+        with pytest.raises(GovernanceError) as rejected:
+            server._runtime_context_revise_failed_qa_implementation_lineage(
+                conn,
+                project_id=PID,
+                context=saved_context,
+                runtime=runtime,
+                record=runtime.store.get(successor["contract_execution_id"]),
+                payload=case_payload,
+                revision_marker=case_marker,
+            )
+        assert rejected.value.code == (
+            "contract_runtime_rework_lineage_revision_invalid"
+        ), case_name
+        assert runtime.store.get(successor["contract_execution_id"])[
+            "execution_state_revision"
+        ] == revision_before_negative_cases
+
+    corrected = server.handle_graph_governance_runtime_context_implementation_evidence(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "parent_task_id": backlog_id,
+                "fence_token": rejoin["fence_token"],
+                "session_token": rejoin["session_token"],
+                "target_project_root": str(target_root),
+                "changed_files": ["agent/governance/server.py"],
+                "graph_trace_ids": [graph_trace_id],
+                "tests": [{"command": "pytest -q", "status": "passed"}],
+                "payload": {
+                    "failed_qa_event_ref": f"timeline:{failed_qa['id']}",
+                    "candidate_new_failures": 0,
+                },
+            },
+        )
+    )
+    canonical = corrected["contract_runtime_canonical_line"]
+    assert canonical["status"] == "revised"
+    assert canonical["commit_sha"] == revised_head
+    assert canonical["failed_qa_source_ref"] == f"timeline:{failed_qa['id']}"
+    assert canonical["append_only_history_preserved"] is True
+    assert canonical["supersedes_implementation_lineage_ref"]
+    assert canonical["next_legal_action"]["line_id"] == "worker_commit"
+
+    revised_record = runtime.store.get(successor["contract_execution_id"])
+    assert revised_record["execution_state_revision"] == (
+        revision_before_negative_cases + 1
+    )
+    boundary_line, implementation_line = revised_record["completed_lines"][-2:]
+    assert boundary_line["line_id"] == "qa_independent_verification"
+    assert boundary_line["status"] == "failed"
+    assert boundary_line["payload"]["source_ref"] == f"timeline:{failed_qa['id']}"
+    assert boundary_line["qa_evidence_provenance"]["schema_version"] == (
+        "qa_evidence_provenance.v1"
+    )
+    assert implementation_line["line_id"] == "worker_implementation"
+    assert implementation_line["commit_sha"] == revised_head
+
+    lineage = _worker_implementation_lineage(revised_record, implementation_line)
+    worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "mf_sub",
+            method="POST",
+            body={
+                "contract_execution_id": successor["contract_execution_id"],
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "fence_token": rejoin["fence_token"],
+                "session_token": rejoin["session_token"],
+                "target_project_root": str(target_root),
+                "worker_commit_sha": revised_head,
+                "worker_session_id": runtime_context.worker_slot_id,
+                "filer_principal": runtime_context.worker_slot_id,
+                "implementation_lineage_ref": lineage["implementation_lineage_ref"],
+                "owned_files": ["agent/governance/server.py"],
+                "changed_files": ["agent/governance/server.py"],
+                "graph_trace_ids": [graph_trace_id],
+            },
+        )
+    )
+    assert worker_commit["ok"] is True
+    assert worker_commit["contract_runtime_close_evidence_gate"]["accepted"] is True
+    assert worker_commit["next_legal_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+
+
 def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(
     conn,
     tmp_path,
