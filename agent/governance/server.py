@@ -76948,7 +76948,86 @@ def _contract_runtime_mf_parallel_close_authority_gate(
     if not mf_parallel_records:
         return {}
 
-    record = mf_parallel_records[-1]
+    selector_candidates: list[tuple[str, str]] = []
+    selector_containers = [("chain_projection", chain_projection)]
+    authority_projection = chain_projection.get("authority_projection")
+    if isinstance(authority_projection, Mapping):
+        selector_containers.append(
+            ("chain_projection.authority_projection", authority_projection)
+        )
+    seen_selector_ids: set[str] = set()
+    for container_name, container in selector_containers:
+        for field in (
+            "active_child_contract_execution_id",
+            "current_contract_execution_id",
+        ):
+            execution_id = str(container.get(field) or "").strip()
+            if (
+                not execution_id.startswith("cex-")
+                or execution_id in seen_selector_ids
+            ):
+                continue
+            seen_selector_ids.add(execution_id)
+            selector_candidates.append((execution_id, f"{container_name}.{field}"))
+
+    records_by_execution_id = {
+        str(item.get("contract_execution_id") or "").strip(): item
+        for item in mf_parallel_records
+        if str(item.get("contract_execution_id") or "").strip()
+    }
+    record: Mapping[str, Any] | None = None
+    selected_contract_execution_id = ""
+    record_selection_source = "last_record_compatibility"
+    if selector_candidates:
+        selected_contract_execution_id, record_selection_source = (
+            selector_candidates[0]
+        )
+        record = records_by_execution_id.get(selected_contract_execution_id)
+
+    if record is None and selector_candidates:
+        return {
+            "schema_version": "contract_runtime_mf_parallel_close_authority_gate.v1",
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "source": "server_derived_contract_runtime_completed_mf_parallel_chain",
+            "primary_decision_source": False,
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": selected_contract_execution_id,
+            "close_commit": close_commit,
+            "record_selection_source": record_selection_source,
+            "authoritative_selector_present": True,
+            "available_mf_parallel_contract_execution_ids": sorted(
+                records_by_execution_id
+            ),
+            "missing_requirement_ids": [
+                "contract_runtime.current_mf_parallel_execution"
+            ],
+            "source_refs": [],
+            "line_sources": {},
+            "ordering_diagnostics": [],
+            "rejected_evidence_by_requirement": {},
+            "commit_mismatches": [],
+            "commit_bridge_diagnostics": [],
+            "checks": {
+                "has_current_mf_parallel_execution": False,
+                "has_worker_implementation": False,
+                "has_worker_commit": False,
+                "has_worker_finish_gate": False,
+                "has_independent_qa": False,
+                "has_observer_merge": False,
+                "has_observer_reconcile": False,
+                "has_observer_close_ready": False,
+                "observer_merge_close_commit_bridged_by_close_ready": False,
+                "observer_close_commit_matches": False,
+            },
+        }
+    if record is None:
+        record = mf_parallel_records[-1]
+        selected_contract_execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+
     strict_temporal_order = bool(
         str(record.get("version") or "").strip()
         and str(record.get("revision") or "").strip()
@@ -77215,6 +77294,11 @@ def _contract_runtime_mf_parallel_close_authority_gate(
         "meta_contract_gate_decision_source": False,
         "contract_execution_id": contract_execution_id,
         "close_commit": close_commit,
+        "record_selection_source": record_selection_source,
+        "authoritative_selector_present": bool(selector_candidates),
+        "available_mf_parallel_contract_execution_ids": sorted(
+            records_by_execution_id
+        ),
         "missing_requirement_ids": missing,
         "source_refs": source_refs,
         "line_sources": {
