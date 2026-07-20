@@ -14429,7 +14429,7 @@ def _runtime_context_contract_runtime_worker_projection(
     try:
         runtime.current_guide(execution_id, actor_role="mf_sub")
         canonical_record = runtime.store.get(execution_id)
-        canonical_record, _context_projection = (
+        canonical_record, context_projection = (
             _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
                 project_id=str(
@@ -14489,6 +14489,16 @@ def _runtime_context_contract_runtime_worker_projection(
         current_state["worker_implementation_lineage"] = dict(
             worker_implementation_lineage
         )
+    recovery = (
+        canonical_record.get("same_lane_worker_commit_recovery")
+        if isinstance(
+            canonical_record.get("same_lane_worker_commit_recovery"),
+            Mapping,
+        )
+        else context_projection.get("same_lane_worker_commit_recovery")
+    )
+    if isinstance(recovery, Mapping):
+        current_state["same_lane_worker_commit_recovery"] = dict(recovery)
     contract_runtime_dispatch_identity = (
         _contract_runtime_dispatch_identity_resolution(canonical_record, context)
         if context is not None
@@ -14516,6 +14526,9 @@ def _runtime_context_contract_runtime_worker_projection(
         ),
         "contract_runtime_dispatch_identity": dict(
             contract_runtime_dispatch_identity
+        ),
+        "same_lane_worker_commit_recovery": (
+            dict(recovery) if isinstance(recovery, Mapping) else {}
         ),
         "timeline_projection_authoritative": False,
     }
@@ -15907,6 +15920,14 @@ def _runtime_context_worker_guide_response(
         worktree_path,
         target_project_root,
     )
+    projected_contract_state = dict(
+        current_state_response.get("contract_runtime_current_state") or {}
+    )
+    same_lane_worker_commit_recovery = dict(
+        projected_contract_state.get("same_lane_worker_commit_recovery")
+        or current_state_response.get("same_lane_worker_commit_recovery")
+        or {}
+    )
     row_scoped_finish_head_projection = (
         _runtime_context_row_scoped_finish_head_projection(
             row_scoped_implementation_head_commit=str(
@@ -15941,6 +15962,14 @@ def _runtime_context_worker_guide_response(
             target_project_root=target_project_root,
             worktree_path=worktree_path,
             contract_worker_commit_required=contract_worker_commit_required,
+            canonical_worker_commit_head=str(
+                timeline_refs.get("worker_commit_sha")
+                or same_lane_worker_commit_recovery.get("recorded_commit_sha")
+                or ""
+            ),
+            same_lane_worker_commit_recovery=(
+                same_lane_worker_commit_recovery
+            ),
         )
     )
     finish_submission_head_commit = str(
@@ -16132,6 +16161,27 @@ def _runtime_context_worker_guide_response(
             *next_required_evidence,
         ]
         scope_blocking_reasons.append("branch_head_scope_mismatch")
+    worker_commit_drift_blocked = (
+        row_scoped_finish_head_projection.get("status")
+        == "worker_commit_drift_blocked"
+    )
+    if worker_commit_drift_blocked:
+        next_legal_action = "stop_and_report_worker_commit_drift"
+        next_legal_action_decision_source = "runtime_context_worker_commit_drift_gate"
+        next_required_evidence = [
+            {
+                "id": "same_lane_worker_commit_recovery",
+                "status": "blocked",
+                "producer": "runtime_context_service",
+                "worker_owned": False,
+                "next_legal_action": next_legal_action,
+                "same_lane_worker_commit_recovery": (
+                    same_lane_worker_commit_recovery
+                ),
+            },
+            *next_required_evidence,
+        ]
+        scope_blocking_reasons.append("worker_commit_drift_blocked")
     if _runtime_context_contract_next_action_override_eligible(
         contract_runtime_next_legal_action,
         runtime_context_id=runtime_context_id,
@@ -17944,6 +17994,8 @@ def _runtime_context_row_scoped_finish_head_projection(
     worktree_path: str = "",
     target_project_root: str = "",
     contract_worker_commit_required: bool = False,
+    canonical_worker_commit_head: str = "",
+    same_lane_worker_commit_recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     row_head = _runtime_context_non_placeholder_text(
         row_scoped_implementation_head_commit
@@ -17952,6 +18004,17 @@ def _runtime_context_row_scoped_finish_head_projection(
     current_head = _runtime_context_non_placeholder_text(current_branch_head_commit)
     submission_head = row_head or context_head
     mismatch = bool(row_head and current_head and row_head != current_head)
+    canonical_commit = _runtime_context_non_placeholder_text(
+        canonical_worker_commit_head
+    )
+    commit_matches_current_head = bool(
+        canonical_commit and current_head and canonical_commit == current_head
+    )
+    recovery = (
+        same_lane_worker_commit_recovery
+        if isinstance(same_lane_worker_commit_recovery, Mapping)
+        else {}
+    )
     status = (
         "branch_head_scope_mismatch"
         if mismatch
@@ -17962,8 +18025,18 @@ def _runtime_context_row_scoped_finish_head_projection(
         )
     )
     if contract_worker_commit_required:
-        status = "worker_commit_ready" if mismatch else "implementation_commit_pending"
-        next_legal_action = "record_worker_commit"
+        if commit_matches_current_head:
+            status = "worker_commit_recorded"
+            next_legal_action = "record_finish_time_worker_attestation"
+        elif recovery.get("status") == "eligible":
+            status = "worker_commit_repair_ready"
+            next_legal_action = "record_worker_commit"
+        elif recovery.get("status") == "blocked":
+            status = "worker_commit_drift_blocked"
+            next_legal_action = "stop_and_report_worker_commit_drift"
+        else:
+            status = "worker_commit_ready" if mismatch else "implementation_commit_pending"
+            next_legal_action = "record_worker_commit"
     else:
         next_legal_action = (
             "stop_for_row_scope_reconciliation"
@@ -17976,6 +18049,7 @@ def _runtime_context_row_scoped_finish_head_projection(
         "row_scoped_implementation_head_commit": row_head,
         "runtime_context_head_commit": context_head,
         "current_branch_head_commit": current_head,
+        "canonical_worker_commit_head": canonical_commit,
         "base_commit": str(base_commit or "").strip(),
         "target_head_commit": str(target_head_commit or "").strip(),
         "implementation_event_ref": str(implementation_event_ref or "").strip(),
@@ -17989,19 +18063,33 @@ def _runtime_context_row_scoped_finish_head_projection(
         ),
         "worker_finish_scope_requires_row_head": not contract_worker_commit_required,
         "worker_commit_must_record_current_branch_head": contract_worker_commit_required,
+        "canonical_worker_commit_matches_current_branch_head": (
+            commit_matches_current_head
+        ),
+        "same_lane_worker_commit_recovery": dict(recovery),
         "later_branch_commits_must_not_widen_row_scope": True,
         "current_branch_head_is_later_than_row_head": mismatch,
         "next_legal_action": next_legal_action,
         "guide": (
             (
-                "The branch HEAD moved after implementation evidence. Record that "
-                "exact clean immutable HEAD through runtime_context.worker_commit "
-                "before any finish-time attestation."
-                if mismatch
+                "The canonical worker_commit matches the current clean branch HEAD. "
+                "Proceed to finish-time worker attestation."
+                if commit_matches_current_head
                 else (
-                    "Create the bounded implementation commit, then record its exact "
-                    "clean HEAD through runtime_context.worker_commit before finish-time "
-                    "attestation and finish gate."
+                    "Stop: the later branch HEAD is not an eligible same-lane bounded "
+                    "repair of the canonical worker_commit."
+                    if recovery.get("status") == "blocked"
+                    else (
+                        "The branch HEAD moved after implementation evidence. Record that "
+                        "exact clean immutable HEAD through runtime_context.worker_commit "
+                        "before any finish-time attestation."
+                        if mismatch
+                        else (
+                            "Create the bounded implementation commit, then record its exact "
+                            "clean HEAD through runtime_context.worker_commit before finish-time "
+                            "attestation and finish gate."
+                        )
+                    )
                 )
             )
             if contract_worker_commit_required
@@ -26125,6 +26213,425 @@ def _runtime_context_actual_worker_commit_line(
     )
 
 
+def _runtime_context_same_lane_worker_commit_recovery(
+    record: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    """Resolve a bounded append-only refresh of a stale same-lane commit.
+
+    A later clean descendant may replace the current worker-commit authority
+    only when the cumulative runtime diff, implementation lineage, graph
+    traces, and owned-file fence remain exactly unchanged.  The old line is
+    retained as history and is ignored only by the non-mutating projection
+    that reopens ``worker_commit``.
+    """
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if str(next_line.get("line_id") or "").strip() != (
+        "worker_finish_time_attestation"
+    ):
+        return {}
+    completed_lines = list(record.get("completed_lines") or [])
+    latest_commit: Mapping[str, Any] | None = None
+    latest_commit_index = -1
+    for index in range(len(completed_lines) - 1, -1, -1):
+        candidate = completed_lines[index]
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("line_id") or "").strip() != "worker_commit":
+            continue
+        if not _runtime_context_contract_line_matches_worker(
+            candidate,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        ):
+            continue
+        latest_commit = candidate
+        latest_commit_index = index
+        break
+    if latest_commit is None:
+        return {}
+
+    payload = (
+        latest_commit.get("payload")
+        if isinstance(latest_commit.get("payload"), Mapping)
+        else {}
+    )
+    recorded_commit = str(
+        latest_commit.get("commit_sha")
+        or payload.get("worker_commit_sha")
+        or payload.get("commit_sha")
+        or ""
+    ).strip()
+    worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
+    runtime_base = str(getattr(context, "base_commit", "") or "").strip()
+    result = {
+        "schema_version": (
+            "runtime_context.same_lane_worker_commit_recovery.v1"
+        ),
+        "status": "blocked",
+        "blocked": True,
+        "server_derived": True,
+        "source_of_authority": "ContractRuntime.completed_lines.worker_commit+git",
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "superseded_completed_line_index": latest_commit_index,
+        "recorded_commit_sha": recorded_commit,
+        "actual_worktree_head_commit": "",
+        "changed_files": [],
+        "owned_files": [],
+        "errors": [],
+        "append_only_history_preserved": True,
+        "next_legal_action": "stop_and_report_worker_commit_drift",
+    }
+    errors: list[str] = result["errors"]
+    if not worktree_path or not os.path.exists(worktree_path):
+        return {}
+    from . import batch_jobs
+
+    try:
+        actual_head = batch_jobs.git_commit(worktree_path)
+    except Exception:
+        # Synthetic/legacy contexts may name a directory without a git
+        # checkout. They cannot claim repair authority, but existing reads must
+        # remain compatible and let the stored ContractRuntime line decide.
+        return {}
+    result["actual_worktree_head_commit"] = actual_head
+    if actual_head == recorded_commit:
+        result.update(
+            {
+                "status": "not_needed",
+                "blocked": False,
+                "next_legal_action": "record_finish_time_worker_attestation",
+            }
+        )
+        return result
+    try:
+        dirty_files = _runtime_context_git_dirty_files(worktree_path)
+        revision_diff = _runtime_context_worker_commit_revision_diff(
+            worktree_path,
+            actual_head,
+            base_commit=runtime_base,
+        )
+    except (GovernanceError, ValidationError, OSError, subprocess.SubprocessError):
+        return {}
+    actual_files = sorted(set(revision_diff.get("changed_files") or []))
+    recorded_files = sorted(
+        set(_runtime_context_service_query_values(payload, "changed_files"))
+    )
+    recorded_diff_files = sorted(
+        set(_runtime_context_service_query_values(payload, "commit_diff_files"))
+    )
+    owned_files = sorted(
+        set(
+            getattr(context, "owned_files", ())
+            or getattr(context, "target_files", ())
+            or ()
+        )
+    )
+    result.update(
+        {
+            "changed_files": actual_files,
+            "recorded_changed_files": recorded_files,
+            "owned_files": owned_files,
+            "dirty_files": dirty_files,
+            "commit_parent_sha": str(revision_diff.get("parent_commit") or ""),
+            "diff_base_commit": str(revision_diff.get("base_commit") or ""),
+        }
+    )
+    implementation = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    implementation_lineage = (
+        _worker_implementation_lineage(record, implementation)
+        if implementation is not None
+        else {}
+    )
+    implementation_files = sorted(
+        set(implementation_lineage.get("changed_files") or [])
+    )
+    implementation_traces = sorted(
+        set(implementation_lineage.get("graph_trace_ids") or [])
+    )
+    recorded_traces = sorted(
+        set(
+            _runtime_context_service_query_values(
+                payload,
+                "graph_trace_ids",
+                "verified_trace_ids",
+            )
+        )
+    )
+    expected_lineage_ref = str(
+        implementation_lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    recorded_lineage_ref = str(
+        payload.get("implementation_lineage_ref") or ""
+    ).strip()
+    if dirty_files:
+        errors.append("assigned worktree is dirty")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", recorded_commit):
+        errors.append("recorded worker_commit is not a full commit SHA")
+    elif not _git_commit_is_ancestor(
+        Path(worktree_path),
+        recorded_commit,
+        actual_head,
+    ):
+        errors.append("current HEAD is not a descendant of recorded worker_commit")
+    if not actual_files or actual_files != recorded_files:
+        errors.append("current cumulative diff widened or changed worker_commit scope")
+    if recorded_diff_files != recorded_files:
+        errors.append("recorded worker_commit diff proof is internally inconsistent")
+    if implementation_files != recorded_files:
+        errors.append("worker_implementation files do not match worker_commit scope")
+    if recorded_traces != implementation_traces:
+        errors.append("worker_commit graph traces do not match worker_implementation")
+    if not expected_lineage_ref or recorded_lineage_ref != expected_lineage_ref:
+        errors.append("worker_commit implementation lineage is stale")
+    if str(payload.get("diff_base_commit") or "").strip() != str(
+        revision_diff.get("base_commit") or ""
+    ).strip():
+        errors.append("worker_commit runtime diff base drifted")
+    if set(actual_files) - set(owned_files):
+        errors.append("current cumulative diff contains files outside the owned fence")
+    if errors:
+        return result
+    result.update(
+        {
+            "status": "eligible",
+            "blocked": False,
+            "implementation_lineage_ref": expected_lineage_ref,
+            "graph_trace_ids": implementation_traces,
+            "next_legal_action": "record_worker_commit",
+        }
+    )
+    return result
+
+
+def _runtime_context_append_same_lane_worker_commit_revision(
+    *,
+    runtime: ContractRuntime,
+    record: Mapping[str, Any],
+    context: Any,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append the replacement worker-commit line after full facade validation."""
+
+    recovery = _runtime_context_same_lane_worker_commit_recovery(record, context)
+    if recovery.get("status") != "eligible":
+        return {}
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    candidate_commit = str(payload.get("worker_commit_sha") or "").strip()
+    errors: list[str] = []
+    if candidate_commit != str(
+        recovery.get("actual_worktree_head_commit") or ""
+    ).strip():
+        errors.append("replacement worker_commit does not match the eligible HEAD")
+    if sorted(set(payload.get("changed_files") or [])) != sorted(
+        set(recovery.get("changed_files") or [])
+    ):
+        errors.append("replacement worker_commit changed_files drifted")
+    if str(payload.get("implementation_lineage_ref") or "").strip() != str(
+        recovery.get("implementation_lineage_ref") or ""
+    ).strip():
+        errors.append("replacement worker_commit implementation lineage drifted")
+    if sorted(set(payload.get("graph_trace_ids") or [])) != sorted(
+        set(recovery.get("graph_trace_ids") or [])
+    ):
+        errors.append("replacement worker_commit graph traces drifted")
+    if errors:
+        raise GovernanceError(
+            "contract_worker_commit_recovery_mismatch",
+            "; ".join(errors),
+            422,
+            {
+                "contract_execution_id": record.get("contract_execution_id"),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "same_lane_worker_commit_recovery": recovery,
+                "next_legal_action": "stop_and_report_worker_commit_drift",
+            },
+        )
+
+    completed_lines = list(record.get("completed_lines") or [])
+    superseded_index = int(recovery["superseded_completed_line_index"])
+    projection_lines = [
+        line
+        for index, line in enumerate(completed_lines)
+        if index != superseded_index
+    ]
+    projection = {
+        "schema_version": "contract_runtime.same_lane_worker_commit_recovery_projection.v1",
+        "source": "server_verified_same_lane_clean_git_descendant",
+        "same_lane_worker_commit_recovery": dict(recovery),
+        "projected_completed_lines": projection_lines,
+        "persistence": {
+            "mutates_contract_runtime_completed_lines": False,
+            "append_only_history_preserved": True,
+        },
+    }
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    projected = runtime.projected_record(
+        execution_id,
+        actor_role="mf_sub",
+        completed_lines=projection_lines,
+        projection=projection,
+    )
+    next_line = (
+        projected.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(projected.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(next_line.get("line_id") or "").strip() != "worker_commit":
+        raise GovernanceError(
+            "contract_worker_commit_recovery_projection_invalid",
+            "same-lane commit recovery did not reopen worker_commit",
+            422,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "next_legal_action": dict(next_line),
+                "fail_closed": True,
+            },
+        )
+    canonical_payload = dict(payload)
+    canonical_payload["canonical_same_lane_repair_head_revision"] = {
+        "schema_version": (
+            "runtime_context.canonical_same_lane_repair_head_revision.v1"
+        ),
+        "source": "server_verified_same_lane_clean_git_descendant",
+        "server_derived": True,
+        "superseded_completed_line_index": superseded_index,
+        "superseded_worker_commit_sha": recovery.get("recorded_commit_sha"),
+        "replacement_worker_commit_sha": candidate_commit,
+        "diff_base_commit": recovery.get("diff_base_commit"),
+        "cumulative_changed_files": list(recovery.get("changed_files") or []),
+        "clean_worktree": True,
+        "append_only_history_preserved": True,
+        "raw_worker_tokens_persisted": False,
+    }
+    write = _contract_runtime_write_from_record(
+        projected,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    write.update(
+        {
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "commit_sha": candidate_commit,
+            "changed_files": list(payload.get("changed_files") or []),
+            "graph_trace_ids": list(payload.get("graph_trace_ids") or []),
+            "payload": canonical_payload,
+        }
+    )
+    for key, value in canonical_payload.items():
+        if key not in write:
+            write[key] = value
+    revised_lines = [
+        *completed_lines,
+        _line_evidence_from_write(write, "mf_sub"),
+    ]
+    projected_after = runtime.projected_record(
+        execution_id,
+        actor_role="mf_sub",
+        completed_lines=revised_lines,
+        projection={
+            "schema_version": (
+                "contract_runtime.same_lane_worker_commit_revision_result.v1"
+            ),
+            "source": "server_verified_same_lane_clean_git_descendant",
+        },
+    )
+    projected_after_next = (
+        projected_after.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(projected_after.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if str(projected_after_next.get("line_id") or "").strip() != (
+        "worker_finish_time_attestation"
+    ):
+        raise GovernanceError(
+            "contract_worker_commit_recovery_projection_invalid",
+            "replacement worker_commit did not advance to finish attestation",
+            422,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "next_legal_action": dict(projected_after_next),
+                "fail_closed": True,
+            },
+        )
+    expected_revision = int(record.get("execution_state_revision") or 1)
+    updated_record = dict(record)
+    updated_record["completed_lines"] = revised_lines
+    updated_record["execution_state_revision"] = expected_revision + 1
+    try:
+        runtime.store.update(
+            execution_id,
+            updated_record,
+            expected_revision=expected_revision,
+        )
+    except ContractRuntimeError as exc:
+        raise GovernanceError(
+            "contract_worker_commit_recovery_revision_conflict",
+            str(exc),
+            409,
+            {
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "fail_closed": True,
+            },
+        ) from exc
+    runtime.current_guide(execution_id, actor_role="mf_sub")
+    persisted = runtime.store.get(execution_id)
+    current_state = _runtime_current_state_from_record(persisted)
+    return {
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+        "accepted": True,
+        "status": "passed",
+        "primary_decision_source": True,
+        "agent_facing_decision_source": "contract_runtime_first_missing_line",
+        "contract_execution_id": execution_id,
+        "actor_role": "mf_sub",
+        "requested_event_kind": "worker_commit",
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "evidence_kind": "worker_commit",
+        "decision": {"ok": True, "errors": []},
+        "execution_state_revision": current_state.get(
+            "execution_state_revision", 0
+        ),
+        "execution_state_hash": current_state.get("execution_state_hash", ""),
+        "runtime_guide_hash": current_state.get("runtime_guide_hash", ""),
+        "next_legal_action": current_state.get("next_legal_action") or {},
+        "same_lane_worker_commit_recovery": dict(recovery),
+        "append_only_history_preserved": True,
+    }
+
+
 def _runtime_context_contract_requires_worker_commit(
     conn,
     contract_execution_id: str,
@@ -28456,15 +28963,24 @@ def handle_graph_governance_runtime_context_worker_commit(ctx: RequestContext):
                 "evidence_kind": "worker_commit",
             },
         }
-        contract_gate = _contract_runtime_close_gate(
-            conn,
-            project_id=project_id,
-            body=contract_body,
-            event_kind="worker_commit",
-            norm_payload=payload,
-            trusted_actor_role="mf_sub",
-            trusted_worker_commit_facade=True,
+        runtime = _contract_runtime(conn)
+        stored_record = runtime.store.get(contract_execution_id)
+        contract_gate = _runtime_context_append_same_lane_worker_commit_revision(
+            runtime=runtime,
+            record=stored_record,
+            context=context,
+            payload=payload,
         )
+        if not contract_gate:
+            contract_gate = _contract_runtime_close_gate(
+                conn,
+                project_id=project_id,
+                body=contract_body,
+                event_kind="worker_commit",
+                norm_payload=payload,
+                trusted_actor_role="mf_sub",
+                trusted_worker_commit_facade=True,
+            )
         final_head = batch_jobs.git_commit(worktree_path)
         final_dirty_files = _runtime_context_git_dirty_files(worktree_path)
         if final_head != actual_head or final_dirty_files:
@@ -56828,6 +57344,9 @@ def _contract_runtime_apply_mf_parallel_context_projection(
         completed_lines=projection["projected_completed_lines"],
         projection=projection,
     )
+    recovery = projection.get("same_lane_worker_commit_recovery")
+    if isinstance(recovery, Mapping):
+        projected["same_lane_worker_commit_recovery"] = dict(recovery)
     return projected, projection
 
 
@@ -56863,6 +57382,7 @@ def _contract_runtime_mf_parallel_context_projection(
     source_refs: list[str] = []
     existing_keys = _contract_runtime_projection_line_keys(completed_lines)
     expected_context_summaries: list[dict[str, Any]] = []
+    same_lane_recoveries: list[dict[str, Any]] = []
     for dispatch_line in dispatch_lines:
         for context in _contract_runtime_contexts_for_dispatch_line(
             conn,
@@ -56883,6 +57403,12 @@ def _contract_runtime_mf_parallel_context_projection(
                     projection=context_projection,
                 )
             )
+            recovery = _runtime_context_same_lane_worker_commit_recovery(
+                record,
+                context,
+            )
+            if recovery and recovery.get("status") in {"eligible", "blocked"}:
+                same_lane_recoveries.append(dict(recovery))
             for line in context_projection.get("projected_lines", []):
                 if not isinstance(line, Mapping):
                     continue
@@ -56941,15 +57467,27 @@ def _contract_runtime_mf_parallel_context_projection(
         not projected_lines
         and not identity_mismatch
         and not failed_qa_rejoin_contexts
+        and not same_lane_recoveries
     ):
         return {}
+    superseded_line_indices = {
+        int(item.get("superseded_completed_line_index"))
+        for item in same_lane_recoveries
+        if item.get("status") == "eligible"
+        and isinstance(item.get("superseded_completed_line_index"), int)
+    }
+    projection_base_lines = [
+        line
+        for index, line in enumerate(completed_lines)
+        if index not in superseded_line_indices
+    ]
     projected_completed_lines = (
         _contract_runtime_merge_projected_completed_lines(
-            completed_lines,
+            projection_base_lines,
             projected_lines,
         )
         if projected_lines
-        else completed_lines
+        else projection_base_lines
     )
     projection = {
         "schema_version": "contract_runtime.mf_parallel_runtime_context_projection.v1",
@@ -56959,7 +57497,11 @@ def _contract_runtime_mf_parallel_context_projection(
             else (
                 "stale_dispatch_identity_mismatch"
                 if identity_mismatch
-                else "failed_qa_revision_rejoin"
+                else (
+                    "failed_qa_revision_rejoin"
+                    if failed_qa_rejoin_contexts
+                    else "same_lane_worker_commit_recovery"
+                )
             )
         ),
         "source": "runtime_context_worker_evidence",
@@ -56983,6 +57525,12 @@ def _contract_runtime_mf_parallel_context_projection(
         )
     if identity_mismatch:
         projection["dispatch_identity_mismatch"] = identity_mismatch
+    if same_lane_recoveries:
+        projection["same_lane_worker_commit_recoveries"] = same_lane_recoveries
+        if len(same_lane_recoveries) == 1:
+            projection["same_lane_worker_commit_recovery"] = dict(
+                same_lane_recoveries[0]
+            )
     return projection
 
 
@@ -63365,6 +63913,97 @@ def _contract_runtime_unchanged_line_rejection(
         ),
         "execution_state_hash": str(state.get("execution_state_hash") or ""),
         "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+    }
+
+
+def _contract_runtime_same_lane_worker_commit_precheck(
+    *,
+    stored_record: Mapping[str, Any],
+    projected_record: Mapping[str, Any],
+    projection: Mapping[str, Any],
+    write: Mapping[str, Any],
+    actor_role: str,
+) -> dict[str, Any]:
+    """Precheck the projected reopen without weakening normal commit writes."""
+
+    recovery = projection.get("same_lane_worker_commit_recovery")
+    if not isinstance(recovery, Mapping) or recovery.get("status") != "eligible":
+        return {}
+    next_line = (
+        projected_record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    requested = {
+        "stage_id": str(write.get("stage_id") or "").strip(),
+        "line_id": str(write.get("line_id") or "").strip(),
+        "evidence_kind": str(write.get("evidence_kind") or "").strip(),
+        "actor_role": str(write.get("actor_role") or actor_role or "").strip(),
+    }
+    expected = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "evidence_kind": "worker_commit",
+        "actor_role": "mf_sub",
+    }
+    errors = [
+        f"{field} mismatch for same-lane worker_commit recovery"
+        for field, expected_value in expected.items()
+        if requested[field] != expected_value
+    ]
+    if str(next_line.get("line_id") or "").strip() != "worker_commit":
+        errors.append("projected ContractRuntime is not awaiting worker_commit")
+    expected_write = _contract_runtime_write_from_record(
+        projected_record,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+    if int(write.get("execution_state_revision") or 0) != int(
+        expected_write.get("execution_state_revision") or 0
+    ):
+        errors.append("execution_state_revision is stale")
+    if str(write.get("runtime_guide_hash") or "").strip() != str(
+        expected_write.get("runtime_guide_hash") or ""
+    ).strip():
+        errors.append("runtime_guide_hash is stale")
+    if errors:
+        return _contract_runtime_unchanged_line_rejection(
+            stored_record,
+            errors,
+        )
+    guide = (
+        projected_record.get("runtime_guide")
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    state = (
+        projected_record.get("execution_state")
+        if isinstance(projected_record.get("execution_state"), Mapping)
+        else {}
+    )
+    return {
+        "schema_version": "contract_runtime_line_write_precheck_result.v1",
+        "ok": True,
+        "decision": {
+            "schema_version": "contract_write_gate_decision.v1",
+            "ok": True,
+            "errors": [],
+        },
+        "record": dict(projected_record),
+        "write": dict(write),
+        "would_mutate_completed_lines": False,
+        "completed_lines_count": len(stored_record.get("completed_lines") or []),
+        "projected_completed_lines_count": len(
+            projection.get("projected_completed_lines") or []
+        ),
+        "execution_state_revision": int(
+            stored_record.get("execution_state_revision") or 0
+        ),
+        "execution_state_hash": str(state.get("execution_state_hash") or ""),
+        "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
+        "same_lane_worker_commit_recovery": dict(recovery),
     }
 
 
@@ -90790,6 +91429,7 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
             else:
                 runtime.current_guide(contract_execution_id, actor_role=actor_role)
                 record = runtime.store.get(contract_execution_id)
+                stored_record = record
                 record, projection = (
                     _contract_runtime_apply_mf_parallel_context_projection(
                         conn,
@@ -90850,15 +91490,25 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         close_authority_precheck
                     )
                 else:
-                    result = runtime.precheck_line_write(
-                        contract_execution_id,
-                        write,
-                        actor_role=actor_role,
-                        projected_completed_lines=(
-                            _contract_runtime_projection_completed_lines(projection)
-                        ),
-                        projection=projection,
+                    result = (
+                        _contract_runtime_same_lane_worker_commit_precheck(
+                            stored_record=stored_record,
+                            projected_record=record,
+                            projection=projection,
+                            write=write,
+                            actor_role=actor_role,
+                        )
                     )
+                    if not result:
+                        result = runtime.precheck_line_write(
+                            contract_execution_id,
+                            write,
+                            actor_role=actor_role,
+                            projected_completed_lines=(
+                                _contract_runtime_projection_completed_lines(projection)
+                            ),
+                            projection=projection,
+                        )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
