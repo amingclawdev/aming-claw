@@ -61067,6 +61067,7 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
                     "candidate_new_failures": 0,
                     "candidate_suite_counts": {
                         "baseline_known_non_green": 17,
+                        "failed": 17,
                         "passed": 712,
                     },
                     "no_pass_claim": True,
@@ -61137,6 +61138,15 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         "reproduced": 17,
         "total": 17,
     }
+    assert server._contract_runtime_value_reports_failed_qa(
+        record["completed_lines"][10]
+    ) is True
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        record["completed_lines"][10]
+    ) is True
+    assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+        record["completed_lines"][10]
+    ) is False
     assert server._contract_runtime_completed_line_acceptance(
         conn,
         project_id=project_id,
@@ -61168,6 +61178,72 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert not server._contract_runtime_candidate_scoped_no_pass_line(
         waived_no_pass
     )
+
+    def assert_no_durable_authority(
+        candidate_record: dict[str, Any],
+    ) -> None:
+        denied_merge = server._contract_runtime_completed_merge_authority(
+            conn,
+            project_id=project_id,
+            record=candidate_record,
+            context=context,
+            timeline_events=timeline_events,
+        )
+        assert denied_merge == {}
+        assert server._contract_runtime_completed_merge_reconcile_authority(
+            conn,
+            project_id=project_id,
+            record=candidate_record,
+            context=context,
+            timeline_events=timeline_events,
+            merge=denied_merge,
+        ) == {}
+
+    genuine_candidate_failure = json.loads(json.dumps(record))
+    genuine_qa = genuine_candidate_failure["completed_lines"][10]
+    for field in ("payload", "test_results", "verification"):
+        genuine_qa[field]["candidate_new_failures"] = 1
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        genuine_qa
+    ) is False
+    assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+        genuine_qa
+    ) is True
+    assert_no_durable_authority(genuine_candidate_failure)
+
+    malformed_no_pass = json.loads(json.dumps(record))
+    malformed_qa = malformed_no_pass["completed_lines"][10]
+    malformed_qa["artifact_refs"].pop("external_no_pass_baseline_ledger")
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        malformed_qa
+    ) is False
+    assert_no_durable_authority(malformed_no_pass)
+
+    for verdict in ("unknown", "failed"):
+        invalid_verdict = json.loads(json.dumps(record))
+        invalid_qa = invalid_verdict["completed_lines"][10]
+        invalid_qa["payload"]["verdict"] = verdict
+        invalid_qa["verification"]["verdict"] = verdict
+        assert server._contract_runtime_candidate_scoped_no_pass_line(
+            invalid_qa
+        ) is False
+        assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+            invalid_qa
+        ) is True
+        assert_no_durable_authority(invalid_verdict)
+
+    non_candidate_scoped = json.loads(json.dumps(record))
+    non_candidate_qa = non_candidate_scoped["completed_lines"][10]
+    non_candidate_qa["payload"]["acceptance_scope"] = "full_suite"
+    non_candidate_qa["test_results"]["scope"] = "full_suite"
+    non_candidate_qa["verification"]["acceptance_scope"] = "full_suite"
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        non_candidate_qa
+    ) is False
+    assert server._contract_runtime_line_reports_disqualifying_failed_qa(
+        non_candidate_qa
+    ) is True
+    assert_no_durable_authority(non_candidate_scoped)
 
     composed_authority = (
         server._contract_runtime_current_full_reconcile_authority_from_merge(

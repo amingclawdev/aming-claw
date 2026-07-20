@@ -62736,6 +62736,22 @@ def _contract_runtime_candidate_scoped_no_pass_line(
     return False
 
 
+def _contract_runtime_line_reports_disqualifying_failed_qa(
+    line: Mapping[str, Any],
+) -> bool:
+    """Separate inherited no-PASS failures from candidate QA failures.
+
+    The generic recursive detector intentionally treats every positive
+    ``failed`` count as failed QA.  A canonical candidate-scoped no-PASS line
+    is the narrow exception: its accepted baseline ledger proves that those
+    failures are inherited while candidate-new failures remain zero.
+    """
+
+    if _contract_runtime_candidate_scoped_no_pass_line(line):
+        return False
+    return _contract_runtime_value_reports_failed_qa(line)
+
+
 def _contract_runtime_completed_merge_authority(
     conn,
     *,
@@ -62824,7 +62840,9 @@ def _contract_runtime_completed_merge_authority(
         return {}
     if (
         not _contract_runtime_line_status_passes(qa_verification[1])
-        or _contract_runtime_value_reports_failed_qa(qa_verification[1])
+        or _contract_runtime_line_reports_disqualifying_failed_qa(
+            qa_verification[1]
+        )
     ):
         return {}
 
@@ -63098,7 +63116,9 @@ def _contract_runtime_completed_line_acceptance(
     )
     if (
         not _contract_runtime_line_status_passes(canonical_line)
-        or _contract_runtime_value_reports_failed_qa(canonical_line)
+        or _contract_runtime_line_reports_disqualifying_failed_qa(
+            canonical_line
+        )
         or str(canonical_line.get("status") or "").strip().lower()
         in {"waived", "bypassed"}
         or (
