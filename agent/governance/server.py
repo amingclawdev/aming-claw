@@ -22287,6 +22287,10 @@ def _runtime_context_gate_summary(gate: Mapping[str, Any] | None) -> dict[str, A
         "server_issued_session_token_verified",
         "checkpoint_id",
         "merge_queue_ready",
+        "test_results",
+        "test_results_acceptance",
+        "no_pass",
+        "overall_release_pass_claimed",
         "validated_head_commit",
         "runtime_status",
         "validated_changed_files",
@@ -22462,6 +22466,208 @@ def _runtime_context_test_results_passed(value: Any) -> bool:
     }
 
 
+_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS = (
+    "accepted_with_known_baseline_failure"
+)
+_RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES = frozenset(
+    {
+        "accepted",
+        "blocked",
+        "error",
+        "errored",
+        "fail",
+        "failed",
+        "failure",
+        "rejected",
+    }
+)
+_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS = (
+    "candidate_new_failures",
+    "full_failed",
+    "inherited_failed",
+    "baseline_failed",
+    "focused_passed",
+    "full_passed",
+    "baseline_passed",
+)
+
+
+def _runtime_context_finish_attestation_no_pass_results_accepted(
+    value: Any,
+) -> bool:
+    """Accept one exact candidate-clean result without claiming release PASS."""
+
+    if not isinstance(value, Mapping) or not value:
+        return False
+    if (
+        str(value.get("status") or "").strip().lower()
+        != _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
+        or value.get("no_pass") is not True
+        or ("passed" in value and value.get("passed") is not False)
+        or (
+            "overall_release_pass" in value
+            and value.get("overall_release_pass") is not False
+        )
+        or (
+            "overall_release_pass_claimed" in value
+            and value.get("overall_release_pass_claimed") is not False
+        )
+    ):
+        return False
+    counts: dict[str, int] = {}
+    for field in _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS:
+        count = value.get(field)
+        if not isinstance(count, int) or isinstance(count, bool):
+            return False
+        counts[field] = count
+    return bool(
+        counts["candidate_new_failures"] == 0
+        and counts["full_failed"] > 0
+        and counts["full_failed"]
+        == counts["inherited_failed"]
+        == counts["baseline_failed"]
+        and counts["focused_passed"] > 0
+        and counts["full_passed"] >= counts["baseline_passed"] >= 0
+    )
+
+
+def _runtime_context_finish_attestation_test_results_accepted(value: Any) -> bool:
+    """Validate finish evidence without changing generic PASS semantics."""
+
+    if not isinstance(value, Mapping) or not value:
+        return False
+    status = str(value.get("status") or "").strip().lower()
+    if (
+        status == _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
+        or value.get("no_pass") is True
+    ):
+        return _runtime_context_finish_attestation_no_pass_results_accepted(value)
+    if status in _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES:
+        return False
+    return _runtime_context_test_results_passed(value)
+
+
+def _runtime_context_finish_attestation_test_results_payload(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the public/persisted finish result with an explicit release boundary."""
+
+    result = dict(value)
+    if _runtime_context_finish_attestation_no_pass_results_accepted(result):
+        result["overall_release_pass_claimed"] = False
+    return result
+
+
+def _runtime_context_restore_finish_gate_no_pass_results(
+    value: Any,
+    *,
+    test_results: Mapping[str, Any],
+) -> Any:
+    """Remove the in-memory legacy adapter from every public gate projection."""
+
+    if isinstance(value, Mapping):
+        restored: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key == "test_results" and isinstance(nested, Mapping):
+                restored[key] = dict(test_results)
+            else:
+                restored[key] = _runtime_context_restore_finish_gate_no_pass_results(
+                    nested,
+                    test_results=test_results,
+                )
+        return restored
+    if isinstance(value, list):
+        return [
+            _runtime_context_restore_finish_gate_no_pass_results(
+                nested,
+                test_results=test_results,
+            )
+            for nested in value
+        ]
+    return value
+
+
+def _runtime_context_validate_finish_gate_test_results(
+    payload: Mapping[str, Any],
+    *,
+    context: Any,
+    validator: Any,
+    validation_error: type[Exception],
+) -> dict[str, Any]:
+    """Run the legacy gate while preserving strict no-PASS release semantics.
+
+    The legacy contract only models green tests.  Its complete identity, scope,
+    startup, trace, and attestation checks remain authoritative, so an exact
+    candidate-clean no-PASS result is translated only in a deep-copied input.
+    The adapter is removed from every returned projection before persistence.
+    """
+
+    supplied = (
+        payload.get("test_results")
+        if isinstance(payload.get("test_results"), Mapping)
+        else {}
+    )
+    if not _runtime_context_finish_attestation_test_results_accepted(supplied):
+        supplied_status = str(supplied.get("status") or "").strip().lower()
+        if (
+            supplied_status == _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS
+            or supplied.get("no_pass") is True
+            or supplied_status
+            in _RUNTIME_CONTEXT_FINISH_ATTESTATION_AMBIGUOUS_STATUSES
+        ):
+            raise validation_error(
+                "MF subagent finish gate requires accepted finish-attestation "
+                "test_results"
+            )
+        return validator(payload, context=context)
+    if not _runtime_context_finish_attestation_no_pass_results_accepted(supplied):
+        return validator(payload, context=context)
+
+    public_results = _runtime_context_finish_attestation_test_results_payload(
+        supplied
+    )
+    adapted_payload = deepcopy(dict(payload))
+    adapted_payload["test_results"] = {
+        **public_results,
+        "passed": True,
+        "_runtime_context_strict_no_pass_validation_adapter": True,
+    }
+    gate = validator(adapted_payload, context=context)
+    restored = _runtime_context_restore_finish_gate_no_pass_results(
+        gate,
+        test_results=public_results,
+    )
+    if not isinstance(restored, Mapping):
+        raise validation_error("MF subagent finish gate returned an invalid result")
+    result = dict(restored)
+    result.update(
+        {
+            "no_pass": True,
+            "overall_release_pass_claimed": False,
+            "test_results_acceptance": {
+                "schema_version": (
+                    "runtime_context.finish_gate_no_pass_acceptance.v1"
+                ),
+                "status": _RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_STATUS,
+                "no_pass": True,
+                "candidate_new_failures": 0,
+                "worker_finish_ready": True,
+                "overall_release_pass_claimed": False,
+                "source": "strict_finish_attestation_test_results",
+            },
+        }
+    )
+    for projection_key in ("lane_ownership_projection", "close_gate_projection"):
+        projection = result.get(projection_key)
+        if isinstance(projection, Mapping):
+            result[projection_key] = {
+                **dict(projection),
+                "no_pass": True,
+                "overall_release_pass_claimed": False,
+            }
+    return result
+
+
 _RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS = {
     "graph_trace_id",
     "graph_trace_ids",
@@ -22579,11 +22785,29 @@ def _runtime_context_test_results_compatible(
     expected: Mapping[str, Any],
 ) -> bool:
     if dict(candidate) == dict(expected):
-        return True
-    if not _runtime_context_test_results_passed(candidate):
+        return _runtime_context_finish_attestation_test_results_accepted(candidate)
+    if not _runtime_context_finish_attestation_test_results_accepted(candidate):
         return False
-    if not _runtime_context_test_results_passed(expected):
+    if not _runtime_context_finish_attestation_test_results_accepted(expected):
         return False
+    candidate_no_pass = (
+        _runtime_context_finish_attestation_no_pass_results_accepted(candidate)
+    )
+    expected_no_pass = (
+        _runtime_context_finish_attestation_no_pass_results_accepted(expected)
+    )
+    if candidate_no_pass or expected_no_pass:
+        if not candidate_no_pass or not expected_no_pass:
+            return False
+        if any(
+            candidate.get(field) != expected.get(field)
+            for field in (
+                "status",
+                "no_pass",
+                *_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS,
+            )
+        ):
+            return False
     candidate_commands = set(
         _runtime_context_service_query_values(candidate, "command", "commands")
     )
@@ -22952,7 +23176,9 @@ def _runtime_context_contract_finish_attestation_projection(
         "changed_files": _runtime_context_same_string_set(
             canonical_files, changed_files
         ),
-        "test_results": _runtime_context_test_results_passed(canonical_tests)
+        "test_results": _runtime_context_finish_attestation_test_results_accepted(
+            canonical_tests
+        )
         and _runtime_context_test_results_compatible(canonical_tests, test_results),
         "worker_session_id": bool(canonical_session)
         and (
@@ -28462,10 +28688,15 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         test_results = (
             body.get("test_results") if isinstance(body.get("test_results"), Mapping) else {}
         )
-        if not _runtime_context_test_results_passed(test_results):
+        if not _runtime_context_finish_attestation_test_results_accepted(
+            test_results
+        ):
             raise ValidationError(
-                "finish-time worker attestation requires non-empty passed test_results"
+                "finish-time worker attestation requires accepted test_results"
             )
+        test_results = _runtime_context_finish_attestation_test_results_payload(
+            test_results
+        )
 
         timeline_events = _runtime_context_service_timeline_events(
             conn,
@@ -28698,6 +28929,16 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
             "test_results": test_results,
             "finish_time_worker_self_attestation": public_attestation,
         }
+        if _runtime_context_finish_attestation_no_pass_results_accepted(
+            test_results
+        ):
+            payload.update(
+                {
+                    "no_pass": True,
+                    "overall_release_pass_claimed": False,
+                    "test_results_status": test_results["status"],
+                }
+            )
         for key, value in route_lineage_payload.items():
             if value:
                 payload[key] = value
@@ -28745,6 +28986,10 @@ def handle_graph_governance_runtime_context_finish_time_worker_attestation(ctx: 
         gate=event.get("meta_contract_gate") if isinstance(event, Mapping) else None,
     )
     response["finish_time_worker_self_attestation"] = public_attestation
+    response["test_results"] = dict(test_results)
+    if _runtime_context_finish_attestation_no_pass_results_accepted(test_results):
+        response["no_pass"] = True
+        response["overall_release_pass_claimed"] = False
     response["finish_order_projection"] = finish_order_projection
     response["contract_runtime_canonical_line"] = canonical_contract_line
     response["next_legal_action"] = "record_finish_gate"
@@ -30411,7 +30656,12 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             if parent_route_lineage:
                 _sanitized_body["parent_route_lineage"] = parent_route_lineage
             try:
-                gate = validate_mf_subagent_finish_gate(_sanitized_body, context=context)
+                gate = _runtime_context_validate_finish_gate_test_results(
+                    _sanitized_body,
+                    context=context,
+                    validator=validate_mf_subagent_finish_gate,
+                    validation_error=MfSubagentContractError,
+                )
             except MfSubagentContractError as exc:
                 repair_response = _parallel_branch_finish_gate_parent_lineage_repair_response(
                     project_id=project_id,

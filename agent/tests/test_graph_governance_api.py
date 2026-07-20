@@ -9568,7 +9568,7 @@ def test_runtime_context_implementation_route_ref_resolves_active_contract_execu
     )
     with pytest.raises(
         ValidationError,
-        match="finish-time worker attestation requires non-empty passed test_results",
+        match="finish-time worker attestation requires accepted test_results",
     ):
         server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
             _ctx_with_role(
@@ -17680,6 +17680,112 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
     assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
     assert finished["context"]["status"] == "validated"
     assert finished["context"]["head_commit"] == "head-finish"
+
+
+def test_parallel_branch_finish_gate_preserves_strict_no_pass_results(conn):
+    task_id = "finish-no-pass-task"
+    backlog_id = "FEAT-FINISH-GATE-NO-PASS"
+    fence_token = "fence-finish-no-pass"
+    worktree_path = "/tmp/nonexistent-finish-no-pass-task"
+    branch_ref = "refs/heads/codex/finish-no-pass-task"
+    head_commit = "head-finish-no-pass"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            base_commit="base-finish-no-pass",
+            head_commit="base-finish-no-pass",
+            target_head_commit="target-finish-no-pass",
+            merge_queue_id="mergeq-finish-no-pass",
+        ),
+        now_iso="2026-07-20T12:00:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit=head_commit,
+    )
+    test_results = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 17,
+        "inherited_failed": 17,
+        "baseline_failed": 17,
+        "focused_passed": 11,
+        "full_passed": 713,
+        "baseline_passed": 712,
+    }
+
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": task_id,
+                "status": "review_ready",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": test_results,
+                "checkpoint_id": "ckpt-finish-no-pass",
+                "fence_token": fence_token,
+                "head_commit": head_commit,
+                "agent_id": "codex-subagent-no-pass",
+                "evidence": _finish_gate_evidence(
+                    fence_token=fence_token,
+                    worktree_path=worktree_path,
+                    branch_ref=branch_ref,
+                    head_commit=head_commit,
+                ),
+            },
+        )
+    )
+
+    expected_results = {
+        **test_results,
+        "overall_release_pass_claimed": False,
+    }
+    assert finished["ok"] is True
+    gate = finished["gate"]
+    assert gate["merge_queue_ready"] is True
+    assert gate["no_pass"] is True
+    assert gate["overall_release_pass_claimed"] is False
+    assert gate["test_results"] == expected_results
+    assert gate["close_gate_projection"]["test_results"] == expected_results
+    assert gate["close_gate_projection"]["no_pass"] is True
+    assert gate["close_gate_projection"]["overall_release_pass_claimed"] is False
+    assert gate["lane_ownership_projection"]["no_pass"] is True
+    assert gate["lane_ownership_projection"][
+        "overall_release_pass_claimed"
+    ] is False
+    timeline_payload = finished["timeline_event_recorded"]["payload"]
+    assert timeline_payload["test_results"] == expected_results
+    assert timeline_payload["mf_subagent_finish_gate"][
+        "test_results"
+    ] == expected_results
+    serialized = json.dumps(finished, sort_keys=True)
+    assert "_runtime_context_strict_no_pass_validation_adapter" not in serialized
+    assert '"overall_release_pass_claimed": true' not in serialized
+    assert '"test_results": {"baseline_failed": 17' in serialized
+    assert '"passed": true' not in json.dumps(
+        {
+            "top": gate["test_results"],
+            "close": gate["close_gate_projection"]["test_results"],
+            "timeline": timeline_payload["test_results"],
+        },
+        sort_keys=True,
+    )
 
 
 @pytest.mark.parametrize("worker_status", ["succeeded", "review_ready"])
@@ -59038,6 +59144,80 @@ def test_runtime_context_read_receipt_rolls_back_contract_when_timeline_write_fa
     ) == []
 
 
+def test_finish_attestation_test_results_accept_exact_no_pass_only():
+    accepted = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 17,
+        "inherited_failed": 17,
+        "baseline_failed": 17,
+        "focused_passed": 11,
+        "full_passed": 713,
+        "baseline_passed": 712,
+    }
+    assert server._runtime_context_finish_attestation_test_results_accepted(
+        accepted
+    ) is True
+    assert server._runtime_context_finish_attestation_test_results_payload(
+        accepted
+    ) == {**accepted, "overall_release_pass_claimed": False}
+    assert server._runtime_context_finish_attestation_test_results_accepted(
+        {"status": "passed", "passed": True}
+    ) is True
+
+    rejected = []
+    for field in (
+        "no_pass",
+        "candidate_new_failures",
+        "full_failed",
+        "inherited_failed",
+        "baseline_failed",
+        "focused_passed",
+        "full_passed",
+        "baseline_passed",
+    ):
+        candidate = dict(accepted)
+        candidate.pop(field)
+        rejected.append(candidate)
+    for field in (
+        "candidate_new_failures",
+        "full_failed",
+        "inherited_failed",
+        "baseline_failed",
+        "focused_passed",
+        "full_passed",
+        "baseline_passed",
+    ):
+        candidate = dict(accepted)
+        candidate[field] = "17"
+        rejected.append(candidate)
+    for update in (
+        {"candidate_new_failures": 1},
+        {"inherited_failed": 16},
+        {"baseline_failed": 16},
+        {"focused_passed": 0},
+        {"baseline_passed": 714},
+        {"overall_release_pass": True},
+        {"overall_release_pass": "true"},
+        {"overall_release_pass_claimed": True},
+        {"passed": True},
+    ):
+        rejected.append({**accepted, **update})
+    for status in ("accepted", "failed", "blocked"):
+        rejected.append({**accepted, "status": status, "passed": True})
+
+    assert all(
+        not server._runtime_context_finish_attestation_test_results_accepted(
+            candidate
+        )
+        for candidate in rejected
+    )
+    assert server._runtime_context_test_results_passed(
+        {"status": "accepted", "passed": True}
+    ) is True
+
+
 def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage(
     conn,
     tmp_path,
@@ -59060,7 +59240,22 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
     contract_execution_id = successor["contract_execution_id"]
     parent_task_id = runtime_context.parent_task_id or backlog_id
     worker_session_id = "worker-session-active-lineage"
-    test_results = {"status": "passed", "passed": True, "command": "pytest -q"}
+    test_results = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 17,
+        "inherited_failed": 17,
+        "baseline_failed": 17,
+        "focused_passed": 11,
+        "full_passed": 713,
+        "baseline_passed": 712,
+        "command": "pytest -q",
+    }
+    persisted_test_results = {
+        **test_results,
+        "overall_release_pass_claimed": False,
+    }
     read_receipt_event_id = "4201"
     read_receipt_hash = "sha256:active-lineage-read"
 
@@ -59089,7 +59284,7 @@ def test_contract_finish_attestation_projection_selects_active_failed_qa_lineage
             "filer_principal": worker_session_id,
             "head_commit": head_commit,
             "changed_files": changed_files,
-            "test_results": test_results,
+            "test_results": persisted_test_results,
             "read_receipt_event_id": read_receipt_event_id,
             "read_receipt_hash": read_receipt_hash,
             "graph_trace_ids": ["gqt-contract-finish-active-lineage"],
@@ -63062,7 +63257,7 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     assert guide["contract_runtime_dispatch_identity"]["accepted"] is True
 
 
-def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
+def test_mf_parallel_inflight_no_pass_finish_uses_contract_dispatch_without_backfill(
     conn,
     tmp_path,
     monkeypatch,
@@ -63161,6 +63356,9 @@ def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
             "schema_version": "runtime_context.contract_worker_commit_projection.v1",
             "status": "validated",
             "canonical_worker_commit_required": True,
+            "contract_execution_id": successor["contract_execution_id"],
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": runtime_context.task_id,
             "worker_commit_sha": head_commit,
             "head_commit": head_commit,
             "changed_files": ["agent/governance/server.py"],
@@ -63195,6 +63393,77 @@ def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
         },
     )
     worker_session_id = f"session-{worker_task_id}"
+    no_pass_test_results = {
+        "status": "accepted_with_known_baseline_failure",
+        "no_pass": True,
+        "candidate_new_failures": 0,
+        "full_failed": 17,
+        "inherited_failed": 17,
+        "baseline_failed": 17,
+        "focused_passed": 11,
+        "full_passed": 713,
+        "baseline_passed": 712,
+    }
+    attestation_body = {
+        **worker_query,
+        "worker_session_id": worker_session_id,
+        "filer_principal": worker_session_id,
+        "worker_transcript_ref": "codex:inflight-dispatch-bridge",
+        "harness_type": "codex",
+        "graph_trace_ids": [graph_trace_id],
+        "read_receipt_event_id": evidence_events["read_receipt"],
+        "read_receipt_hash": "sha256:mf-parallel-runtime-projection-read",
+        "head_commit": head_commit,
+        "actual_cwd": str(worker_root),
+        "actual_git_root": str(worker_root),
+        "test_results": no_pass_test_results,
+    }
+    timeline_count_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"]
+    contract_revision_before = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"]
+    rejected_results = []
+    for update in (
+        {"no_pass": None},
+        {"candidate_new_failures": 1},
+        {"inherited_failed": 16},
+        {"focused_passed": 0},
+        {"full_passed": None},
+        {"baseline_failed": "17"},
+        {"overall_release_pass": True},
+        {"status": "accepted", "passed": True},
+        {"status": "failed", "passed": True},
+        {"status": "blocked", "passed": True},
+    ):
+        rejected_results.append({**no_pass_test_results, **update})
+    for rejected_test_results in rejected_results:
+        with pytest.raises(
+            ValidationError,
+            match="finish-time worker attestation requires accepted test_results",
+        ):
+            server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": runtime_context.runtime_context_id,
+                    },
+                    "mf_sub",
+                    method="POST",
+                    body={
+                        **attestation_body,
+                        "test_results": rejected_test_results,
+                    },
+                )
+            )
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"] == timeline_count_before
+    assert server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )["execution_state_revision"] == contract_revision_before
+
     finish = (
         server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
             _ctx_with_role(
@@ -63204,22 +63473,7 @@ def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
                 },
                 "mf_sub",
                 method="POST",
-                body={
-                    **worker_query,
-                    "worker_session_id": worker_session_id,
-                    "filer_principal": worker_session_id,
-                    "worker_transcript_ref": "codex:inflight-dispatch-bridge",
-                    "harness_type": "codex",
-                    "graph_trace_ids": [graph_trace_id],
-                    "read_receipt_event_id": evidence_events["read_receipt"],
-                    "read_receipt_hash": (
-                        "sha256:mf-parallel-runtime-projection-read"
-                    ),
-                    "head_commit": head_commit,
-                    "actual_cwd": str(worker_root),
-                    "actual_git_root": str(worker_root),
-                    "test_results": {"status": "passed", "passed": True},
-                },
+                body=attestation_body,
             )
         )
     )
@@ -63234,6 +63488,19 @@ def test_mf_parallel_inflight_finish_uses_contract_dispatch_without_backfill(
     assert stored_payload["observer_command_id_source"] == (
         "contract_runtime_execution_id_bridge"
     )
+    expected_test_results = {
+        **no_pass_test_results,
+        "overall_release_pass_claimed": False,
+    }
+    assert stored_payload["test_results"] == expected_test_results
+    assert stored_payload["no_pass"] is True
+    assert stored_payload["overall_release_pass_claimed"] is False
+    assert finish["test_results"] == expected_test_results
+    assert finish["no_pass"] is True
+    assert finish["overall_release_pass_claimed"] is False
+    assert finish["finish_gate_submission"]["body"][
+        "test_results"
+    ] == expected_test_results
     assert finish["finish_gate_submission"]["body"]["observer_command_id"] == (
         successor["contract_execution_id"]
     )
