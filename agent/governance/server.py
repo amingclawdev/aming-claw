@@ -25040,7 +25040,7 @@ def _runtime_context_git_dirty_files(worktree_path: str) -> list[str]:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValidationError(f"unable to inspect assigned worktree status: {exc}") from exc
-    return parse_git_porcelain_paths(proc.stdout)
+    return filter_dirty_files(parse_git_porcelain_paths(proc.stdout))
 
 
 def _runtime_context_worker_commit_contract_execution_id(

@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from agent.governance import parallel_branch_runtime as pbr
+from agent.governance import server
 from agent.governance.auto_chain import _DIRTY_IGNORE
 from agent.governance.dirty_worktree import filter_dirty_files, is_ignored_dirty_path
 from agent.governance.state_reconcile import _git_dirty_files
@@ -132,5 +133,20 @@ def test_parallel_merge_dirty_files_uses_shared_filter(monkeypatch, tmp_path) ->
     monkeypatch.setattr(pbr, "_git_preview_command", fake_preview_command)
 
     assert pbr._git_worktree_dirty_files(tmp_path, timeout_seconds=30) == [
+        "src/app.js",
+    ]
+
+
+def test_runtime_context_dirty_files_uses_shared_filter(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    graph_cache = tmp_path / ".aming-claw/cache/branches/worker"
+    graph_cache.mkdir(parents=True)
+    for name in ("graph.base.json", "graph.branch.overlay.json", "manifest.json"):
+        (graph_cache / name).write_text("{}\n", encoding="utf-8")
+    source = tmp_path / "src/app.js"
+    source.parent.mkdir(parents=True)
+    source.write_text("export {};\n", encoding="utf-8")
+
+    assert server._runtime_context_git_dirty_files(str(tmp_path)) == [
         "src/app.js",
     ]
