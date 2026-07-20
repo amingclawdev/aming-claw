@@ -21044,6 +21044,7 @@ def _runtime_context_historical_rework_route_correction_authority(
     if source_index < 0 or source_index >= failed_qa_index:
         return {}
     rejoin_marker = _runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
         context=context,
         runtime_context_id=runtime_context_id,
         timeline_events=timeline_events,
@@ -23751,12 +23752,15 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
 
 def _runtime_context_authenticated_failed_qa_timeline_boundary(
     *,
+    conn,
     context: Any,
     runtime_context_id: str,
     timeline_events: Sequence[Mapping[str, Any]],
     before_event_id: int = 0,
 ) -> dict[str, Any]:
     """Return the latest active server-authenticated QA timeline verdict."""
+
+    from . import task_timeline
 
     task_id = str(getattr(context, "task_id", "") or "").strip()
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
@@ -23847,7 +23851,11 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
             or ""
         ).strip()
         authenticated = bool(
-            gate.get("ok") is True
+            task_timeline._source_backed_qa_session_authority_valid(
+                source_authority,
+                conn=conn,
+            )
+            and gate.get("ok") is True
             and gate.get("primary_decision_source") is True
             and str(gate.get("source_of_authority") or "").strip()
             == "qa_session_verification"
@@ -23906,6 +23914,7 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
 
 def _runtime_context_failed_qa_revision_rejoin_marker(
     *,
+    conn,
     context: Any,
     runtime_context_id: str,
     timeline_events: Sequence[Mapping[str, Any]],
@@ -24031,6 +24040,7 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             continue
         timeline_failed_qa_boundary = (
             _runtime_context_authenticated_failed_qa_timeline_boundary(
+                conn=conn,
                 context=context,
                 runtime_context_id=runtime_context_id,
                 timeline_events=timeline_events,
@@ -25549,6 +25559,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     )
     active_timeline_failed_qa = (
         _runtime_context_authenticated_failed_qa_timeline_boundary(
+            conn=conn,
             context=context,
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
@@ -25556,6 +25567,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     )
     authoritative_revision_marker = (
         _runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
             context=context,
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
@@ -25918,6 +25930,20 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "implementation revision claimed HEAD must match the clean assigned worktree HEAD"
         )
     if timeline_backed_failed_qa_revision:
+        prior_canonical_implementation_commit = str(
+            (previous or {}).get("commit_sha") or ""
+        ).strip()
+        if (
+            not re.fullmatch(
+                r"[0-9a-f]{40,64}", prior_canonical_implementation_commit
+            )
+            or str(active_timeline_failed_qa.get("commit_sha") or "").strip()
+            != prior_canonical_implementation_commit
+        ):
+            errors.append(
+                "timeline failed-QA commit must equal the superseded canonical "
+                "worker implementation commit"
+            )
         guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
         next_line = (
             guide.get("next_legal_action")
@@ -56241,6 +56267,7 @@ def _contract_runtime_projection_for_context(
     if not contract_runtime_failed_qa:
         failed_qa_revision_rejoin_marker = (
             _runtime_context_failed_qa_revision_rejoin_marker(
+                conn=conn,
                 context=context,
                 runtime_context_id=runtime_context_id,
                 timeline_events=timeline_events,

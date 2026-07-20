@@ -31141,6 +31141,7 @@ def test_runtime_context_session_token_rejoin_reopens_validated_worker_after_fai
     assert saved.status == STATE_WORKTREE_READY
     assert saved.last_recovery_action == "mf_subagent_failed_qa_revision_rejoin_issued"
     revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
         context=saved,
         runtime_context_id=saved.runtime_context_id,
         timeline_events=task_timeline.list_events(
@@ -31890,6 +31891,7 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
     saved_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert saved_context is not None
     revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
         context=saved_context,
         runtime_context_id=saved_context.runtime_context_id,
         timeline_events=task_timeline.list_events(
@@ -32605,64 +32607,90 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         now_iso="2026-07-19T11:00:00Z",
     )
     qa_principal = "qa:timeline-only-failed-qa"
-    qa_session_id = "ses-timeline-only-failed-qa"
-    qa_scope_binding_ref = "qa_scope:timeline-only-failed-qa"
-    authority_hash = _fake_sha("timeline-only-failed-qa-authority")
-    failed_qa = task_timeline.record_event(
-        conn,
+    snapshot_id = "full-timeline-only-failed-qa"
+    _activate_basic_graph(conn, snapshot_id, commit_sha=initial_head)
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
         project_id=PID,
-        task_id=runtime_context.task_id,
         backlog_id=backlog_id,
-        event_type="independent_verification.completed",
-        event_kind="independent_verification",
-        phase="verification",
-        status="failed",
-        actor=qa_principal,
+        task_id=runtime_context.task_id,
         commit_sha=initial_head,
-        payload={
-            "runtime_context_id": runtime_context.runtime_context_id,
-            "task_id": runtime_context.task_id,
-            "parent_task_id": backlog_id,
-            "reviewer_role": "independent_qa",
-            "requirement_id": "independent_verification_lane",
-            "candidate_new_failures": 0,
-            "observer_impersonation": False,
-            "contract_gate_decision": {
-                "ok": True,
-                "primary_decision_source": True,
-                "source_of_authority": "qa_session_verification",
-                "required_role": "qa",
-                "missing_proof_fields": [],
-            },
-            "source_backed_contract_gate_authority": {
-                "schema_version": "source_backed_contract_gate_authority.v1",
-                "source": "server_qa_session_verification",
-                "source_of_authority": "qa_session_verification",
-                "authority_hash": authority_hash,
-                "qa_session_proof": {
-                    "schema_version": "qa_session_scope_proof.v1",
-                    "source": "authenticated_qa_session",
-                    "verified": True,
-                    "role": "qa",
-                    "principal_id": qa_principal,
-                    "qa_session_id": qa_session_id,
-                    "qa_scope_binding_ref": qa_scope_binding_ref,
-                    "project_id": PID,
-                    "backlog_id": backlog_id,
-                    "task_id": runtime_context.task_id,
-                    "event_kind": "independent_verification",
-                    "evidence_status": "failed",
-                    "commit_sha": initial_head,
-                },
-            },
-        },
-        verification={
-            "result": "failed",
-            "verdict": "FAIL",
-            "requirement_id": "independent_verification_lane",
-        },
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{runtime_context.task_id}",
+        f"commit:{initial_head}",
+        qa_scope_binding_ref,
+    ]
+    qa_session = server.role_service.register(
+        conn,
+        qa_principal,
+        PID,
+        "qa",
+        scope=qa_scope,
     )
     conn.commit()
+    qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": runtime_context.task_id,
+            "commit_sha": initial_head,
+            "project_root": str(target_root),
+        },
+    )
+    qa_graph_ctx._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": qa_principal,
+            "scope": qa_scope,
+        }
+    )
+    qa_graph = server.handle_graph_governance_query(qa_graph_ctx)
+    qa_timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": backlog_id,
+            "task_id": runtime_context.task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "status": "failed",
+            "actor": qa_principal,
+            "commit_sha": initial_head,
+            "verification": {
+                "result": "failed",
+                "verdict": "FAIL",
+                "requirement_id": "independent_verification_lane",
+            },
+            "payload": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "parent_task_id": backlog_id,
+                "reviewer_role": "independent_qa",
+                "requirement_id": "independent_verification_lane",
+                "candidate_new_failures": 0,
+                "graph_trace_ids": [qa_graph["trace_id"]],
+                "observer_impersonation": False,
+            },
+        },
+    )
+    qa_timeline_ctx._session = dict(qa_graph_ctx._session)
+    failed_qa = server.handle_task_timeline_append(qa_timeline_ctx)
+    failed_authority = failed_qa["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    assert task_timeline._source_backed_qa_session_authority_valid(
+        failed_authority,
+        conn=conn,
+    ) is True
+    assert failed_authority["qa_session_proof"]["commit_sha"] == initial_head
 
     before_rejoin_record = runtime.store.get(successor["contract_execution_id"])
     initial_payload = {
@@ -32683,6 +32711,62 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             "verified_trace_ids": [graph_trace_id],
         },
     }
+
+    def assert_invalid_qa_authority_does_not_mutate_runtime():
+        before = runtime.store.get(successor["contract_execution_id"])
+        events = task_timeline.list_events(
+            conn,
+            PID,
+            task_id=runtime_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+        assert server._runtime_context_authenticated_failed_qa_timeline_boundary(
+            conn=conn,
+            context=runtime_context,
+            runtime_context_id=runtime_context.runtime_context_id,
+            timeline_events=events,
+        ) == {}
+        assert server._runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=PID,
+            context=runtime_context,
+            runtime=runtime,
+            record=before,
+            payload=initial_payload,
+            revision_marker={},
+        ) == {}
+        after = runtime.store.get(successor["contract_execution_id"])
+        assert after["execution_state_revision"] == before["execution_state_revision"]
+        assert after["completed_lines"] == before["completed_lines"]
+
+    original_failed_payload = json.loads(json.dumps(failed_qa["payload"]))
+    tampered_failed_payload = json.loads(json.dumps(original_failed_payload))
+    tampered_failed_payload["source_backed_contract_gate_authority"][
+        "authority_hash"
+    ] = _fake_sha("tampered-timeline-only-qa-authority")
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(tampered_failed_payload), int(failed_qa["id"])),
+    )
+    conn.commit()
+    assert_invalid_qa_authority_does_not_mutate_runtime()
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(original_failed_payload), int(failed_qa["id"])),
+    )
+    conn.execute(
+        "UPDATE graph_query_traces SET qa_session_id = '' WHERE trace_id = ?",
+        (qa_graph["trace_id"],),
+    )
+    conn.commit()
+    assert_invalid_qa_authority_does_not_mutate_runtime()
+    conn.execute(
+        "UPDATE graph_query_traces SET qa_session_id = ? WHERE trace_id = ?",
+        (qa_session["session_id"], qa_graph["trace_id"]),
+    )
+    conn.commit()
+
     with pytest.raises(GovernanceError) as missing_rejoin:
         server._runtime_context_revise_failed_qa_implementation_lineage(
             conn,
@@ -32731,6 +32815,7 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     saved_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert saved_context is not None
     revision_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
         context=saved_context,
         runtime_context_id=saved_context.runtime_context_id,
         timeline_events=task_timeline.list_events(
@@ -32753,6 +32838,37 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     revision_before_negative_cases = runtime.store.get(
         successor["contract_execution_id"]
     )["execution_state_revision"]
+    commit_mismatch_record = json.loads(
+        json.dumps(runtime.store.get(successor["contract_execution_id"]))
+    )
+    prior_canonical_implementation = server._worker_commit_completed_implementation(
+        commit_mismatch_record,
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+    )
+    assert prior_canonical_implementation is not None
+    assert initial_head != base_commit
+    prior_canonical_implementation["commit_sha"] = base_commit
+    with pytest.raises(GovernanceError) as mismatched_qa_commit:
+        server._runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=PID,
+            context=saved_context,
+            runtime=runtime,
+            record=commit_mismatch_record,
+            payload=revision_payload,
+            revision_marker=revision_marker,
+        )
+    assert mismatched_qa_commit.value.code == (
+        "contract_runtime_rework_lineage_revision_invalid"
+    )
+    assert "superseded canonical worker implementation commit" in str(
+        mismatched_qa_commit.value
+    )
+    assert runtime.store.get(successor["contract_execution_id"])[
+        "execution_state_revision"
+    ] == revision_before_negative_cases
+
     negative_cases = {
         "wrong_source": ({**revision_marker, "failed_qa_source": "caller_claim"}, revision_payload),
         "stale_session": (
