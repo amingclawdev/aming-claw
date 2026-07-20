@@ -2531,6 +2531,42 @@ def _git_repo(tmp_path):
     return create_parallel_fixture_project(tmp_path).root
 
 
+def _seed_server_authored_batch_coordination_lineage(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    merge_queue_id: str,
+    coordination_backlog_id: str,
+    now_iso: str,
+) -> None:
+    """Represent the canonical mf_batch enter event required by live apply."""
+
+    task_timeline.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO task_timeline_events (
+            project_id, backlog_id, task_id, event_type,
+            event_kind, payload_json, created_at
+        ) VALUES (?, ?, ?, 'mf_batch_parallel.entered',
+                  'mf_batch_parallel_entered', ?, ?)
+        """,
+        (
+            PID,
+            coordination_backlog_id,
+            batch_id,
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "merge_queue_id": merge_queue_id,
+                    "backlog_id": coordination_backlog_id,
+                },
+                sort_keys=True,
+            ),
+            now_iso,
+        ),
+    )
+
+
 def _init_test_git_repo(root: Path, *, filename: str = "candidate.txt") -> str:
     root.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -20494,6 +20530,15 @@ def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_p
         ],
         now_iso="2026-05-17T08:28:00Z",
     )
+    _seed_server_authored_batch_coordination_lineage(
+        conn,
+        batch_id="PB-api-execute",
+        merge_queue_id=queue_id,
+        coordination_backlog_id=(
+            "ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION"
+        ),
+        now_iso="2026-05-17T08:28:00Z",
+    )
 
     dry_run = server.handle_graph_governance_parallel_branch_merge_execute(
         _ctx(
@@ -20746,6 +20791,13 @@ def test_parallel_branch_merge_execute_mutates_target_owner_not_candidate_worktr
         ],
         now_iso="2026-07-17T08:35:00Z",
     )
+    _seed_server_authored_batch_coordination_lineage(
+        conn,
+        batch_id="mf-batch-shared-target-owner",
+        merge_queue_id=queue_id,
+        coordination_backlog_id="AC-MERGE-TARGET-OWNER",
+        now_iso="2026-07-17T08:35:00Z",
+    )
 
     live = server.handle_graph_governance_parallel_branch_merge_execute(
         _ctx(
@@ -20937,6 +20989,13 @@ def _prepare_merge_ownership_guard_case(conn, tmp_path, *, suffix: str):
         ],
         now_iso="2026-07-19T12:10:00Z",
     )
+    _seed_server_authored_batch_coordination_lineage(
+        conn,
+        batch_id=f"mf-batch-ownership-{suffix}",
+        merge_queue_id=queue_id,
+        coordination_backlog_id="AC-MERGE-OWNERSHIP-GUARD",
+        now_iso="2026-07-19T12:10:00Z",
+    )
     evidence = {
         "dirty_worktree_check": {"status": "pass"},
         "test_evidence": {
@@ -21091,6 +21150,13 @@ def test_parallel_branch_merge_execute_aborts_owner_merge_when_commit_fails(
                 projection_id="semproj-commit-failure-cleanup",
             )
         ],
+        now_iso="2026-07-19T12:00:00Z",
+    )
+    _seed_server_authored_batch_coordination_lineage(
+        conn,
+        batch_id="mf-batch-commit-failure-cleanup",
+        merge_queue_id=queue_id,
+        coordination_backlog_id="AC-MERGE-COMMIT-FAILURE-CLEANUP",
         now_iso="2026-07-19T12:00:00Z",
     )
 
@@ -22092,6 +22158,13 @@ def test_parallel_branch_merge_execute_accepts_parent_route_for_reclaimed_contex
                 projection_id="semproj-execute-parent-route",
             )
         ],
+        now_iso="2026-05-17T08:34:00Z",
+    )
+    _seed_server_authored_batch_coordination_lineage(
+        conn,
+        batch_id="PB-api-execute-parent-route",
+        merge_queue_id=queue_id,
+        coordination_backlog_id=parent_task_id,
         now_iso="2026-05-17T08:34:00Z",
     )
     conn.commit()
@@ -48252,6 +48325,181 @@ def test_release_operator_head_queue_pinned_active_precedence_is_non_skippable(
     ] is True
 
 
+def test_release_operator_head_queue_preserves_reconciled_epoch_member_positions(
+    conn,
+    monkeypatch,
+):
+    child_a = "AC-RELEASE-EPOCH-CHILD-A"
+    child_b = "AC-RELEASE-EPOCH-CHILD-B"
+    coordination = "AC-RELEASE-EPOCH-COORDINATION"
+    unrelated = "AC-RELEASE-EPOCH-UNRELATED"
+    head_insert = "AC-RELEASE-EPOCH-HEAD-INSERT"
+    safe_append = "AC-RELEASE-EPOCH-SAFE-APPEND"
+    backlog_ids = [child_a, child_b, coordination, unrelated]
+    for backlog_id in [*backlog_ids, head_insert, safe_append]:
+        _insert_release_queue_backlog(conn, backlog_id)
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "release-operator"},
+    )
+    for backlog_id in backlog_ids:
+        inserted = server.handle_project_release_operator_head_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={"action": "insert", "backlog_id": backlog_id},
+            )
+        )
+        assert inserted["ok"] is True
+
+    queue_id = "mq-release-epoch-members"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=f"item-{index}",
+                task_id=f"task-{index}",
+                backlog_id=backlog_id,
+                branch_ref=f"refs/heads/codex/release-epoch-{index}",
+                queue_index=index,
+                status=STATE_MERGED,
+                target_ref="refs/heads/main",
+                merge_commit="epoch-final-head",
+            )
+            for index, backlog_id in enumerate((child_a, child_b), start=1)
+        ],
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-release-epoch-members",
+            epoch_id="epoch-release-epoch-members",
+            coordination_backlog_id=coordination,
+            target_ref="refs/heads/main",
+            base_head="base-head",
+            current_head="epoch-final-head",
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=("item-1", "item-2"),
+            remaining_queue_item_ids=(),
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED,
+            reconcile_state="reconciled",
+            snapshot_id="full-epoch-final-head",
+        ),
+        now_iso="2026-07-20T12:00:00Z",
+    )
+    assert epoch.active_backlog_id == ""
+
+    code, insert_refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "insert",
+                "backlog_id": head_insert,
+                "position": 1,
+                "reason": "must not shift reconciled epoch positions",
+            },
+        )
+    )
+    assert code == 409
+    assert insert_refusal["error"] == (
+        "active_integration_epoch_member_positions_non_insertable"
+    )
+    assert insert_refusal["shifted_backlog_ids"] == [
+        child_a,
+        child_b,
+        coordination,
+    ]
+    assert insert_refusal["position_preserved"] is True
+
+    appended = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "insert",
+                "backlog_id": safe_append,
+                "reason": "append after every protected epoch member",
+            },
+        )
+    )
+    assert appended["ok"] is True
+    appended_item = next(
+        item
+        for item in appended["release_operator_head_queue"]["items"]
+        if item["backlog_id"] == safe_append
+    )
+    assert appended_item["position"] == 5
+
+    code, skip_refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "skip",
+                "backlog_id": child_b,
+                "reason": "must not defer a reconciled epoch member",
+            },
+        )
+    )
+    assert code == 409
+    assert skip_refusal["error"] == (
+        "active_integration_epoch_position_non_skippable"
+    )
+    assert skip_refusal["next_legal_action"]["id"] == (
+        "close_reconciled_child_rows"
+    )
+    assert skip_refusal["next_legal_action"]["backlog_id"] == child_a
+    assert set(skip_refusal["protected_backlog_ids"]) == {
+        child_a,
+        child_b,
+        coordination,
+    }
+
+    code, reorder_refusal = server.handle_project_release_operator_head_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "action": "reorder",
+                "backlog_ids": [
+                    unrelated,
+                    child_a,
+                    child_b,
+                    coordination,
+                    safe_append,
+                ],
+                "reason": "must not move frozen epoch positions",
+            },
+        )
+    )
+    assert code == 409
+    assert reorder_refusal["error"] == (
+        "active_integration_epoch_member_positions_non_reorderable"
+    )
+    assert set(reorder_refusal["moved_backlog_ids"]) == {
+        child_a,
+        child_b,
+        coordination,
+    }
+    assert reorder_refusal["position_preserved"] is True
+
+    view = server.handle_project_release_operator_head_queue(
+        _ctx({"project_id": PID})
+    )["release_operator_head_queue"]
+    assert [item["backlog_id"] for item in view["items"]] == [
+        *backlog_ids,
+        safe_append,
+    ]
+    assert [item["skip_count"] for item in view["items"]] == [0, 0, 0, 0, 0]
+    assert head_insert not in {item["backlog_id"] for item in view["items"]}
+
+
 def test_onboard_route_guide_without_backlog_selects_durable_queue_head(conn, monkeypatch):
     first_id = "AC-RELEASE-FRESH-HEAD"
     second_id = "AC-RELEASE-FRESH-NEXT"
@@ -70586,3 +70834,164 @@ def test_active_integration_epoch_precedes_onboard_and_rejects_new_allocation(
     )
     assert resolved_child is not None and child_scope == "child"
     assert resolved_parent is not None and parent_scope == "coordination"
+
+
+@pytest.mark.parametrize(
+    "invalid_child_commit,invalid_child_fixed_at,expected_detail_key",
+    [
+        (
+            "older-unrelated-child-commit",
+            "2026-07-20T12:01:00Z",
+            "stale_commit_child_backlog_ids",
+        ),
+        (
+            "epoch-final-head",
+            "2026-07-20T11:59:59Z",
+            "stale_fixed_at_child_backlog_ids",
+        ),
+    ],
+)
+def test_coordination_close_rejects_child_fixed_before_canonical_epoch_barrier(
+    conn,
+    monkeypatch,
+    invalid_child_commit,
+    invalid_child_fixed_at,
+    expected_detail_key,
+):
+    coordination = "AC-EPOCH-CLOSE-COORDINATION"
+    child_a = "AC-EPOCH-CLOSE-CHILD-A"
+    child_b = "AC-EPOCH-CLOSE-CHILD-B"
+    for backlog_id in (coordination, child_a, child_b):
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+    queue_id = "mq-epoch-close-canonical-barrier"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id=f"item-{index}",
+                task_id=f"task-{index}",
+                backlog_id=backlog_id,
+                branch_ref=f"refs/heads/codex/epoch-close-{index}",
+                queue_index=index,
+                status=STATE_MERGED,
+                target_ref="refs/heads/main",
+                merge_commit="epoch-final-head",
+            )
+            for index, backlog_id in enumerate((child_a, child_b), start=1)
+        ],
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-epoch-close-canonical-barrier",
+            epoch_id="epoch-close-canonical-barrier",
+            coordination_backlog_id=coordination,
+            target_ref="refs/heads/main",
+            base_head="base-head",
+            current_head="epoch-final-head",
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=("item-1", "item-2"),
+            remaining_queue_item_ids=(),
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED,
+            reconcile_state="reconciled",
+            snapshot_id="full-epoch-final-head",
+        ),
+        now_iso="2026-07-20T12:00:00Z",
+    )
+    conn.execute(
+        """UPDATE backlog_bugs
+           SET status = 'FIXED', "commit" = ?, fixed_at = ?, updated_at = ?
+           WHERE bug_id = ?""",
+        (
+            invalid_child_commit,
+            invalid_child_fixed_at,
+            invalid_child_fixed_at,
+            child_a,
+        ),
+    )
+    conn.execute(
+        """UPDATE backlog_bugs
+           SET status = 'FIXED', "commit" = ?, fixed_at = ?, updated_at = ?
+           WHERE bug_id = ?""",
+        (
+            "epoch-final-head",
+            "2026-07-20T12:01:00Z",
+            "2026-07-20T12:01:00Z",
+            child_b,
+        ),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(
+        server,
+        "_require_route_token_mutation_gate",
+        lambda *_args, **_kwargs: {"allowed": True, "evidence_refs": []},
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_hotfix_backlog_close_tag",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_backlog_close_route_action_precheck_event",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_verify_mf_close_timeline_gate",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_backlog_close_route_waiver_identity_block",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_route_token_gate_event",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_build_backlog_close_impact_check",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_backlog_close(
+            _ctx(
+                {"project_id": PID, "bug_id": coordination},
+                method="POST",
+                body={"actor": "observer", "commit": "epoch-final-head"},
+            )
+        )
+
+    assert exc.value.code == "integration_epoch_atomic_child_close_not_ready"
+    assert exc.value.status == 409
+    assert exc.value.details[expected_detail_key] == [child_a]
+    assert exc.value.details["required_child_commit"] == epoch.current_head
+    assert exc.value.details["reconcile_barrier_at"] == epoch.updated_at
+    assert exc.value.details["epoch_remains_active"] is True
+    parent_row = conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (coordination,)
+    ).fetchone()
+    assert parent_row["status"] == "MF_IN_PROGRESS"
+    active_epoch = parallel_branch_runtime.get_active_integration_epoch(
+        conn, PID, merge_queue_id=queue_id
+    )
+    assert active_epoch is not None
+    assert active_epoch.status == (
+        parallel_branch_runtime.INTEGRATION_EPOCH_RECONCILED
+    )

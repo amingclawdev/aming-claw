@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import sqlite3
 
 from agent.governance import mf_subagent_contract as mf_contract
 from agent.governance import parallel_branch_runtime as pbr
+from agent.governance import task_timeline
 from agent.tests.fixtures.parallel_project import (
     PB001RestartFixtureProject,
     create_pb001_restart_fixture_project,
@@ -43,6 +45,39 @@ def _runtime_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _seed_batch_coordination_lineage(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    merge_queue_id: str,
+    backlog_id: str = "AC-PB010-COORDINATION",
+) -> None:
+    task_timeline.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO task_timeline_events (
+            project_id, backlog_id, task_id, event_type,
+            event_kind, payload_json, created_at
+        ) VALUES (?, ?, ?, 'mf_batch_parallel.entered',
+                  'mf_batch_parallel_entered', ?, ?)
+        """,
+        (
+            PROJECT_ID,
+            backlog_id,
+            batch_id,
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "merge_queue_id": merge_queue_id,
+                    "backlog_id": backlog_id,
+                },
+                sort_keys=True,
+            ),
+            NOW,
+        ),
+    )
 
 
 def _contexts() -> list[BranchTaskRuntimeContext]:
@@ -1699,6 +1734,11 @@ def test_merge_queue_apply_consumes_already_integrated_lane_without_target_mutat
             ),
         ],
         now_iso=NOW,
+    )
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=BATCH_ID,
+        merge_queue_id="mergeq-PB010-integrated",
     )
     preview_call: dict[str, object] = {}
 

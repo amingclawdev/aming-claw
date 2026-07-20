@@ -64505,6 +64505,61 @@ def _record_release_operator_head_queue_event(
     )
     return int(cursor.lastrowid or 0)
 
+
+def _release_operator_head_queue_integration_epoch_guard(
+    conn,
+    *,
+    project_id: str,
+) -> dict[str, Any]:
+    """Project the non-skippable/non-reorderable active epoch positions."""
+
+    from .parallel_branch_runtime import (
+        integration_epoch_child_backlog_ids,
+        integration_epoch_resume_payload,
+        integration_epoch_to_dict,
+        list_active_integration_epochs,
+    )
+
+    epochs = list_active_integration_epochs(conn, project_id)
+    if not epochs:
+        return {}
+    protected_ids: list[str] = []
+    epoch_guards: list[dict[str, Any]] = []
+    member_guards: dict[str, dict[str, Any]] = {}
+    for epoch in epochs:
+        resume = integration_epoch_resume_payload(conn, epoch)
+        epoch_members = tuple(
+            dict.fromkeys(
+                backlog_id
+                for backlog_id in (
+                    str(resume.get("backlog_id") or "").strip(),
+                    epoch.active_backlog_id,
+                    *integration_epoch_child_backlog_ids(conn, epoch),
+                    epoch.coordination_backlog_id,
+                )
+                if backlog_id
+            )
+        )
+        epoch_guard = {
+            "integration_epoch": integration_epoch_to_dict(epoch),
+            "next_legal_action": resume,
+            "resume_backlog_id": str(resume.get("backlog_id") or "").strip(),
+            "protected_backlog_ids": list(epoch_members),
+        }
+        epoch_guards.append(epoch_guard)
+        for backlog_id in epoch_members:
+            if backlog_id not in protected_ids:
+                protected_ids.append(backlog_id)
+            member_guards.setdefault(backlog_id, epoch_guard)
+    primary = epoch_guards[0]
+    return {
+        **primary,
+        "integration_epochs": [guard["integration_epoch"] for guard in epoch_guards],
+        "epoch_guards": epoch_guards,
+        "member_guards": member_guards,
+        "protected_backlog_ids": protected_ids,
+    }
+
 _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "onboard_route_guide",
     "graph_query",
@@ -89869,6 +89924,12 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         before_view = _release_operator_head_queue_view(conn, project_id)
+        integration_epoch_guard = (
+            _release_operator_head_queue_integration_epoch_guard(
+                conn,
+                project_id=project_id,
+            )
+        )
         if action == "insert":
             backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
             if not backlog_id:
@@ -89928,6 +89989,30 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                     "error": "release_operator_head_queue_position_out_of_range",
                     "allowed_range": [1, count + 1],
                 }
+            if integration_epoch_guard:
+                protected_ids = set(
+                    integration_epoch_guard.get("protected_backlog_ids") or []
+                )
+                shifted_epoch_members = [
+                    str(item.get("backlog_id") or "")
+                    for item in before_view.get("items") or []
+                    if str(item.get("backlog_id") or "") in protected_ids
+                    and int(item.get("position") or 0) >= position
+                ]
+                if shifted_epoch_members:
+                    return 409, {
+                        "ok": False,
+                        "error": (
+                            "active_integration_epoch_member_positions_"
+                            "non_insertable"
+                        ),
+                        "backlog_id": backlog_id,
+                        "requested_position": position,
+                        "shifted_backlog_ids": shifted_epoch_members,
+                        "position_preserved": True,
+                        "no_pass_claim": True,
+                        **integration_epoch_guard,
+                    }
             conn.execute(
                 """
                 UPDATE release_operator_head_queue
@@ -89979,6 +90064,39 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                     "error": "release_operator_head_queue_reorder_invalid",
                     "message": str(exc),
                 }
+            if integration_epoch_guard:
+                before_positions = {
+                    str(item.get("backlog_id") or ""): int(
+                        item.get("position") or 0
+                    )
+                    for item in before_view.get("items") or []
+                }
+                after_positions = {
+                    backlog_id: position
+                    for position, backlog_id in enumerate(ordered, start=1)
+                }
+                moved_epoch_members = [
+                    backlog_id
+                    for backlog_id in integration_epoch_guard.get(
+                        "protected_backlog_ids"
+                    )
+                    or []
+                    if backlog_id in before_positions
+                    and before_positions[backlog_id]
+                    != after_positions.get(backlog_id)
+                ]
+                if moved_epoch_members:
+                    return 409, {
+                        "ok": False,
+                        "error": (
+                            "active_integration_epoch_member_positions_"
+                            "non_reorderable"
+                        ),
+                        "moved_backlog_ids": moved_epoch_members,
+                        "position_preserved": True,
+                        "no_pass_claim": True,
+                        **integration_epoch_guard,
+                    }
             now = _utc_now()
             for position, backlog_id in enumerate(ordered, start=1):
                 conn.execute(
@@ -90022,17 +90140,16 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                     "error": "release_operator_head_queue_item_not_found",
                     "backlog_id": backlog_id,
                 }
-            from .parallel_branch_runtime import (
-                get_active_integration_epoch,
-                integration_epoch_resume_payload,
-                integration_epoch_to_dict,
-            )
-
-            active_epoch = get_active_integration_epoch(conn, project_id)
             if (
-                active_epoch is not None
-                and active_epoch.active_backlog_id == backlog_id
+                integration_epoch_guard
+                and backlog_id
+                in set(
+                    integration_epoch_guard.get("protected_backlog_ids") or []
+                )
             ):
+                member_epoch_guard = (
+                    integration_epoch_guard.get("member_guards") or {}
+                ).get(backlog_id) or {}
                 return 409, {
                     "ok": False,
                     "error": "active_integration_epoch_position_non_skippable",
@@ -90040,10 +90157,15 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                     "position": before_item.get("position"),
                     "position_preserved": True,
                     "no_pass_claim": True,
-                    "integration_epoch": integration_epoch_to_dict(active_epoch),
-                    "next_legal_action": integration_epoch_resume_payload(
-                        conn, active_epoch
-                    ),
+                    "protected_backlog_ids": integration_epoch_guard.get(
+                        "protected_backlog_ids"
+                    )
+                    or [],
+                    "integration_epochs": integration_epoch_guard.get(
+                        "integration_epochs"
+                    )
+                    or [],
+                    **member_epoch_guard,
                 }
             if bool(before_item.get("pinned")) and bool(
                 before_item.get("active_execution")
@@ -92083,38 +92205,100 @@ def handle_backlog_close(ctx: RequestContext):
                 placeholders = ",".join("?" for _ in integration_child_backlog_ids)
                 child_rows = conn.execute(
                     f"""
-                    SELECT bug_id, status FROM backlog_bugs
+                    SELECT bug_id, status, "commit", fixed_at
+                    FROM backlog_bugs
                     WHERE bug_id IN ({placeholders})
                     """,
                     integration_child_backlog_ids,
                 ).fetchall()
-                child_statuses = {
-                    str(child_row["bug_id"] or ""): str(child_row["status"] or "")
+                child_states = {
+                    str(child_row["bug_id"] or ""): {
+                        "status": str(child_row["status"] or ""),
+                        "commit": str(child_row["commit"] or ""),
+                        "fixed_at": str(child_row["fixed_at"] or ""),
+                    }
                     for child_row in child_rows
                 }
-                invalid_children = [
-                    child_id
-                    for child_id in integration_child_backlog_ids
-                    if child_statuses.get(child_id) != "FIXED"
-                ]
+                child_statuses = {
+                    child_id: state["status"]
+                    for child_id, state in child_states.items()
+                }
                 missing_children = [
                     child_id
                     for child_id in integration_child_backlog_ids
-                    if child_id not in child_statuses
+                    if child_id not in child_states
                 ]
+                invalid_status_children = [
+                    child_id
+                    for child_id in integration_child_backlog_ids
+                    if (child_states.get(child_id) or {}).get("status") != "FIXED"
+                ]
+                stale_commit_children = [
+                    child_id
+                    for child_id in integration_child_backlog_ids
+                    if (child_states.get(child_id) or {}).get("commit")
+                    != integration_epoch_close.current_head
+                ]
+                reconcile_barrier_at = integration_epoch_close.updated_at
+                reconcile_barrier_order = (
+                    _contract_runtime_close_authority_time_order_value(
+                        reconcile_barrier_at
+                    )
+                )
+                stale_fixed_at_children = []
+                for child_id in integration_child_backlog_ids:
+                    fixed_at = (child_states.get(child_id) or {}).get(
+                        "fixed_at", ""
+                    )
+                    fixed_at_order = (
+                        _contract_runtime_close_authority_time_order_value(
+                            fixed_at
+                        )
+                    )
+                    if (
+                        reconcile_barrier_order is None
+                        or fixed_at_order is None
+                        or fixed_at_order < reconcile_barrier_order
+                    ):
+                        stale_fixed_at_children.append(child_id)
+                invalid_children = list(
+                    dict.fromkeys(
+                        [
+                            *invalid_status_children,
+                            *stale_commit_children,
+                            *stale_fixed_at_children,
+                        ]
+                    )
+                )
                 if invalid_children or missing_children:
                     raise GovernanceError(
                         "integration_epoch_atomic_child_close_not_ready",
                         (
                             "coordination close requires every child to have passed "
-                            "its own protected close route and already be FIXED"
+                            "its own protected close route at the canonical epoch "
+                            "head after the final reconcile barrier"
                         ),
                         409,
                         {
                             "invalid_child_backlog_ids": invalid_children,
                             "missing_child_backlog_ids": missing_children,
                             "child_statuses": child_statuses,
+                            "child_states": child_states,
+                            "invalid_status_child_backlog_ids": (
+                                invalid_status_children
+                            ),
+                            "stale_commit_child_backlog_ids": (
+                                stale_commit_children
+                            ),
+                            "stale_fixed_at_child_backlog_ids": (
+                                stale_fixed_at_children
+                            ),
+                            "required_child_commit": (
+                                integration_epoch_close.current_head
+                            ),
+                            "reconcile_barrier_at": reconcile_barrier_at,
                             "bulk_child_status_mutation_forbidden": True,
+                            "epoch_remains_active": True,
                         },
                     )
 

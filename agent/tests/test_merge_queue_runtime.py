@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 
 import pytest
 
 from agent.governance import parallel_branch_runtime as pbr
+from agent.governance import task_timeline
 from agent.tests.fixtures.parallel_project import create_merge_preview_fixture_project
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
@@ -70,6 +72,39 @@ def _runtime_conn(path: str = ":memory:") -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _seed_batch_coordination_lineage(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    merge_queue_id: str,
+    backlog_id: str = "AC-BATCH-PARENT",
+) -> None:
+    task_timeline.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO task_timeline_events (
+            project_id, backlog_id, task_id, event_type,
+            event_kind, payload_json, created_at
+        ) VALUES (?, ?, ?, 'mf_batch_parallel.entered',
+                  'mf_batch_parallel_entered', ?, ?)
+        """,
+        (
+            PROJECT_ID,
+            backlog_id,
+            batch_id,
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "merge_queue_id": merge_queue_id,
+                    "backlog_id": backlog_id,
+                },
+                sort_keys=True,
+            ),
+            "2026-07-20T12:00:00Z",
+        ),
+    )
 
 
 def _passing_merge_evidence() -> dict[str, dict[str, str]]:
@@ -1343,6 +1378,137 @@ def test_merge_queue_item_matches_reconciled_head_prefix_rules() -> None:
     )
 
 
+def test_reconcile_without_queue_scope_refuses_ambiguous_matching_epochs_without_mutation() -> None:
+    conn = _runtime_conn()
+    for suffix, target_ref, queue_id in (
+        ("one", "refs/heads/main", "mq-ambiguous-one"),
+        ("two", "refs/heads/release", "mq-ambiguous-two"),
+    ):
+        upsert_integration_epoch(
+            conn,
+            IntegrationEpoch(
+                project_id=PROJECT_ID,
+                batch_id=f"batch-ambiguous-{suffix}",
+                epoch_id=f"epoch-ambiguous-{suffix}",
+                coordination_backlog_id=f"AC-BATCH-{suffix.upper()}",
+                target_ref=target_ref,
+                base_head="base-head",
+                current_head="shared-final-head",
+                merge_queue_id=queue_id,
+                status=pbr.INTEGRATION_EPOCH_RECONCILE_PENDING,
+                reconcile_state="pending",
+            ),
+            now_iso="2026-07-20T12:00:00Z",
+        )
+
+    result = pbr.mark_integration_epoch_reconciled(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit="shared-final-head",
+        snapshot_id="full-shared-final-head",
+        projection_id="",
+        now_iso="2026-07-20T12:01:00Z",
+    )
+
+    assert result is None
+    for batch_id in ("batch-ambiguous-one", "batch-ambiguous-two"):
+        epoch = pbr.get_integration_epoch(conn, PROJECT_ID, batch_id)
+        assert epoch is not None
+        assert epoch.status == pbr.INTEGRATION_EPOCH_RECONCILE_PENDING
+        assert epoch.reconcile_state == "pending"
+        assert epoch.snapshot_id == ""
+        assert epoch.updated_at == "2026-07-20T12:00:00Z"
+
+
+def test_open_integration_epoch_refuses_non_contiguous_merged_prefix_without_mutation() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-prefix-gap"
+    queue_id = "mq-prefix-gap"
+    row2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-row2",
+        task_id="task-row2",
+        backlog_id="AC-PREFIX-ROW2",
+        branch_ref="refs/heads/codex/prefix-row2",
+        queue_index=2,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            replace(
+                row2,
+                queue_item_id="item-row1",
+                task_id="task-row1",
+                backlog_id="AC-PREFIX-ROW1",
+                queue_index=1,
+                status=STATE_MERGED,
+            ),
+            row2,
+            replace(
+                row2,
+                queue_item_id="item-row3",
+                task_id="task-row3",
+                backlog_id="AC-PREFIX-ROW3",
+                queue_index=3,
+                status=STATE_MERGED,
+            ),
+        ],
+    )
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
+
+    with pytest.raises(IntegrationEpochFrozenError) as exc:
+        open_or_validate_integration_epoch(
+            conn,
+            item=row2,
+            batch_id=batch_id,
+            target_head="base-head",
+        )
+
+    assert "merged row after the first unmerged row" in str(exc.value)
+    assert exc.value.epoch.failure_reason == "non_contiguous_merged_prefix"
+    assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
+def test_open_integration_epoch_requires_coordination_backlog_lineage_before_mutation() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-missing-coordination"
+    queue_id = "mq-missing-coordination"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-only",
+        task_id="task-only",
+        backlog_id="AC-MISSING-COORDINATION-CHILD",
+        branch_ref="refs/heads/codex/missing-coordination",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+    upsert_merge_queue_items(conn, [item])
+
+    with pytest.raises(IntegrationEpochFrozenError) as exc:
+        open_or_validate_integration_epoch(
+            conn,
+            item=item,
+            batch_id=batch_id,
+            target_head="base-head",
+        )
+
+    assert "recover or replay" in str(exc.value)
+    assert "mf_batch_parallel.entered" in str(exc.value)
+    assert exc.value.epoch.failure_reason == (
+        "coordination_backlog_lineage_unresolved"
+    )
+    assert pbr.get_integration_epoch(conn, PROJECT_ID, batch_id) is None
+
+
 def test_integration_epoch_restart_recovers_already_integrated_item_and_freezes_unrelated_merge(
     tmp_path,
     monkeypatch,
@@ -1392,6 +1558,11 @@ def test_integration_epoch_restart_recovers_already_integrated_item_and_freezes_
             ),
         )
     upsert_merge_queue_items(conn, [row1, row2])
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
     epoch = open_or_validate_integration_epoch(
         conn,
         item=row1,
@@ -1522,6 +1693,11 @@ def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_ski
         ),
     )
     upsert_merge_queue_items(conn, [item])
+    _seed_batch_coordination_lineage(
+        conn,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+    )
     open_or_validate_integration_epoch(
         conn,
         item=item,
