@@ -58811,6 +58811,23 @@ _CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS = set(_QA_REVIEW_AUTHORITY_NAMES) | {
 _CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS = set(
     _QA_REVIEW_AUTHORITY_CONTAINERS
 )
+_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS = {
+    "actor_session_principal",
+    "authenticated_qa_binding",
+    "authorization_source",
+    "completion_status_gate",
+    "evidence_owner_actor",
+    "evidence_owner_role",
+    "evidence_owner_session",
+    "evidence_owner_session_ref",
+    "materialized_from",
+    "materialized_from_report",
+    "observer_impersonation",
+    "parent_materialization_authorized",
+    "qa_session_token_ref",
+    "submitter_principal",
+    "submitter_session",
+}
 _CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS = {
     "actor_role",
     "backlog_id",
@@ -59432,6 +59449,105 @@ def _contract_runtime_strip_authority_claims(
     return value
 
 
+def _contract_runtime_bind_authenticated_qa_provenance(
+    session: Mapping[str, Any],
+    *,
+    write: Mapping[str, Any],
+    source: str,
+    binding_claims: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replace caller-shaped QA authority with authenticated session facts."""
+
+    sanitized = _contract_runtime_strip_authority_claims(
+        write,
+        field_names=_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS,
+    )
+    effective = dict(sanitized) if isinstance(sanitized, Mapping) else {}
+    caller_provenance = (
+        write.get("qa_evidence_provenance")
+        if isinstance(write.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    canonical_provenance = _contract_runtime_strip_authority_claims(
+        caller_provenance,
+        field_names=_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS,
+    )
+    canonical_provenance = (
+        dict(canonical_provenance)
+        if isinstance(canonical_provenance, Mapping)
+        else {}
+    )
+    qa_principal = str(session.get("principal_id") or "qa").strip() or "qa"
+    qa_session_id = str(session.get("session_id") or "").strip()
+    authenticated_binding = {
+        "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+        "server_derived": True,
+        "qa_principal": qa_principal,
+        "qa_session_id": qa_session_id,
+    }
+    authenticated_binding.update(dict(binding_claims or {}))
+    canonical_provenance.update(
+        {
+            "schema_version": "qa_evidence_provenance.v1",
+            "source": source,
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": authenticated_binding,
+        }
+    )
+    effective.update(
+        {
+            "actor_session_principal": qa_principal,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_role": "qa",
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "qa_evidence_provenance": canonical_provenance,
+        }
+    )
+    return effective
+
+
+def _contract_runtime_bind_qa_independent_verification_authority(
+    ctx: RequestContext,
+    conn,
+    *,
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> dict[str, Any]:
+    session = ctx.require_auth(conn)
+    if _normalized_contract_runtime_action(session.get("role")) != "qa":
+        raise PermissionDeniedError(
+            str(session.get("role") or "unknown"),
+            "contract_runtime_qa_independent_verification_authority",
+            {
+                "required_role": "qa",
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "line_id": str(write.get("line_id") or ""),
+                "authority_source": "authenticated_qa_session",
+            },
+        )
+    return _contract_runtime_bind_authenticated_qa_provenance(
+        session,
+        write=write,
+        source="contract_runtime_qa_independent_verification_binding",
+        binding_claims={"independent_verification_session_matched": True},
+    )
+
+
 def _contract_runtime_bind_qa_graph_authority(
     ctx: RequestContext,
     conn,
@@ -59572,74 +59688,11 @@ def _contract_runtime_bind_qa_graph_authority(
     # from that trusted context instead of retaining caller-shaped ownership or
     # authorization claims.  The opaque QA-session ref is transport state in
     # the managed MCP process; it is not itself accepted as caller evidence.
-    qa_provenance_security_fields = {
-        "authorization_source",
-        "completion_status_gate",
-        "evidence_owner_actor",
-        "evidence_owner_role",
-        "evidence_owner_session",
-        "evidence_owner_session_ref",
-        "materialized_from",
-        "materialized_from_report",
-        "observer_impersonation",
-        "parent_materialization_authorized",
-        "qa_session_token_ref",
-        "submitter_principal",
-        "submitter_session",
-    }
-    caller_provenance = (
-        effective.get("qa_evidence_provenance")
-        if isinstance(effective.get("qa_evidence_provenance"), Mapping)
-        else {}
-    )
-    canonical_provenance = _contract_runtime_strip_authority_claims(
-        caller_provenance,
-        field_names=qa_provenance_security_fields,
-    )
-    canonical_provenance = (
-        dict(canonical_provenance)
-        if isinstance(canonical_provenance, Mapping)
-        else {}
-    )
-    qa_principal = str(session.get("principal_id") or "qa").strip() or "qa"
-    qa_session_id = str(session.get("session_id") or "").strip()
-    canonical_provenance.update(
-        {
-            "schema_version": "qa_evidence_provenance.v1",
-            "source": "contract_runtime_qa_graph_authority_binding",
-            "server_derived": True,
-            "authorization_source": "qa_session_token_ref",
-            "evidence_owner_role": "qa",
-            "evidence_owner_actor": qa_principal,
-            "evidence_owner_session": qa_session_id,
-            "submitter_principal": qa_principal,
-            "submitter_session": qa_session_id,
-            "observer_impersonation": False,
-            "parent_materialization_authorized": False,
-            "authenticated_qa_binding": {
-                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
-                "server_derived": True,
-                "qa_principal": qa_principal,
-                "qa_session_id": qa_session_id,
-                "graph_trace_session_matched": True,
-            },
-        }
-    )
-    for field in qa_provenance_security_fields:
-        effective.pop(field, None)
-    effective.update(
-        {
-            "actor_session_principal": qa_principal,
-            "authorization_source": "qa_session_token_ref",
-            "evidence_owner_actor": qa_principal,
-            "evidence_owner_role": "qa",
-            "evidence_owner_session": qa_session_id,
-            "submitter_principal": qa_principal,
-            "submitter_session": qa_session_id,
-            "observer_impersonation": False,
-            "parent_materialization_authorized": False,
-            "qa_evidence_provenance": canonical_provenance,
-        }
+    effective = _contract_runtime_bind_authenticated_qa_provenance(
+        session,
+        write=effective,
+        source="contract_runtime_qa_graph_authority_binding",
+        binding_claims={"graph_trace_session_matched": True},
     )
     for field in ("runtime_context_id", "task_id", "parent_task_id"):
         value = str(evidence.get(field) or identity.get(field) or "").strip()
@@ -61590,6 +61643,13 @@ def _contract_runtime_bind_server_line_authority(
         return _contract_runtime_bind_observer_merge_authority(
             conn,
             project_id=project_id,
+            record=record,
+            write=write,
+        )
+    if line_id == "qa_independent_verification":
+        return _contract_runtime_bind_qa_independent_verification_authority(
+            ctx,
+            conn,
             record=record,
             write=write,
         )
@@ -72277,6 +72337,7 @@ def _contract_runtime_close_gate(
     norm_payload: Mapping[str, Any],
     normalized_status: str = "",
     trusted_actor_role: str = "",
+    trusted_actor_session: Mapping[str, Any] | None = None,
     trusted_worker_commit_facade: bool = False,
 ) -> dict[str, Any]:
     contract_execution_id = _contract_runtime_close_execution_id(body, conn=conn)
@@ -72411,9 +72472,49 @@ def _contract_runtime_close_gate(
     write["payload"] = canonical_norm_payload
     if normalized_status:
         write["status"] = normalized_status
-    for key in ("artifact_refs", "verification", "trace_id", "commit_sha"):
+    for key in (
+        "artifact_refs",
+        "test_results",
+        "verification",
+        "qa_evidence_provenance",
+        "trace_id",
+        "commit_sha",
+    ):
         if key in body:
             write[key] = body[key]
+    if (
+        str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and actor_role == "qa"
+    ):
+        session = (
+            dict(trusted_actor_session)
+            if isinstance(trusted_actor_session, Mapping)
+            else {}
+        )
+        if (
+            _normalized_contract_runtime_action(session.get("role")) != "qa"
+        ):
+            raise GovernanceError(
+                "contract_runtime_close_evidence_rejected",
+                (
+                    "qa_independent_verification requires one authenticated QA "
+                    "session bound by the live host adapter"
+                ),
+                403,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "line_id": "qa_independent_verification",
+                    "actor_role": actor_role,
+                    "authority_source": "authenticated_qa_session",
+                },
+            )
+        write = _contract_runtime_bind_authenticated_qa_provenance(
+            session,
+            write=write,
+            source="contract_runtime_qa_independent_verification_binding",
+            binding_claims={"independent_verification_session_matched": True},
+        )
     result = runtime.submit_line_write(
         contract_execution_id,
         write,
@@ -78078,6 +78179,9 @@ def handle_task_timeline_append(ctx: RequestContext):
                     trusted_contract_runtime_actor_role = (
                         _trusted_contract_runtime_actor_role_from_context(ctx, conn)
                     )
+                trusted_contract_runtime_actor_session = {}
+                if trusted_contract_runtime_actor_role == "qa":
+                    trusted_contract_runtime_actor_session = ctx.require_auth(conn)
                 contract_runtime_close_evidence_gate = _contract_runtime_close_gate(
                     conn,
                     project_id=project_id,
@@ -78086,6 +78190,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                     norm_payload=validation_payload,
                     normalized_status=norm_status,
                     trusted_actor_role=trusted_contract_runtime_actor_role,
+                    trusted_actor_session=trusted_contract_runtime_actor_session,
                 )
             if meta_contract_error_message:
                 meta_contract_gate = {

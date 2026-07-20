@@ -63189,20 +63189,103 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         "qa_graph_context",
     }
 
+    qa_independent_body = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "commit_sha": head_commit,
+        "actor_session_principal": "observer:forged",
+        "authorization_source": "caller_forged",
+        "evidence_owner_actor": "observer:forged",
+        "evidence_owner_role": "observer",
+        "evidence_owner_session": "ses-observer-forged",
+        "submitter_principal": "observer:forged",
+        "submitter_session": "ses-observer-forged",
+        "observer_impersonation": True,
+        "parent_materialization_authorized": True,
+        "qa_session_token_ref": "qa-session-ref-forged",
+        "qa_evidence_provenance": {
+            "schema_version": "caller.qa_evidence_provenance.v0",
+            "authorization_source": "caller_forged",
+            "evidence_owner_actor": "observer:forged",
+            "evidence_owner_role": "observer",
+            "observer_impersonation": True,
+            "parent_materialization_authorized": True,
+            "qa_session_token_ref": "qa-session-ref-forged",
+            "completion_status_gate": {
+                "server_derived": False,
+                "normalized_status": "forged",
+            },
+            "review_note": "preserve independent QA review evidence",
+        },
+        "payload": {
+            "schema_version": "qa_independent_verification.v1",
+            "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+            "verdict": "accepted",
+            "full_suite_claim": "not_claimed",
+            "external_full_suite_ledger_location": (
+                "artifact_refs.external_no_pass_baseline_ledger"
+            ),
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+            "contract_execution_id": successor["contract_execution_id"],
+            "tests": ["pytest agent/tests/test_graph_governance_api.py"],
+        },
+        "test_results": {
+            "scope": "candidate_regression_and_acceptance_criteria",
+            "focused_failed": 0,
+            "focused_passed": 1,
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "verification": {
+            "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+            "verdict": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "status": "accepted",
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "candidate_new_failures": 0,
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "base_reproduction": {"reproduced": 17, "total": 17},
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": 17,
+                    "passed": 712,
+                },
+                "refs": ["pytest:agent/tests/test_graph_governance_api.py"],
+            }
+        },
+    }
+    with pytest.raises((ContractRuntimeError, PermissionDeniedError)):
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": successor["contract_execution_id"],
+                },
+                "observer",
+                method="POST",
+                body=qa_independent_body,
+            )
+        )
     precheck = server.handle_project_contract_runtime_line_write_precheck(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": successor["contract_execution_id"]},
             "qa",
             method="POST",
-            body={
-                "stage_id": "qa",
-                "line_id": "qa_independent_verification",
-                "evidence_kind": "independent_verification",
-                "payload": {
-                    "contract_execution_id": successor["contract_execution_id"],
-                    "tests": ["pytest agent/tests/test_graph_governance_api.py"],
-                },
-            },
+            body=qa_independent_body,
         )
     )
     assert precheck["ok"] is True
@@ -63219,12 +63302,19 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
                 "event_kind": "independent_verification",
                 "phase": "qa",
                 "actor": "qa:cicero",
-                "status": "passed",
+                "status": "accepted",
+                "commit_sha": head_commit,
                 "payload": {
+                    **qa_independent_body["payload"],
                     "contract_execution_id": successor["contract_execution_id"],
                     "runtime_context_id": runtime_context.runtime_context_id,
-                    "tests": ["pytest agent/tests/test_graph_governance_api.py"],
                 },
+                "test_results": qa_independent_body["test_results"],
+                "verification": qa_independent_body["verification"],
+                "artifact_refs": qa_independent_body["artifact_refs"],
+                "qa_evidence_provenance": qa_independent_body[
+                    "qa_evidence_provenance"
+                ],
                 "route_waiver": _route_waiver(
                     "task_timeline_append",
                     backlog_id=backlog_id,
@@ -63260,16 +63350,44 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         if line["line_id"] == "qa_independent_verification"
     ][0]
     assert qa_line["actor_role"] == "qa"
-    assert qa_line["status"] == "passed"
-    assert qa_line["qa_evidence_provenance"]["completion_status_gate"] == {
+    assert qa_line["status"] == "accepted"
+    independent_provenance = qa_line["qa_evidence_provenance"]
+    assert independent_provenance["schema_version"] == (
+        "qa_evidence_provenance.v1"
+    )
+    assert independent_provenance["source"] == (
+        "contract_runtime_qa_independent_verification_binding"
+    )
+    assert independent_provenance["server_derived"] is True
+    assert independent_provenance["authorization_source"] == (
+        "qa_session_token_ref"
+    )
+    assert independent_provenance["evidence_owner_actor"] == "qa-principal"
+    assert independent_provenance["evidence_owner_role"] == "qa"
+    assert independent_provenance["observer_impersonation"] is False
+    assert independent_provenance["parent_materialization_authorized"] is False
+    assert independent_provenance["authenticated_qa_binding"] == {
+        "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+        "server_derived": True,
+        "qa_principal": "qa-principal",
+        "qa_session_id": "ses-qa",
+        "independent_verification_session_matched": True,
+    }
+    assert independent_provenance["review_note"] == (
+        "preserve independent QA review evidence"
+    )
+    assert "qa_session_token_ref" not in qa_line
+    assert "observer:forged" not in json.dumps(qa_line, sort_keys=True)
+    assert independent_provenance["completion_status_gate"] == {
         "schema_version": "contract_runtime.qa_completion_status_gate.v1",
         "source": "contract_runtime_line_write_normalization",
         "top_level_status_present": True,
         "top_level_status_passing": True,
-        "normalized_status": "passed",
+        "normalized_status": "accepted",
         "nested_payload_decision_satisfies": False,
         "server_derived": True,
     }
+    assert server._contract_runtime_candidate_scoped_no_pass_line(qa_line) is True
 
     duplicate_result = server.handle_task_timeline_append(
         _ctx(
