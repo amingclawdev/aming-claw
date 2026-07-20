@@ -32683,6 +32683,79 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     )
     qa_timeline_ctx._session = dict(qa_graph_ctx._session)
     failed_qa = server.handle_task_timeline_append(qa_timeline_ctx)
+
+    passed_qa_body = json.loads(json.dumps(qa_timeline_ctx.body))
+    passed_qa_body["status"] = "passed"
+    passed_qa_body["verification"].update(
+        {
+            "result": "passed",
+            "verdict": "PASS",
+        }
+    )
+    passed_qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=passed_qa_body,
+    )
+    passed_qa_ctx._session = dict(qa_graph_ctx._session)
+    passed_qa = server.handle_task_timeline_append(passed_qa_ctx)
+    assert passed_qa["status"] == "passed"
+    events_after_pass = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    assert server._runtime_context_authenticated_failed_qa_timeline_boundary(
+        conn=conn,
+        context=runtime_context,
+        runtime_context_id=runtime_context.runtime_context_id,
+        timeline_events=events_after_pass,
+    ) == {}
+    with pytest.raises(GovernanceError) as closed_after_pass:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": "Later authenticated QA PASS closes failed-QA recovery",
+                    "now_iso": "2999-01-02T23:59:00Z",
+                },
+            )
+        )
+    assert closed_after_pass.value.code == "fence_invalidated_or_unknown"
+    assert closed_after_pass.value.details["timeline_reopen_for_revision"] is False
+
+    # Only a new authenticated failure can reopen the revision boundary.
+    renewed_qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=json.loads(json.dumps(qa_graph_ctx.body)),
+    )
+    renewed_qa_graph_ctx._session = dict(qa_graph_ctx._session)
+    qa_graph = server.handle_graph_governance_query(renewed_qa_graph_ctx)
+    renewed_failed_qa_body = json.loads(json.dumps(qa_timeline_ctx.body))
+    renewed_failed_qa_body["payload"]["graph_trace_ids"] = [
+        qa_graph["trace_id"]
+    ]
+    renewed_failed_qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body=renewed_failed_qa_body,
+    )
+    renewed_failed_qa_ctx._session = dict(qa_graph_ctx._session)
+    failed_qa = server.handle_task_timeline_append(renewed_failed_qa_ctx)
     failed_authority = failed_qa["payload"][
         "source_backed_contract_gate_authority"
     ]
@@ -32766,6 +32839,22 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         (qa_session["session_id"], qa_graph["trace_id"]),
     )
     conn.commit()
+    restored_events = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    restored_boundary = (
+        server._runtime_context_authenticated_failed_qa_timeline_boundary(
+            conn=conn,
+            context=runtime_context,
+            runtime_context_id=runtime_context.runtime_context_id,
+            timeline_events=restored_events,
+        )
+    )
+    assert restored_boundary["event_id"] == int(failed_qa["id"])
 
     with pytest.raises(GovernanceError) as missing_rejoin:
         server._runtime_context_revise_failed_qa_implementation_lineage(
@@ -32782,7 +32871,7 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     )
     assert "active failed-QA boundary" in str(missing_rejoin.value)
 
-    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+    first_rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
             "coordinator",
@@ -32796,7 +32885,69 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             },
         )
     )
+    assert first_rejoin["reopen_for_revision"] is True
+    assert first_rejoin["timeline_reopen_for_revision"] is True
+    assert first_rejoin["attempt"] == 2
+    assert first_rejoin["retry_round"] == 1
+
+    # The raw worker auth is lost after the first failed-QA revision rejoin.
+    # A second same-identity rejoin is only an auth rotation: it preserves the
+    # revision counters/fence while moving authority to the newest session ref.
+    rejoin = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "target_project_root": str(target_root),
+                "reason": "Same failed-QA worker lost raw auth after revision rejoin",
+                "now_iso": "2999-01-03T00:01:00Z",
+            },
+        )
+    )
     assert rejoin["reopen_for_revision"] is True
+    assert rejoin["timeline_reopen_for_revision"] is True
+    assert rejoin["previous_status"] == STATE_WORKTREE_READY
+    assert rejoin["current_status"] == STATE_WORKTREE_READY
+    assert rejoin["attempt"] == first_rejoin["attempt"] == 2
+    assert rejoin["retry_round"] == first_rejoin["retry_round"] == 1
+    assert rejoin["worker_id"] == first_rejoin["worker_id"]
+    assert rejoin["worker_slot_id"] == first_rejoin["worker_slot_id"]
+    assert rejoin["fence_token_hash"] == first_rejoin["fence_token_hash"]
+    assert rejoin["session_token_ref"] != first_rejoin["session_token_ref"]
+    second_rejoin_event_id = int(rejoin["audit_event_id"])
+    second_rejoin_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (second_rejoin_event_id,),
+    ).fetchone()
+    second_rejoin_audit = json.loads(second_rejoin_row["payload_json"])
+    assert second_rejoin_audit["reopen_for_revision"] is True
+    assert second_rejoin_audit["timeline_reopen_for_revision"] is True
+    assert second_rejoin_audit["attempt"] == 2
+    assert second_rejoin_audit["retry_round"] == 1
+
+    auth_rotated_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert auth_rotated_context is not None
+    auth_rotated_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=auth_rotated_context,
+        runtime_context_id=auth_rotated_context.runtime_context_id,
+        timeline_events=task_timeline.list_events(
+            conn,
+            PID,
+            task_id=auth_rotated_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    assert auth_rotated_marker["revision_event_ref"] == (
+        f"timeline:{second_rejoin_event_id}"
+    )
+    assert auth_rotated_marker["session_token_ref_rotation"][
+        "active_session_token_ref"
+    ] == rejoin["session_token_ref"]
 
     candidate.write_text("timeline-only failed QA revision\n", encoding="utf-8")
     subprocess.run(
@@ -33056,6 +33207,57 @@ def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_with
     assert blocked.value.code == "fence_invalidated_or_unknown"
     assert blocked.value.details["context_status"] == STATE_VALIDATED
     assert blocked.value.details["reopen_for_revision"] is False
+
+    ready_context = upsert_branch_context(
+        conn,
+        replace(
+            context,
+            status=STATE_WORKTREE_READY,
+            attempt=2,
+            retry_round=1,
+            last_recovery_action="mf_subagent_failed_qa_revision_rejoin_issued",
+        ),
+        now_iso="2026-07-20T11:50:00Z",
+    )
+    auth_rotations = []
+    for index in range(2):
+        auth_rotations.append(
+            server.handle_graph_governance_runtime_context_session_token_rejoin(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": ready_context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "task_id": ready_context.task_id,
+                        "parent_task_id": ready_context.root_task_id,
+                        "target_project_root": str(target_root),
+                        "reason": (
+                            "auth-only rotation without active authenticated "
+                            f"failed QA #{index + 1}"
+                        ),
+                        "now_iso": f"2999-01-04T00:0{index}:00Z",
+                    },
+                )
+            )
+        )
+    first_rotation, second_rotation = auth_rotations
+    assert first_rotation["reopen_for_revision"] is False
+    assert first_rotation["timeline_reopen_for_revision"] is False
+    assert second_rotation["reopen_for_revision"] is False
+    assert second_rotation["timeline_reopen_for_revision"] is False
+    assert second_rotation["attempt"] == first_rotation["attempt"] == 2
+    assert second_rotation["retry_round"] == first_rotation["retry_round"] == 1
+    assert second_rotation["session_token_ref"] != first_rotation["session_token_ref"]
+    second_rotation_row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (int(second_rotation["audit_event_id"]),),
+    ).fetchone()
+    second_rotation_audit = json.loads(second_rotation_row["payload_json"])
+    assert second_rotation_audit["reopen_for_revision"] is False
+    assert second_rotation_audit["timeline_reopen_for_revision"] is False
 
 
 def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_context(

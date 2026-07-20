@@ -23675,23 +23675,49 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
 
 def _runtime_context_failed_qa_revision_rejoin_allowed(
     *,
+    conn,
     context: Any,
     runtime_context_id: str,
     timeline_events: Sequence[Mapping[str, Any]],
 ) -> bool:
-    from .parallel_branch_runtime import FAILED_QA_REVISION_REJOIN_STATES
+    from .parallel_branch_runtime import (
+        FAILED_QA_REVISION_REJOIN_STATES,
+        STATE_WORKTREE_READY,
+    )
 
-    if getattr(context, "status", "") not in FAILED_QA_REVISION_REJOIN_STATES:
-        return False
+    context_status = str(getattr(context, "status", "") or "").strip()
+    if context_status not in FAILED_QA_REVISION_REJOIN_STATES:
+        if context_status != STATE_WORKTREE_READY:
+            return False
+        active_failed_qa = (
+            _runtime_context_authenticated_failed_qa_timeline_boundary(
+                conn=conn,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events,
+            )
+        )
+        if not active_failed_qa:
+            return False
+        prior_revision_marker = _runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+        )
+        return bool(prior_revision_marker)
     task_id = str(getattr(context, "task_id", "") or "").strip()
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
     runtime_id = str(runtime_context_id or "").strip()
     blocking_statuses = {"blocked", "error", "fail", "failed", "invalid", "rejected"}
+    passing_statuses = {"accepted", "ok", "pass", "passed", "succeeded", "success"}
     qa_kinds = {"independent_verification", "qa_review", "qa_verification"}
+    latest_qa_status = ""
 
-    for event in timeline_events:
-        if not isinstance(event, Mapping):
-            continue
+    for event in sorted(
+        (item for item in timeline_events if isinstance(item, Mapping)),
+        key=lambda item: int(item.get("id") or 0),
+    ):
         payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         verification = (
             event.get("verification")
@@ -23727,7 +23753,7 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
             or payload.get("status")
             or ""
         ).strip().lower()
-        if status not in blocking_statuses:
+        if status not in blocking_statuses | passing_statuses:
             continue
 
         qa_marker = " ".join(
@@ -23746,8 +23772,8 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
             or "independent_verification" in qa_marker
             or "independent_qa" in qa_marker
         ):
-            return True
-    return False
+            latest_qa_status = status
+    return latest_qa_status in blocking_statuses
 
 
 def _runtime_context_authenticated_failed_qa_timeline_boundary(
@@ -24579,6 +24605,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             resolved_route_identity if resolved_route_identity else expected_route_identity
         )
         timeline_reopen_for_revision = _runtime_context_failed_qa_revision_rejoin_allowed(
+            conn=conn,
             context=context,
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
@@ -24630,6 +24657,14 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "fail_closed": True,
                 },
             ) from exc
+
+        # The branch-runtime primitive only changes revision counters when it
+        # moves a validated/merge-ready context back to worktree-ready.  A
+        # later same-context auth-only rejoin must keep those counters stable,
+        # while the facade preserves the active server-authenticated failed-QA
+        # revision authority in both its response and append-only audit event.
+        result["reopen_for_revision"] = reopen_for_revision
+        result["timeline_reopen_for_revision"] = timeline_reopen_for_revision
 
         safe_route_identity = {
             field: str(selected_route_identity.get(field) or "").strip()
