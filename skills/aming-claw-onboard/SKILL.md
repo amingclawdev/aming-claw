@@ -18,6 +18,10 @@ instructions.
    `graph_operations_queue`.
 2. Call MCP `onboard_route_guide` with `project_id` and any available
    `backlog_id` or `bug_id`, role/work-type hints, and route-token refs.
+   When no backlog is supplied for implementation work, the service may select
+   the durable release-operator head queue. An active queued execution has
+   precedence, a pinned active position has highest queue precedence, and only
+   when neither exists does the ordinary ordered head become selected.
 3. If MCP does not expose `onboard_route_guide`, fall back to
    `POST /api/projects/{project_id}/onboard-route-guide` with the same fields.
 4. Confirm role: `observer`, `worker`, `mf_sub`, or `qa`.
@@ -61,6 +65,15 @@ instructions.
 - Do not treat archived skill files as active instructions.
 - Do not mutate governed files until a backlog row and route/contract evidence
   exist.
+- The release-operator head queue is deliberately bounded to 32 OPEN backlog
+  rows. Only an authenticated observer/coordinator may insert, reorder, or
+  record an ordinary skip through
+  `/api/projects/{project_id}/release-operator-head-queue`. Reorder submits the
+  exact current membership. Ordinary skip is audited and one-selection-only:
+  it increments visible skip evidence without changing durable position. A
+  pinned row with an active execution is non-skippable. The queue never
+  overrides an explicit backlog selection or a higher-precedence active
+  execution returned by the live runtime.
 - For operator-supervised direct work, record the onboard/direct exception
   evidence before mutation and stay inside the approved target files. The
   canonical close order is pre-mutation exception -> commit-bound

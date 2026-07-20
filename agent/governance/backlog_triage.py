@@ -50,6 +50,10 @@ _MIN_WEIGHTED_OVERLAP_FOR_MERGE = 0.6
 # Title similarity threshold required to corroborate a weak file-overlap merge.
 _TITLE_SIMILARITY_FOR_WEAK_CORROBORATION = 0.25
 
+# The release-operator queue is intentionally a small head queue, not a
+# general-purpose scheduler or policy registry.
+RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS = 32
+
 
 def _parse_tf(v):
     if isinstance(v, str):
@@ -191,6 +195,87 @@ def _weighted_overlap(
 
     score = (non_hub_overlap_sum / non_hub_own_sum) if non_hub_own_sum > 0 else 0.0
     return round(score, 4), per_file, all_hub
+
+
+def release_operator_head_queue_order(
+    backlog_ids: list[str],
+    *,
+    existing_backlog_ids: list[str],
+) -> list[str]:
+    """Validate an exact, deterministic operator reorder request."""
+    ordered = [str(value or "").strip() for value in backlog_ids]
+    if not ordered or any(not value for value in ordered):
+        raise ValueError("reorder requires non-empty backlog_ids")
+    if len(ordered) > RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS:
+        raise ValueError("release operator head queue exceeds bounded capacity")
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("reorder backlog_ids must be unique")
+    existing = [str(value or "").strip() for value in existing_backlog_ids]
+    if set(ordered) != set(existing) or len(ordered) != len(existing):
+        raise ValueError("reorder backlog_ids must exactly match the durable queue")
+    return ordered
+
+
+def select_release_operator_head_queue(
+    rows: list[dict],
+    *,
+    temporarily_skipped_backlog_ids: set[str] | None = None,
+) -> dict:
+    """Select the bounded queue head with active-execution precedence.
+
+    A pinned row only receives special treatment while it has an active
+    execution.  Ordinary skip is one-shot: callers can exclude a row for the
+    current selection without changing its durable position.
+    """
+    skipped = {
+        str(value or "").strip()
+        for value in (temporarily_skipped_backlog_ids or set())
+        if str(value or "").strip()
+    }
+    ordered = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            int(row.get("position") or 0),
+            str(row.get("backlog_id") or ""),
+        ),
+    )
+    eligible = [
+        row
+        for row in ordered
+        if bool(row.get("eligible", True))
+        and str(row.get("backlog_id") or "") not in skipped
+    ]
+    pinned_active = [
+        row
+        for row in eligible
+        if bool(row.get("pinned")) and bool(row.get("active_execution"))
+    ]
+    active = [row for row in eligible if bool(row.get("active_execution"))]
+    if pinned_active:
+        selected = pinned_active[0]
+        source = "pinned_active_position"
+    elif active:
+        selected = active[0]
+        source = "higher_precedence_active_execution"
+    elif eligible:
+        selected = eligible[0]
+        source = "ordered_queue_head"
+    else:
+        selected = {}
+        source = "queue_empty"
+    selected_backlog_id = str(selected.get("backlog_id") or "")
+    return {
+        "schema_version": "release_operator_head_queue.selection.v1",
+        "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
+        "queue_count": len(ordered),
+        "eligible_count": len(eligible),
+        "selected_backlog_id": selected_backlog_id,
+        "selection_source": source,
+        "pinned_active_position": bool(source == "pinned_active_position"),
+        "selected_active_execution": bool(selected.get("active_execution")),
+        "ordinary_head_selected": bool(source == "ordered_queue_head"),
+        "temporarily_skipped_backlog_ids": sorted(skipped),
+    }
 
 
 def triage_backlog_insert(payload: dict, open_rows: list[dict]) -> dict:

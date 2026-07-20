@@ -69,6 +69,11 @@ from .contracts.runtime import (
 from .contracts.hash import stable_sha256
 from .contracts.schema import ContractDefinitionError
 from .contracts.write_gate import contract_line_evidence_policy
+from .backlog_triage import (
+    RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
+    release_operator_head_queue_order,
+    select_release_operator_head_queue,
+)
 from agent.mcp.schema_contract import (
     MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
     MCP_TOOL_SCHEMA_VERSION,
@@ -61378,6 +61383,237 @@ def _normalize_dispatch_payload_worker_role(
 ONBOARD_CONTRACT_ID = "onboard_contract"
 ONBOARD_ROUTE_GUIDE_SERVICE_ID = "onboard_route_guide"
 
+_RELEASE_OPERATOR_HEAD_QUEUE_SCHEMA = "release_operator_head_queue.v1"
+
+
+def _ensure_release_operator_head_queue_schema(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS release_operator_head_queue (
+            project_id TEXT NOT NULL,
+            backlog_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            skip_count INTEGER NOT NULL DEFAULT 0,
+            last_skip_reason TEXT NOT NULL DEFAULT '',
+            last_skipped_at TEXT NOT NULL DEFAULT '',
+            inserted_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, backlog_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_release_operator_head_queue_order
+        ON release_operator_head_queue(project_id, position, backlog_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS release_operator_head_queue_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            backlog_id TEXT NOT NULL DEFAULT '',
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            before_json TEXT NOT NULL DEFAULT '{}',
+            after_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _release_operator_head_queue_execution_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    projection = read_backlog_contract_chain_current(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
+    readiness_state = str(projection.get("readiness_state") or "").strip()
+    execution_id = str(
+        projection.get("active_child_contract_execution_id")
+        or projection.get("current_contract_execution_id")
+        or ""
+    ).strip()
+    active = bool(
+        execution_id
+        and readiness_state not in {"", "contract_complete", "complete", "closed"}
+        and (next_action or projection.get("active_child_contract_execution_id"))
+    )
+    return {
+        "active_execution": active,
+        "active_contract_execution_id": execution_id if active else "",
+        "readiness_state": readiness_state,
+    }
+
+
+def _release_operator_head_queue_rows(conn, project_id: str) -> list[dict[str, Any]]:
+    _ensure_release_operator_head_queue_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT q.*, b.status AS backlog_status, b.title AS backlog_title
+        FROM release_operator_head_queue q
+        LEFT JOIN backlog_bugs b ON b.bug_id = q.backlog_id
+        WHERE q.project_id = ?
+        ORDER BY q.position, q.backlog_id
+        """,
+        (project_id,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = {
+            "backlog_id": str(_row_get(row, "backlog_id", "") or ""),
+            "title": str(_row_get(row, "backlog_title", "") or ""),
+            "position": int(_row_get(row, "position", 0) or 0),
+            "pinned": bool(_row_get(row, "pinned", 0)),
+            "skip_count": int(_row_get(row, "skip_count", 0) or 0),
+            "last_skip_reason": str(
+                _row_get(row, "last_skip_reason", "") or ""
+            ),
+            "last_skipped_at": str(_row_get(row, "last_skipped_at", "") or ""),
+            "inserted_at": str(_row_get(row, "inserted_at", "") or ""),
+            "updated_at": str(_row_get(row, "updated_at", "") or ""),
+            "backlog_status": str(_row_get(row, "backlog_status", "") or ""),
+        }
+        item["eligible"] = item["backlog_status"] == "OPEN"
+        item.update(
+            _release_operator_head_queue_execution_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=item["backlog_id"],
+            )
+        )
+        result.append(item)
+    return result
+
+
+def _release_operator_head_queue_view(
+    conn,
+    project_id: str,
+    *,
+    temporarily_skipped_backlog_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    items = _release_operator_head_queue_rows(conn, project_id)
+    selection = select_release_operator_head_queue(
+        items,
+        temporarily_skipped_backlog_ids=temporarily_skipped_backlog_ids,
+    )
+    selected_id = str(selection.get("selected_backlog_id") or "")
+    head = next(
+        (dict(item) for item in items if item["backlog_id"] == selected_id),
+        {},
+    )
+    events = conn.execute(
+        """
+        SELECT id, action, backlog_id, actor, reason, before_json, after_json,
+               created_at
+        FROM release_operator_head_queue_events
+        WHERE project_id = ?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (project_id,),
+    ).fetchall()
+    audit_events = []
+    for event in events:
+        audit_events.append(
+            {
+                "id": int(_row_get(event, "id", 0) or 0),
+                "action": str(_row_get(event, "action", "") or ""),
+                "backlog_id": str(_row_get(event, "backlog_id", "") or ""),
+                "actor": str(_row_get(event, "actor", "") or ""),
+                "reason": str(_row_get(event, "reason", "") or ""),
+                "before": backlog_runtime.parse_json_object(
+                    _row_get(event, "before_json", "{}")
+                ),
+                "after": backlog_runtime.parse_json_object(
+                    _row_get(event, "after_json", "{}")
+                ),
+                "created_at": str(_row_get(event, "created_at", "") or ""),
+            }
+        )
+    revision_payload = [
+        {
+            key: item.get(key)
+            for key in (
+                "backlog_id",
+                "position",
+                "pinned",
+                "skip_count",
+                "last_skipped_at",
+                "backlog_status",
+                "active_contract_execution_id",
+            )
+        }
+        for item in items
+    ]
+    return {
+        "schema_version": _RELEASE_OPERATOR_HEAD_QUEUE_SCHEMA,
+        "project_id": project_id,
+        "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
+        "count": len(items),
+        "items": items,
+        "head": head,
+        "selection": selection,
+        "queue_revision": stable_sha256(revision_payload),
+        "audit_events": audit_events,
+        "ordinary_skip_policy": {
+            "position_preserved": True,
+            "skip_count_monotonic": True,
+            "skip_is_one_selection_only": True,
+        },
+        "pinned_active_position_policy": {
+            "takes_precedence": True,
+            "ordinary_skip_allowed": False,
+        },
+    }
+
+
+def _record_release_operator_head_queue_event(
+    conn,
+    *,
+    project_id: str,
+    action: str,
+    backlog_id: str,
+    actor: str,
+    reason: str = "",
+    before: Mapping[str, Any] | None = None,
+    after: Mapping[str, Any] | None = None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO release_operator_head_queue_events (
+            project_id, action, backlog_id, actor, reason,
+            before_json, after_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            action,
+            backlog_id,
+            actor,
+            reason,
+            json.dumps(dict(before or {}), ensure_ascii=False, sort_keys=True),
+            json.dumps(dict(after or {}), ensure_ascii=False, sort_keys=True),
+            _utc_now(),
+        ),
+    )
+    return int(cursor.lastrowid or 0)
+
 _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "onboard_route_guide",
     "graph_query",
@@ -62744,6 +62980,15 @@ def _onboard_contract_route_guide(
             "kind": "http",
             "method": "POST",
             "path": "/api/projects/{project_id}/onboard-route-guide",
+        },
+        "release_operator_head_queue": {
+            "kind": "http",
+            "read_method": "GET",
+            "mutation_method": "POST",
+            "path": "/api/projects/{project_id}/release-operator-head-queue",
+            "mutation_roles": ["observer", "coordinator"],
+            "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
+            "actions": ["insert", "reorder", "skip"],
         },
         "contract_chain_current": {
             "kind": "mcp_or_http",
@@ -86540,6 +86785,268 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
     }
 
 
+@route("GET", "/api/projects/{project_id}/release-operator-head-queue")
+@route("POST", "/api/projects/{project_id}/release-operator-head-queue")
+def handle_project_release_operator_head_queue(ctx: RequestContext):
+    """Read or mutate the bounded release-operator queue."""
+    project_id = ctx.get_project_id()
+    with DBContext(project_id) as conn:
+        if ctx.method == "GET":
+            return {
+                "ok": True,
+                "release_operator_head_queue": _release_operator_head_queue_view(
+                    conn, project_id
+                ),
+            }
+
+        session = _require_graph_governance_operator(
+            ctx,
+            conn,
+            "backlog.release-operator-head-queue.mutate",
+        )
+        actor = str(session.get("principal_id") or session.get("role") or "operator")
+        body = ctx.body if isinstance(ctx.body, Mapping) else {}
+        action = str(body.get("action") or "").strip().lower()
+        if action not in {"insert", "reorder", "skip"}:
+            return 400, {
+                "ok": False,
+                "error": "invalid_release_operator_head_queue_action",
+                "allowed_actions": ["insert", "reorder", "skip"],
+            }
+
+        # Serialize the bounded read/validate/write sequence across governance
+        # processes so position shifts and exact-membership reorder stay atomic.
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        before_view = _release_operator_head_queue_view(conn, project_id)
+        if action == "insert":
+            backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+            if not backlog_id:
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_backlog_id_required",
+                }
+            backlog = conn.execute(
+                "SELECT bug_id, status, title FROM backlog_bugs WHERE bug_id = ?",
+                (backlog_id,),
+            ).fetchone()
+            if backlog is None:
+                return 404, {
+                    "ok": False,
+                    "error": "backlog_not_found",
+                    "backlog_id": backlog_id,
+                }
+            if str(_row_get(backlog, "status", "") or "") != "OPEN":
+                return 409, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_requires_open_backlog",
+                    "backlog_id": backlog_id,
+                    "backlog_status": str(_row_get(backlog, "status", "") or ""),
+                }
+            existing = conn.execute(
+                """
+                SELECT position FROM release_operator_head_queue
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ).fetchone()
+            if existing is not None:
+                return 409, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_duplicate",
+                    "backlog_id": backlog_id,
+                    "position": int(_row_get(existing, "position", 0) or 0),
+                }
+            count = int(before_view.get("count") or 0)
+            if count >= RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS:
+                return 409, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_capacity_reached",
+                    "bounded_capacity": RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
+                }
+            raw_position = body.get("position")
+            try:
+                position = int(raw_position) if raw_position not in (None, "") else count + 1
+            except (TypeError, ValueError):
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_position_invalid",
+                }
+            if position < 1 or position > count + 1:
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_position_out_of_range",
+                    "allowed_range": [1, count + 1],
+                }
+            conn.execute(
+                """
+                UPDATE release_operator_head_queue
+                SET position = position + 1, updated_at = ?
+                WHERE project_id = ? AND position >= ?
+                """,
+                (_utc_now(), project_id, position),
+            )
+            now = _utc_now()
+            pinned = _body_bool(body, "pinned", False)
+            conn.execute(
+                """
+                INSERT INTO release_operator_head_queue (
+                    project_id, backlog_id, position, pinned, inserted_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (project_id, backlog_id, position, int(pinned), now, now),
+            )
+            event_id = _record_release_operator_head_queue_event(
+                conn,
+                project_id=project_id,
+                action="insert",
+                backlog_id=backlog_id,
+                actor=actor,
+                reason=str(body.get("reason") or "operator curated insert"),
+                before={},
+                after={"position": position, "pinned": pinned},
+            )
+
+        elif action == "reorder":
+            requested = body.get("backlog_ids")
+            if not isinstance(requested, list):
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_reorder_list_required",
+                }
+            existing_ids = [
+                str(item.get("backlog_id") or "")
+                for item in before_view.get("items") or []
+            ]
+            try:
+                ordered = release_operator_head_queue_order(
+                    requested,
+                    existing_backlog_ids=existing_ids,
+                )
+            except ValueError as exc:
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_reorder_invalid",
+                    "message": str(exc),
+                }
+            now = _utc_now()
+            for position, backlog_id in enumerate(ordered, start=1):
+                conn.execute(
+                    """
+                    UPDATE release_operator_head_queue
+                    SET position = ?, updated_at = ?
+                    WHERE project_id = ? AND backlog_id = ?
+                    """,
+                    (position, now, project_id, backlog_id),
+                )
+            event_id = _record_release_operator_head_queue_event(
+                conn,
+                project_id=project_id,
+                action="reorder",
+                backlog_id="",
+                actor=actor,
+                reason=str(body.get("reason") or "operator curated reorder"),
+                before={"backlog_ids": existing_ids},
+                after={"backlog_ids": ordered},
+            )
+
+        else:
+            backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+            reason = str(body.get("reason") or "").strip()
+            if not backlog_id or not reason:
+                return 400, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_skip_requires_backlog_and_reason",
+                }
+            before_item = next(
+                (
+                    item
+                    for item in before_view.get("items") or []
+                    if item.get("backlog_id") == backlog_id
+                ),
+                None,
+            )
+            if before_item is None:
+                return 404, {
+                    "ok": False,
+                    "error": "release_operator_head_queue_item_not_found",
+                    "backlog_id": backlog_id,
+                }
+            if bool(before_item.get("pinned")) and bool(
+                before_item.get("active_execution")
+            ):
+                return 409, {
+                    "ok": False,
+                    "error": "pinned_active_position_non_skippable",
+                    "backlog_id": backlog_id,
+                    "position": before_item.get("position"),
+                    "active_contract_execution_id": before_item.get(
+                        "active_contract_execution_id"
+                    ),
+                    "position_preserved": True,
+                    "no_pass_claim": True,
+                }
+            now = _utc_now()
+            conn.execute(
+                """
+                UPDATE release_operator_head_queue
+                SET skip_count = skip_count + 1,
+                    last_skip_reason = ?, last_skipped_at = ?, updated_at = ?
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (reason, now, now, project_id, backlog_id),
+            )
+            after_row = conn.execute(
+                """
+                SELECT position, pinned, skip_count, last_skip_reason, last_skipped_at
+                FROM release_operator_head_queue
+                WHERE project_id = ? AND backlog_id = ?
+                """,
+                (project_id, backlog_id),
+            ).fetchone()
+            after_item = dict(after_row) if after_row is not None else {}
+            event_id = _record_release_operator_head_queue_event(
+                conn,
+                project_id=project_id,
+                action="skip",
+                backlog_id=backlog_id,
+                actor=actor,
+                reason=reason,
+                before=before_item,
+                after=after_item,
+            )
+
+        conn.commit()
+        view = _release_operator_head_queue_view(conn, project_id)
+        response = {
+            "ok": True,
+            "action": action,
+            "event_id": event_id,
+            "release_operator_head_queue": view,
+        }
+        if action == "skip":
+            one_shot = _release_operator_head_queue_view(
+                conn,
+                project_id,
+                temporarily_skipped_backlog_ids={backlog_id},
+            )
+            response["ordinary_skip"] = {
+                "schema_version": "release_operator_head_queue.ordinary_skip.v1",
+                "backlog_id": backlog_id,
+                "position_preserved": True,
+                "skip_count": next(
+                    (
+                        item.get("skip_count")
+                        for item in view.get("items") or []
+                        if item.get("backlog_id") == backlog_id
+                    ),
+                    0,
+                ),
+                "next_selection": one_shot.get("selection") or {},
+            }
+        return response
+
+
 @route("GET", "/api/projects/{project_id}/onboard-route-guide")
 @route("POST", "/api/projects/{project_id}/onboard-route-guide")
 def handle_project_onboard_route_guide(ctx: RequestContext):
@@ -86570,23 +87077,39 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
-    if not backlog_id:
-        if work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
-            return _onboard_no_backlog_service_response(
-                project_id=project_id,
-                role=role,
-                work_type=work_type,
-                route_token_ref=route_token_ref,
-            )
-        raise ValidationError(
-            "onboard route guide requires backlog_id or bug_id for implementation work",
-            _onboard_missing_backlog_error_details(
-                project_id=project_id,
-                role=role,
-                work_type=work_type,
-            ),
+    if not backlog_id and work_type and work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
+        return _onboard_no_backlog_service_response(
+            project_id=project_id,
+            role=role,
+            work_type=work_type,
+            route_token_ref=route_token_ref,
         )
+    queue_view: dict[str, Any] = {}
     with DBContext(project_id) as conn:
+        if not backlog_id:
+            queue_view = _release_operator_head_queue_view(conn, project_id)
+            backlog_id = str(
+                queue_view.get("selection", {}).get("selected_backlog_id") or ""
+            ).strip()
+            if not backlog_id:
+                raise ValidationError(
+                    (
+                        "onboard route guide requires backlog_id or bug_id, "
+                        "or a curated queue head"
+                    ),
+                    {
+                        **_onboard_missing_backlog_error_details(
+                            project_id=project_id,
+                            role=role,
+                            work_type=work_type,
+                        ),
+                        "release_operator_head_queue": queue_view,
+                        "safe_next_step": (
+                            "an observer/coordinator inserts an OPEN backlog row into "
+                            "the bounded release-operator head queue"
+                        ),
+                    },
+                )
         response = _onboard_route_guide_service_response(
             conn,
             project_id=project_id,
@@ -86595,6 +87118,13 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
             role=role,
             work_type=work_type,
         )
+    if queue_view:
+        selection = dict(queue_view.get("selection") or {})
+        response["release_operator_head_queue_selection"] = selection
+        response["selected_backlog_source"] = selection.get("selection_source")
+        route_guide = response.get("onboard_route_guide")
+        if isinstance(route_guide, dict):
+            route_guide["release_operator_head_queue_selection"] = selection
     return response
 
 
