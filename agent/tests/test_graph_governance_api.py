@@ -36,6 +36,7 @@ from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
 from agent.governance.contracts.instructions import resolve_instruction_bundle
+from agent.governance.contracts import write_gate as contract_write_gate
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     _mf_parallel_worker_commit_errors,
@@ -66025,6 +66026,68 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         is True
     )
     assert later_authority["active_snapshot_matches_canonical_head"] is True
+
+    reconcile_policy = server._contract_runtime_line_evidence_policy(
+        server._contract_runtime_store(conn).get(
+            successor["contract_execution_id"]
+        ),
+        "current_full_reconcile_evidence_policy",
+        line_id="observer_reconcile",
+    )
+
+    def reconcile_gate_errors(authority):
+        errors = []
+        contract_write_gate._validate_current_full_reconcile_evidence(
+            errors,
+            {"payload": {"reconcile_authority": authority}},
+            execution_state={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "contract_execution_id": successor["contract_execution_id"],
+            },
+            line_id="observer_reconcile",
+            policy=reconcile_policy,
+        )
+        return errors
+
+    assert reconcile_gate_errors(later_authority) == []
+
+    for missing_verification in (
+        "reconcile_snapshot_verified",
+        "reconciled_commit_is_ancestor_of_canonical_head",
+        "active_snapshot_matches_canonical_head",
+        "active_snapshot_verified",
+    ):
+        incomplete_authority = copy.deepcopy(later_authority)
+        incomplete_authority.pop(missing_verification, None)
+        incomplete_authority.pop("authority_hash", None)
+        incomplete_authority["authority_hash"] = server.stable_sha256(
+            incomplete_authority
+        )
+        assert (
+            "observer_reconcile reconcile commit identities must match"
+            in reconcile_gate_errors(incomplete_authority)
+        )
+
+    caller_shaped_authority = copy.deepcopy(later_authority)
+    caller_shaped_authority.pop("authority_hash", None)
+    assert (
+        "observer_reconcile reconcile commit identities must match"
+        in reconcile_gate_errors(caller_shaped_authority)
+    )
+
+    marker_mismatch_authority = copy.deepcopy(later_authority)
+    marker_mismatch_authority["current_full_reconcile_marker"][
+        "snapshot_id"
+    ] = marker_mismatch_authority["active_snapshot_id"]
+    marker_mismatch_authority.pop("authority_hash", None)
+    marker_mismatch_authority["authority_hash"] = server.stable_sha256(
+        marker_mismatch_authority
+    )
+    assert (
+        "observer_reconcile current_full_reconcile_marker is not canonical"
+        in reconcile_gate_errors(marker_mismatch_authority)
+    )
 
 
 def test_dispatch_identity_mismatch_counts_completed_expected_context_lines(

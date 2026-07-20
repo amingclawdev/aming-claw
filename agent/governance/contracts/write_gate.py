@@ -561,13 +561,17 @@ def _validate_current_full_reconcile_evidence(
         if write_value and authority_value and write_value != authority_value:
             errors.append(f"{line_id} authority.{field} mismatch")
 
-    commits = [
-        str(authority.get(field) or "").strip().lower()
+    commit_fields = {
+        str(field): str(authority.get(field) or "").strip().lower()
         for field in policy.get("required_commit_fields") or ()
-    ]
+    }
+    commits = list(commit_fields.values())
     if not commits or not all(_is_full_commit(value) for value in commits):
         errors.append(f"{line_id} requires full canonical reconcile commit identities")
-    elif len(set(commits)) != 1:
+    elif len(set(commits)) != 1 and not _verified_historical_reconcile_descendant(
+        authority,
+        commit_fields=commit_fields,
+    ):
         errors.append(f"{line_id} reconcile commit identities must match")
     if not str(authority.get("active_snapshot_id") or "").strip():
         errors.append(f"{line_id} requires authority.active_snapshot_id")
@@ -652,7 +656,11 @@ def _validate_current_full_reconcile_evidence(
         and str(marker.get("target_commit_sha") or "").strip().lower()
         == str(authority.get("merged_commit_sha") or "").strip().lower()
         and str(marker.get("snapshot_id") or "").strip()
-        == str(authority.get("active_snapshot_id") or "").strip()
+        == str(
+            authority.get("reconcile_snapshot_id")
+            or authority.get("active_snapshot_id")
+            or ""
+        ).strip()
         and _int_value(marker.get("reconcile_event_id")) == reconcile_event_id
         and str(marker.get("reconcile_event_created_at") or "").strip()
         == str(authority.get("reconcile_event_created_at") or "").strip()
@@ -688,6 +696,52 @@ def _validate_current_full_reconcile_evidence(
         == str(authority.get("reconcile_event_created_at") or "").strip()
     ):
         errors.append(f"{line_id} current-full provenance does not match marker")
+
+
+def _verified_historical_reconcile_descendant(
+    authority: Mapping[str, Any],
+    *,
+    commit_fields: Mapping[str, str],
+) -> bool:
+    """Accept a superseded reconcile only with complete live descendant proof."""
+
+    historical_commit = str(commit_fields.get("merged_commit_sha") or "")
+    reconciled_commit = str(commit_fields.get("reconciled_commit_sha") or "")
+    reconcile_snapshot_commit = str(
+        authority.get("reconcile_snapshot_commit") or ""
+    ).strip().lower()
+    canonical_head_commit = str(
+        commit_fields.get("canonical_head_commit") or ""
+    )
+    active_snapshot_commit = str(
+        commit_fields.get("active_snapshot_commit") or ""
+    )
+    reconcile_snapshot_id = str(
+        authority.get("reconcile_snapshot_id") or ""
+    ).strip()
+    active_snapshot_id = str(authority.get("active_snapshot_id") or "").strip()
+    authority_hash = str(authority.get("authority_hash") or "").strip().lower()
+    unsigned_authority = dict(authority)
+    unsigned_authority.pop("authority_hash", None)
+
+    return bool(
+        _is_full_commit(historical_commit)
+        and historical_commit == reconciled_commit == reconcile_snapshot_commit
+        and _is_full_commit(canonical_head_commit)
+        and canonical_head_commit == active_snapshot_commit
+        and historical_commit != canonical_head_commit
+        and reconcile_snapshot_id
+        and active_snapshot_id
+        and reconcile_snapshot_id != active_snapshot_id
+        and authority.get("reconcile_snapshot_verified") is True
+        and authority.get("canonical_head_equals_merged_commit") is False
+        and authority.get("reconciled_commit_is_ancestor_of_canonical_head") is True
+        and authority.get("canonical_head_verified") is True
+        and authority.get("active_snapshot_matches_canonical_head") is True
+        and authority.get("active_snapshot_verified") is True
+        and _is_sha256(authority_hash)
+        and stable_sha256(unsigned_authority) == authority_hash
+    )
 
 
 def contract_line_evidence_policy(
