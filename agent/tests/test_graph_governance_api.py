@@ -63,6 +63,7 @@ from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
     BatchMergeItem,
     BatchMergeRuntime,
+    IntegrationEpoch,
     MergeQueueItem,
     STATE_MERGE_FAILED,
     STATE_MERGED,
@@ -85,6 +86,7 @@ from agent.governance.parallel_branch_runtime import (
     upsert_branch_context,
     upsert_merge_queue_item,
     upsert_merge_queue_items,
+    upsert_integration_epoch,
     validate_mf_subagent_graph_query_identity,
 )
 
@@ -70447,3 +70449,140 @@ def test_desktop_ticket_resolver_rejects_dispatch_selector_mutation(
 
     assert result["ok"] is False
     assert result["execution_ticket"]["selector_mismatches"] == [field]
+
+
+def test_active_integration_epoch_precedes_onboard_and_rejects_new_allocation(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    queue_id = "mq-api-integration-epoch"
+    task_id = "batch-row2-task"
+    backlog_id = "AC-BATCH-ROW2"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="batch-api-integration-epoch",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref="refs/heads/codex/batch-row2",
+            status="merge_ready",
+            checkpoint_id="checkpoint-row2",
+            merge_queue_id=queue_id,
+        ),
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-row2",
+                task_id=task_id,
+                backlog_id=backlog_id,
+                branch_ref="refs/heads/codex/batch-row2",
+                queue_index=2,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+            )
+        ],
+    )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-api-integration-epoch",
+            epoch_id="integration-epoch-api",
+            coordination_backlog_id="AC-BATCH-PARENT",
+            target_ref="refs/heads/main",
+            base_head="base-head",
+            current_head="partial-head",
+            merge_queue_id=queue_id,
+            merge_cursor=1,
+            merged_prefix=("item-row1",),
+            remaining_queue_item_ids=("item-row2",),
+            status="merge_in_doubt",
+            active_queue_item_id="item-row2",
+            active_task_id=task_id,
+            active_backlog_id=backlog_id,
+            active_checkpoint_id="checkpoint-row2",
+            expected_head_before="partial-head",
+            expected_branch_head="row2-head",
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-UNRELATED-REQUEST",
+                "role": "observer",
+                "work_type": "parallel_worker",
+            },
+        )
+    )
+    assert guide["backlog_id"] == backlog_id
+    assert guide["requested_backlog_id"] == "AC-UNRELATED-REQUEST"
+    assert guide["next_legal_action"]["id"] == "resume_batch_merge"
+    assert guide["next_legal_action"]["queue_item_id"] == "item-row2"
+    assert guide["next_legal_action"]["checkpoint_id"] == "checkpoint-row2"
+    assert guide["position_skippable"] is False
+
+    no_backlog_guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+    assert no_backlog_guide["backlog_id"] == backlog_id
+    assert no_backlog_guide["next_legal_action"]["id"] == "resume_batch_merge"
+    assert no_backlog_guide["selected_backlog_source"] == (
+        "active_integration_epoch"
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args: {"role": "observer", "principal_id": "observer"},
+    )
+    code, refusal = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "new-unrelated-task",
+                "backlog_id": "AC-UNRELATED",
+                "workspace_root": str(tmp_path),
+                "base_commit": "partial-head",
+                "target_head_commit": "partial-head",
+                "target_ref": "refs/heads/main",
+                "owned_files": ["agent/unrelated.py"],
+                "agent_id": "observer",
+                "worker_id": "new-worker",
+            },
+        )
+    )
+    assert code == 409
+    assert refusal["error"] == "integration_epoch_dispatch_base_frozen"
+    assert refusal["partial_epoch_head"] == "partial-head"
+    assert refusal["next_legal_action"]["id"] == "resume_batch_merge"
+
+    resolved_child, child_scope = (
+        parallel_branch_runtime.resolve_active_integration_epoch_for_backlog(
+            conn, PID, backlog_id
+        )
+    )
+    resolved_parent, parent_scope = (
+        parallel_branch_runtime.resolve_active_integration_epoch_for_backlog(
+            conn, PID, "AC-BATCH-PARENT"
+        )
+    )
+    assert resolved_child is not None and child_scope == "child"
+    assert resolved_parent is not None and parent_scope == "coordination"

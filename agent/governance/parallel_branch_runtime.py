@@ -212,6 +212,41 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_batch_items_project_batch
   ON parallel_branch_batch_items(project_id, batch_id, queue_index, task_id);
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_batch_items_project_branch
   ON parallel_branch_batch_items(project_id, branch_ref);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_integration_epochs (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    epoch_id          TEXT NOT NULL,
+    coordination_backlog_id TEXT NOT NULL DEFAULT '',
+    target_ref        TEXT NOT NULL,
+    base_head         TEXT NOT NULL,
+    current_head      TEXT NOT NULL,
+    merge_queue_id    TEXT NOT NULL,
+    merge_cursor      INTEGER NOT NULL DEFAULT 0,
+    merged_prefix_json TEXT NOT NULL DEFAULT '[]',
+    remaining_queue_item_ids_json TEXT NOT NULL DEFAULT '[]',
+    reconcile_state   TEXT NOT NULL DEFAULT 'pending',
+    status            TEXT NOT NULL DEFAULT 'open',
+    active_queue_item_id TEXT NOT NULL DEFAULT '',
+    active_task_id    TEXT NOT NULL DEFAULT '',
+    active_backlog_id TEXT NOT NULL DEFAULT '',
+    active_checkpoint_id TEXT NOT NULL DEFAULT '',
+    expected_head_before TEXT NOT NULL DEFAULT '',
+    expected_branch_head TEXT NOT NULL DEFAULT '',
+    last_merge_commit TEXT NOT NULL DEFAULT '',
+    snapshot_id       TEXT NOT NULL DEFAULT '',
+    projection_id     TEXT NOT NULL DEFAULT '',
+    failure_reason    TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    closed_at         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project_id, batch_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_active_target
+  ON parallel_branch_integration_epochs(project_id, target_ref)
+  WHERE status != 'closed';
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_queue
+  ON parallel_branch_integration_epochs(project_id, merge_queue_id, status);
 """
 
 STATE_MERGED = "merged"
@@ -260,6 +295,20 @@ BATCH_STATE_REPLAY_IN_PROGRESS = "replay_in_progress"
 BATCH_STATE_ACCEPTED = "accepted"
 BATCH_STATE_ABANDONED = "abandoned"
 BATCH_STATE_CLEANED = "cleaned"
+
+INTEGRATION_EPOCH_OPEN = "open"
+INTEGRATION_EPOCH_MERGE_IN_DOUBT = "merge_in_doubt"
+INTEGRATION_EPOCH_RECONCILE_PENDING = "reconcile_pending"
+INTEGRATION_EPOCH_RECONCILED = "reconciled"
+INTEGRATION_EPOCH_CLOSED = "closed"
+INTEGRATION_EPOCH_ACTIVE_STATES = frozenset(
+    {
+        INTEGRATION_EPOCH_OPEN,
+        INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+        INTEGRATION_EPOCH_RECONCILE_PENDING,
+        INTEGRATION_EPOCH_RECONCILED,
+    }
+)
 
 ACTION_LEAVE_MERGED = "leave_merged"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
@@ -912,6 +961,14 @@ def _bounded_reissue_ttl_seconds(value: Any) -> int:
 
 class BranchRuntimeFenceError(ValueError):
     """Raised when a stale worker attempts to mutate branch runtime state."""
+
+
+class IntegrationEpochFrozenError(ValueError):
+    """Raised when an open batch epoch rejects an unrelated target mutation."""
+
+    def __init__(self, message: str, epoch: "IntegrationEpoch"):
+        super().__init__(message)
+        self.epoch = epoch
 
 
 @dataclass(frozen=True)
@@ -1750,6 +1807,36 @@ class BatchMergeRuntime:
 
 
 @dataclass(frozen=True)
+class IntegrationEpoch:
+    project_id: str
+    batch_id: str
+    epoch_id: str
+    coordination_backlog_id: str
+    target_ref: str
+    base_head: str
+    current_head: str
+    merge_queue_id: str
+    merge_cursor: int = 0
+    merged_prefix: tuple[str, ...] = ()
+    remaining_queue_item_ids: tuple[str, ...] = ()
+    reconcile_state: str = "pending"
+    status: str = INTEGRATION_EPOCH_OPEN
+    active_queue_item_id: str = ""
+    active_task_id: str = ""
+    active_backlog_id: str = ""
+    active_checkpoint_id: str = ""
+    expected_head_before: str = ""
+    expected_branch_head: str = ""
+    last_merge_commit: str = ""
+    snapshot_id: str = ""
+    projection_id: str = ""
+    failure_reason: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    closed_at: str = ""
+
+
+@dataclass(frozen=True)
 class BatchRollbackPlan:
     scenario_id: str
     project_id: str
@@ -1782,6 +1869,7 @@ class ParallelBranchReadModel:
     summary: dict[str, Any]
     branch_lanes: tuple[dict[str, Any], ...]
     merge_queue: dict[str, Any]
+    integration_epoch: dict[str, Any]
     rollback: dict[str, Any]
     total_counts: dict[str, int]
     truncated: dict[str, bool]
@@ -1793,6 +1881,7 @@ class ParallelBranchReadModel:
             "summary": self.summary,
             "branch_lanes": list(self.branch_lanes),
             "merge_queue": self.merge_queue,
+            "integration_epoch": self.integration_epoch,
             "rollback": self.rollback,
             "total_counts": self.total_counts,
             "truncated": self.truncated,
@@ -1896,12 +1985,25 @@ def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
     _ensure_branch_runtime_context_columns(conn)
     _ensure_branch_merge_queue_columns(conn)
+    _ensure_integration_epoch_columns(conn)
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_runtime_context
           ON parallel_branch_runtime_contexts(project_id, runtime_context_id)
         """
     )
+
+
+def _ensure_integration_epoch_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "PRAGMA table_info(parallel_branch_integration_epochs)"
+    ).fetchall()
+    columns = {str(row["name"] if hasattr(row, "keys") else row[1]) for row in rows}
+    if "coordination_backlog_id" not in columns:
+        conn.execute(
+            "ALTER TABLE parallel_branch_integration_epochs "
+            "ADD COLUMN coordination_backlog_id TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
@@ -10139,6 +10241,27 @@ def batch_merge_runtime_to_dict(runtime: BatchMergeRuntime) -> dict[str, Any]:
     return payload
 
 
+def integration_epoch_to_dict(epoch: IntegrationEpoch) -> dict[str, Any]:
+    payload = asdict(epoch)
+    payload["merged_prefix"] = list(epoch.merged_prefix)
+    payload["remaining_queue_item_ids"] = list(epoch.remaining_queue_item_ids)
+    payload["frozen"] = epoch.status in INTEGRATION_EPOCH_ACTIVE_STATES
+    payload["next_legal_action"] = (
+        "resume_batch_merge"
+        if epoch.status in {INTEGRATION_EPOCH_OPEN, INTEGRATION_EPOCH_MERGE_IN_DOUBT}
+        else (
+            "final_batch_reconcile"
+            if epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING
+            else (
+                "close_batch_atomically"
+                if epoch.status == INTEGRATION_EPOCH_RECONCILED
+                else "none"
+            )
+        )
+    )
+    return payload
+
+
 def batch_rollback_plan_to_dict(plan: BatchRollbackPlan) -> dict[str, Any]:
     payload = asdict(plan)
     payload["abandoned_merge_commits"] = list(plan.abandoned_merge_commits)
@@ -11788,6 +11911,7 @@ def record_merge_queue_graph_epoch_after_reconcile(
     projection_id: str,
     merge_queue_id: str = "",
     queue_item_id: str = "",
+    activation_completed: bool = True,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Fill missing graph epoch refs on merged queue rows after current-full reconcile."""
@@ -11807,6 +11931,7 @@ def record_merge_queue_graph_epoch_after_reconcile(
         "projection_id": projection,
         "merge_queue_id": queue_id,
         "queue_item_id": item_id,
+        "activation_completed": bool(activation_completed),
         "updated_count": 0,
         "context_updated_count": 0,
         "queue_items": [],
@@ -11822,7 +11947,6 @@ def record_merge_queue_graph_epoch_after_reconcile(
             ("project_id", project),
             ("target_head_commit", target),
             ("snapshot_id", snapshot),
-            ("projection_id", projection),
         )
         if not value
     ]
@@ -11830,6 +11954,8 @@ def record_merge_queue_graph_epoch_after_reconcile(
         result["skipped_reason"] = "missing_required_graph_epoch_input"
         result["missing_fields"] = missing
         return result
+    result["semantic_projection_optional"] = True
+    result["projection_status"] = "recorded" if projection else "skipped"
 
     clauses = [
         "project_id = ?",
@@ -11925,6 +12051,31 @@ def record_merge_queue_graph_epoch_after_reconcile(
     result["status"] = "recorded" if updated_items else "skipped"
     if not updated_items:
         result["skipped_reason"] = "no_matching_merged_queue_item_missing_graph_epoch"
+    if activation_completed:
+        epoch = mark_integration_epoch_reconciled(
+            conn,
+            project_id=project,
+            target_head_commit=target,
+            snapshot_id=snapshot,
+            projection_id=projection,
+            merge_queue_id=queue_id,
+            now_iso=now,
+        )
+        result["integration_epoch_reconcile_recording"] = "completed"
+    else:
+        epoch = get_active_integration_epoch(
+            conn,
+            project,
+            merge_queue_id=queue_id,
+        )
+        result["integration_epoch_reconcile_recording"] = (
+            "deferred_until_snapshot_activation"
+        )
+    result["integration_epoch"] = (
+        integration_epoch_to_dict(epoch) if epoch is not None else None
+    )
+    if epoch is not None and epoch.status == INTEGRATION_EPOCH_RECONCILED:
+        result["integration_epoch_barrier"] = "reconciled_frozen_until_atomic_close"
     return result
 
 
@@ -12261,6 +12412,685 @@ def get_batch_merge_runtime(
     return _batch_runtime_from_row(
         row,
         list_batch_merge_items(conn, project_id, batch_id),
+    )
+
+
+def _integration_epoch_from_row(row: sqlite3.Row) -> IntegrationEpoch:
+    return IntegrationEpoch(
+        project_id=str(row["project_id"] or ""),
+        batch_id=str(row["batch_id"] or ""),
+        epoch_id=str(row["epoch_id"] or ""),
+        coordination_backlog_id=str(row["coordination_backlog_id"] or ""),
+        target_ref=str(row["target_ref"] or ""),
+        base_head=str(row["base_head"] or ""),
+        current_head=str(row["current_head"] or ""),
+        merge_queue_id=str(row["merge_queue_id"] or ""),
+        merge_cursor=int(row["merge_cursor"] or 0),
+        merged_prefix=_parse_json_array(row["merged_prefix_json"]),
+        remaining_queue_item_ids=_parse_json_array(
+            row["remaining_queue_item_ids_json"]
+        ),
+        reconcile_state=str(row["reconcile_state"] or "pending"),
+        status=str(row["status"] or INTEGRATION_EPOCH_OPEN),
+        active_queue_item_id=str(row["active_queue_item_id"] or ""),
+        active_task_id=str(row["active_task_id"] or ""),
+        active_backlog_id=str(row["active_backlog_id"] or ""),
+        active_checkpoint_id=str(row["active_checkpoint_id"] or ""),
+        expected_head_before=str(row["expected_head_before"] or ""),
+        expected_branch_head=str(row["expected_branch_head"] or ""),
+        last_merge_commit=str(row["last_merge_commit"] or ""),
+        snapshot_id=str(row["snapshot_id"] or ""),
+        projection_id=str(row["projection_id"] or ""),
+        failure_reason=str(row["failure_reason"] or ""),
+        created_at=str(row["created_at"] or ""),
+        updated_at=str(row["updated_at"] or ""),
+        closed_at=str(row["closed_at"] or ""),
+    )
+
+
+def upsert_integration_epoch(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+    *,
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    """Persist the single durable integration epoch for one batch."""
+
+    ensure_branch_runtime_schema(conn)
+    now = now_iso or utc_now()
+    created = epoch.created_at or now
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_integration_epochs (
+            project_id, batch_id, epoch_id, coordination_backlog_id,
+            target_ref, base_head, current_head,
+            merge_queue_id, merge_cursor, merged_prefix_json,
+            remaining_queue_item_ids_json, reconcile_state, status,
+            active_queue_item_id, active_task_id, active_backlog_id,
+            active_checkpoint_id, expected_head_before, expected_branch_head,
+            last_merge_commit, snapshot_id, projection_id, failure_reason,
+            created_at, updated_at, closed_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(project_id, batch_id) DO UPDATE SET
+            epoch_id = excluded.epoch_id,
+            coordination_backlog_id = excluded.coordination_backlog_id,
+            target_ref = excluded.target_ref,
+            base_head = excluded.base_head,
+            current_head = excluded.current_head,
+            merge_queue_id = excluded.merge_queue_id,
+            merge_cursor = excluded.merge_cursor,
+            merged_prefix_json = excluded.merged_prefix_json,
+            remaining_queue_item_ids_json = excluded.remaining_queue_item_ids_json,
+            reconcile_state = excluded.reconcile_state,
+            status = excluded.status,
+            active_queue_item_id = excluded.active_queue_item_id,
+            active_task_id = excluded.active_task_id,
+            active_backlog_id = excluded.active_backlog_id,
+            active_checkpoint_id = excluded.active_checkpoint_id,
+            expected_head_before = excluded.expected_head_before,
+            expected_branch_head = excluded.expected_branch_head,
+            last_merge_commit = excluded.last_merge_commit,
+            snapshot_id = excluded.snapshot_id,
+            projection_id = excluded.projection_id,
+            failure_reason = excluded.failure_reason,
+            updated_at = excluded.updated_at,
+            closed_at = excluded.closed_at
+        """,
+        (
+            epoch.project_id,
+            epoch.batch_id,
+            epoch.epoch_id,
+            epoch.coordination_backlog_id,
+            epoch.target_ref,
+            epoch.base_head,
+            epoch.current_head,
+            epoch.merge_queue_id,
+            epoch.merge_cursor,
+            _json_array(epoch.merged_prefix),
+            _json_array(epoch.remaining_queue_item_ids),
+            epoch.reconcile_state,
+            epoch.status,
+            epoch.active_queue_item_id,
+            epoch.active_task_id,
+            epoch.active_backlog_id,
+            epoch.active_checkpoint_id,
+            epoch.expected_head_before,
+            epoch.expected_branch_head,
+            epoch.last_merge_commit,
+            epoch.snapshot_id,
+            epoch.projection_id,
+            epoch.failure_reason,
+            created,
+            now,
+            epoch.closed_at,
+        ),
+    )
+    found = get_integration_epoch(conn, epoch.project_id, epoch.batch_id)
+    if found is None:
+        raise RuntimeError(f"integration epoch was not persisted: {epoch.batch_id}")
+    return found
+
+
+def get_integration_epoch(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+) -> IntegrationEpoch | None:
+    ensure_branch_runtime_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epochs
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (project_id, batch_id),
+    ).fetchone()
+    return _integration_epoch_from_row(row) if row is not None else None
+
+
+def get_active_integration_epoch(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    target_ref: str = "",
+    merge_queue_id: str = "",
+) -> IntegrationEpoch | None:
+    """Return the frozen epoch that owns a target ref or merge queue."""
+
+    ensure_branch_runtime_schema(conn)
+    clauses = ["project_id = ?", "status != ?"]
+    params: list[Any] = [project_id, INTEGRATION_EPOCH_CLOSED]
+    if str(target_ref or "").strip():
+        clauses.append("target_ref = ?")
+        params.append(str(target_ref).strip())
+    if str(merge_queue_id or "").strip():
+        clauses.append("merge_queue_id = ?")
+        params.append(str(merge_queue_id).strip())
+    row = conn.execute(
+        f"""
+        SELECT * FROM parallel_branch_integration_epochs
+        WHERE {' AND '.join(clauses)}
+        ORDER BY created_at, batch_id
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return _integration_epoch_from_row(row) if row is not None else None
+
+
+def resolve_active_integration_epoch_for_backlog(
+    conn: sqlite3.Connection,
+    project_id: str,
+    backlog_id: str,
+) -> tuple[IntegrationEpoch | None, str]:
+    """Resolve parent/child epoch membership without trusting close input."""
+
+    ensure_branch_runtime_schema(conn)
+    backlog = str(backlog_id or "").strip()
+    if not backlog:
+        return None, ""
+    parent = conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epochs
+        WHERE project_id = ? AND coordination_backlog_id = ? AND status != ?
+        ORDER BY created_at
+        LIMIT 1
+        """,
+        (project_id, backlog, INTEGRATION_EPOCH_CLOSED),
+    ).fetchone()
+    if parent is not None:
+        return _integration_epoch_from_row(parent), "coordination"
+    child = conn.execute(
+        """
+        SELECT epoch.*
+        FROM parallel_branch_integration_epochs AS epoch
+        JOIN parallel_branch_merge_queue_items AS item
+          ON item.project_id = epoch.project_id
+         AND item.merge_queue_id = epoch.merge_queue_id
+        WHERE epoch.project_id = ?
+          AND item.backlog_id = ?
+          AND epoch.status != ?
+        ORDER BY epoch.created_at, item.queue_index
+        LIMIT 1
+        """,
+        (project_id, backlog, INTEGRATION_EPOCH_CLOSED),
+    ).fetchone()
+    if child is not None:
+        return _integration_epoch_from_row(child), "child"
+    return None, ""
+
+
+def integration_epoch_child_backlog_ids(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+) -> tuple[str, ...]:
+    ensure_branch_runtime_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT backlog_id, MIN(queue_index) AS first_queue_index
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND backlog_id != ''
+        GROUP BY backlog_id
+        ORDER BY first_queue_index, backlog_id
+        """,
+        (epoch.project_id, epoch.merge_queue_id),
+    ).fetchall()
+    return tuple(
+        str(row["backlog_id"] or "")
+        for row in rows
+        if row["backlog_id"]
+        and str(row["backlog_id"] or "") != epoch.coordination_backlog_id
+    )
+
+
+def validate_integration_epoch_backlog_close(
+    epoch: IntegrationEpoch,
+    *,
+    backlog_scope: str,
+    target_head_commit: str,
+) -> dict[str, Any]:
+    """Validate child/coordination close without releasing the epoch."""
+
+    scope = str(backlog_scope or "").strip()
+    target = str(target_head_commit or "").strip()
+    if scope not in {"child", "coordination"}:
+        raise ValueError("backlog_scope must be child or coordination")
+    if (
+        epoch.status != INTEGRATION_EPOCH_RECONCILED
+        or epoch.remaining_queue_item_ids
+        or epoch.current_head != target
+    ):
+        raise IntegrationEpochFrozenError(
+            "backlog close remains frozen until the final batch reconcile barrier",
+            epoch,
+        )
+    return {
+        "schema_version": "mf_batch_parallel.integration_epoch_close_gate.v1",
+        "passed": True,
+        "backlog_scope": scope,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "target_head_commit": target,
+        "release_epoch": scope == "coordination",
+        "preserve_epoch_freeze": scope == "child",
+        "child_protected_close_required": scope == "child",
+    }
+
+
+def integration_epoch_resume_payload(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+) -> dict[str, Any]:
+    """Build the copy-safe canonical restart/onboard instruction."""
+
+    item = None
+    if epoch.active_queue_item_id:
+        item = get_merge_queue_item(
+            conn,
+            epoch.project_id,
+            epoch.merge_queue_id,
+            epoch.active_queue_item_id,
+        )
+    action_id = "resume_batch_merge"
+    action_backlog_id = epoch.active_backlog_id
+    child_backlog_ids: tuple[str, ...] = ()
+    pending_child_backlog_ids: tuple[str, ...] = ()
+    if epoch.status == INTEGRATION_EPOCH_RECONCILE_PENDING:
+        action_id = "final_batch_reconcile"
+        action_backlog_id = epoch.coordination_backlog_id
+    elif epoch.status == INTEGRATION_EPOCH_RECONCILED:
+        child_backlog_ids = integration_epoch_child_backlog_ids(conn, epoch)
+        child_statuses: dict[str, str] = {}
+        if child_backlog_ids:
+            placeholders = ",".join("?" for _ in child_backlog_ids)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT bug_id, status FROM backlog_bugs
+                    WHERE bug_id IN ({placeholders})
+                    """,
+                    child_backlog_ids,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            child_statuses = {
+                str(row["bug_id"] or ""): str(row["status"] or "") for row in rows
+            }
+        pending_child_backlog_ids = tuple(
+            backlog_id
+            for backlog_id in child_backlog_ids
+            if child_statuses.get(backlog_id) != "FIXED"
+        )
+        if pending_child_backlog_ids:
+            action_id = "close_reconciled_child_rows"
+            action_backlog_id = pending_child_backlog_ids[0]
+        else:
+            action_id = "close_batch_atomically"
+            action_backlog_id = epoch.coordination_backlog_id
+    return {
+        "schema_version": "mf_batch_parallel.integration_epoch_resume.v1",
+        "id": action_id,
+        "line_id": action_id,
+        "source": "durable_integration_epoch",
+        "precedence": "active_integration_epoch",
+        "project_id": epoch.project_id,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "target_ref": epoch.target_ref,
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": epoch.active_queue_item_id,
+        "task_id": epoch.active_task_id,
+        "backlog_id": action_backlog_id,
+        "checkpoint_id": epoch.active_checkpoint_id,
+        "merge_cursor": epoch.merge_cursor,
+        "status": epoch.status,
+        "reconcile_state": epoch.reconcile_state,
+        "child_backlog_ids": list(child_backlog_ids),
+        "pending_child_backlog_ids": list(pending_child_backlog_ids),
+        "canonical_queue_item": merge_queue_item_to_dict(item) if item else None,
+        "position_skippable": False,
+        "target_ref_frozen": True,
+        "raw_session_token_included": False,
+        "raw_fence_token_included": False,
+        "raw_route_token_included": False,
+    }
+
+
+def _integration_epoch_next_item_fields(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
+) -> tuple[str, str, str]:
+    item = get_merge_queue_item(conn, project_id, merge_queue_id, queue_item_id)
+    if item is None:
+        return "", "", ""
+    context = get_branch_context(conn, project_id, item.task_id)
+    return (
+        item.task_id,
+        item.backlog_id or (context.backlog_id if context is not None else ""),
+        context.checkpoint_id if context is not None else "",
+    )
+
+
+def _integration_epoch_coordination_backlog_id(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str,
+    merge_queue_id: str,
+) -> str:
+    """Resolve the batch parent from server-authored mf_batch timeline state."""
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT backlog_id, payload_json
+            FROM task_timeline_events
+            WHERE project_id = ? AND event_type = 'mf_batch_parallel.entered'
+            ORDER BY id DESC
+            """,
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return ""
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        payload_queue = str(
+            payload.get("merge_queue_id")
+            or (payload.get("merge_queue_plan") or {}).get("merge_queue_id")
+            or ""
+        ).strip()
+        if str(payload.get("batch_id") or "").strip() != batch_id:
+            continue
+        if payload_queue and payload_queue != merge_queue_id:
+            continue
+        return str(payload.get("backlog_id") or row["backlog_id"] or "").strip()
+    return ""
+
+
+def open_or_validate_integration_epoch(
+    conn: sqlite3.Connection,
+    *,
+    item: MergeQueueItem,
+    batch_id: str,
+    target_head: str,
+    checkpoint_id: str = "",
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    """Open the batch epoch or prove this item is its canonical successor."""
+
+    batch = str(batch_id or "").strip()
+    if not batch:
+        raise ValueError("batch_id is required for an integration epoch")
+    target_ref = str(item.target_ref or "refs/heads/main").strip()
+    active_target = get_active_integration_epoch(
+        conn, item.project_id, target_ref=target_ref
+    )
+    if active_target is not None and (
+        active_target.batch_id != batch
+        or active_target.merge_queue_id != item.merge_queue_id
+    ):
+        raise IntegrationEpochFrozenError(
+            "target ref is frozen by another batch integration epoch",
+            active_target,
+        )
+    existing = get_integration_epoch(conn, item.project_id, batch)
+    if existing is not None:
+        if existing.status == INTEGRATION_EPOCH_CLOSED:
+            raise IntegrationEpochFrozenError(
+                "closed integration epoch cannot accept another merge", existing
+            )
+        if existing.status in {
+            INTEGRATION_EPOCH_RECONCILE_PENDING,
+            INTEGRATION_EPOCH_RECONCILED,
+        }:
+            raise IntegrationEpochFrozenError(
+                "integration epoch is at the final reconcile/close barrier", existing
+            )
+        if existing.active_queue_item_id != item.queue_item_id:
+            raise IntegrationEpochFrozenError(
+                "merge request does not match the epoch's canonical queue position",
+                existing,
+            )
+        return existing
+
+    ordered = _list_merge_queue_items_with_target_fallback(
+        conn,
+        item.project_id,
+        item.merge_queue_id,
+        target_ref=target_ref,
+    )
+    remaining = tuple(
+        candidate.queue_item_id
+        for candidate in ordered
+        if candidate.status != STATE_MERGED
+    )
+    if not remaining or remaining[0] != item.queue_item_id:
+        provisional = IntegrationEpoch(
+            project_id=item.project_id,
+            batch_id=batch,
+            epoch_id="",
+            coordination_backlog_id="",
+            target_ref=target_ref,
+            base_head=target_head,
+            current_head=target_head,
+            merge_queue_id=item.merge_queue_id,
+            active_queue_item_id=remaining[0] if remaining else "",
+        )
+        raise IntegrationEpochFrozenError(
+            "first live merge must use the earliest unmerged batch queue item",
+            provisional,
+        )
+    merged_prefix = tuple(
+        candidate.queue_item_id
+        for candidate in ordered
+        if candidate.status == STATE_MERGED
+    )
+    epoch_id = _stable_plan_id(
+        "integration-epoch",
+        item.project_id,
+        batch,
+        target_ref,
+        item.merge_queue_id,
+        target_head,
+    )
+    coordination_backlog_id = _integration_epoch_coordination_backlog_id(
+        conn,
+        project_id=item.project_id,
+        batch_id=batch,
+        merge_queue_id=item.merge_queue_id,
+    )
+    return upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=item.project_id,
+            batch_id=batch,
+            epoch_id=epoch_id,
+            coordination_backlog_id=coordination_backlog_id,
+            target_ref=target_ref,
+            base_head=target_head,
+            current_head=target_head,
+            merge_queue_id=item.merge_queue_id,
+            merge_cursor=len(merged_prefix),
+            merged_prefix=merged_prefix,
+            remaining_queue_item_ids=remaining,
+            active_queue_item_id=item.queue_item_id,
+            active_task_id=item.task_id,
+            active_backlog_id=item.backlog_id,
+            active_checkpoint_id=checkpoint_id,
+        ),
+        now_iso=now_iso,
+    )
+
+
+def arm_integration_epoch_merge_in_doubt(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+    *,
+    item: MergeQueueItem,
+    target_head_before: str,
+    branch_head: str,
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    """Durably arm crash recovery before the git writer mutates the target."""
+
+    if epoch.active_queue_item_id != item.queue_item_id:
+        raise IntegrationEpochFrozenError(
+            "cannot arm a non-canonical integration epoch item", epoch
+        )
+    armed = upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            status=INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+            expected_head_before=target_head_before,
+            expected_branch_head=branch_head,
+            failure_reason="",
+        ),
+        now_iso=now_iso,
+    )
+    # This commit is intentional: the recovery marker must survive a process
+    # death between the git ref mutation and the durable queue result write.
+    conn.commit()
+    return armed
+
+
+def advance_integration_epoch_after_merge(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str,
+    queue_item_id: str,
+    merge_commit: str,
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    epoch = get_integration_epoch(conn, project_id, batch_id)
+    if epoch is None:
+        raise KeyError(f"integration epoch not found: {project_id}/{batch_id}")
+    if epoch.active_queue_item_id != queue_item_id:
+        if queue_item_id in epoch.merged_prefix:
+            return epoch
+        raise IntegrationEpochFrozenError(
+            "merged queue item does not match the epoch cursor", epoch
+        )
+    merged_prefix = tuple(dict.fromkeys((*epoch.merged_prefix, queue_item_id)))
+    remaining = tuple(
+        candidate
+        for candidate in epoch.remaining_queue_item_ids
+        if candidate != queue_item_id
+    )
+    next_item_id = remaining[0] if remaining else ""
+    next_task, next_backlog, next_checkpoint = _integration_epoch_next_item_fields(
+        conn,
+        project_id=project_id,
+        merge_queue_id=epoch.merge_queue_id,
+        queue_item_id=next_item_id,
+    )
+    return upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            current_head=merge_commit,
+            merge_cursor=len(merged_prefix),
+            merged_prefix=merged_prefix,
+            remaining_queue_item_ids=remaining,
+            status=(
+                INTEGRATION_EPOCH_OPEN
+                if remaining
+                else INTEGRATION_EPOCH_RECONCILE_PENDING
+            ),
+            active_queue_item_id=next_item_id,
+            active_task_id=next_task,
+            active_backlog_id=next_backlog,
+            active_checkpoint_id=next_checkpoint,
+            expected_head_before="",
+            expected_branch_head="",
+            last_merge_commit=merge_commit,
+            reconcile_state="pending",
+            failure_reason="",
+        ),
+        now_iso=now_iso,
+    )
+
+
+def mark_integration_epoch_reconciled(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    target_head_commit: str,
+    snapshot_id: str,
+    projection_id: str,
+    merge_queue_id: str = "",
+    now_iso: str = "",
+) -> IntegrationEpoch | None:
+    epoch = get_active_integration_epoch(
+        conn,
+        project_id,
+        merge_queue_id=merge_queue_id,
+    ) if merge_queue_id else get_active_integration_epoch(conn, project_id)
+    if epoch is None:
+        return None
+    if epoch.status != INTEGRATION_EPOCH_RECONCILE_PENDING:
+        return epoch
+    if epoch.remaining_queue_item_ids or epoch.current_head != target_head_commit:
+        return upsert_integration_epoch(
+            conn,
+            replace(
+                epoch,
+                reconcile_state="failed",
+                failure_reason="reconcile target head does not match frozen epoch head",
+            ),
+            now_iso=now_iso,
+        )
+    return upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            status=INTEGRATION_EPOCH_RECONCILED,
+            reconcile_state="reconciled",
+            snapshot_id=snapshot_id,
+            projection_id=projection_id,
+            failure_reason="",
+        ),
+        now_iso=now_iso,
+    )
+
+
+def close_integration_epoch(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str,
+    target_head_commit: str,
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    """Release the target freeze only after the final reconcile barrier."""
+
+    epoch = get_integration_epoch(conn, project_id, batch_id)
+    if epoch is None:
+        raise KeyError(f"integration epoch not found: {project_id}/{batch_id}")
+    if epoch.status != INTEGRATION_EPOCH_RECONCILED:
+        raise IntegrationEpochFrozenError(
+            "integration epoch must be reconciled before atomic close", epoch
+        )
+    if epoch.remaining_queue_item_ids or epoch.current_head != target_head_commit:
+        raise IntegrationEpochFrozenError(
+            "integration epoch close head/cursor does not match the frozen barrier",
+            epoch,
+        )
+    now = now_iso or utc_now()
+    return upsert_integration_epoch(
+        conn,
+        replace(epoch, status=INTEGRATION_EPOCH_CLOSED, closed_at=now),
+        now_iso=now,
     )
 
 
@@ -16967,6 +17797,56 @@ def execute_merge_queue_item(
         ]
     repo_root = Path(repo_root_path).resolve()
     selected_target_ref = target_ref or item.target_ref or "refs/heads/main"
+    if item.target_ref != selected_target_ref:
+        item = replace(item, target_ref=selected_target_ref)
+        items = [
+            item if candidate.queue_item_id == item.queue_item_id else candidate
+            for candidate in items
+        ]
+    item_context = get_branch_context(conn, project_id, item.task_id)
+    item_batch_id = str(item_context.batch_id if item_context is not None else "").strip()
+    item_checkpoint_id = str(
+        item_context.checkpoint_id if item_context is not None else ""
+    ).strip()
+    active_epoch = get_active_integration_epoch(
+        conn,
+        project_id,
+        target_ref=selected_target_ref,
+    )
+    epoch_idempotent_replay = bool(
+        active_epoch is not None
+        and active_epoch.merge_queue_id == item.merge_queue_id
+        and item.queue_item_id in active_epoch.merged_prefix
+        and item.status == STATE_MERGED
+    )
+    if not dry_run and active_epoch is not None and (
+        active_epoch.merge_queue_id != item.merge_queue_id
+        or active_epoch.batch_id != item_batch_id
+        or (
+            not epoch_idempotent_replay
+            and (
+                active_epoch.active_queue_item_id != item.queue_item_id
+                or active_epoch.status
+                in {
+                    INTEGRATION_EPOCH_RECONCILE_PENDING,
+                    INTEGRATION_EPOCH_RECONCILED,
+                }
+            )
+        )
+    ):
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "integration_epoch_target_ref_frozen",
+            "message": (
+                "target ref is frozen; only the canonical queue item or final "
+                "reconcile/close action for the active batch epoch may proceed"
+            ),
+            "integration_epoch": integration_epoch_to_dict(active_epoch),
+            "next_legal_action": integration_epoch_resume_payload(conn, active_epoch),
+            "recorded": None,
+        }
     if not item.branch_ref:
         return {
             "ok": False,
@@ -16995,6 +17875,29 @@ def execute_merge_queue_item(
         target_commit=target_commit,
         timeout_seconds=timeout_seconds,
     )
+    if (
+        not dry_run
+        and active_epoch is not None
+        and active_epoch.status == INTEGRATION_EPOCH_MERGE_IN_DOUBT
+        and not already_integrated
+        and target_commit != active_epoch.expected_head_before
+    ):
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "integration_epoch_merge_in_doubt",
+            "message": (
+                "actual target head is neither the durable pre-mutation head nor "
+                "a target containing the expected branch head; blind replay refused"
+            ),
+            "actual_target_head": target_commit,
+            "expected_target_head": active_epoch.expected_head_before,
+            "expected_branch_head": active_epoch.expected_branch_head,
+            "integration_epoch": integration_epoch_to_dict(active_epoch),
+            "next_legal_action": integration_epoch_resume_payload(conn, active_epoch),
+            "recorded": None,
+        }
     if already_integrated:
         integrated_item = replace(
             item,
@@ -17035,6 +17938,54 @@ def execute_merge_queue_item(
                 "next_actions": ["record_merge_result_without_target_ref_mutation"],
                 "recorded": None,
             }
+        if epoch_idempotent_replay and active_epoch is not None:
+            return {
+                "ok": True,
+                "dry_run": False,
+                "executed": False,
+                "already_integrated": True,
+                "idempotent_epoch_replay": True,
+                "target_ref_mutated": False,
+                "merge_commit": target_commit or item.merge_commit or branch_commit,
+                "candidate_preview_root": str(repo_root),
+                "preview": preview,
+                "gate_plan": merge_gate_plan_to_dict(gate_plan),
+                "recorded": {
+                    "queue_item": merge_queue_item_to_dict(item),
+                    "context": (
+                        public_branch_context_to_dict(item_context)
+                        if item_context is not None
+                        else None
+                    ),
+                },
+                "integration_epoch": integration_epoch_to_dict(active_epoch),
+            }
+        epoch: IntegrationEpoch | None = None
+        if item_batch_id:
+            try:
+                epoch = open_or_validate_integration_epoch(
+                    conn,
+                    item=integrated_item,
+                    batch_id=item_batch_id,
+                    target_head=target_commit or branch_commit,
+                    checkpoint_id=item_checkpoint_id,
+                    now_iso=now_iso,
+                )
+            except IntegrationEpochFrozenError as exc:
+                return {
+                    "ok": False,
+                    "dry_run": False,
+                    "executed": False,
+                    "already_integrated": True,
+                    "target_ref_mutated": False,
+                    "error": "integration_epoch_target_ref_frozen",
+                    "message": str(exc),
+                    "integration_epoch": integration_epoch_to_dict(exc.epoch),
+                    "next_legal_action": integration_epoch_resume_payload(
+                        conn, exc.epoch
+                    ),
+                    "recorded": None,
+                }
         recorded = record_merge_queue_result(
             conn,
             project_id=project_id,
@@ -17054,6 +18005,15 @@ def execute_merge_queue_item(
             ),
             now_iso=now_iso,
         )
+        if epoch is not None:
+            epoch = advance_integration_epoch_after_merge(
+                conn,
+                project_id=project_id,
+                batch_id=epoch.batch_id,
+                queue_item_id=integrated_item.queue_item_id,
+                merge_commit=target_commit or branch_commit,
+                now_iso=now_iso,
+            )
         return {
             "ok": True,
             "dry_run": False,
@@ -17065,6 +18025,9 @@ def execute_merge_queue_item(
             "preview": preview,
             "gate_plan": merge_gate_plan_to_dict(gate_plan),
             "recorded": recorded,
+            "integration_epoch": (
+                integration_epoch_to_dict(epoch) if epoch is not None else None
+            ),
         }
     gate_evidence = dict(evidence or {})
     gate_evidence["git_conflict_check"] = preview
@@ -17248,6 +18211,42 @@ def execute_merge_queue_item(
             "recorded": None,
         }
 
+    epoch = None
+    if item_batch_id:
+        try:
+            epoch = open_or_validate_integration_epoch(
+                conn,
+                item=item,
+                batch_id=item_batch_id,
+                target_head=before_commit,
+                checkpoint_id=item_checkpoint_id,
+                now_iso=now_iso,
+            )
+            epoch = arm_integration_epoch_merge_in_doubt(
+                conn,
+                epoch,
+                item=item,
+                target_head_before=before_commit,
+                branch_head=branch_commit,
+                now_iso=now_iso,
+            )
+        except IntegrationEpochFrozenError as exc:
+            return {
+                "ok": False,
+                "dry_run": False,
+                "executed": False,
+                "error": "integration_epoch_target_ref_frozen",
+                "message": str(exc),
+                "integration_epoch": integration_epoch_to_dict(exc.epoch),
+                "next_legal_action": integration_epoch_resume_payload(conn, exc.epoch),
+                "candidate_preview_root": str(repo_root),
+                "target_mutation_root": str(mutation_root),
+                "target_mutation_root_source": mutation_root_source,
+                "preview": preview,
+                "gate_plan": merge_gate_plan_to_dict(gate_plan),
+                "recorded": None,
+            }
+
     merge_head_before_writer = _git_preview_command(
         mutation_root,
         ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
@@ -17411,6 +18410,15 @@ def execute_merge_queue_item(
         ),
         now_iso=now_iso,
     )
+    if epoch is not None:
+        epoch = advance_integration_epoch_after_merge(
+            conn,
+            project_id=project_id,
+            batch_id=epoch.batch_id,
+            queue_item_id=item.queue_item_id,
+            merge_commit=merge_commit,
+            now_iso=now_iso,
+        )
     return {
         "ok": True,
         "dry_run": False,
@@ -17424,6 +18432,9 @@ def execute_merge_queue_item(
         "preview": preview,
         "gate_plan": merge_gate_plan_to_dict(gate_plan),
         "recorded": recorded,
+        "integration_epoch": (
+            integration_epoch_to_dict(epoch) if epoch is not None else None
+        ),
     }
 
 
@@ -18021,6 +19032,7 @@ def build_parallel_branch_read_model(
     contexts: list[BranchTaskRuntimeContext],
     recovery_plan: RecoveryPlan | None = None,
     merge_queue_plan: MergeQueuePlan | None = None,
+    integration_epoch: IntegrationEpoch | None = None,
     batch_plan: BatchRollbackPlan | None = None,
     active_merge_queue_id: str = "",
     target_ref: str = "",
@@ -18085,6 +19097,13 @@ def build_parallel_branch_read_model(
         "stale_count": len(merge_queue.get("stale_task_ids", [])),
         "rollback_required": bool(rollback.get("rollback_required")),
         "cleanup_allowed": bool(rollback.get("cleanup_allowed", True)),
+        "target_ref_frozen": bool(
+            integration_epoch
+            and integration_epoch.status in INTEGRATION_EPOCH_ACTIVE_STATES
+        ),
+        "integration_epoch_status": (
+            integration_epoch.status if integration_epoch is not None else ""
+        ),
         "truncated": any(truncated.values()),
     }
 
@@ -18094,6 +19113,11 @@ def build_parallel_branch_read_model(
         summary=summary,
         branch_lanes=branch_lanes,
         merge_queue=merge_queue,
+        integration_epoch=(
+            integration_epoch_to_dict(integration_epoch)
+            if integration_epoch is not None
+            else {}
+        ),
         rollback=rollback,
         total_counts=total_counts,
         truncated=truncated,
@@ -18126,8 +19150,10 @@ def build_parallel_branch_read_model_from_db(
     )
 
     batch_runtime: BatchMergeRuntime | None = None
+    integration_epoch: IntegrationEpoch | None = None
     if batch_id:
         batch_runtime = get_batch_merge_runtime(conn, project_id, batch_id)
+        integration_epoch = get_integration_epoch(conn, project_id, batch_id)
 
     queue_plan: MergeQueuePlan | None = None
     queue_id = str(merge_queue_id or "").strip()
@@ -18162,6 +19188,12 @@ def build_parallel_branch_read_model_from_db(
                 for item in queue_items
             ]
         queue_plan = decide_merge_queue(queue_items, scenario_id=scenario_id) if queue_items else None
+        if integration_epoch is None:
+            integration_epoch = get_active_integration_epoch(
+                conn,
+                project_id,
+                merge_queue_id=queue_id,
+            )
 
     batch_plan: BatchRollbackPlan | None = None
     if batch_runtime is not None:
@@ -18178,6 +19210,7 @@ def build_parallel_branch_read_model_from_db(
         contexts=contexts,
         recovery_plan=recovery_plan,
         merge_queue_plan=queue_plan,
+        integration_epoch=integration_epoch,
         batch_plan=batch_plan,
         active_merge_queue_id=queue_id,
         target_ref=target_ref,

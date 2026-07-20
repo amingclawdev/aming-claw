@@ -546,6 +546,119 @@ def test_serialized_batch_read_model_keeps_row2_visible_after_row1_merge():
     assert row2["merge_allowed"] is False
 
 
+def test_fresh_session_read_model_resumes_exact_epoch_row2_without_head_drift(
+    tmp_path,
+):
+    db_path = tmp_path / "fresh-session-epoch.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    batch_id = "batch-fresh-session"
+    queue_id = "mq-fresh-session"
+    row1 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-row1",
+        task_id="task-row1",
+        backlog_id="AC-FRESH-ROW1",
+        branch_ref="refs/heads/codex/fresh-row1",
+        queue_index=1,
+        status=pbr.STATE_MERGED,
+        target_ref=TARGET_REF,
+        merge_commit="partial-head",
+        target_head_before_merge="base-head",
+        target_head_after_merge="partial-head",
+        current_target_head="partial-head",
+        snapshot_id="scope-row1",
+        projection_id="semproj-row1",
+    )
+    row2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-row2",
+        task_id="task-row2",
+        backlog_id="AC-FRESH-ROW2",
+        branch_ref="refs/heads/codex/fresh-row2",
+        queue_index=2,
+        status=pbr.STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+        validated_target_head="partial-head",
+        current_target_head="partial-head",
+        merge_preview_id="preview-row2",
+    )
+    upsert_merge_queue_items(conn, [row1, row2], now_iso=NOW)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            task_id="task-row2",
+            backlog_id="AC-FRESH-ROW2",
+            branch_ref=row2.branch_ref,
+            ref_name="main",
+            status=pbr.STATE_MERGE_READY,
+            checkpoint_id="checkpoint-row2",
+            target_head_commit="partial-head",
+            merge_queue_id=queue_id,
+            merge_preview_id="preview-row2",
+        ),
+        now_iso=NOW,
+    )
+    pbr.upsert_integration_epoch(
+        conn,
+        pbr.IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="integration-epoch-fresh-session",
+            coordination_backlog_id="AC-FRESH-PARENT",
+            target_ref=TARGET_REF,
+            base_head="base-head",
+            current_head="partial-head",
+            merge_queue_id=queue_id,
+            merge_cursor=1,
+            merged_prefix=("item-row1",),
+            remaining_queue_item_ids=("item-row2",),
+            status=pbr.INTEGRATION_EPOCH_OPEN,
+            active_queue_item_id="item-row2",
+            active_task_id="task-row2",
+            active_backlog_id="AC-FRESH-ROW2",
+            active_checkpoint_id="checkpoint-row2",
+            last_merge_commit="partial-head",
+        ),
+        now_iso=NOW,
+    )
+    conn.commit()
+    conn.close()
+
+    fresh = sqlite3.connect(db_path)
+    fresh.row_factory = sqlite3.Row
+    read_model = build_parallel_branch_read_model_from_db(
+        fresh,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=queue_id,
+        target_ref=TARGET_REF,
+        current_target_head="partial-head",
+        now_iso=NOW,
+        limit=10,
+    ).to_dict()
+
+    epoch = read_model["integration_epoch"]
+    assert read_model["summary"]["target_ref_frozen"] is True
+    assert epoch["status"] == pbr.INTEGRATION_EPOCH_OPEN
+    assert epoch["current_head"] == "partial-head"
+    assert epoch["merged_prefix"] == ["item-row1"]
+    assert epoch["remaining_queue_item_ids"] == ["item-row2"]
+    assert epoch["active_queue_item_id"] == "item-row2"
+    assert epoch["active_checkpoint_id"] == "checkpoint-row2"
+    assert epoch["next_legal_action"] == "resume_batch_merge"
+    queue_rows = {
+        row["queue_item_id"]: row for row in read_model["merge_queue"]["rows"]
+    }
+    assert queue_rows["item-row2"]["current_target_head"] == "partial-head"
+    assert read_model["summary"]["stale_count"] == 0
+    fresh.close()
+
+
 def test_serialized_batch_read_model_recovers_missing_row2_from_context_lineage():
     conn = _runtime_conn()
     batch_id = "mf-batch-parallel-84d4cdf62e77b2c1cc54"
