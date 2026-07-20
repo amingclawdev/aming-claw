@@ -27245,12 +27245,93 @@ def _runtime_context_submit_canonical_contract_line(
                 {},
             ),
         )
-        if revision.get("status") == "validated_submission":
+        revision_status = str(revision.get("status") or "").strip()
+        if revision_status == "validated_timeline_boundary_submission":
+            prevalidated_payload = (
+                dict(revision.get("canonical_payload") or {})
+                if isinstance(revision.get("canonical_payload"), Mapping)
+                else {}
+            )
+            replay_marker = (
+                dict(
+                    prevalidated_payload.get(
+                        "failed_qa_revision_rejoin_marker"
+                    )
+                    or {}
+                )
+                if isinstance(
+                    prevalidated_payload.get(
+                        "failed_qa_revision_rejoin_marker"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            if not prevalidated_payload or not replay_marker:
+                conn.rollback()
+                raise GovernanceError(
+                    "contract_runtime_rework_lineage_revision_replay_invalid",
+                    "timeline-backed implementation prevalidation did not return a server-derived revision marker",
+                    422,
+                    {
+                        "contract_execution_id": execution_id,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "first_stage_status": revision_status,
+                        "fail_closed": True,
+                        "timeline_evidence_backfill_allowed": False,
+                    },
+                )
+            try:
+                replay = _runtime_context_revise_failed_qa_implementation_lineage(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    runtime=runtime,
+                    record=stored_record,
+                    payload=prevalidated_payload,
+                    revision_marker=replay_marker,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            replay_next_action = (
+                replay.get("next_legal_action")
+                if isinstance(replay.get("next_legal_action"), Mapping)
+                else {}
+            )
+            if (
+                replay.get("status") != "revised"
+                or replay.get("canonical") is not True
+                or str(replay_next_action.get("line_id") or "").strip()
+                != "worker_commit"
+            ):
+                conn.rollback()
+                raise GovernanceError(
+                    "contract_runtime_rework_lineage_revision_replay_rejected",
+                    "timeline-backed implementation revision replay did not produce the canonical revised line",
+                    422,
+                    {
+                        "contract_execution_id": execution_id,
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                        "first_stage_status": revision_status,
+                        "second_stage_status": replay.get("status"),
+                        "second_stage_canonical": replay.get("canonical"),
+                        "second_stage_next_legal_action": dict(
+                            replay_next_action
+                        ),
+                        "fail_closed": True,
+                        "timeline_evidence_backfill_allowed": False,
+                    },
+                )
+            return replay
+        if revision_status == "validated_submission":
             canonical_payload = dict(
                 revision.get("canonical_payload") or canonical_payload
             )
         elif revision and (
-            revision.get("status") == "revised"
+            revision_status == "revised"
             or next_line_id != "worker_implementation"
         ):
             return revision

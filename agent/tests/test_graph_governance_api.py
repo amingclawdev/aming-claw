@@ -33506,26 +33506,181 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
             "execution_state_revision"
         ] == revision_before_negative_cases
 
-    corrected = server.handle_graph_governance_runtime_context_implementation_evidence(
-        _ctx_with_role(
-            {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
-            "mf_sub",
-            method="POST",
-            body={
-                "parent_task_id": backlog_id,
-                "fence_token": rejoin["fence_token"],
-                "session_token": rejoin["session_token"],
-                "target_project_root": str(target_root),
-                "changed_files": ["agent/governance/server.py"],
-                "graph_trace_ids": [graph_trace_id],
-                "tests": [{"command": "pytest -q", "status": "passed"}],
-                "payload": {
-                    "failed_qa_event_ref": f"timeline:{failed_qa['id']}",
-                    "candidate_new_failures": 0,
-                },
-            },
+    def mutation_state():
+        record = runtime.store.get(successor["contract_execution_id"])
+        events = task_timeline.list_events(
+            conn,
+            PID,
+            task_id=runtime_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+        return {
+            "execution_state_revision": record["execution_state_revision"],
+            "completed_lines": json.loads(
+                json.dumps(record["completed_lines"])
+            ),
+            "timeline_event_ids": [int(event["id"]) for event in events],
+        }
+
+    prevalidation_before = mutation_state()
+    prevalidation = (
+        server._runtime_context_revise_failed_qa_implementation_lineage(
+            conn,
+            project_id=PID,
+            context=saved_context,
+            runtime=runtime,
+            record=runtime.store.get(successor["contract_execution_id"]),
+            payload=revision_payload,
+            revision_marker={},
         )
     )
+    assert prevalidation["status"] == (
+        "validated_timeline_boundary_submission"
+    )
+    prevalidated_marker = prevalidation["canonical_payload"][
+        "failed_qa_revision_rejoin_marker"
+    ]
+    assert prevalidated_marker == revision_marker
+    assert mutation_state() == prevalidation_before
+
+    original_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection
+    )
+    original_revision_helper = (
+        server._runtime_context_revise_failed_qa_implementation_lineage
+    )
+
+    def projection_without_runtime_rejoin(*args, **kwargs):
+        projected, projection = original_projection(*args, **kwargs)
+        projection = json.loads(json.dumps(projection))
+        projection["failed_qa_revision_rejoin_contexts"] = []
+        return projected, projection
+
+    def corrected_implementation_request():
+        return server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": rejoin["fence_token"],
+                    "session_token": rejoin["session_token"],
+                    "target_project_root": str(target_root),
+                    "changed_files": ["agent/governance/server.py"],
+                    "graph_trace_ids": [graph_trace_id],
+                    "tests": [
+                        {"command": "pytest -q", "status": "passed"}
+                    ],
+                    "payload": {
+                        "failed_qa_event_ref": f"timeline:{failed_qa['id']}",
+                        "candidate_new_failures": 0,
+                    },
+                },
+            )
+        )
+
+    replaced_marker_replays = []
+
+    def replace_second_stage_marker(*args, **kwargs):
+        supplied_marker = dict(kwargs.get("revision_marker") or {})
+        if supplied_marker:
+            replaced_marker_replays.append(dict(supplied_marker))
+            kwargs = dict(kwargs)
+            kwargs["revision_marker"] = {
+                **supplied_marker,
+                "revision_event_ref": "timeline:replaced-marker",
+            }
+        return original_revision_helper(*args, **kwargs)
+
+    before_replaced_marker = mutation_state()
+    with monkeypatch.context() as replaced_marker:
+        replaced_marker.setattr(
+            server,
+            "_contract_runtime_apply_mf_parallel_context_projection",
+            projection_without_runtime_rejoin,
+        )
+        replaced_marker.setattr(
+            server,
+            "_runtime_context_revise_failed_qa_implementation_lineage",
+            replace_second_stage_marker,
+        )
+        with pytest.raises(GovernanceError) as invalid_replay_marker:
+            corrected_implementation_request()
+    assert invalid_replay_marker.value.code == (
+        "contract_runtime_rework_lineage_revision_invalid"
+    )
+    assert replaced_marker_replays == [revision_marker]
+    assert mutation_state() == before_replaced_marker
+
+    replay_rejections = []
+
+    def reject_second_stage_after_cas(*args, **kwargs):
+        supplied_marker = dict(kwargs.get("revision_marker") or {})
+        result = original_revision_helper(*args, **kwargs)
+        if supplied_marker and result.get("status") == "revised":
+            replay_rejections.append(dict(supplied_marker))
+            return {**result, "status": "rejected", "canonical": False}
+        return result
+
+    before_second_stage_rejection = mutation_state()
+    with monkeypatch.context() as rejected_replay:
+        rejected_replay.setattr(
+            server,
+            "_contract_runtime_apply_mf_parallel_context_projection",
+            projection_without_runtime_rejoin,
+        )
+        rejected_replay.setattr(
+            server,
+            "_runtime_context_revise_failed_qa_implementation_lineage",
+            reject_second_stage_after_cas,
+        )
+        with pytest.raises(GovernanceError) as second_stage_rejected:
+            corrected_implementation_request()
+    assert second_stage_rejected.value.code == (
+        "contract_runtime_rework_lineage_revision_replay_rejected"
+    )
+    assert replay_rejections == [revision_marker]
+    assert mutation_state() == before_second_stage_rejection
+
+    replay_markers = {"derived": [], "supplied": []}
+
+    def record_exact_marker_replay(*args, **kwargs):
+        supplied_marker = dict(kwargs.get("revision_marker") or {})
+        result = original_revision_helper(*args, **kwargs)
+        if supplied_marker:
+            replay_markers["supplied"].append(supplied_marker)
+        elif result.get("status") == (
+            "validated_timeline_boundary_submission"
+        ):
+            replay_markers["derived"].append(
+                dict(
+                    result["canonical_payload"][
+                        "failed_qa_revision_rejoin_marker"
+                    ]
+                )
+            )
+        return result
+
+    before_corrected = mutation_state()
+    with monkeypatch.context() as projection_gap:
+        projection_gap.setattr(
+            server,
+            "_contract_runtime_apply_mf_parallel_context_projection",
+            projection_without_runtime_rejoin,
+        )
+        projection_gap.setattr(
+            server,
+            "_runtime_context_revise_failed_qa_implementation_lineage",
+            record_exact_marker_replay,
+        )
+        corrected = corrected_implementation_request()
+    assert replay_markers["derived"] == [revision_marker, revision_marker]
+    assert replay_markers["supplied"] == [revision_marker]
     canonical = corrected["contract_runtime_canonical_line"]
     assert canonical["status"] == "revised"
     assert canonical["commit_sha"] == revised_head
@@ -33550,7 +33705,10 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
 
     revised_record = runtime.store.get(successor["contract_execution_id"])
     assert revised_record["execution_state_revision"] == (
-        revision_before_negative_cases + 1
+        before_corrected["execution_state_revision"] + 1
+    )
+    assert len(revised_record["completed_lines"]) == (
+        len(before_corrected["completed_lines"]) + 2
     )
     boundary_line, implementation_line = revised_record["completed_lines"][-2:]
     assert boundary_line["line_id"] == "qa_independent_verification"
