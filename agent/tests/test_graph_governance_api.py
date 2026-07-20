@@ -58848,6 +58848,179 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     assert authority["authority_source"].startswith(
         "contract_runtime_completed_lines"
     )
+
+    # A no-PASS candidate result remains usable only when the canonical QA
+    # lines bind exact candidate scope, DB-verified graph evidence, explicit
+    # base reproduction, zero candidate-new failures, and server-derived
+    # durable merge authority.  It must never become a release PASS claim.
+    no_pass_record = runtime.store.get(contract_execution_id)
+    qa_graph_line = no_pass_record["completed_lines"][9]
+    qa_graph_line.update(
+        {
+            "commit_sha": qa_commit,
+            "observer_impersonation": False,
+            "authorization_source": "qa_session_token_ref",
+            "qa_evidence_provenance": {
+                "schema_version": "qa_evidence_provenance.v1",
+                "authorization_source": "qa_session_token_ref",
+                "evidence_owner_role": "qa",
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+            },
+        }
+    )
+    qa_graph_line["payload"].update(
+        {
+            "schema_version": "qa_graph_context.v1",
+            "acceptance_scope": (
+                "candidate_regression_and_acceptance_criteria"
+            ),
+            "candidate_new_graph_failures": 0,
+            "exact_candidate": True,
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+        }
+    )
+    qa_line = no_pass_record["completed_lines"][10]
+    qa_candidate_result = {
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "external_full_suite_ledger_location": (
+            "artifact_refs.external_no_pass_baseline_ledger"
+        ),
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "status": "accepted",
+    }
+    qa_line.update(
+        {
+            "status": "accepted",
+            "authorization_source": "qa_session_token_ref",
+            "observer_impersonation": False,
+            "qa_evidence_provenance": {
+                "schema_version": "qa_evidence_provenance.v1",
+                "authorization_source": "qa_session_token_ref",
+                "evidence_owner_role": "qa",
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "completion_status_gate": {
+                    "schema_version": (
+                        "contract_runtime.qa_completion_status_gate.v1"
+                    ),
+                    "server_derived": True,
+                    "normalized_status": "accepted",
+                    "top_level_status_present": True,
+                    "top_level_status_passing": True,
+                },
+            },
+            "artifact_refs": {
+                "external_no_pass_baseline_ledger": {
+                    "base_reproduction": {"reproduced": 17, "total": 17},
+                    "candidate_new_failures": 0,
+                    "candidate_suite_counts": {
+                        "baseline_known_non_green": 17,
+                        "passed": 712,
+                    },
+                    "no_pass_claim": True,
+                    "overall_release_pass_claimed": False,
+                    "refs": ["request:req-base-reproduction"],
+                }
+            },
+            "test_results": {
+                **qa_candidate_result,
+                "schema_version": "qa_candidate_acceptance_results.v1",
+                "scope": "candidate_regression_and_acceptance_criteria",
+                "focused_failed": 0,
+                "focused_passed": 41,
+                "static_checks_passed": 4,
+            },
+            "verification": {
+                **qa_candidate_result,
+                "schema_version": "qa_independent_verification.v1",
+                "acceptance_scope": (
+                    "candidate_regression_and_acceptance_criteria"
+                ),
+                "verdict": "accepted",
+            },
+            "payload": {
+                **qa_candidate_result,
+                "schema_version": "qa_independent_verification.v1",
+                "acceptance_scope": (
+                    "candidate_regression_and_acceptance_criteria"
+                ),
+                "full_suite_claim": "not_claimed",
+                "verdict": "accepted",
+            },
+        }
+    )
+    merge_line = no_pass_record["completed_lines"][11]
+    merge_line["status"] = "accepted"
+    merge_line["payload"].update(
+        {
+            "schema_version": "observer_merge.no_pass_exception.v1",
+            "candidate_new_failures": 0,
+            "independent_qa_status": "accepted",
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "system_diagnostics_open": ["AC-SYSTEM-NO-PASS-DIAGNOSTIC"],
+        }
+    )
+    runtime.store.update(
+        contract_execution_id,
+        no_pass_record,
+        expected_revision=int(no_pass_record["execution_state_revision"]),
+    )
+    record = runtime.store.get(contract_execution_id)
+    no_pass_authority = server._contract_runtime_completed_merge_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    assert no_pass_authority["authority_verified"] is True
+    assert no_pass_authority["no_pass_claim"] is True
+    assert no_pass_authority["overall_release_pass_claimed"] is False
+    assert no_pass_authority["qa_acceptance_scope"] == (
+        "candidate_regression_and_acceptance_criteria"
+    )
+    assert no_pass_authority["candidate_new_failures"] == 0
+    assert no_pass_authority["base_reproduction"] == {
+        "reproduced": 17,
+        "total": 17,
+    }
+    assert server._contract_runtime_completed_line_acceptance(
+        conn,
+        project_id=project_id,
+        record=record,
+        completed_line_index=10,
+        expected_line=record["completed_lines"][10],
+    )["db_verified"] is True
+    authority = no_pass_authority
+
+    caller_shaped = json.loads(json.dumps(record["completed_lines"][10]))
+    caller_shaped["artifact_refs"].pop("external_no_pass_baseline_ledger")
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        caller_shaped
+    )
+    failed_no_pass = json.loads(json.dumps(record["completed_lines"][10]))
+    failed_no_pass["status"] = "failed"
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        failed_no_pass
+    )
+    impersonated_no_pass = json.loads(
+        json.dumps(record["completed_lines"][10])
+    )
+    impersonated_no_pass["observer_impersonation"] = True
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        impersonated_no_pass
+    )
+    waived_no_pass = json.loads(json.dumps(record["completed_lines"][11]))
+    waived_no_pass["status"] = "waived"
+    assert not server._contract_runtime_candidate_scoped_no_pass_line(
+        waived_no_pass
+    )
+
     composed_authority = (
         server._contract_runtime_current_full_reconcile_authority_from_merge(
             conn,

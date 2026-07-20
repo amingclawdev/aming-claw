@@ -60115,6 +60115,200 @@ def _contract_runtime_bind_observer_merge_authority(
     return effective
 
 
+def _contract_runtime_candidate_scoped_no_pass_line(
+    line: Mapping[str, Any],
+) -> bool:
+    """Accept only the bounded, non-release-PASS no-PASS evidence shapes.
+
+    ``no_pass_claim`` is not itself authority.  The exception below is limited
+    to the three canonical mf_parallel lines whose other evidence is verified
+    by the merge-authority resolver: QA graph traces, independent candidate QA,
+    and the server-derived durable merge projection.
+    """
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    if (
+        payload.get("no_pass_claim") is not True
+        or payload.get("overall_release_pass_claimed") is not False
+        or line.get("observer_impersonation") is True
+        or str(line.get("status") or "").strip().lower() in {"waived", "bypassed"}
+        or str(payload.get("disposition") or "").strip()
+        == "proceeded_with_exception"
+    ):
+        return False
+
+    line_id = str(line.get("line_id") or "").strip()
+    candidate_scope = "candidate_regression_and_acceptance_criteria"
+    commit_sha = str(line.get("commit_sha") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
+        return False
+
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    qa_provenance_verified = bool(
+        str(provenance.get("schema_version") or "")
+        == "qa_evidence_provenance.v1"
+        and str(provenance.get("authorization_source") or "")
+        == "qa_session_token_ref"
+        and str(provenance.get("evidence_owner_role") or "") == "qa"
+        and provenance.get("observer_impersonation") is False
+        and provenance.get("parent_materialization_authorized") is False
+    )
+
+    if line_id == "qa_graph_context":
+        graph_evidence = (
+            payload.get("graph_trace_evidence")
+            if isinstance(payload.get("graph_trace_evidence"), Mapping)
+            else {}
+        )
+        graph_commit = str(
+            graph_evidence.get("candidate_commit_sha")
+            or graph_evidence.get("candidate_commit")
+            or ""
+        ).strip().lower()
+        return bool(
+            str(line.get("actor_role") or "").strip() == "qa"
+            and str(line.get("evidence_kind") or "").strip() == "graph_trace"
+            and str(line.get("authorization_source") or "")
+            == "qa_session_token_ref"
+            and str(payload.get("schema_version") or "") == "qa_graph_context.v1"
+            and str(payload.get("acceptance_scope") or "") == candidate_scope
+            and payload.get("candidate_new_graph_failures") == 0
+            and payload.get("exact_candidate") is True
+            and qa_provenance_verified
+            and graph_evidence.get("db_verified") is True
+            and not list(graph_evidence.get("identity_mismatches") or [])
+            and list(
+                graph_evidence.get("verified_trace_ids")
+                or graph_evidence.get("trace_ids")
+                or []
+            )
+            and graph_commit == commit_sha
+        )
+
+    if line_id == "qa_independent_verification":
+        completion_gate = (
+            provenance.get("completion_status_gate")
+            if isinstance(provenance.get("completion_status_gate"), Mapping)
+            else {}
+        )
+        artifact_refs = (
+            line.get("artifact_refs")
+            if isinstance(line.get("artifact_refs"), Mapping)
+            else {}
+        )
+        baseline_ledger = (
+            artifact_refs.get("external_no_pass_baseline_ledger")
+            if isinstance(
+                artifact_refs.get("external_no_pass_baseline_ledger"), Mapping
+            )
+            else {}
+        )
+        base_reproduction = (
+            baseline_ledger.get("base_reproduction")
+            if isinstance(baseline_ledger.get("base_reproduction"), Mapping)
+            else {}
+        )
+        test_results = (
+            line.get("test_results")
+            if isinstance(line.get("test_results"), Mapping)
+            else {}
+        )
+        verification = (
+            line.get("verification")
+            if isinstance(line.get("verification"), Mapping)
+            else {}
+        )
+        reproduced = base_reproduction.get("reproduced")
+        total = base_reproduction.get("total")
+        candidate_suite_counts = (
+            baseline_ledger.get("candidate_suite_counts")
+            if isinstance(baseline_ledger.get("candidate_suite_counts"), Mapping)
+            else {}
+        )
+        baseline_reproduced = bool(
+            isinstance(reproduced, int)
+            and not isinstance(reproduced, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and reproduced == total
+            and total > 0
+        )
+        candidate_fields_match = all(
+            value.get("candidate_new_failures") == 0
+            and not list(value.get("candidate_specific_issues") or [])
+            and value.get("no_pass_claim") is True
+            and value.get("overall_release_pass_claimed") is False
+            and str(value.get("status") or "").strip().lower() == "accepted"
+            for value in (payload, test_results, verification)
+        )
+        return bool(
+            str(line.get("actor_role") or "").strip() == "qa"
+            and str(line.get("evidence_kind") or "").strip()
+            == "independent_verification"
+            and str(line.get("authorization_source") or "")
+            == "qa_session_token_ref"
+            and str(line.get("status") or "").strip().lower() == "accepted"
+            and str(payload.get("schema_version") or "")
+            == "qa_independent_verification.v1"
+            and str(payload.get("acceptance_scope") or "") == candidate_scope
+            and str(payload.get("verdict") or "").strip().lower() == "accepted"
+            and str(payload.get("full_suite_claim") or "") == "not_claimed"
+            and str(payload.get("external_full_suite_ledger_location") or "")
+            == "artifact_refs.external_no_pass_baseline_ledger"
+            and candidate_fields_match
+            and str(test_results.get("scope") or "") == candidate_scope
+            and test_results.get("focused_failed") == 0
+            and isinstance(test_results.get("focused_passed"), int)
+            and not isinstance(test_results.get("focused_passed"), bool)
+            and test_results.get("focused_passed") > 0
+            and str(verification.get("acceptance_scope") or "") == candidate_scope
+            and str(verification.get("verdict") or "").strip().lower()
+            == "accepted"
+            and baseline_ledger.get("candidate_new_failures") == 0
+            and baseline_ledger.get("no_pass_claim") is True
+            and baseline_ledger.get("overall_release_pass_claimed") is False
+            and baseline_reproduced
+            and candidate_suite_counts.get("baseline_known_non_green") == total
+            and isinstance(candidate_suite_counts.get("passed"), int)
+            and not isinstance(candidate_suite_counts.get("passed"), bool)
+            and candidate_suite_counts.get("passed") > 0
+            and list(baseline_ledger.get("refs") or [])
+            and qa_provenance_verified
+            and completion_gate.get("server_derived") is True
+            and completion_gate.get("top_level_status_present") is True
+            and completion_gate.get("top_level_status_passing") is True
+            and str(completion_gate.get("normalized_status") or "") == "accepted"
+        )
+
+    if line_id == "observer_merge":
+        durable = (
+            payload.get("durable_merge_authority")
+            if isinstance(payload.get("durable_merge_authority"), Mapping)
+            else {}
+        )
+        return bool(
+            str(line.get("actor_role") or "").strip() == "observer"
+            and str(line.get("evidence_kind") or "").strip() == "merge"
+            and str(line.get("status") or "").strip().lower() == "accepted"
+            and str(payload.get("schema_version") or "")
+            == "observer_merge.no_pass_exception.v1"
+            and payload.get("candidate_new_failures") == 0
+            and str(payload.get("independent_qa_status") or "").strip().lower()
+            == "accepted"
+            and list(payload.get("system_diagnostics_open") or [])
+            and str(durable.get("schema_version") or "")
+            == _CONTRACT_RUNTIME_DURABLE_MERGE_SCHEMA_VERSION
+            and durable.get("server_derived") is True
+            and durable.get("db_verified") is True
+        )
+
+    return False
+
+
 def _contract_runtime_completed_merge_authority(
     conn,
     *,
@@ -60152,7 +60346,10 @@ def _contract_runtime_completed_merge_authority(
             and str(line.get("actor_role") or "").strip() == actor_role
             and str(line.get("evidence_kind") or "").strip() == evidence_kind
             and str(line.get("status") or "").strip().lower() not in {"waived", "bypassed"}
-            and payload.get("no_pass_claim") is not True
+            and (
+                payload.get("no_pass_claim") is not True
+                or _contract_runtime_candidate_scoped_no_pass_line(line)
+            )
             and str(payload.get("disposition") or "").strip()
             != "proceeded_with_exception"
         )
@@ -60362,9 +60559,36 @@ def _contract_runtime_completed_merge_authority(
     if merge_event_id <= 0 or not merge_event_created_at:
         return {}
 
+    no_pass_claim = any(
+        (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        ).get("no_pass_claim")
+        is True
+        for line in (qa_graph[1], qa_verification[1], merge_line[1])
+    )
+    baseline_ledger = (
+        qa_verification[1].get("artifact_refs", {}).get(
+            "external_no_pass_baseline_ledger"
+        )
+        if isinstance(qa_verification[1].get("artifact_refs"), Mapping)
+        and isinstance(
+            qa_verification[1].get("artifact_refs", {}).get(
+                "external_no_pass_baseline_ledger"
+            ),
+            Mapping,
+        )
+        else {}
+    )
     return {
         "timeline_verified": True,
         "authority_verified": True,
+        "no_pass_claim": no_pass_claim,
+        "overall_release_pass_claimed": False,
+        "qa_acceptance_scope": str(qa_payload.get("acceptance_scope") or ""),
+        "candidate_new_failures": qa_payload.get("candidate_new_failures"),
+        "base_reproduction": dict(baseline_ledger.get("base_reproduction") or {}),
         "authority_source": (
             "contract_runtime_completed_lines+server_durable_merge_schema+"
             "durable_merge_queue+task_timeline_merge"
@@ -60450,7 +60674,10 @@ def _contract_runtime_completed_line_acceptance(
         or _contract_runtime_value_reports_failed_qa(canonical_line)
         or str(canonical_line.get("status") or "").strip().lower()
         in {"waived", "bypassed"}
-        or payload.get("no_pass_claim") is True
+        or (
+            payload.get("no_pass_claim") is True
+            and not _contract_runtime_candidate_scoped_no_pass_line(canonical_line)
+        )
         or str(payload.get("disposition") or "").strip()
         == "proceeded_with_exception"
     ):
