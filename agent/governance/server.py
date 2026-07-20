@@ -23892,6 +23892,9 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             or contract_runtime_worker_sequence.get("contract_execution_id")
             or ""
         ).strip()
+        failed_qa_source_ref = str(
+            contract_runtime_failed_qa.get("failed_qa_source_ref") or ""
+        ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
             "source": "accepted_runtime_context_rejoin_event",
@@ -23902,6 +23905,8 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             ),
             "revision_event_id": event_id,
             "revision_event_ref": f"timeline:{event_id}",
+            "contract_execution_id": marker_contract_execution_id,
+            "failed_qa_source_ref": failed_qa_source_ref,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -25421,18 +25426,6 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             str(previous_authority.get("diff_base_commit") or "").strip(),
         )
     )
-    # The implementation facade passes through the generic close gate before
-    # its canonical timeline hook, so this request may observe the line it just
-    # wrote. Equality alone cannot prove idempotence: a delta-only retry has the
-    # same claimed files as that newly-written line. Only a prior line already
-    # carrying server-derived cumulative git authority is safely idempotent.
-    if (
-        post_failed_qa_implementation_exists
-        and claimed_files == previous_files
-        and previous_has_canonical_cumulative_authority
-    ):
-        return {}
-
     resolved_revision_marker = dict(revision_marker)
     if not str(resolved_revision_marker.get("revision_event_ref") or "").strip():
         from . import task_timeline
@@ -25522,8 +25515,35 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     revision_event_ref = str(
         resolved_revision_marker.get("revision_event_ref") or ""
     ).strip()
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    expected_failed_qa_source_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:{failed_qa_index}"
+        if contract_execution_id
+        else ""
+    )
+    marker_failed_qa_source_ref = str(
+        resolved_revision_marker.get("failed_qa_source_ref") or ""
+    ).strip()
     if not revision_event_ref:
-        errors.append("implementation revision requires the accepted failed-QA rejoin marker")
+        errors.append(
+            "implementation revision requires the accepted failed-QA rejoin marker"
+        )
+    if (
+        str(resolved_revision_marker.get("source") or "").strip()
+        != "accepted_runtime_context_rejoin_event"
+        or str(
+            resolved_revision_marker.get("contract_execution_id") or ""
+        ).strip()
+        != contract_execution_id
+        or not expected_failed_qa_source_ref
+        or marker_failed_qa_source_ref != expected_failed_qa_source_ref
+    ):
+        errors.append(
+            "implementation revision requires a server-derived rejoin for the "
+            "active failed-QA boundary"
+        )
     if errors:
         raise GovernanceError(
             "contract_runtime_rework_lineage_revision_invalid",
@@ -25536,12 +25556,34 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 "claimed_changed_files": claimed_files,
                 "cumulative_changed_files": cumulative_files,
                 "owned_files": owned_files,
+                "active_failed_qa_source_ref": expected_failed_qa_source_ref,
+                "supplied_failed_qa_source_ref": marker_failed_qa_source_ref,
                 "fail_closed": True,
                 "next_legal_action": (
                     "retry_implementation_evidence_with_cumulative_runtime_diff"
                 ),
             },
         )
+
+    previous_revision_event_ref = str(
+        previous_authority.get("revision_event_ref") or ""
+    ).strip()
+    previous_actual_head = str(
+        previous_authority.get("actual_head_commit") or ""
+    ).strip()
+    # The implementation facade may observe the canonical line it just wrote.
+    # Treat that as idempotent only when it belongs to this exact git revision
+    # and this exact failed-QA rejoin boundary. A later failed-QA cycle may
+    # legitimately retain the same cumulative file set, so file equality alone
+    # must never suppress its append-only implementation revision.
+    if (
+        post_failed_qa_implementation_exists
+        and claimed_files == previous_files
+        and previous_has_canonical_cumulative_authority
+        and previous_actual_head == actual_head
+        and previous_revision_event_ref == revision_event_ref
+    ):
+        return {}
 
     canonical_payload = dict(payload)
     canonical_payload["failed_qa_revision_rejoin_marker"] = dict(
@@ -25560,9 +25602,48 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         "cumulative_changed_files": cumulative_files,
         "owned_files": owned_files,
         "revision_event_ref": revision_event_ref,
+        "failed_qa_source_ref": expected_failed_qa_source_ref,
         "raw_worker_tokens_persisted": False,
     }
     if not post_failed_qa_implementation_exists:
+        if previous is not None:
+            prior_lineage = _worker_implementation_lineage(record, previous)
+            previous_session_token_ref = _timeline_first_deep_text(
+                {"line": previous},
+                "session_token_ref",
+            )
+            revised_session_token_ref = _timeline_first_deep_text(
+                {"payload": canonical_payload},
+                "session_token_ref",
+            )
+            session_token_ref_rotated = bool(
+                previous_session_token_ref
+                and revised_session_token_ref != previous_session_token_ref
+            )
+            canonical_payload["canonical_rework_lineage_revision"] = {
+                "schema_version": (
+                    "contract_runtime.worker_implementation_rework_revision.v1"
+                ),
+                "source": "server_verified_failed_qa_rework",
+                "failed_qa_completed_line_index": failed_qa_index,
+                "superseded_completed_line_index": previous_index,
+                "supersedes_implementation_lineage_ref": prior_lineage[
+                    "implementation_lineage_ref"
+                ],
+                "revision_event_ref": revision_event_ref,
+                "commit_sha": actual_head,
+                "append_only_history_preserved": True,
+                "session_token_ref_rotation": {
+                    "applied": session_token_ref_rotated,
+                    "source": (
+                        "accepted_runtime_context_rejoin_event"
+                        if session_token_ref_rotated
+                        else "same_session_token_ref"
+                    ),
+                    "revision_event_ref": revision_event_ref,
+                    "raw_session_tokens_persisted": False,
+                },
+            }
         return {
             "schema_version": (
                 "runtime_context.failed_qa_implementation_prevalidation.v1"
@@ -25822,6 +25903,8 @@ def _runtime_context_submit_canonical_contract_line(
                     "source",
                     "revision_event_id",
                     "revision_event_ref",
+                    "contract_execution_id",
+                    "failed_qa_source_ref",
                     "runtime_context_id",
                     "task_id",
                     "parent_task_id",
@@ -55188,6 +55271,8 @@ def _contract_runtime_mf_parallel_context_projection(
                     "source",
                     "revision_event_id",
                     "revision_event_ref",
+                    "contract_execution_id",
+                    "failed_qa_source_ref",
                     "attempt",
                     "retry_round",
                     "route_token_ref",

@@ -32103,6 +32103,228 @@ def test_failed_qa_rework_versions_cumulative_implementation_before_worker_commi
         "record_finish_time_worker_attestation"
     )
 
+    # Drive the same runtime context through a second independent-QA failure.
+    # The cumulative file set is intentionally unchanged; the new clean HEAD
+    # and later accepted rejoin boundary are the revision identity.
+    second_cycle_record = runtime.store.get(successor["contract_execution_id"])
+    second_cycle_common = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "line_instance_id": f"runtime_context:{runtime_context.runtime_context_id}",
+        "commit_sha": revised_head,
+    }
+    second_cycle_record["completed_lines"].extend(
+        [
+            {
+                **second_cycle_common,
+                "stage_id": "worker_attestation",
+                "line_id": "worker_finish_time_attestation",
+                "actor_role": "mf_sub",
+                "evidence_kind": "record_finish_time_worker_attestation",
+                "status": "passed",
+                "payload": {**second_cycle_common, "status": "passed"},
+            },
+            {
+                **second_cycle_common,
+                "stage_id": "worker_finish",
+                "line_id": "worker_finish_gate",
+                "actor_role": "mf_sub",
+                "evidence_kind": "mf_subagent_finish_gate",
+                "status": "passed",
+                "payload": {**second_cycle_common, "status": "passed"},
+            },
+            {
+                **second_cycle_common,
+                "stage_id": "qa_graph_context",
+                "line_id": "qa_graph_context",
+                "actor_role": "qa",
+                "evidence_kind": "graph_trace",
+                "status": "passed",
+                "payload": {**second_cycle_common, "status": "passed"},
+            },
+            {
+                **second_cycle_common,
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "verification": {
+                    "result": "failed",
+                    "verdict": "FAIL",
+                    "acceptance_failed": ["second_failed_qa_revision"],
+                },
+                "payload": {
+                    **second_cycle_common,
+                    "status": "failed",
+                    "verdict": "FAIL",
+                    "summary": "A second revision is required in the same files.",
+                },
+            },
+        ]
+    )
+    second_cycle_record["execution_state_revision"] = int(
+        second_cycle_record["execution_state_revision"]
+    ) + 1
+    runtime.store.update(successor["contract_execution_id"], second_cycle_record)
+    current_context = get_branch_context(conn, PID, runtime_context.task_id)
+    assert current_context is not None
+    current_context = upsert_branch_context(
+        conn,
+        replace(current_context, status=STATE_VALIDATED),
+        now_iso="2026-07-18T04:30:00Z",
+    )
+
+    second_failed_record = runtime.store.get(successor["contract_execution_id"])
+    stale_boundary_payload = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": backlog_id,
+        "session_token_ref": rejoin["session_token_ref"],
+        "changed_files": changed_files,
+        "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+        "graph_trace_db_evidence": {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+        },
+    }
+    for case_name, stale_marker in {
+        "stale_prior_rejoin": revision_marker,
+        "missing_later_rejoin": {},
+    }.items():
+        with pytest.raises(GovernanceError) as boundary_error:
+            server._runtime_context_revise_failed_qa_implementation_lineage(
+                conn,
+                project_id=PID,
+                context=current_context,
+                runtime=runtime,
+                record=second_failed_record,
+                payload=stale_boundary_payload,
+                revision_marker=stale_marker,
+            )
+        assert boundary_error.value.code == (
+            "contract_runtime_rework_lineage_revision_invalid"
+        ), case_name
+        assert "active failed-QA boundary" in str(
+            boundary_error.value
+        ), case_name
+
+    second_rejoin = (
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "target_project_root": str(target_root),
+                    "reason": "second failed QA requires another bounded revision",
+                    "now_iso": "2999-01-02T00:00:00Z",
+                },
+            )
+        )
+    )
+    assert second_rejoin["reopen_for_revision"] is True
+    assert second_rejoin["session_token_ref"] != rejoin["session_token_ref"]
+
+    initial_candidate.write_text(
+        "second failed QA revision\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=target_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "second failed QA child revision"],
+        cwd=target_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    second_revised_head = batch_jobs.git_commit(target_root)
+    history_before_second_revision = copy.deepcopy(
+        runtime.store.get(successor["contract_execution_id"])["completed_lines"]
+    )
+    prior_second_lineage = _worker_implementation_lineage(
+        second_failed_record,
+        retry_implementations[-1],
+    )
+
+    second_corrected = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "parent_task_id": backlog_id,
+                    "fence_token": second_rejoin["fence_token"],
+                    "session_token": second_rejoin["session_token"],
+                    "target_project_root": str(target_root),
+                    "changed_files": changed_files,
+                    "graph_trace_ids": ["gqt-failed-qa-cumulative-worker"],
+                    "tests": [{"command": "pytest -q", "status": "passed"}],
+                    "payload": {"summary": "Second cumulative failed-QA revision."},
+                },
+            )
+        )
+    )
+    second_canonical = second_corrected["contract_runtime_canonical_line"]
+    assert second_canonical["status"] == "revised"
+    assert second_canonical["append_only_history_preserved"] is True
+    assert second_canonical["supersedes_implementation_lineage_ref"]
+
+    twice_revised_record = runtime.store.get(successor["contract_execution_id"])
+    assert twice_revised_record["completed_lines"][
+        : len(history_before_second_revision)
+    ] == history_before_second_revision
+    second_latest = next(
+        (
+            line
+            for line in reversed(twice_revised_record["completed_lines"])
+            if line.get("line_id") == "worker_implementation"
+            and line.get("runtime_context_id") == runtime_context.runtime_context_id
+            and line.get("task_id") == runtime_context.task_id
+        ),
+        None,
+    )
+    assert second_latest is not None
+    assert second_latest["commit_sha"] == second_revised_head
+    assert second_latest["changed_files"] == changed_files
+    second_revision_audit = second_latest["payload"][
+        "canonical_rework_lineage_revision"
+    ]
+    assert second_revision_audit["append_only_history_preserved"] is True
+    assert second_revision_audit["supersedes_implementation_lineage_ref"] == (
+        prior_second_lineage["implementation_lineage_ref"]
+    )
+    assert second_revision_audit["revision_event_ref"] == (
+        second_rejoin["audit_event_ref"]
+    )
+    second_marker = second_latest["payload"][
+        "failed_qa_revision_rejoin_marker"
+    ]
+    second_failed_index = max(
+        index
+        for index, line in enumerate(history_before_second_revision)
+        if line.get("line_id") == "qa_independent_verification"
+        and line.get("status") == "failed"
+    )
+    assert second_marker["failed_qa_source_ref"] == (
+        f"contract_runtime:{successor['contract_execution_id']}:"
+        f"completed_lines:{second_failed_index}"
+    )
+
 
 def test_timeline_failed_qa_rejoin_starts_fresh_contract_route_revision_without_backfill(
     conn,
