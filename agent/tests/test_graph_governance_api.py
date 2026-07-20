@@ -61106,12 +61106,8 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
     merge_line["status"] = "accepted"
     merge_line["payload"].update(
         {
-            "schema_version": "observer_merge.no_pass_exception.v1",
-            "candidate_new_failures": 0,
-            "independent_qa_status": "accepted",
             "no_pass_claim": True,
             "overall_release_pass_claimed": False,
-            "system_diagnostics_open": ["AC-SYSTEM-NO-PASS-DIAGNOSTIC"],
         }
     )
     runtime.store.update(
@@ -61154,6 +61150,12 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
         completed_line_index=10,
         expected_line=record["completed_lines"][10],
     )["db_verified"] is True
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        record["completed_lines"][11]
+    ) is False
+    assert server._contract_runtime_server_derived_observer_merge_no_pass_line(
+        record["completed_lines"][11]
+    ) is True
     authority = no_pass_authority
 
     caller_shaped = json.loads(json.dumps(record["completed_lines"][10]))
@@ -61198,6 +61200,34 @@ def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timelin
             timeline_events=timeline_events,
             merge=denied_merge,
         ) == {}
+
+    for field, value in (
+        ("schema_version", "caller.observer_merge_authority.v0"),
+        ("server_derived", False),
+        ("db_verified", False),
+    ):
+        non_durable_merge = json.loads(json.dumps(record))
+        non_durable_merge["completed_lines"][11]["payload"][
+            "durable_merge_authority"
+        ][field] = value
+        assert_no_durable_authority(non_durable_merge)
+
+    missing_durable_merge = json.loads(json.dumps(record))
+    missing_durable_merge["completed_lines"][11]["payload"].pop(
+        "durable_merge_authority"
+    )
+    assert_no_durable_authority(missing_durable_merge)
+
+    for status in ("failed", "waived", "bypassed"):
+        rejected_merge = json.loads(json.dumps(record))
+        rejected_merge["completed_lines"][11]["status"] = status
+        assert_no_durable_authority(rejected_merge)
+
+    exception_merge = json.loads(json.dumps(record))
+    exception_merge["completed_lines"][11]["payload"]["disposition"] = (
+        "proceeded_with_exception"
+    )
+    assert_no_durable_authority(exception_merge)
 
     genuine_candidate_failure = json.loads(json.dumps(record))
     genuine_qa = genuine_candidate_failure["completed_lines"][10]
