@@ -40853,6 +40853,72 @@ def _mf_parallel_close_authority_record(
     ]
 
 
+def _mf_parallel_close_authority_v2_record(
+    contract_execution_id: str,
+    *,
+    close_commit: str,
+    worker_commit: str,
+    complete: bool,
+) -> dict:
+    lines = [
+        _mf_parallel_close_authority_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "worker_commit",
+            "worker_commit",
+            "mf_sub",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            commit_sha=worker_commit,
+        ),
+        _mf_parallel_close_authority_line(
+            "qa_independent_verification",
+            "independent_verification",
+            "qa",
+            commit_sha=worker_commit,
+            payload={"verified_commit": worker_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            commit_sha=close_commit,
+            payload={"merge_commit": close_commit},
+        ),
+        _mf_parallel_close_authority_line(
+            "observer_reconcile",
+            "reconcile",
+            "observer",
+            commit_sha=close_commit,
+            payload={"target_commit_sha": close_commit},
+        ),
+    ]
+    if complete:
+        lines.append(
+            _mf_parallel_close_authority_line(
+                "observer_close_ready",
+                "close_ready",
+                "observer",
+                commit_sha=close_commit,
+                payload={"merge_commit": close_commit},
+            )
+        )
+    record = _mf_parallel_close_authority_record(
+        contract_execution_id,
+        lines,
+    )[0]
+    record["contract_id"] = "mf_parallel.v2"
+    return record
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
@@ -40947,6 +41013,116 @@ def test_timeline_gate_authoritatively_accepts_completed_mf_parallel_runtime_cha
     assert full["timeline_gate"]["checks"][
         "contract_runtime_mf_parallel_close_authority"
     ] is True
+
+
+def test_mf_parallel_close_authority_selects_current_recovery_before_stale_last_record(
+):
+    close_commit = "a149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "b149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    current_execution_id = "cex-mf-parallel-current-recovery-complete"
+    stale_execution_id = "cex-mf-parallel-stale-predecessor-incomplete"
+    current = _mf_parallel_close_authority_v2_record(
+        current_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+    )
+    stale = _mf_parallel_close_authority_v2_record(
+        stale_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=False,
+    )
+    projection = _mf_parallel_close_authority_chain_projection(
+        current_execution_id
+    )
+    projection["current_contract_execution_id"] = current_execution_id
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [current, stale],
+        chain_projection=projection,
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is True
+    assert gate["contract_execution_id"] == current_execution_id
+    assert gate["record_selection_source"] == (
+        "chain_projection.current_contract_execution_id"
+    )
+    assert gate["authoritative_selector_present"] is True
+
+
+def test_mf_parallel_close_authority_fails_current_recovery_before_stale_complete_record(
+):
+    close_commit = "c149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "d149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    current_execution_id = "cex-mf-parallel-current-recovery-incomplete"
+    stale_execution_id = "cex-mf-parallel-stale-predecessor-complete"
+    current = _mf_parallel_close_authority_v2_record(
+        current_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=False,
+    )
+    stale = _mf_parallel_close_authority_v2_record(
+        stale_execution_id,
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+    )
+    projection = _mf_parallel_close_authority_chain_projection(
+        current_execution_id
+    )
+    projection["active_child_contract_execution_id"] = current_execution_id
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [current, stale],
+        chain_projection=projection,
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is False
+    assert gate["contract_execution_id"] == current_execution_id
+    assert gate["record_selection_source"] == (
+        "chain_projection.active_child_contract_execution_id"
+    )
+    assert "contract_runtime.observer_close_ready" in gate[
+        "missing_requirement_ids"
+    ]
+
+
+def test_mf_parallel_close_authority_fails_when_current_recovery_record_is_missing():
+    close_commit = "e149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    worker_commit = "f149e8bdf9b100f28fb5843f61ef83ed82618f18"
+    current_execution_id = "cex-mf-parallel-current-recovery-missing"
+    stale = _mf_parallel_close_authority_v2_record(
+        "cex-mf-parallel-stale-predecessor-only",
+        close_commit=close_commit,
+        worker_commit=worker_commit,
+        complete=True,
+    )
+    projection = _mf_parallel_close_authority_chain_projection(
+        current_execution_id
+    )
+    projection["active_child_contract_execution_id"] = current_execution_id
+    projection["current_contract_execution_id"] = stale[
+        "contract_execution_id"
+    ]
+
+    gate = server._contract_runtime_mf_parallel_close_authority_gate(
+        [stale],
+        chain_projection=projection,
+        close_commit=close_commit,
+    )
+
+    assert gate["passed"] is False
+    assert gate["contract_execution_id"] == current_execution_id
+    assert gate["record_selection_source"] == (
+        "chain_projection.active_child_contract_execution_id"
+    )
+    assert gate["missing_requirement_ids"] == [
+        "contract_runtime.current_mf_parallel_execution"
+    ]
 
 
 def test_mf_parallel_close_authority_prefers_source_event_order_over_projection_index():
