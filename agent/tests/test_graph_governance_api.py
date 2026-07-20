@@ -32538,6 +32538,47 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
 
     runtime = server._contract_runtime(conn)
     stored = runtime.store.get(successor["contract_execution_id"])
+    # Reproduce the frozen live ContractRuntime shape: the legacy canonical
+    # worker_implementation line has no commit fields, while its immediately
+    # following source-backed worker_commit carries the exact immutable commit
+    # and canonical implementation lineage.
+    prior_implementation_index = next(
+        index
+        for index, line in enumerate(stored["completed_lines"])
+        if line.get("line_id") == "worker_implementation"
+        and line.get("runtime_context_id") == runtime_context.runtime_context_id
+        and line.get("task_id") == runtime_context.task_id
+    )
+    prior_implementation = stored["completed_lines"][
+        prior_implementation_index
+    ]
+    prior_lineage = _worker_implementation_lineage(
+        stored,
+        prior_implementation,
+    )
+    prior_implementation.pop("commit_sha", None)
+    prior_implementation_payload = prior_implementation.get("payload")
+    assert isinstance(prior_implementation_payload, dict)
+    for field in (
+        "commit_sha",
+        "head_commit",
+        "immutable_head_commit",
+        "validated_head_commit",
+        "worker_commit_sha",
+    ):
+        prior_implementation_payload.pop(field, None)
+    prior_worker_commit_index = prior_implementation_index + 1
+    prior_worker_commit = stored["completed_lines"][prior_worker_commit_index]
+    assert prior_worker_commit["line_id"] == "worker_commit"
+    assert prior_worker_commit["commit_sha"] == initial_head
+    prior_worker_commit["implementation_lineage_ref"] = prior_lineage[
+        "implementation_lineage_ref"
+    ]
+    prior_worker_commit_payload = prior_worker_commit.get("payload")
+    assert isinstance(prior_worker_commit_payload, dict)
+    prior_worker_commit_payload["implementation_lineage_ref"] = prior_lineage[
+        "implementation_lineage_ref"
+    ]
     passed_common = {
         "runtime_context_id": runtime_context.runtime_context_id,
         "task_id": runtime_context.task_id,
@@ -33292,6 +33333,90 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         "execution_state_revision"
     ] == revision_before_negative_cases
 
+    fallback_negative_cases = {}
+    for case_name in (
+        "missing_worker_commit",
+        "lineage_mismatch",
+        "runtime_mismatch",
+        "task_mismatch",
+        "multiple_different_commits",
+        "non_full_commit",
+    ):
+        case_record = json.loads(
+            json.dumps(runtime.store.get(successor["contract_execution_id"]))
+        )
+        case_implementation = server._worker_commit_completed_implementation(
+            case_record,
+            runtime_context_id=runtime_context.runtime_context_id,
+            task_id=runtime_context.task_id,
+        )
+        assert case_implementation is not None
+        assert not case_implementation.get("commit_sha")
+        case_implementation_index = next(
+            index
+            for index, line in enumerate(case_record["completed_lines"])
+            if line is case_implementation or line == case_implementation
+        )
+        case_worker_commit_index = next(
+            index
+            for index in range(
+                case_implementation_index + 1,
+                len(case_record["completed_lines"]),
+            )
+            if case_record["completed_lines"][index].get("line_id")
+            == "worker_commit"
+        )
+        case_worker_commit = case_record["completed_lines"][
+            case_worker_commit_index
+        ]
+        if case_name == "missing_worker_commit":
+            # Even matching nested implementation/client/timeline/runtime-head
+            # values are not a substitute for the canonical worker_commit line.
+            case_implementation["payload"]["commit_sha"] = initial_head
+            case_implementation["payload"]["head_commit"] = initial_head
+            case_record["completed_lines"].pop(case_worker_commit_index)
+        elif case_name == "lineage_mismatch":
+            case_worker_commit["implementation_lineage_ref"] = (
+                "contract-runtime:worker-implementation:" + _fake_sha(case_name)
+            )
+        elif case_name == "runtime_mismatch":
+            case_worker_commit["runtime_context_id"] = "mfrctx-other-runtime"
+        elif case_name == "task_mismatch":
+            case_worker_commit["task_id"] = "other-worker-task"
+        elif case_name == "multiple_different_commits":
+            conflicting_worker_commit = json.loads(
+                json.dumps(case_worker_commit)
+            )
+            conflicting_worker_commit["commit_sha"] = base_commit
+            case_record["completed_lines"].append(conflicting_worker_commit)
+        elif case_name == "non_full_commit":
+            case_worker_commit["commit_sha"] = initial_head[:12]
+        fallback_negative_cases[case_name] = case_record
+
+    for case_name, case_record in fallback_negative_cases.items():
+        with pytest.raises(GovernanceError) as rejected:
+            server._runtime_context_revise_failed_qa_implementation_lineage(
+                conn,
+                project_id=PID,
+                context=saved_context,
+                runtime=runtime,
+                record=case_record,
+                payload={
+                    **revision_payload,
+                    "prior_implementation_commit": initial_head,
+                },
+                revision_marker=revision_marker,
+            )
+        assert rejected.value.code == (
+            "contract_runtime_rework_lineage_revision_invalid"
+        ), case_name
+        assert "superseded canonical worker implementation commit" in str(
+            rejected.value
+        ), case_name
+        assert runtime.store.get(successor["contract_execution_id"])[
+            "execution_state_revision"
+        ] == revision_before_negative_cases
+
     negative_cases = {
         "wrong_source": ({**revision_marker, "failed_qa_source": "caller_claim"}, revision_payload),
         "stale_session": (
@@ -33364,6 +33489,20 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     assert canonical["append_only_history_preserved"] is True
     assert canonical["supersedes_implementation_lineage_ref"]
     assert canonical["next_legal_action"]["line_id"] == "worker_commit"
+    superseded_commit_authority = canonical[
+        "superseded_implementation_commit_authority"
+    ]
+    assert superseded_commit_authority["commit_sha"] == initial_head
+    assert superseded_commit_authority["source"] == (
+        "ContractRuntime.completed_lines.worker_commit.commit_sha"
+    )
+    assert superseded_commit_authority[
+        "implementation_completed_line_index"
+    ] == prior_implementation_index
+    assert superseded_commit_authority[
+        "worker_commit_completed_line_indices"
+    ] == [prior_worker_commit_index]
+    assert superseded_commit_authority["errors"] == []
 
     revised_record = runtime.store.get(successor["contract_execution_id"])
     assert revised_record["execution_state_revision"] == (

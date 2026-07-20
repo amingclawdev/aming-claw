@@ -25947,6 +25947,135 @@ def _runtime_context_contract_failed_qa_has_canonical_provenance(
     )
 
 
+def _runtime_context_superseded_implementation_commit_authority(
+    record: Mapping[str, Any],
+    *,
+    implementation: Mapping[str, Any] | None,
+    implementation_index: int,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Resolve the immutable commit of a superseded implementation line.
+
+    Current canonical implementation lines carry a top-level ``commit_sha``.
+    A legacy line may omit that field; in that one case only, the immediately
+    following canonical worker-commit segment can supply the commit.  Nested
+    payloads, runtime context heads, timeline projections, and caller claims
+    are deliberately not commit authorities here.
+    """
+
+    source_prefix = "ContractRuntime.completed_lines"
+    authority = {
+        "schema_version": (
+            "contract_runtime.superseded_implementation_commit_authority.v1"
+        ),
+        "server_derived": True,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "implementation_completed_line_index": implementation_index,
+        "commit_sha": "",
+        "source": "",
+        "source_of_authority": "",
+        "implementation_lineage_ref": "",
+        "worker_commit_completed_line_indices": [],
+        "errors": [],
+    }
+    errors: list[str] = authority["errors"]
+    if implementation is None or implementation_index < 0:
+        errors.append("prior canonical worker_implementation line is missing")
+        return authority
+
+    top_level_commit = str(implementation.get("commit_sha") or "").strip()
+    if top_level_commit:
+        if not re.fullmatch(r"[0-9a-f]{40,64}", top_level_commit):
+            errors.append(
+                "prior canonical worker_implementation commit_sha is not a full SHA"
+            )
+            return authority
+        source = f"{source_prefix}.worker_implementation.commit_sha"
+        authority.update(
+            {
+                "commit_sha": top_level_commit,
+                "source": source,
+                "source_of_authority": source,
+            }
+        )
+        return authority
+
+    expected_lineage_ref = str(
+        _worker_implementation_lineage(record, implementation).get(
+            "implementation_lineage_ref"
+        )
+        or ""
+    ).strip()
+    authority["implementation_lineage_ref"] = expected_lineage_ref
+    candidates: list[tuple[int, Mapping[str, Any]]] = []
+    completed_lines = list(record.get("completed_lines") or [])
+    for index in range(implementation_index + 1, len(completed_lines)):
+        line = completed_lines[index]
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id == "worker_implementation":
+            break
+        if line_id == "worker_commit":
+            candidates.append((index, line))
+
+    if not candidates:
+        errors.append(
+            "legacy worker_implementation requires its following canonical worker_commit"
+        )
+        return authority
+
+    candidate_commits: list[str] = []
+    for index, line in candidates:
+        authority["worker_commit_completed_line_indices"].append(index)
+        if str(line.get("runtime_context_id") or "").strip() != runtime_context_id:
+            errors.append(
+                "fallback worker_commit runtime_context_id does not match the active runtime"
+            )
+        if str(line.get("task_id") or "").strip() != task_id:
+            errors.append(
+                "fallback worker_commit task_id does not match the active runtime"
+            )
+        if (
+            str(line.get("implementation_lineage_ref") or "").strip()
+            != expected_lineage_ref
+        ):
+            errors.append(
+                "fallback worker_commit implementation_lineage_ref does not "
+                "match the superseded implementation"
+            )
+        commit_sha = str(line.get("commit_sha") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{40,64}", commit_sha):
+            errors.append(
+                "fallback worker_commit top-level commit_sha is not a full SHA"
+            )
+        else:
+            candidate_commits.append(commit_sha)
+
+    unique_commits = sorted(set(candidate_commits))
+    if len(unique_commits) > 1:
+        errors.append(
+            "fallback worker_commit segment contains multiple different commit SHAs"
+        )
+    if errors or len(unique_commits) != 1:
+        return authority
+
+    source = f"{source_prefix}.worker_commit.commit_sha"
+    authority.update(
+        {
+            "commit_sha": unique_commits[0],
+            "source": source,
+            "source_of_authority": source,
+        }
+    )
+    return authority
+
+
 def _runtime_context_revise_failed_qa_implementation_lineage(
     conn,
     *,
@@ -26362,12 +26491,23 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         errors.append(
             "implementation revision claimed HEAD must match the clean assigned worktree HEAD"
         )
+    prior_implementation_commit_authority: dict[str, Any] = {}
     if timeline_backed_failed_qa_revision:
+        prior_implementation_commit_authority = (
+            _runtime_context_superseded_implementation_commit_authority(
+                record,
+                implementation=previous,
+                implementation_index=previous_index,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+        )
         prior_canonical_implementation_commit = str(
-            (previous or {}).get("commit_sha") or ""
+            prior_implementation_commit_authority.get("commit_sha") or ""
         ).strip()
         if (
-            not re.fullmatch(
+            prior_implementation_commit_authority.get("errors")
+            or not re.fullmatch(
                 r"[0-9a-f]{40,64}", prior_canonical_implementation_commit
             )
             or str(active_timeline_failed_qa.get("commit_sha") or "").strip()
@@ -26435,6 +26575,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 "owned_files": owned_files,
                 "active_failed_qa_source_ref": expected_failed_qa_source_ref,
                 "supplied_failed_qa_source_ref": marker_failed_qa_source_ref,
+                "superseded_implementation_commit_authority": dict(
+                    prior_implementation_commit_authority
+                ),
                 "fail_closed": True,
                 "next_legal_action": (
                     "retry_implementation_evidence_with_cumulative_runtime_diff"
@@ -26480,6 +26623,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         "owned_files": owned_files,
         "revision_event_ref": revision_event_ref,
         "failed_qa_source_ref": expected_failed_qa_source_ref,
+        "superseded_implementation_commit_authority": dict(
+            prior_implementation_commit_authority
+        ),
         "raw_worker_tokens_persisted": False,
     }
     if timeline_backed_failed_qa_revision and not supplied_revision_marker:
@@ -26641,6 +26787,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "revision_event_ref": revision_event_ref,
             "failed_qa_source_ref": expected_failed_qa_source_ref,
             "commit_sha": actual_head,
+            "superseded_implementation_commit_authority": dict(
+                prior_implementation_commit_authority
+            ),
             "append_only_history_preserved": True,
             "session_token_ref_rotation": {
                 "applied": bool(
@@ -26762,6 +26911,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "execution_state_hash": current_state.get("execution_state_hash", ""),
             "next_legal_action": current_state.get("next_legal_action") or {},
             "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "superseded_implementation_commit_authority": dict(
+                prior_implementation_commit_authority
+            ),
             "append_only_history_preserved": True,
             "timeline_projection_authoritative": False,
         }
