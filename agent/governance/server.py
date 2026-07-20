@@ -23673,6 +23673,192 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         conn.close()
 
 
+def _runtime_context_authenticated_failed_qa_rejoin_continuity(
+    *,
+    context: Any,
+    runtime_context_id: str,
+    timeline_events: Sequence[Mapping[str, Any]],
+    active_failed_qa: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one failed-QA revision identity across auth-only rotations."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_secret_hash,
+        runtime_context_session_token_ref,
+    )
+
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    expected_attempt = int(getattr(context, "attempt", 0) or 0)
+    expected_retry_round = int(getattr(context, "retry_round", 0) or 0)
+    expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    expected_worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    expected_fence_token_hash = runtime_context_secret_hash(
+        str(getattr(context, "fence_token", "") or "")
+    )
+    active_session_token_ref = runtime_context_session_token_ref(context)
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    assigned_worktree = str(getattr(context, "worktree_path", "") or "").strip()
+    if (
+        not runtime_context_id
+        or not task_id
+        or not active_session_token_ref
+        or expected_attempt <= 1
+        or expected_retry_round <= 0
+        or not expected_worker_id
+        or not expected_worker_slot_id
+        or not expected_fence_token_hash
+        or not target_project_root
+    ):
+        return {}
+    if assigned_worktree and Path(target_project_root).resolve() != Path(
+        assigned_worktree
+    ).resolve():
+        return {}
+
+    failed_qa_event_id = int(active_failed_qa.get("event_id") or 0)
+    authoritative_rejoin: dict[str, Any] = {}
+    latest_rotation: dict[str, Any] = {}
+    passing_statuses = {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+    for event in sorted(
+        (item for item in timeline_events if isinstance(item, Mapping)),
+        key=lambda item: int(item.get("id") or 0),
+    ):
+        event_id = int(event.get("id") or 0)
+        if event_id <= failed_qa_event_id:
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        event_runtime_context_id = str(
+            payload.get("runtime_context_id") or ""
+        ).strip()
+        event_task_id = str(
+            event.get("task_id") or payload.get("task_id") or ""
+        ).strip()
+        event_backlog_id = str(
+            event.get("backlog_id") or payload.get("backlog_id") or ""
+        ).strip()
+        event_status = str(event.get("status") or "").strip().lower()
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        event_type = str(event.get("event_type") or "").strip().lower()
+
+        worker_commit = bool(
+            event_kind == "worker_commit"
+            or event_type in {
+                "mf_subagent.worker_commit",
+                "runtime_context.worker_commit",
+            }
+            or str(payload.get("action") or "").strip()
+            == "record_worker_commit"
+        )
+        if worker_commit and event_status in passing_statuses:
+            if (
+                event_task_id == task_id
+                and event_backlog_id == backlog_id
+                and event_runtime_context_id in {"", runtime_context_id}
+            ):
+                return {}
+            continue
+
+        rejoin_event = bool(
+            event_type == "observer.runtime_context_session_token_rejoin"
+            or (
+                event_kind == "observer_command"
+                and str(payload.get("action") or "").strip()
+                == "runtime_context_session_token_rejoin"
+            )
+        )
+        if not rejoin_event or event_status not in passing_statuses:
+            continue
+        if event_runtime_context_id != runtime_context_id:
+            continue
+        if event_task_id != task_id or event_backlog_id != backlog_id:
+            return {}
+
+        event_target_project_root = (
+            _timeline_first_deep_text(payload, "target_project_root")
+            or _timeline_first_deep_text(payload, "worktree_path")
+        )
+        identity_matches = bool(
+            str(payload.get("parent_task_id") or "").strip() == parent_task_id
+            and int(payload.get("attempt") or 0) == expected_attempt
+            and int(payload.get("retry_round") or 0) == expected_retry_round
+            and str(payload.get("current_status") or "").strip()
+            == "worktree_ready"
+            and str(payload.get("worker_id") or "").strip()
+            == expected_worker_id
+            and str(
+                payload.get("worker_slot_id")
+                or payload.get("worker_id")
+                or ""
+            ).strip()
+            == expected_worker_slot_id
+            and str(payload.get("fence_token_hash") or "").strip()
+            == expected_fence_token_hash
+            and (
+                not event_target_project_root
+                or Path(event_target_project_root).resolve()
+                == Path(target_project_root).resolve()
+            )
+        )
+        event_session_token_ref = str(
+            payload.get("session_token_ref") or ""
+        ).strip()
+        if not identity_matches or not event_session_token_ref:
+            return {}
+
+        latest_rotation = {
+            "event_id": event_id,
+            "event_ref": f"timeline:{event_id}",
+            "session_token_ref": event_session_token_ref,
+        }
+        if (
+            _truthy_flag(payload.get("reopen_for_revision"))
+            and _truthy_flag(payload.get("timeline_reopen_for_revision"))
+        ):
+            authoritative_rejoin = {
+                "event_id": event_id,
+                "event_ref": f"timeline:{event_id}",
+                "session_token_ref": event_session_token_ref,
+            }
+
+    if (
+        not authoritative_rejoin
+        or not latest_rotation
+        or latest_rotation.get("session_token_ref") != active_session_token_ref
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "runtime_context.authenticated_failed_qa_rejoin_continuity.v1"
+        ),
+        "source": "accepted_runtime_context_rejoin_history",
+        "server_derived": True,
+        "failed_qa_event_ref": active_failed_qa.get("source_ref") or "",
+        "authoritative_rejoin_event_ref": authoritative_rejoin["event_ref"],
+        "latest_rotation_event_ref": latest_rotation["event_ref"],
+        "active_session_token_ref": active_session_token_ref,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "worker_id": expected_worker_id,
+        "worker_slot_id": expected_worker_slot_id,
+        "target_project_root": target_project_root,
+        "fence_token_hash": expected_fence_token_hash,
+        "attempt": expected_attempt,
+        "retry_round": expected_retry_round,
+    }
+
+
 def _runtime_context_failed_qa_revision_rejoin_allowed(
     *,
     conn,
@@ -23699,13 +23885,15 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
         )
         if not active_failed_qa:
             return False
-        prior_revision_marker = _runtime_context_failed_qa_revision_rejoin_marker(
-            conn=conn,
-            context=context,
-            runtime_context_id=runtime_context_id,
-            timeline_events=timeline_events,
+        rejoin_continuity = (
+            _runtime_context_authenticated_failed_qa_rejoin_continuity(
+                context=context,
+                runtime_context_id=runtime_context_id,
+                timeline_events=timeline_events,
+                active_failed_qa=active_failed_qa,
+            )
         )
-        return bool(prior_revision_marker)
+        return bool(rejoin_continuity)
     task_id = str(getattr(context, "task_id", "") or "").strip()
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
     runtime_id = str(runtime_context_id or "").strip()
@@ -24073,6 +24261,24 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 before_event_id=event_id,
             )
         )
+        canonical_timeline_reopen_authority = bool(
+            timeline_reopen_authority and timeline_failed_qa_boundary
+        )
+        legacy_timeline_reopen_authority = bool(
+            timeline_reopen_authority
+            and not canonical_timeline_reopen_authority
+            and not contract_runtime_reopen_authority
+        )
+        effective_contract_runtime_reopen_authority = bool(
+            contract_runtime_reopen_authority
+            and not canonical_timeline_reopen_authority
+        )
+        if not (
+            canonical_timeline_reopen_authority
+            or legacy_timeline_reopen_authority
+            or effective_contract_runtime_reopen_authority
+        ):
+            continue
         route_identity = (
             payload.get("route_identity")
             if isinstance(payload.get("route_identity"), Mapping)
@@ -24092,31 +24298,36 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             or contract_runtime_worker_sequence.get("contract_execution_id")
             or ""
         ).strip()
-        failed_qa_source_ref = str(
-            contract_runtime_failed_qa.get("failed_qa_source_ref") or ""
-        ).strip()
-        if not failed_qa_source_ref:
+        failed_qa_source_ref = ""
+        if canonical_timeline_reopen_authority:
             failed_qa_source_ref = str(
                 timeline_failed_qa_boundary.get("source_ref") or ""
+            ).strip()
+        if not failed_qa_source_ref:
+            failed_qa_source_ref = str(
+                contract_runtime_failed_qa.get("failed_qa_source_ref") or ""
             ).strip()
         return {
             "schema_version": "contract_runtime.failed_qa_revision_rejoin_marker.v1",
             "source": "accepted_runtime_context_rejoin_event",
             "reopen_authority_source": (
-                "contract_runtime_failed_qa_revision"
-                if contract_runtime_reopen_authority
-                else "failed_qa_timeline_event"
+                "failed_qa_timeline_event"
+                if (
+                    canonical_timeline_reopen_authority
+                    or legacy_timeline_reopen_authority
+                )
+                else "contract_runtime_failed_qa_revision"
             ),
             "revision_event_id": event_id,
             "revision_event_ref": f"timeline:{event_id}",
             "contract_execution_id": marker_contract_execution_id,
             "failed_qa_source_ref": failed_qa_source_ref,
             "failed_qa_source": (
-                "contract_runtime_completed_lines"
-                if contract_runtime_reopen_authority
+                "server_qa_session_verification"
+                if canonical_timeline_reopen_authority
                 else (
-                    "server_qa_session_verification"
-                    if timeline_failed_qa_boundary
+                    "contract_runtime_completed_lines"
+                    if effective_contract_runtime_reopen_authority
                     else ""
                 )
             ),
@@ -25560,6 +25771,32 @@ def _runtime_context_contract_requires_worker_commit(
         ) from exc
 
 
+def _runtime_context_contract_failed_qa_has_canonical_provenance(
+    line: Mapping[str, Any],
+) -> bool:
+    """Return whether a ContractRuntime failed-QA line has bounded QA authority."""
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else (
+            payload.get("qa_evidence_provenance")
+            if isinstance(payload.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+    )
+    return bool(
+        str(provenance.get("schema_version") or "").strip()
+        == "qa_evidence_provenance.v1"
+        and str(provenance.get("authorization_source") or "").strip()
+        == "qa_session_token_ref"
+        and str(provenance.get("evidence_owner_role") or "").strip() == "qa"
+        and provenance.get("observer_impersonation") is False
+        and provenance.get("parent_materialization_authorized") is False
+    )
+
+
 def _runtime_context_revise_failed_qa_implementation_lineage(
     conn,
     *,
@@ -25599,6 +25836,16 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             runtime_context_id=runtime_context_id,
             timeline_events=timeline_events,
         )
+    )
+    timeline_precedes_unproven_contract_failed_qa = bool(
+        active_timeline_failed_qa
+        and failed_qa_index >= 0
+        and not _runtime_context_contract_failed_qa_has_canonical_provenance(
+            completed_lines[failed_qa_index]
+        )
+    )
+    authoritative_failed_qa_index = (
+        -1 if timeline_precedes_unproven_contract_failed_qa else failed_qa_index
     )
     authoritative_revision_marker = (
         _runtime_context_failed_qa_revision_rejoin_marker(
@@ -25681,13 +25928,13 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         ),
         -1,
     )
-    if failed_qa_index < 0 and not active_timeline_failed_qa:
+    if authoritative_failed_qa_index < 0 and not active_timeline_failed_qa:
         return {}
     timeline_backed_failed_qa_revision = bool(
-        failed_qa_index < 0 and active_timeline_failed_qa
+        authoritative_failed_qa_index < 0 and active_timeline_failed_qa
     )
     post_failed_qa_implementation_exists = bool(
-        previous is not None and previous_index > failed_qa_index
+        previous is not None and previous_index > authoritative_failed_qa_index
     )
     claimed_files = sorted(
         set(_runtime_context_service_query_values(payload, "changed_files"))
@@ -25824,15 +26071,16 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     ).strip()
     expected_failed_qa_source_ref = str(
         (
-            f"contract_runtime:{contract_execution_id}:completed_lines:{failed_qa_index}"
-            if failed_qa_index >= 0 and contract_execution_id
+            f"contract_runtime:{contract_execution_id}:completed_lines:"
+            f"{authoritative_failed_qa_index}"
+            if authoritative_failed_qa_index >= 0 and contract_execution_id
             else active_timeline_failed_qa.get("source_ref")
         )
         or ""
     ).strip()
     expected_failed_qa_source = (
         "contract_runtime_completed_lines"
-        if failed_qa_index >= 0
+        if authoritative_failed_qa_index >= 0
         else "server_qa_session_verification"
     )
     marker_failed_qa_source_ref = str(
