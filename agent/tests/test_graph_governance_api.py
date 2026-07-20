@@ -32745,6 +32745,8 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     renewed_qa_graph_ctx._session = dict(qa_graph_ctx._session)
     qa_graph = server.handle_graph_governance_query(renewed_qa_graph_ctx)
     renewed_failed_qa_body = json.loads(json.dumps(qa_timeline_ctx.body))
+    renewed_failed_qa_body["payload"].pop("runtime_context_id", None)
+    renewed_failed_qa_body["verification"].pop("runtime_context_id", None)
     renewed_failed_qa_body["payload"]["graph_trace_ids"] = [
         qa_graph["trace_id"]
     ]
@@ -32764,6 +32766,9 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         conn=conn,
     ) is True
     assert failed_authority["qa_session_proof"]["commit_sha"] == initial_head
+    assert "runtime_context_id" not in failed_authority["qa_session_proof"]
+    assert "runtime_context_id" not in failed_qa["payload"]
+    assert "runtime_context_id" not in failed_qa["verification"]
 
     before_rejoin_record = runtime.store.get(successor["contract_execution_id"])
     initial_payload = {
@@ -32814,6 +32819,112 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         assert after["completed_lines"] == before["completed_lines"]
 
     original_failed_payload = json.loads(json.dumps(failed_qa["payload"]))
+    explicitly_wrong_runtime_payload = json.loads(
+        json.dumps(original_failed_payload)
+    )
+    explicitly_wrong_runtime_payload["runtime_context_id"] = (
+        "mfrctx-explicitly-wrong-runtime"
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(explicitly_wrong_runtime_payload), int(failed_qa["id"])),
+    )
+    conn.commit()
+    assert_invalid_qa_authority_does_not_mutate_runtime()
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(original_failed_payload), int(failed_qa["id"])),
+    )
+    conn.commit()
+
+    persisted_runtime_rows = (
+        server._runtime_context_project_task_branch_runtime_rows(
+            conn,
+            project_id=PID,
+            task_id=runtime_context.task_id,
+        )
+    )
+    assert len(persisted_runtime_rows) == 1
+    persisted_runtime_row = persisted_runtime_rows[0]
+
+    self_reported_runtime_payload = json.loads(json.dumps(original_failed_payload))
+    self_reported_runtime_authority = self_reported_runtime_payload[
+        "source_backed_contract_gate_authority"
+    ]
+    self_reported_runtime_authority["qa_session_proof"][
+        "runtime_context_id"
+    ] = runtime_context.runtime_context_id
+    self_reported_runtime_authority["authority_hash"] = (
+        task_timeline._canonical_contract_hash(
+            {
+                key: value
+                for key, value in self_reported_runtime_authority.items()
+                if key != "authority_hash"
+            }
+        )
+    )
+    assert task_timeline._source_backed_qa_session_authority_valid(
+        self_reported_runtime_authority,
+        conn=conn,
+    ) is True
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(self_reported_runtime_payload), int(failed_qa["id"])),
+    )
+    conn.commit()
+    with monkeypatch.context() as missing_server_db_binding:
+        missing_server_db_binding.setattr(
+            server,
+            "_runtime_context_project_task_branch_runtime_rows",
+            lambda *_args, **_kwargs: [],
+        )
+        assert_invalid_qa_authority_does_not_mutate_runtime()
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(original_failed_payload), int(failed_qa["id"])),
+    )
+    conn.commit()
+
+    rejected_server_db_bindings = {
+        "missing": [],
+        "ambiguous": [
+            dict(persisted_runtime_row),
+            {
+                **persisted_runtime_row,
+                "runtime_context_id": "mfrctx-ambiguous-runtime",
+            },
+        ],
+        "cross_runtime": [
+            {
+                **persisted_runtime_row,
+                "runtime_context_id": "mfrctx-cross-runtime",
+            }
+        ],
+        "backlog_mismatch": [
+            {
+                **persisted_runtime_row,
+                "backlog_id": "AC-DIFFERENT-BACKLOG",
+            }
+        ],
+        "worktree_mismatch": [
+            {
+                **persisted_runtime_row,
+                "target_project_root": str(target_root / "different-worktree"),
+                "worktree_path": str(target_root / "different-worktree"),
+            }
+        ],
+    }
+    for case_name, server_db_rows in rejected_server_db_bindings.items():
+        with monkeypatch.context() as mismatched_runtime_binding:
+            mismatched_runtime_binding.setattr(
+                server,
+                "_runtime_context_project_task_branch_runtime_rows",
+                lambda *_args, _rows=server_db_rows, **_kwargs: json.loads(
+                    json.dumps(_rows)
+                ),
+            )
+            assert_invalid_qa_authority_does_not_mutate_runtime()
+
     tampered_failed_payload = json.loads(json.dumps(original_failed_payload))
     tampered_failed_payload["source_backed_contract_gate_authority"][
         "authority_hash"
@@ -32855,6 +32966,21 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
         )
     )
     assert restored_boundary["event_id"] == int(failed_qa["id"])
+    assert restored_boundary["runtime_context_binding_server_derived"] is True
+    assert restored_boundary["runtime_context_binding_source"] == (
+        "server_db_unique_project_task_branch_runtime_context"
+    )
+    assert restored_boundary["runtime_context_binding"] == {
+        "schema_version": "runtime_context.timeline_runtime_binding.v1",
+        "source": "server_db_unique_project_task_branch_runtime_context",
+        "server_derived": True,
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "project_id": PID,
+        "task_id": runtime_context.task_id,
+        "backlog_id": backlog_id,
+        "target_project_root": str(target_root.resolve()),
+        "qa_scope_binding_ref": qa_scope_binding_ref,
+    }
 
     with pytest.raises(GovernanceError) as missing_rejoin:
         server._runtime_context_revise_failed_qa_implementation_lineage(

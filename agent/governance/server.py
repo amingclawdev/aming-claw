@@ -23964,6 +23964,126 @@ def _runtime_context_failed_qa_revision_rejoin_allowed(
     return latest_qa_status in blocking_statuses
 
 
+def _runtime_context_project_task_branch_runtime_rows(
+    conn,
+    *,
+    project_id: str,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Read the server-owned project/task runtime binding without guessing."""
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT project_id, task_id, runtime_context_id, backlog_id,
+                   target_project_root, worktree_path
+            FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND task_id = ?
+            ORDER BY updated_at DESC, runtime_context_id
+            """,
+            (str(project_id or "").strip(), str(task_id or "").strip()),
+        ).fetchall()
+    except (sqlite3.Error, KeyError, TypeError):
+        return []
+    return [dict(row) for row in rows]
+
+
+def _runtime_context_server_derived_legacy_qa_runtime_binding(
+    conn,
+    *,
+    context: Any,
+    runtime_context_id: str,
+    event: Mapping[str, Any],
+    qa_proof: Mapping[str, Any],
+    event_commit: str,
+) -> dict[str, Any]:
+    """Bind legacy QA events with no runtime id to one server DB context."""
+
+    project_id = str(getattr(context, "project_id", "") or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    context_runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    event_project_id = str(event.get("project_id") or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
+    expected_target_root = _runtime_context_effective_target_project_root(context)
+    expected_worktree = str(getattr(context, "worktree_path", "") or "").strip()
+    if (
+        not project_id
+        or event_project_id != project_id
+        or not task_id
+        or not backlog_id
+        or not runtime_id
+        or context_runtime_context_id != runtime_id
+        or not expected_target_root
+        or not expected_worktree
+    ):
+        return {}
+
+    rows = _runtime_context_project_task_branch_runtime_rows(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+    )
+    if len(rows) != 1:
+        return {}
+    row = rows[0]
+    row_runtime_context_id = str(row.get("runtime_context_id") or "").strip()
+    row_backlog_id = str(row.get("backlog_id") or "").strip()
+    row_target_root = str(row.get("target_project_root") or "").strip()
+    row_worktree = str(row.get("worktree_path") or "").strip()
+    row_effective_target_root = row_target_root or row_worktree
+    qa_query_root = str(qa_proof.get("query_root") or "").strip()
+    if (
+        str(row.get("project_id") or "").strip() != project_id
+        or str(row.get("task_id") or "").strip() != task_id
+        or row_runtime_context_id != runtime_id
+        or row_backlog_id != backlog_id
+        or not row_effective_target_root
+        or not row_worktree
+        or not qa_query_root
+    ):
+        return {}
+
+    try:
+        expected_root_path = Path(expected_target_root).resolve()
+        expected_worktree_path = Path(expected_worktree).resolve()
+        row_target_path = Path(row_effective_target_root).resolve()
+        row_worktree_path = Path(row_worktree).resolve()
+        qa_query_root_path = Path(qa_query_root).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {}
+    if not (
+        expected_root_path
+        == expected_worktree_path
+        == row_target_path
+        == row_worktree_path
+        == qa_query_root_path
+    ):
+        return {}
+
+    expected_scope_ref = _qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=event_commit,
+    )
+    if str(qa_proof.get("qa_scope_binding_ref") or "").strip() != expected_scope_ref:
+        return {}
+    return {
+        "schema_version": "runtime_context.timeline_runtime_binding.v1",
+        "source": "server_db_unique_project_task_branch_runtime_context",
+        "server_derived": True,
+        "runtime_context_id": row_runtime_context_id,
+        "project_id": project_id,
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "target_project_root": str(expected_root_path),
+        "qa_scope_binding_ref": expected_scope_ref,
+    }
+
+
 def _runtime_context_authenticated_failed_qa_timeline_boundary(
     *,
     conn,
@@ -24003,16 +24123,9 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
         event_backlog_id = str(
             event.get("backlog_id") or payload.get("backlog_id") or ""
         ).strip()
-        event_runtime_context_id = str(
-            payload.get("runtime_context_id")
-            or verification.get("runtime_context_id")
-            or ""
-        ).strip()
         if task_id and event_task_id != task_id:
             continue
         if backlog_id and event_backlog_id != backlog_id:
-            continue
-        if runtime_context_id and event_runtime_context_id != runtime_context_id:
             continue
         event_kind = str(event.get("event_kind") or "").strip().lower()
         event_type = str(event.get("event_type") or "").strip().lower()
@@ -24101,6 +24214,38 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
         )
         if not authenticated or status not in blocking_statuses | passing_statuses:
             continue
+        explicit_runtime_context_ids = {
+            str(value or "").strip()
+            for value in (
+                payload.get("runtime_context_id"),
+                verification.get("runtime_context_id"),
+            )
+            if str(value or "").strip()
+        }
+        if explicit_runtime_context_ids:
+            if explicit_runtime_context_ids != {
+                str(runtime_context_id or "").strip()
+            }:
+                continue
+            runtime_context_binding = {
+                "schema_version": "runtime_context.timeline_runtime_binding.v1",
+                "source": "timeline_event_explicit_runtime_context_id",
+                "server_derived": False,
+                "runtime_context_id": str(runtime_context_id or "").strip(),
+            }
+        else:
+            runtime_context_binding = (
+                _runtime_context_server_derived_legacy_qa_runtime_binding(
+                    conn,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    event=event,
+                    qa_proof=qa_proof,
+                    event_commit=event_commit,
+                )
+            )
+            if not runtime_context_binding:
+                continue
         latest = {
             "schema_version": "runtime_context.authenticated_failed_qa_timeline_boundary.v1",
             "source": "server_qa_session_verification",
@@ -24118,6 +24263,11 @@ def _runtime_context_authenticated_failed_qa_timeline_boundary(
                 source_authority.get("authority_hash") or ""
             ).strip(),
             "runtime_context_id": runtime_context_id,
+            "runtime_context_binding_source": runtime_context_binding["source"],
+            "runtime_context_binding_server_derived": runtime_context_binding[
+                "server_derived"
+            ],
+            "runtime_context_binding": runtime_context_binding,
             "task_id": task_id,
             "backlog_id": backlog_id,
         }
