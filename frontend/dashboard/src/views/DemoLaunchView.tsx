@@ -27,6 +27,16 @@ export interface DemoEnvironmentLink {
   href: string;
 }
 
+const DEMO_LAUNCH_PROMPT_VARIANTS = [
+  { id: "direct_main", label: "Direct Main" },
+  { id: "mf_parallel", label: "MF Parallel" },
+  { id: "mf_batch_parallel", label: "MF Batch Parallel" },
+] as const;
+
+function normalizedPromptId(id: string): string {
+  return id.trim().toLowerCase().replace(/[-\s]+/g, "_");
+}
+
 export function demoErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
     const body = error.body.trim();
@@ -64,7 +74,29 @@ export function demoEnvironmentLinks(env: DemoEnvironment): DemoEnvironmentLink[
 
 export function demoLaunchPrompts(env: DemoEnvironment): DemoLaunchPrompt[] {
   const prompts = (env.launch_prompts ?? []).filter((prompt) => prompt.prompt.trim());
-  if (prompts.length) return prompts;
+  if (prompts.length) {
+    const variantOrder = new Map<string, number>(
+      DEMO_LAUNCH_PROMPT_VARIANTS.map((variant, index) => [variant.id, index]),
+    );
+    const variantLabels = new Map<string, string>(
+      DEMO_LAUNCH_PROMPT_VARIANTS.map((variant) => [variant.id, variant.label]),
+    );
+
+    return prompts
+      .map((prompt, sourceIndex) => {
+        const normalizedId = normalizedPromptId(prompt.id);
+        return {
+          prompt: {
+            ...prompt,
+            label: variantLabels.get(normalizedId) ?? prompt.label,
+          },
+          sourceIndex,
+          variantIndex: variantOrder.get(normalizedId) ?? DEMO_LAUNCH_PROMPT_VARIANTS.length,
+        };
+      })
+      .sort((left, right) => left.variantIndex - right.variantIndex || left.sourceIndex - right.sourceIndex)
+      .map(({ prompt }) => prompt);
+  }
   if (env.launch_prompt.trim()) {
     return [{
       id: "legacy",
@@ -373,40 +405,48 @@ function DemoEnvironmentCard(props: {
         ))}
       </div>
 
-      <div className="demo-block-grid">
-        <section className="demo-code-panel">
+      <div className="demo-block-stack">
+        <section className="demo-code-panel demo-preview-panel">
           <div className="demo-code-head">Preview command</div>
           <code className="demo-command-line">{env.planner_preview_command || "No preview command"}</code>
         </section>
-        {prompts.length ? prompts.map((prompt) => {
-          const promptKey = `${env.id}:${prompt.id}`;
-          const copied = props.copiedPromptKey === promptKey;
-          return (
-            <section key={prompt.id} className="demo-code-panel demo-prompt-panel">
-              <div className="demo-code-head">
-                <span className="demo-prompt-title">
-                  <span>{prompt.label || "Launch prompt"}</span>
-                  <span className="demo-prompt-kicker">Copy-safe prompt</span>
-                </span>
-                <button
-                  type="button"
-                  className="action-btn"
-                  onClick={() => props.onCopyPrompt(env, prompt)}
-                  disabled={!prompt.prompt}
-                >
-                  {copied ? "Copied" : "Copy"}
-                </button>
-              </div>
-              {prompt.description ? <p className="demo-prompt-description">{prompt.description}</p> : null}
-              <pre className="demo-prompt-block"><code>{prompt.prompt}</code></pre>
-            </section>
-          );
-        }) : (
-          <section className="demo-code-panel demo-prompt-panel">
-            <div className="demo-code-head">Launch prompt</div>
-            <pre className="demo-prompt-block"><code>No launch prompt</code></pre>
-          </section>
-        )}
+        <section className="demo-prompt-area" aria-label={`${env.label || env.id} launch prompts`}>
+          <div className="demo-prompt-area-head">
+            <span>Launch prompts</span>
+            <span>{prompts.length ? `${prompts.length} path${prompts.length === 1 ? "" : "s"}` : "Unavailable"}</span>
+          </div>
+          <div className={`demo-prompt-grid demo-prompt-grid-${Math.min(Math.max(prompts.length, 1), 3)}`}>
+            {prompts.length ? prompts.map((prompt) => {
+              const promptKey = `${env.id}:${prompt.id}`;
+              const copied = props.copiedPromptKey === promptKey;
+              return (
+                <section key={prompt.id} className="demo-code-panel demo-prompt-panel">
+                  <div className="demo-code-head">
+                    <span className="demo-prompt-title">
+                      <span>{prompt.label || "Launch prompt"}</span>
+                      <span className="demo-prompt-kicker">Copy-safe prompt</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="action-btn"
+                      onClick={() => props.onCopyPrompt(env, prompt)}
+                      disabled={!prompt.prompt}
+                    >
+                      {copied ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  {prompt.description ? <p className="demo-prompt-description">{prompt.description}</p> : null}
+                  <pre className="demo-prompt-block"><code>{prompt.prompt}</code></pre>
+                </section>
+              );
+            }) : (
+              <section className="demo-code-panel demo-prompt-panel">
+                <div className="demo-code-head">Launch prompt</div>
+                <pre className="demo-prompt-block"><code>No launch prompt</code></pre>
+              </section>
+            )}
+          </div>
+        </section>
       </div>
     </article>
   );

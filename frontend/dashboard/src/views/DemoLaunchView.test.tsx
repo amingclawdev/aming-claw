@@ -98,6 +98,14 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   const created = environmentFromCreateResponse(demoLaunchFixtureEnvironment);
   const links = demoEnvironmentLinks(created);
   const prompts = demoLaunchPrompts(created);
+  const mixedIdPrompts = demoLaunchPrompts({
+    ...created,
+    launch_prompts: [
+      { id: "mf-batch-parallel", label: "Batch", prompt: " Batch prompt\nwith exact spacing " },
+      { id: "direct_main", label: "Direct", prompt: "Direct prompt" },
+      { id: "mf-parallel", label: "Parallel", prompt: "Parallel prompt" },
+    ],
+  });
   const legacyPrompts = demoLaunchPrompts({
     ...created,
     launch_prompt: "Legacy launch prompt",
@@ -117,6 +125,7 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!created.launch_prompt.includes("Focus/UI lane")) throw new Error("launch prompt must name the Focus/UI lane");
   if (!created.launch_prompt.includes("Reminder/domain lane")) throw new Error("launch prompt must name the Reminder/domain lane");
   if (prompts.length !== 3) throw new Error("daily planner demo should surface three launch prompts");
+  if (prompts.map((prompt) => prompt.label).join("|") !== "Direct Main|MF Parallel|MF Batch Parallel") throw new Error("three launch prompts must use the canonical panel order");
   if (!prompts.some((prompt) => prompt.id === "direct_main" && prompt.prompt.includes("operator_supervised_direct_main"))) throw new Error("direct_main prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_parallel" && prompt.prompt.includes("mf_parallel"))) throw new Error("mf_parallel prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_batch_parallel" && prompt.prompt.includes("mf_batch_parallel"))) throw new Error("mf_batch_parallel prompt must be available");
@@ -124,7 +133,10 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!prompts.some((prompt) => prompt.prompt.includes("system CLI agent service or a host-created bounded worker/subagent"))) throw new Error("worker prompt must force a host-created worker lane");
   if (!prompts.some((prompt) => prompt.prompt.includes("Do not act as the worker from the observer session"))) throw new Error("observer must not impersonate worker");
   if (!prompts.some((prompt) => prompt.prompt.includes("query_source=qa") && prompt.prompt.includes("query_purpose=independent_verification"))) throw new Error("QA graph query identity must be explicit");
-  if (legacyPrompts.length !== 1 || legacyPrompts[0]?.id !== "legacy") throw new Error("legacy launch_prompt fallback must be preserved");
+  if (mixedIdPrompts.map((prompt) => prompt.label).join("|") !== "Direct Main|MF Parallel|MF Batch Parallel") throw new Error("underscore and hyphen ids must resolve to stable labels and order");
+  if (mixedIdPrompts[2]?.prompt !== " Batch prompt\nwith exact spacing ") throw new Error("panel copy text must preserve the exact prompt value");
+  if (legacyPrompts.length !== 1 || legacyPrompts[0]?.id !== "legacy" || legacyPrompts[0]?.label !== "Launch prompt") throw new Error("legacy launch_prompt fallback must be preserved");
+  if (legacyPrompts[0]?.prompt !== "Legacy launch prompt") throw new Error("legacy launch_prompt text must remain readable");
 
   return links.map((link) => link.label);
 }

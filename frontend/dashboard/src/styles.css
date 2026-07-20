@@ -10623,9 +10623,8 @@ details[open] .task-playback-narrative-summary::before {
   border-color: var(--blue-fg, #1d4ed8);
 }
 
-.demo-block-grid {
+.demo-block-stack {
   display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(320px, 1.2fr);
   gap: 10px;
 }
 
@@ -10660,6 +10659,46 @@ details[open] .task-playback-narrative-summary::before {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.demo-preview-panel {
+  width: 100%;
+}
+
+.demo-prompt-area {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.demo-prompt-area-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 2px;
+  color: var(--ink-500);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.demo-prompt-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.demo-prompt-grid-1 {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.demo-prompt-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.demo-prompt-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .demo-prompt-panel {
@@ -10724,7 +10763,8 @@ details[open] .task-playback-narrative-summary::before {
   }
 
   .demo-env-meta,
-  .demo-block-grid {
+  .demo-prompt-grid-2,
+  .demo-prompt-grid-3 {
     grid-template-columns: 1fr;
   }
 }
