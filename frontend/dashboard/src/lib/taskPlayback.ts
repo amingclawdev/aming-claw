@@ -257,6 +257,25 @@ export interface TaskPlaybackCompactLedgerDisplayState {
   legacyAdvisoryValues: string[];
 }
 
+export type TaskPlaybackCurrentSnapshotFreshness = "reported" | "unknown";
+
+/**
+ * Mutable ContractRuntime state for the selected backlog row.
+ *
+ * This is deliberately not a timeline event. `projection_updated_at` describes
+ * snapshot freshness only and must never be used as playback event time.
+ */
+export interface TaskPlaybackCurrentSnapshot {
+  schema_version: "task_playback.current_snapshot.v1";
+  source: "compact_ledger";
+  backlog_id: string;
+  row: TaskPlaybackCompactLedgerRow | null;
+  projection_updated_at: string;
+  freshness: TaskPlaybackCurrentSnapshotFreshness;
+  freshness_label: string;
+  current_snapshot_in_playback: false;
+}
+
 export interface TaskPlaybackTrace {
   schema_version: typeof TASK_PLAYBACK_TRACE_SCHEMA;
   project_id: string;
@@ -271,6 +290,8 @@ export interface TaskPlaybackTrace {
   artifact_refs: TaskPlaybackArtifactRef[];
   /** Canonical current authority axes. Never projected into playback frames. */
   authority_view: ContractRuntimeAuthorityViewModel | null;
+  /** Mutable compact-ledger state. Never projected into playback frames. */
+  current_snapshot: TaskPlaybackCurrentSnapshot;
   compact_ledger: TaskPlaybackCompactLedger;
   privacy_boundary: TaskPlaybackPrivacyBoundary;
   close_gate_summary: TaskPlaybackCloseGateSummary;
@@ -471,17 +492,16 @@ export function projectContractRuntimeAuthorityViewModel(
 }
 
 export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): TaskPlaybackTrace {
-  const timelineEvents = input.taskTimeline?.events ?? [];
+  const timelineEvents = (input.taskTimeline?.events ?? []).filter(isStablePlaybackSourceEvent);
   const authorityView = input.taskTimeline?.contract_runtime_visualization
     ? projectContractRuntimeAuthorityViewModel(input.taskTimeline.contract_runtime_visualization)
     : null;
-  const gateEvents = input.gateResponse?.events ?? [];
+  const gateEvents = (input.gateResponse?.events ?? []).filter(isStablePlaybackSourceEvent);
   const compactLedger = normalizeTaskPlaybackCompactLedger(
     firstCompactLedgerSource(input.compactLedger, input.taskTimeline, input.gateResponse),
     input.projectId,
   );
-  const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(compactLedger, input.generatedAt);
-  const events = mergeTimelineEvents([...timelineEvents, ...ledgerEvents], gateEvents);
+  const events = mergeTimelineEvents(timelineEvents, gateEvents);
   const frames = events.map((event, index) => frameFromEvent(event, index));
   const closeGateSummary = closeGateSummaryFrom(input.gateResponse);
   const lanes = lanesFromFrames(frames, input.backlog, closeGateSummary);
@@ -504,6 +524,7 @@ export function normalizeTaskPlaybackTrace(input: NormalizeTaskPlaybackInput): T
     evidence_refs: evidenceRefs,
     artifact_refs: artifactRefs,
     authority_view: authorityView,
+    current_snapshot: taskPlaybackCurrentSnapshot(compactLedger, input.backlog.bug_id),
     compact_ledger: compactLedger,
     privacy_boundary: {
       raw_prompt_text: "not_displayed",
@@ -628,11 +649,35 @@ export function normalizeTaskPlaybackCompactLedger(source: unknown, fallbackProj
 
 export function taskPlaybackLedgerRowsToTimelineEvents(
   ledger: TaskPlaybackCompactLedger | null | undefined,
-  generatedAt?: string,
+  _generatedAt?: string,
 ): TaskTimelineEvent[] {
-  if (!ledger?.rows.length) return [];
-  const at = generatedAt ?? new Date().toISOString();
-  return ledger.rows.map((row, index) => compactLedgerEventFromRow(row, ledger, index, at));
+  // Compact-ledger rows are mutable current projections, not append-only
+  // source events. Keep this compatibility export intentionally empty so old
+  // callers cannot turn projection freshness or page-load time into event time.
+  void ledger;
+  return [];
+}
+
+export function taskPlaybackCurrentSnapshot(
+  ledger: TaskPlaybackCompactLedger | null | undefined,
+  backlogId = "",
+): TaskPlaybackCurrentSnapshot {
+  const row = ledger?.rows.find((item) => item.backlog_id === backlogId)
+    ?? ledger?.rows[0]
+    ?? null;
+  const projectionUpdatedAt = row?.projection_updated_at ?? "";
+  return {
+    schema_version: "task_playback.current_snapshot.v1",
+    source: "compact_ledger",
+    backlog_id: row?.backlog_id || backlogId,
+    row,
+    projection_updated_at: projectionUpdatedAt,
+    freshness: projectionUpdatedAt ? "reported" : "unknown",
+    freshness_label: projectionUpdatedAt
+      ? `reported ${projectionUpdatedAt}`
+      : "unknown / stale until refreshed",
+    current_snapshot_in_playback: false,
+  };
 }
 
 export function recentTimelineEventKey(event: TaskTimelineEvent, index = 0): string {
@@ -663,23 +708,18 @@ export function projectRecentTimelineEvents(
   response: RecentTimelineProjectionInput | null | undefined,
 ): TaskTimelineEvent[] {
   const record = response ?? {};
-  const sourceEvents = Array.isArray(record.events) ? record.events : [];
-  const projectionEvents = Array.isArray(record.contract_runtime_projection_events)
-    ? record.contract_runtime_projection_events
+  const sourceEvents = Array.isArray(record.events)
+    ? record.events.filter(isStablePlaybackSourceEvent)
     : [];
-  const compactLedger = normalizeTaskPlaybackCompactLedger(
-    firstCompactLedgerSource(record.compact_ledger, record.compactLedger, record),
-    record.project_id ?? "",
-  );
-  const ledgerEvents = taskPlaybackLedgerRowsToTimelineEvents(
-    compactLedger,
-    record.generated_at,
-  );
-  return mergeRecentTimelineEvents([
-    ...sourceEvents,
-    ...projectionEvents,
-    ...ledgerEvents,
-  ]);
+  return mergeRecentTimelineEvents(sourceEvents);
+}
+
+function isStablePlaybackSourceEvent(event: TaskTimelineEvent): boolean {
+  const payload = asRecord(event.payload);
+  return event.event_type !== TASK_COMPACT_LEDGER_EVENT_TYPE
+    && event.event_type !== "contract_runtime.current_state"
+    && event.event_kind !== "contract_runtime_compact_ledger"
+    && firstStringField(payload, ["source"]) !== "task_timeline_compact_ledger";
 }
 
 export function taskPlaybackLedgerRowRefs(row: TaskPlaybackCompactLedgerRow): TaskPlaybackEvidenceRef[] {
@@ -1034,105 +1074,6 @@ function normalizeLedgerBlockerSummary(value: unknown): TaskPlaybackCompactLedge
     keys: stable(keys),
     summary: firstStringField(record, ["summary", "description"]),
     reason: firstStringField(record, ["reason"]),
-  };
-}
-
-function compactLedgerEventFromRow(
-  row: TaskPlaybackCompactLedgerRow,
-  ledger: TaskPlaybackCompactLedger,
-  index: number,
-  generatedAt: string,
-): TaskTimelineEvent {
-  const refs = taskPlaybackLedgerRowRefs(row);
-  const nextAction = row.next_legal_action;
-  const projectionFields = compactLedgerProjectionFields(row);
-  const payload = {
-    schema_version: ledger.schema_version,
-    lane: "gate",
-    backlog_id: row.backlog_id,
-    title: row.title,
-    priority: row.priority,
-    row_status: row.status,
-    contract_execution_id: row.contract_execution_id,
-    ...projectionFields,
-    merge_queue_id: row.merge_queue_id,
-    merge_queue_index: row.merge_queue_index,
-    merge_queue_item_id: row.merge_queue_item_id,
-    merge_queue_task_id: row.merge_queue_task_id,
-    merge_queue_status: row.merge_queue_status,
-    latest_event_id: row.latest_event_id,
-    latest_event_kind: row.latest_event_kind,
-    latest_event_type: row.latest_event_type,
-    latest_status: row.latest_status,
-    latest_payload_ref: row.latest_payload_ref,
-    next_legal_action: nextAction,
-    blocker_summary: row.blocker_summary,
-    head_commit: row.head_commit,
-    readiness_state: row.readiness_state,
-    ledger_refs: refs.map((ref) => `${ref.label}: ${ref.value}`),
-    source_event_count: ledger.source_event_count,
-    ledger_row_count: ledger.row_count,
-  };
-  return {
-    event_id: `ledger:${row.backlog_id || row.contract_execution_id || index + 1}`,
-    project_id: ledger.project_id,
-    backlog_id: row.backlog_id,
-    task_id: row.merge_queue_task_id || row.contract_execution_id,
-    event_type: TASK_COMPACT_LEDGER_EVENT_TYPE,
-    event_kind: "contract_runtime_compact_ledger",
-    phase: "contract_runtime",
-    actor: "ContractRuntime",
-    status: compactLedgerStatus(row),
-    commit_sha: row.head_commit || row.commit || undefined,
-    payload,
-    verification: {
-      contract_execution_id: row.contract_execution_id,
-      ...projectionFields,
-      readiness_state: row.readiness_state,
-      close_ready: row.readiness_state === "close_ready",
-      blocked: compactLedgerStatus(row) === "blocked",
-      latest_event_id: row.latest_event_id,
-      latest_event_kind: row.latest_event_kind,
-      latest_event_type: row.latest_event_type,
-      latest_status: row.latest_status,
-      latest_payload_ref: row.latest_payload_ref,
-      head_commit: row.head_commit,
-      next_legal_action: nextAction,
-      blocker_summary: row.blocker_summary,
-    },
-    artifact_refs: {
-      compact_ledger_schema: ledger.schema_version,
-      contract_execution_id: row.contract_execution_id,
-      ...projectionFields,
-      latest_payload_ref: row.latest_payload_ref,
-      merge_queue_id: row.merge_queue_id,
-      merge_queue_index: row.merge_queue_index,
-      merge_queue_item_id: row.merge_queue_item_id,
-      merge_queue_task_id: row.merge_queue_task_id,
-      merge_queue_status: row.merge_queue_status,
-      ledger_refs: refs.map((ref) => `${ref.label}: ${ref.value}`),
-      source_event_id: row.latest_event_id,
-      source_event_refs: refs.filter((ref) => ref.kind === "source_event").map((ref) => ref.value),
-    },
-    created_at: row.projection_updated_at || generatedAt,
-  };
-}
-
-function compactLedgerProjectionFields(row: TaskPlaybackCompactLedgerRow): Record<string, unknown> {
-  return {
-    contract_chain_id: row.contract_chain_id,
-    root_contract_execution_id: row.root_contract_execution_id,
-    current_contract_execution_id: row.current_contract_execution_id,
-    current_contract_id: row.current_contract_id,
-    parent_to_resume_contract_execution_id: row.parent_to_resume_contract_execution_id,
-    active_child_contract_execution_id: row.active_child_contract_execution_id,
-    projection_generation: row.projection_generation,
-    projection_watermark: row.projection_watermark,
-    projection_hash: row.projection_hash,
-    projection_updated_at: row.projection_updated_at,
-    projection_degraded: row.projection_degraded,
-    projection_degraded_flags: row.projection_degraded_flags,
-    contract_chain_current: row.contract_chain_current,
   };
 }
 

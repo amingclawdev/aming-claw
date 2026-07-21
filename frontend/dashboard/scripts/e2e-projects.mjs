@@ -812,6 +812,7 @@ function verifyBacklogEvidenceContract() {
   const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
   const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
   const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
+  const taskTimelineSource = readFileSync(path.join(REPO_ROOT, "agent/governance/task_timeline.py"), "utf8");
   assert(apiSource.includes("backlogTimelineGateFor"), "Backlog API client should fetch per-row timeline gate evidence");
   assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
   assert(apiSource.includes("contractRuntimeVisualizationFor") && apiSource.includes("/visualization/backlogs/"), "Dashboard API should use the canonical ContractRuntime visualization endpoint");
@@ -826,7 +827,11 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("Historical compact ledger (advisory)") && viewSource.includes("Historical ledger action (advisory)"), "Legacy compact-ledger instructions should remain history/advisory when canonical authority is present");
   assert(playbackSource.includes("backlog_id: response.backlog_id") && playbackSource.includes("execution_state_revision: executionStateRevision") && playbackSource.includes("event_id: eventId"), "Authority adapter cache identity should include backlog, execution revision, and event identity");
   assert(playbackSource.includes("current_snapshot_in_playback: false") && semanticSource.includes('text.includes("bypass") || text.includes("waiv")'), "Current authority snapshots must stay out of playback and bypass/waiver evidence must not render as PASS");
+  assert(playbackSource.includes("taskPlaybackCurrentSnapshot") && playbackSource.includes("unknown / stale until refreshed") && playbackPanelSource.includes("History boundary: current state is not a playback event"), "Playback should render compact-ledger current state separately with explicit unknown/stale freshness");
+  assert(playbackSource.includes("record.events.filter(isStablePlaybackSourceEvent)") && !playbackSource.includes("created_at: row.projection_updated_at || generatedAt"), "Recent playback history should contain stable source events only and never timestamp events from projection/page freshness");
+  assert(taskTimelineSource.includes("compact-ledger rows are mutable snapshots") && taskTimelineSource.includes("del ledger, generated_at") && taskTimelineSource.includes("return []"), "Backend compact-ledger compatibility projection must not synthesize mutable snapshots into events");
   assert(playbackTestSource.includes('"direct_main.v1"') && playbackTestSource.includes('"mf_parallel.v2"') && playbackTestSource.includes('"mf_batch_parallel.v1"') && playbackTestSource.includes('"ordered_batch_merge"'), "Authority fixtures should cover direct-main, parallel worker/QA, and ordered batch merge dogfood paths");
+  assert(playbackTestSource.includes("refresh should keep append-only source history stable") && playbackTestSource.includes("refresh should advance the separate current snapshot"), "Dogfood refresh fixtures should prove current snapshots advance without rewriting history");
   assert(viewSource.includes("ContractGatePanel"), "Backlog detail should render a dedicated Contract & Gate tab panel");
   assert(viewSource.includes("NoGateNotice"), "Backlog gate UI should render explicit no-gate/not-applicable state");
   assert(viewSource.includes("BacklogDetailModal"), "Backlog rows should open a detail modal");
