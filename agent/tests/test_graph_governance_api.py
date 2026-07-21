@@ -50634,6 +50634,143 @@ def test_contract_update_facade_requires_completed_onboard_successor(conn):
     assert exc.value.details["successor_contract_id"] == "contract_update"
 
 
+def _capture_current_stream_line_invalidations(callback):
+    from agent.governance import event_bus
+
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def on_event(name, payload):
+        if name in {
+            "contract_runtime.changed",
+            "contract_chain.current_changed",
+            "current_task.changed",
+        }:
+            published.append((name, payload))
+
+    event_bus._bus.subscribe_all(on_event)
+    try:
+        result = callback()
+    finally:
+        event_bus._bus.unsubscribe_all(on_event)
+    return result, published
+
+
+def _assert_current_stream_line_invalidations(
+    published,
+    *,
+    backlog_id: str,
+    execution_id: str,
+) -> None:
+    assert len(published) == 3
+    invalidations = {name: payload for name, payload in published}
+    assert set(invalidations) == {
+        "contract_runtime.changed",
+        "contract_chain.current_changed",
+        "current_task.changed",
+    }
+    for payload in invalidations.values():
+        assert payload["backlog_id"] == backlog_id
+        assert payload["contract_execution_id"] == execution_id
+        assert payload["execution_state_revision"] > 0
+
+
+def test_contract_add_accepted_line_publishes_current_stream_invalidations(conn):
+    backlog_id = "AC-CONTRACT-ADD-CURRENT-STREAM-INVALIDATION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_contract_add_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    accepted, published = _capture_current_stream_line_invalidations(
+        lambda: server.handle_project_contract_add_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": "observer_request",
+                    "line_id": "observer_request_contract_add",
+                    "evidence_kind": "contract_add_request",
+                },
+            )
+        )
+    )
+
+    assert accepted["ok"] is True
+    _assert_current_stream_line_invalidations(
+        published,
+        backlog_id=backlog_id,
+        execution_id=execution_id,
+    )
+
+
+def test_contract_update_accepted_line_publishes_current_stream_invalidations(conn):
+    backlog_id = "AC-CONTRACT-UPDATE-CURRENT-STREAM-INVALIDATION"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    onboard = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    _complete_source_backed_onboarding(conn, onboard["contract_execution_id"])
+    started = server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id="contract-update-current-stream-worker",
+        fence_token="fence-contract-update-current-stream-worker",
+        token="contract-update-current-stream-token",
+    )
+    accepted, published = _capture_current_stream_line_invalidations(
+        lambda: server.handle_project_contract_update_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": "observer_request",
+                    "line_id": "observer_request_contract_update",
+                    "evidence_kind": "contract_update_request",
+                    "payload": {
+                        "previous_revision": "rev1",
+                        "new_revision": "rev2",
+                        "worker_runtime_context": {
+                            "runtime_context_id": runtime_context.runtime_context_id,
+                            "task_id": runtime_context.task_id,
+                            "parent_task_id": backlog_id,
+                            "worker_role": "mf_sub",
+                            "target_project_root": "/tmp/contract-update-current-stream",
+                        },
+                    },
+                },
+            )
+        )
+    )
+
+    assert accepted["ok"] is True
+    _assert_current_stream_line_invalidations(
+        published,
+        backlog_id=backlog_id,
+        execution_id=execution_id,
+    )
+
+
 def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
     backlog_id = "AC-CONTRACT-UPDATE-FACADE"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)

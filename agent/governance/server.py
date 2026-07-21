@@ -50121,6 +50121,24 @@ def _publish_contract_runtime_current_changed(
     )
 
 
+def _publish_accepted_contract_runtime_line_write(
+    project_id: str,
+    *,
+    result: Mapping[str, Any],
+) -> None:
+    """Publish one post-commit invalidation from a line-write facade result."""
+
+    record = result.get("record")
+    if not result.get("ok") or not isinstance(record, Mapping):
+        return
+    _publish_contract_runtime_current_changed(
+        project_id,
+        backlog_id=str(record.get("backlog_id") or ""),
+        record=record,
+        source="contract_runtime.line_write.accepted",
+    )
+
+
 _ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
 _ROUTE_GATE_PAYLOAD_KEYS = (
     "route_token",
@@ -91376,13 +91394,10 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
-        if result.get("ok") and isinstance(result.get("record"), Mapping):
-            _publish_contract_runtime_current_changed(
-                project_id,
-                backlog_id=str(result["record"].get("backlog_id") or ""),
-                record=result["record"],
-                source="contract_runtime.line_write.accepted",
-            )
+        _publish_accepted_contract_runtime_line_write(
+            project_id,
+            result=result,
+        )
     response = {
         "schema_version": "onboard_contract.line_write_response.v1",
         "ok": bool(result.get("ok")),
@@ -91550,6 +91565,10 @@ def handle_project_contract_add_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
+        _publish_accepted_contract_runtime_line_write(
+            project_id,
+            result=result,
+        )
     response = {
         "schema_version": "contract_add.line_write_response.v1",
         "ok": bool(result.get("ok")),
@@ -91853,6 +91872,10 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
+        _publish_accepted_contract_runtime_line_write(
+            project_id,
+            result=result,
+        )
     response = {
         "schema_version": "contract_update.line_write_response.v1",
         "ok": bool(result.get("ok")),
@@ -92428,13 +92451,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
-        if result.get("ok") and isinstance(result.get("record"), Mapping):
-            _publish_contract_runtime_current_changed(
-                project_id,
-                backlog_id=str(result["record"].get("backlog_id") or ""),
-                record=result["record"],
-                source="contract_runtime.line_write.accepted",
-            )
+        _publish_accepted_contract_runtime_line_write(
+            project_id,
+            result=result,
+        )
     response = {
         "schema_version": "contract_runtime.line_write_response.v1",
         "ok": bool(result.get("ok")),
