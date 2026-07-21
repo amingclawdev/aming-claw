@@ -909,6 +909,11 @@ function verifyBacklogEvidenceContract() {
   assert(playbackViewSource.includes("activityRefreshSeq"), "Activity view should bridge SSE events into immediate refreshes");
   assert(playbackViewSource.includes("task_timeline.appended"), "Activity view should refresh on task timeline append events");
   assert(playbackViewSource.includes("current_task.changed"), "Activity view should refresh on current-task changed events");
+  assert(playbackViewSource.includes("contract_runtime.changed") && playbackViewSource.includes("contract_chain.current_changed") && playbackViewSource.includes("runtime_context.changed"), "Activity view should immediately refresh for ContractRuntime, chain-current, and runtime-context invalidations");
+  assert(playbackViewSource.includes("ContractRuntime current:"), "Activity Current should render the compact ledger/runtime state independently of playback history");
+  assert(playbackSource.includes("current_stream_events") && playbackSource.includes("isCurrentStreamProjectionEvent") && playbackSource.includes("synthetic_current"), "Activity Current should unify stable synthetic current projections with recent raw events");
+  assert(taskTimelineSource.includes('f"contract-runtime:{execution_id}:rev:{revision}"') && taskTimelineSource.includes('f"contract-chain:{chain_identity}:gen:{generation}"'), "Recent current projections should use stable ContractRuntime and contract-chain revision identities");
+  assert(apiSource.includes("current_stream_events?:"), "Dashboard API should type the unified current-stream projection response");
   assert(playbackViewSource.includes("CURRENT_TASK_REFRESH_MS"), "Activity view should define a bounded live refresh interval");
   assert(playbackViewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Activity view should poll the primary task without page reloads");
   assert(playbackViewSource.includes("refreshActivityTimeline"), "Activity view should refresh task detail, timeline, and gate together");

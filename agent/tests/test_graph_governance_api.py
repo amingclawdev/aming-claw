@@ -53627,6 +53627,8 @@ def test_contract_add_facade_rejects_non_contract_add_execution_on_enter_and_rea
 
 
 def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
+    from agent.governance import event_bus
+
     backlog_id = "AC-CONTRACT-RUNTIME-GENERIC-ONBOARD"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
     runtime = server._contract_runtime(conn)
@@ -53650,19 +53652,33 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     assert current["contract_id"] == "onboard_contract"
     assert current["next_legal_action"]["id"] == "graph_query_schema_trace"
 
-    accepted = server.handle_project_contract_runtime_line_write(
-        _ctx_with_role(
-            {"project_id": PID, "contract_execution_id": record["contract_execution_id"]},
-            "observer",
-            method="POST",
-            body={
-                "stage_id": "graph_context",
-                "line_id": "graph_query_schema_trace",
-                "evidence_kind": "graph_query_schema_trace",
-                "payload": {"trace_id": "gqt-generic-onboard"},
-            },
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def on_event(name, payload):
+        if name in {
+            "contract_runtime.changed",
+            "contract_chain.current_changed",
+            "current_task.changed",
+        }:
+            published.append((name, payload))
+
+    event_bus._bus.subscribe_all(on_event)
+    try:
+        accepted = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": record["contract_execution_id"]},
+                "observer",
+                method="POST",
+                body={
+                    "stage_id": "graph_context",
+                    "line_id": "graph_query_schema_trace",
+                    "evidence_kind": "graph_query_schema_trace",
+                    "payload": {"trace_id": "gqt-generic-onboard"},
+                },
+            )
         )
-    )
+    finally:
+        event_bus._bus.unsubscribe_all(on_event)
 
     assert accepted["ok"] is True
     assert accepted["schema_version"] == "contract_runtime.runtime_facade_response.v1"
@@ -53671,6 +53687,17 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
     assert accepted["agent_facing_decision_source"] == (
         "contract_runtime_first_missing_line"
     )
+    changed = next(payload for name, payload in published if name == "contract_runtime.changed")
+    assert changed["backlog_id"] == backlog_id
+    assert changed["contract_execution_id"] == record["contract_execution_id"]
+    assert changed["contract_revision_id"]
+    assert changed["execution_state_revision"] > record["execution_state_revision"]
+    assert changed["event_id"] == (
+        f"contract-runtime:{record['contract_execution_id']}:rev:"
+        f"{changed['execution_state_revision']}"
+    )
+    assert any(name == "contract_chain.current_changed" for name, _ in published)
+    assert any(name == "current_task.changed" for name, _ in published)
 
 
 def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
@@ -58073,6 +58100,78 @@ def _setup_mf_parallel_contract_runtime_worker_dispatch(
     )
     assert dispatch["ok"] is True
     return successor, runtime_context
+
+
+def test_recent_timeline_projects_runtime_newer_current_stream(conn):
+    backlog_id = "AC-RECENT-RUNTIME-NEWER-CURRENT-STREAM"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="recent-runtime-newer-parent",
+        worker_task_id="recent-runtime-newer-worker",
+        fence_token="fence-recent-runtime-newer",
+        token="session-recent-runtime-newer",
+    )
+    execution_id = successor["contract_execution_id"]
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE project_id = ? AND backlog_id = ?",
+        ("2026-07-20T10:00:00Z", PID, backlog_id),
+    )
+    conn.execute(
+        "UPDATE contract_runtime_executions SET updated_at = ? WHERE contract_execution_id = ?",
+        ("2099-07-21T10:00:00Z", execution_id),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts SET updated_at = ? WHERE project_id = ? AND task_id = ?",
+        ("2099-07-21T10:01:00Z", PID, runtime_context.task_id),
+    )
+    conn.commit()
+
+    response = server.handle_task_timeline_recent(
+        _ctx({"project_id": PID}, query={"limit": "100"})
+    )
+
+    current_events = response["current_stream_events"]
+    runtime_event = next(
+        event
+        for event in current_events
+        if event["event_type"] == "contract_runtime.current_state"
+        and event["payload"]["contract_execution_id"] == execution_id
+    )
+    chain_event = next(
+        event
+        for event in current_events
+        if event["event_type"] == "contract_chain.current_state"
+        and event["backlog_id"] == backlog_id
+    )
+    context_event = next(
+        event
+        for event in current_events
+        if event["event_type"] == "runtime_context.current_state"
+        and event["payload"]["runtime_context_id"]
+        == runtime_context.runtime_context_id
+    )
+    assert runtime_event["event_id"].startswith(
+        f"contract-runtime:{execution_id}:rev:"
+    )
+    assert runtime_event["created_at"] == "2099-07-21T10:00:00Z"
+    assert chain_event["event_id"].startswith(
+        f"contract-chain:{successor['contract_chain_id']}:gen:"
+    )
+    assert context_event["event_id"].startswith(
+        f"runtime-context:{runtime_context.runtime_context_id}:rev:"
+    )
+    assert context_event["created_at"] == "2099-07-21T10:01:00Z"
+    assert response["contract_runtime_projection_events"] == current_events
+    compact_row = next(
+        row
+        for row in response["compact_ledger"]["rows"]
+        if row["backlog_id"] == backlog_id
+    )
+    assert compact_row["projection_updated_at"] == "2099-07-21T10:00:00Z"
+    assert compact_row["projection_freshness_source"] == (
+        "contract_runtime_executions.updated_at"
+    )
 
 
 def test_source_backed_mf_parallel_without_dispatch_rejects_ticket_authority(conn):

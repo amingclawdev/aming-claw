@@ -984,6 +984,7 @@ function SegmentedButton<T extends string>({
 
 function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; trace: TaskPlaybackTrace }) {
   const authority = trace.authority_view;
+  const currentSnapshot = trace.current_snapshot.row;
   const currentAction = authority?.contract_execution_progress.current_action;
   const latestFrame = trace.frames[trace.frames.length - 1] ?? null;
   const latestEvent = hint?.latest_event ?? {};
@@ -1019,6 +1020,13 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
       || (trace.close_gate_summary.blocked ? trace.close_gate_summary.reason_sentence : "none recorded");
   const activeCount = hint?.active_count != null ? `${hint.active_count} active` : "";
   const singleActive = hint?.single_active_task ? singleActiveSummary(hint.single_active_task) : "";
+  const compactRuntimeState = currentSnapshot
+    ? compactJoin([
+      currentSnapshot.readiness_state || currentSnapshot.latest_status,
+      currentSnapshot.current_contract_execution_id || currentSnapshot.contract_execution_id,
+      currentSnapshot.next_legal_action.action || currentSnapshot.next_legal_action.id,
+    ])
+    : "";
   return (
     <div className="task-playback-chip-section" aria-label="Current stream state">
       <strong>Current stream state</strong>
@@ -1026,6 +1034,7 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
         {activeCount ? <span>{activeCount}</span> : null}
         {singleActive ? <span>{singleActive}</span> : null}
         <span>Current snapshot freshness: {trace.current_snapshot.freshness_label}</span>
+        {compactRuntimeState ? <span>ContractRuntime current: {compactRuntimeState}</span> : null}
         <span>Latest event: {latestEventText || "none recorded"}</span>
         <span>Worker/QA/close gate: {laneState || "none recorded"}</span>
         {authority ? <span>Contract progress: {authority.contract_execution_progress.display_status}</span> : null}
@@ -1111,6 +1120,9 @@ function isActivityLiveEvent(name: string): boolean {
   return [
     "task_timeline.appended",
     "current_task.changed",
+    "contract_runtime.changed",
+    "contract_chain.current_changed",
+    "runtime_context.changed",
     "task.created",
     "task.completed",
     "task.failed",

@@ -1402,6 +1402,7 @@ export interface RecentTimelineResponse {
   events: import("../types").TaskTimelineEvent[];
   count: number;
   compact_ledger?: unknown;
+  current_stream_events?: import("../types").TaskTimelineEvent[];
   contract_runtime_projection_events?: import("../types").TaskTimelineEvent[];
   contract_runtime_projection_event_count?: number;
   order?: string;

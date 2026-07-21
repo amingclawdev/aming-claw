@@ -1745,25 +1745,51 @@ function taskPlaybackCompactLedgerProjectionAssertions(): string[] {
   assertFixture(trace.current_snapshot.current_snapshot_in_playback === false, "compact ledger: current snapshot must declare that it is outside playback");
   assertFixture(!JSON.stringify(trace.current_snapshot.row).includes("rtok-private-fixture"), "compact ledger: current snapshot should not expose token refs");
   const syntheticProjectionEvent: TaskTimelineEvent = {
-    event_id: "ledger:synthetic-current",
+    event_id: "contract-runtime:cex-synthetic-current:rev:7",
     event_type: "contract_runtime.current_state",
-    event_kind: "contract_runtime_compact_ledger",
+    event_kind: "contract_runtime_current",
     status: "recorded",
     created_at: "2026-06-27T21:44:00Z",
-    payload: { source: "task_timeline_compact_ledger" },
+    payload: {
+      source: "contract_runtime_current",
+      synthetic_current: true,
+      append_only_history: false,
+      contract_execution_id: "cex-synthetic-current",
+      execution_state_revision: 7,
+    },
+  };
+  const syntheticRuntimeContextEvent: TaskTimelineEvent = {
+    event_id: "runtime-context:mfrctx-synthetic-current:rev:crev-7",
+    event_type: "runtime_context.current_state",
+    event_kind: "runtime_context_current",
+    status: "running",
+    created_at: "2026-06-27T21:44:30Z",
+    payload: {
+      source: "parallel_branch_runtime_contexts",
+      synthetic_current: true,
+      append_only_history: false,
+      runtime_context_id: "mfrctx-synthetic-current",
+      runtime_revision_id: "crev-7",
+    },
   };
   const recentEvents = projectRecentTimelineEvents({
     project_id: "aming-claw",
     events: [stableSourceEvent, syntheticProjectionEvent],
     compact_ledger: ledger,
-    contract_runtime_projection_events: [syntheticProjectionEvent],
+    current_stream_events: [syntheticProjectionEvent, syntheticRuntimeContextEvent],
+    contract_runtime_projection_events: [syntheticProjectionEvent, syntheticRuntimeContextEvent],
     generated_at: "2026-06-27T21:45:00Z",
   });
   assertFixture(
-    recentEvents.length === 1
-      && recentEvents[0]?.event_id === stableSourceEvent.event_id
-      && recentEvents[0]?.created_at === stableSourceEvent.created_at,
-    "compact ledger: project-wide recent history should ignore current projection events and keep stable source time",
+    recentEvents.length === 3
+      && recentEvents[0]?.event_id === syntheticRuntimeContextEvent.event_id
+      && recentEvents[1]?.event_id === syntheticProjectionEvent.event_id
+      && recentEvents[2]?.event_id === stableSourceEvent.event_id,
+    "compact ledger: Activity Current should unify stable runtime projections with raw timeline events and deduplicate aliases",
+  );
+  assertFixture(
+    trace.frames.length === 1 && trace.frames[0]?.source_event_id === stableSourceEvent.event_id,
+    "compact ledger: current-stream projections must stay outside append-only playback history",
   );
 
   const legacyOnlyBacklog: BacklogBug = {

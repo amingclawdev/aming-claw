@@ -2346,12 +2346,33 @@ class TestTaskTimeline(unittest.TestCase):
         [current_row] = current_ledger["rows"]
         self.assertTrue(current_row["projection_updated_at"])
         self.assertEqual(current_ledger["source_event_count"], 0)
+        current_events = task_timeline.compact_ledger_to_timeline_events(
+            current_ledger,
+            generated_at="2026-06-27T21:45:00Z",
+        )
+        self.assertEqual(len(current_events), 2)
+        runtime_event = next(
+            event
+            for event in current_events
+            if event["event_type"] == "contract_runtime.current_state"
+        )
+        chain_event = next(
+            event
+            for event in current_events
+            if event["event_type"] == "contract_chain.current_state"
+        )
         self.assertEqual(
-            task_timeline.compact_ledger_to_timeline_events(
-                current_ledger,
-                generated_at="2026-06-27T21:45:00Z",
-            ),
-            [],
+            runtime_event["event_id"],
+            f"contract-runtime:{parent['contract_execution_id']}:rev:"
+            f"{current_row['projection_generation']}",
+        )
+        self.assertEqual(runtime_event["created_at"], current_row["projection_updated_at"])
+        self.assertTrue(runtime_event["payload"]["synthetic_current"])
+        self.assertFalse(runtime_event["payload"]["append_only_history"])
+        self.assertEqual(
+            chain_event["event_id"],
+            f"contract-chain:{parent['contract_chain_id']}:gen:"
+            f"{current_row['projection_generation']}",
         )
 
     def test_compact_ledger_contract_complete_suppresses_stale_blocker(self):
@@ -2429,7 +2450,12 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertNotIn("blocker_summary", row["contract_chain_current"])
         self.assertNotIn("close_blocked_by_next_legal_action", row["contract_chain_current"])
 
-        self.assertEqual(task_timeline.compact_ledger_to_timeline_events(ledger), [])
+        current_events = task_timeline.compact_ledger_to_timeline_events(ledger)
+        self.assertEqual(
+            {event["event_type"] for event in current_events},
+            {"contract_runtime.current_state", "contract_chain.current_state"},
+        )
+        self.assertTrue(all(event["created_at"] == "" for event in current_events))
 
     def test_compact_ledger_merge_complete_projection_clears_stale_action(self):
         from agent.governance import task_timeline
@@ -4602,7 +4628,13 @@ class TestTaskTimeline(unittest.TestCase):
         published = []
 
         def on_event(name, payload):
-            if name in {"task_timeline.appended", "current_task.changed"}:
+            if name in {
+                "task_timeline.appended",
+                "current_task.changed",
+                "contract_runtime.changed",
+                "contract_chain.current_changed",
+                "runtime_context.changed",
+            }:
                 published.append((name, payload))
 
         bus.subscribe_all(on_event)
@@ -4617,6 +4649,13 @@ class TestTaskTimeline(unittest.TestCase):
                 event_kind="mf_subagent.startup",
                 actor="mf-sub",
                 status="running",
+                payload={
+                    "contract_execution_id": "cex-sse",
+                    "contract_chain_id": "cchain-sse",
+                    "contract_revision_id": "crev-sse",
+                    "execution_state_revision": 7,
+                    "runtime_context_id": "mfrctx-sse",
+                },
             )
         finally:
             bus.unsubscribe_all(on_event)
@@ -4634,6 +4673,17 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(timeline["status"], "running")
         self.assertEqual(current["source"], "task_timeline.record_event")
         self.assertEqual(current["runtime_state"], "running")
+        self.assertEqual(current["contract_execution_id"], "cex-sse")
+        self.assertEqual(current["execution_state_revision"], 7)
+        for event_name in (
+            "contract_runtime.changed",
+            "contract_chain.current_changed",
+            "runtime_context.changed",
+        ):
+            invalidation = next(payload for name, payload in published if name == event_name)
+            self.assertEqual(invalidation["backlog_id"], "BUG-SSE")
+            self.assertEqual(invalidation["contract_execution_id"], "cex-sse")
+            self.assertEqual(invalidation["execution_state_revision"], 7)
 
     def test_queued_event_publishes_timeline_and_current_task_events(self):
         from agent.governance import event_bus, task_timeline

@@ -1325,12 +1325,43 @@ def _publish_timeline_event(inserted_event: dict[str, Any]) -> None:
             "phase": _text(inserted_event.get("phase")),
             "status": _text(inserted_event.get("status")),
         }
+        for key in (
+            "contract_execution_id",
+            "contract_chain_id",
+            "contract_revision_id",
+            "runtime_context_id",
+        ):
+            value = _first_deep_text(inserted_event, key)
+            if value:
+                payload[key] = value
+        revision = _first_deep_value(inserted_event, "execution_state_revision")
+        try:
+            revision = int(revision or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        if revision:
+            payload["execution_state_revision"] = revision
         event_bus._bus.publish("task_timeline.appended", payload)
         event_bus._bus.publish("current_task.changed", {
             **payload,
             "source": "task_timeline.record_event",
             "runtime_state": payload["status"],
         })
+        if payload.get("contract_execution_id"):
+            event_bus._bus.publish("contract_runtime.changed", {
+                **payload,
+                "source": "task_timeline.record_event",
+            })
+        if payload.get("contract_chain_id"):
+            event_bus._bus.publish("contract_chain.current_changed", {
+                **payload,
+                "source": "task_timeline.record_event",
+            })
+        if payload.get("runtime_context_id"):
+            event_bus._bus.publish("runtime_context.changed", {
+                **payload,
+                "source": "task_timeline.record_event",
+            })
     except Exception:
         log.debug("task timeline event publish failed", exc_info=True)
 
@@ -14540,16 +14571,129 @@ def compact_ledger_to_timeline_events(
     *,
     generated_at: str = "",
 ) -> list[dict[str, Any]]:
-    """Return no events because compact-ledger rows are mutable snapshots.
+    """Project mutable ledger rows into stable *current-stream* events.
 
-    The compatibility helper remains for callers during the response-schema
-    transition, but current ContractRuntime projections must never enter the
-    append-only timeline. In particular, neither ``projection_updated_at`` nor
-    response generation time is an event timestamp.
+    These projections are returned separately from append-only history.  Their
+    ids are content/revision identities, and their timestamps come only from a
+    durable projection update (never response-generation time).
     """
 
-    del ledger, generated_at
-    return []
+    del generated_at
+    project_id = str(ledger.get("project_id") or "")
+    events: list[dict[str, Any]] = []
+    for item in ledger.get("rows") or []:
+        if not isinstance(item, Mapping):
+            continue
+        backlog_id = str(item.get("backlog_id") or "").strip()
+        current = _mapping(item.get("contract_chain_current"))
+        runtime_state = _mapping(current.get("contract_runtime_current_state"))
+        execution_id = str(
+            runtime_state.get("contract_execution_id")
+            or item.get("current_contract_execution_id")
+            or item.get("contract_execution_id")
+            or ""
+        ).strip()
+        revision = int(
+            runtime_state.get("execution_state_revision")
+            or item.get("projection_generation")
+            or current.get("generation")
+            or 0
+        )
+        updated_at = str(item.get("projection_updated_at") or "").strip()
+        next_action = _compact_next_legal_action(
+            runtime_state.get("next_legal_action") or item.get("next_legal_action")
+        )
+        status = str(
+            runtime_state.get("readiness_state")
+            or item.get("readiness_state")
+            or item.get("latest_status")
+            or "recorded"
+        )
+        if execution_id:
+            event_id = f"contract-runtime:{execution_id}:rev:{revision}"
+            events.append(
+                {
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": str(
+                        _first_deep_text(runtime_state, "task_id")
+                        or _first_deep_text(next_action, "task_id")
+                        or ""
+                    ),
+                    "event_type": "contract_runtime.current_state",
+                    "event_kind": "contract_runtime_current",
+                    "phase": "current",
+                    "status": status,
+                    "actor": "ContractRuntime",
+                    "correlation_id": execution_id,
+                    "created_at": updated_at,
+                    "payload": {
+                        "schema_version": "contract_runtime.current_stream_event.v1",
+                        "source": "contract_runtime_current",
+                        "synthetic_current": True,
+                        "append_only_history": False,
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": execution_id,
+                        "contract_id": str(
+                            runtime_state.get("contract_id")
+                            or item.get("current_contract_id")
+                            or ""
+                        ),
+                        "contract_chain_id": str(
+                            runtime_state.get("contract_chain_id")
+                            or item.get("contract_chain_id")
+                            or ""
+                        ),
+                        "contract_revision_id": str(
+                            runtime_state.get("contract_revision_id") or ""
+                        ),
+                        "execution_state_revision": revision,
+                        "next_legal_action": next_action,
+                        "projection_updated_at": updated_at,
+                    },
+                }
+            )
+
+        chain_id = str(item.get("contract_chain_id") or "").strip()
+        generation = int(item.get("projection_generation") or current.get("generation") or 0)
+        if chain_id:
+            chain_identity = chain_id
+            event_id = f"contract-chain:{chain_identity}:gen:{generation}"
+            events.append(
+                {
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "event_type": "contract_chain.current_state",
+                    "event_kind": "contract_chain_current",
+                    "phase": "current",
+                    "status": str(item.get("readiness_state") or status),
+                    "actor": "ContractRuntime",
+                    "correlation_id": chain_identity,
+                    "created_at": updated_at,
+                    "payload": {
+                        "schema_version": "contract_chain.current_stream_event.v1",
+                        "source": "backlog_contract_chain_current",
+                        "synthetic_current": True,
+                        "append_only_history": False,
+                        "backlog_id": backlog_id,
+                        "contract_chain_id": chain_id,
+                        "current_contract_execution_id": str(
+                            item.get("current_contract_execution_id") or execution_id
+                        ),
+                        "current_contract_id": str(item.get("current_contract_id") or ""),
+                        "projection_generation": generation,
+                        "projection_watermark": int(item.get("projection_watermark") or 0),
+                        "projection_hash": str(item.get("projection_hash") or ""),
+                        "next_legal_action": _compact_next_legal_action(
+                            item.get("next_legal_action")
+                        ),
+                        "projection_updated_at": updated_at,
+                    },
+                }
+            )
+    return events
 
 
 def _priority_sort_key(priority: Any) -> int:

@@ -357,6 +357,7 @@ export interface RecentTimelineProjectionInput {
   events?: TaskTimelineEvent[];
   compact_ledger?: unknown;
   compactLedger?: unknown;
+  current_stream_events?: TaskTimelineEvent[];
   contract_runtime_projection_events?: TaskTimelineEvent[];
   generated_at?: string;
 }
@@ -1024,7 +1025,22 @@ export function projectRecentTimelineEvents(
   const sourceEvents = Array.isArray(record.events)
     ? record.events.filter(isStablePlaybackSourceEvent)
     : [];
-  return mergeRecentTimelineEvents(sourceEvents);
+  const currentEvents = [
+    ...(Array.isArray(record.current_stream_events) ? record.current_stream_events : []),
+    ...(Array.isArray(record.contract_runtime_projection_events) ? record.contract_runtime_projection_events : []),
+  ].filter(isCurrentStreamProjectionEvent);
+  return mergeRecentTimelineEvents([...currentEvents, ...sourceEvents]);
+}
+
+function isCurrentStreamProjectionEvent(event: TaskTimelineEvent): boolean {
+  const payload = asRecord(event.payload);
+  return booleanFrom(payload.synthetic_current)
+    && booleanFrom(payload.append_only_history) === false
+    && [
+      "contract_runtime.current_state",
+      "contract_chain.current_state",
+      "runtime_context.current_state",
+    ].includes(event.event_type);
 }
 
 function isStablePlaybackSourceEvent(event: TaskTimelineEvent): boolean {

@@ -50038,8 +50038,13 @@ def _publish_current_task_changed(
     source: str = "",
     runtime_state: str = "",
     event_id: Any = "",
+    contract_execution_id: str = "",
+    contract_chain_id: str = "",
+    contract_revision_id: str = "",
+    execution_state_revision: int = 0,
+    runtime_context_id: str = "",
 ) -> None:
-    _publish_event("current_task.changed", {
+    payload = {
         "project_id": project_id,
         "backlog_id": backlog_id,
         "task_id": task_id,
@@ -50047,7 +50052,73 @@ def _publish_current_task_changed(
         "runtime_state": runtime_state,
         "event_id": event_id,
         "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    for key, value in (
+        ("contract_execution_id", contract_execution_id),
+        ("contract_chain_id", contract_chain_id),
+        ("contract_revision_id", contract_revision_id),
+        ("runtime_context_id", runtime_context_id),
+    ):
+        if value:
+            payload[key] = value
+    if execution_state_revision:
+        payload["execution_state_revision"] = int(execution_state_revision)
+    _publish_event("current_task.changed", payload)
+
+
+def _publish_contract_runtime_current_changed(
+    project_id: str,
+    *,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    source: str,
+) -> None:
+    """Invalidate Activity Current after one accepted runtime revision."""
+
+    current = _runtime_current_state_from_record(record)
+    execution_id = str(current.get("contract_execution_id") or "")
+    chain_id = str(current.get("contract_chain_id") or "")
+    revision_id = str(current.get("contract_revision_id") or "")
+    revision = int(current.get("execution_state_revision") or 0)
+    next_action = (
+        current.get("next_legal_action")
+        if isinstance(current.get("next_legal_action"), Mapping)
+        else {}
+    )
+    runtime_context_id = str(next_action.get("runtime_context_id") or "")
+    task_id = str(next_action.get("task_id") or "")
+    payload = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "source": source,
+        "runtime_state": str(current.get("readiness_state") or "recorded"),
+        "contract_execution_id": execution_id,
+        "contract_chain_id": chain_id,
+        "contract_revision_id": revision_id,
+        "execution_state_revision": revision,
+        "runtime_context_id": runtime_context_id,
+        "event_id": f"contract-runtime:{execution_id}:rev:{revision}",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    _publish_event("contract_runtime.changed", payload)
+    if chain_id:
+        _publish_event("contract_chain.current_changed", payload)
+    if runtime_context_id:
+        _publish_event("runtime_context.changed", payload)
+    _publish_current_task_changed(
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        source=source,
+        runtime_state=payload["runtime_state"],
+        event_id=payload["event_id"],
+        contract_execution_id=execution_id,
+        contract_chain_id=chain_id,
+        contract_revision_id=revision_id,
+        execution_state_revision=revision,
+        runtime_context_id=runtime_context_id,
+    )
 
 
 _ROUTE_TOKEN_TASK_CREATE_TYPES = {"dev", "test", "qa", "gatekeeper", "merge", "deploy"}
@@ -81653,11 +81724,42 @@ def handle_task_timeline_list(ctx: RequestContext):
             parent_event_id=parent_event_id,
             limit=limit,
         )
-        compact_ledger = (
-            task_timeline.build_compact_ledger(conn, project_id, events)
-            if include_compact_ledger
-            else None
-        )
+        compact_ledger = None
+        if include_compact_ledger:
+            event_ledger = task_timeline.build_compact_ledger(
+                conn,
+                project_id,
+                events,
+            )
+            if backlog_id:
+                current_ledger = task_timeline.build_contract_runtime_current_ledger(
+                    conn,
+                    project_id,
+                    limit=max(limit, 100),
+                )
+                current_ledger = {
+                    **current_ledger,
+                    "rows": [
+                        row
+                        for row in current_ledger.get("rows") or []
+                        if str(row.get("backlog_id") or "") == backlog_id
+                    ],
+                }
+                current_ledger["row_count"] = len(current_ledger["rows"])
+                compact_ledger = task_timeline.merge_compact_ledgers(
+                    project_id,
+                    event_ledger,
+                    current_ledger,
+                    source_event_count=len(events),
+                )
+            else:
+                compact_ledger = event_ledger
+            compact_ledger = _task_timeline_runtime_fresh_compact_ledger(
+                conn,
+                project_id=project_id,
+                ledger=compact_ledger,
+                task_timeline_module=task_timeline,
+            )
     response = {
         "ok": True,
         "project_id": project_id,
@@ -81722,6 +81824,184 @@ def _task_timeline_recent_compact_event(
     return compact
 
 
+def _task_timeline_runtime_fresh_compact_ledger(
+    conn,
+    *,
+    project_id: str,
+    ledger: Mapping[str, Any],
+    task_timeline_module: Any,
+) -> dict[str, Any]:
+    """Overlay ContractRuntime current state without changing raw history."""
+
+    result = dict(ledger)
+    rows: list[dict[str, Any]] = []
+    for item in ledger.get("rows") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        backlog_id = str(row.get("backlog_id") or "").strip()
+        if backlog_id:
+            current = _contract_chain_current_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                rebuild_if_missing=False,
+            )
+            if current:
+                task_timeline_module._apply_compact_contract_chain_current(
+                    row,
+                    current,
+                )
+                runtime_state = (
+                    current.get("contract_runtime_current_state")
+                    if isinstance(current.get("contract_runtime_current_state"), Mapping)
+                    else {}
+                )
+                execution_id = str(
+                    runtime_state.get("contract_execution_id")
+                    or row.get("current_contract_execution_id")
+                    or ""
+                ).strip()
+                if execution_id:
+                    row["contract_execution_id"] = execution_id
+                    runtime_row = conn.execute(
+                        """
+                        SELECT updated_at
+                        FROM contract_runtime_executions
+                        WHERE project_id = ? AND contract_execution_id = ?
+                        """,
+                        (project_id, execution_id),
+                    ).fetchone()
+                    runtime_updated_at = str(
+                        _row_get(runtime_row, "updated_at", "") if runtime_row else ""
+                    )
+                    if runtime_updated_at > str(row.get("projection_updated_at") or ""):
+                        row["projection_updated_at"] = runtime_updated_at
+                        row["projection_freshness_source"] = (
+                            "contract_runtime_executions.updated_at"
+                        )
+        rows.append(row)
+    result["rows"] = rows
+    result["row_count"] = len(rows)
+    return result
+
+
+def _task_timeline_runtime_context_current_events(
+    conn,
+    *,
+    project_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Return public-safe runtime-context current projections for Activity."""
+
+    has_runtime_contexts = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'parallel_branch_runtime_contexts'
+        """
+    ).fetchone()
+    if not has_runtime_contexts:
+        return []
+    has_revisions = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'parallel_branch_runtime_contract_revisions'
+        """
+    ).fetchone()
+    revision_sql = (
+        """
+        (SELECT revision_id
+           FROM parallel_branch_runtime_contract_revisions revisions
+          WHERE revisions.project_id = contexts.project_id
+            AND revisions.runtime_context_id = contexts.runtime_context_id
+          ORDER BY revisions.created_at DESC, revisions.revision_id DESC
+          LIMIT 1) AS revision_id
+        """
+        if has_revisions
+        else "'' AS revision_id"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT contexts.runtime_context_id, contexts.task_id,
+               contexts.parent_task_id, contexts.backlog_id,
+               contexts.status, contexts.stage_type, contexts.attempt,
+               contexts.checkpoint_id, contexts.merge_queue_id,
+               contexts.head_commit, contexts.updated_at,
+               {revision_sql}
+        FROM parallel_branch_runtime_contexts contexts
+        WHERE contexts.project_id = ? AND contexts.runtime_context_id != ''
+        ORDER BY contexts.updated_at DESC, contexts.runtime_context_id
+        LIMIT ?
+        """,
+        (project_id, max(1, min(int(limit or 100), 500))),
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        runtime_context_id = str(row.get("runtime_context_id") or "").strip()
+        if not runtime_context_id:
+            continue
+        revision = str(
+            row.get("revision_id")
+            or row.get("updated_at")
+            or f"attempt-{int(row.get('attempt') or 0)}"
+        )
+        parent_task_id = str(row.get("parent_task_id") or "")
+        events.append(
+            {
+                "event_id": f"runtime-context:{runtime_context_id}:rev:{revision}",
+                "project_id": project_id,
+                "backlog_id": str(row.get("backlog_id") or ""),
+                "task_id": str(row.get("task_id") or ""),
+                "event_type": "runtime_context.current_state",
+                "event_kind": "runtime_context_current",
+                "phase": "current",
+                "status": str(row.get("status") or "recorded"),
+                "actor": "RuntimeContextService",
+                "correlation_id": runtime_context_id,
+                "created_at": str(row.get("updated_at") or ""),
+                "commit_sha": str(row.get("head_commit") or ""),
+                "payload": {
+                    "schema_version": "runtime_context.current_stream_event.v1",
+                    "source": "parallel_branch_runtime_contexts",
+                    "synthetic_current": True,
+                    "append_only_history": False,
+                    "backlog_id": str(row.get("backlog_id") or ""),
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": str(row.get("task_id") or ""),
+                    "parent_task_id": parent_task_id,
+                    "contract_execution_id": parent_task_id,
+                    "runtime_revision_id": revision,
+                    "stage_type": str(row.get("stage_type") or ""),
+                    "attempt": int(row.get("attempt") or 0),
+                    "checkpoint_id": str(row.get("checkpoint_id") or ""),
+                    "merge_queue_id": str(row.get("merge_queue_id") or ""),
+                    "updated_at": str(row.get("updated_at") or ""),
+                },
+            }
+        )
+    return events
+
+
+def _task_timeline_merge_current_stream_events(
+    *event_lists: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for event in (event for events in event_lists for event in events):
+        event_id = str(event.get("event_id") or event.get("id") or "").strip()
+        if event_id:
+            deduped[event_id] = event
+    return sorted(
+        deduped.values(),
+        key=lambda event: (
+            str(event.get("created_at") or ""),
+            str(event.get("event_id") or ""),
+        ),
+        reverse=True,
+    )[: max(1, min(int(limit or 100), 500))]
+
+
 @route("GET", "/api/task/{project_id}/timeline/recent")
 def handle_task_timeline_recent(ctx: RequestContext):
     """Project-wide recent timeline events, newest-first, cross-row.
@@ -81774,8 +82054,20 @@ def handle_task_timeline_recent(ctx: RequestContext):
             event_ledger,
             source_event_count=len(events),
         )
-        contract_runtime_projection_events = (
-            task_timeline.compact_ledger_to_timeline_events(compact_ledger)
+        compact_ledger = _task_timeline_runtime_fresh_compact_ledger(
+            conn,
+            project_id=project_id,
+            ledger=compact_ledger,
+            task_timeline_module=task_timeline,
+        )
+        contract_runtime_projection_events = _task_timeline_merge_current_stream_events(
+            task_timeline.compact_ledger_to_timeline_events(compact_ledger),
+            _task_timeline_runtime_context_current_events(
+                conn,
+                project_id=project_id,
+                limit=limit,
+            ),
+            limit=limit,
         )
         response_events = (
             [
@@ -81794,6 +82086,7 @@ def handle_task_timeline_recent(ctx: RequestContext):
         "events": response_events,
         "count": len(events),
         "compact_ledger": compact_ledger,
+        "current_stream_events": contract_runtime_projection_events,
         "contract_runtime_projection_events": contract_runtime_projection_events,
         "contract_runtime_projection_event_count": len(contract_runtime_projection_events),
         "order": "newest_first",
@@ -91083,6 +91376,13 @@ def handle_project_onboard_contract_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
+        if result.get("ok") and isinstance(result.get("record"), Mapping):
+            _publish_contract_runtime_current_changed(
+                project_id,
+                backlog_id=str(result["record"].get("backlog_id") or ""),
+                record=result["record"],
+                source="contract_runtime.line_write.accepted",
+            )
     response = {
         "schema_version": "onboard_contract.line_write_response.v1",
         "ok": bool(result.get("ok")),
@@ -92128,6 +92428,13 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
+        if result.get("ok") and isinstance(result.get("record"), Mapping):
+            _publish_contract_runtime_current_changed(
+                project_id,
+                backlog_id=str(result["record"].get("backlog_id") or ""),
+                record=result["record"],
+                source="contract_runtime.line_write.accepted",
+            )
     response = {
         "schema_version": "contract_runtime.line_write_response.v1",
         "ok": bool(result.get("ok")),
