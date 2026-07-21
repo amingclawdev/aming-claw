@@ -417,6 +417,8 @@ export const PRIVATE_EVIDENCE_KEY =
   /(^|[._\s-])(raw_prompt|raw_private_prompt_text|private_prompt|prompt_text|prompt_body|prompt_payload|hidden_prompt|hidden_context|system_prompt|developer_prompt|secret|credential|credentials|password|api_key|access_token|refresh_token|auth_token|one_time_auth|filesystem|cwd|worktree_path|host_path|host_paths|host_home|raw_private_context|private_context|private_context_body|raw_private_route_body|private_route_context_body|private_body|observer_only_context|unmanifested_prompt_text)([._\s-]|$)|(^|[._\s-])token([._\s-]|$)(?!hash)/i;
 const ABSOLUTE_HOST_PATH = /(^|\s)(\/Users\/[^\s,;:]+|\/home\/[^\s,;:]+|\/var\/folders\/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)/g;
 const TOKEN_VALUE = /\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b/g;
+const RAW_TYPED_DAG_SECRET_TEXT = /\braw[-_\s]*(?:route|session)[-_\s]*token\b|(?:route|session)[-_\s]*token\s*[:=]\s*(?!\[private detail redacted\])/i;
+const PRIVATE_DETAIL_REDACTION = "[private detail redacted]";
 
 export function isPrivatePlaybackText(value?: string | null): boolean {
   return isPrivateTimelineText(value);
@@ -544,16 +546,16 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
   const rawIdentityMap = new Map<string, string>();
 
   const addNode = (node: TaskPlaybackDagNode): string => {
-    const id = safeText(node.id);
+    const id = sanitizeTaskPlaybackDagText(node.id, "node.id");
     if (!id) return "";
     const normalized: TaskPlaybackDagNode = {
       ...node,
       id,
-      kind: safeText(node.kind) || "reference",
-      label: safeText(node.label) || id,
-      status: safeText(String(node.status ?? "")),
-      authority_source: safeText(node.authority_source) || "contract_runtime.visualization.dag",
-      evidence_ref: safeText(String(node.evidence_ref ?? "")),
+      kind: sanitizeTaskPlaybackDagText(node.kind, "node.kind") || "reference",
+      label: sanitizeTaskPlaybackDagText(node.label, "node.label") || id,
+      status: sanitizeTaskPlaybackDagText(String(node.status ?? ""), "node.status"),
+      authority_source: sanitizeTaskPlaybackDagText(node.authority_source, "node.authority_source") || "contract_runtime.visualization.dag",
+      evidence_ref: sanitizeTaskPlaybackDagText(String(node.evidence_ref ?? ""), "node.evidence_ref"),
       inferred: Boolean(node.inferred),
     };
     const existing = nodes.get(id);
@@ -565,21 +567,21 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
     const raw = rawNode as ContractRuntimeDagNode;
     const id = normalizedDagNodeId(raw);
     if (!id) continue;
-    rawIdentityMap.set(safeText(String(raw.id ?? "")), id);
+    rawIdentityMap.set(sanitizeTaskPlaybackDagText(String(raw.id ?? ""), "node.id"), id);
     addNode({
       id,
-      kind: safeText(String(raw.kind ?? "reference")),
-      label: safeText(String(raw.label ?? id)),
-      status: safeText(String(raw.status ?? "")),
-      authority_source: safeText(String(raw.authority_source ?? "contract_runtime.visualization.dag")),
-      evidence_ref: safeText(String(raw.evidence_ref ?? "")),
-      backlog_id: safeText(String(raw.backlog_id ?? "")),
-      contract_execution_id: safeText(String(raw.contract_execution_id ?? "")),
-      contract_id: safeText(String(raw.contract_id ?? "")),
-      event_id: safeText(String(raw.event_id ?? "")),
-      task_id: safeText(String(raw.task_id ?? "")),
-      worker_id: safeText(String(raw.worker_id ?? "")),
-      merge_queue_id: safeText(String(raw.merge_queue_id ?? "")),
+      kind: sanitizeTaskPlaybackDagText(String(raw.kind ?? "reference"), "node.kind"),
+      label: sanitizeTaskPlaybackDagText(String(raw.label ?? id), "node.label"),
+      status: sanitizeTaskPlaybackDagText(String(raw.status ?? ""), "node.status"),
+      authority_source: sanitizeTaskPlaybackDagText(String(raw.authority_source ?? "contract_runtime.visualization.dag"), "node.authority_source"),
+      evidence_ref: sanitizeTaskPlaybackDagText(String(raw.evidence_ref ?? ""), "node.evidence_ref"),
+      backlog_id: sanitizeTaskPlaybackDagText(String(raw.backlog_id ?? ""), "node.backlog_id"),
+      contract_execution_id: sanitizeTaskPlaybackDagText(String(raw.contract_execution_id ?? ""), "node.contract_execution_id"),
+      contract_id: sanitizeTaskPlaybackDagText(String(raw.contract_id ?? ""), "node.contract_id"),
+      event_id: sanitizeTaskPlaybackDagText(String(raw.event_id ?? ""), "node.event_id"),
+      task_id: sanitizeTaskPlaybackDagText(String(raw.task_id ?? ""), "node.task_id"),
+      worker_id: sanitizeTaskPlaybackDagText(String(raw.worker_id ?? ""), "node.worker_id"),
+      merge_queue_id: sanitizeTaskPlaybackDagText(String(raw.merge_queue_id ?? ""), "node.merge_queue_id"),
       merge_queue_index: numberFrom(raw.merge_queue_index) ?? undefined,
       inferred: Boolean(raw.inferred),
     });
@@ -639,19 +641,19 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
     evidence_ref: string;
     inferred: boolean;
   }): void => {
-    const source = ensureReferenceNode(safeText(edge.source), edge.authority_source);
-    const target = ensureReferenceNode(safeText(edge.target), edge.authority_source);
-    const relationship = safeText(String(edge.relationship)) as ContractRuntimeDagRelationship;
+    const source = ensureReferenceNode(sanitizeTaskPlaybackDagText(edge.source, "edge.source"), edge.authority_source);
+    const target = ensureReferenceNode(sanitizeTaskPlaybackDagText(edge.target, "edge.target"), edge.authority_source);
+    const relationship = sanitizeTaskPlaybackDagText(String(edge.relationship), "edge.relationship") as ContractRuntimeDagRelationship;
     if (!source || !target || !relationship || source === target) return;
     const stableId = `${relationship}:${source}:${target}`;
-    const authoritySource = safeText(edge.authority_source) || "contract_runtime.visualization.dag";
+    const authoritySource = sanitizeTaskPlaybackDagText(edge.authority_source, "edge.authority_source") || "contract_runtime.visualization.dag";
     const normalized: TaskPlaybackDagEdge = {
       id: stableId,
       source,
       target,
       relationship,
       authority_source: authoritySource,
-      evidence_ref: safeText(edge.evidence_ref || "") || `${authoritySource}:${target}`,
+      evidence_ref: sanitizeTaskPlaybackDagText(edge.evidence_ref || "", "edge.evidence_ref") || `${authoritySource}:${target}`,
       inferred: Boolean(edge.inferred),
     };
     const existing = edges.get(stableId);
@@ -661,11 +663,11 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
   for (const rawEdge of rawDag?.edges ?? []) {
     addEdge({
       id: safeText(String(rawEdge.id ?? "")),
-      source: rawIdentityMap.get(safeText(String(rawEdge.source ?? ""))) || safeText(String(rawEdge.source ?? "")),
-      target: rawIdentityMap.get(safeText(String(rawEdge.target ?? ""))) || safeText(String(rawEdge.target ?? "")),
-      relationship: safeText(String(rawEdge.relationship ?? "related")),
-      authority_source: safeText(String(rawEdge.authority_source ?? "contract_runtime.visualization.dag")),
-      evidence_ref: safeText(String(rawEdge.evidence_ref ?? "")),
+      source: rawIdentityMap.get(sanitizeTaskPlaybackDagText(String(rawEdge.source ?? ""), "edge.source")) || sanitizeTaskPlaybackDagText(String(rawEdge.source ?? ""), "edge.source"),
+      target: rawIdentityMap.get(sanitizeTaskPlaybackDagText(String(rawEdge.target ?? ""), "edge.target")) || sanitizeTaskPlaybackDagText(String(rawEdge.target ?? ""), "edge.target"),
+      relationship: sanitizeTaskPlaybackDagText(String(rawEdge.relationship ?? "related"), "edge.relationship"),
+      authority_source: sanitizeTaskPlaybackDagText(String(rawEdge.authority_source ?? "contract_runtime.visualization.dag"), "edge.authority_source"),
+      evidence_ref: sanitizeTaskPlaybackDagText(String(rawEdge.evidence_ref ?? ""), "edge.evidence_ref"),
       inferred: Boolean(rawEdge.inferred),
     });
   }
@@ -4348,6 +4350,37 @@ function sanitizeEvidenceString(value: string, path = ""): string {
   if (!redacted) return "";
   if (isSensitiveEvidencePath(path) || isSensitiveEvidenceText(redacted, path)) return "[private detail redacted]";
   return redacted;
+}
+
+function sanitizeTaskPlaybackDagText(value: string, field: string): string {
+  const sanitized = sanitizeEvidenceString(value, `contract_runtime.visualization.dag.${field}`);
+  return RAW_TYPED_DAG_SECRET_TEXT.test(sanitized) ? PRIVATE_DETAIL_REDACTION : sanitized;
+}
+
+/** Return the first unsafe field path so API boundaries can reject falsely public-safe DAGs. */
+export function typedDagRawSecretPath(dag: unknown): string {
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown, path: string): string => {
+    if (typeof value === "string") {
+      return isSensitiveEvidencePath(path) || RAW_TYPED_DAG_SECRET_TEXT.test(value) ? path : "";
+    }
+    if (value == null || typeof value !== "object") return "";
+    if (seen.has(value)) return "";
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const match = visit(value[index], `${path}.${index}`);
+        if (match) return match;
+      }
+      return "";
+    }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const match = visit(item, `${path}.${key}`);
+      if (match) return match;
+    }
+    return "";
+  };
+  return visit(dag, "contract_runtime.visualization.dag");
 }
 
 function isSensitiveEvidenceText(value: string, path = ""): boolean {

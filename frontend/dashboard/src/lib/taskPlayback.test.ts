@@ -11,6 +11,7 @@ import {
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
+  typedDagRawSecretPath,
   displayPlaybackFrames,
   latestPlaybackFrameId,
   pushPlaybackNavStack,
@@ -1285,6 +1286,48 @@ function taskPlaybackTypedDagAssertions(): string[] {
   for (const required of ["backlog_parent", "backlog_child", "backlog_successor", "batch_row_dispatch", "worker_qa_failed", "worker_qa_rework", "worker_qa_passed", "ordered_merge_queue", "reconcile", "settlement", "close", "bypass", "waiver", "parent_event"]) {
     assertFixture(relationTypes.has(required), `typed DAG consumer should expose ${required}`);
   }
+
+  const rawSessionSecret = "raw-session-token-should-not-render";
+  const rawRouteSecret = "raw-route-token-should-not-render";
+  const unsafeVisualization = typedDagVisualizationFixture(
+    "mf_parallel.v2",
+    [
+      {
+        id: "node:unsafe",
+        kind: "worker",
+        label: rawSessionSecret,
+        authority_source: `route_token:${rawRouteSecret}`,
+        evidence_ref: `session_token=${rawSessionSecret}`,
+      },
+      node("node:safe-target", "qa"),
+    ],
+    [
+      {
+        ...edge("worker_qa_failed", "node:unsafe", "node:safe-target"),
+        authority_source: `route_token:${rawRouteSecret}`,
+        evidence_ref: `session_token=${rawSessionSecret}`,
+      },
+    ],
+  );
+  assertFixture(
+    typedDagRawSecretPath(unsafeVisualization.dag) === "contract_runtime.visualization.dag.nodes.0.label",
+    "API boundary helper should locate the first falsely public-safe raw DAG secret field",
+  );
+  const sanitizedUnsafeDag = normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events: [], visualization: unsafeVisualization });
+  const sanitizedUnsafeNode = sanitizedUnsafeDag.nodes.find((item) => item.id === "node:unsafe");
+  const sanitizedUnsafeEdge = sanitizedUnsafeDag.edges.find((item) => item.source === "node:unsafe" && item.target === "node:safe-target");
+  assertFixture(Boolean(sanitizedUnsafeNode && sanitizedUnsafeEdge), "unsafe DAG fixture should remain structurally inspectable after redaction");
+  for (const [field, value] of Object.entries({
+    "node.label": sanitizedUnsafeNode?.label,
+    "node.authority_source": sanitizedUnsafeNode?.authority_source,
+    "node.evidence_ref": sanitizedUnsafeNode?.evidence_ref,
+    "edge.authority_source": sanitizedUnsafeEdge?.authority_source,
+    "edge.evidence_ref": sanitizedUnsafeEdge?.evidence_ref,
+  })) {
+    assertFixture(value === "[private detail redacted]", `${field} should redact raw route/session secret material`);
+  }
+  const sanitizedUnsafeJson = JSON.stringify(sanitizedUnsafeDag);
+  assertFixture(!sanitizedUnsafeJson.includes(rawSessionSecret) && !sanitizedUnsafeJson.includes(rawRouteSecret), "public-safe typed DAG normalization must not retain raw route/session secrets");
 
   const sharedEvent: TaskTimelineEvent = {
     event_id: "shared-event-1",
