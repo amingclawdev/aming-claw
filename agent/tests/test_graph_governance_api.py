@@ -66635,6 +66635,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     # server-derived bindings remain sufficient for read-only compatibility.
     historical_base_commit = "469e167f3b1f48bb1dbdf83cc696057be39d0959"
     historical_candidate_commit = "6d26c32d8347863ba3049a02c1ad722fec9fb489"
+    historical_contract_execution_id = "cex-mf-parallel-87fbdfddeff1876e8617"
     historical_failure_ids = [
         "agent/tests/test_graph_governance_api.py::test_parallel_branch_finish_gate_graph_trace_gap_is_non_closeable_recovery",
         "agent/tests/test_graph_governance_api.py::test_bounded_worker_dispatch_recovery_projects_host_envelope_handoff",
@@ -66727,6 +66728,7 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     )
     historical_line["payload"] = {
         "schema_version": "mf_parallel.qa_independent_verification.v1",
+        "contract_execution_id": historical_contract_execution_id,
         "base_commit_sha": historical_base_commit,
         "candidate_commit_sha": historical_candidate_commit,
         "acceptance_scope": "candidate_regression_and_acceptance_criteria",
@@ -66744,7 +66746,86 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         },
     }
     assert "server_normalized" not in historical_ledger
-    assert _line_status_allows_contract_completion(historical_line) is True
+    assert _line_status_allows_contract_completion(historical_line) is False
+
+    # Even a fully redundant, internally consistent current candidate line is
+    # not legacy authority after only its normalization markers are removed.
+    freshly_normalized_redundant = json.loads(json.dumps(historical_line))
+    fresh_base_commit = expected_graph_evidence["base_commit_sha"]
+    fresh_candidate_commit = head_commit
+    freshly_normalized_redundant.update(
+        {
+            "commit_sha": fresh_candidate_commit,
+            "immutable_head_commit": fresh_candidate_commit,
+            "validated_head_commit": fresh_candidate_commit,
+        }
+    )
+    fresh_payload = freshly_normalized_redundant["payload"]
+    fresh_payload["base_commit_sha"] = fresh_base_commit
+    fresh_payload["candidate_commit_sha"] = fresh_candidate_commit
+    for results in (
+        freshly_normalized_redundant["test_results"],
+        fresh_payload["test_results"],
+    ):
+        results["baseline_commit_sha"] = fresh_base_commit
+        results["candidate_commit_sha"] = fresh_candidate_commit
+    for fresh_ledger in (
+        freshly_normalized_redundant["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ],
+        fresh_payload["artifact_refs"]["external_no_pass_baseline_ledger"],
+    ):
+        fresh_ledger["base_commit_sha"] = fresh_base_commit
+        fresh_ledger["candidate_commit_sha"] = fresh_candidate_commit
+        fresh_ledger["server_normalized"] = True
+    assert (
+        _line_status_allows_contract_completion(freshly_normalized_redundant)
+        is True
+    )
+    marker_stripped_redundant = json.loads(
+        json.dumps(freshly_normalized_redundant)
+    )
+    marker_stripped_redundant["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ].pop("server_normalized")
+    marker_stripped_redundant["payload"]["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ].pop("server_normalized")
+    assert (
+        _line_status_allows_contract_completion(marker_stripped_redundant)
+        is False
+    )
+
+    # A reconstructed current record can make every neighboring graph,
+    # principal, session, commit, trace, and ledger field agree.  It remains
+    # ineligible without the narrowly pinned persisted historical identity.
+    reconstructed_record = json.loads(json.dumps(stored_after_qa))
+    reconstructed_execution_id = "cex-reconstructed-no-pass-adversary"
+    reconstructed_record["contract_execution_id"] = reconstructed_execution_id
+    reconstructed_line = json.loads(json.dumps(marker_stripped_redundant))
+    reconstructed_line["graph_trace_ids"] = [qa_graph_trace_id]
+    reconstructed_line["payload"][
+        "contract_execution_id"
+    ] = reconstructed_execution_id
+    reconstructed_record["completed_lines"] = [
+        reconstructed_line
+        if line["line_id"] == "qa_independent_verification"
+        else line
+        for line in reconstructed_record["completed_lines"]
+    ]
+    reconstructed_line_index = next(
+        index
+        for index, line in enumerate(reconstructed_record["completed_lines"])
+        if line["line_id"] == "qa_independent_verification"
+    )
+    assert (
+        _line_status_allows_contract_completion(
+            reconstructed_record["completed_lines"][reconstructed_line_index],
+            source_record=reconstructed_record,
+            source_line_index=reconstructed_line_index,
+        )
+        is False
+    )
 
     invalid_historical_lines = []
     historical_explicit_false = json.loads(json.dumps(historical_line))
@@ -66786,13 +66867,84 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     # Exercise the candidate source runtime against a persisted historical
     # line, not only the predicate: the next projected owner is observer_merge.
     historical_record = json.loads(json.dumps(stored_after_qa))
+    historical_record["contract_execution_id"] = historical_contract_execution_id
     historical_record["completed_lines"] = [
         historical_line if line["line_id"] == "qa_independent_verification" else line
         for line in historical_record["completed_lines"]
     ]
+    historical_graph_line = [
+        line
+        for line in historical_record["completed_lines"]
+        if line["line_id"] == "qa_graph_context"
+    ][0]
+    historical_graph_line["commit_sha"] = historical_candidate_commit
+    historical_graph_line["graph_trace_ids"] = historical_line["graph_trace_ids"]
+    historical_graph_line["graph_query_trace_ids"] = historical_line[
+        "graph_trace_ids"
+    ]
+    historical_graph_line["payload"]["graph_trace_ids"] = historical_line[
+        "graph_trace_ids"
+    ]
+    historical_graph_line["payload"]["graph_query_trace_ids"] = historical_line[
+        "graph_trace_ids"
+    ]
+    historical_graph_evidence = historical_graph_line["payload"][
+        "graph_trace_evidence"
+    ]
+    historical_graph_evidence.update(
+        {
+            "base_commit_sha": historical_base_commit,
+            "candidate_commit_sha": historical_candidate_commit,
+            "candidate_commit": historical_candidate_commit,
+            "trace_ids": historical_line["graph_trace_ids"],
+            "verified_trace_ids": historical_line["graph_trace_ids"],
+            "requested_trace_ids": historical_line["graph_trace_ids"],
+            "missing_trace_ids": [],
+            "identity_mismatches": [],
+            "db_verified": True,
+        }
+    )
+    historical_graph_index = next(
+        index
+        for index, line in enumerate(historical_record["completed_lines"])
+        if line["line_id"] == "qa_graph_context"
+    )
+    historical_qa_index = next(
+        index
+        for index, line in enumerate(historical_record["completed_lines"])
+        if line["line_id"] == "qa_independent_verification"
+    )
+    assert historical_graph_index < historical_qa_index <= 10
+    historical_padding_count = 10 - historical_qa_index
+    historical_record["completed_lines"][
+        historical_graph_index:historical_graph_index
+    ] = [
+        {
+            "stage_id": "historical_context",
+            "line_id": f"historical_persisted_context_{index}",
+            "actor_role": "observer",
+            "evidence_kind": "historical_context",
+            "status": "accepted",
+        }
+        for index in range(historical_padding_count)
+    ]
+    historical_qa_index = next(
+        index
+        for index, line in enumerate(historical_record["completed_lines"])
+        if line["line_id"] == "qa_independent_verification"
+    )
+    assert historical_qa_index == 10
+    assert (
+        _line_status_allows_contract_completion(
+            historical_record["completed_lines"][historical_qa_index],
+            source_record=historical_record,
+            source_line_index=historical_qa_index,
+        )
+        is True
+    )
     runtime_store = server._contract_runtime_store(conn)
-    runtime_store.update(successor["contract_execution_id"], historical_record)
-    persisted_historical = runtime_store.get(successor["contract_execution_id"])
+    runtime_store.create(historical_record)
+    persisted_historical = runtime_store.get(historical_contract_execution_id)
     persisted_historical_line = [
         line
         for line in persisted_historical["completed_lines"]
@@ -66805,13 +66957,12 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
         _ctx_with_role(
             {
                 "project_id": PID,
-                "contract_execution_id": successor["contract_execution_id"],
+                "contract_execution_id": historical_contract_execution_id,
             },
             "observer",
         )
     )
     assert historical_projection["next_legal_action"]["line_id"] == "observer_merge"
-    runtime_store.update(successor["contract_execution_id"], stored_after_qa)
 
     # Source-runtime eligibility is narrow: the inherited non-green counts may
     # advance only while every authenticated canonical ledger invariant holds.

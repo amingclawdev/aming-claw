@@ -1543,7 +1543,7 @@ def _find_direct_fix_repair_line(record: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(record.get("completed_lines"), list)
         else []
     )
-    after_index = _last_failed_qa_line_index(lines)
+    after_index = _last_failed_qa_line_index(lines, source_record=record)
     if _direct_fix_graph_gates_active(record):
         worker_graph = _find_completed_line(
             record,
@@ -1607,7 +1607,11 @@ def _find_direct_fix_qa_line(
             continue
         if str(line.get("evidence_kind") or "").strip() not in DIRECT_FIX_QA_EVIDENCE_KINDS:
             continue
-        if not _line_status_allows_direct_fix_qa(line):
+        if not _line_status_allows_direct_fix_qa(
+            line,
+            source_record=record,
+            source_line_index=index,
+        ):
             continue
         explicit_scope_matches = _line_scope_matches_direct_fix_child(
             line,
@@ -1730,8 +1734,17 @@ def _parent_resume_ack_line_matches(
     return True
 
 
-def _line_status_allows_direct_fix_qa(line: Mapping[str, Any]) -> bool:
-    return _line_status_allows_contract_completion(line)
+def _line_status_allows_direct_fix_qa(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
+    return _line_status_allows_contract_completion(
+        line,
+        source_record=source_record,
+        source_line_index=source_line_index,
+    )
 
 
 _CONTRACT_COMPLETION_BLOCKING_STATUSES = frozenset(
@@ -1764,13 +1777,18 @@ _CONTRACT_COMPLETION_FAILURE_COUNT_FIELDS = frozenset(
 def _contract_completion_satisfying_lines(
     lines: Sequence[Mapping[str, Any]],
     *,
+    source_record: Mapping[str, Any] | None = None,
     failed_qa_rejoin_contexts: set[tuple[str, str]] | None = None,
     failed_qa_rejoin_markers: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[Mapping[str, Any]]:
-    last_failed_qa_index = _last_failed_qa_line_index(lines)
+    last_failed_qa_index = _last_failed_qa_line_index(
+        lines,
+        source_record=source_record,
+    )
     post_failed_retry_contexts = _post_failed_qa_retry_context_keys(
         lines,
         failed_qa_index=last_failed_qa_index,
+        source_record=source_record,
     )
     post_failed_retry_contexts.update(failed_qa_rejoin_contexts or set())
     failed_qa_rejoin_boundaries = _failed_qa_rejoin_boundaries(
@@ -1805,7 +1823,9 @@ def _contract_completion_satisfying_lines(
             ):
                 continue
         if isinstance(line, Mapping) and not _line_status_allows_contract_completion(
-            line
+            line,
+            source_record=source_record,
+            source_line_index=index,
         ):
             continue
         satisfying.append(line)
@@ -1924,8 +1944,15 @@ def _compat_completion_lines_for_record(
     return [*list(line_items), *additions]
 
 
-def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
-    failed_index = _last_failed_qa_line_index(lines)
+def _active_failed_qa_line_index(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> int:
+    failed_index = _last_failed_qa_line_index(
+        lines,
+        source_record=source_record,
+    )
     if failed_index < 0:
         return -1
     for index, line in enumerate(lines):
@@ -1935,7 +1962,11 @@ def _active_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
             continue
         if not _line_shape_allows_contract_completion(line):
             continue
-        if _line_status_allows_contract_completion(line):
+        if _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=index,
+        ):
             return -1
     return failed_index
 
@@ -1944,8 +1975,12 @@ def _attach_failed_qa_rework_guidance(
     guide: dict[str, Any],
     *,
     line_items: Sequence[Mapping[str, Any]],
+    source_record: Mapping[str, Any] | None = None,
 ) -> None:
-    failed_index = _active_failed_qa_line_index(line_items)
+    failed_index = _active_failed_qa_line_index(
+        line_items,
+        source_record=source_record,
+    )
     if failed_index < 0:
         return
     next_action = guide.get("next_legal_action")
@@ -1977,14 +2012,22 @@ def _attach_failed_qa_rework_guidance(
     guide.setdefault("failed_qa_rework", blocker)
 
 
-def _last_failed_qa_line_index(lines: Sequence[Mapping[str, Any]]) -> int:
+def _last_failed_qa_line_index(
+    lines: Sequence[Mapping[str, Any]],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> int:
     failed_index = -1
     for index, line in enumerate(lines):
         if not isinstance(line, Mapping):
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
-        if not _line_status_allows_contract_completion(line):
+        if not _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=index,
+        ):
             failed_index = index
     return failed_index
 
@@ -2035,16 +2078,24 @@ def _post_failed_qa_retry_context_keys(
     lines: Sequence[Mapping[str, Any]],
     *,
     failed_qa_index: int,
+    source_record: Mapping[str, Any] | None = None,
 ) -> set[tuple[str, str]]:
     if failed_qa_index < 0:
         return set()
     contexts: set[tuple[str, str]] = set()
-    for line in lines[failed_qa_index + 1 :]:
+    for index, line in enumerate(
+        lines[failed_qa_index + 1 :],
+        start=failed_qa_index + 1,
+    ):
         if not isinstance(line, Mapping):
             continue
         if str(line.get("line_id") or "").strip() not in _FAILED_QA_RETRY_PROOF_LINE_IDS:
             continue
-        if not _line_status_allows_contract_completion(line):
+        if not _line_status_allows_contract_completion(
+            line,
+            source_record=source_record,
+            source_line_index=index,
+        ):
             continue
         contexts.update(_line_retry_context_keys(line))
     return contexts
@@ -2554,13 +2605,22 @@ def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:
     return not (blocked_schemas and schema_version in blocked_schemas)
 
 
-def _line_status_allows_contract_completion(line: Mapping[str, Any]) -> bool:
+def _line_status_allows_contract_completion(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
+) -> bool:
     if _mapping_own_fields_contain_contract_completion_blocker(line):
         return False
     line_id = str(line.get("line_id") or "").strip()
     canonical_no_pass = bool(
         line_id == "qa_independent_verification"
-        and _qa_independent_verification_canonical_no_pass_completion(line)
+        and _qa_independent_verification_canonical_no_pass_completion(
+            line,
+            source_record=source_record,
+            source_line_index=source_line_index,
+        )
     )
     if _contains_contract_completion_blocker(line.get("qa_evidence_provenance")):
         return False
@@ -2610,10 +2670,20 @@ _QA_NO_PASS_PAYLOAD_SCHEMA_VERSIONS = frozenset(
         "mf_parallel.qa_independent_verification.v1",
     }
 )
+# The migration predates ``server_normalized`` on this one stored QA line.
+# New lines must carry the marker and cannot opt into compatibility by shape.
+_QA_NO_PASS_PRE_MARKER_PERSISTED_LINE_IDENTITIES = frozenset(
+    {
+        ("cex-mf-parallel-87fbdfddeff1876e8617", 10),
+    }
+)
 
 
 def _qa_independent_verification_canonical_no_pass_completion(
     line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None = None,
+    source_line_index: int = -1,
 ) -> bool:
     """Recognize only the authenticated canonical no-PASS ledger.
 
@@ -2813,6 +2883,8 @@ def _qa_independent_verification_canonical_no_pass_completion(
         base_failures=base_failures,
         candidate_failures=candidate_failures,
         passed=passed,
+        source_record=source_record,
+        source_line_index=source_line_index,
     ):
         return False
 
@@ -2857,6 +2929,8 @@ def _qa_no_pass_ledger_marker_allows_completion(
     base_failures: tuple[str, ...],
     candidate_failures: tuple[str, ...],
     passed: int,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
 ) -> bool:
     """Accept current normalization or the immutable pre-marker line shape.
 
@@ -2870,6 +2944,14 @@ def _qa_no_pass_ledger_marker_allows_completion(
     if ledger.get("server_normalized") is True:
         return True
     if "server_normalized" in ledger:
+        return False
+    if not _qa_no_pass_persisted_legacy_source_context(
+        line,
+        source_record=source_record,
+        source_line_index=source_line_index,
+        base_commit=base_commit,
+        candidate_commit=candidate_commit,
+    ):
         return False
 
     principal = str(binding.get("qa_principal") or "").strip()
@@ -3025,6 +3107,143 @@ def _qa_no_pass_ledger_marker_allows_completion(
         and payload_ledger.get("overall_release_pass_claimed") is False
         and list(payload_ledger.get("refs") or [])
     )
+
+
+def _qa_no_pass_persisted_legacy_source_context(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
+    base_commit: str,
+    candidate_commit: str,
+) -> bool:
+    """Bind pre-marker compatibility to one trusted persisted record member."""
+
+    if not isinstance(source_record, Mapping):
+        return False
+    stored_lines = source_record.get("completed_lines")
+    if not isinstance(stored_lines, list):
+        return False
+    persisted_line_indexes = [
+        index
+        for index, stored_line in enumerate(stored_lines)
+        if stored_line is line or stored_line == line
+    ]
+    if len(persisted_line_indexes) != 1:
+        return False
+    persisted_line_index = persisted_line_indexes[0]
+    if source_line_index < 0:
+        return False
+    persisted_identity = (
+        str(source_record.get("contract_execution_id") or "").strip(),
+        persisted_line_index,
+    )
+    if persisted_identity not in _QA_NO_PASS_PRE_MARKER_PERSISTED_LINE_IDENTITIES:
+        return False
+    if not (
+        str(source_record.get("schema_version") or "")
+        == "contract_runtime_execution_record.v1"
+        and _record_contract_id(source_record) in {"mf_parallel", "mf_parallel.v2"}
+        and str(source_record.get("project_id") or "").strip()
+        and str(source_record.get("backlog_id") or "").strip()
+        and str(source_record.get("contract_execution_id") or "").strip()
+    ):
+        return False
+
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    execution_id = str(source_record.get("contract_execution_id") or "").strip()
+    if str(payload.get("contract_execution_id") or "").strip() != execution_id:
+        return False
+    line_trace_ids = _qa_no_pass_failure_identities(line.get("graph_trace_ids"))
+    if not line_trace_ids:
+        return False
+
+    provenance = (
+        line.get("qa_evidence_provenance")
+        if isinstance(line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    principal = str(binding.get("qa_principal") or "").strip()
+    session_id = str(binding.get("qa_session_id") or "").strip()
+
+    for graph_line in reversed(stored_lines[:persisted_line_index]):
+        if not isinstance(graph_line, Mapping):
+            continue
+        if str(graph_line.get("line_id") or "").strip() != "qa_graph_context":
+            continue
+        graph_payload = (
+            graph_line.get("payload")
+            if isinstance(graph_line.get("payload"), Mapping)
+            else {}
+        )
+        graph_evidence = (
+            graph_payload.get("graph_trace_evidence")
+            if isinstance(graph_payload.get("graph_trace_evidence"), Mapping)
+            else {}
+        )
+        graph_provenance = (
+            graph_line.get("qa_evidence_provenance")
+            if isinstance(graph_line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        graph_binding = (
+            graph_provenance.get("authenticated_qa_binding")
+            if isinstance(
+                graph_provenance.get("authenticated_qa_binding"), Mapping
+            )
+            else {}
+        )
+        graph_trace_ids = _qa_no_pass_failure_identities(
+            graph_evidence.get("verified_trace_ids")
+            or graph_evidence.get("trace_ids")
+        )
+        if (
+            str(graph_line.get("actor_role") or "").strip() == "qa"
+            and str(graph_line.get("status") or "").strip().lower() == "accepted"
+            and str(graph_line.get("authorization_source") or "")
+            == "qa_session_token_ref"
+            and graph_line.get("observer_impersonation") is False
+            and graph_line.get("parent_materialization_authorized") is False
+            and str(graph_provenance.get("schema_version") or "")
+            == "qa_evidence_provenance.v1"
+            and str(graph_provenance.get("source") or "")
+            == "contract_runtime_qa_graph_authority_binding"
+            and graph_provenance.get("server_derived") is True
+            and str(graph_binding.get("schema_version") or "")
+            == "contract_runtime.authenticated_qa_binding.v1"
+            and graph_binding.get("server_derived") is True
+            and graph_binding.get("graph_trace_session_matched") is True
+            and str(graph_binding.get("qa_principal") or "").strip() == principal
+            and str(graph_binding.get("qa_session_id") or "").strip() == session_id
+            and str(graph_line.get("commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(graph_evidence.get("base_commit_sha") or "").strip().lower()
+            == base_commit
+            and str(
+                graph_evidence.get("candidate_commit_sha")
+                or graph_evidence.get("candidate_commit")
+                or ""
+            )
+            .strip()
+            .lower()
+            == candidate_commit
+            and graph_evidence.get("db_verified") is True
+            and not list(graph_evidence.get("missing_trace_ids") or [])
+            and not list(graph_evidence.get("identity_mismatches") or [])
+            and graph_trace_ids
+            and set(line_trace_ids).issubset(set(graph_trace_ids))
+            and str(graph_evidence.get("project_id") or "").strip()
+            == str(source_record.get("project_id") or "").strip()
+            and str(graph_evidence.get("backlog_id") or "").strip()
+            == str(source_record.get("backlog_id") or "").strip()
+        ):
+            return True
+    return False
 
 
 def _qa_no_pass_failure_identities(value: Any) -> tuple[str, ...]:
@@ -3978,6 +4197,7 @@ class ContractRuntime:
         )
         completion_satisfying_lines = _contract_completion_satisfying_lines(
             completion_input_lines,
+            source_record=record,
             failed_qa_rejoin_contexts=(
                 _failed_qa_rejoin_context_keys_from_projection(projection)
             ),
@@ -4002,7 +4222,11 @@ class ContractRuntime:
             instruction_bundle=instruction_bundle,
             judgment_hints=_record_judgment_hints(record),
         )
-        _attach_failed_qa_rework_guidance(guide, line_items=line_items)
+        _attach_failed_qa_rework_guidance(
+            guide,
+            line_items=line_items,
+            source_record=record,
+        )
         _attach_completed_line_evidence(guide, line_items)
         sanitized_projection: dict[str, Any] = {}
         if projection:
@@ -4209,7 +4433,10 @@ class ContractRuntime:
 
         record = self.store.get(contract_execution_id)
         lines = list(record.get("completed_lines") or [])
-        failed_qa_index = _active_failed_qa_line_index(lines)
+        failed_qa_index = _active_failed_qa_line_index(
+            lines,
+            source_record=record,
+        )
         payload = (
             dict(effective_write.get("payload"))
             if isinstance(effective_write.get("payload"), Mapping)
