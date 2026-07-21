@@ -383,6 +383,42 @@ export interface ContractRuntimeAuthorityCacheIdentity {
   key: string;
 }
 
+export type ContractRuntimeCompatibilityRepairType =
+  | "blocker_id"
+  | "diagnostic_backlog_id"
+  | "missing_requirement_id"
+  | "missing_event_kind"
+  | "contract_line"
+  | "contract_stage"
+  | "source_event_id"
+  | "source_authority"
+  | "source_missing_repair_id"
+  | string;
+
+export interface ContractRuntimeCompatibilitySource {
+  id: string;
+  source_authority: string;
+  source_event_id: string;
+  source_event_ref: string;
+  source_event_kind: string;
+  blocked: boolean;
+  advisory_only: true;
+  overrides_current_authority: false;
+  raw_fields: Record<string, string>;
+}
+
+export interface ContractRuntimeCompatibilityRepairTarget {
+  id: string;
+  type: ContractRuntimeCompatibilityRepairType;
+  repair_id: string;
+  source_field: string;
+  source_authority: string;
+  source_event_id: string;
+  source_event_ref: string;
+  advisory_only: true;
+  overrides_current_authority: false;
+}
+
 export interface ContractRuntimeAuthorityViewModel {
   schema_version: "contract_runtime.authority_view_model.v1";
   project_id: string;
@@ -406,6 +442,8 @@ export interface ContractRuntimeAuthorityViewModel {
     legacy_advisories: Record<string, unknown>[];
     bypass_records: Record<string, unknown>[];
     projection_conflicts: Record<string, unknown>[];
+    raw_compatibility_sources: ContractRuntimeCompatibilitySource[];
+    repair_targets: ContractRuntimeCompatibilityRepairTarget[];
     current_snapshot_in_playback: false;
     append_only: boolean;
     truncated: boolean;
@@ -462,6 +500,7 @@ export function contractRuntimeAuthorityDisplayStatus(
 export function projectContractRuntimeAuthorityViewModel(
   response: ContractRuntimeVisualizationResponse,
 ): ContractRuntimeAuthorityViewModel {
+  const compatibility = normalizeContractRuntimeCompatibility(response);
   const runtimeAction = response.contract_execution_progress.next_legal_action ?? {};
   const chainAction = response.contract_chain.next_legal_action ?? {};
   const runtimeActionPresent = Object.keys(runtimeAction).length > 0;
@@ -530,12 +569,160 @@ export function projectContractRuntimeAuthorityViewModel(
       legacy_advisories: [...response.legacy_advisories],
       bypass_records: [...response.bypass_records],
       projection_conflicts: [...response.projection_conflicts],
+      raw_compatibility_sources: compatibility.sources,
+      repair_targets: compatibility.repairTargets,
       current_snapshot_in_playback: false,
       append_only: response.timeline.append_only,
       truncated: response.timeline.truncated,
       next_cursor: response.timeline.next_cursor,
     },
   };
+}
+
+const CONTRACT_RUNTIME_REPAIR_LABELS: Record<string, string> = {
+  blocker_id: "Blocker ID",
+  diagnostic_backlog_id: "Diagnostic backlog ID",
+  missing_requirement_id: "Missing requirement ID",
+  missing_event_kind: "Missing event kind",
+  contract_line: "Contract line",
+  contract_stage: "Contract stage",
+  source_event_id: "Source event",
+  source_authority: "Source authority",
+  source_missing_repair_id: "Missing stable repair ID",
+};
+
+/**
+ * Shared public-safe formatter for Activity Current, Playback, and Backlog.
+ * Canonical ContractRuntime state remains authoritative; compatibility repair
+ * targets are explicitly labelled advisory and are emitted only for sources
+ * whose backend projection says `blocked=true`.
+ */
+export function contractRuntimeCompatibilityRepairValues(
+  authority: ContractRuntimeAuthorityViewModel | null | undefined,
+): string[] {
+  if (!authority) return [];
+  const sources = authority.historical_diagnostics.raw_compatibility_sources;
+  return authority.historical_diagnostics.repair_targets.map((target) => {
+    const source = compatibilitySourceForTarget(sources, target);
+    const label = CONTRACT_RUNTIME_REPAIR_LABELS[target.type] || humanizeRepairType(target.type);
+    const value = sanitizeTaskPlaybackEvidenceText(target.repair_id, `repair_targets.${target.type}`);
+    const sourceIdentity = sanitizeTaskPlaybackEvidenceText(
+      source?.id || target.source_event_ref || target.source_event_id || target.source_authority,
+      "raw_compatibility.source_identity",
+    );
+    const eventId = sanitizeTaskPlaybackEvidenceText(
+      target.source_event_id || source?.source_event_id || "",
+      "repair_targets.source_event_id",
+    );
+    const authorityLabel = sanitizeTaskPlaybackEvidenceText(
+      target.source_authority || source?.source_authority || "",
+      "repair_targets.source_authority",
+    );
+    const parts = [`${label}: ${value || "source_missing_repair_id"}`];
+    if (target.type !== "source_event_id" && eventId) parts.push(`Source event: #${eventId}`);
+    if (target.type !== "source_authority" && authorityLabel) parts.push(`Source authority: ${authorityLabel}`);
+    if (target.type === "source_missing_repair_id") {
+      if (sourceIdentity) parts.push(`Compatibility source: ${sourceIdentity}`);
+      const rawFields = compatibilityRawFieldValues(source?.raw_fields ?? {});
+      parts.push(`Raw compatibility: ${rawFields.length > 0 ? rawFields.join(", ") : "blocked=true; no stable repair ID"}`);
+    }
+    return parts.join(" · ");
+  });
+}
+
+function normalizeContractRuntimeCompatibility(
+  response: ContractRuntimeVisualizationResponse,
+): {
+  sources: ContractRuntimeCompatibilitySource[];
+  repairTargets: ContractRuntimeCompatibilityRepairTarget[];
+} {
+  const responseRecord = response as unknown as Record<string, unknown>;
+  const rawCompatibility = asRecord(responseRecord.raw_compatibility);
+  const sources = (Array.isArray(rawCompatibility.sources) ? rawCompatibility.sources : [])
+    .map(normalizeCompatibilitySource)
+    .filter((source): source is ContractRuntimeCompatibilitySource => Boolean(source));
+  const blockedSourceIds = new Set(sources.filter((source) => source.blocked).map((source) => source.id));
+  const repairTargets = (Array.isArray(responseRecord.repair_targets) ? responseRecord.repair_targets : [])
+    .map(normalizeCompatibilityRepairTarget)
+    .filter((target): target is ContractRuntimeCompatibilityRepairTarget => {
+      if (!target) return false;
+      const source = compatibilitySourceForTarget(sources, target);
+      return source ? blockedSourceIds.has(source.id) : true;
+    });
+  return { sources, repairTargets };
+}
+
+function normalizeCompatibilitySource(value: unknown): ContractRuntimeCompatibilitySource | null {
+  const record = asRecord(value);
+  const id = safeText(stringFrom(record.id));
+  if (!id) return null;
+  const blocked = compatibilityBlockedValue(record.blocked);
+  const rawFields: Record<string, string> = {};
+  for (const [path, rawValue] of Object.entries(asRecord(record.raw_fields))) {
+    if (isSensitiveEvidencePath(path)) continue;
+    const values = stringsFromUnknown(rawValue)
+      .map((item) => sanitizeTaskPlaybackEvidenceText(item, `raw_compatibility.raw_fields.${path}`))
+      .filter((item) => item && item !== PRIVATE_DETAIL_REDACTION);
+    if (values.length > 0) rawFields[safeText(path)] = values.join(", ");
+  }
+  return {
+    id: sanitizeTaskPlaybackEvidenceText(id, "raw_compatibility.source_identity"),
+    source_authority: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_authority), "raw_compatibility.source_authority"),
+    source_event_id: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_event_id), "raw_compatibility.source_event_id"),
+    source_event_ref: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_event_ref), "raw_compatibility.source_event_ref"),
+    source_event_kind: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_event_kind), "raw_compatibility.source_event_kind"),
+    blocked,
+    advisory_only: true,
+    overrides_current_authority: false,
+    raw_fields: rawFields,
+  };
+}
+
+function normalizeCompatibilityRepairTarget(value: unknown): ContractRuntimeCompatibilityRepairTarget | null {
+  const record = asRecord(value);
+  const type = safeText(stringFrom(record.type));
+  const repairId = sanitizeTaskPlaybackEvidenceText(stringFrom(record.repair_id), `repair_targets.${type}`);
+  if (!type || !repairId || repairId === PRIVATE_DETAIL_REDACTION) return null;
+  return {
+    id: sanitizeTaskPlaybackEvidenceText(stringFrom(record.id), "repair_targets.id"),
+    type,
+    repair_id: repairId,
+    source_field: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_field), "repair_targets.source_field"),
+    source_authority: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_authority), "repair_targets.source_authority"),
+    source_event_id: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_event_id), "repair_targets.source_event_id"),
+    source_event_ref: sanitizeTaskPlaybackEvidenceText(stringFrom(record.source_event_ref), "repair_targets.source_event_ref"),
+    advisory_only: true,
+    overrides_current_authority: false,
+  };
+}
+
+function compatibilitySourceForTarget(
+  sources: ContractRuntimeCompatibilitySource[],
+  target: ContractRuntimeCompatibilityRepairTarget,
+): ContractRuntimeCompatibilitySource | undefined {
+  return sources.find((source) => (
+    (target.source_event_ref && source.source_event_ref === target.source_event_ref)
+    || (target.source_event_id && source.source_event_id === target.source_event_id)
+    || target.id.includes(source.id)
+  ));
+}
+
+function compatibilityRawFieldValues(rawFields: Record<string, string>): string[] {
+  return Object.entries(rawFields)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, value]) => `${path}: ${value}`);
+}
+
+function compatibilityBlockedValue(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+  return ["1", "blocked", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function humanizeRepairType(value: string): string {
+  const text = value.replace(/[-_]+/g, " ").trim();
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "Repair target";
 }
 
 /** Normalize the backend visual read model into one public-safe identity space. */
@@ -4192,7 +4379,9 @@ function inferredNextLegalAction(diagnosis: TaskPlaybackStructuredFact[], status
     return "Record the missing public evidence, then rerun close-gate verification.";
   }
   if (status === "failed") return "Repair the failing evidence, rerun verification, then request review again.";
-  return "Resolve the listed blocker ids, then retry the governed action.";
+  const blockerIds = factValue(diagnosis, "blocker_ids");
+  if (blockerIds) return `Resolve blocker IDs ${blockerIds}, then retry the governed action.`;
+  return "Repair target source_missing_repair_id: use the labeled source event, source authority, and raw compatibility identity before retrying the governed action.";
 }
 
 function hasOutcomeAuditFacts(

@@ -20,6 +20,7 @@ import {
   readPlaybackEventParam,
   resolveInitialPlaybackFrameId,
   resolveSelectedFrameIdForEventParam,
+  contractRuntimeCompatibilityRepairValues,
   PLAYBACK_URL_PARAMS,
   type TaskPlaybackTrace,
   type ActivityEventCard,
@@ -944,6 +945,7 @@ export default function TaskPlaybackView({ backlog, projectId }: Props) {
                 <span className="mono">Select a backlog row to fetch governed timeline APIs</span>
               )}
             </div>
+            <CompatibilityRepairTargets trace={activeTrace} surface="Playback" />
             <TaskPlaybackPanel
               trace={activeTrace}
               selectedFrameId={activeFrameId}
@@ -1027,6 +1029,7 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
       currentSnapshot.next_legal_action.action || currentSnapshot.next_legal_action.id,
     ])
     : "";
+  const compatibilityRepairTargets = contractRuntimeCompatibilityRepairValues(authority);
   return (
     <div className="task-playback-chip-section" aria-label="Current stream state">
       <strong>Current stream state</strong>
@@ -1047,6 +1050,22 @@ function ActivityStreamSummary({ hint, trace }: { hint: CurrentTaskHint | null; 
         ) : null}
         <span>Next expected evidence: {nextExpected}</span>
         <span>Blocker/next legal action: {blocker}; {nextAction}</span>
+        {compatibilityRepairTargets.map((target) => (
+          <span key={target}>Compatibility repair target (advisory): {target}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CompatibilityRepairTargets({ trace, surface }: { trace: TaskPlaybackTrace; surface: string }) {
+  const targets = contractRuntimeCompatibilityRepairValues(trace.authority_view);
+  if (targets.length === 0) return null;
+  return (
+    <div className="task-playback-chip-section" aria-label={`${surface} compatibility repair targets`}>
+      <strong>{surface} compatibility repair targets (advisory)</strong>
+      <div>
+        {targets.map((target) => <span key={target}>{target}</span>)}
       </div>
     </div>
   );

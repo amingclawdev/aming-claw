@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type { BacklogBug, BacklogTimelineGateResponse, ContractRuntimeVisualizationResponse, TaskTimelineEvent } from "../types";
 import {
   contractRuntimeAuthorityDisplayStatus,
+  contractRuntimeCompatibilityRepairValues,
   isBacklogRowPrivate,
   normalizeTaskPlaybackTrace,
   normalizeTaskPlaybackDag,
@@ -1456,6 +1457,120 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
   assertFixture(contractRuntimeAuthorityDisplayStatus("BYPASSED") !== "PASS" && contractRuntimeAuthorityDisplayStatus("WAIVED") !== "PASS", "bypassed/waived authority statuses must never normalize to PASS");
   assertFixture(timelineStatusFromEvent(response.timeline.events[0]) === "recorded", "bypassed timeline text must not be misclassified by the passed substring");
   assertFixture(view.historical_diagnostics.timeline_events.length === 1 && view.historical_diagnostics.current_snapshot_in_playback === false, "current authority snapshot must stay separate from append-only playback history");
+
+  for (const blocked of [false, 0, ""]) {
+    const nonBlockingCompatibility = projectContractRuntimeAuthorityViewModel({
+      ...response,
+      raw_compatibility: {
+        sources: [{
+          id: "timeline:15440",
+          source_authority: "task_timeline_events",
+          source_event_id: "15440",
+          source_event_ref: "timeline:15440",
+          source_event_kind: "legacy_gate",
+          blocked,
+          raw_fields: { "payload.blocked": blocked },
+        }],
+      },
+      repair_targets: [{
+        id: "repair-target:timeline:15440:blocker_id:must-not-render",
+        type: "blocker_id",
+        repair_id: "must-not-render",
+        source_field: "payload.blocker_id",
+        source_authority: "task_timeline_events",
+        source_event_id: "15440",
+        source_event_ref: "timeline:15440",
+      }],
+    } as unknown as ContractRuntimeVisualizationResponse);
+    assertFixture(
+      contractRuntimeCompatibilityRepairValues(nonBlockingCompatibility).length === 0,
+      `compatibility blocked=${JSON.stringify(blocked)} must not produce a red/unmet repair target`,
+    );
+  }
+
+  const diagnosticId = "AC-SYSTEM-PARENTLESS-DIRECT-MAIN-QA-TIMELINE-ONBOARD-CONTRACT-DEFINITION-R1-20260719";
+  const repairTypes = [
+    ["blocker_id", "qa_timeline_onboard_definition_missing"],
+    ["diagnostic_backlog_id", diagnosticId],
+    ["missing_requirement_id", "qa_verification"],
+    ["missing_event_kind", "independent_verification"],
+    ["contract_line", "worker_verification"],
+    ["contract_stage", "qa"],
+    ["source_event_id", "15441"],
+    ["source_authority", "task_timeline_events"],
+  ] as const;
+  const compatibilityView = projectContractRuntimeAuthorityViewModel({
+    ...response,
+    raw_compatibility: {
+      schema_version: "contract_runtime.visualization.raw_compatibility.v1",
+      public_safe: true,
+      advisory_only: true,
+      overrides_current_authority: false,
+      sources: [
+        {
+          id: "timeline:15441",
+          source_authority: "task_timeline_events",
+          source_event_id: "15441",
+          source_event_ref: "timeline:15441",
+          source_event_kind: "system_block",
+          blocked: true,
+          raw_fields: { "payload.diagnostic_backlog_id": diagnosticId },
+        },
+        {
+          id: "timeline:15442",
+          source_authority: "task_timeline_events",
+          source_event_id: "15442",
+          source_event_ref: "timeline:15442",
+          source_event_kind: "legacy_gate",
+          blocked: true,
+          raw_fields: {
+            "payload.blocked": true,
+            "payload.reason": "legacy gate reported a block without a stable identifier",
+            "payload.route_token_ref": "rtok-must-not-render",
+          },
+        },
+      ],
+    },
+    repair_targets: [
+      ...repairTypes.map(([type, repairId]) => ({
+        id: `repair-target:timeline:15441:${type}:${repairId}`,
+        type,
+        repair_id: repairId,
+        source_field: `payload.${type}`,
+        source_authority: "task_timeline_events",
+        source_event_id: "15441",
+        source_event_ref: "timeline:15441",
+      })),
+      {
+        id: "repair-target:timeline:15442:source_missing_repair_id",
+        type: "source_missing_repair_id",
+        repair_id: "source_missing_repair_id",
+        source_field: "",
+        source_authority: "task_timeline_events",
+        source_event_id: "15442",
+        source_event_ref: "timeline:15442",
+      },
+    ],
+  } as unknown as ContractRuntimeVisualizationResponse);
+  const compatibilityLabels = contractRuntimeCompatibilityRepairValues(compatibilityView);
+  for (const expected of [
+    "Blocker ID: qa_timeline_onboard_definition_missing",
+    `Diagnostic backlog ID: ${diagnosticId}`,
+    "Missing requirement ID: qa_verification",
+    "Missing event kind: independent_verification",
+    "Contract line: worker_verification",
+    "Contract stage: qa",
+    "Source event: 15441",
+    "Source authority: task_timeline_events",
+  ]) {
+    assertFixture(compatibilityLabels.some((label) => label.includes(expected)), `event #15441 should expose typed repair target ${expected}`);
+  }
+  const missingRepairIdLabel = compatibilityLabels.find((label) => label.includes("Missing stable repair ID")) || "";
+  assertFixture(missingRepairIdLabel.includes("source_missing_repair_id"), "missing stable ids should be explicit, never a generic resolve-listed-ids instruction");
+  assertFixture(missingRepairIdLabel.includes("Compatibility source: timeline:15442"), "missing stable ids should name the sanitized compatibility source identity");
+  assertFixture(missingRepairIdLabel.includes("payload.reason: legacy gate reported a block without a stable identifier"), "missing stable ids should show labeled raw compatibility context");
+  assertFixture(!compatibilityLabels.join(" ").includes("rtok-must-not-render"), "compatibility repair formatting must preserve the private evidence boundary");
+  assertFixture(!compatibilityLabels.join(" ").includes("Resolve listed blocker ids"), "compatibility repair formatting must not emit generic blocker instructions without ids");
 
   const completedContractResponse: ContractRuntimeVisualizationResponse = {
     ...response,
