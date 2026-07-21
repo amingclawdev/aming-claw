@@ -1,3 +1,8 @@
+import { readFileSync } from "node:fs";
+import { renderToStaticMarkup } from "react-dom/server";
+
+import { ContractRuntimeAuthorityPanel } from "../components/TaskPlaybackPanel";
+import type { ContractRuntimeAuthorityViewModel } from "../lib/taskPlayback";
 import type { BacklogBug } from "../types";
 
 const projectedCommandBug: BacklogBug = {
@@ -37,3 +42,77 @@ export function projectedCommandCardLabel(bug: BacklogBug = projectedCommandBug)
 }
 
 export const projectedCommandCardFixtureLabel = projectedCommandCardLabel();
+
+const backlogViewSource = readFileSync(new URL("./BacklogView.tsx", import.meta.url), "utf8");
+const playbackPanelSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
+
+function assertBacklogAuthority(condition: boolean, message: string): void {
+  if (!condition) throw new Error(`Backlog authority fixture failed: ${message}`);
+}
+
+assertBacklogAuthority(
+  backlogViewSource.includes("projectContractRuntimeAuthorityViewModel")
+    && backlogViewSource.includes("ContractRuntimeAuthorityPanel"),
+  "Backlog detail and Timeline DAG must consume the canonical three-axis authority view",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes("Historical compact ledger (advisory)")
+    && backlogViewSource.includes("Historical ledger action (advisory)"),
+  "legacy compact-ledger actions must be labeled advisory when canonical authority is present",
+);
+assertBacklogAuthority(
+  playbackPanelSource.includes("Backlog row close authority")
+    && playbackPanelSource.includes("partial / continuation required")
+    && playbackPanelSource.includes("diagnostic_backlog_id"),
+  "shared authority presentation must separate row close, pagination, and bypass diagnostics",
+);
+
+const authorityPanelSsr = renderToStaticMarkup(
+  <ContractRuntimeAuthorityPanel
+    authority={{
+      cache_identity: { key: "AC-AUTHORITY-SSR:cex-authority-ssr:18:16090" },
+      contract_execution_progress: {
+        display_status: "COMPLETED",
+        contract_execution_id: "cex-authority-ssr",
+        execution_state_revision: 18,
+        current_action_source: "backlog_contract_chain_current",
+        current_action: { id: "qa_graph_context", action: "record_graph_trace" },
+        line_states: [],
+        line_states_truncated: false,
+        runtime_records_truncated: false,
+      },
+      backlog_close_readiness: { display_status: "OPEN", state: "open", backlog_status: "OPEN" },
+      historical_diagnostics: {
+        timeline_events: [],
+        bypass_records: [
+          {
+            decision: "continue_with_audited_bypass",
+            reason: "operator approved exception",
+            diagnostic_backlog_id: "AC-DIAG-BYPASS",
+          },
+          {
+            disposition: "waiver",
+            status: "bypassed",
+            reason: "waiver approved",
+            diagnostic_backlog_id: "AC-DIAG-WAIVER",
+          },
+        ],
+        legacy_advisories: [],
+        truncated: false,
+        next_cursor: "",
+      },
+    } as unknown as ContractRuntimeAuthorityViewModel}
+  />,
+);
+
+assertBacklogAuthority(
+  authorityPanelSsr.includes('class="status-badge status-unknown">COMPLETED</b>')
+    && !authorityPanelSsr.includes('class="status-badge status-complete">COMPLETED</b>'),
+  "contract-complete progress must render with neutral rather than success/PASS visual semantics",
+);
+assertBacklogAuthority(
+  authorityPanelSsr.includes("BYPASSED · record 1 · operator approved exception · diagnostic AC-DIAG-BYPASS")
+    && authorityPanelSsr.includes("WAIVED · record 2 · waiver approved · diagnostic AC-DIAG-WAIVER")
+    && !authorityPanelSsr.includes("CONTINUE_WITH_AUDITED_BYPASS"),
+  "bypass history must render canonical BYPASSED/WAIVED labels while retaining reason and diagnostic refs",
+);

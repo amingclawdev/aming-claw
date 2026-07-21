@@ -11,6 +11,7 @@ import type {
   BacklogTimelineGateResponse,
   BacklogBug,
   BacklogResponse,
+  ContractRuntimeVisualizationResponse,
   EdgesResponse,
   FeedbackQueueResponse,
   FileHygieneActionResponse,
@@ -64,6 +65,7 @@ function backlogTimelineQuery(backlogId: string, limit: number): string {
   return new URLSearchParams({
     backlog_id: backlogId,
     limit: String(limit),
+    include_compact_ledger: "true",
   }).toString();
 }
 
@@ -469,7 +471,12 @@ export const api = {
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineQuery(backlogId, limit);
-    return getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+    const taskTimelineRequest = getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+    const authorityRequest = api.contractRuntimeVisualizationFor(projectId, backlogId, limit, signal);
+    return Promise.all([taskTimelineRequest, authorityRequest]).then(([taskTimeline, contractRuntimeVisualization]) => ({
+      ...taskTimeline,
+      contract_runtime_visualization: contractRuntimeVisualization,
+    }));
   },
   /** Project-wide recent timeline events, newest-first, cross-row.
    *  Each event carries backlog_id and task_id for row-tag rendering.
@@ -482,6 +489,13 @@ export const api = {
     const q = backlogTimelineGateQuery(limit);
     return getJSON<BacklogTimelineGateResponse>(
       `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
+      signal,
+    );
+  },
+  contractRuntimeVisualizationFor(projectId: string, backlogId: string, limit = 100, signal?: AbortSignal) {
+    const q = new URLSearchParams({ limit: String(limit) }).toString();
+    return getJSON<ContractRuntimeVisualizationResponse>(
+      `/api/projects/${pidFor(projectId)}/visualization/backlogs/${encodeURIComponent(backlogId)}?${q}`,
       signal,
     );
   },
